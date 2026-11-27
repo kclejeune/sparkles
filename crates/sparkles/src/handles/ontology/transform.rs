@@ -11,7 +11,7 @@ use super::{OntologyRequest, Opened};
 use crate::Dataset;
 use crate::error::{Error, Result};
 use crate::sparql::QueryOptions;
-use sparkles_owl::classify::{Classification, Excluded};
+use sparkles_owl::classify::{Classification, Excluded, Unmapped};
 use sparkles_owl::ofn::Renderer;
 use sparkles_owl::transform::{
     self, Document, MaterializeOptions, ReasonOptions, ReduceOptions, RelaxOptions, Report,
@@ -31,6 +31,9 @@ pub struct WorkingOntology {
     pub doc: Document,
     /// the prefixes of the input, which the writers use
     pub prefixes: BTreeMap<String, String>,
+    /// the triples of the input that map to no axiom, which every classification of the
+    /// ontology counts as left out
+    pub unmapped: Unmapped,
 }
 
 impl WorkingOntology {
@@ -63,16 +66,18 @@ impl WorkingOntology {
                 name: path.display().to_string(),
                 doc: Document::new(doc.header, doc.axioms),
                 prefixes: doc.prefixes.into_iter().collect(),
+                unmapped: Unmapped::default(),
             });
         }
         if let Some(file) = OntologyFile::read(path, req, threads)? {
             let prefixes = file.prefixes();
             let name = file.name.clone();
-            let doc = file.into_document(opts)?;
+            let (doc, unmapped) = file.into_counted_document(opts)?;
             return Ok(WorkingOntology {
                 name,
                 doc,
                 prefixes,
+                unmapped,
             });
         }
         let ds = Dataset::memory();
@@ -90,22 +95,33 @@ impl WorkingOntology {
         opts: &QueryOptions,
     ) -> Result<WorkingOntology> {
         let mut axioms: Vec<Axiom> = o.ontology.axioms.keys().cloned().collect();
-        o.assertions(opts, |ax, _, _| {
-            if let Some(ax) = ax {
-                axioms.push(ax);
+        let mut unread = Unmapped::default();
+        o.assertions(opts, |ax, t, _| {
+            match ax {
+                Some(ax) => axioms.push(ax),
+                None => unread.push(t),
             }
             Ok(true)
         })?;
+        let unmapped =
+            super::classify::unmapped_of(&o.ontology, &unread, &std::cell::RefCell::new(None));
         Ok(WorkingOntology {
             name,
             doc: Document::new(o.ontology.header.clone(), axioms),
             prefixes,
+            unmapped,
         })
     }
 
-    /// The ontology as a file that `classify` and `check` read.
+    /// The ontology as a file that `classify` and `check` read, whose classifications
+    /// count the input's triples that map to no axiom as left out.
     pub fn to_file(&self) -> Result<OntologyFile> {
-        OntologyFile::from_document(self.name.clone(), self.doc.clone(), self.prefixes.clone())
+        OntologyFile::from_document(
+            self.name.clone(),
+            self.doc.clone(),
+            self.prefixes.clone(),
+            self.unmapped.clone(),
+        )
     }
 
     /// A renderer with the input's prefixes.
@@ -120,7 +136,7 @@ impl WorkingOntology {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> std::result::Result<Report, TransformError> {
-        transform::reason(&mut self.doc, o, &mut classifier(c, opts))
+        transform::reason(&mut self.doc, o, &mut classifier(c, opts, &self.unmapped))
     }
 
     /// `reduce`.
@@ -130,7 +146,7 @@ impl WorkingOntology {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> std::result::Result<Report, TransformError> {
-        transform::reduce(&mut self.doc, o, &mut classifier(c, opts))
+        transform::reduce(&mut self.doc, o, &mut classifier(c, opts, &self.unmapped))
     }
 
     /// `materialize`. The ontology is unchanged when it fails.
@@ -140,7 +156,7 @@ impl WorkingOntology {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> std::result::Result<Report, TransformError> {
-        transform::materialize(&mut self.doc, o, &mut classifier(c, opts))
+        transform::materialize(&mut self.doc, o, &mut classifier(c, opts, &self.unmapped))
     }
 
     /// `relax`, which classifies nothing.
@@ -150,8 +166,15 @@ impl WorkingOntology {
 
     /// Write the ontology to `path` in the syntax its extension names.
     pub fn write(&self, path: &Path) -> Result<()> {
+        let _ = self.write_reported(path)?;
+        Ok(())
+    }
+
+    /// Write the ontology to `path` in the syntax its extension names, returning the
+    /// writer's report of written and any lossy/skipped axioms.
+    pub fn write_reported(&self, path: &Path) -> Result<sparkles_owl::WriteReport> {
         let (format, gz) = OutputFormat::of(path)?;
-        write_axioms(
+        write_axioms_reported(
             path,
             format,
             gz,
@@ -164,16 +187,29 @@ impl WorkingOntology {
 
 /// The classification of a transformation: the classifier with the request's threads
 /// and the options' deadline and budgets. A transformation asserts what the taxonomy
-/// says, so it never takes a partial answer, and a stopped run fails.
+/// says, so it never takes a partial answer, and a stopped run fails. A strict request
+/// fails when the classification leaves an axiom out, or the `unmapped` triples of the
+/// input that map to no axiom.
 fn classifier<'a>(
     c: &'a ClassifyRequest,
     opts: &'a QueryOptions,
+    unmapped: &'a Unmapped,
 ) -> impl FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>)> + 'a {
+    // a transformation reads the taxonomy and what was left out, not which classes keep
+    // their answer
     let c = ClassifyRequest {
         partial: false,
+        skip_coverage: true,
         ..c.clone()
     };
-    move |kinds: &[&AxiomKind]| classify_once(kinds, &c, opts)
+    move |kinds: &[&AxiomKind]| {
+        let (classification, excluded) =
+            classify_once(kinds, &c, opts, None, &|| unmapped.clone())?;
+        if c.strict && !classification.complete {
+            return Err(super::classify::strict_refusal(&classification, &excluded));
+        }
+        Ok((classification, excluded))
+    }
 }
 
 /// The syntaxes the writers write, by the extensions ROBOT reads them from.
@@ -187,12 +223,19 @@ pub enum OutputFormat {
     Turtle,
     /// `.nt`
     NTriples,
+    /// `.owx` (OWL/XML)
+    OwlXml,
+    /// `.omn` (Manchester OWL Syntax)
+    Manchester,
+    /// `.obo` (OBO 1.4)
+    Obo,
+    /// `.json` (OBO Graphs JSON)
+    OboGraphsJson,
 }
 
 impl OutputFormat {
     /// The syntax of an output path by its extension, after a `.gz` that compresses
-    /// it, and whether it is compressed. ROBOT's other syntaxes are refused, since no
-    /// writer exists here.
+    /// it, and whether it is compressed.
     pub fn of(path: &Path) -> Result<(OutputFormat, bool)> {
         let name = path
             .file_name()
@@ -208,17 +251,10 @@ impl OutputFormat {
             "owl" | "rdf" => OutputFormat::RdfXml,
             "ttl" => OutputFormat::Turtle,
             "nt" => OutputFormat::NTriples,
-            "owx" | "omn" | "obo" | "json" => {
-                return Err(Error::invalid(format!(
-                    "no writer for .{ext} output (ROBOT's {}): write .ofn, .owl, .ttl or .nt",
-                    match ext.as_str() {
-                        "owx" => "OWL/XML",
-                        "omn" => "Manchester syntax",
-                        "obo" => "OBO format",
-                        _ => "OBO Graphs JSON",
-                    }
-                )));
-            }
+            "owx" => OutputFormat::OwlXml,
+            "omn" => OutputFormat::Manchester,
+            "obo" => OutputFormat::Obo,
+            "json" => OutputFormat::OboGraphsJson,
             _ => {
                 return Err(Error::invalid(format!(
                     "io#INVALID FORMAT ERROR unknown format: {ext}"
@@ -227,10 +263,23 @@ impl OutputFormat {
         };
         Ok((f, gz))
     }
+
+    /// Human-readable syntax name for diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            OutputFormat::Functional => "OWL functional-style syntax (.ofn)",
+            OutputFormat::RdfXml => "RDF/XML (.owl)",
+            OutputFormat::Turtle => "Turtle (.ttl)",
+            OutputFormat::NTriples => "N-Triples (.nt)",
+            OutputFormat::OwlXml => "OWL/XML (.owx)",
+            OutputFormat::Manchester => "Manchester OWL syntax (.omn)",
+            OutputFormat::Obo => "OBO 1.4 (.obo)",
+            OutputFormat::OboGraphsJson => "OBO Graphs JSON (.json)",
+        }
+    }
 }
 
-/// Write a header and axioms to `path`: a functional-style document whose axioms are
-/// one to a line, or their triples by the mapping to RDF graphs.
+/// Write a header and axioms to `path` in `format`.
 pub fn write_axioms<'a>(
     path: &Path,
     format: OutputFormat,
@@ -239,24 +288,140 @@ pub fn write_axioms<'a>(
     header: &sparkles_owl::Header,
     axioms: impl IntoIterator<Item = &'a Axiom>,
 ) -> Result<()> {
-    let file = std::fs::File::create(path)
-        .map_err(|e| Error::invalid(format!("cannot write {}: {e}", path.display())))?;
-    let io = |e: std::io::Error| Error::invalid(format!("cannot write {}: {e}", path.display()));
-    let buf = std::io::BufWriter::with_capacity(1 << 20, file);
-    // each layer is finished and flushed by hand, so that an error writing the gzip
-    // trailer or the last buffer fails the command
-    let buf = if gz {
-        let mut enc = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
-        write_body(&mut enc, format, prefixes, header, axioms).map_err(io)?;
-        enc.finish().map_err(io)?
-    } else {
-        let mut buf = buf;
-        write_body(&mut buf, format, prefixes, header, axioms).map_err(io)?;
-        buf
-    };
-    let file = buf.into_inner().map_err(|e| io(e.into_error()))?;
-    file.sync_all().map_err(io)?;
+    let _ = write_axioms_reported(path, format, gz, prefixes, header, axioms)?;
     Ok(())
+}
+
+/// Resolve `path` to the final target path for atomic replacement: follows existing
+/// symlinks (including dangling symlink chains, bounded to 40 hops) so an output symlink
+/// stays intact and points at the atomically replaced target, matching `File::create`.
+/// Returns an error if resolution fails or exhausts the hop bound.
+fn resolve_atomic_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(canon) => return Ok(canon),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut cur = path.to_path_buf();
+    for _ in 0..=40 {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = std::fs::read_link(&cur)?;
+                cur = if link.is_absolute() {
+                    link
+                } else {
+                    cur.parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map_or_else(|| link.clone(), |p| p.join(&link))
+                };
+            }
+            Ok(_) => return Ok(cur),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(cur),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "too many levels of symbolic links",
+    ))
+}
+
+/// Create a private (`0o700` on Unix) temporary staging directory inside `parent` so
+/// neither partial writes nor fresh umask-masked files are visible to other users or
+/// group members before atomic publication.
+fn create_private_stage_dir(parent: &Path) -> std::io::Result<tempfile::TempDir> {
+    let mut stage_builder = tempfile::Builder::new();
+    stage_builder.prefix(".sparkles-owl-stage-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        stage_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    stage_builder.tempdir_in(parent)
+}
+
+/// Create a staged output file inside the private `stage_dir`.
+///
+/// Fresh outputs (`!preserve_existing`) request mode `0o666` so the kernel applies the
+/// process umask (matching `File::create`) while `stage_dir`'s `0o700` keeps the file
+/// private until publication. Overwrites of existing files stay `0o600` during
+/// serialization and receive their preserved mode only after serialization and flush.
+fn create_staged_file(
+    stage_dir: &Path,
+    _preserve_existing: bool,
+) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("out-").suffix(".tmp");
+    #[cfg(unix)]
+    if !_preserve_existing {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    builder.tempfile_in(stage_dir)
+}
+
+/// Write a header and axioms to `path` in `format`, returning the writer's report of
+/// written and any skipped axioms.
+pub fn write_axioms_reported<'a>(
+    path: &Path,
+    format: OutputFormat,
+    gz: bool,
+    prefixes: &BTreeMap<String, String>,
+    header: &sparkles_owl::Header,
+    axioms: impl IntoIterator<Item = &'a Axiom>,
+) -> Result<sparkles_owl::WriteReport> {
+    let io = |e: std::io::Error| Error::invalid(format!("cannot write {}: {e}", path.display()));
+    let werr = |e: sparkles_owl::WriteError| {
+        Error::invalid(format!("cannot write {}: {e}", path.display()))
+    };
+    let target = resolve_atomic_target(path).map_err(io)?;
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let existing_perms = match std::fs::symlink_metadata(&target) {
+        Ok(meta) => {
+            if !meta.file_type().is_file() {
+                return Err(io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "output destination must be a regular file",
+                )));
+            }
+            Some(meta.permissions())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io(e)),
+    };
+    let stage_dir = create_private_stage_dir(parent).map_err(io)?;
+    let mut tmp = create_staged_file(stage_dir.path(), existing_perms.is_some()).map_err(io)?;
+    // Stage output beside the resolved destination so a writer or gzip error never
+    // truncates or overwrites an existing file. Each layer is finished and flushed by
+    // hand so an error writing the gzip trailer or final buffer fails the command.
+    let report = {
+        let mut buf = std::io::BufWriter::with_capacity(1 << 20, tmp.as_file_mut());
+        if gz {
+            let mut enc = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
+            let report = write_body(&mut enc, format, prefixes, header, axioms).map_err(werr)?;
+            let mut buf = enc.finish().map_err(io)?;
+            buf.flush().map_err(io)?;
+            report
+        } else {
+            let report = write_body(&mut buf, format, prefixes, header, axioms).map_err(werr)?;
+            buf.flush().map_err(io)?;
+            report
+        }
+    };
+    if let Some(perms) = existing_perms {
+        tmp.as_file().set_permissions(perms).map_err(io)?;
+    }
+    tmp.as_file().sync_all().map_err(io)?;
+    tmp.persist(&target).map_err(|e| io(e.error))?;
+    drop(stage_dir);
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(report)
 }
 
 /// The document in the syntax `format` names.
@@ -266,31 +431,60 @@ fn write_body<'a>(
     prefixes: &BTreeMap<String, String>,
     header: &sparkles_owl::Header,
     axioms: impl IntoIterator<Item = &'a Axiom>,
-) -> std::io::Result<()> {
+) -> std::result::Result<sparkles_owl::WriteReport, sparkles_owl::WriteError> {
     let r = Renderer::new(prefixes.clone());
-    if format == OutputFormat::Functional {
-        return write_functional(out, &r, header, axioms);
+    match format {
+        OutputFormat::Functional => write_functional(out, &r, header, axioms).map_err(Into::into),
+        OutputFormat::OwlXml => sparkles_owl::owx::write_document(out, &r, header, axioms),
+        OutputFormat::Manchester => sparkles_owl::manchester::write_document(
+            out,
+            &r,
+            header,
+            axioms,
+            sparkles_owl::WriteOptions::default(),
+        ),
+        OutputFormat::Obo => sparkles_owl::obo::write_document(
+            out,
+            &r,
+            header,
+            axioms,
+            sparkles_owl::WriteOptions::default(),
+        ),
+        OutputFormat::OboGraphsJson => sparkles_owl::obographs::write_document(
+            out,
+            &r,
+            header,
+            axioms,
+            sparkles_owl::WriteOptions::default(),
+        ),
+        OutputFormat::RdfXml | OutputFormat::Turtle | OutputFormat::NTriples => {
+            let rdf = match format {
+                OutputFormat::RdfXml => oxrdfio::RdfFormat::RdfXml,
+                OutputFormat::Turtle => oxrdfio::RdfFormat::Turtle,
+                _ => oxrdfio::RdfFormat::NTriples,
+            };
+            let mut fresh = sparkles_owl::write::counter("genid");
+            let axioms: Vec<&'a Axiom> = axioms.into_iter().collect();
+            let written_axioms = axioms.len();
+            let triples = sparkles_owl::write::ontology_triples(header, axioms, &mut fresh);
+            // the input's prefixes and the standard ones, as the renderer has them
+            let ser = crate::io::with_prefixes(
+                oxrdfio::RdfSerializer::from_format(rdf),
+                r.prefixes()
+                    .into_iter()
+                    .map(|(p, n)| (p.to_string(), n.to_string())),
+            );
+            let mut w = ser.for_writer(out);
+            for t in &triples {
+                w.serialize_triple(t)?;
+            }
+            w.finish()?;
+            Ok(sparkles_owl::WriteReport {
+                written_axioms,
+                ..Default::default()
+            })
+        }
     }
-    let rdf = match format {
-        OutputFormat::RdfXml => oxrdfio::RdfFormat::RdfXml,
-        OutputFormat::Turtle => oxrdfio::RdfFormat::Turtle,
-        _ => oxrdfio::RdfFormat::NTriples,
-    };
-    let mut fresh = sparkles_owl::write::counter("genid");
-    let triples = sparkles_owl::write::ontology_triples(header, axioms, &mut fresh);
-    // the input's prefixes and the standard ones, as the renderer has them
-    let ser = crate::io::with_prefixes(
-        oxrdfio::RdfSerializer::from_format(rdf),
-        r.prefixes()
-            .into_iter()
-            .map(|(p, n)| (p.to_string(), n.to_string())),
-    );
-    let mut w = ser.for_writer(out);
-    for t in &triples {
-        w.serialize_triple(t)?;
-    }
-    w.finish()?;
-    Ok(())
 }
 
 /// [`sparkles_owl::ofn::document`], written as it goes.
@@ -299,7 +493,7 @@ fn write_functional<'a>(
     r: &Renderer,
     header: &sparkles_owl::Header,
     axioms: impl IntoIterator<Item = &'a Axiom>,
-) -> std::io::Result<()> {
+) -> std::io::Result<sparkles_owl::WriteReport> {
     for (p, n) in r.prefixes() {
         writeln!(w, "Prefix({p}:=<{n}>)")?;
     }
@@ -318,10 +512,16 @@ fn write_functional<'a>(
         writeln!(w, "{}", r.annotation(a))?;
     }
     w.write_all(b"\n")?;
+    let mut written_axioms = 0usize;
     for ax in axioms {
         writeln!(w, "{}", r.axiom(ax))?;
+        written_axioms += 1;
     }
-    w.write_all(b")\n")
+    w.write_all(b")\n")?;
+    Ok(sparkles_owl::WriteReport {
+        written_axioms,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -382,9 +582,65 @@ EquivalentClasses(:D ObjectIntersectionOf(:C ObjectSomeValuesFrom(:p :B)))
             let back = read(&p);
             assert_eq!(back.doc, w.doc, "{name}");
         }
-        assert!(OutputFormat::of(Path::new("x.owx")).is_err());
-        assert!(OutputFormat::of(Path::new("x.json")).is_err());
+        assert_eq!(
+            OutputFormat::of(Path::new("x.owx")).unwrap(),
+            (OutputFormat::OwlXml, false)
+        );
+        assert_eq!(
+            OutputFormat::of(Path::new("x.omn")).unwrap(),
+            (OutputFormat::Manchester, false)
+        );
+        assert_eq!(
+            OutputFormat::of(Path::new("x.obo")).unwrap(),
+            (OutputFormat::Obo, false)
+        );
+        assert_eq!(
+            OutputFormat::of(Path::new("x.json")).unwrap(),
+            (OutputFormat::OboGraphsJson, false)
+        );
+        assert_eq!(
+            OutputFormat::of(Path::new("x.owx.gz")).unwrap(),
+            (OutputFormat::OwlXml, true)
+        );
         assert!(OutputFormat::of(Path::new("x")).is_err());
+        // OWL/XML and Manchester round-trip losslessly on the reasoned ontology
+        let owx_path = d.path().join("r.owx");
+        w.write(&owx_path).unwrap();
+        let owx_doc =
+            sparkles_owl::owx::parse(&std::fs::read_to_string(&owx_path).unwrap()).unwrap();
+        assert_eq!(
+            Document::new(owx_doc.header, owx_doc.axioms),
+            w.doc,
+            "r.owx"
+        );
+        let omn_path = d.path().join("r.omn");
+        let omn_rep = w.write_reported(&omn_path).unwrap();
+        assert!(omn_rep.is_lossless(), "{omn_rep:?}");
+        let omn_doc =
+            sparkles_owl::manchester::parse_document(&std::fs::read_to_string(&omn_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            Document::new(omn_doc.header, omn_doc.axioms),
+            w.doc,
+            "r.omn"
+        );
+        // OBO 1.4 and OBO Graphs JSON write cleanly and parse back
+        let obo_path = d.path().join("r.obo");
+        let _ = w.write_reported(&obo_path).unwrap();
+        let obo_doc =
+            sparkles_owl::obo::parse(&std::fs::read_to_string(&obo_path).unwrap()).unwrap();
+        assert!(obo_doc.axioms.contains(&Axiom::sub_class_of(
+            sparkles_owl::Class::new("http://ex.org/A"),
+            sparkles_owl::Class::new("http://ex.org/B"),
+        )));
+        let json_path = d.path().join("r.json");
+        let _ = w.write_reported(&json_path).unwrap();
+        let json_doc =
+            sparkles_owl::obographs::parse(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert!(json_doc.axioms.contains(&Axiom::sub_class_of(
+            sparkles_owl::Class::new("http://ex.org/A"),
+            sparkles_owl::Class::new("http://ex.org/B"),
+        )));
         // a file of the document classifies as the document
         let file = w.to_file().unwrap();
         let out = file.classify(&c, &QueryOptions::default()).unwrap();
@@ -393,5 +649,379 @@ EquivalentClasses(:D ObjectIntersectionOf(:C ObjectSomeValuesFrom(:p :B)))
             &sparkles_owl::Class::new("http://ex.org/A"),
             &sparkles_owl::Class::new("http://ex.org/C"),
         ));
+    }
+    /// A triple that maps to no axiom, here the domain of a property that is not
+    /// declared, is left out of every classification of the ontology: a strict reason
+    /// refuses, and one that is not strict answers incomplete.
+    #[test]
+    fn a_triple_that_maps_to_no_axiom_is_left_out() {
+        let d = tempfile::tempdir().unwrap();
+        let input = d.path().join("o.ttl");
+        std::fs::write(
+            &input,
+            "@prefix : <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             :A a owl:Class . :B a owl:Class . :C a owl:Class .
+             :p rdfs:domain :A . :A owl:disjointWith :B . :C rdfs:subClassOf :B .
+             :x :p :y . :x a :B .",
+        )
+        .unwrap();
+        let mut w = read(&input);
+        assert!(w.unmapped.count > 0, "the domain triple maps to an axiom");
+        assert!(
+            w.unmapped
+                .triples
+                .iter()
+                .any(|t| t.to_string()
+                    == "<http://ex.org/p> <http://www.w3.org/2000/01/rdf-schema#domain> <http://ex.org/A>"),
+            "{:?}",
+            w.unmapped
+        );
+        let strict = ClassifyRequest {
+            strict: true,
+            ..Default::default()
+        };
+        let err = w
+            .reason(&ReasonOptions::default(), &strict, &QueryOptions::default())
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("map to no axiom"), "{err:?}");
+    }
+
+    /// A file of the working ontology, as a chained command classifies it, counts the
+    /// input's triples that map to no axiom, which the document has lost: here an
+    /// undeclared property's domain and a class assertion of a blank node that no triple
+    /// describes. Its classification answers incomplete after a reason that is not
+    /// strict, and a strict one refuses.
+    #[test]
+    fn a_file_of_the_working_ontology_counts_the_unmapped_triples() {
+        let d = tempfile::tempdir().unwrap();
+        let input = d.path().join("o.ttl");
+        std::fs::write(
+            &input,
+            "@prefix : <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             :A a owl:Class . :B a owl:Class . :B rdfs:subClassOf :A .
+             :p rdfs:domain :A . :x a _:missing .",
+        )
+        .unwrap();
+        let mut w = read(&input);
+        assert_eq!(w.unmapped.count, 2, "{:?}", w.unmapped);
+        assert!(
+            w.unmapped
+                .triples
+                .iter()
+                .any(|t| t.predicate.as_str() == sparkles_owl::vocab::RDF_TYPE
+                    && matches!(t.object, oxrdf::Term::BlankNode(_))),
+            "{:?}",
+            w.unmapped
+        );
+        w.reason(
+            &ReasonOptions::default(),
+            &ClassifyRequest::default(),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let file = w.to_file().unwrap();
+        for assertions in [false, true] {
+            let c = ClassifyRequest {
+                assertions,
+                ..Default::default()
+            };
+            let out = file.classify(&c, &QueryOptions::default()).unwrap();
+            let k = &out.classification;
+            assert!(!k.complete, "assertions {assertions}");
+            assert_eq!(k.unmapped, w.unmapped, "assertions {assertions}");
+            let strict = ClassifyRequest { strict: true, ..c };
+            let Err(err) = file.classify(&strict, &QueryOptions::default()) else {
+                panic!("assertions {assertions}: a strict run answered");
+            };
+            assert!(err.to_string().contains("map to no axiom"), "{err}");
+        }
+        // the document a file of the working ontology hands on keeps them too
+        let (_, unmapped) = file
+            .into_counted_document(&QueryOptions::default())
+            .unwrap();
+        assert_eq!(unmapped, w.unmapped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_staging_preserves_mode_respects_umask_and_follows_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tempfile::tempdir().unwrap();
+        let input = d.path().join("in.ofn");
+        std::fs::write(&input, ONTO).unwrap();
+        let w = read(&input);
+
+        // 1. New output file gets the same umask-masked mode as File::create.
+        let probe = d.path().join("probe.txt");
+        std::fs::File::create(&probe).unwrap();
+        let expected_new_mode = std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+        let fresh = d.path().join("fresh.owx");
+        w.write(&fresh).unwrap();
+        let actual_new_mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(actual_new_mode, expected_new_mode);
+
+        // 2. Overwriting an existing readable file preserves its explicit mode (e.g. 0o644 / 0o640).
+        let existing = d.path().join("shared.owx");
+        std::fs::write(&existing, "old").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        w.write(&existing).unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let body = std::fs::read_to_string(&existing).unwrap();
+        assert!(sparkles_owl::owx::parse(&body).is_ok());
+
+        // 3. Writing through an existing symlink preserves the symlink and atomically updates its target.
+        let target = d.path().join("real_target.owx");
+        std::fs::write(&target, "stale").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = d.path().join("link.owx");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        w.write(&link).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let updated = std::fs::read_to_string(&target).unwrap();
+        assert!(sparkles_owl::owx::parse(&updated).is_ok());
+
+        // 4. Writing through a dangling symlink creates the target and keeps the symlink intact.
+        let dangling_target = d.path().join("created_via_link.owx");
+        let dangling = d.path().join("dangling.owx");
+        std::os::unix::fs::symlink(&dangling_target, &dangling).unwrap();
+        w.write(&dangling).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(dangling_target.exists());
+        assert!(
+            sparkles_owl::owx::parse(&std::fs::read_to_string(&dangling_target).unwrap()).is_ok()
+        );
+
+        // 5. Overwriting a read-only regular file (0o444) succeeds (mode applied after
+        // serialization) and preserves 0o444.
+        let readonly = d.path().join("readonly.owx");
+        std::fs::write(&readonly, "old").unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o444)).unwrap();
+        w.write(&readonly).unwrap();
+        assert_eq!(
+            std::fs::metadata(&readonly).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert!(sparkles_owl::owx::parse(&std::fs::read_to_string(&readonly).unwrap()).is_ok());
+
+        // 6. Cyclic symlink loops (self-loop and mutual loop) fail and preserve the links.
+        let self_loop = d.path().join("self_loop.owx");
+        std::os::unix::fs::symlink(&self_loop, &self_loop).unwrap();
+        assert!(w.write(&self_loop).is_err());
+        assert!(
+            std::fs::symlink_metadata(&self_loop)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(&self_loop).unwrap(), self_loop);
+
+        let loop_a = d.path().join("loop_a.owx");
+        let loop_b = d.path().join("loop_b.owx");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        assert!(w.write(&loop_a).is_err());
+        assert!(
+            std::fs::symlink_metadata(&loop_a)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(&loop_a).unwrap(), loop_b);
+
+        // 7. Non-regular destinations (directory, FIFO directly, symlink to FIFO) are refused
+        // before staging and remain untouched.
+        let dir_dest = d.path().join("dir.owx");
+        std::fs::create_dir(&dir_dest).unwrap();
+        assert!(w.write(&dir_dest).is_err());
+        assert!(dir_dest.is_dir());
+
+        let fifo = d.path().join("pipe.owx");
+        let mkfifo_status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(mkfifo_status.success());
+        let fifo_link = d.path().join("pipe_link.owx");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+        assert!(w.write(&fifo).is_err());
+        assert!(w.write(&fifo_link).is_err());
+        assert!(
+            !std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert!(
+            std::fs::symlink_metadata(&fifo_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // 8. No staging directories are left behind in `d`.
+        let leftover: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".sparkles-owl-stage-")
+            })
+            .collect();
+        assert!(leftover.is_empty(), "leftover staging dirs: {leftover:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_staging_private_dir_and_fresh_mode_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_ENV: &str = "SPARKLES_TEST_STAGE_UMASK_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let output = std::process::Command::new("sh")
+                .args(["-c", "umask 002 && exec \"$@\"", "--"])
+                .arg(&exe)
+                .args([
+                    "--exact",
+                    "handles::ontology::transform::tests::atomic_staging_private_dir_and_fresh_mode_under_permissive_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "permissive-umask child failed ({:?}):\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let d = tempfile::tempdir().unwrap();
+
+        // Confirm the child process actually runs under permissive umask 002 (default
+        // tempfile::Builder tempdir inherits 0o777 & !0o002 == 0o775), so a runner
+        // umask of 077 cannot mask a regression.
+        let default_dir = tempfile::Builder::new().tempdir_in(d.path()).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(default_dir.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775,
+            "expected permissive umask 002 in child process"
+        );
+        drop(default_dir);
+
+        // Staging directory must still be strictly private (0o700) under umask 002.
+        let stage_dir = create_private_stage_dir(d.path()).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(stage_dir.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "staging directory must be mode 0o700 even under permissive umask"
+        );
+
+        // Fresh staged file takes 0o666 & !0o002 == 0o664 inside the 0o700 directory;
+        // existing-file staged file stays private 0o600 before serialization finishes.
+        let fresh_tmp = create_staged_file(stage_dir.path(), false).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(fresh_tmp.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o664
+        );
+        let existing_tmp = create_staged_file(stage_dir.path(), true).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(existing_tmp.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(fresh_tmp);
+        drop(existing_tmp);
+        drop(stage_dir);
+
+        // End-to-end fresh write publishes with umask-masked mode 0o664.
+        let input = d.path().join("in.ofn");
+        std::fs::write(&input, ONTO).unwrap();
+        let w = read(&input);
+        let fresh_out = d.path().join("fresh.owx");
+        w.write(&fresh_out).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(&fresh_out)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o664
+        );
+
+        // Serialization failure preserves existing destination and leaves no stage dir.
+        let bad_target = d.path().join("keep.owx");
+        std::fs::write(&bad_target, "SENTINEL").unwrap();
+        let bad_ax = Axiom::new(AxiomKind::AnnotationAssertion(
+            sparkles_owl::AnnotationProperty::new(sparkles_owl::vocab::RDFS_LABEL),
+            sparkles_owl::AnnotationSubject::Iri(
+                sparkles_owl::Iri::new("http://ex.org/A").unwrap(),
+            ),
+            sparkles_owl::AnnotationValue::Literal(sparkles_owl::Literal::simple("bad\0nul")),
+        ));
+        let err = write_axioms_reported(
+            &bad_target,
+            OutputFormat::OwlXml,
+            false,
+            &BTreeMap::new(),
+            &sparkles_owl::Header::default(),
+            [&bad_ax],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("U+0000"), "{err}");
+        assert_eq!(std::fs::read_to_string(&bad_target).unwrap(), "SENTINEL");
+
+        let leftover: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".sparkles-owl-stage-")
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "leftover staging dirs after serialization error: {leftover:?}"
+        );
     }
 }

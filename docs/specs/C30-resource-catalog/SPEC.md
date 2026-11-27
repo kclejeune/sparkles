@@ -1,6 +1,6 @@
 # C30: Resource catalog
 
-> **Status:** partially implemented (Phase 1).
+> **Status:** implemented in part (Phase 1).
 >
 > **Roadmap:** [item 458](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered

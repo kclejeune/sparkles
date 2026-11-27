@@ -6,7 +6,7 @@ import type {
   UpdateOptions,
   CommitReceipt,
 } from '@sparkles-rdf/common';
-import { QueryTimeoutError, decodeTerm, unsigned } from '@sparkles-rdf/common';
+import { InvalidInputError, QueryTimeoutError, decodeTerm, unsigned } from '@sparkles-rdf/common';
 export type Configuration = Record<string, unknown>;
 export interface CommitInfo {
   seq: bigint;
@@ -618,6 +618,7 @@ export interface ClassificationOutcome {
   consistency: 'consistent' | 'inconsistent' | 'unknown';
   excludedCount: number;
   incompleteCount: number;
+  unmappedCount: number;
 }
 export type ClassificationSourceRow =
   | { kind: 'requestedGraph'; ordinal: number; graph: string }
@@ -675,6 +676,7 @@ export interface OntologyFrameClassification {
     result: ClassificationResult;
     outcome: ClassificationOutcome;
     unsatisfiable: boolean;
+    incomplete: boolean;
     parents: {
       total: number;
       limit: number;
@@ -693,18 +695,30 @@ export interface OntologyClassification extends OntologyState {
   resultId: string;
   /** false only when the ontology is proved inconsistent; see `consistency` */
   consistent: boolean;
-  /** whether the ontology has a model as far as the run knows: only a partial answer is `unknown` */
+  /**
+   * whether the ontology has a model as far as the run knows: `unknown` for a partial
+   * answer that did not decide it, or when a left-out axiom could make it inconsistent
+   */
   consistency: 'consistent' | 'inconsistent' | 'unknown';
   /**
-   * false when an axiom is left out or used in part, or the answer is partial, so that
-   * entailments may be missing
+   * whether the answer is complete for the whole ontology: false when an axiom is left
+   * out or used in part, or the answer is partial, so that entailments may be missing
    */
   complete: boolean;
+  /**
+   * whether the answer is complete for the axioms the run took, as a profile reasoner
+   * such as ELK reports it: false only for a partial answer
+   */
+  completeForTaken: boolean;
   /** true for the partial answer of a run that its deadline, cancellation or memory budget stopped */
   partial: boolean;
   /** the rules the ontology's axioms need */
   tier: 'el' | 'horn' | 'disjunctive';
-  /** the classes whose superclasses a partial answer may miss */
+  /**
+   * the classes whose superclasses, equivalent classes or satisfiability the answer may
+   * miss: those a partial answer left open and those whose bottom-locality module holds
+   * a left-out axiom
+   */
   incompleteCount: number;
   /** those classes, the first `limit`, in IRI order */
   incomplete: string[];
@@ -716,12 +730,21 @@ export interface OntologyClassification extends OntologyState {
   unsatisfiable: string[];
   excludedCount: number;
   excluded: OntologyExcluded[];
+  /**
+   * the first 100 triples of the input that map to no axiom, as N-Triples terms, which
+   * leave the answer incomplete; `stats.unmapped` counts them all (the OWL API calls
+   * such triples unparsed)
+   */
+  unmappedTriples: { subject: string; predicate: string; object: string }[];
+  /** whether `stats.unmapped` counts more triples than `unmappedTriples` lists */
+  unmappedTruncated: boolean;
   stats: Configuration;
   nodes?: OntologyTaxonomyNode[];
   next?: number;
   class?: OntologyTaxonomyNode & {
     iri: string;
     unsatisfiable: boolean;
+    incomplete: boolean;
     childClasses: string[];
     superClasses: string[];
   };
@@ -759,6 +782,8 @@ export interface DlQueryAnswer extends OntologyState {
     engine: 'el' | 'rl';
     title: string;
     why: string;
+    /** whether the classifier ran in EL-only (ELK) mode; always populated by the current engine */
+    elOnly?: boolean;
     complete: boolean;
     instancesComplete: boolean | null;
     gapCount: number;
@@ -777,6 +802,235 @@ export interface DlQueryAnswer extends OntologyState {
   directSubclasses?: string[];
   instances?: string[];
 }
+/** Evidence settings status and currently protected or detached role graphs (spec C25). */
+export interface EvidenceSettingsStatus {
+  settings: Configuration;
+  digest: string | null;
+  revision: bigint;
+  managed: string[];
+  detached: string[];
+}
+/** One commit named by a durable evidence source hold. */
+export interface EvidenceHoldCommit {
+  branch: string | null;
+  branchId: string;
+  commit: bigint;
+}
+/** A durable evidence source hold. */
+export interface EvidenceHold {
+  id: string;
+  owner: string;
+  created: string;
+  commits: EvidenceHoldCommit[];
+}
+/** A page of evidence source holds. */
+export interface EvidenceHoldsPage {
+  holds: EvidenceHold[];
+  next: string | null;
+  heldCommits: number;
+  maxCommits: number;
+}
+/** The result of acquiring a durable evidence source hold. */
+export interface EvidenceHoldAcquired {
+  created: boolean;
+  hold: EvidenceHold;
+}
+/** Common options for evidence operations targeting a branch and principal. */
+export type EvidenceWriteOptions = OperationOptions & {
+  branch?: string;
+  principal?: string;
+  author?: string;
+};
+/** Options for read-only evidence operations targeting an optional branch. */
+export type EvidenceReadOptions = OperationOptions & {
+  branch?: string;
+};
+/** Dry-run preview summary of an evidence write operation. */
+export interface EvidenceDryRun {
+  wouldCommit: boolean;
+  inserted: bigint;
+  deleted: bigint;
+  error: string | null;
+}
+/** One record created or matched by an evidence proposal. */
+export interface EvidenceProposedRecord {
+  key: string;
+  kind: string;
+  iri: string;
+  graph: string;
+  recordDigest: string;
+  existing: boolean;
+}
+/** Outcome of proposing claims and evidence records. */
+export interface EvidenceProposeResult {
+  operation: string;
+  committed: boolean;
+  replayed: boolean;
+  commit: bigint;
+  branchId: string;
+  firstAvailableAt: string | null;
+  hold: string | null;
+  records: EvidenceProposedRecord[];
+  dryRun?: EvidenceDryRun;
+}
+/** A triple added to or removed from an evidence projection graph. */
+export interface EvidenceProjectionChange {
+  output: string;
+  triple: string;
+}
+/** A new revision of a matching policy's resolution map. */
+export interface EvidenceMapChange {
+  policy: string;
+  revision: string;
+  number: bigint;
+  previous: string | null;
+  decisionsAdded: string[];
+  decisionsEnded: string[];
+  entities: string[];
+}
+/** Supports, projected triples and map revisions changed by a review or withdrawal. */
+export interface EvidenceChanged {
+  supportsAdded: string[];
+  supportsEnded: string[];
+  inserted: EvidenceProjectionChange[];
+  removed: EvidenceProjectionChange[];
+  map?: EvidenceMapChange;
+}
+/** One recorded review decision. */
+export interface EvidenceDecisionResult {
+  key: string;
+  iri: string;
+  target: string;
+  disposition: string;
+  supersedes: string | null;
+  support: string | null;
+  notProjected: string | null;
+  conflicts: string[];
+}
+/** Outcome of reviewing claims or identity proposals under a policy. */
+export interface EvidenceReviewResult {
+  operation: string;
+  committed: boolean;
+  replayed: boolean;
+  commit: bigint;
+  branchId: string;
+  decisions: EvidenceDecisionResult[];
+  changed: EvidenceChanged;
+  mapRevision: string | null;
+  dryRun?: EvidenceDryRun;
+}
+/** One recorded claim withdrawal. */
+export interface EvidenceWithdrawalResult {
+  key: string;
+  iri: string | null;
+  target: string;
+  existing: boolean;
+}
+/** Outcome of withdrawing claim occurrences. */
+export interface EvidenceWithdrawResult {
+  operation: string;
+  committed: boolean;
+  replayed: boolean;
+  commit: bigint;
+  branchId: string;
+  withdrawals: EvidenceWithdrawalResult[];
+  changed: EvidenceChanged;
+  dryRun?: EvidenceDryRun;
+}
+/** A verified stored-fact reference. */
+export interface EvidenceResolvedStoredFact {
+  key: string;
+  storedFact: {
+    datasetId: string;
+    branchId: string;
+    commit: bigint;
+    servedBy: string;
+    graph: string | null;
+    reifier: string | null;
+  };
+}
+/** Verified character span of a resolved passage record. */
+export interface EvidenceResolvedSpan {
+  rendition: string;
+  start: bigint;
+  end: bigint;
+  textDigest: string;
+}
+/** A verified authenticated evidence record reference. */
+export interface EvidenceResolvedRecord {
+  key: string;
+  record: {
+    iri: string;
+    kind: string;
+    graph: string;
+    receipt: {
+      iri: string;
+      datasetId: string;
+      branchId: string;
+      commit: bigint;
+    };
+    contentDigest: string | null;
+    recordDigest: string | null;
+    span: EvidenceResolvedSpan | null;
+  };
+}
+/** One resolved reference returned by `evidence.resolve`. */
+export type EvidenceResolvedReference = EvidenceResolvedStoredFact | EvidenceResolvedRecord;
+/** Outcome of resolving stored-fact and record references. */
+export interface EvidenceResolveResult {
+  resolved: EvidenceResolvedReference[];
+}
+/** Review state, current decision and origin of one claim occurrence. */
+export interface EvidenceClaimOccurrence {
+  claim: string;
+  graph: string;
+  state: 'accepted' | 'rejected' | 'needs-evidence' | 'unreviewed' | 'withdrawn';
+  decision: string | null;
+  decisionVersion: number | null;
+  kind: 'reported' | 'observation' | 'hypothesis' | 'preference';
+  polarity: 'positive' | 'negative' | 'uncertain';
+  proposition: string;
+  revision: string | null;
+  source: string | null;
+  by: string | null;
+  origin: 'instructions' | 'source';
+}
+/** Outcome of reading claim states under a review policy. */
+export interface EvidenceClaimStatesResult {
+  policy: string;
+  commit: bigint;
+  claims: (EvidenceClaimOccurrence | null)[];
+}
+/** Resolution of one entity through a matching policy's resolution map. */
+export interface EvidenceResolvedEntity {
+  entity: string;
+  representative: string;
+  members: string[];
+  membersComplete: boolean;
+  decisions: string[];
+}
+/** Outcome of resolving entities under a matching policy. */
+export interface EvidenceEntitiesResult {
+  policy: string;
+  revision: string | null;
+  number: bigint;
+  commit: bigint;
+  entities: EvidenceResolvedEntity[];
+}
+/** One authenticated assessment depending on a changed record. */
+export interface EvidenceDependent {
+  assessment: string;
+  graph: string;
+  on: string;
+  dependence: 'target' | 'used';
+  depth: number;
+}
+/** Outcome of finding dependent assessments. */
+export interface EvidenceDependentsResult {
+  commit: bigint;
+  dependents: EvidenceDependent[];
+}
+
 export class Administration {
   readonly snapshots;
   readonly history;
@@ -791,6 +1045,7 @@ export class Administration {
   readonly indexes;
   readonly reasoning;
   readonly validation;
+  readonly evidence;
   constructor(
     private call: AdminCall,
     getBranch: (name: string) => Promise<Dataset>,
@@ -966,6 +1221,7 @@ export class Administration {
             offset?: number;
             limit?: number;
             lang?: string | string[];
+            elOnly?: boolean;
           } = {},
       ) => {
         if ((o as OntologyRead).inferences)
@@ -981,6 +1237,7 @@ export class Administration {
             offset: o.offset,
             limit: o.limit,
             lang: o.lang,
+            elOnly: o.elOnly,
           },
           o,
           false,
@@ -1253,15 +1510,17 @@ export class Administration {
        * Classify by OWL 2 EL (spec F24): consistency, the unsatisfiable classes, the axioms
        * left out or used in part, one class (`about`) and the taxonomy's nodes (`nodes`,
        * `limit` from `offset`). `target` writes the taxonomy to that named graph in one commit.
-       * `partial` answers what a run with the disjunctive rules proved when its deadline or
-       * cancellation stops it, with `partial` true, the `incomplete` classes and the
-       * `consistency`.
+       * `partial` answers what a classification run at any tier (EL, Horn, or disjunctive)
+       * proved when its deadline or cancellation stops it after saturation begins, with
+       * `partial` true, the `incomplete` classes and the `consistency`.
        */
       classify: <P extends 'frame' | undefined = undefined>(
         o: OntologySelection &
           UpdateOptions & {
             at?: string | number | bigint;
             assertions?: boolean;
+            /** classify by the OWL 2 EL rules alone, as ELK does */
+            elOnly?: boolean;
             about?: string;
             nodes?: boolean;
             limit?: number;
@@ -1269,8 +1528,13 @@ export class Administration {
             threads?: number;
             target?: OntologyGraph;
             message?: string;
-            /** answer what a run with the disjunctive rules proved when `timeout` or `signal` stops it */
+            /** answer what a classification run at any tier proved when `timeout` or `signal` stops it */
             partial?: boolean;
+            /**
+             * refuse with `UnsupportedError`, whose `details.code` is
+             * `classification-incomplete`, when the classifier would leave an axiom out
+             */
+            strict?: boolean;
             /** the expansion strategy of the disjunctive rules */
             expansion?: 'cautious' | 'eager';
             projection?: P;
@@ -1285,6 +1549,7 @@ export class Administration {
             mode: o.mode,
             at: o.at === undefined || typeof o.at === 'string' ? o.at : unsigned(o.at),
             assertions: o.assertions,
+            elOnly: o.elOnly,
             about: o.about,
             nodes: o.nodes,
             limit: o.limit,
@@ -1293,6 +1558,7 @@ export class Administration {
             target: o.target,
             message: o.message,
             partial: o.partial,
+            strict: o.strict,
             expansion: o.expansion,
             projection: o.projection,
             lang: o.lang,
@@ -1326,6 +1592,8 @@ export class Administration {
           OperationOptions & {
             syntax?: 'manchester' | 'functional';
             reasoning?: 'auto' | 'el' | 'rl';
+            /** classify by the OWL 2 EL rules alone, as ELK does */
+            elOnly?: boolean;
             answers?: DlAnswer[];
             limit?: number;
             threads?: number;
@@ -1341,6 +1609,7 @@ export class Administration {
             expression,
             syntax: o.syntax,
             reasoning: o.reasoning,
+            elOnly: o.elOnly,
             answers: o.answers,
             limit: o.limit,
             threads: o.threads,
@@ -1719,6 +1988,139 @@ export class Administration {
         reset: (o?: UpdateOptions) => call<void>('validation.guard.reset', {}, o, true),
       },
     };
+    const evidenceOpts = (o?: OperationOptions): OperationOptions | undefined =>
+      o ? { signal: o.signal, timeout: o.timeout } : undefined;
+    const evidenceWriteOpts = (o?: OperationOptions): OperationOptions =>
+      ({ ...(evidenceOpts(o) ?? {}), answersWhenStopped: true }) as OperationOptions;
+    this.evidence = {
+      settings: () => call<EvidenceSettingsStatus>('evidence.settings', {}, undefined, false),
+      configure: (settings: Configuration | string, o?: OperationOptions) =>
+        call<EvidenceSettingsStatus>(
+          'evidence.configure',
+          (typeof settings === 'string'
+            ? settings
+            : settings === undefined
+              ? 'null'
+              : settings) as unknown as Configuration,
+          evidenceWriteOpts(o),
+          true,
+        ),
+      detach: (graph: string) =>
+        call<EvidenceSettingsStatus>('evidence.detach', { graph }, undefined, true),
+      holds: async (options: { onBranch?: string; after?: string; limit?: number } = {}) =>
+        call<EvidenceHoldsPage>(
+          'evidence.holds',
+          {
+            onBranch: options.onBranch,
+            after: options.after,
+            limit: options.limit === undefined ? undefined : evU32(options.limit, 'limit'),
+          },
+          undefined,
+          false,
+        ),
+      acquireHold: async (
+        commits: { commit: number | bigint; branch?: string; branchId?: string }[],
+        options: { id?: string } = {},
+      ) =>
+        call<EvidenceHoldAcquired>(
+          'evidence.acquireHold',
+          {
+            ...(options.id !== undefined ? { id: options.id } : {}),
+            commits: validateHoldCommits(commits),
+          },
+          undefined,
+          true,
+        ),
+      releaseHold: (id: string) => call<boolean>('evidence.releaseHold', { id }, undefined, true),
+      resolve: async (
+        references: Configuration[] | Configuration,
+        options: EvidenceReadOptions = {},
+      ) =>
+        call<EvidenceResolveResult>(
+          'evidence.resolve',
+          {
+            branch: options.branch,
+            request: validateResolveRequest(
+              Array.isArray(references) ? { references } : references,
+            ),
+          },
+          evidenceOpts(options),
+          false,
+        ),
+      propose: async (proposal: Configuration, options: EvidenceWriteOptions = {}) =>
+        call<EvidenceProposeResult>(
+          'evidence.propose',
+          {
+            branch: options.branch,
+            principal: options.principal,
+            author: options.author,
+            request: validateProposeRequest(proposal),
+          },
+          evidenceWriteOpts(options),
+          true,
+        ),
+      review: async (review: Configuration, options: EvidenceWriteOptions = {}) =>
+        call<EvidenceReviewResult>(
+          'evidence.review',
+          {
+            branch: options.branch,
+            principal: options.principal,
+            author: options.author,
+            request: validateReviewRequest(review),
+          },
+          evidenceWriteOpts(options),
+          true,
+        ),
+      withdraw: async (withdrawal: Configuration, options: EvidenceWriteOptions = {}) =>
+        call<EvidenceWithdrawResult>(
+          'evidence.withdraw',
+          {
+            branch: options.branch,
+            principal: options.principal,
+            author: options.author,
+            request: validateWithdrawRequest(withdrawal),
+          },
+          evidenceWriteOpts(options),
+          true,
+        ),
+      claimStates: async (
+        policy: string,
+        claims: string[],
+        options: EvidenceReadOptions & { at?: string | number | bigint } = {},
+      ) =>
+        call<EvidenceClaimStatesResult>(
+          'evidence.claimStates',
+          {
+            branch: options.branch,
+            at: options.at === undefined ? undefined : evAt(options.at),
+            policy,
+            claims,
+          },
+          evidenceOpts(options),
+          false,
+        ),
+      resolveEntities: (policy: string, entities: string[], options: EvidenceReadOptions = {}) =>
+        call<EvidenceEntitiesResult>(
+          'evidence.resolveEntities',
+          { branch: options.branch, policy, entities },
+          evidenceOpts(options),
+          false,
+        ),
+      findDependents: (
+        changed: string[],
+        options: EvidenceReadOptions & { transitive?: boolean } = {},
+      ) =>
+        call<EvidenceDependentsResult>(
+          'evidence.findDependents',
+          {
+            branch: options.branch,
+            changed,
+            transitive: options.transitive ?? false,
+          },
+          evidenceOpts(options),
+          false,
+        ),
+    };
   }
 }
 // Native numeric strings avoid lossy JSON parsing. Convert only numeric schema fields,
@@ -1736,6 +2138,7 @@ const counts = new Set([
   'added',
   'removed',
   'commit',
+  'servedBy',
   'firstCommit',
   'classifiedCommit',
   'producerCommit',
@@ -1780,18 +2183,115 @@ const numbers = new Set([
   'version',
   'ifVersion',
 ]);
-export function adminResult(v: any, key = ''): any {
-  if (['definition', 'config', 'variables', 'data', 'default'].includes(key)) return v;
+const evidenceCounts = new Set([...counts, 'revision', 'number', 'start', 'end']);
+
+function evAt(value: unknown): string {
+  if (typeof value === 'string') return value;
+  return 'commit:' + evU64(value, 'at');
+}
+function evU64(value: unknown, name: string): string {
+  if (typeof value !== 'number' && typeof value !== 'bigint')
+    throw new InvalidInputError(`${name} must be a safe integer or bigint`);
+  return unsigned(value, name);
+}
+function evOptU64(value: unknown, name: string): string | undefined | null {
+  if (value === undefined || value === null) return value;
+  return evU64(value, name);
+}
+function evU32(value: unknown, name: string): number {
+  if (typeof value !== 'number' && typeof value !== 'bigint')
+    throw new InvalidInputError(`${name} must be a safe integer or bigint`);
+  const v = BigInt(unsigned(value, name));
+  if (v > 0xffffffffn) throw new InvalidInputError(`${name} is outside u32`);
+  return Number(v);
+}
+function validateStoredFact(sf: unknown, path: string): unknown {
+  if (!sf || typeof sf !== 'object' || Array.isArray(sf)) return sf;
+  const obj = sf as Configuration;
+  if (!('commit' in obj)) return sf;
+  return { ...obj, commit: evU64(obj.commit, `${path}.commit`) };
+}
+function validateHoldCommits(
+  commits: { commit: number | bigint; branch?: string; branchId?: string }[],
+): unknown {
+  if (!Array.isArray(commits)) return commits;
+  return commits.map((c, i) => {
+    if (!c || typeof c !== 'object' || !('commit' in c)) return c;
+    return { ...c, commit: evU64(c.commit, `commits[${i}].commit`) };
+  });
+}
+function validateResolveRequest(req: Configuration): Configuration {
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return req;
+  if (!Array.isArray(req.references)) return req;
+  return {
+    ...req,
+    references: req.references.map((r, i) => {
+      if (!r || typeof r !== 'object' || !('storedFact' in r)) return r;
+      const obj = r as Configuration;
+      return {
+        ...obj,
+        storedFact: validateStoredFact(obj.storedFact, `references[${i}].storedFact`),
+      };
+    }),
+  };
+}
+function validateProposeRequest(req: Configuration): Configuration {
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return req;
+  const out: Configuration = { ...req };
+  if ('ifHead' in out) out.ifHead = evOptU64(out.ifHead, 'ifHead');
+  if (Array.isArray(out.passages)) {
+    out.passages = out.passages.map((p, i) => {
+      if (!p || typeof p !== 'object' || Array.isArray(p)) return p;
+      const obj = { ...(p as Configuration) };
+      if ('start' in obj) obj.start = evU64(obj.start, `passages[${i}].start`);
+      if ('end' in obj) obj.end = evU64(obj.end, `passages[${i}].end`);
+      return obj;
+    });
+  }
+  if (Array.isArray(out.references)) {
+    out.references = out.references.map((r, i) => {
+      if (!r || typeof r !== 'object' || !('storedFact' in r)) return r;
+      const obj = r as Configuration;
+      return {
+        ...obj,
+        storedFact: validateStoredFact(obj.storedFact, `references[${i}].storedFact`),
+      };
+    });
+  }
+  return out;
+}
+function validateReviewRequest(req: Configuration): Configuration {
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return req;
+  const out: Configuration = { ...req };
+  if ('ifHead' in out) out.ifHead = evU64(out.ifHead, 'ifHead');
+  if ('policyVersion' in out) out.policyVersion = evU32(out.policyVersion, 'policyVersion');
+  return out;
+}
+function validateWithdrawRequest(req: Configuration): Configuration {
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return req;
+  const out: Configuration = { ...req };
+  if ('ifHead' in out) out.ifHead = evOptU64(out.ifHead, 'ifHead');
+  return out;
+}
+
+function decodeAdmin(v: any, key: string, countKeys: Set<string>): any {
+  if (['definition', 'config', 'variables', 'data', 'default', 'settings'].includes(key)) return v;
   if (typeof v === 'string' && /^\d+$/.test(v)) {
-    if (counts.has(key)) return BigInt(v);
+    if (countKeys.has(key)) return BigInt(v);
     if (numbers.has(key)) return Number(v);
   }
   if (Array.isArray(v) && key === 'reconstructable') return v.map((pair) => pair.map(BigInt));
-  if (Array.isArray(v)) return v.map((item) => adminResult(item, key));
+  if (Array.isArray(v)) return v.map((item) => decodeAdmin(item, key, countKeys));
   if (v && typeof v === 'object') {
     const out: Record<string, unknown> = {};
-    for (const [k, value] of Object.entries(v)) out[k] = adminResult(value, k);
+    for (const [k, value] of Object.entries(v)) out[k] = decodeAdmin(value, k, countKeys);
     return out;
   }
   return v;
+}
+export function adminResult(v: any, key = ''): any {
+  return decodeAdmin(v, key, counts);
+}
+export function evidenceResult(v: any, key = ''): any {
+  return decodeAdmin(v, key, evidenceCounts);
 }

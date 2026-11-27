@@ -223,12 +223,11 @@ const FIXTURES: &[(&str, &str, &str, bool)] = &[
         "Limit",
         true,
     ),
-    // item 1189: a path search under a cursor runs as a materialized fallback
     (
         "path search",
         "PREFIX path: <urn:x-sparkles:path#> SELECT ?b ?p { SERVICE path:search { [] path:source <urn:c:0> ; path:target ?b ; path:predicate <urn:n> ; path:algorithm path:all ; path:maxLength 3000 ; path:pathIndex ?p } }",
         "PathSearch",
-        false,
+        true,
     ),
 ];
 
@@ -345,22 +344,28 @@ fn allowance(name: &str) -> Allowance {
             under: 52 * K,
             ..exact
         },
-        // item 1189: a path search under a cursor holds its search outside its ledger
-        "path search" => Allowance {
-            under: 360 * K,
-            ..exact
-        },
-        // item 1190: the change log's reader holds what it decodes outside its ledger
+        // items 1190 and 1192: the streamed change-log reader stays within its ledger
+        // except for small uncharged scratch, and overcharges per-change quad_bytes
+        // that count term Arcs shared with the record (bounded per page)
         "history" => Allowance {
-            under: 430 * K,
-            over: 72 * K,
+            under: 16 * K,
+            over: 260 * K,
             ..exact
         },
-        // item 1191: the text reader holds its index searcher's state outside its ledger
+        // items 1191 and 1192: the streamed text reader stays within its ledger except
+        // for small Tantivy searcher scratch, and overcharges its page estimate
+        // min(hits, 4096) * 192 bytes in text::Reader::open. Because enable_text builds
+        // with available_parallelism().min(8) Tantivy writer threads and hit_terms
+        // decodes one segment at a time, multi-segment builds hold a smaller peak heap
+        // than a single-segment build against the same 958,497-byte (959 kB) ledger peak.
+        // Measured granted-run heap peaks range from 313 kB (4-vCPU CI) to 407 kB
+        // (406,344 bytes on 1 segment), all rounded upward in decimal kB, while 8 balanced
+        // segments are estimated around 290 kB; 640 KiB (655,360 bytes) covers peaks down
+        // to 243 kB under the five-quarters check.
         "text" => Allowance {
-            under: 470 * K,
-            over: 72 * K,
-            ..exact
+            under: 24 * K,
+            over: 880 * K,
+            peak: 640 * K,
         },
         // item 1193: the external sort holds its pieces' sorts outside its ledger inside a
         // pull and charges its merge a formula above what it holds, and its runs are
@@ -394,6 +399,13 @@ fn allowance(name: &str) -> Allowance {
         // item 1194: DISTINCT's passes hold their spill frames outside its ledger
         "distinct spilled" => Allowance {
             under: 64 * K,
+            ..exact
+        },
+        // item 1184: a rebuilt SELECT view streams through a child cursor whose in-memory
+        // leaf scan charges for blocks the in-memory store never allocates
+        "view rebuilt" => Allowance {
+            over: 256 * K,
+            peak: 256 * K,
             ..exact
         },
         _ => exact,
@@ -695,6 +707,147 @@ fn the_text_reader_holds_its_ledger_and_no_more() {
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
 
+/// The view reader (item 1121), over current, stale, history-rewound and rebuilt reads.
+#[test]
+fn the_view_reader_holds_its_ledger_and_no_more() {
+    use sparkles_core::incr::{OpenHost, Runtime, RuntimeOptions, ViewDef};
+    use sparkles_core::sparql::FallbackPolicy;
+
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..2000 {
+        data.push_str(&format!("<urn:s:{i}> <urn:p> \"val-{i}\" .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    rt.set_host(Arc::new(OpenHost));
+    rt.put(
+        &s,
+        "items",
+        ViewDef::table("SELECT ?s ?o WHERE { ?s <urn:p> ?o }"),
+    )
+    .unwrap();
+    rt.round(&s);
+    let snap_base = s.snapshot();
+
+    let run_view = |snap: &Arc<sparkles_core::store::Snapshot>,
+                    q: &str,
+                    granted: bool,
+                    batch: usize|
+     -> Audit {
+        heap::audit(|| {
+            let pool = QueryPool::new(1 << 40);
+            let opts = QueryOptions {
+                no_cache: true,
+                max_memory_bytes: Some(256 << 20),
+                grant: granted.then(|| Arc::new(pool.try_grant(0).unwrap())),
+                views: Some(rt.clone()),
+                ..Default::default()
+            };
+            let cursor = CursorOptions {
+                batch_rows: batch,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            };
+            select_cursor(snap.clone(), q, &opts, &cursor).unwrap()
+        })
+    };
+
+    let q_cur = "PREFIX view: <urn:x-sparkles:view#> SELECT ?s ?o ?c { SERVICE view:read { [] view:name \"items\" ; view:bind ?s, ?o ; view:commit ?c } }";
+    let q_stale = "PREFIX view: <urn:x-sparkles:view#> SELECT ?s ?o ?c { SERVICE view:read { [] view:name \"items\" ; view:bind ?s, ?o ; view:commit ?c ; view:allowStale true } }";
+
+    let mut found = Vec::new();
+    // 1) Current shared read.
+    for granted in [false, true] {
+        for batch in [64, 4096] {
+            let mut a = run_view(&snap_base, q_cur, granted, batch);
+            for _ in 0..2 {
+                a = run_view(&snap_base, q_cur, granted, batch);
+            }
+            print(
+                "view current",
+                &format!("{}/{batch}", if granted { "granted" } else { "local" }),
+                &a,
+            );
+            assert_eq!(a.rows, 2000);
+            found.extend(a.check("view current", &allowance("view")));
+        }
+    }
+    // 2) History rewind read (view ahead within history).
+    let mut del = String::from("DELETE DATA { ");
+    for i in 0..200 {
+        del.push_str(&format!("<urn:s:{i}> <urn:p> \"val-{i}\" . "));
+    }
+    del.push('}');
+    update(&s, &del, &QueryOptions::default()).unwrap();
+    rt.round(&s);
+    // Stale read ahead of snap_base before introducing new terms.
+    for granted in [false, true] {
+        let mut a = run_view(&snap_base, q_stale, granted, 256);
+        for _ in 0..2 {
+            a = run_view(&snap_base, q_stale, granted, 256);
+        }
+        print("view stale", if granted { "granted" } else { "local" }, &a);
+        assert_eq!(a.rows, 1800);
+        found.extend(a.check("view stale", &allowance("view")));
+    }
+    let snap_before_add = s.snapshot();
+    let mut add = String::from("INSERT DATA { ");
+    for i in 0..200 {
+        add.push_str(&format!(
+            "<urn:added:{i}> <urn:p> \"{}-{i}\" . ",
+            "added".repeat(20)
+        ));
+    }
+    add.push('}');
+    update(&s, &add, &QueryOptions::default()).unwrap();
+    rt.round(&s);
+    for (label, snap, rows) in [
+        ("view history (mixed)", &snap_base, 2000),
+        ("view history (inserts)", &snap_before_add, 1800),
+    ] {
+        for granted in [false, true] {
+            let mut a = run_view(snap, q_cur, granted, 256);
+            for _ in 0..2 {
+                a = run_view(snap, q_cur, granted, 256);
+            }
+            print(label, if granted { "granted" } else { "local" }, &a);
+            assert_eq!(a.rows, rows);
+            found.extend(a.check(label, &allowance("view")));
+        }
+    }
+    // 4) Rebuilt read (history expired > 16 commits).
+    for i in 0..18 {
+        update(
+            &s,
+            &format!("INSERT DATA {{ <urn:e:{i}> <urn:p> \"e-{i}\" }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        rt.round(&s);
+    }
+    for granted in [false, true] {
+        let mut a = run_view(&snap_base, q_cur, granted, 256);
+        for _ in 0..2 {
+            a = run_view(&snap_base, q_cur, granted, 256);
+        }
+        print(
+            "view rebuilt",
+            if granted { "granted" } else { "local" },
+            &a,
+        );
+        assert_eq!(a.rows, 2000);
+        found.extend(a.check("view rebuilt", &allowance("view rebuilt")));
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
 /// The meter reads what the counted thread allocates and holds, whatever is freed or
 /// allocated around it.
 #[test]
@@ -975,4 +1128,475 @@ fn meter_race(site: usize) -> bool {
     heap::HOOK.store(0, Ordering::SeqCst);
     other.join().unwrap();
     moved
+}
+
+#[test]
+fn native_backward_search_admits_a_wide_filtered_frontier() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("<urn:root> <urn:p> <urn:mid:00000> .\n");
+    for i in 0..4096 {
+        data.push_str(&format!("<urn:mid:{i:05}> <urn:p> <urn:target> .\n"));
+    }
+    data.push_str("<urn:mid:04095> <urn:p> <urn:dead:1>, <urn:dead:2>, <urn:dead:3> .\n");
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = "PREFIX path: <urn:x-sparkles:path#> SELECT ?i { SERVICE path:search { [] path:source <urn:root> ; path:target <urn:target> ; path:predicate <urn:p> ; path:algorithm path:all ; path:maxLength 2 ; path:maxDegree 2 ; path:pathIndex ?i } }";
+    let _ = run(&s, q, false, 1);
+    let audit = run(&s, q, false, 1);
+    assert_eq!(audit.rows, 1);
+    target(&audit.plan, "PathSearch", true).unwrap();
+    let failures = audit.check("backward path frontier", &Allowance::EXACT);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn native_vector_order_admits_exact_partitions() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let data = (0..16_400)
+        .map(|i| format!("<urn:s:{i}> <urn:v> \"[1,0,0]\"^^<urn:x-sparkles:vector> .\n"))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = "PREFIX spk: <urn:x-sparkles:> SELECT ?s { ?s <urn:v> ?v } ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 2";
+    // Keep the value cache reservation step smaller than the audit tolerance.
+    let _ = run_under(&s, q, false, 1, 512 << 10, None);
+    let audit = run_under(&s, q, false, 1, 512 << 10, None);
+    assert_eq!(audit.rows, 2);
+    target(&audit.plan, "VectorSearch", true).unwrap();
+    let plan = serde_json::from_str(&audit.plan).unwrap();
+    assert!(nodes(&plan).into_iter().any(|node| {
+        node["operator"]["operator"] == "VectorSearch"
+            && node["operator"]["counters"]["method"] == "exact"
+            && node["operator"]["counters"]["scored"] == 16_400
+    }));
+    let failures = audit.check("exact VectorOrder", &Allowance::EXACT);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "geo")]
+#[test]
+fn native_constant_relation_keeps_its_input_charged_until_the_first_witness() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+    for i in 0..1000 {
+        data.push_str(&format!(
+            "<urn:a> geo:hasDefaultGeometry <urn:g:{i}> .\n<urn:g:{i}> geo:asWKT \"POLYGON((0 0, {} 0, {} 10, 0 10, 0 0))\"^^geo:wktLiteral .\n\
+             <urn:b> geo:asWKT \"POINT(1.{i:04} 1)\"^^geo:wktLiteral .\n",
+            i + 3, i + 3
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.enable_geo(sparkles_core::geo::GeoConfig {
+        query_rewrite: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> SELECT * { <urn:a> geo:sfIntersects <urn:b> } LIMIT 1";
+    // Tighten the ordinary cache reservation steps for this small result.
+    let _ = run_under(&s, q, false, 1, 512 << 10, None);
+    let audit = run_under(&s, q, false, 1, 512 << 10, None);
+    assert_eq!(audit.rows, 1);
+    target(&audit.plan, "SpatialRelate", true).unwrap();
+    let failures = audit.check("both-constant SpatialRelate", &Allowance::EXACT);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "geo")]
+#[test]
+fn native_constant_basic_geo_keeps_longitude_scratch_bounded() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from(
+        "@prefix wgs: <http://www.w3.org/2003/01/geo/wgs84_pos#> .\n<urn:point> wgs:lat 1 .\n",
+    );
+    for i in 0..6000 {
+        data.push_str(&format!("<urn:point> wgs:long 1.{i:04} .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.enable_geo(sparkles_core::geo::GeoConfig {
+        wgs84: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = "PREFIX spatial: <http://jena.apache.org/spatial#> SELECT * { <urn:point> spatial:withinBox(0 0 10 10) }";
+    let _ = run_under(&s, q, false, 1, 512 << 10, None);
+    let audit = run_under(&s, q, false, 1, 512 << 10, None);
+    assert_eq!(audit.rows, 1);
+    target(&audit.plan, "SpatialPf", true).unwrap();
+    let failures = audit.check("constant-subject Basic Geo", &Allowance::EXACT);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "geo")]
+#[test]
+fn native_one_constant_relation_admits_lit_pass_memo() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+    for i in 0..4000 {
+        data.push_str(&format!(
+            "<urn:p:{i}> geo:asWKT \"POINT(5.{i:04} 5)\"^^geo:wktLiteral .\n"
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.enable_geo(sparkles_core::geo::GeoConfig {
+        query_rewrite: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> SELECT ?s { ?s geo:sfIntersects \"POLYGON((0 0, 10 0, 10 1, 1 1, 1 10, 0 10, 0 0))\"^^geo:wktLiteral }";
+    let _ = run_under(&s, q, false, 1, 512 << 10, None);
+    let audit = run_under(&s, q, false, 1, 512 << 10, None);
+    assert_eq!(audit.rows, 0);
+    target(&audit.plan, "SpatialRelate", true).unwrap();
+    let failures = audit.check(
+        "one-constant SpatialRelate lit_pass memo",
+        &Allowance::EXACT,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "geo")]
+#[test]
+fn native_one_constant_relation_fallback_admits_key_chunk() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+    for i in 0..4096 {
+        data.push_str(&format!(
+            "<urn:p:{i}> geo:asWKT \"POINT(5.{:04} 5)\"^^geo:wktLiteral .\n",
+            i % 64
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    // `geo:sfDisjoint` is not index-usable, so SpatialRelate takes the `OneConstCand::Scan`
+    // fallback arm with a 4,096-key chunk pull while every point lies inside the query polygon.
+    s.enable_geo(sparkles_core::geo::GeoConfig {
+        query_rewrite: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> SELECT ?s { ?s geo:sfDisjoint \"POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))\"^^geo:wktLiteral }";
+    let _ = run_under(&s, q, false, 4096, 512 << 10, None);
+    let audit = run_under(&s, q, false, 4096, 512 << 10, None);
+    assert_eq!(audit.rows, 0);
+    target(&audit.plan, "SpatialRelate", true).unwrap();
+    let plan = serde_json::from_str(&audit.plan).unwrap();
+    assert!(nodes(&plan).into_iter().any(|node| {
+        node["operator"]["operator"] == "SpatialRelate"
+            && node["operator"]["counters"]["candidates"] == 4096
+            && node["operator"]["counters"]["treeNodesVisited"] == 0
+    }));
+    let failures = audit.check(
+        "one-constant SpatialRelate fallback scan",
+        &Allowance::EXACT,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Items 1122 & 1123: `path:allShortest`, shortest paths to a variable end, and
+/// unlimited path searches over a group input and/or nested edge pattern hold their
+/// ledger within `Allowance::EXACT`.
+#[test]
+fn native_path_search_1122_1123_forms_hold_exact_ledger() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    // A chain of 8 diamonds (256 tied shortest paths) plus a 1,500-node fan-out graph
+    // and weighted edges.
+    for i in 0..8 {
+        data.push_str(&format!(
+            "<urn:d:{i}> <urn:d> <urn:da:{i}> .\n\
+             <urn:d:{i}> <urn:d> <urn:db:{i}> .\n\
+             <urn:da:{i}> <urn:d> <urn:d:{}> .\n\
+             <urn:db:{i}> <urn:d> <urn:d:{}> .\n\
+             << <urn:d:{i}> <urn:d> <urn:da:{i}> >> <urn:w> 1.5 .\n\
+             << <urn:d:{i}> <urn:d> <urn:db:{i}> >> <urn:w> 1.5 .\n\
+             << <urn:da:{i}> <urn:d> <urn:d:{}> >> <urn:w> 1.0 .\n\
+             << <urn:db:{i}> <urn:d> <urn:d:{}> >> <urn:w> 1.0 .\n",
+            i + 1,
+            i + 1,
+            i + 1,
+            i + 1
+        ));
+    }
+    for i in 0..1500 {
+        data.push_str(&format!("<urn:n:{i}> <urn:k> {i} .\n"));
+        data.push_str(&format!(
+            "<urn:n:{i}> <urn:e> <urn:n:{}> .\n",
+            (i + 1) % 1500
+        ));
+        data.push_str(&format!(
+            "<urn:n:{i}> <urn:e> <urn:n:{}> .\n",
+            (i * 7 + 3) % 1500
+        ));
+    }
+    // Wide-weight fallback graph, hub graph for `path:maxDegree`, and a high-reifier edge.
+    data.push_str(
+        "<urn:w:0> <urn:we> <urn:w:1> . <urn:w:1> <urn:we> <urn:w:2> .\n\
+         <urn:w:0> <urn:we> <urn:w:3> . <urn:w:3> <urn:we> <urn:w:2> .\n\
+         << <urn:w:0> <urn:we> <urn:w:1> >> <urn:w> 1.0 .\n\
+         << <urn:w:1> <urn:we> <urn:w:2> >> <urn:w> 1e12 .\n\
+         << <urn:w:0> <urn:we> <urn:w:3> >> <urn:w> 1e12 .\n\
+         << <urn:w:3> <urn:we> <urn:w:2> >> <urn:w> 1.0 .\n\
+         <urn:h:0> <urn:he> <urn:hub> . <urn:h:0> <urn:he> <urn:alt> . <urn:alt> <urn:he> <urn:h:1> .\n",
+    );
+    for i in 1..=20 {
+        data.push_str(&format!("<urn:hub> <urn:he> <urn:h:{i}> .\n"));
+    }
+    data.push_str("<urn:mr:0> <urn:mre> <urn:mr:1> .\n");
+    for i in 0..2000 {
+        data.push_str(&format!(
+            "<< <urn:mr:0> <urn:mre> <urn:mr:1> ~ <urn:mrr:{i}> >> <urn:w> 2.0 .\n"
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+
+    const P: &str = "PREFIX path: <urn:x-sparkles:path#> ";
+    let cases = [
+        (
+            "allShortest const unweighted",
+            format!(
+                "{P}SELECT ?p ?i ?es ?eo {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo }} }}"
+            ),
+        ),
+        (
+            "allShortest const weighted",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "allShortest const weighted maxLength Yen",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:3> ; path:predicate <urn:d> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:maxLength 6 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "shortest const weighted maxLength",
+            format!(
+                "{P}SELECT ?i ?c {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:weight <urn:w> ; path:maxLength 16 ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "shortest variable target weighted maxLength",
+            format!(
+                "{P}SELECT ?t ?c ?l {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target ?t ; path:predicate <urn:d> ; path:weight <urn:w> ; path:maxLength 6 ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "shortest variable source weighted maxLength",
+            format!(
+                "{P}SELECT ?s ?c ?l {{ SERVICE path:search {{ [] path:source ?s ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:weight <urn:w> ; path:maxLength 6 ; path:cost ?c ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "kShortest const weighted maxLength",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:3> ; path:predicate <urn:d> ; path:algorithm path:kShortest ; path:k 6 ; path:weight <urn:w> ; path:maxLength 6 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "allShortest wide-weight fallback",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:w:0> ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "shortest const weighted maxLength wide-weight fallback",
+            format!(
+                "{P}SELECT ?i ?c {{ SERVICE path:search {{ [] path:source <urn:w:0> ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:weight <urn:w> ; path:maxLength 3 ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "allShortest const weighted maxLength wide-weight fallback",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:w:0> ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:maxLength 3 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "shortest variable source weighted maxLength wide-weight fallback",
+            format!(
+                "{P}SELECT ?s ?i ?c {{ SERVICE path:search {{ [] path:source ?s ; path:target <urn:w:2> ; path:predicate <urn:we> ; path:weight <urn:w> ; path:maxLength 3 ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "shortest variable target",
+            format!(
+                "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:n:0> ; path:target ?t ; path:predicate <urn:e> ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "shortest backward variable source",
+            format!(
+                "{P}SELECT ?s ?l {{ SERVICE path:search {{ [] path:source ?s ; path:target <urn:n:50> ; path:predicate <urn:e> ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "allShortest variable target with edge term",
+            format!(
+                "{P}SELECT ?t ?p ?i ?e ?l {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target ?t ; path:predicate <urn:d> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edge ?e ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "shortest over group no limit",
+            format!(
+                "{P}SELECT ?s ?l {{ ?s <urn:k> ?k FILTER(?k < 15) SERVICE path:search {{ [] path:source ?s ; path:target <urn:n:50> ; path:predicate <urn:e> ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "mixed bound and unbound targets in group",
+            format!(
+                "{P}SELECT ?s ?t ?l {{ VALUES (?s ?t) {{ (<urn:n:0> <urn:n:10>) (<urn:n:0> <urn:n:20>) (<urn:n:0> UNDEF) (<urn:n:1> <urn:n:30>) }} SERVICE path:search {{ [] path:source ?s ; path:target ?t ; path:predicate <urn:e> ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "shortest over edge pattern no limit",
+            format!(
+                "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:n:0> ; path:target ?t ; path:length ?l ; path:start ?x ; path:end ?y . ?x <urn:e> ?y }} }}"
+            ),
+        ),
+        (
+            "allShortest over group and edge pattern",
+            format!(
+                "{P}SELECT ?s ?p ?l {{ ?s <urn:k> ?k FILTER(?k < 5) SERVICE path:search {{ [] path:source ?s ; path:target <urn:n:20> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:length ?l ; path:start ?x ; path:end ?y . ?x <urn:e> ?y }} }}"
+            ),
+        ),
+        (
+            "path:all over group and edge pattern",
+            format!(
+                "{P}SELECT ?s ?t ?p ?l {{ ?s <urn:k> ?k FILTER(?k < 3) SERVICE path:search {{ [] path:source ?s ; path:target ?t ; path:algorithm path:all ; path:maxLength 2 ; path:pathIndex ?p ; path:length ?l ; path:start ?x ; path:end ?y . ?x <urn:e> ?y }} }}"
+            ),
+        ),
+        (
+            "allShortest with maxDegree hub cache",
+            format!(
+                "{P}SELECT ?p ?i ?es ?eo {{ SERVICE path:search {{ [] path:source <urn:h:0> ; path:target <urn:h:1> ; path:predicate <urn:he> ; path:algorithm path:allShortest ; path:maxDegree 4 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo }} }}"
+            ),
+        ),
+        (
+            "weighted shortest high-reifier streaming lookup",
+            format!(
+                "{P}SELECT ?c {{ SERVICE path:search {{ [] path:source <urn:mr:0> ; path:target <urn:mr:1> ; path:predicate <urn:mre> ; path:weight <urn:w> ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "kShortest const",
+            format!(
+                "{P}SELECT ?p ?i {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:algorithm path:kShortest ; path:k 8 ; path:pathIndex ?p ; path:edgeIndex ?i }} }}"
+            ),
+        ),
+    ];
+
+    let mut found = Vec::new();
+    for (name, q) in &cases {
+        for (granted, mode) in [(false, "local"), (true, "granted")] {
+            for batch in [16, 256] {
+                let mut a = run(&s, q, granted, batch);
+                for _ in 0..2 {
+                    a = run(&s, q, granted, batch);
+                }
+                print(name, &format!("{mode}/{batch}"), &a);
+                assert!(a.rows > 0, "{name}: no rows");
+                target(&a.plan, "PathSearch", true).unwrap();
+                found.extend(a.check(
+                    &format!("{name} ({mode}, batch {batch})"),
+                    &Allowance::EXACT,
+                ));
+            }
+        }
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+
+    // Eager bounded high-reifier weight lookup (`path:limit`) reduces reifiers in place
+    // without allocating `Vec<Key>` or `Vec<u64>` proportional to the 2,000 reifiers.
+    let eager_reifier_q = format!(
+        "{P}SELECT ?c {{ SERVICE path:search {{ [] path:source <urn:mr:0> ; path:target <urn:mr:1> ; path:predicate <urn:mre> ; path:weight <urn:w> ; path:maxLength 2 ; path:limit 10 ; path:cost ?c }} }}"
+    );
+    let snap = s.snapshot();
+    let opts = QueryOptions {
+        no_cache: true,
+        ..Default::default()
+    };
+    let _ = sparkles_core::sparql::query(snap.clone(), &eager_reifier_q, &opts).unwrap();
+    let (_, eager_peak) =
+        heap::peak(|| sparkles_core::sparql::query(snap.clone(), &eager_reifier_q, &opts).unwrap());
+    assert!(
+        eager_peak < 64 * 1024,
+        "eager bounded high-reifier weight lookup allocated {eager_peak} bytes (expected O(1) scratch < 64 KiB)"
+    );
+}
+
+#[test]
+fn a_rebuilt_construct_does_not_build_its_whole_circuit_for_one_row() {
+    use sparkles_core::incr::{OpenHost, Runtime, RuntimeOptions, ViewDef};
+    use sparkles_core::sparql::{AggregateErrors, FallbackPolicy};
+    let _serial = heap::serial();
+    let s = store(12_000);
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    rt.set_host(Arc::new(OpenHost));
+    rt.put(
+        &s,
+        "graph",
+        ViewDef::table("CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }"),
+    )
+    .unwrap();
+    rt.round(&s);
+    let snap = s.snapshot();
+    let opts = QueryOptions {
+        views: Some(rt),
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        max_memory_bytes: Some(1 << 20),
+        pool: Some(QueryPool::new(1 << 20)),
+        no_cache: true,
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let q = "PREFIX view: <urn:x-sparkles:view#> SELECT ?subject { SERVICE view:read { [] view:name \"graph\" ; view:bind ?subject } } LIMIT 1";
+    let (rows, peak) = heap::peak(|| {
+        let mut c = select_cursor(snap, q, &opts, &cursor).unwrap();
+        c.next_batch().unwrap().unwrap().len()
+    });
+    assert_eq!(rows, 1);
+    assert!(peak < 1 << 20, "the first pull allocated {peak} bytes");
 }

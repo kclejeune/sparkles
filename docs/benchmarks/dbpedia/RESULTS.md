@@ -5,20 +5,20 @@ This is a [manual report](../README.md#evidence-and-generated-reports). Read the
 
 ## Comparison summary
 
-At the 50M slice, among the 27 queries with complete, agreeing content
-  checks across all five engines, Sparkles has the lowest median on 25 warm and 27 cold.
-  Fluree is within 5% ahead on two small warm queries. After the
-  [decimal arithmetic change](#decimal-arithmetic-and-inline-dates), `births-by-decade`
-  takes 7.1 ms warm and 37.8 ms cold in the comparative tables, against QLever's 13.5 and
-  43.8 ms. The complete-HTTP timer of the
-  [cursor assessment](#cursor-expression-reuse-controls) gives 3.9 and 27.5 ms against
-  17.2 and 29.3 ms, so the cold result is within 10%.
+At the 50M slice, among the 27 queries with complete, agreeing content checks across all
+five engines, Sparkles has the lowest median on 25 warm and 27 cold. Fluree is within 5%
+ahead on two small warm queries. After the
+[decimal arithmetic change](#decimal-arithmetic-and-inline-dates), `births-by-decade`
+takes 7.1 ms warm and 37.8 ms cold in the comparative tables, against QLever's 13.5 and
+43.8 ms. The complete-HTTP timer of the
+[cursor assessment](#cursor-expression-reuse-controls) gives 3.9 and 27.5 ms against 17.2
+and 29.3 ms, so the cold result is within 10%.
 
-At 1.24 billion triples, Sparkles loads English DBpedia in 480 s, against
-  QLever's 1,674 s and Fluree's 2,919 s. The comparative tables report lower times than
-  QLever on 29 warm queries with agreeing qualified answer checks and on 29 of 31 cold
-  queries. The full-data `births-by-decade` guards are internal A/B comparisons and do
-  not establish a peer ranking at that scale.
+At 1.24 billion triples, Sparkles loads English DBpedia in 480 s, against QLever's 1,674 s
+and Fluree's 2,919 s. The comparative tables report lower times than QLever on 29 warm
+queries with agreeing qualified answer checks and on 29 of 31 cold queries. The full-data
+`births-by-decade` guards are internal A/B comparisons and do not establish a peer ranking
+at that scale.
 
 ## DBpedia
 

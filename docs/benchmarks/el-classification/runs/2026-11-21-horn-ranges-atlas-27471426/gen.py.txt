@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Small random Horn ontologies with ranges and domains of properties that chains and
+transitivity reach, inverses, subproperties, functional properties, assertions and nominals,
+for item 693's range universals. Usage: gen.py DIR COUNT SEED"""
+import random, sys
+d, count, seed = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+NR = 5
+def prop(r): return f":r{r.randrange(NR)}"
+def role(r):
+    p = prop(r)
+    return f"ObjectInverseOf({p})" if r.randrange(3) == 0 else p
+def cls(r, depth=0):
+    t = r.randrange(7 if depth < 2 else 2)
+    a = f":A{r.randrange(6)}"
+    if t <= 1: return a
+    if t == 2: return f"ObjectIntersectionOf({a} :A{r.randrange(6)})"
+    if t == 3 and r.randrange(3) == 0: return f"ObjectOneOf(:i{r.randrange(3)})"
+    return f"ObjectSomeValuesFrom({role(r)} {cls(r, depth+1)})"
+for n in range(count):
+    r = random.Random(f"{seed}:{n}")
+    s = []
+    # the property axioms: chains, transitivity, inverses, subproperties
+    for _ in range(2 + r.randrange(4)):
+        k = r.randrange(6)
+        p = prop(r)
+        if k == 0: s.append(f"TransitiveObjectProperty({p})")
+        elif k == 1: s.append(f"SubObjectPropertyOf(ObjectPropertyChain({role(r)} {role(r)}) {p})")
+        elif k == 2: s.append(f"SubObjectPropertyOf({role(r)} {p})")
+        elif k == 3: s.append(f"InverseObjectProperties({p} {prop(r)})")
+        elif k == 4: s.append(f"SubObjectPropertyOf(ObjectPropertyChain({role(r)} {role(r)} {role(r)}) {p})")
+        else: s.append(f"SymmetricObjectProperty({p})")
+    for _ in range(2 + r.randrange(4)):
+        if r.randrange(3): s.append(f"ObjectPropertyRange({role(r)} :A{r.randrange(6)})")
+        else: s.append(f"ObjectPropertyDomain({role(r)} :A{r.randrange(6)})")
+    for _ in range(4 + r.randrange(7)):
+        k = r.randrange(9)
+        A = f":A{r.randrange(6)}"
+        if k == 0: s.append(f"SubClassOf({A} :A{r.randrange(6)})")
+        elif k <= 2: s.append(f"SubClassOf({A} ObjectSomeValuesFrom({role(r)} {cls(r,1)}))")
+        elif k == 3: s.append(f"SubClassOf(ObjectSomeValuesFrom({role(r)} {cls(r,1)}) {A})")
+        elif k == 4: s.append(f"EquivalentClasses(:Q{r.randrange(4)} {cls(r)})")
+        elif k == 5: s.append(f"SubClassOf({A} ObjectAllValuesFrom({role(r)} :A{r.randrange(6)}))")
+        elif k == 6: s.append(f"ClassAssertion({A} :i{r.randrange(3)})")
+        elif k == 7: s.append(f"ObjectPropertyAssertion({prop(r)} :i{r.randrange(3)} :i{r.randrange(3)})")
+        else: s.append(f"SubClassOf({A} {cls(r)})")
+    if r.randrange(4) == 0:
+        s.append(f"EquivalentClasses(:N{r.randrange(3)} ObjectOneOf(:i{r.randrange(3)}))")
+    body = "\n".join(s)
+    with open(f"{d}/g{n:05}.ofn", "w") as f:
+        f.write("Prefix(:=<http://e/>)\nOntology(<http://e/o>\n" + body + "\n)\n")

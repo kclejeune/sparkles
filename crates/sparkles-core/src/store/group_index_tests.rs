@@ -17,7 +17,6 @@ const GEO: &str = "http://www.opengis.net/ont/geosparql#";
 fn options() -> StoreOptions {
     StoreOptions {
         group_commit: true,
-        group_commit_idle_direct: false,
         ..Default::default()
     }
 }
@@ -615,6 +614,17 @@ fn a_building_or_failed_spatial_index_keeps_commits_out_of_groups() {
     let (hits, scanned) = window(s.snapshot(), [-1.0, -1.0, 6.0, 6.0]);
     assert!(!scanned);
     assert_eq!(hits.len(), 6, "{hits:?}");
+    let before = grouped(&s);
+    update(
+        &s,
+        &format!("DELETE DATA {{ <urn:seed> <{GEO}asWKT> \"POINT(0 0)\"^^<{GEO}wktLiteral> }}"),
+    )
+    .unwrap();
+    assert_eq!(grouped(&s), before + 1);
+    let (hits, scanned) = window(s.snapshot(), [-1.0, -1.0, 6.0, 6.0]);
+    assert!(!scanned);
+    assert_eq!(hits.len(), 5, "{hits:?}");
+    assert!(!hits.contains("<urn:seed>"));
 }
 
 /// Embedding work is scheduled when a commit is published, never for a commit above the

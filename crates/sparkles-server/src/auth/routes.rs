@@ -87,6 +87,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ontology/{ds}/imports", &["GET", "PATCH"]),
     ("/$/ontology/{ds}/imports/catalog", &["POST"]),
     ("/$/ontology/{ds}/imports/fetch", &["POST"]),
+    // pattern-based axiom generation (U12): preview reads, apply writes
+    ("/$/ontology/{ds}/patterns/preview", &["POST"]),
+    ("/$/ontology/{ds}/patterns/apply", &["POST"]),
     ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/graph/{ds}/facets", &["POST"]),
     // editing forms (U02): the check and the save check write on the branch they name
@@ -115,6 +118,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // evidence-profile settings (C25 §7)
     ("/$/evidence/{ds}/settings", &["GET", "PUT"]),
     ("/$/evidence/{ds}/detach", &["POST"]),
+    ("/$/evidence/{ds}/identities/rebuild", &["POST"]),
+    ("/$/evidence/{ds}/reauthenticate", &["POST"]),
+    ("/$/evidence/{ds}/projections/reconcile", &["POST"]),
     ("/$/evidence/{ds}/holds", &["GET", "POST"]),
     ("/$/evidence/{ds}/holds/{id}", &["DELETE"]),
     // durable jobs (C26 §6)
@@ -196,7 +202,15 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/resources/{id}/license", &["GET"]),
     ("/$/resources/{id}/notice", &["GET"]),
     ("/$/resources/{id}/header", &["GET"]),
+    ("/$/resources/{id}/recipes", &["GET"]),
     ("/$/resources/{id}/install/{ds}", &["POST"]),
+    // linked-data publishing front end (C32): filtered by the handlers to datasets and
+    // graphs the caller may read
+    ("/$/ld", &["GET"]),
+    ("/$/ld/doc", &["GET"]),
+    ("/$/ld/ns/{prefix}", &["GET"]),
+    ("/$/ld/ns/{prefix}/", &["GET"]),
+    ("/$/ld/ns/{prefix}/{*local}", &["GET"]),
     ("/$/asks/{ds}", &["GET", "DELETE"]),
     ("/$/asks/{ds}/{id}/feedback", &["POST"]),
     ("/$/queries/{ds}/{name}", &["GET", "PUT", "DELETE"]),
@@ -455,6 +469,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/ontology/{ds}/imports"
         | "/$/ontology/{ds}/imports/catalog"
         | "/$/ontology/{ds}/imports/fetch" => Dataset(Admin),
+        "/$/ontology/{ds}/patterns/apply" => Dataset(Write),
         "/$/assistant/{ds}" => Dataset(Admin),
         "/$/graphrag/{ds}"
         | "/$/graphrag/{ds}/communities"
@@ -468,7 +483,12 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // the settings file and the model configuration are the operator's
         "/$/settings" => Server(ServerPerm::ServerAdmin),
         "/$/settings/{ds}" => Dataset(Read),
-        "/$/settings/{ds}/{kind}" if get => Dataset(Read),
+        "/$/settings/{ds}/{kind}"
+            if get
+                && !uri.path().rsplit('/').next().is_some_and(|kind| {
+                    percent_encoding::percent_decode_str(kind).decode_utf8_lossy()
+                        == crate::settings::evidence::NAME
+                }) => Dataset(Read),
         "/$/settings/{ds}/{kind}" => Dataset(Admin),
         // the model configuration and its keys: the server's outbound connections
         "/$/server/settings/{kind}" | "/$/server/secrets" | "/$/server/secrets/{name}" => {
@@ -490,7 +510,15 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/resources/{id}/acceptance"
         | "/$/resources/{id}/license"
         | "/$/resources/{id}/notice"
-        | "/$/resources/{id}/header" => Server(ServerPerm::ServerAdmin),
+        | "/$/resources/{id}/header"
+        | "/$/resources/{id}/recipes" => Server(ServerPerm::ServerAdmin),
+        // linked-data publishing front end (C32): handlers enforce dataset, graph and
+        // triple read permissions
+        "/$/ld"
+        | "/$/ld/doc"
+        | "/$/ld/ns/{prefix}"
+        | "/$/ld/ns/{prefix}/"
+        | "/$/ld/ns/{prefix}/{*local}" => Caller,
         // only the caller's own entries, whatever its role (C18 §6.4)
         "/$/asks/{ds}" | "/$/asks/{ds}/{id}/feedback" => Dataset(Read),
         // endpoints, models, budgets and the secret names of the operator's providers
@@ -536,6 +564,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/ontology/{ds}/individuals"
         | "/$/ontology/{ds}/classification"
         | "/$/ontology/{ds}/term"
+        | "/$/ontology/{ds}/patterns/preview"
         | "/$/graph/{ds}/groups"
         | "/$/graph/{ds}/facets"
         | "/$/forms/{ds}"
@@ -619,6 +648,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // the settings name the protected graphs and review policies
         | "/$/evidence/{ds}/settings"
         | "/$/evidence/{ds}/detach"
+        | "/$/evidence/{ds}/identities/rebuild"
+        | "/$/evidence/{ds}/reauthenticate"
+        | "/$/evidence/{ds}/projections/reconcile"
         // holds name commits of any branch and decide retained history
         | "/$/evidence/{ds}/holds"
         | "/$/evidence/{ds}/holds/{id}"
@@ -750,9 +782,10 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/$/ontology/{ds}/individuals"
         | "/$/ontology/{ds}/classification"
         | "/$/ontology/{ds}/term"
+        | "/$/ontology/{ds}/patterns/preview"
         | "/$/ontology/{ds}/entity" => Endpoint::Query,
         "/$/ontology/{ds}/axioms" if get => Endpoint::Query,
-        "/$/ontology/{ds}/axioms" => Endpoint::Update,
+        "/$/ontology/{ds}/axioms" | "/$/ontology/{ds}/patterns/apply" => Endpoint::Update,
         "/$/ontology/{ds}/imports" if get => Endpoint::Query,
         "/$/ontology/{ds}/imports"
         | "/$/ontology/{ds}/imports/catalog"

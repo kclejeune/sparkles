@@ -1,6 +1,9 @@
 //! `sparkles vector`: create, list, status, rebuild and drop vector indexes, run as the
 //! real binary against a local database and against a server.
 
+#[cfg(feature = "auth")]
+mod common;
+
 use serde_json::Value as J;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -167,37 +170,17 @@ fn vector_index_lifecycle() {
     );
 }
 
-/// A free port in 4800–4819.
-#[cfg(feature = "auth")]
-fn port() -> u16 {
-    (4800..4820)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .expect("a free port in 4800-4819")
-}
-
 #[cfg(feature = "auth")]
 #[test]
 fn vector_index_on_a_server() {
     use std::time::{Duration, Instant};
     let dir = tempfile::tempdir().unwrap();
-    let port = port();
-    struct Kill(std::process::Child);
-    impl Drop for Kill {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let _server = Kill(
-        Command::new(BIN)
-            .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
+    let (_server, port) = common::ServerProcess::start(
+        common::serve()
             .args(["--mem", "ds", "--data"])
             .arg(dir.path().join("data"))
-            .env_remove("SPARKLES_SERVER")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
+            .env_remove("SPARKLES_SERVER"),
+        &dir.path().join("server.log"),
     );
     let url = format!("http://127.0.0.1:{port}");
     let t0 = Instant::now();

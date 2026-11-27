@@ -1,20 +1,23 @@
 # Development
 
-This page is the contributor guide. It covers building Sparkles from source, the
-everyday tasks, the test suites, the language bindings, continuous integration, releases,
-the Nix flake and the third-party license notices. [USAGE.md](USAGE.md) covers running
-and operating the binary. The UI has its own development notes in
-[ui/README.md](../ui/README.md). The design specs in [specs/README.md](specs/README.md)
-explain why each feature is built the way it is.
+This guide covers building Sparkles from source, everyday mise tasks, test and conformance
+suites, language bindings, CI, batch gates, releases, Nix builds and third-party licenses.
+See [USAGE.md](USAGE.md) for operating the binary, [ui/README.md](../ui/README.md) for UI
+development, [specs/README.md](specs/README.md) for feature designs,
+[AGENTS.md](../AGENTS.md) for contributor house rules, and [ROADMAP.md](ROADMAP.md) for
+work priorities.
 
 Sparkles is experimental. The on-disk format, HTTP API, CLI and Rust API may change
 between commits without a migration path.
 
-[AGENTS.md](../AGENTS.md) holds the house rules for human and agent contributors. It
-covers the local checks, the engineering rules on streaming execution, on-disk formats and
-performance claims, how commits and documentation are written, and the workflow for
-splitting large work across several agents. [ROADMAP.md](ROADMAP.md) sets the order of
-work.
+| Goal | Command |
+|---|---|
+| Build UI and release server | `mise run build` |
+| Fast iteration gate (format, lints, API check, Rust tests) | `mise run ci:fast` |
+| Narrowed fast gate for current branch changes | `scripts/ci.sh --fast --changed origin/main` |
+| Full local CI gate (Rust, UI, Python, JVM, Node, licenses) | `mise run ci` |
+| W3C SPARQL, SHACL and ShEx conformance suites | `mise run test:w3c`, `test:shacl`, `test:shex` |
+| Format Rust, UI and JS sources | `mise run fmt` |
 
 * [Project layout](#project-layout)
 * [Building from source](#building-from-source)
@@ -22,12 +25,15 @@ work.
 * [Git hooks](#git-hooks)
 * [Testing](#testing)
 * [Language bindings](#language-bindings)
+* [Rust HTTP client models](#rust-http-client-models)
 * [Benchmark scripts](#benchmark-scripts)
+* [Batch gate](#batch-gate)
 * [Continuous integration](#continuous-integration)
 * [Releases](#releases)
 * [Engineering invariants](#engineering-invariants)
 * [Nix](#nix)
 * [Third-party licenses](#third-party-licenses)
+* [API compatibility](#api-compatibility)
 
 ## Project layout
 
@@ -35,22 +41,25 @@ work.
 
 | Path | Role | Jena analogue |
 |---|---|---|
-| `crates/sparkles-core` | The engine: ids, vocabulary, indexes, bulk builder, MVCC store and WAL, SPARQL and RDF I/O | jena-core, jena-arq, jena-tdb2 |
-| `crates/sparkles` | The library: the engine's modules, the `Dataset` API, its handles and the query builder | jena-querybuilder, in-process RDFConnection |
-| `crates/sparkles-server` | The HTTP server and the `sparkles` CLI | jena-fuseki2, jena-cmds |
-| `crates/sparkles-alloc` | The mimalloc global allocator of the server, the bindings and the memory examples | — |
-| `crates/sparkles-reasoner` | RDFS, OWL 2 RL and Jena rules by semi-naive forward chaining | jena-core `reasoner` |
-| `crates/sparkles-shacl`, `crates/sparkles-shex` | SHACL and ShEx validation over store snapshots | jena-shacl, jena-shex |
-| `crates/sparkles-owl` | The OWL 2 axiom model, its mappings to and from RDF graphs, the functional-style writer and the OWL 2 DL, EL, QL and RL checks | jena-ontapi |
-| `crates/sparkles-backup` | Backup repositories on a file system or S3 | Fuseki `/$/backup` |
-| `crates/sparkles-graphql` | The read-only GraphQL adapter | — |
-| `crates/sparkles-fmt`, `crates/sparkles-fmt-wasm` | The formatter and linter, and their WebAssembly build | — |
-| `crates/sparkles-client` | The Rust client of remote SPARQL endpoints | jena-rdfconnection (remote) |
-| `crates/sparkles-py` | The Python package (PyO3, its own cargo workspace) | — |
-| `crates/sparkles-ffi`, `jvm/` | The JVM bindings: the UniFFI native library and the Kotlin `sparkles-jena` library | jena-tdb2's `DatasetGraphTDB` |
-| `crates/sparkles-node`, `js/` | The Node-API addon, RDF/JS contracts and TypeScript engine and remote client packages | — |
-| `vendor/spargebra` | Oxigraph's SPARQL parser, vendored with fixes ([PATCHED.md](../vendor/spargebra/PATCHED.md)) | ARQ's grammar |
-| `ui/` | The SvelteKit web UI | jena-fuseki-ui |
+| `crates/sparkles-core` | Engine: IDs, vocabulary, indexes, bulk builder, MVCC store, WAL, SPARQL and RDF I/O | jena-core, jena-arq, jena-tdb2 |
+| `crates/sparkles` | Application library: `Dataset`, `Catalog`, admin handles and query builder | jena-querybuilder, in-process RDFConnection |
+| `crates/sparkles-server` | HTTP server, MCP server and `sparkles` CLI | jena-fuseki2, jena-cmds |
+| `crates/sparkles-alloc` | mimalloc global allocator for the server, bindings and memory examples | — |
+| `crates/sparkles-budget` | Cooperative cancellation, deadlines and query memory/work budgets | — |
+| `crates/sparkles-reasoner` | RDFS, OWL 2 RL and Jena rules via semi-naive forward chaining and demand derivation | jena-core `reasoner` |
+| `crates/sparkles-shacl`, `crates/sparkles-shaclc`, `crates/sparkles-shex` | SHACL, SHACLC and ShEx validation over store snapshots | jena-shacl, jena-shex |
+| `crates/sparkles-owl` | OWL 2 axiom model, RDF graph mappings, functional writer and DL/EL/QL/RL checks | jena-ontapi |
+| `crates/sparkles-backup` | Incremental, deduplicated backup repositories on filesystem or S3 (with optional encryption) | Fuseki `/$/backup` |
+| `crates/sparkles-graphql` | Read-only GraphQL-to-SPARQL compiler | — |
+| `crates/sparkles-fmt`, `crates/sparkles-fmt-wasm` | Formatter, linter and WebAssembly browser module | — |
+| `crates/sparkles-embed`, `crates/sparkles-modelstore` | Local embedding runtime and managed model-file storage | — |
+| `crates/sparkles-office`, `crates/sparkles-memory-import` | Office document conversion and coding-agent memory/transcript importers | — |
+| `crates/sparkles-client` | Rust HTTP client for remote SPARQL endpoints | jena-rdfconnection (remote) |
+| `crates/sparkles-py` | Python package (PyO3, separate Cargo workspace) | — |
+| `crates/sparkles-ffi`, `jvm/` | JVM bindings: UniFFI/JNI native library and Kotlin `sparkles-jena` SDK | jena-tdb2 `DatasetGraphTDB` |
+| `crates/sparkles-node`, `js/` | Node-API addon, RDF/JS contracts and TypeScript engine and client packages | — |
+| `vendor/spargebra` | Oxigraph's SPARQL parser, vendored with fixes ([PATCHED.md](../vendor/spargebra/PATCHED.md)) | ARQ grammar |
+| `ui/` | SvelteKit web UI | jena-fuseki-ui |
 
 ## Building from source
 
@@ -93,25 +102,21 @@ processes do not hold Boxington's target lease unless the task helper wraps them
 [managed-target guide](https://mr-boxington.jdx.dev/managed-targets) for the placement
 and collection rules.
 
-Boxington collects a whole managed target at once, including the target of a live
-checkout. It does so when the targets exceed their size budget or when the cache disk has
-less free space than `gc.min_free_size`. The only protection is the target's lease, which
-each `mbx` command holds from its start until it exits. Two `mbx` commands in a row
-therefore leave a gap in which a background collection can remove everything the first
-one built, such as `target/release/libsparkles_ffi.so` or `target/jvm/uniffi`. The next
-command then starts from an empty target. `scripts/ci.sh` closes the gap by starting
-`mbx sparkles-task` around a command that waits for the script to end, so one lease
-covers the prepare step and every check until the run ends, however the run stops. This holds however the script is started, including the batch gate
-on a build host. Tasks that consume a build also make it inside their own lease.
-`jvm:test`, `jvm:build` and `jvm:sample` run `scripts/jvm-native.sh` first, `node:test`
-and `ui:e2e` build the server, and the benchmark and screenshot tasks build the release
-binary again. The binding lint and test tasks that pass `--target-dir target` run under
-`mbx sparkles-task` as well. Boxington does not place a target directory that a command
-names explicitly, so after a collection such a command could find a dangling `target`
-link and fail with "Not a directory", while the task helper places a fresh target first. A build that is already fresh takes a few seconds. While a run holds its
-lease, low-disk collection cannot reclaim the run's own target and evicts shared cache
-objects instead, so a host whose disk is nearly full can still run out of space during a
-gate.
+Boxington collects a whole managed target at once, including a live checkout's target,
+when targets exceed their size budget or free disk falls below `gc.min_free_size`. Only
+an active `mbx` target lease protects a target, so consecutive `mbx` commands leave a gap
+where background collection can remove build outputs such as
+`target/release/libsparkles_ffi.so` or `target/jvm/uniffi`.
+
+`scripts/ci.sh` closes that gap by holding `mbx sparkles-task` across preparation and all
+checks until the script exits, including on batch-gate hosts. Tasks that consume a build
+also build inside their own lease: `jvm:test`, `jvm:build` and `jvm:sample` run
+`scripts/jvm-native.sh` first; `node:test` and `ui:e2e` build the server; benchmark and
+screenshot tasks rebuild the release binary. Binding lint and test tasks that pass
+`--target-dir target` also run under `mbx sparkles-task` so a fresh target is placed
+beforehand instead of failing on a dangling `target` symlink. While a lease is held,
+low-disk collection evicts shared cache objects rather than the active target, so a nearly
+full disk can still run out of space mid-gate.
 
 Scripts follow two rules that keep a collection from breaking them. Scratch output that
 no compiler produces, such as logs, downloaded suites, test binaries built with plain
@@ -143,55 +148,62 @@ Node, pnpm or Rust on the host. `mise run docker:build` builds the image of
 
 ## mise tasks
 
-[`mise.toml`](../mise.toml) pins Mr. Boxington, Node, pnpm, hyperfine, prek, shfmt, shellcheck, a Java 17
-and a Java 21 JDK, and Gradle. Its hyperfine is the only source of the benchmark runners'
-timer, since the Nix development shell does not provide one. Rust comes from `rust-toolchain.toml`. `mise.toml` also defines the everyday tasks, and
-`mise tasks` lists them all:
+[`mise.toml`](../mise.toml) pins Mr. Boxington, Node, pnpm, hyperfine, prek, shfmt,
+shellcheck, Java 17 and Java 21 JDKs, Gradle and `cargo-nextest`. Its `hyperfine` is the
+benchmark runners' timer because the Nix development shell does not provide one. Rust
+comes from `rust-toolchain.toml`. Run `mise tasks` to list all tasks; common tasks are:
 
 ```sh
-mise run build        # UI + release binary
-mise run serve        # build, then serve ./data on :3030
-mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
-mise run lint         # clippy -D warnings + svelte-check
-mise run lint:features # clippy -D warnings over feature combinations (opt-in)
-mise run test:features # the stripped-server compatibility matrix (opt-in)
+mise run build          # UI + release binary
+mise run serve          # build, then serve ./data on :3030
+mise run fmt            # cargo fmt + UI oxfmt + JS format (fmt:check for CI)
+mise run lint           # clippy -D warnings + svelte-check
+mise run lint:features  # clippy -D warnings over feature combinations (opt-in)
+mise run test:features  # stripped-server compatibility matrix (opt-in)
 mise run lint:shell     # formatting and ShellCheck for maintained shell scripts (in ci)
-mise run lint:doc-paths # every crates/sparkles… path cited in the docs exists (in ci)
-mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
-mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
-mise run office:fuzz  # fuzz the Office converter of ingestion the same way
-mise run test         # all Rust tests with cargo-nextest, then doctests (test:cargo runs plain mbx test)
-mise run test:partitioned # the nextest tests built once and run in shares on several machines
-mise run ui:wasm      # the formatter's WebAssembly module for the UI (optional)
-mise run ui:dev       # UI dev server, proxying the API to $SPARKLES_API (default http://localhost:3030)
-mise run ui:mock      # mock API server for UI work without the Rust backend
-mise run ui:test      # UI unit tests (Vitest)
-mise run ui:e2e       # UI end-to-end tests (Playwright; Chromium from `nix develop`, see below)
-mise run ui:e2e:mock  # UI end-to-end tests against the mock backend
-mise run py:build     # the Python wheel (crates/sparkles-py) into target/wheels, with maturin
-mise run py:sdist     # the Python source distribution into target/wheels
-mise run py:test      # build the Python extension and run its pytest suite (in ci, with py:lint)
-mise run py:lock      # refresh crates/sparkles-py/Cargo.lock from Cargo.lock
-mise run jvm:build    # the sparkles-jena jar (jvm/sparkles-jena/build/libs), with the native library
-mise run jvm:test     # Jena's contract tests and the binding's own tests (in ci, with jvm:lint and jvm:rust-test)
-mise run jvm:sample   # compile, test and run the Java sample (jvm/sample-java)
-mise run jvm:lock     # refresh crates/sparkles-ffi/Cargo.lock from Cargo.lock
-mise run jvm:nix-deps # refresh nix/jvm-deps.json after the Gradle dependencies change
-mise run ci           # every check below, with a log per task and a summary (scripts/ci.sh)
-mise run ci:fast      # fmt:check + lint:shell + lint:doc-paths + lint + test, for iterating
-mise run doc          # API docs of the library crates
-mise run openapi      # rewrite docs/openapi.json after an API change (a test fails until then)
-mise run docs:screenshots # the README's screenshots (docs/images): the demo dataset in docs/demo, and the mock backend for branches, the agent pages, the arcs maps and the GraphRAG communities
-mise run docs:screenshots:mock # only the branch, agent, time slider, arcs and GraphRAG community screenshots, from the mock backend, without a release build
-mise run docker:build # the Docker image of compose.yaml (not in ci)
+mise run lint:doc-paths # cited source paths and public entry-page doc links (in ci)
+mise run api:check      # HTTP API compatibility inventory and fixtures (in ci)
+mise run client:types:check # verify Rust client OpenAPI models are current (client:types regenerates)
+mise run fmt:wasm       # clippy and node runtime tests for the formatter's wasm32 build (in ci)
+mise run fmt:fuzz       # fuzz the formatter with cargo-fuzz (needs nightly; not in ci)
+mise run office:fuzz    # fuzz the Office ingestion converter (needs nightly; not in ci)
+mise run test           # all Rust tests with cargo-nextest, then doctests (test:cargo runs plain mbx test)
+mise run test:bench-scripts # Python CI/gate/benchmark script tests and crash-harness tests (in ci)
+mise run test:timing-cohort # wall-clock-sensitive host-timing tests on a dedicated idle worker
+mise run test:partitioned   # nextest tests built once and run in shares across machines
+mise run ui:wasm        # formatter WebAssembly module for the UI (optional)
+mise run ui:dev         # UI dev server proxying $SPARKLES_API (default http://localhost:3030)
+mise run ui:mock        # mock API server for UI work without the Rust backend
+mise run ui:test        # UI unit tests (Vitest)
+mise run ui:e2e         # UI end-to-end tests (Playwright; Chromium from `nix develop`)
+mise run ui:e2e:mock    # UI end-to-end tests against the mock backend
+mise run py:build       # Python wheel (crates/sparkles-py) into target/wheels with maturin
+mise run py:sdist       # Python source distribution into target/wheels
+mise run py:test        # build Python extension and run pytest suite (in ci, with py:lint)
+mise run py:lock        # refresh crates/sparkles-py/Cargo.lock from Cargo.lock
+mise run jvm:build      # sparkles-jena jar (jvm/sparkles-jena/build/libs) with native library
+mise run jvm:test       # Jena contract tests and binding tests (in ci, with jvm:lint and jvm:rust-test)
+mise run jvm:sample     # compile, test and run the Java sample (jvm/sample-java)
+mise run jvm:lock       # refresh crates/sparkles-ffi/Cargo.lock from Cargo.lock
+mise run jvm:nix-deps   # refresh nix/jvm-deps.json after Gradle dependencies change
+mise run node:build     # host Node-API addon and TypeScript packages
+mise run node:test      # Node runtime, protocol and lifecycle tests (in ci, with node:lint and node:client:check)
+mise run ci             # default CI gate with per-task logs and summary (scripts/ci.sh)
+mise run ci:fast        # fmt:check + lint:shell + lint:doc-paths + api:check + client:types:check + lint + test
+mise run doc            # API docs for the library crates
+mise run openapi        # rewrite docs/openapi.json after an API change
+mise run docs:screenshots      # regenerate docs/images screenshots (demo dataset + mock backend)
+mise run docs:screenshots:mock # regenerate mock-backed screenshots without a release build
+mise run docker:build   # build the Docker image of compose.yaml (not in ci)
 mise run gen-data 1000000 .artifacts/bench-data/10m.nt
-mise run bench        # Sparkles vs Fuseki, QLever, Fluree and Oxigraph; `bench 1000000 --runs 5` for 10.5M triples
-mise run bench:text   # full-text search: Sparkles vs Fuseki with jena-text vs QLever
-mise run bench:watdiv # the same engines on WatDiv's 20 query templates, 11M triples
+mise run bench          # Sparkles vs Fuseki, QLever, Fluree and Oxigraph (`bench 1000000 --runs 5` for 10.5M)
+mise run bench:text     # full-text search: Sparkles vs Fuseki (jena-text) vs QLever
+mise run bench:watdiv   # WatDiv 20 query templates at 11M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
-mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
-mise run bench:remote --executor boat:bx_ID main HEAD   # interleaved A/B of two revisions on an admitted Boat worker
-mise run licenses     # regenerate the third-party notices after a Cargo.lock or UI dependency change (licenses:check)
+mise run bench:shacl-write 100000 # 1-triple INSERT DATA latency with validation off / warn / reject
+mise run bench:request-insn BASE_BIN TIP_BIN # per-request instruction counts on Linux
+mise run bench:remote --executor boat:bx_ID --build-host boat:bx_ID origin/main HEAD # batch query screen on Boat
+mise run licenses       # regenerate third-party notices after Cargo.lock or UI dependency changes (licenses:check)
 ```
 
 ## Git hooks
@@ -215,7 +227,7 @@ runs every hook over the whole tree.
 ```sh
 mise run ci            # formatting, clippy, all workspace tests, UI, Python, JVM and JavaScript tests, license notices
 mise run ci --exhaustive-features # the default gate plus optional-feature lint and compatibility tests
-mise run ci:fast       # formatting, cited doc paths, workspace clippy and the Rust tests
+mise run ci:fast       # formatting, shell checks, doc paths/links, API & client-type checks, workspace clippy and Rust tests
 mise run lint:features # clippy over feature combinations (opt-in)
 mise run test:features # the stripped-server compatibility matrix (opt-in)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
@@ -369,67 +381,41 @@ details.
 
 ### Script tests
 
-The Python tests of the CI, gate and benchmark scripts live in `scripts/bench-tests`, and
-`mise run test:bench-scripts` runs them with `scripts/unittest-parallel.py`, eight processes
-at a time. `python3 -m unittest discover -s scripts/bench-tests` runs the same tests
-serially, and the runner reaches the same verdict under the condition given below. It
-discovers the suite once in a child process and then starts one process per module or
-package that discovery loads. Each process discovers the whole suite again, checks that it
-found the same tests in the same order, and runs its own part exactly as discovered. Import
-errors, import-time skips and class and module fixtures therefore behave as they do
-serially. The whole suite runs in one process, as discovery returned it, and the runner says
-why, when any module or package has a `load_tests` hook, when the suite holds anything other
-than default suites and `TestCase` tests, including a suite given its own `run`, when a test
-module changes unittest's suite classes or rebinds their names, or when test classes of one
-module run under more than one module, as when one test module imports another's class. Such
-a suite or test can depend on what ran before it, and the runner does not try to tell
-whether it does. A default suite that replaces both its own `run` and `countTestCases` and
-hides its tests, for instance by setting `_tests` to `None`, is outside what the runner
-supports, and the runner fails the run with exit 1 instead of passing it. Tests that share
-state in another way, such as a helper module's globals, are not detected. The runner
-therefore reaches the serial verdict only when no test depends on state that a test in
-another process left behind, and passing alone does not show this, since such a test can
-skip instead of fail. The same holds for the tests of a split module.
-The runner also assumes that a test's own `run` method reads only its own test's result, and
-that test code does not react to being inspected or imported more than once, since each
-process imports every module and asks each test for its id and attributes again. The
-[nightly gate](#nightly-gate) runs the suite both ways and fails when the two verdicts or
-test counts differ.
-The three long tests of `test_x08_latency` run one per process. A module named with
-`--split` is split this way only when it has no fixtures, imported classes or repeated
-tests, and otherwise runs whole with a note that says why.
+The Python tests for CI, gate and benchmark scripts live in `scripts/bench-tests`.
+`mise run test:bench-scripts` runs them in up to eight worker processes via
+`scripts/unittest-parallel.py`, matching serial `python3 -m unittest discover -s
+scripts/bench-tests` when tests do not share cross-process state. The runner discovers the
+suite once, spawns one process per module or package, re-discovers to verify identical test
+ordering, and runs each slice as discovered so import errors, skips and module/class
+fixtures behave identically. The three long tests in `test_x08_latency` split one per
+process (a `--split` module is split only when it has no fixtures, imported classes or
+repeated tests).
 
-Each process writes a result record, and the runner takes its verdict from those records
-and from unittest's own results, never from the printed output. A process that ends without
-a complete record fails, and a run in which no test ran and none was skipped exits 5, as
-unittest does. The process-leak check in `test_zz_process_leaks.py` runs once, after every
-other process, on the unwaited subprocesses that each process reports after its tests and
-teardown. Discovery has a 300 s deadline and each process a 900 s deadline, which
-`--discover-timeout` and `--unit-timeout` change. The one process that runs the whole suite,
-when it does, has a 2400 s deadline, which `--suite-timeout` changes. At a deadline, or on SIGINT, SIGTERM or
-SIGHUP, the runner starts no more processes, stops every active one with its group and the
-descendants it can find, with SIGKILL after a grace period that `--grace` sets, and fails
-the run. When the runner itself is killed, its processes get SIGTERM from the kernel and
-stop their own descendants. The runner needs Linux's `/proc` and `prctl`, and on another
-host it says so and hands the run to a serial `unittest discover`, which then exits as it
-would on its own. It hands the run over in the same way when the discovery directory, or any
-directory under it, has an entry named as one of the few modules that its processes load
-before discovery and serial discovery does not, such as `json.py`, since a test importing
-`json` would get that file serially and the runner's module in its processes. Serial
-discovery puts the working directory first on the path before it loads `argparse` and
-`unittest`, so an entry there named as any module loaded after interpreter startup, such as
-`locale.py`, also hands the run over. A test that puts a directory outside the discovery
-directory on the path is not checked, and the nightly comparison of the two runs catches a
-module that it shadows. `--keep DIR` keeps the discovery, the plan, each process's output
-and the result records. Discovery and every process get the interpreter's `-W`
-options, so `python3 -Werror scripts/unittest-parallel.py` fails on a warning as serial
-`python3 -Werror -m unittest discover` does.
+The runner falls back to a single serial process (reporting why) when a module defines
+`load_tests`, contains custom suites outside default `TestCase` suites, rebinds unittest
+suite classes, or runs one module's test classes under another module. A suite that
+replaces both `run` and `countTestCases` while hiding `_tests` fails with exit 1. Because
+shared module globals or repeated-import side effects cannot be detected automatically,
+the [nightly gate](#nightly-gate) runs the suite both ways and fails if verdicts or counts
+differ.
 
-Every test module in `scripts/bench-tests` imports `git_isolation` as its first import, and
-`test_git_isolation.py` fails when one does not. The import removes the host's `GIT_*`
-variables and global Git configuration, such as hooks, signing and templates, so a fixture
-repository and any script a test runs see only their own settings. A new test module needs
-the same first import, even when it runs Git only through another script.
+* **Verdicts and leak checks.** Each process writes a result record, and the runner
+  decides from those records rather than printed text (an incomplete record fails; zero
+  run and zero skipped exits 5). `test_zz_process_leaks.py` runs last over all processes'
+  unwaited subprocess reports.
+* **Deadlines and cleanup.** Default timeouts are 300 s for discovery (`--discover-timeout`),
+  900 s per worker (`--unit-timeout`) and 2,400 s for a serial fallback (`--suite-timeout`).
+  On timeout or SIGINT/SIGTERM/SIGHUP, active process groups and descendants receive
+  SIGTERM followed by SIGKILL after `--grace`. `--keep DIR` retains discovery, plan, logs
+  and records, and interpreter `-W` flags propagate (so `python3 -Werror` matches serial
+  `unittest`).
+* **Platform and shadowing fallbacks.** Parallel isolation uses Linux `/proc` and `prctl`;
+  non-Linux hosts, or discovery/working directories containing files shadowing pre-loaded
+  stdlib modules (such as `json.py` or `locale.py`), hand off to serial `unittest discover`.
+
+Every test module in `scripts/bench-tests` must import `git_isolation` first
+(`test_git_isolation.py` enforces this), stripping host `GIT_*` variables and global Git
+config so fixture repositories see only their own settings.
 
 ### Remote executors
 
@@ -463,13 +449,14 @@ Verify snapshot and credential behavior before treating a seed as reusable. Tool
 alone does not qualify a compiler workload or snapshot lifecycle.
 
 The provider-neutral `bench:remote`, `bench:remote-writes` and `bench:jena-remote`
-commands accept an explicit admitted `boat:bx_ID` worker. Build hosts, partitioned test
-shares and gate hosts accept the same selector. The [remote executor commands](REMOTE-EXECUTORS.md)
-describe the tracked qualification/environment/finish commands, explicit private
-profile and admission inputs, warm reuse, artifact transport and cleanup. The batch query
-screen runs on a quiet Intel host, as [benchmarking](BENCHMARKING.md) describes, and a
-`bench:remote` run on a Boat worker gives only an approximate check. The retired
-`bench:nsc` tasks are unsupported. Changing placement preserves the tests, benchmark comparability and acceptance criteria.
+commands accept an explicit admitted `boat:bx_ID` worker, as do build hosts, partitioned
+test shares and gate hosts. [REMOTE-EXECUTORS.md](REMOTE-EXECUTORS.md) covers
+qualification, job environments, warm reuse, artifact transport and cleanup. The batch
+query screen runs on an admitted Boat worker (`mise run bench:remote --executor boat:bx_ID
+--build-host boat:bx_ID origin/main HEAD`) as the screen of record; small or contested
+effects are checked on an Intel host, as [BENCHMARKING.md](BENCHMARKING.md) describes. The
+retired `bench:nsc` tasks are unsupported. Changing placement preserves tests, benchmark
+comparability and acceptance criteria.
 
 ### Known flaky tests
 
@@ -481,6 +468,13 @@ the tests that passed only on a retry to `.artifacts/ci/flaky-tests.txt`, and
 still fails the run. The batch gate adds one rerun of each failed test, alone, as
 [Reruns of failed tests](#reruns-of-failed-tests) describes, and `mise run test` itself
 retries no other test.
+
+Test harnesses that start `sparkles serve` use `--port 0` to let the kernel assign a
+loopback port when the child binds. They read the address from that child's startup log
+before making any HTTP requests. A harness that allows a fixed port still waits for its
+own child's bind record. Tests that need an open dataset wait for readiness or retry
+the query. The kernel assigns and binds the port in one operation, and can reuse the
+address once the child closes its listener.
 
 ### Partitioned test runs
 
@@ -499,7 +493,7 @@ connection.
 
 A Boat share checks its admission and remaining lifetime, uses the qualified installed
 tools and retains the existing archive and coverage checks. It never installs or
-refreshes toolchain pins during a job. Item 762 tracks real Boat workload acceptance.
+refreshes toolchain pins during a job ([ROADMAP.md](ROADMAP.md), item 762).
 
 The test binaries hold the absolute paths of the checkout that built them, from
 `CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_*` and `CARGO_TARGET_TMPDIR`. Each share therefore
@@ -594,37 +588,35 @@ first run builds the dependencies once per feature set. After that, a change cos
 minute or two.
 
 `mise run test:features` (`scripts/test-features.sh`) runs the server's unit and
-integration tests with the default features off and one optional feature set on, for
-each of `none`, `auth`, `reasoning,auth`, `mcp`, `memory`, `graphql` and `shacl`. The ordinary test run
-builds the server with its default features only, so a test that asserts a route or
-command that exists only with some feature passes there and fails under another build.
-This task is the test counterpart of `lint:features`. The script runs every set even
-after one fails, prints a line for each with its result and time, and exits non-zero if
-any set failed. Names on the command line choose the sets, and a set with several
-features is a comma-separated list, as in `scripts/test-features.sh none mcp,shacl`.
-Each set writes its output to `.artifacts/test-features/<set>.log`. The sets share the
-workspace target directory, so the dependencies compile once, and `CARGO_BUILD_JOBS`
-limits the compile jobs as it does for any mbx run. A test of a route that exists only
-with a feature carries a `#[cfg(feature = "...")]` gate for that feature, and a test
-file that needs a feature has the gate on the whole file. `mise run ci` runs this task
-and `mise run ci:fast` leaves it out, because every set compiles the server crate again.
-A set takes one to two minutes when the dependencies are warm, and the first run of a set
-takes several minutes more.
+integration tests with default features off and one optional feature set enabled (`none`,
+`auth`, `reasoning,auth`, `mcp`, `memory`, `graphql` and `shacl`). Because ordinary runs
+test only default features, feature-specific route or command tests need
+`#[cfg(feature = "...")]` gates (on the test or whole file).
+
+The script runs every set even after one fails, writes each log to
+`.artifacts/test-features/<set>.log` and exits non-zero if any fails. Command-line
+arguments select subsets (for example `scripts/test-features.sh none mcp,shacl`). Sets
+share the workspace target directory so dependencies compile once, and `CARGO_BUILD_JOBS`
+caps compile concurrency. Because each set recompiles `sparkles-server` (1–2 minutes warm,
+longer cold), `mise run ci` runs this task only when requested with
+`--exhaustive-features` or by task name, and `mise run ci:fast` omits it.
 
 Without the `ontology` feature, the ontology HTTP routes remain registered and answer
 `501` after the usual request authorization. The `reasoning,auth` test set exercises
 reasoning and authorization with ontology and MCP disabled, including cached reasoning
 and stored-answer visibility.
 
-`mise run lint:doc-paths` (`scripts/check-doc-paths.py`) checks that every
-`crates/sparkles…` path cited in the README, `docs/*.md`, `docs/specs` and the comments of
-the Rust sources exists. It expands `{a,b}` groups and ignores line numbers. A file that a
-spec describes before it is written goes in the script's `PLANNED` set.
+`mise run lint:doc-paths` runs both `scripts/check-doc-paths.py --code` (verifying every
+`crates/sparkles…` path cited in the README, `docs/**/*.md`, crate READMEs and Rust source
+comments, expanding `{a,b}` groups and skipping planned paths in its `PLANNED` set) and
+`scripts/check-doc-links.py` (verifying local links, anchors and images on the public
+documentation entry pages).
 
 ### Jena client tests
 
 `mise run test:jena-clients` (`scripts/test-jena-clients.sh`) builds a debug server, starts
-it on a temporary data directory on port 5230 with `--gsp-direct-naming`, and runs
+it with a temporary data directory, a kernel-assigned loopback port and
+`--gsp-direct-naming`, and runs
 `testsuite/jena-clients/JenaClients.java` with Java's single-file launcher. The program
 uses Jena's `RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP`
 and `UpdateExecHTTP` with every query send mode, result format and RDF syntax Jena has,
@@ -640,8 +632,8 @@ another port. The task is not part of `mise run ci`.
 ### Browser integration tests
 
 `mise run ui:e2e` builds the formatter's WebAssembly module, the UI with the module and a
-debug server. It starts two `sparkles serve` processes on free ports of 127.0.0.1, each
-with a temporary data directory. The first has a small dataset and an auth configuration
+debug server. It starts two `sparkles serve` processes on kernel-assigned loopback
+ports, each with a temporary data directory. The first has a small dataset and an auth configuration
 with users and API tokens. The second runs without auth and allows private outbound
 addresses. The task then runs the Playwright tests in `ui/tests/e2e` in headless Chromium
 and stops the servers. The Pattern pane, the plan's pattern and **Apply to query** in the
@@ -672,25 +664,24 @@ task is not part of `mise run ci`.
 ### Crash tests
 
 `scripts/power-loss.sh` runs the crash tests of
-[X09](specs/X09-group-commit-by-default.md) sections 10.2 and 10.4 with a release build and
-`scripts/crash-harness.rs`, which `rustc --edition 2024 -O` builds as one file. Its
-`logwrites` mode needs root and the device-mapper `log-writes` target. It records every
-write, flush and FUA of a file system under a 16-writer load and then replays crash images
-from the log, 1,000 by default, checking each recovered store. Its `kill9` mode kills the
-server at random moments of the same load, 200 times by default, and checks every receipt
-after each restart. With a directory in place of `ext4` or `xfs` it needs no root. Neither
-mode is part of `mise run ci`. A load that took no receipt, had a failed write or, in
-`logwrites`, failed to mark the log fails the run, because its checks would pass without
-testing anything. A failed `logwrites` run keeps its log and the first three failing images,
-and `crash-harness replay --only` with the same seed rebuilds any other failing image.
-`--index text`, `geo` or `embed` configures a full-text, spatial or embedding index on each
-store before the load, as section 17.8 asks, and every check then also compares that index
-with the recovered data. The `selftest` mode needs no root. It checks that the driver fails a load whose writes the
-server refuses with a 507, passes a working one, and fails one whose marks all fail. Run it
-after changing the harness. The harness's own tests, which check which `sparkles check`
-warnings a recovered store may still show after an open, run in the `test:bench-scripts`
-task of `mise run ci`. The `--fs` and `--work`
-directories must exist:
+[X09](specs/X09-group-commit-by-default.md) sections 10.2 and 10.4 with a release build
+and `scripts/crash-harness.rs` (compiled as a single file with `rustc --edition 2024 -O`).
+Neither `logwrites` nor `kill9` runs in `mise run ci`, while the harness's own unit tests
+run in `test:bench-scripts`.
+
+* `logwrites` (requires root and device-mapper `log-writes`) records every write, flush
+  and FUA under a 16-writer load and replays crash images (1,000 by default), verifying
+  each recovered store. Failures retain the log and first three failing images, and
+  `crash-harness replay --only` reproduces any other failing image from the same seed.
+* `kill9` kills the server at random points under the same load (200 times by default)
+  and verifies every receipt after restart; passing a directory instead of `ext4` or `xfs`
+  needs no root.
+* `selftest` (no root) verifies that the driver rejects 507 write refusals, passes a
+  working load and fails unmarked logs; run it after changing the harness.
+
+A load with zero receipts, failed writes or failed `logwrites` marks fails the run.
+`--index text`, `geo` or `embed` enables the corresponding index before the load and
+checks index agreement after recovery. Both `--fs` and `--work` must exist:
 
 ```sh
 mkdir -p /tmp/plt
@@ -1013,10 +1004,20 @@ normal test report, rather than every intermediate report from the feature matri
 `ci.exit` keeps the original CI result. The separate `ci-receipts.exit` fails if a
 selected Rust task has no retained report or evidence cannot be copied and verified.
 Not-selected tasks, tasks that never started and selections with no Rust packages are
-recorded separately. No replacement XML is generated for a missing report. A successful
-cached task whose report has been collected can therefore have a passing task result and
-failed evidence retention. The gate does not rerun that task automatically. Compiler
+recorded separately. No replacement XML is generated for a missing report. Compiler
 cache directories are not a store for validation evidence.
+
+When mise reuses a passing Rust test task, its replayed log names the gate run that
+produced the report and gives the hash of that run's JUnit manifest. The current
+manifest records the same reference. The `ci-receipts` step verifies the source
+manifest, its passing test result and the hashes of its retained files on the CI host.
+At least one report must have been created or changed during the source test task.
+The check looks in archived output if the gate name has since been used again. A missing
+or changed source still fails evidence retention even when the cached task passes.
+The gate does not rerun that task automatically. Use `gate.sh --full <rev>` to run
+the checks again if a cached pass has an invalid origin. An error while recording the
+origin fails the gate's test task before mise caches a pass. Custom gate run names
+must start with a letter, digit, underscore or hyphen for JUnit origin recording.
 
 `scripts/ci.sh` runs on the primary host, which is `GATE_PRIMARY` or the first gate host.
 When the batch needs a conformance step, the steps run on a second gate host for the same
@@ -1079,31 +1080,21 @@ never rewrites a script that a queued or running gate is reading. The host also 
 `~/gate/py-venv`. `scripts/gate/setup-host.sh <host>` creates them, copies the suites from
 wally through the laptop and checks linger, mbx and free disk.
 
-A gate has a disk floor on every host, 110 GiB by default for a ci half, a whole gate, the
-link check and a conformance half alike. That is the floor of a Boat gate, which a cold
-workspace build needs. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change the floors of the
-ci and conformance parts, in the environment or in `~/.config/sparkles/gate.env`, and
-`GATE_BOAT_MIN_FREE_GIB` sets a Boat worker's. The driver reads the free disk under the
-home directory of each chosen host before it starts anything there and warns when a host
-is short. It collects nothing, since another job or a timing run may hold the host. The
-gate checks the floor under the host's heavy lock, before it builds, because a running
-build holds its target's lease and the cache cannot give back that space until the gate
-ends. An ssh host that is short runs `mbx gc` with `gc.min_free_size` raised to the floor,
-which collects idle managed targets and evicts cache objects until that much is free, and
-a Boat worker runs its disk cleanup. A gate still short ends with exit 4 and
-`disk-below-floor` in its `outcome` file, and the driver says that the host's disk was
-below its floor. A split gate keeps each half's own record, the ci half's as `outcome` and
-the conformance half's as `outcome-conf`. When every failed half exited 4 with its own
-disk record, the merge exits 4, writes `gate-outcome` and names the refusing halves in
-`outcome-host`. Any other failure makes the merge exit 1. An ssh gate still creates its
-worktree before it takes the heavy lock, which roadmap item 1169 tracks. `--auto` and the default helper choice read the disk without collecting, and a host's cache
-keeps it near its own `gc.min_free_size`, so they count a host as having the disk for a
-whole gate at `GATE_MIN_FREE_GB` free, 40 by default, and for a conformance half at
-`GATE_MIN_FREE_HALF_GB`, 20 by default. `gate.sh --hosts` marks a host that meets a floor
-as `room-for-whole` or `room-for-half`, and one that needs a collection before the floor as
-`whole-after-gc` or `half-after-gc`. Each ssh gate start on
-such a host evicts cache down to the floor, so a host whose cache budget and other data
-leave less than the floor free rebuilds more of the cache on each gate.
+Every gate enforces a disk floor — 110 GiB by default (the room a cold workspace build
+needs on a Boat worker), configurable via `GATE_NEED_CI_GB`, `GATE_NEED_CONF_GB` and
+`GATE_BOAT_MIN_FREE_GIB`. Before starting, the driver checks free space under each host's
+home directory and warns without collecting (another job or benchmark may hold the host).
+Under the heavy lock before building, an SSH host runs `mbx gc` with `gc.min_free_size`
+raised to the floor and a Boat worker runs its disk cleanup; if still short, the gate
+exits 4 with `disk-below-floor` in `outcome` (`outcome-conf` for the conformance half, and
+a merged exit 4 if every failed half hit the floor). SSH gates still create their worktree
+before acquiring the heavy lock ([ROADMAP.md](ROADMAP.md), item 1169).
+
+For scheduling without collecting, `--auto` and helper selection count a host as having
+room at `GATE_MIN_FREE_GB` (40 GiB) for a whole gate and `GATE_MIN_FREE_HALF_GB` (20 GiB)
+for a conformance half. `gate.sh --hosts` reports `room-for-whole` / `room-for-half` or
+`whole-after-gc` / `half-after-gc`; hosts that need GC on each start evict more cache
+between gates.
 
 Each run sets `CARGO_BUILD_JOBS` from its host's gate memory cap, the cap in GiB less one,
 halved, between 2 and 8. That gives 5 jobs at a Boat worker's 12 GiB cap, 6 jobs on a host
@@ -1221,8 +1212,10 @@ and the commit to the checks it calls for, and writes the choice and its reasons
 
 The run then calls `scripts/ci.sh` without `--force`, with the chosen tasks and with
 `--changed` when the packages are not the whole workspace, so mise's task cache on that
-host skips a chosen check whose inputs already passed there. The conformance steps that
-the selection leaves out appear in `steps.txt` as skipped. A commit without
+host skips a chosen check whose inputs already passed there. The gate's `test` task
+reuses only earlier gate passes on that host. Changes to the JUnit retention script
+invalidate those passes because it writes the cached origin line. The conformance steps
+that the selection leaves out appear in `steps.txt` as skipped. A commit without
 `select-checks.py`, or a run without a base, runs every check without `--force`. The Rust
 tests of the ci half also run the W3C, SHACL and ShEx suites whenever their packages are
 chosen, since the gate sets the suites' directories, so the conformance steps add the
@@ -1624,7 +1617,7 @@ package or cryptographic attestation is published.
 The candidate build runs Boxington in local mode and saves no store. A saved store took
 about 3.4 GB of the 10 GB repository cache and pushed the CI test build's caches out. It
 shortened the build step to about 22 min from the 35 min of an empty store on GitHub's
-runner, and item 1078 looks for a smaller store that keeps part of that gain.
+runner ([ROADMAP.md](ROADMAP.md), item 1078).
 
 The outer `server:artifact` task activates the same pinned wasm-bindgen CLI as
 `ui:wasm`, so the packer can record its version after the formatter task exits. A
@@ -1687,7 +1680,7 @@ never-started donor, checks the file and mounts it read-only; it installs no run
 libraries. The receipt records the donor, package, digest and archive identity. This
 fixture is not Debian's default trust policy. Each smoke container has a 1 GiB memory
 limit, no extra swap, a 256-process limit and one CPU. The wider platform matrix, signed
-provenance and published artifacts remain item 59 work.
+provenance and published artifacts remain open ([ROADMAP.md](ROADMAP.md), item 59).
 
 ## Engineering invariants
 
@@ -1842,9 +1835,9 @@ same path as before unless a manifest or the lockfile changed. In the same way,
 its path across a UI change, and `.#packages.x86_64-linux.sparkles-fmt-wasm` keeps its
 path across a change to any crate but the formatter's two.
 
-Per-crate Nix builds with crate2nix are under investigation in roadmap item 92 of
-[ROADMAP.md](ROADMAP.md) and in [X13](specs/X13-per-crate-nix-builds.md). Until that
-work shows a measured gain, the flake builds with crane.
+Per-crate Nix builds with crate2nix remain under investigation ([ROADMAP.md](ROADMAP.md),
+item 92, and [X13](specs/X13-per-crate-nix-builds.md)). Until that work shows a measured
+gain, the flake builds with crane.
 
 ## Third-party licenses
 
@@ -1940,60 +1933,54 @@ Shallow or missing history fails proof. The checker never fetches missing Git ob
 They do not become successful comparisons. The cheap task compares HTTP only.
 The standard CLI comparison requires the generated tree from the Rust test.
 
-The checker rejects removed operations, statuses, content types, parameters and
-members, newly required inputs, narrowed input types or enums, and widened response
-types or enums. It also flags removal of documented response values and guarantees,
-as X12 requires beyond formal output subtyping. Optional input and response-member
-additions pass. Local references, array items, nullable types and combined object
-schemas are traversed. Changed ambiguous unions, unknown constraints and security
-metadata require review. The checker does not prove general JSON Schema implication.
-Enum and const constraints apply together. Unknown validators are checked for changes
-in reachable local reference targets even when the reference text stays the same.
-One shared traversal distinguishes schemas, named schema maps, named data maps and
-literal values. Schema annotations are ignored only at schema positions. Names such
-as `default` and `$ref` remain data in `dependentRequired` and other named maps.
-Known schema positions follow local references, including recursive targets.
-Covered map value schemas are compared even when their reference text is unchanged.
-OpenAPI schemas and reference objects use their declared container positions, while
-example values, link parameters and OAuth scope names remain literal data.
-Specification Extensions in Paths, Responses and Callback objects retain an opaque
-extension context. Component names, property names, header names, callback names and
-OAuth scopes retain their meaning when they begin with `x-`.
-Ambiguous reference-shaped structures under unknown keywords fail as unsupported
-contexts. Dynamic references, schema resource identifiers and other schema dialects
-also fail explicitly. These refusals do not establish compatibility.
-The CLI tree records positional argument identities and indices, so exchanging two
-equally shaped arguments changes the contract.
-Existing real-response, protocol and authorization tests remain necessary.
+The checker rejects removed operations, statuses, content types, parameters and members,
+newly required inputs, narrowed input types or enums, widened response types or enums, and
+removed documented response values or guarantees. Optional input and response-member
+additions pass. Local references, array items, nullable types and combined object schemas
+are traversed, while changed ambiguous unions, unknown constraints and security metadata
+require review (the checker does not prove general JSON Schema implication).
+
+One shared traversal distinguishes schema positions, named schema maps, named data maps
+and literal values:
+* Enum and `const` constraints apply together, and unknown validators check reachable
+  local reference targets even when the `$ref` text is unchanged.
+* Schema annotations are ignored only at schema positions; keys such as `default` and
+  `$ref` stay literal data inside `dependentRequired` and other named data maps, and
+  example values, link parameters and OAuth scopes remain literal data.
+* Known schema positions follow recursive local references and compare covered map-value
+  schemas. Specification extensions (`x-`) keep opaque extension context in Paths,
+  Responses and Callbacks, while component, property, header, callback and OAuth scope
+  names retain their meaning.
+* Ambiguous reference-shaped structures under unknown keywords, dynamic references,
+  schema resource identifiers and other schema dialects fail explicitly rather than
+  passing silently.
+* The CLI contract records positional argument identities and indices, so swapping two
+  equally shaped arguments fails the check. Existing protocol, response and authorization
+  tests remain required alongside schema comparison.
 
 ### Reviewing differences and capturing baselines
 
 `docs/api-breaks.toml` accepts exact diagnostic identities with a baseline, target
-version, reason and Compatibility changelog anchor. Wildcards, stale entries and
+version, reason and Compatibility changelog anchor; wildcards, stale entries and
 unmatched diagnostics fail. Bootstrap changes use the `development` disposition and
-`unreleased-compatibility` anchor. Equal package versions in unreleased development
-do not establish a patch-release guarantee. An actual release baseline forbids that
-bootstrap disposition. A pre-1.0 minor break may use `break` with its release heading.
-A proven break cannot be relabeled as `nonbreaking-review`. Unknown cases may receive
-that disposition only after independent review establishes their compatibility.
-Patch and stable-minor breaks cannot be waived. Major-removal announcement evidence
-and release baseline updates remain part of Phase 4c.
+`unreleased-compatibility` anchor (forbidden against a released baseline). A pre-1.0 minor
+break may use `break` with its release heading; a proven break cannot be relabeled
+`nonbreaking-review` (reserved for unknown cases cleared by independent review), and patch
+or stable-minor breaks cannot be waived. Major-removal announcements and release baseline
+updates remain open in [ROADMAP.md](ROADMAP.md) (item 60).
 
 Baseline regeneration is never an automatic response to a failed comparison. The HTTP
-bootstrap must match the selected source's checked-in description byte for byte.
-The CLI baseline is captured from that same source with only the test serializer
-added. `SPARKLES_API_CAPTURE` supplies an absolute, new output filename to the
-`cli_docs::compatibility::capture_standard_cli_contract` test. Capture requires the
-complete default feature profile and refuses an existing output file. Review the
-source diff and captured file before installing it into the immutable inventory.
-Use a mise task that holds the managed-target lease for any capture workflow that
-launches compiled files separately. Ordinary `mbx test` holds its own lease.
+bootstrap must match the selected source's checked-in description byte for byte, and the
+CLI baseline is captured from that same source with only the test serializer added
+(`SPARKLES_API_CAPTURE` pointing to a new absolute path for
+`cli_docs::compatibility::capture_standard_cli_contract` under the full default feature
+profile). Review the source diff and captured file before installing it into the immutable
+inventory, and hold the managed-target lease if a capture launches compiled binaries
+outside `mbx test`.
 
-Phase 4a enforces HTTP and standard CLI development-baseline checks only. Rust and
-binding release comparisons remain Phase 4b. The HTTP guard starts from documented
-operations. Unused generated component declarations and their public `.d.ts` types
-remain part of the binding comparison gate in Phase 4b. Phase 4c retains CLI JSON and exit-code
-coverage, MCP and metrics guards, deprecation signaling, release baselines and
-installed-artifact checks. Roadmap item 60 stays open. Items 58 and 59 own publication
-and additional platforms. No released artifact or platform guarantee follows merely
-from passing a source-tree compatibility check.
+Current enforcement covers HTTP and standard CLI development baselines only. Rust and
+binding release comparisons (including unused generated component declarations and public
+`.d.ts` types), CLI JSON/exit-code coverage, MCP and metrics guards, deprecation headers
+and installed-artifact checks remain open in [ROADMAP.md](ROADMAP.md) (item 60; items 58
+and 59 own publication and additional platforms). Passing source-tree compatibility checks
+does not by itself guarantee released artifacts or platform coverage.

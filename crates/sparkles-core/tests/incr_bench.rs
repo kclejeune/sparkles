@@ -160,6 +160,9 @@ fn check_view(rt: &Runtime, s: &Store, key: &str, name: &str, text: &str, opts: 
         caller: None,
         deadline: None,
         aggregate_errors: None,
+        memory_parent: None,
+        memory_pool: None,
+        max_memory_bytes: None,
     });
     let fresh = sparql::query(
         s.snapshot(),
@@ -1160,6 +1163,122 @@ fn aggregate_pass_against_recompute() {
         metric(&format!("aggregates/{name}/pass-median"), pm, "ms", "lower");
         metric(&format!("aggregates/{name}/pass-p95"), p95, "ms", "lower");
         metric(&format!("aggregates/{name}/state"), state, "MiB", "lower");
+        rt.delete(name).unwrap();
+        rt.round(&s);
+    }
+}
+
+/// Ordered windows (spec F13 §4.4, item 419): the pass time of a view with `ORDER BY`
+/// and `LIMIT` against the query, which is what each commit cost when such a view was a
+/// `recompute` node. The commits are small: a person who takes the top age, a person at
+/// the top who loses their age, an age that changes anywhere, and a new member, so that
+/// the window loses rows often and its reserve refills.
+#[test]
+#[ignore]
+fn window_against_recompute() {
+    let n = people();
+    let s = store(n, None);
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    rt.set_host(Arc::new(OpenHost));
+    let windows: &[(&str, &str)] = &[
+        (
+            "oldest",
+            "SELECT ?p ?a WHERE { ?p :age ?a } ORDER BY DESC(?a) ?p LIMIT 10",
+        ),
+        (
+            "oldest-page-5",
+            "SELECT ?p ?a WHERE { ?p :age ?a } ORDER BY DESC(?a) ?p LIMIT 10 OFFSET 40",
+        ),
+        (
+            "largest-teams",
+            "SELECT ?t (COUNT(?p) AS ?n) WHERE { ?p :memberOf ?t } GROUP BY ?t ORDER BY DESC(?n) ?t LIMIT 10",
+        ),
+    ];
+    println!(
+        "| view | build ms | query ms | pass median ms | pass p95 ms | pass max ms | query / pass | state MiB |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
+    for (name, q) in windows {
+        let text = format!("{PREFIX}{q}");
+        let t = Instant::now();
+        rt.put(&s, name, ViewDef::table(text.clone())).unwrap();
+        rt.round(&s);
+        let build = t.elapsed().as_secs_f64() * 1e3;
+        let mut query = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let r = sparql::query(
+                s.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            std::hint::black_box(r.len());
+            query.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let mut passes = Vec::new();
+        for i in 0..400 {
+            let f = fresh();
+            let who = (f * 7919) % n;
+            let u = match i % 4 {
+                0 | 2 => {
+                    // the oldest person loses their age, so the window loses its first row
+                    let r = sparql::query(
+                        s.snapshot(),
+                        &format!(
+                            "{PREFIX}SELECT ?p WHERE {{ ?p :age ?a }} ORDER BY DESC(?a) ?p LIMIT 1"
+                        ),
+                        &QueryOptions::default(),
+                    )
+                    .unwrap();
+                    let d = r.rows().unwrap();
+                    let p = rows_of(&[(d.row(0).unwrap().values(), 1)])
+                        .pop()
+                        .expect("a person");
+                    format!("DELETE WHERE {{ {p} :age ?a }}")
+                }
+                1 => format!(
+                    "DELETE WHERE {{ :p{who} :age ?a }} ; INSERT DATA {{ :p{who} :age {} }}",
+                    20 + f % 50
+                ),
+                _ => format!(
+                    "INSERT DATA {{ :new{f} :memberOf :t{} . :new{f} :age 33 }}",
+                    who % 50
+                ),
+            };
+            upd(&s, &u);
+            let t = Instant::now();
+            rt.round(&s);
+            passes.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        check_view(
+            &rt,
+            &s,
+            &format!("window/{name}"),
+            name,
+            &text,
+            QueryOptions::default(),
+        );
+        let info = rt.get(&s, name).unwrap();
+        let qm = pct(&mut query, 0.5);
+        let pm = pct(&mut passes, 0.5);
+        let p95 = pct(&mut passes, 0.95);
+        let max = passes.iter().copied().fold(0.0, f64::max);
+        let state = info.state_bytes as f64 / (1 << 20) as f64;
+        println!(
+            "| {name} | {build:.1} | {qm:.1} | {pm:.3} | {p95:.3} | {max:.3} | {:.0} | {state:.1} |",
+            qm / pm,
+        );
+        metric(&format!("window/{name}/build"), build, "ms", "lower");
+        metric(&format!("window/{name}/query"), qm, "ms", "lower");
+        metric(&format!("window/{name}/pass-median"), pm, "ms", "lower");
+        metric(&format!("window/{name}/pass-p95"), p95, "ms", "lower");
+        // the largest pass is a refill, one per `max(k, 100)` deletions, so it is
+        // printed and not recorded as a metric a gate could compare
+        metric(&format!("window/{name}/state"), state, "MiB", "lower");
         rt.delete(name).unwrap();
         rt.round(&s);
     }

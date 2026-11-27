@@ -237,14 +237,14 @@ impl AggregateErrorsSetting {
     /// under it.
     pub fn set(&self, m: AggregateErrors) -> Result<()> {
         self.ds.store().set_aggregate_errors_setting(Some(m))?;
-        self.ds.inner.views.kick();
+        self.ds.inner.views.mode_changed();
         Ok(())
     }
 
     /// Remove the dataset's own reading, so that the store's option applies.
     pub fn reset(&self) -> Result<()> {
         self.ds.store().set_aggregate_errors_setting(None)?;
-        self.ds.inner.views.kick();
+        self.ds.inner.views.mode_changed();
         Ok(())
     }
 

@@ -1,14 +1,148 @@
 //! The OWL 2 structural specification as Rust values: entities, property and class
 //! expressions, data ranges, axioms, annotations and the ontology header.
 //!
-//! Abstract classes of the specification are enums and n-ary operands are sets, so two
-//! values are equal exactly when the specification calls them structurally equivalent.
-//! Sets are `BTreeSet`s, which also gives every value a stable order for output.
+//! Abstract classes of the specification are enums and n-ary operands are sets (or sorted
+//! [`Multiset`]s for disjointness and inequality axioms, where repeated operands constrain
+//! the repeated member rather than collapsing), so two values are equal exactly when the
+//! specification calls them structurally equivalent and every value has a stable order for
+//! output.
 
 use crate::vocab;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
+
+/// A canonical, order-independent multiset of operands.
+///
+/// Elements are kept in sorted order so structural equality, ordering, hashing and
+/// serialized output do not depend on input order, while repeated occurrences are
+/// preserved. Disjointness and inequality axioms use this instead of `BTreeSet` because
+/// repeating an operand (such as `DisjointClasses(:A :A)` or `DisjointUnion(:C :A :A)`)
+/// carries logical meaning that deduplication would lose.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Multiset<T>(Vec<T>);
+
+impl<T> Multiset<T> {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.0.iter()
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    pub fn into_vec(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<T: Ord> Multiset<T> {
+    pub fn insert(&mut self, value: T) {
+        let pos = match self.0.binary_search(&value) {
+            Ok(i) | Err(i) => i,
+        };
+        self.0.insert(pos, value);
+    }
+
+    pub fn contains(&self, value: &T) -> bool {
+        self.0.binary_search(value).is_ok()
+    }
+
+    pub fn count(&self, value: &T) -> usize {
+        let start = self.0.partition_point(|x| x < value);
+        let end = self.0.partition_point(|x| x <= value);
+        end - start
+    }
+}
+
+impl<T: Eq> Multiset<T> {
+    pub fn has_duplicates(&self) -> bool {
+        self.0.windows(2).any(|w| w[0] == w[1])
+    }
+}
+
+impl<T: Ord> From<Vec<T>> for Multiset<T> {
+    fn from(mut values: Vec<T>) -> Self {
+        values.sort();
+        Self(values)
+    }
+}
+
+impl<T: Ord, const N: usize> From<[T; N]> for Multiset<T> {
+    fn from(values: [T; N]) -> Self {
+        Self::from(Vec::from(values))
+    }
+}
+
+impl<T> From<BTreeSet<T>> for Multiset<T> {
+    fn from(values: BTreeSet<T>) -> Self {
+        Self(values.into_iter().collect())
+    }
+}
+
+impl<T: Ord> FromIterator<T> for Multiset<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::from(iter.into_iter().collect::<Vec<_>>())
+    }
+}
+
+impl<T: Ord> Extend<T> for Multiset<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        let mut incoming: Vec<T> = iter.into_iter().collect();
+        if incoming.is_empty() {
+            return;
+        }
+        if self.0.is_empty() {
+            incoming.sort();
+            self.0 = incoming;
+        } else {
+            let mut v = std::mem::take(&mut self.0);
+            v.append(&mut incoming);
+            v.sort();
+            self.0 = v;
+        }
+    }
+}
+
+impl<T> IntoIterator for Multiset<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Multiset<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<T> AsRef<[T]> for Multiset<T> {
+    fn as_ref(&self) -> &[T] {
+        &self.0
+    }
+}
 
 /// An IRI.
 pub type Iri = oxrdf::NamedNode;
@@ -560,12 +694,12 @@ pub enum AxiomKind {
 
     SubClassOf(ClassExpression, ClassExpression),
     EquivalentClasses(BTreeSet<ClassExpression>),
-    DisjointClasses(BTreeSet<ClassExpression>),
-    DisjointUnion(Class, BTreeSet<ClassExpression>),
+    DisjointClasses(Multiset<ClassExpression>),
+    DisjointUnion(Class, Multiset<ClassExpression>),
 
     SubObjectPropertyOf(SubObjectPropertyExpression, ObjectPropertyExpression),
     EquivalentObjectProperties(BTreeSet<ObjectPropertyExpression>),
-    DisjointObjectProperties(BTreeSet<ObjectPropertyExpression>),
+    DisjointObjectProperties(Multiset<ObjectPropertyExpression>),
     InverseObjectProperties(ObjectPropertyExpression, ObjectPropertyExpression),
     ObjectPropertyDomain(ObjectPropertyExpression, ClassExpression),
     ObjectPropertyRange(ObjectPropertyExpression, ClassExpression),
@@ -579,7 +713,7 @@ pub enum AxiomKind {
 
     SubDataPropertyOf(DataProperty, DataProperty),
     EquivalentDataProperties(BTreeSet<DataProperty>),
-    DisjointDataProperties(BTreeSet<DataProperty>),
+    DisjointDataProperties(Multiset<DataProperty>),
     DataPropertyDomain(DataProperty, ClassExpression),
     DataPropertyRange(DataProperty, DataRange),
     FunctionalDataProperty(DataProperty),
@@ -592,7 +726,7 @@ pub enum AxiomKind {
     ),
 
     SameIndividual(BTreeSet<Individual>),
-    DifferentIndividuals(BTreeSet<Individual>),
+    DifferentIndividuals(Multiset<Individual>),
     ClassAssertion(ClassExpression, Individual),
     ObjectPropertyAssertion(ObjectPropertyExpression, Individual, Individual),
     NegativeObjectPropertyAssertion(ObjectPropertyExpression, Individual, Individual),
@@ -848,6 +982,24 @@ impl Axiom {
         AxiomKind::DisjointClasses(cs.into_iter().collect()).into()
     }
 
+    pub fn disjoint_union(c: Class, cs: impl IntoIterator<Item = ClassExpression>) -> Axiom {
+        AxiomKind::DisjointUnion(c, cs.into_iter().collect()).into()
+    }
+
+    pub fn disjoint_object_properties(
+        ps: impl IntoIterator<Item = ObjectPropertyExpression>,
+    ) -> Axiom {
+        AxiomKind::DisjointObjectProperties(ps.into_iter().collect()).into()
+    }
+
+    pub fn disjoint_data_properties(ps: impl IntoIterator<Item = DataProperty>) -> Axiom {
+        AxiomKind::DisjointDataProperties(ps.into_iter().collect()).into()
+    }
+
+    pub fn different_individuals(is: impl IntoIterator<Item = Individual>) -> Axiom {
+        AxiomKind::DifferentIndividuals(is.into_iter().collect()).into()
+    }
+
     pub fn class_assertion(c: impl Into<ClassExpression>, i: Individual) -> Axiom {
         AxiomKind::ClassAssertion(c.into(), i).into()
     }
@@ -938,6 +1090,62 @@ impl Axiom {
                 }]
             }
             _ => vec![self.clone()],
+        }
+    }
+
+    /// Visit each normal form of this axiom without cloning `self` in the common case,
+    /// stopping early if `f` returns `Ok(false)` or `Err(_)`.
+    pub fn for_each_normal_form<E>(
+        &self,
+        mut f: impl FnMut(std::borrow::Cow<'_, Axiom>) -> Result<bool, E>,
+    ) -> Result<bool, E> {
+        fn visit_pairs<T: Clone + Ord, E>(
+            set: &BTreeSet<T>,
+            annotations: &BTreeSet<Annotation>,
+            make: impl Fn(BTreeSet<T>) -> AxiomKind,
+            f: &mut impl FnMut(std::borrow::Cow<'_, Axiom>) -> Result<bool, E>,
+        ) -> Result<bool, E> {
+            let mut it = set.iter();
+            let Some(mut prev) = it.next() else {
+                return Ok(true);
+            };
+            for next in it {
+                let ax = Axiom {
+                    kind: make([prev.clone(), next.clone()].into_iter().collect()),
+                    annotations: annotations.clone(),
+                };
+                if !f(std::borrow::Cow::Owned(ax))? {
+                    return Ok(false);
+                }
+                prev = next;
+            }
+            Ok(true)
+        }
+        let a = &self.annotations;
+        match &self.kind {
+            AxiomKind::EquivalentClasses(s) if s.len() > 2 => {
+                visit_pairs(s, a, AxiomKind::EquivalentClasses, &mut f)
+            }
+            AxiomKind::EquivalentObjectProperties(s) if s.len() > 2 => {
+                visit_pairs(s, a, AxiomKind::EquivalentObjectProperties, &mut f)
+            }
+            AxiomKind::EquivalentDataProperties(s) if s.len() > 2 => {
+                visit_pairs(s, a, AxiomKind::EquivalentDataProperties, &mut f)
+            }
+            AxiomKind::SameIndividual(s) if s.len() > 2 => {
+                visit_pairs(s, a, AxiomKind::SameIndividual, &mut f)
+            }
+            AxiomKind::ObjectPropertyAssertion(ObjectPropertyExpression::InverseOf(p), x, y) => {
+                f(std::borrow::Cow::Owned(Axiom {
+                    kind: AxiomKind::ObjectPropertyAssertion(
+                        ObjectPropertyExpression::Property(p.clone()),
+                        y.clone(),
+                        x.clone(),
+                    ),
+                    annotations: a.clone(),
+                }))
+            }
+            _ => f(std::borrow::Cow::Borrowed(self)),
         }
     }
 }
@@ -1109,7 +1317,8 @@ impl Signature {
                 self.ce(a);
                 self.ce(b);
             }
-            K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs.iter().for_each(|c| self.ce(c)),
+            K::EquivalentClasses(cs) => cs.iter().for_each(|c| self.ce(c)),
+            K::DisjointClasses(cs) => cs.iter().for_each(|c| self.ce(c)),
             K::DisjointUnion(c, cs) => {
                 self.class(c);
                 cs.iter().for_each(|c| self.ce(c));
@@ -1121,9 +1330,8 @@ impl Signature {
                 }
                 self.ope(sup);
             }
-            K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
-                ps.iter().for_each(|p| self.ope(p))
-            }
+            K::EquivalentObjectProperties(ps) => ps.iter().for_each(|p| self.ope(p)),
+            K::DisjointObjectProperties(ps) => ps.iter().for_each(|p| self.ope(p)),
             K::InverseObjectProperties(a, b) => {
                 self.ope(a);
                 self.ope(b);
@@ -1143,9 +1351,8 @@ impl Signature {
                 self.dp(a);
                 self.dp(b);
             }
-            K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
-                ps.iter().for_each(|p| self.dp(p))
-            }
+            K::EquivalentDataProperties(ps) => ps.iter().for_each(|p| self.dp(p)),
+            K::DisjointDataProperties(ps) => ps.iter().for_each(|p| self.dp(p)),
             K::DataPropertyDomain(p, c) => {
                 self.dp(p);
                 self.ce(c);
@@ -1164,9 +1371,8 @@ impl Signature {
                 ops.iter().for_each(|p| self.ope(p));
                 dps.iter().for_each(|p| self.dp(p));
             }
-            K::SameIndividual(is) | K::DifferentIndividuals(is) => {
-                is.iter().for_each(|i| self.ind(i))
-            }
+            K::SameIndividual(is) => is.iter().for_each(|i| self.ind(i)),
+            K::DifferentIndividuals(is) => is.iter().for_each(|i| self.ind(i)),
             K::ClassAssertion(c, i) => {
                 self.ce(c);
                 self.ind(i);
@@ -1196,6 +1402,436 @@ impl Signature {
             }
         }
     }
+
+    /// Zero-allocation visitor invoking `on_class` for every `Class` and `on_ind` for every
+    /// `NamedIndividual` mentioned anywhere in `k` (excluding annotations).
+    pub(crate) fn visit_classes_and_individuals<'a>(
+        k: &'a AxiomKind,
+        on_class: &mut impl FnMut(&'a Class),
+        on_ind: &mut impl FnMut(&'a NamedIndividual),
+    ) {
+        fn visit_ind<'a>(i: &'a Individual, on_ind: &mut impl FnMut(&'a NamedIndividual)) {
+            if let Individual::Named(n) = i {
+                on_ind(n);
+            }
+        }
+        fn visit_ce<'a>(
+            c: &'a ClassExpression,
+            on_class: &mut impl FnMut(&'a Class),
+            on_ind: &mut impl FnMut(&'a NamedIndividual),
+        ) {
+            use ClassExpression as C;
+            match c {
+                C::Class(c) => on_class(c),
+                C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+                    for x in cs {
+                        visit_ce(x, on_class, on_ind);
+                    }
+                }
+                C::ObjectComplementOf(c)
+                | C::ObjectSomeValuesFrom(_, c)
+                | C::ObjectAllValuesFrom(_, c) => visit_ce(c, on_class, on_ind),
+                C::ObjectOneOf(is) => {
+                    for i in is {
+                        visit_ind(i, on_ind);
+                    }
+                }
+                C::ObjectHasValue(_, i) => visit_ind(i, on_ind),
+                C::ObjectMinCardinality(_, _, Some(c))
+                | C::ObjectMaxCardinality(_, _, Some(c))
+                | C::ObjectExactCardinality(_, _, Some(c)) => visit_ce(c, on_class, on_ind),
+                C::ObjectHasSelf(_)
+                | C::ObjectMinCardinality(_, _, None)
+                | C::ObjectMaxCardinality(_, _, None)
+                | C::ObjectExactCardinality(_, _, None)
+                | C::DataSomeValuesFrom(_, _)
+                | C::DataAllValuesFrom(_, _)
+                | C::DataHasValue(_, _)
+                | C::DataMinCardinality(_, _, _)
+                | C::DataMaxCardinality(_, _, _)
+                | C::DataExactCardinality(_, _, _) => {}
+            }
+        }
+        use AxiomKind as K;
+        match k {
+            K::Declaration(Entity::Class(c)) => on_class(c),
+            K::Declaration(Entity::NamedIndividual(n)) => on_ind(n),
+            K::SubClassOf(a, b) => {
+                visit_ce(a, on_class, on_ind);
+                visit_ce(b, on_class, on_ind);
+            }
+            K::EquivalentClasses(cs) => {
+                for c in cs {
+                    visit_ce(c, on_class, on_ind);
+                }
+            }
+            K::DisjointClasses(cs) => {
+                for c in cs {
+                    visit_ce(c, on_class, on_ind);
+                }
+            }
+            K::DisjointUnion(c, cs) => {
+                on_class(c);
+                for x in cs {
+                    visit_ce(x, on_class, on_ind);
+                }
+            }
+            K::ObjectPropertyDomain(_, c)
+            | K::ObjectPropertyRange(_, c)
+            | K::DataPropertyDomain(_, c)
+            | K::HasKey(c, _, _) => visit_ce(c, on_class, on_ind),
+            K::SameIndividual(is) => {
+                for i in is {
+                    visit_ind(i, on_ind);
+                }
+            }
+            K::DifferentIndividuals(is) => {
+                for i in is {
+                    visit_ind(i, on_ind);
+                }
+            }
+            K::ClassAssertion(c, i) => {
+                visit_ce(c, on_class, on_ind);
+                visit_ind(i, on_ind);
+            }
+            K::ObjectPropertyAssertion(_, a, b) | K::NegativeObjectPropertyAssertion(_, a, b) => {
+                visit_ind(a, on_ind);
+                visit_ind(b, on_ind);
+            }
+            K::DataPropertyAssertion(_, a, _) | K::NegativeDataPropertyAssertion(_, a, _) => {
+                visit_ind(a, on_ind);
+            }
+            K::Declaration(_)
+            | K::SubObjectPropertyOf(_, _)
+            | K::EquivalentObjectProperties(_)
+            | K::DisjointObjectProperties(_)
+            | K::InverseObjectProperties(_, _)
+            | K::FunctionalObjectProperty(_)
+            | K::InverseFunctionalObjectProperty(_)
+            | K::ReflexiveObjectProperty(_)
+            | K::IrreflexiveObjectProperty(_)
+            | K::SymmetricObjectProperty(_)
+            | K::AsymmetricObjectProperty(_)
+            | K::TransitiveObjectProperty(_)
+            | K::SubDataPropertyOf(_, _)
+            | K::EquivalentDataProperties(_)
+            | K::DisjointDataProperties(_)
+            | K::DataPropertyRange(_, _)
+            | K::FunctionalDataProperty(_)
+            | K::DatatypeDefinition(_, _)
+            | K::AnnotationAssertion(_, _, _)
+            | K::SubAnnotationPropertyOf(_, _)
+            | K::AnnotationPropertyDomain(_, _)
+            | K::AnnotationPropertyRange(_, _) => {}
+        }
+    }
+}
+
+/// Borrowed entity or leaf visited during an allocation-free walk of an axiom's
+/// structure. Matches [`Signature::axiom`] entity classification while also visiting
+/// anonymous individuals and simple literals so callers can poll cooperatively inside
+/// wide n-ary axioms.
+pub(crate) enum EntityRef<'a> {
+    Class(&'a Class),
+    Datatype(&'a str),
+    ObjectProperty(&'a ObjectProperty),
+    DataProperty(&'a DataProperty),
+    AnnotationProperty(&'a AnnotationProperty),
+    NamedIndividual(&'a NamedIndividual),
+    AnonymousIndividual,
+    OtherLeaf,
+}
+
+impl EntityRef<'_> {
+    #[inline]
+    pub(crate) fn iri_str(&self) -> Option<&str> {
+        match self {
+            EntityRef::Class(e) => Some(e.as_str()),
+            EntityRef::Datatype(s) => Some(s),
+            EntityRef::ObjectProperty(e) => Some(e.as_str()),
+            EntityRef::DataProperty(e) => Some(e.as_str()),
+            EntityRef::AnnotationProperty(e) => Some(e.as_str()),
+            EntityRef::NamedIndividual(e) => Some(e.as_str()),
+            EntityRef::AnonymousIndividual | EntityRef::OtherLeaf => None,
+        }
+    }
+}
+
+fn visit_entity<'a, E>(
+    e: &'a Entity,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    match e {
+        Entity::Class(c) => f(EntityRef::Class(c)),
+        Entity::Datatype(d) => f(EntityRef::Datatype(d.as_str())),
+        Entity::ObjectProperty(p) => f(EntityRef::ObjectProperty(p)),
+        Entity::DataProperty(p) => f(EntityRef::DataProperty(p)),
+        Entity::AnnotationProperty(p) => f(EntityRef::AnnotationProperty(p)),
+        Entity::NamedIndividual(i) => f(EntityRef::NamedIndividual(i)),
+    }
+}
+
+fn visit_ind<'a, E>(
+    i: &'a Individual,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    match i {
+        Individual::Named(n) => f(EntityRef::NamedIndividual(n)),
+        Individual::Anonymous(_) => f(EntityRef::AnonymousIndividual),
+    }
+}
+
+fn visit_lit<'a, E>(
+    l: &'a Literal,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    if l.language().is_none() && l.datatype() != vocab::XSD_STRING {
+        f(EntityRef::Datatype(l.datatype()))
+    } else {
+        f(EntityRef::OtherLeaf)
+    }
+}
+
+fn visit_dr<'a, E>(
+    r: &'a DataRange,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    match r {
+        DataRange::Datatype(d) => f(EntityRef::Datatype(d.as_str())),
+        DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => {
+            for r in rs {
+                visit_dr(r, f)?;
+            }
+            Ok(())
+        }
+        DataRange::ComplementOf(r) => visit_dr(r, f),
+        DataRange::OneOf(ls) => {
+            for l in ls {
+                visit_lit(l, f)?;
+            }
+            Ok(())
+        }
+        DataRange::DatatypeRestriction(d, fs) => {
+            f(EntityRef::Datatype(d.as_str()))?;
+            for fr in fs {
+                visit_lit(&fr.value, f)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn visit_ce<'a, E>(
+    c: &'a ClassExpression,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    use ClassExpression as C;
+    match c {
+        C::Class(c) => f(EntityRef::Class(c)),
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+            for c in cs {
+                visit_ce(c, f)?;
+            }
+            Ok(())
+        }
+        C::ObjectComplementOf(c) => visit_ce(c, f),
+        C::ObjectOneOf(is) => {
+            for i in is {
+                visit_ind(i, f)?;
+            }
+            Ok(())
+        }
+        C::ObjectSomeValuesFrom(p, c) | C::ObjectAllValuesFrom(p, c) => {
+            f(EntityRef::ObjectProperty(p.named()))?;
+            visit_ce(c, f)
+        }
+        C::ObjectHasValue(p, i) => {
+            f(EntityRef::ObjectProperty(p.named()))?;
+            visit_ind(i, f)
+        }
+        C::ObjectHasSelf(p) => f(EntityRef::ObjectProperty(p.named())),
+        C::ObjectMinCardinality(_, p, c)
+        | C::ObjectMaxCardinality(_, p, c)
+        | C::ObjectExactCardinality(_, p, c) => {
+            f(EntityRef::ObjectProperty(p.named()))?;
+            if let Some(c) = c {
+                visit_ce(c, f)?;
+            }
+            Ok(())
+        }
+        C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => {
+            for p in ps {
+                f(EntityRef::DataProperty(p))?;
+            }
+            visit_dr(r, f)
+        }
+        C::DataHasValue(p, l) => {
+            f(EntityRef::DataProperty(p))?;
+            visit_lit(l, f)
+        }
+        C::DataMinCardinality(_, p, r)
+        | C::DataMaxCardinality(_, p, r)
+        | C::DataExactCardinality(_, p, r) => {
+            f(EntityRef::DataProperty(p))?;
+            if let Some(r) = r {
+                visit_dr(r, f)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Walks every entity and leaf in `k` without allocating or cloning IRIs.
+pub(crate) fn visit_axiom_entities<'a, E>(
+    k: &'a AxiomKind,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    use AxiomKind as K;
+    match k {
+        K::Declaration(e) => visit_entity(e, f),
+        K::SubClassOf(a, b) => {
+            visit_ce(a, f)?;
+            visit_ce(b, f)
+        }
+        K::EquivalentClasses(cs) => {
+            for c in cs {
+                visit_ce(c, f)?;
+            }
+            Ok(())
+        }
+        K::DisjointClasses(cs) => {
+            for c in cs {
+                visit_ce(c, f)?;
+            }
+            Ok(())
+        }
+        K::DisjointUnion(c, cs) => {
+            f(EntityRef::Class(c))?;
+            for c in cs {
+                visit_ce(c, f)?;
+            }
+            Ok(())
+        }
+        K::SubObjectPropertyOf(sub, sup) => {
+            match sub {
+                SubObjectPropertyExpression::Expression(p) => {
+                    f(EntityRef::ObjectProperty(p.named()))?;
+                }
+                SubObjectPropertyExpression::Chain(ps) => {
+                    for p in ps {
+                        f(EntityRef::ObjectProperty(p.named()))?;
+                    }
+                }
+            }
+            f(EntityRef::ObjectProperty(sup.named()))
+        }
+        K::EquivalentObjectProperties(ps) => {
+            for p in ps {
+                f(EntityRef::ObjectProperty(p.named()))?;
+            }
+            Ok(())
+        }
+        K::DisjointObjectProperties(ps) => {
+            for p in ps {
+                f(EntityRef::ObjectProperty(p.named()))?;
+            }
+            Ok(())
+        }
+        K::InverseObjectProperties(a, b) => {
+            f(EntityRef::ObjectProperty(a.named()))?;
+            f(EntityRef::ObjectProperty(b.named()))
+        }
+        K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
+            f(EntityRef::ObjectProperty(p.named()))?;
+            visit_ce(c, f)
+        }
+        K::FunctionalObjectProperty(p)
+        | K::InverseFunctionalObjectProperty(p)
+        | K::ReflexiveObjectProperty(p)
+        | K::IrreflexiveObjectProperty(p)
+        | K::SymmetricObjectProperty(p)
+        | K::AsymmetricObjectProperty(p)
+        | K::TransitiveObjectProperty(p) => f(EntityRef::ObjectProperty(p.named())),
+        K::SubDataPropertyOf(a, b) => {
+            f(EntityRef::DataProperty(a))?;
+            f(EntityRef::DataProperty(b))
+        }
+        K::EquivalentDataProperties(ps) => {
+            for p in ps {
+                f(EntityRef::DataProperty(p))?;
+            }
+            Ok(())
+        }
+        K::DisjointDataProperties(ps) => {
+            for p in ps {
+                f(EntityRef::DataProperty(p))?;
+            }
+            Ok(())
+        }
+        K::DataPropertyDomain(p, c) => {
+            f(EntityRef::DataProperty(p))?;
+            visit_ce(c, f)
+        }
+        K::DataPropertyRange(p, r) => {
+            f(EntityRef::DataProperty(p))?;
+            visit_dr(r, f)
+        }
+        K::FunctionalDataProperty(p) => f(EntityRef::DataProperty(p)),
+        K::DatatypeDefinition(d, r) => {
+            f(EntityRef::Datatype(d.as_str()))?;
+            visit_dr(r, f)
+        }
+        K::HasKey(c, ops, dps) => {
+            visit_ce(c, f)?;
+            for p in ops {
+                f(EntityRef::ObjectProperty(p.named()))?;
+            }
+            for p in dps {
+                f(EntityRef::DataProperty(p))?;
+            }
+            Ok(())
+        }
+        K::SameIndividual(is) => {
+            for i in is {
+                visit_ind(i, f)?;
+            }
+            Ok(())
+        }
+        K::DifferentIndividuals(is) => {
+            for i in is {
+                visit_ind(i, f)?;
+            }
+            Ok(())
+        }
+        K::ClassAssertion(c, i) => {
+            visit_ce(c, f)?;
+            visit_ind(i, f)
+        }
+        K::ObjectPropertyAssertion(p, a, b) | K::NegativeObjectPropertyAssertion(p, a, b) => {
+            f(EntityRef::ObjectProperty(p.named()))?;
+            visit_ind(a, f)?;
+            visit_ind(b, f)
+        }
+        K::DataPropertyAssertion(p, a, l) | K::NegativeDataPropertyAssertion(p, a, l) => {
+            f(EntityRef::DataProperty(p))?;
+            visit_ind(a, f)?;
+            visit_lit(l, f)
+        }
+        K::AnnotationAssertion(p, _, v) => {
+            f(EntityRef::AnnotationProperty(p))?;
+            if let AnnotationValue::Literal(l) = v {
+                visit_lit(l, f)?;
+            }
+            Ok(())
+        }
+        K::SubAnnotationPropertyOf(a, b) => {
+            f(EntityRef::AnnotationProperty(a))?;
+            f(EntityRef::AnnotationProperty(b))
+        }
+        K::AnnotationPropertyDomain(p, _) | K::AnnotationPropertyRange(p, _) => {
+            f(EntityRef::AnnotationProperty(p))
+        }
+    }
 }
 
 /// The ontology header (structural specification §3): IRI, version IRI, direct imports
@@ -1206,4 +1842,96 @@ pub struct Header {
     pub version_iri: Option<Iri>,
     pub imports: BTreeSet<Iri>,
     pub annotations: BTreeSet<Annotation>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiset_extend_preserves_sorted_invariant_on_iterator_panic() {
+        struct PanicAfterOne(bool);
+        impl Iterator for PanicAfterOne {
+            type Item = i32;
+            fn next(&mut self) -> Option<Self::Item> {
+                if !self.0 {
+                    self.0 = true;
+                    Some(2)
+                } else {
+                    panic!("iterator failed mid-extend");
+                }
+            }
+        }
+
+        let mut ms = Multiset::from([2, 4]);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ms.extend(PanicAfterOne(false));
+        }));
+        assert!(res.is_err());
+        assert!(
+            ms.as_slice().is_sorted(),
+            "Multiset must remain sorted after iterator panic, got {:?}",
+            ms.as_slice()
+        );
+        assert_eq!(ms, Multiset::from(ms.as_slice().to_vec()));
+        assert_eq!(
+            ms.has_duplicates(),
+            ms.as_slice().windows(2).any(|w| w[0] == w[1])
+        );
+    }
+
+    #[test]
+    fn multiset_extend_preserves_sorted_invariant_on_ord_panic() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        #[derive(Clone, Debug)]
+        struct PanicOrd {
+            value: i32,
+            should_panic: Arc<AtomicBool>,
+        }
+
+        impl PartialEq for PanicOrd {
+            fn eq(&self, other: &Self) -> bool {
+                self.value == other.value
+            }
+        }
+        impl Eq for PanicOrd {}
+        impl PartialOrd for PanicOrd {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for PanicOrd {
+            fn cmp(&self, other: &Self) -> Ordering {
+                if self.should_panic.load(AtomicOrdering::SeqCst) {
+                    panic!("Ord::cmp panicked during extend");
+                }
+                self.value.cmp(&other.value)
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let item = |value| PanicOrd {
+            value,
+            should_panic: Arc::clone(&flag),
+        };
+        let mut ms = Multiset::from([item(2), item(4)]);
+        flag.store(true, AtomicOrdering::SeqCst);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ms.extend([item(2)]);
+        }));
+        flag.store(false, AtomicOrdering::SeqCst);
+        assert!(res.is_err());
+        assert!(
+            ms.as_slice().is_sorted(),
+            "Multiset must remain sorted after Ord panic, got {:?}",
+            ms.as_slice()
+        );
+        assert_eq!(ms, Multiset::from(ms.as_slice().to_vec()));
+        assert_eq!(
+            ms.has_duplicates(),
+            ms.as_slice().windows(2).any(|w| w[0] == w[1])
+        );
+    }
 }

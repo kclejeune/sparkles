@@ -4,7 +4,9 @@
 //! random sequences of edits over generated ontologies and the fixtures.
 
 use proptest::prelude::*;
-use sparkles_owl::classify::{Classification, Classifier, Excluded, Limits};
+use sparkles_owl::classify::{
+    Classification, Classifier, Consistency, Excluded, Expansion, Limits,
+};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
 
@@ -31,8 +33,20 @@ fn limits(threads: usize) -> Limits {
 }
 
 /// What two classifications must share: every subsumption between classes, the
-/// unsatisfiable classes, the consistency and the completeness.
-fn answer(o: &Classification) -> (Vec<(String, String)>, Vec<String>, bool, bool) {
+/// unsatisfiable classes, the legacy and full consistency status, overall and taken
+/// completeness, and the incomplete class list.
+#[allow(clippy::type_complexity)]
+fn answer(
+    o: &Classification,
+) -> (
+    Vec<(String, String)>,
+    Vec<String>,
+    bool,
+    Consistency,
+    bool,
+    bool,
+    Vec<String>,
+) {
     let t = &o.taxonomy;
     let cs: Vec<Class> = t.classes().cloned().collect();
     let mut pairs = Vec::new();
@@ -46,7 +60,20 @@ fn answer(o: &Classification) -> (Vec<(String, String)>, Vec<String>, bool, bool
     pairs.sort();
     let mut unsat: Vec<String> = t.unsatisfiable().map(|c| c.as_str().to_string()).collect();
     unsat.sort();
-    (pairs, unsat, o.consistent, o.complete)
+    let incomplete: Vec<String> = o
+        .incomplete
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect();
+    (
+        pairs,
+        unsat,
+        o.consistent,
+        o.consistency,
+        o.complete,
+        o.complete_for_taken,
+        incomplete,
+    )
 }
 
 /// Classifies the kept classifier and one that starts again over `held`, and checks
@@ -1197,13 +1224,16 @@ const BOUNDED: [&str; 2] = [UNIVERSALS, UNIONS];
 
 #[test]
 fn a_kept_run_that_passes_its_memory_budget_starts_again_in_full() {
-    // whether a base's kept run peaks above the least budget of a fresh run depends on
-    // a few bytes of accounting, so the test asks that one base's kept run at least
-    // passes it, and that every kept run answers as the fresh one does
-    let mut restarted = 0;
+    // Pad each base with unrelated classes so holding the last index beside the new
+    // one cleanly exceeds the least budget of a fresh run on both the Horn and Tier D
+    // bases, rather than depending on a few bytes of transient scratch accounting.
+    let pad: String = (0..64)
+        .map(|i| format!("SubClassOf(:Pad{i} :L)\n"))
+        .collect();
     for base in BOUNDED {
+        let padded = format!("{base}\n{pad}");
         let held = {
-            let mut held = axioms(base);
+            let mut held = axioms(&padded);
             held.extend(axioms("SubClassOf(:M :K)"));
             held
         };
@@ -1233,8 +1263,9 @@ fn a_kept_run_that_passes_its_memory_budget_starts_again_in_full() {
         let want = fresh(high).unwrap();
         // a kept run holds more than that, the last index among it, and answers as the
         // classifier that starts again does
+        let mut restarted = 0;
         for more in [0usize, 64, 256, 1024, 4096] {
-            let (mut k, _) = started(base, 1);
+            let (mut k, _) = started(&padded, 1);
             k.add(&axioms("SubClassOf(:M :K)"));
             let out = k
                 .classify(&Limits {
@@ -1252,11 +1283,11 @@ fn a_kept_run_that_passes_its_memory_budget_starts_again_in_full() {
             let out = k.classify(&limits(1)).unwrap();
             assert!(out.stats.incremental);
         }
+        assert!(
+            restarted > 0,
+            "no kept run passed the budget of a fresh one"
+        );
     }
-    assert!(
-        restarted > 0,
-        "no kept run passed the budget of a fresh one"
-    );
 }
 
 #[test]
@@ -1431,4 +1462,1598 @@ fn a_property_that_gains_its_first_link_gets_its_transitions_back() {
             same_as_fresh(&mut k, &held, threads, "after the leaf left");
         }
     }
+}
+
+fn eager_limits(threads: usize) -> Limits {
+    Limits {
+        threads,
+        expansion: Expansion::Eager,
+        ..Limits::default()
+    }
+}
+
+fn same_as_fresh_with(
+    k: &mut Classifier,
+    held: &[Axiom],
+    lim: &Limits,
+    at: &str,
+) -> Classification {
+    let out = k.classify(lim).unwrap();
+    let mut fresh = Classifier::of(held);
+    let want = fresh.classify(lim).unwrap();
+    assert_eq!(answer(&out), answer(&want), "the answers differ {at}");
+    assert_eq!(out.taxonomy, want.taxonomy, "the taxonomies differ {at}");
+    assert_eq!(
+        k.excluded(),
+        fresh.excluded(),
+        "the axioms left out differ {at}"
+    );
+    out
+}
+
+fn started_eager(base: &str, threads: usize) -> (Classifier, Vec<Axiom>) {
+    let held = axioms(base);
+    let lim = eager_limits(threads);
+    let mut k = Classifier::of(&held);
+    let out = same_as_fresh_with(&mut k, &held, &lim, "at the start (eager)");
+    assert!(!out.stats.incremental);
+    assert!(k.excluded().is_empty(), "{:?}", k.excluded());
+    (k, held)
+}
+
+#[test]
+fn eager_unsat_conjunction_does_not_spuriously_clear_first_member() {
+    // `:A` is interned before `:B`, so the eager conjunction context for `∃r.A ⊓ ∀r.B` has
+    // core `[A, B]` (no `NEG` bit) and derives `bottom` via `B ⊑ C` and `Disjoint(A, C)`.
+    // Removing `B ⊑ C` changes only `B`, clearing `B`, `[A, B]`, and `U`, while keeping `A`
+    // and the 8 classes below `A`. Before fixing `tested_class`, `[A, B]` was mistaken for
+    // a test of `A`, spuriously clearing `A` and all 8 subclasses too.
+    let base = "SubClassOf(:A0 :A)
+         SubClassOf(:A1 :A)
+         SubClassOf(:A2 :A)
+         SubClassOf(:A3 :A)
+         SubClassOf(:A4 :A)
+         SubClassOf(:A5 :A)
+         SubClassOf(:A6 :A)
+         SubClassOf(:A7 :A)
+         SubClassOf(:U ObjectSomeValuesFrom(:r :A))
+         SubClassOf(:U ObjectAllValuesFrom(:r :B))
+         SubClassOf(:B :C)
+         DisjointClasses(:A :C)
+         SubClassOf(:W ObjectUnionOf(:P :Q))
+         SubClassOf(:P :R)
+         SubClassOf(:Q :R)";
+    for threads in [1, 4] {
+        let lim = eager_limits(threads);
+        let (mut k, mut held) = started_eager(base, threads);
+        let out = k.classify(&lim).unwrap();
+        assert_eq!(out.stats.tier, sparkles_owl::classify::Tier::Disjunctive);
+        assert!(out.taxonomy.is_unsatisfiable(&c("U")));
+        assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+
+        remove(&mut k, &mut held, "SubClassOf(:B :C)");
+        let out = same_as_fresh_with(
+            &mut k,
+            &held,
+            &lim,
+            &format!("after B ⊑ C left on {threads} threads"),
+        );
+        assert!(out.stats.incremental, "eager run started again");
+        assert!(!out.taxonomy.is_unsatisfiable(&c("U")));
+        // At most B, [A, B], and U (and any existential/conjunction expression context for U)
+        // are cleared; A and A0..A7 (9 contexts) must remain intact.
+        assert!(
+            out.stats.cleared <= 4,
+            "spurious invalidation of A's subtree: cleared {} contexts",
+            out.stats.cleared
+        );
+
+        add(&mut k, &mut held, "SubClassOf(:B :C)");
+        let out = same_as_fresh_with(
+            &mut k,
+            &held,
+            &lim,
+            &format!("after B ⊑ C returned on {threads} threads"),
+        );
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_unsatisfiable(&c("U")));
+    }
+}
+
+#[test]
+fn eager_change_keeps_unreachable_contexts_and_tracks_held_tests() {
+    for threads in [1, 4, 8] {
+        let lim = eager_limits(threads);
+        let (mut k, mut held) = started_eager(UNIONS, threads);
+        let out = k.classify(&lim).unwrap();
+        assert_eq!(out.stats.tier, sparkles_owl::classify::Tier::Disjunctive);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(out.taxonomy.is_subclass(&c("F"), &c("G")));
+
+        // An unrelated leaf keeps every existing context.
+        add(&mut k, &mut held, "SubClassOf(:M :K)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after leaf joined (eager)");
+        assert!(out.stats.incremental, "eager run started again");
+        assert_eq!(out.stats.cleared, 0);
+        assert!(out.taxonomy.is_subclass(&c("M"), &c("L")));
+
+        // A told subsumer of K clears only K and M.
+        add(&mut k, &mut held, "SubClassOf(:K :D)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after K got subsumer (eager)");
+        assert!(out.stats.incremental);
+        assert_eq!(out.stats.cleared, 2);
+        assert!(out.taxonomy.is_subclass(&c("M"), &c("D")));
+
+        // A held test loses its support and regains it.
+        remove(&mut k, &mut held, "SubClassOf(:C :D)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after case lost support (eager)");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(!out.taxonomy.is_subclass(&c("E"), &c("D")));
+        assert!(!out.taxonomy.is_subclass(&c("F"), &c("G")));
+        add(&mut k, &mut held, "SubClassOf(:C :D)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after case regained support (eager)");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("E"), &c("D")));
+        assert!(out.taxonomy.is_subclass(&c("F"), &c("G")));
+
+        // Complement on the left creates a universal clause affecting all contexts.
+        add(&mut k, &mut held, "SubClassOf(ObjectComplementOf(:B) :D)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after left complement (eager)");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("K"), &c("D")));
+        remove(&mut k, &mut held, "SubClassOf(ObjectComplementOf(:B) :D)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after left complement left (eager)");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    }
+}
+
+#[test]
+fn eager_conjunction_and_shared_successor_incremental_parity() {
+    // Exercises eager conjunction successors `[B, C]` and `[B, C2]`, a conditional
+    // existential restriction, and two distinct roles (`:r` and `:s`) in `:S` targeting the
+    // same eager conjunction context `[B, C]`.
+    let base = "SubClassOf(:A ObjectUnionOf(:X ObjectSomeValuesFrom(:r :B)))
+         SubClassOf(:A ObjectAllValuesFrom(:r :C))
+         SubClassOf(ObjectIntersectionOf(:B :C) owl:Nothing)
+         SubClassOf(:X :Y)
+         SubClassOf(:S ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:S ObjectAllValuesFrom(:r :C))
+         SubClassOf(:S ObjectSomeValuesFrom(:s :B))
+         SubClassOf(:S ObjectAllValuesFrom(:s :C))
+         SubClassOf(:Z ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:Z ObjectAllValuesFrom(:r :C2))
+         SubClassOf(ObjectIntersectionOf(:B :C2) :W)
+         SubClassOf(ObjectSomeValuesFrom(:r :W) :V)
+         SubClassOf(:K :L)";
+    for threads in [1, 4, 8] {
+        let lim = eager_limits(threads);
+        let (mut k, mut held) = started_eager(base, threads);
+        let out = k.classify(&lim).unwrap();
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("S")));
+        assert!(out.taxonomy.is_subclass(&c("Z"), &c("V")));
+
+        // Re-saturating A and S against kept eager conjunction successors replays clauses.
+        add(&mut k, &mut held, "SubClassOf(:A :N) SubClassOf(:S :N2)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after A and S got subsumers");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("S")));
+
+        // Removing the clash clears `[B, C]` and both predecessors A and S, keeping Z and K.
+        remove(
+            &mut k,
+            &mut held,
+            "SubClassOf(ObjectIntersectionOf(:B :C) owl:Nothing)",
+        );
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after clash left (eager)");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        assert!(!out.taxonomy.is_unsatisfiable(&c("S")));
+        assert!(out.taxonomy.is_subclass(&c("Z"), &c("V")));
+
+        // Adding new expressions shifts dynamic eager conjunction context IDs cleanly.
+        add(
+            &mut k,
+            &mut held,
+            "SubClassOf(:K ObjectSomeValuesFrom(:r :Fresh1))
+             SubClassOf(:Fresh1 :Fresh2)
+             SubClassOf(ObjectIntersectionOf(:B :C) owl:Nothing)",
+        );
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after shift and clash return");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("S")));
+        assert!(out.taxonomy.is_subclass(&c("Z"), &c("V")));
+    }
+}
+
+#[test]
+fn eager_switch_rooted_and_counting_stay_on_full_rebuild() {
+    // Switching between Cautious and Eager on the same Classifier must restart fresh.
+    let (mut k, mut held) = started_eager(UNIONS, 1);
+    add(&mut k, &mut held, "SubClassOf(:M :K)");
+    let out = same_as_fresh_with(&mut k, &held, &limits(1), "switching eager -> cautious");
+    assert!(!out.stats.incremental);
+    add(&mut k, &mut held, "SubClassOf(:M2 :K)");
+    let out = same_as_fresh_with(
+        &mut k,
+        &held,
+        &eager_limits(1),
+        "switching cautious -> eager",
+    );
+    assert!(!out.stats.incremental);
+    add(&mut k, &mut held, "SubClassOf(:M3 :K)");
+    let out = same_as_fresh_with(&mut k, &held, &eager_limits(1), "staying in eager");
+    assert!(out.stats.incremental);
+
+    // Counting runs under Expansion::Eager must stay on full rebuild.
+    let counting_eager = Limits {
+        counting: true,
+        expansion: Expansion::Eager,
+        ..Limits::default()
+    };
+    let mut held_c = axioms(&format!(
+        "{UNIONS}\nSubClassOf(:A ObjectMaxCardinality(2 :r :B))"
+    ));
+    let mut kc = Classifier::of(&held_c);
+    kc.classify(&counting_eager).unwrap();
+    add(&mut kc, &mut held_c, "SubClassOf(:M :K)");
+    let out = same_as_fresh_with(&mut kc, &held_c, &counting_eager, "counting eager");
+    assert!(!out.stats.incremental);
+
+    // Rooted runs under Expansion::Eager must stay on full rebuild.
+    let rooted_eager = Limits {
+        rooted: true,
+        expansion: Expansion::Eager,
+        ..Limits::default()
+    };
+    let mut held_r = axioms(&format!("{UNIONS}\nClassAssertion(:A :ind)"));
+    let mut kr = Classifier::of(&held_r);
+    kr.classify(&rooted_eager).unwrap();
+    add(&mut kr, &mut held_r, "SubClassOf(:M :K)");
+    let out = same_as_fresh_with(&mut kr, &held_r, &rooted_eager, "rooted eager");
+    assert!(!out.stats.incremental);
+
+    // Post-counting fallback under Expansion::Eager (`dl_counting_over == true`, where
+    // `no_counting` ran Tier D without the counting axioms) must not retain kept contexts.
+    let post_counting_eager = Limits {
+        threads: 1,
+        counting: true,
+        dl_work: Some(1),
+        expansion: Expansion::Eager,
+        ..Limits::default()
+    };
+    let mut held_pc = axioms(&format!(
+        "{UNIONS}\nSubClassOf(:A ObjectMaxCardinality(2 :r :B))"
+    ));
+    let mut kpc = Classifier::of(&held_pc);
+    let first_pc = kpc.classify(&post_counting_eager).unwrap();
+    assert!(
+        first_pc.stats.dl_counting_over,
+        "counting eager run with dl_work=1 did not take post-counting fallback"
+    );
+    add(&mut kpc, &mut held_pc, "SubClassOf(:M :K)");
+    let out = same_as_fresh_with(
+        &mut kpc,
+        &held_pc,
+        &eager_limits(1),
+        "after post-counting eager fallback",
+    );
+    assert!(
+        !out.stats.incremental,
+        "post-counting fallback retained eager contexts"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Random sequences of additions and removals under `Expansion::Eager` on 1, 4, and 8
+    /// threads: every kept run produces byte-for-byte identical taxonomies and consistency
+    /// verdicts to a fresh run.
+    #[test]
+    fn eager_edits_of_a_disjunctive_ontology_answer_as_a_fresh_run(
+        base in prop::collection::vec(gen_axiom(), 4..24),
+        edits in prop::collection::vec(
+            (prop::collection::vec(gen_axiom(), 0..3), prop::collection::vec(any::<u8>(), 0..3)),
+            1..8,
+        ),
+        threads in prop::sample::select(vec![1usize, 4, 8]),
+    ) {
+        let lim = eager_limits(threads);
+        let text = |g: &Gen| disjunctive_axiom(g.0, g.1, g.2, g.3, g.4);
+        let mut held: Vec<Axiom> = Vec::new();
+        for g in &base {
+            for a in axioms(&text(g)) {
+                if !held.iter().any(|h| h.kind == a.kind) {
+                    held.push(a);
+                }
+            }
+        }
+        let mut k = Classifier::of(&held);
+        same_as_fresh_with(&mut k, &held, &lim, "at the start (eager)");
+        for (step, (added, removed)) in edits.iter().enumerate() {
+            for &i in removed {
+                if !held.is_empty() {
+                    let gone = held.remove(i as usize % held.len());
+                    k.remove([&gone]);
+                }
+            }
+            for g in added {
+                for a in axioms(&text(g)) {
+                    if !held.iter().any(|h| h.kind == a.kind) {
+                        k.add([&a]);
+                        held.push(a);
+                    }
+                }
+            }
+            same_as_fresh_with(&mut k, &held, &lim, &format!("after eager edit {step}"));
+        }
+    }
+}
+
+#[test]
+fn eager_seeded_edits_keep_contexts_often_enough_to_test_them() {
+    use sparkles_owl::classify::Tier;
+    let mut seed = 0xE46E_5A32_D192_ED03u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let (mut steps, mut disjunctive, mut incremental, mut cleared_some, mut cleared_none) =
+        (0usize, 0, 0, 0, 0);
+    let (mut kept_a_class, mut tests_held) = (0usize, 0);
+    for round in 0..240usize {
+        let threads = [1usize, 4, 8][round % 3];
+        let lim = eager_limits(threads);
+        let gen_axioms = |n: usize, next: &mut dyn FnMut() -> u64| -> Vec<Axiom> {
+            let mut out = Vec::new();
+            for _ in 0..n {
+                let x = next();
+                let text = disjunctive_axiom(
+                    x as u8,
+                    (x >> 8) as u8,
+                    (x >> 16) as u8,
+                    (x >> 24) as u8,
+                    (x >> 32) as u8,
+                );
+                out.extend(axioms(&text));
+            }
+            out
+        };
+        let mut held: Vec<Axiom> = Vec::new();
+        for a in gen_axioms(8 + (next() % 16) as usize, &mut next) {
+            if !held.iter().any(|h| h.kind == a.kind) {
+                held.push(a);
+            }
+        }
+        let mut k = Classifier::of(&held);
+        let first = same_as_fresh_with(&mut k, &held, &lim, "at the start (eager)");
+        let mut classes_before = first.taxonomy.classes().count();
+        for step in 0..6 {
+            for _ in 0..next() % 3 {
+                if !held.is_empty() {
+                    let gone = held.remove(next() as usize % held.len());
+                    k.remove([&gone]);
+                }
+            }
+            for a in gen_axioms((next() % 3) as usize, &mut next) {
+                if !held.iter().any(|h| h.kind == a.kind) {
+                    k.add([&a]);
+                    held.push(a);
+                }
+            }
+            let at = format!("in eager round {round} after edit {step}");
+            let out = same_as_fresh_with(&mut k, &held, &lim, &at);
+            steps += 1;
+            if out.stats.tier == Tier::Disjunctive && out.stats.outside_el.taken > 0 {
+                disjunctive += 1;
+                if out.stats.incremental {
+                    incremental += 1;
+                    cleared_some += usize::from(out.stats.cleared > 0);
+                    cleared_none += usize::from(out.stats.cleared == 0);
+                    kept_a_class +=
+                        usize::from(out.stats.cleared > 0 && out.stats.cleared < classes_before);
+                    tests_held += usize::from(out.stats.dl_tests_held > 0);
+                }
+            }
+            classes_before = out.taxonomy.classes().count();
+        }
+    }
+    eprintln!(
+        "TALLY eager steps={steps} disjunctive={disjunctive} incremental={incremental} \
+         cleared_some={cleared_some} cleared_none={cleared_none} kept_a_class={kept_a_class} \
+         tests_held={tests_held}"
+    );
+    assert!(incremental >= 650, "{incremental} eager incremental steps");
+    assert!(
+        cleared_some >= 550,
+        "{cleared_some} eager steps cleared a context"
+    );
+    assert!(
+        cleared_none >= 80,
+        "{cleared_none} eager steps cleared none"
+    );
+    assert!(
+        kept_a_class >= 100,
+        "{kept_a_class} eager steps kept a class beside cleared ones"
+    );
+    assert!(
+        tests_held >= 100,
+        "{tests_held} eager steps with a test that held"
+    );
+}
+
+#[test]
+fn eager_edits_of_the_dl603_fixtures_answer_as_a_fresh_run() {
+    let tally = edits_of_files(&fixture_files("dl603"), 2, &eager_limits);
+    eprintln!("TALLY eager dl603 {tally:?}");
+    assert!(tally.files >= 600, "{tally:?}");
+    assert!(tally.incremental >= 650, "{tally:?}");
+    assert!(tally.disjunctive >= 475, "{tally:?}");
+    assert!(tally.kept_a_class >= 400, "{tally:?}");
+}
+
+#[test]
+fn eager_edits_of_the_dl897_fixtures_answer_as_a_fresh_run() {
+    let tally = edits_of_files(&fixture_files("dl897"), 3, &eager_limits);
+    eprintln!("TALLY eager dl897 {tally:?}");
+    assert!(tally.files >= 25, "{tally:?}");
+    assert!(tally.disjunctive >= 140, "{tally:?}");
+    assert!(tally.kept_a_class >= 125, "{tally:?}");
+}
+
+#[test]
+fn eager_kept_run_memory_budget_charge_cancellation_and_partial() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 1. Tight `max_memory` budget on a kept eager run falls back to fresh and recovers.
+    let pad: String = (0..64)
+        .map(|i| format!("SubClassOf(:Pad{i} :L)\n"))
+        .collect();
+    let padded = format!(
+        "{UNIONS}\nSubClassOf(:A ObjectSomeValuesFrom(:r :B))\n\
+         SubClassOf(:A ObjectAllValuesFrom(:r :C))\n{pad}"
+    );
+    let mut held = axioms(&padded);
+    held.extend(axioms("SubClassOf(:M :K)"));
+    let fresh = |limit: usize| {
+        let mut k = Classifier::of(&held);
+        let out = k
+            .classify(&Limits {
+                max_memory: Some(limit),
+                ..eager_limits(1)
+            })
+            .ok()?;
+        k.excluded().is_empty().then_some(out)
+    };
+    let (mut low, mut high) = (0usize, 1usize << 30);
+    assert!(fresh(high).is_some());
+    while high - low > 64 {
+        let mid = low + (high - low) / 2;
+        if fresh(mid).is_some() {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    let want = fresh(high).unwrap();
+    let mut restarted = 0;
+    for more in [0usize, 64, 256, 1024, 4096] {
+        let (mut k, _) = started_eager(&padded, 1);
+        k.add(&axioms("SubClassOf(:M :K)"));
+        let out = k
+            .classify(&Limits {
+                max_memory: Some(high + more),
+                ..eager_limits(1)
+            })
+            .unwrap();
+        assert_eq!(answer(&out), answer(&want));
+        assert_eq!(out.taxonomy, want.taxonomy);
+        assert_eq!(k.excluded(), Vec::new());
+        restarted += usize::from(!out.stats.incremental);
+        // The run after the fresh retry keeps eager contexts again.
+        k.add(&axioms("SubClassOf(:M2 :K)"));
+        let out = k.classify(&eager_limits(1)).unwrap();
+        assert!(out.stats.incremental);
+    }
+    assert!(
+        restarted > 0,
+        "no eager kept run passed the budget of a fresh one"
+    );
+
+    // 2. Pool-credit `charge` refusal on an eager kept run retries fresh drawing on
+    // already-admitted credit without double-charging past `cap`.
+    let mut saw_refusal_retry = false;
+    for more in [0usize, 64, 256, 1024] {
+        let charged = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let cap = high + more;
+        let (mut k, _) = started_eager(&padded, 1);
+        k.add(&axioms("SubClassOf(:M :K)"));
+        let c_ref = charged.clone();
+        let r_ref = refused.clone();
+        let out = k
+            .classify(&Limits {
+                charge: Some(Arc::new(move |bytes| {
+                    let prev = c_ref.fetch_add(bytes, Ordering::Relaxed);
+                    if prev + bytes > cap {
+                        c_ref.fetch_sub(bytes, Ordering::Relaxed);
+                        r_ref.fetch_add(1, Ordering::Relaxed);
+                        false
+                    } else {
+                        true
+                    }
+                })),
+                ..eager_limits(1)
+            })
+            .unwrap();
+        assert_eq!(answer(&out), answer(&want));
+        assert_eq!(out.taxonomy, want.taxonomy);
+        assert!(k.excluded().is_empty(), "{:?}", k.excluded());
+        assert!(charged.load(Ordering::Relaxed) <= cap);
+        if refused.load(Ordering::Relaxed) > 0 {
+            assert!(
+                !out.stats.incremental,
+                "charge refusal did not trigger a fresh retry"
+            );
+            saw_refusal_retry = true;
+        }
+    }
+    assert!(
+        saw_refusal_retry,
+        "charge callback never refused a kept eager run to exercise drawing_on fresh retry"
+    );
+
+    // 3. Cancellation and mid-incremental deadline recovery under Expansion::Eager on 1 and 4 threads.
+    for threads in [1usize, 4] {
+        let lim = eager_limits(threads);
+        let mut stopped = 0;
+        for polls in 0..40usize {
+            let (mut k, mut held) = started_eager(UNIONS, threads);
+            add(&mut k, &mut held, "SubClassOf(:A :N) SubClassOf(:N :K)");
+            let seen = Arc::new(AtomicUsize::new(0));
+            let s = seen.clone();
+            let cancelled = Limits {
+                cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
+                ..lim.clone()
+            };
+            if k.classify(&cancelled).is_err() {
+                stopped += 1;
+            }
+            let out = same_as_fresh_with(
+                &mut k,
+                &held,
+                &lim,
+                &format!("eager after stop at poll {polls} on {threads} threads"),
+            );
+            assert!(out.taxonomy.is_subclass(&c("A"), &c("L")));
+        }
+        assert!(
+            stopped > 0,
+            "no eager run was cancelled on {threads} threads"
+        );
+
+        // Public-API deadline timeout and clean fresh recovery on 1 and 4 threads.
+        // Phase-isolated mid-invalidation and mid-saturation deadline stops with a
+        // controlled clock live in `classify::tests::eager_kept_phase_deadline_stops_and_recovers`.
+        let (mut k, mut held) = started_eager(&padded, threads);
+        add(&mut k, &mut held, "SubClassOf(:A :N) SubClassOf(:N :N2)");
+        let late = Limits {
+            deadline: Some(std::time::Instant::now()),
+            ..lim.clone()
+        };
+        let err = k.classify(&late).unwrap_err();
+        assert!(
+            matches!(err, sparkles_owl::classify::Error::Timeout),
+            "expected Timeout on {threads} threads, got {err:?}"
+        );
+        let out = same_as_fresh_with(
+            &mut k,
+            &held,
+            &lim,
+            &format!("eager after deadline on {threads} threads"),
+        );
+        assert!(!out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("N2")));
+    }
+
+    // 4. `Limits::partial = true` stop mid-incremental under Expansion::Eager remains sound
+    // (complete classes match fresh, incomplete classes report only entailed positive
+    // subsumptions, non-Unknown consistency matches fresh), stays unretained (`dirty = true`),
+    // and the next complete run starts fresh, on both 1 and 4 threads.
+    for threads in [1usize, 4] {
+        let lim = eager_limits(threads);
+        let mut saw_partial = false;
+        for polls in 1..80usize {
+            let (mut k, mut held) = started_eager(&padded, threads);
+            add(
+                &mut k,
+                &mut held,
+                "SubClassOf(:N1 ObjectUnionOf(:N2 :N3)) SubClassOf(:N2 :D) SubClassOf(:N3 :D)",
+            );
+            let seen = Arc::new(AtomicUsize::new(0));
+            let s = seen.clone();
+            let partial_lim = Limits {
+                partial: true,
+                cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
+                ..lim.clone()
+            };
+            if let Ok(part) = k.classify(&partial_lim)
+                && !part.complete_for_taken
+            {
+                saw_partial = true;
+                assert!(part.stats.incremental);
+                let mut fresh = Classifier::of(&held);
+                let want = fresh.classify(&lim).unwrap();
+                if part.consistency != Consistency::Unknown {
+                    assert_eq!(part.consistency, want.consistency);
+                }
+                let incomplete: std::collections::HashSet<&Class> =
+                    part.incomplete.iter().collect();
+                for cls in part.taxonomy.classes() {
+                    if !incomplete.contains(cls) {
+                        for sup in want.taxonomy.classes() {
+                            assert_eq!(
+                                part.taxonomy.is_subclass(cls, sup),
+                                want.taxonomy.is_subclass(cls, sup),
+                                "partial eager answer disagreed on complete class {} ({threads}t)",
+                                cls.as_str()
+                            );
+                        }
+                    } else {
+                        for sup in part.taxonomy.classes() {
+                            if part.taxonomy.is_subclass(cls, sup) {
+                                assert!(
+                                    want.taxonomy.is_subclass(cls, sup),
+                                    "partial eager answer reported unsound subsumption {} ⊑ {} for incomplete class ({threads}t)",
+                                    cls.as_str(),
+                                    sup.as_str()
+                                );
+                            }
+                        }
+                    }
+                }
+                // Partial runs are not retained (`dirty = true`), so the next run starts fresh.
+                let next = same_as_fresh_with(
+                    &mut k,
+                    &held,
+                    &lim,
+                    &format!("after eager partial on {threads} threads"),
+                );
+                assert!(!next.stats.incremental, "partial eager state was retained");
+                break;
+            }
+        }
+        assert!(
+            saw_partial,
+            "no incremental eager run stopped partially on {threads} threads"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: EL data lattice & Item 972 DtIx checker incremental maintenance
+// ---------------------------------------------------------------------------
+
+/// Functional-syntax helper with XSD, RDF, RDFS, and OWL prefixes for data tests.
+fn data_axioms(body: &str) -> Vec<Axiom> {
+    let doc = ofn_read::parse(&format!(
+        "Prefix(:=<{EX}>)\n\
+         Prefix(owl:=<http://www.w3.org/2002/07/owl#>)\n\
+         Prefix(rdf:=<http://www.w3.org/1999/02/22-rdf-syntax-ns#>)\n\
+         Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)\n\
+         Prefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)\n\
+         Ontology(\n{body}\n)"
+    ))
+    .unwrap();
+    doc.axioms
+}
+
+fn data_started(base: &str, threads: usize) -> (Classifier, Vec<Axiom>) {
+    let held = data_axioms(base);
+    let mut k = Classifier::of(&held);
+    let out = same_as_fresh(&mut k, &held, threads, "at the start");
+    assert!(!out.stats.incremental);
+    (k, held)
+}
+
+fn data_add(k: &mut Classifier, held: &mut Vec<Axiom>, body: &str) {
+    let more = data_axioms(body);
+    k.add(&more);
+    held.extend(more);
+}
+
+fn data_remove(k: &mut Classifier, held: &mut Vec<Axiom>, body: &str) {
+    let gone = data_axioms(body);
+    k.remove(&gone);
+    held.retain(|a| !gone.iter().any(|g| g.kind == a.kind));
+}
+
+#[test]
+fn el_data_lattice_additions_deletions_and_functional_groups_stay_incremental() {
+    let base = "SubDataPropertyOf(:d1 :df)
+        SubDataPropertyOf(:d2 :df)
+        FunctionalDataProperty(:df)
+        DataPropertyRange(:d1 xsd:integer)
+        SubClassOf(:A DataSomeValuesFrom(:d1 xsd:decimal))
+        SubClassOf(:A DataHasValue(:d2 \"5\"^^xsd:integer))
+        SubClassOf(:K :L)
+        SubClassOf(:P DataSomeValuesFrom(:u xsd:string))
+        SubClassOf(DataSomeValuesFrom(:u xsd:string) :Q)";
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = data_started(base, threads);
+        let init = same_as_fresh(&mut k, &held, threads, "initial functional EL data");
+        assert!(init.taxonomy.is_subclass(&c("P"), &c("Q")));
+        assert!(!init.taxonomy.is_unsatisfiable(&c("A")));
+
+        // Editing an unrelated class keeps all functional/data contexts untouched.
+        data_add(&mut k, &mut held, "SubClassOf(:M :K)");
+        let out = same_as_fresh(&mut k, &held, threads, "unrelated leaf added");
+        assert!(out.stats.incremental);
+        assert_eq!(out.stats.cleared, 0);
+
+        // Adding a negative data restriction matching A's merged functional group (:d1 + :d2 -> 5)
+        // must clear A via `changed_neg_roles` even though :d1 alone only had xsd:integer.
+        let hit_d1 = "SubClassOf(DataHasValue(:d1 \"5.0\"^^xsd:decimal) :HitD1)";
+        data_add(&mut k, &mut held, hit_d1);
+        let out = same_as_fresh(&mut k, &held, threads, "negative data restriction on :d1");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("HitD1")));
+
+        // Adding a negative data restriction on the functional superproperty :df also matches.
+        let hit_df = "SubClassOf(DataHasValue(:df \"5\"^^xsd:integer) :HitDf)";
+        data_add(&mut k, &mut held, hit_df);
+        let out = same_as_fresh(&mut k, &held, threads, "negative data restriction on :df");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("HitDf")));
+
+        // Removing the negative restriction retracts the subsumption incrementally.
+        data_remove(&mut k, &mut held, hit_d1);
+        let out = same_as_fresh(&mut k, &held, threads, "removed :d1 negative data");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("HitD1")));
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("HitDf")));
+
+        // Adding a conflicting functional value makes A unsatisfiable; removing restores it.
+        let conflict = "SubClassOf(:A DataHasValue(:d2 \"6\"^^xsd:integer))";
+        data_add(&mut k, &mut held, conflict);
+        let out = same_as_fresh(&mut k, &held, threads, "functional conflict added");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+        assert!(!out.taxonomy.is_unsatisfiable(&c("P")));
+
+        data_remove(&mut k, &mut held, conflict);
+        let out = same_as_fresh(&mut k, &held, threads, "functional conflict removed");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("HitDf")));
+
+        // Editing a non-functional EL data restriction on :u works incrementally too.
+        data_remove(
+            &mut k,
+            &mut held,
+            "SubClassOf(DataSomeValuesFrom(:u xsd:string) :Q)",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "removed :u negative restriction");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("P"), &c("Q")));
+    }
+}
+
+#[test]
+fn horn_with_el_data_and_functional_groups_stays_incremental_and_falls_back_on_role_edits() {
+    let base = "FunctionalDataProperty(:df)
+        DataPropertyRange(:df xsd:integer)
+        SubClassOf(:A ObjectAllValuesFrom(:r :B))
+        SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+        SubClassOf(ObjectIntersectionOf(:B :C) DataHasValue(:df \"10\"^^xsd:integer))
+        SubClassOf(:C DataHasValue(:df \"10\"^^xsd:integer))
+        SubClassOf(DataSomeValuesFrom(:df xsd:decimal) :Num)
+        SubClassOf(:K :L)";
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = data_started(base, threads);
+        data_add(&mut k, &mut held, "SubClassOf(:M :K)");
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "unrelated edit in Horn+functional data",
+        );
+        assert!(out.stats.incremental);
+        assert_eq!(out.stats.cleared, 0);
+
+        // Adding a conflicting functional value under :B makes :B ⊓ :C (and thus :A) unsat.
+        let bad = "SubClassOf(:B DataHasValue(:df \"11\"^^xsd:integer))";
+        data_add(&mut k, &mut held, bad);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "functional conflict in Horn successor",
+        );
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+
+        data_remove(&mut k, &mut held, bad);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "functional conflict removed in Horn",
+        );
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+
+        // Role-table and datatype-definition edits safely fall back to full rebuilds.
+        data_add(
+            &mut k,
+            &mut held,
+            "DataPropertyRange(:df xsd:nonNegativeInteger)",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "DataPropertyRange fallback");
+        assert!(!out.stats.incremental);
+
+        data_remove(&mut k, &mut held, "FunctionalDataProperty(:df)");
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "FunctionalDataProperty removal fallback",
+        );
+        assert!(!out.stats.incremental);
+
+        data_add(
+            &mut k,
+            &mut held,
+            "DatatypeDefinition(:SmallInt DatatypeRestriction(xsd:integer xsd:maxInclusive \"5\"^^xsd:integer))",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "DatatypeDefinition fallback");
+        assert!(!out.stats.incremental);
+
+        data_add(
+            &mut k,
+            &mut held,
+            "SubClassOf(:K DataSomeValuesFrom(owl:topDataProperty xsd:integer))",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "topDataProperty fallback");
+        assert!(!out.stats.incremental);
+    }
+}
+
+#[test]
+fn removing_data_axiom_later_allows_tier_d_to_take_added_disjunction() {
+    let base = "SubClassOf(:A DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:A :G)";
+    let (mut k, mut held) = data_started(base, 1);
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:A DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after removing data axiom");
+    assert!(out.stats.incremental);
+    // Now add a disjunction: stale_tier must force a fresh interner so Tier D takes it.
+    data_add(
+        &mut k,
+        &mut held,
+        "SubClassOf(:B ObjectUnionOf(:C :D))
+         SubClassOf(:C :E)
+         SubClassOf(:D :E)",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after adding disjunction");
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("B"), &c("E")));
+    assert!(k.excluded().is_empty());
+}
+
+#[test]
+fn deleting_data_axiom_with_mixed_zero_min_disjunction_restarts_into_tier_d() {
+    // Tier D short-circuits ObjectMinCardinality(0, ..) to TOP without inspecting its
+    // filler, so a disjunctive axiom containing data only beneath a zero minimum is
+    // accepted by Tier D once the blocking EL data axiom is removed.
+    let horn_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:P ObjectAllValuesFrom(:r :Q))
+        SubClassOf(:A ObjectIntersectionOf(
+            ObjectUnionOf(:B :C)
+            ObjectMinCardinality(0 :r DataSomeValuesFrom(:z xsd:integer))))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(horn_base, 1);
+    assert!(
+        !k.classify(&limits(1))
+            .unwrap()
+            .taxonomy
+            .is_subclass(&c("A"), &c("G"))
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed zero-min disjunction (Horn)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // Same transition when the initial run had no Horn axiom (KeptTier::El).
+    let el_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:A ObjectIntersectionOf(
+            ObjectUnionOf(:B :C)
+            ObjectMinCardinality(0 :r DataSomeValuesFrom(:z xsd:integer))))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(el_base, 1);
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed zero-min disjunction (EL)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // And when the mixed zero-min disjunction is added only after an earlier data deletion.
+    let (mut k, mut held) = data_started(
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+         SubClassOf(:B :G)
+         SubClassOf(:C :G)",
+        1,
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after deleting data axiom");
+    assert!(out.stats.incremental);
+    data_add(
+        &mut k,
+        &mut held,
+        "SubClassOf(:A ObjectIntersectionOf(
+            ObjectUnionOf(:B :C)
+            ObjectMinCardinality(0 :r DataSomeValuesFrom(:z xsd:integer))))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after adding mixed zero-min disjunction");
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // DisjointClasses with 1 unique data operand and a repeated disjunctive non-data
+    // operand is accepted by Tier D because Norm::axiom skips unique operands when
+    // unique.len() < 2 while forcing every repeated operand empty.
+    let disj_horn_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:P ObjectAllValuesFrom(:r :Q))
+        DisjointClasses(
+            DataSomeValuesFrom(:z xsd:integer)
+            ObjectComplementOf(ObjectUnionOf(:B :C))
+            ObjectComplementOf(ObjectUnionOf(:B :C)))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(disj_horn_base, 1);
+    assert!(
+        !k.classify(&limits(1))
+            .unwrap()
+            .taxonomy
+            .is_subclass(&Class::thing(), &c("G"))
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed DisjointClasses (Horn)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // Same DisjointClasses transition from KeptTier::El.
+    let disj_el_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        DisjointClasses(
+            DataSomeValuesFrom(:z xsd:integer)
+            ObjectComplementOf(ObjectUnionOf(:B :C))
+            ObjectComplementOf(ObjectUnionOf(:B :C)))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(disj_el_base, 1);
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed DisjointClasses (EL)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // And when the mixed DisjointClasses is added after an earlier data deletion.
+    let (mut k, mut held) = data_started(
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+         SubClassOf(:B :G)
+         SubClassOf(:C :G)",
+        1,
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting data axiom before DisjointClasses",
+    );
+    assert!(out.stats.incremental);
+    data_add(
+        &mut k,
+        &mut held,
+        "DisjointClasses(
+            DataSomeValuesFrom(:z xsd:integer)
+            ObjectComplementOf(ObjectUnionOf(:B :C))
+            ObjectComplementOf(ObjectUnionOf(:B :C)))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after adding mixed DisjointClasses");
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("G")));
+    assert!(k.excluded().is_empty());
+}
+
+#[test]
+fn dtix_multi_component_edits_preserve_untouched_components_across_renumbering() {
+    // Component 1 (:d): facet + cover; Component 2 (:e1, :e2): disjoint/cardinality;
+    // Component 3 (:g): unrelated EL data property.
+    let base = "SubClassOf(:A DataSomeValuesFrom(:d DataUnionOf(xsd:integer xsd:string)))
+        SubClassOf(DataSomeValuesFrom(:d xsd:integer) :B1)
+        SubClassOf(DataSomeValuesFrom(:d xsd:string) :B2)
+        SubClassOf(:KeepD DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"10\"^^xsd:integer)))
+        SubClassOf(DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"0\"^^xsd:integer)) :NonNeg)
+        SubClassOf(:E DataMinCardinality(2 :e1 xsd:integer))
+        SubClassOf(DataSomeValuesFrom(:e1 xsd:integer) :HasE1)
+        SubClassOf(:E2 DataSomeValuesFrom(:e2 xsd:int))
+        SubClassOf(:G DataSomeValuesFrom(:g xsd:string))
+        SubClassOf(DataSomeValuesFrom(:g xsd:string) :GOut)
+        SubClassOf(:K :L)";
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = data_started(base, threads);
+        let init = same_as_fresh(&mut k, &held, threads, "initial multi-component DtIx");
+        assert!(init.taxonomy.is_subclass(&c("KeepD"), &c("NonNeg")));
+        assert!(init.taxonomy.is_subclass(&c("E"), &c("HasE1")));
+        assert!(init.taxonomy.is_subclass(&c("G"), &c("GOut")));
+        assert!(
+            !k.excluded().is_empty(),
+            "component :d should report COVER in excluded"
+        );
+
+        // Editing component :e1/:e2 (adding DisjointDataProperties, merging :e1 and :e2
+        // and shifting component IDs!) must stay incremental and keep :KeepD and :A's COVER.
+        let disj = "DisjointDataProperties(:e1 :e2)";
+        data_add(&mut k, &mut held, disj);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "added DisjointDataProperties(:e1 :e2)",
+        );
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("KeepD"), &c("NonNeg")));
+        assert!(out.taxonomy.is_subclass(&c("G"), &c("GOut")));
+
+        // Add a brand-new checker component :z to further shift component numbering.
+        let comp_z = "SubClassOf(:Z DataMaxCardinality(1 :z xsd:integer))
+            SubClassOf(:Z DataMinCardinality(2 :z xsd:integer))";
+        data_add(&mut k, &mut held, comp_z);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "added brand-new checker component :z",
+        );
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_unsatisfiable(&c("Z")));
+
+        // Remove DisjointDataProperties(:e1 :e2) (splitting component back).
+        data_remove(&mut k, &mut held, disj);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "removed DisjointDataProperties(:e1 :e2)",
+        );
+        assert!(out.stats.incremental);
+
+        // Transition :A's component :d from COVER -> FINE by telling :A :B1 (DtFire refire!),
+        // then back from FINE -> COVER.
+        let resolve = "SubClassOf(:A :B1)";
+        data_add(&mut k, &mut held, resolve);
+        let out = same_as_fresh(&mut k, &held, threads, "resolved COVER via DtFire");
+        assert!(out.stats.incremental);
+        assert!(k.excluded().is_empty(), "COVER should have cleared");
+
+        data_remove(&mut k, &mut held, resolve);
+        let out = same_as_fresh(&mut k, &held, threads, "re-exposed COVER");
+        assert!(out.stats.incremental);
+        assert!(!k.excluded().is_empty(), "COVER should have returned");
+
+        // Remove brand-new component :z completely.
+        data_remove(&mut k, &mut held, comp_z);
+        let out = same_as_fresh(&mut k, &held, threads, "removed component :z completely");
+        assert!(out.stats.incremental);
+    }
+}
+
+#[test]
+fn dtix_orphan_and_cyclic_cover_cleanup_and_reconnection() {
+    // Anonymous conjunction successor (:X ⊓ ∃d.(int ∪ str)) produces COVER on :d,
+    // and links to a kept successor :U via :s, while :KeepD holds a FINE atom on :d.
+    let base = "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:X DataSomeValuesFrom(:d DataUnionOf(xsd:integer xsd:string)))))
+        SubClassOf(DataSomeValuesFrom(:d xsd:integer) :B1)
+        SubClassOf(DataSomeValuesFrom(:d xsd:string) :B2)
+        SubClassOf(:X ObjectSomeValuesFrom(:s :U))
+        SubClassOf(:U :V)
+        SubClassOf(ObjectSomeValuesFrom(:s :V) :HasV)
+        SubClassOf(:KeepD DataSomeValuesFrom(:d xsd:int))
+        SubClassOf(:CycRoot ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C1 :C2)))
+        SubClassOf(ObjectIntersectionOf(:C1 :C2) ObjectSomeValuesFrom(:t ObjectIntersectionOf(:C2 :C3)))
+        SubClassOf(ObjectIntersectionOf(:C2 :C3) ObjectSomeValuesFrom(:t ObjectIntersectionOf(:C1 :C2)))
+        SubClassOf(ObjectIntersectionOf(:C2 :C3) DataSomeValuesFrom(:e DataUnionOf(xsd:integer xsd:string)))
+        SubClassOf(DataSomeValuesFrom(:e xsd:integer) :E1)
+        SubClassOf(DataSomeValuesFrom(:e xsd:string) :E2)
+        SubClassOf(:KeepE DataSomeValuesFrom(:e xsd:int))";
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = data_started(base, threads);
+        assert!(!k.excluded().is_empty());
+
+        // Remove link from :A to the conjunction context: orphan_prune must clear it
+        // so :d no longer reports COVER in excluded.
+        let link_a = "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:X DataSomeValuesFrom(:d DataUnionOf(xsd:integer xsd:string)))))";
+        data_remove(&mut k, &mut held, link_a);
+        let out = same_as_fresh(&mut k, &held, threads, "removed link to COVER orphan");
+        assert!(out.stats.incremental);
+
+        // Remove link from :CycRoot to the disconnected 2-cycle of conjunction contexts:
+        // forward reachability in orphan_prune must clear the entire cycle so :e's COVER
+        // also disappears!
+        let link_cyc =
+            "SubClassOf(:CycRoot ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C1 :C2)))";
+        data_remove(&mut k, &mut held, link_cyc);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "removed link to cyclic COVER orphan",
+        );
+        assert!(out.stats.incremental);
+        assert!(
+            k.excluded().is_empty(),
+            "all orphan COVERs must be pruned: {:?}",
+            k.excluded()
+        );
+
+        // Re-connect :A to the previously pruned conjunction context (which links to kept :U)
+        // and verify :U replays its propagations (:HasV) cleanly!
+        data_add(&mut k, &mut held, link_a);
+        data_add(
+            &mut k,
+            &mut held,
+            "SubClassOf(ObjectSomeValuesFrom(:r :HasV) :AReachV)",
+        );
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "reconnected pruned orphan to kept :U",
+        );
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("AReachV")));
+    }
+}
+
+#[test]
+fn el_lattice_to_and_from_dtix_checker_transitions_fall_back_safely() {
+    for threads in [1, 4, 8] {
+        // 1. Whole ontology transitions: None -> Some -> None
+        let (mut k, mut held) = data_started(
+            "SubClassOf(:A DataSomeValuesFrom(:d xsd:integer))
+             SubClassOf(DataSomeValuesFrom(:d xsd:decimal) :B)",
+            threads,
+        );
+        let facet = "SubClassOf(:A DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"1\"^^xsd:integer)))";
+        data_add(&mut k, &mut held, facet);
+        let out = same_as_fresh(&mut k, &held, threads, "whole ontology EL -> DtIx");
+        assert!(!out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+
+        data_remove(&mut k, &mut held, facet);
+        let out = same_as_fresh(&mut k, &held, threads, "whole ontology DtIx -> EL");
+        assert!(!out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+
+        // 2. Single property switches mode while another checker component (:c) remains active:
+        //    :e switches EL -> checker and then checker -> EL.
+        let (mut k, mut held) = data_started(
+            "SubClassOf(:C DataAllValuesFrom(:c xsd:integer))
+             SubClassOf(:C DataSomeValuesFrom(:c xsd:string))
+             SubClassOf(:A DataSomeValuesFrom(:e xsd:integer))
+             SubClassOf(DataSomeValuesFrom(:e xsd:decimal) :B)",
+            threads,
+        );
+        let e_trigger = "SubClassOf(:A DataAllValuesFrom(:e xsd:integer))";
+        data_add(&mut k, &mut held, e_trigger);
+        let out = same_as_fresh(&mut k, &held, threads, "property :e EL -> checker");
+        assert!(!out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("C")));
+
+        data_remove(&mut k, &mut held, e_trigger);
+        let out = same_as_fresh(&mut k, &held, threads, "property :e checker -> EL");
+        assert!(!out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("C")));
+    }
+}
+
+#[test]
+fn incremental_data_and_dtix_memory_budget_and_cancellation() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let pad: String = (0..48)
+        .map(|i| format!("SubClassOf(:Pad{i} :L)\n"))
+        .collect();
+    let base = format!(
+        "FunctionalDataProperty(:df)
+         SubClassOf(:A DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"0\"^^xsd:integer)))
+         SubClassOf(DataSomeValuesFrom(:d xsd:integer) :NumD)
+         SubClassOf(:E DataMinCardinality(2 :e xsd:integer))
+         SubClassOf(DataSomeValuesFrom(:e xsd:integer) :HasE)
+         SubClassOf(:F DataHasValue(:df \"1\"^^xsd:integer))
+         SubClassOf(:K :L)
+         {pad}"
+    );
+    let edit = "SubClassOf(:M :K)\nSubClassOf(:E2 DataAllValuesFrom(:e xsd:integer))";
+    let mut held = data_axioms(&base);
+    held.extend(data_axioms(edit));
+
+    // Find tight fresh budget for the edited ontology.
+    let fresh = |limit: usize| {
+        let mut k = Classifier::of(&held);
+        let out = k
+            .classify(&Limits {
+                max_memory: Some(limit),
+                ..limits(1)
+            })
+            .ok()?;
+        k.excluded().is_empty().then_some(out)
+    };
+    let (mut low, mut high) = (0usize, 1usize << 30);
+    assert!(fresh(high).is_some());
+    while high - low > 128 {
+        let mid = low + (high - low) / 2;
+        if fresh(mid).is_some() {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    let want = fresh(high).unwrap();
+
+    // Tight memory cap + pool charge callback must never exceed cap and must match fresh.
+    for more in [0usize, 512, 4096] {
+        let cap = high + more;
+        let granted = Arc::new(AtomicUsize::new(0));
+        let g = granted.clone();
+        let bounded = Limits {
+            max_memory: Some(cap),
+            charge: Some(Arc::new(move |bytes| {
+                let prev = g.fetch_add(bytes, Ordering::Relaxed);
+                if prev.saturating_add(bytes) > cap {
+                    g.fetch_sub(bytes, Ordering::Relaxed);
+                    false
+                } else {
+                    true
+                }
+            })),
+            ..limits(1)
+        };
+        let (mut k, _) = data_started(&base, 1);
+        k.add(&data_axioms(edit));
+        let out = k.classify(&bounded).unwrap();
+        assert!(
+            granted.load(Ordering::Relaxed) <= cap,
+            "pool charge exceeded cap {cap}"
+        );
+        assert_eq!(answer(&out), answer(&want));
+        assert_eq!(out.taxonomy, want.taxonomy);
+        assert_eq!(k.excluded(), Vec::new());
+    }
+
+    // Pool-credited LateRestart::Incompatible on EL-lattice -> DtIx mode switch:
+    // total pool grant must stay bounded by peak (not double-charging build).
+    let (mut k, mut mode_held) = data_started(
+        "SubClassOf(:C DataAllValuesFrom(:c xsd:integer))
+         SubClassOf(:A DataSomeValuesFrom(:e xsd:integer))
+         SubClassOf(DataSomeValuesFrom(:e xsd:decimal) :B)",
+        1,
+    );
+    let switch = "SubClassOf(:A DataAllValuesFrom(:e xsd:integer))";
+    data_add(&mut k, &mut mode_held, switch);
+    let granted = Arc::new(AtomicUsize::new(0));
+    let g = granted.clone();
+    let out = k
+        .classify(&Limits {
+            charge: Some(Arc::new(move |bytes| {
+                g.fetch_add(bytes, Ordering::Relaxed);
+                true
+            })),
+            ..limits(1)
+        })
+        .unwrap();
+    assert!(!out.stats.incremental);
+    assert!(
+        granted.load(Ordering::Relaxed) <= out.stats.peak_memory,
+        "granted {} exceeded reported peak {}",
+        granted.load(Ordering::Relaxed),
+        out.stats.peak_memory
+    );
+
+    // Cooperative cancellation & deadline polling across incremental data + DtIx edits.
+    let mut stopped = 0;
+    for polls in 0..50usize {
+        let (mut k, mut h) = data_started(&base, 1);
+        data_add(&mut k, &mut h, edit);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s = seen.clone();
+        let cancelled = Limits {
+            cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
+            ..limits(1)
+        };
+        if k.classify(&cancelled).is_err() {
+            stopped += 1;
+        }
+        same_as_fresh(&mut k, &h, 1, &format!("after cancel at poll {polls}"));
+    }
+    assert!(stopped > 0, "expected at least one cancellation stop");
+
+    let (mut k, mut h) = data_started(&base, 1);
+    data_add(&mut k, &mut h, edit);
+    let late = Limits {
+        deadline: Some(std::time::Instant::now()),
+        ..limits(1)
+    };
+    assert!(k.classify(&late).is_err());
+    same_as_fresh(&mut k, &h, 1, "after expired deadline");
+}
+
+#[test]
+fn random_horn_el_data_and_dtix_edit_sequences_match_fresh() {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    let xsd = |s: &str| Datatype::new(format!("http://www.w3.org/2001/XMLSchema#{s}"));
+    let dp = |s: &str| DataProperty::new(format!("{EX}{s}"));
+    let op = |s: &str| ObjectPropertyExpression::Property(ObjectProperty::new(format!("{EX}{s}")));
+    let cl = |i: usize| ClassExpression::Class(c(&format!("C{i}")));
+
+    let random_data_expr = |rng: &mut Rng,
+                            prop_idx: usize,
+                            allow_checker: bool|
+     -> ClassExpression {
+        let p = dp(&format!("d{prop_idx}"));
+        let kind = if allow_checker {
+            rng.below(9)
+        } else {
+            rng.below(4)
+        };
+        match kind {
+            0 => ClassExpression::DataSomeValuesFrom(vec![p], DataRange::Datatype(xsd("integer"))),
+            1 => ClassExpression::DataSomeValuesFrom(vec![p], DataRange::Datatype(xsd("decimal"))),
+            2 => ClassExpression::DataSomeValuesFrom(vec![p], DataRange::Datatype(xsd("string"))),
+            3 => {
+                let v = rng.below(3);
+                ClassExpression::DataHasValue(
+                    p,
+                    Literal::typed(v.to_string(), "http://www.w3.org/2001/XMLSchema#integer"),
+                )
+            }
+            4 => {
+                let bound = rng.below(4);
+                ClassExpression::DataSomeValuesFrom(
+                    vec![p],
+                    DataRange::DatatypeRestriction(
+                        xsd("integer"),
+                        std::collections::BTreeSet::from([FacetRestriction {
+                            facet: Iri::new("http://www.w3.org/2001/XMLSchema#minInclusive")
+                                .unwrap(),
+                            value: Literal::typed(
+                                bound.to_string(),
+                                "http://www.w3.org/2001/XMLSchema#integer",
+                            ),
+                        }]),
+                    ),
+                )
+            }
+            5 => ClassExpression::DataSomeValuesFrom(
+                vec![p],
+                DataRange::UnionOf(std::collections::BTreeSet::from([
+                    DataRange::Datatype(xsd("integer")),
+                    DataRange::Datatype(xsd("string")),
+                ])),
+            ),
+            6 => ClassExpression::DataAllValuesFrom(
+                vec![p],
+                DataRange::Datatype(if rng.below(2) == 0 {
+                    xsd("integer")
+                } else {
+                    xsd("string")
+                }),
+            ),
+            7 => ClassExpression::DataMinCardinality(
+                1 + rng.below(2) as u32,
+                p,
+                Some(DataRange::Datatype(xsd("integer"))),
+            ),
+            _ => {
+                ClassExpression::DataMaxCardinality(1, p, Some(DataRange::Datatype(xsd("integer"))))
+            }
+        }
+    };
+
+    let random_axiom = |rng: &mut Rng| -> Axiom {
+        match rng.below(14) {
+            0..=3 => {
+                // EL-data property d0 (functional) or d1 (plain)
+                let prop = rng.below(2);
+                let de = random_data_expr(rng, prop, false);
+                let a = cl(rng.below(6));
+                if rng.below(2) == 0 {
+                    Axiom::sub_class_of(a, de)
+                } else {
+                    Axiom::sub_class_of(de, a)
+                }
+            }
+            4..=8 => {
+                // Checker properties d2, d3, or mode-switching d4
+                let prop = 2 + rng.below(3);
+                let allow_checker = prop < 4 || rng.below(3) == 0;
+                let de = random_data_expr(rng, prop, allow_checker);
+                let a = cl(rng.below(6));
+                if rng.below(2) == 0 {
+                    Axiom::sub_class_of(a, de)
+                } else {
+                    Axiom::sub_class_of(de, a)
+                }
+            }
+            9 => {
+                // Horn object restriction carrying a data restriction
+                let a = cl(rng.below(6));
+                let b = cl(rng.below(6));
+                if rng.below(2) == 0 {
+                    Axiom::sub_class_of(a, ClassExpression::some(op("r"), b))
+                } else {
+                    Axiom::sub_class_of(a, ClassExpression::all(op("r"), b))
+                }
+            }
+            10 => Axiom::sub_class_of(cl(rng.below(6)), cl(rng.below(6))),
+            11 => {
+                let a = rng.below(6);
+                let b = (a + 1 + rng.below(5)) % 6;
+                Axiom::disjoint_classes([cl(a), cl(b)])
+            }
+            12 => Axiom::new(AxiomKind::DisjointDataProperties(
+                vec![dp("d2"), dp("d3")].into(),
+            )),
+            _ => Axiom::new(AxiomKind::DataPropertyDomain(
+                dp(&format!("d{}", rng.below(4))),
+                cl(rng.below(6)),
+            )),
+        }
+    };
+
+    let mut total_steps = 0usize;
+    let mut incremental_steps = 0usize;
+    let mut kept_some = 0usize;
+    for threads in [1, 4, 8] {
+        for seed in 1..=12u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (threads as u64));
+            let mut held = data_axioms(
+                "FunctionalDataProperty(:d0)
+                 DataPropertyRange(:d1 xsd:integer)
+                 SubClassOf(:C0 DataAllValuesFrom(:d2 xsd:integer))
+                 SubClassOf(:C1 DataSomeValuesFrom(:d3 xsd:int))
+                 Declaration(Class(:C2))
+                 Declaration(Class(:C3))
+                 Declaration(Class(:C4))
+                 Declaration(Class(:C5))",
+            );
+            for _ in 0..8 {
+                let a = random_axiom(&mut rng);
+                if !held.iter().any(|h| h.kind == a.kind) {
+                    held.push(a);
+                }
+            }
+            let mut k = Classifier::of(&held);
+            same_as_fresh(&mut k, &held, threads, &format!("seed {seed} init"));
+            for step in 0..10 {
+                // Remove 0..=2 editable axioms (keep the first 2 role axioms fixed most of the time).
+                let mut removed = Vec::new();
+                for _ in 0..rng.below(3) {
+                    if held.len() > 8 {
+                        let idx = 2 + rng.below(held.len() - 2);
+                        removed.push(held.remove(idx));
+                    }
+                }
+                let mut added = Vec::new();
+                for _ in 0..1 + rng.below(2) {
+                    let a = random_axiom(&mut rng);
+                    if !held.iter().any(|h| h.kind == a.kind)
+                        && !added.iter().any(|h: &Axiom| h.kind == a.kind)
+                    {
+                        added.push(a);
+                    }
+                }
+                k.remove(&removed);
+                k.add(&added);
+                held.extend(added);
+                let out = same_as_fresh(
+                    &mut k,
+                    &held,
+                    threads,
+                    &format!("threads {threads} seed {seed} step {step}"),
+                );
+                total_steps += 1;
+                if out.stats.incremental {
+                    incremental_steps += 1;
+                    if out.stats.cleared < out.taxonomy.classes().count() {
+                        kept_some += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        incremental_steps * 2 >= total_steps,
+        "expected most data/DtIx edits to run incrementally: {incremental_steps}/{total_steps}"
+    );
+    assert!(
+        kept_some > 0,
+        "expected incremental data/DtIx runs to keep untouched classes"
+    );
 }

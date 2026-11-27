@@ -1,6 +1,6 @@
 # C25: Evidence, claims and assessments
 
-> **Status:** partially implemented
+> **Status:** implemented in part (Phase 1 resources and local Phase 2 preparation)
 >
 > **Phases:** Phase 1 supplies versioned vocabulary, shapes, source and claim fixtures,
 > compatibility views and competency queries. Phase 2 adds authenticated typed writes,
@@ -550,8 +550,43 @@ closed links. Recovery checks a known original UUID before and under process exc
 and cannot create a missing root or empty generation. A failed delete move is synchronized
 back before reopen, or remains unavailable with its original bytes and reported path.
 Uncertain moved data uses the existing retained `.kept-<name>-<token>` convention.
-Catalog startup refuses only a registered root that lacks its directory or CURRENT,
-names the expected path and serves the other datasets. Restore publication
+Managed persistent deletes record an intent, stage the source and synchronize its new
+name before removing the registry row. Format 2 of `config.json` stores persistent
+dataset UUIDs, and format 3 adds swap revisions. Format 4 of `delete.json` records the
+prepared stage and can record a committed decision before a later registration reuses the
+alias and UUID. Startup validates the journal and registry before recovering any
+operation, and checks registered UUIDs when opening persistent datasets. For a prepared
+delete, it restores a verified staged copy when the original UUID remains registered and
+reclaims the copy when the registry records the deletion or a replacement. It takes the
+store process lock before moving or removing a copy and synchronizes the database
+directory before retiring the intent. Live deletion and startup recovery hold the process
+lock while removing store contents. Format 3 prepared records retain their provenance on
+rewrite; a sole verified `.deleted-<token>` trash copy is classified as committed before
+conflict and duplicate-root checks, allowing a same-UUID replacement or verified legacy
+predecessor to recover while reclaiming only the trash copies, while an ambiguous kept
+copy or conflicting path keeps the registration closed and retains the staged copy.
+Restore publication synchronizes the journal before replacing the registry and preserves
+dataset bytes after an indeterminate registry replacement. In-place restores persist the
+predecessor revision in format 3 of `config.json` and write a versioned swap marker in
+`.replaced-<name>-<task>` after synchronizing rename 1 so all catalog builds reconcile
+both copies against the durable registry before removing either one, synchronizing the
+database directory before removing the marker during live and startup rollbacks. Unmarked
+format 2 pairs reconcile against the registered UUID and fail closed on ambiguous
+identities, while unmarked format 1 rows retain roll-forward recovery. Unmarked
+roll-forward synchronizes the database directory under the live store lock before
+removing a predecessor, and obsolete unmarked copies with no persistent registry row
+are retired without populating the live path. Startup refuses to open when `config.json`
+is absent beside any `.replaced-` directory while still reporting newer swap marker
+formats as unsupported. A `.replaced-` copy carrying a validated `.keep-replaced-v1`
+marker is moved to `.kept-<name>-<task>` under the store lock when free, or retained
+and warned when occupied, keeping the live alias untouched. Ambiguous legacy
+journal records and competing staged restore copies remain available for recovery.
+Startup preserves
+unknown kept copies and reports retained paths, byte counts and incomplete counts.
+Restores mark intentional `keepReplaced` copies so their warnings do not depend on the
+active name.
+A registered root with a missing directory or CURRENT stays closed. Startup names the
+expected path and serves the other datasets. Restore publication
 checks the restored identity separately from original-identity rollback. Existing roots
 without a known expected UUID retain the supported legacy metadata upgrade only when
 CURRENT already exists.
@@ -682,7 +717,7 @@ The open questions of this step were decided as follows.
    advertise their capability separately.
 8. **C19 layering.** `evidence.json` holds the complete canonical object whose digest
    `managed.json` records, so the settings are not a C19 layered kind in this step.
-   Declared settings and drift refusal are roadmap item 508.
+   The [declared layer](#declared-evidence-settings) extends this administration step.
 10. **Bindings.** The settings operations are HTTP and Rust only in this step. The
    Python, JVM and Node.js bindings receive them with the typed evidence operations,
    as roadmap item 509 records.
@@ -690,11 +725,42 @@ The open questions of this step were decided as follows.
    receipts are added with the operations that write those records, so that their
    shapes and fixtures are tested against real output.
 
+### Declared evidence settings
+
+The C19 `evidence` kind accepts declarations in `serve --settings` under `defaults`
+and named `datasets`. An operator can lock the whole kind, a field, a named policy or
+a policy field. The evidence entry in `managed.json` carries nonempty runtime
+overrides as an `evidenceOverrides` object with `overridesFormat` 1 and a sparse
+`patch` object. The same registry replacement publishes the override and the
+digest of canonical `evidence.json`, together with the protected graphs. Backups
+capture that registry entry with the recorded settings. A reset that empties the
+override removes its member in the same publication. Without a declaration or lock,
+the recorded settings provide the runtime values.
+
+Dataset administrators can compare the effective and recorded settings in
+`GET /$/settings/{ds}/evidence`. Startup and reload apply declarations to the
+effective view without recording a configuration or detaching graphs. The server
+refuses typed evidence operations with `409 evidence-settings-drift` while the
+settings differ. Policy-backed recall and ask, claims-mode ingestion and
+policy-backed GraphRAG builds and refreshes also check for drift. Ordinary writes
+continue to enforce the recorded protection. A valid disabled declaration can
+supply defaults for an unconfigured dataset without recording settings or reporting
+drift. Resetting that runtime layer leaves the dataset unconfigured.
+An administrator reconciles drift by writing the layered kind or recording a
+complete configuration through the evidence settings route. Both honor locks
+and require an explicit detach before dropping a protected graph. A detach is
+refused when the declaration locks evidence enabled and locks a role or policy
+that requires that graph.
+
+### Durable source holds
+
 Durable source holds are the third Phase 2 step. `sparkles_core::holds` records in
-`holds.json` format 1 at the dataset root the commits that owners keep readable on
-`main` and every branch. A hold has an owner-chosen UUID, its owner, its creation time
-and a sorted set of commits, each named by the branch identity the caller gave and the
-branch store whose history serves it. A commit at or below a branch's starting point is
+`holds.json` at the dataset root the commits that owners keep readable on
+`main` and every branch. Format 1 records local holds. Format 2 adds a
+`forDatasetId` to each foreign hold to identify the proposing dataset.
+A hold has an owner-chosen UUID, its owner, its creation time and a sorted set of commits.
+Each commit names the branch identity the caller gave and the branch store whose
+history serves it. A commit at or below a branch's starting point is
 served by its upstream. A read of the starting commit on the branch falls back to the
 upstream once the branch no longer keeps its own copy, so the hold keeps it readable
 under both names. Together the holds of a dataset name at most 65,536 commits. The
@@ -752,10 +818,12 @@ every lock and releases those it does not keep, unless the hold was acquired aga
 meanwhile. Each acquisition of an existing hold starts its grace period again, and a
 reopened store counts it from the hold's creation. The
 typed evidence operations supply that check when they record references. A
-`holds.json` that cannot be read or names another dataset keeps every past state and
-refuses hold changes and branch deletions with `holds-unavailable`, while reads and
-writes continue. A newer format refuses the open. Backups and clones carry no holds,
-because they carry no past states, and deleting a dataset deletes its holds. The file
+`holds.json` that cannot be read or whose top-level `datasetId` differs from the
+dataset being opened keeps every past state and refuses hold changes and branch deletions
+with `holds-unavailable`, while reads and writes continue. A newer format refuses the
+open. Backups and clones carry no holds because they carry no past states. Deleting
+a dataset deletes the holds stored there. Foreign holds stored elsewhere stay subject
+to the reconciliation rules below. The file
 is rewritten whole for each change, which costs up to a few megabytes of writing at the
 bound. That keeps one atomic commit point per change.
 
@@ -855,10 +923,25 @@ compared byte for byte, including for references refused from their anchor alone
    It cannot tell a record that a typed writer published from one written with a
    correct-looking receipt while its graph was detached. The authenticated typed writer
    of the next step must record an operation marker that makes that distinction.
-2. **Delta charge.** The 64 MiB allowance uses C29's conservative 2 KiB charge for
-   each quad of a state's unindexed delta, so a state with tens of thousands of writes
-   since its last compaction can answer `incomplete-evidence`. Roadmap item 542
-   tracks a tighter charge for shared live states.
+2. **Delta charge.** An earlier revision charged C29's conservative 2 KiB per delta quad
+   even when the selected state was the store's shared live snapshot or an already-cached
+   historical snapshot, so resolution under the 64 MiB allowance answered
+   `incomplete-evidence` past about 32,700 uncompacted writes. Bounded history reads and
+   evidence resolution now charge a live snapshot or persistent history-cache hit only for
+   its retained 4 KiB handle and any non-live sealed generation metadata, while in-memory
+   historical snapshots and freshly materialized private historical replays still pre-admit
+   and retain the conservative 2 KiB per quad delta charge before allocation. In a release
+   diagnostic,
+   `evidence_resolution_delta_charge_diagnostic`, run on the 8-vCPU, 16-GiB Linux Boat
+   worker `bx_z8s55a5v` and not as a benchmark-host result, shared live and cached
+   stored-fact resolution across 10,000, 50,000 and 100,000 uncompacted delta quads
+   stayed constant at 6,400 bytes retained, with a smallest admitting cap near 7 KiB and
+   0.75 to 1.06 µs median latency. Live record resolution stayed at 6,742 bytes retained
+   and 13.2 to 21.0 µs median latency, and a triple-level protection hiding 10% of quads
+   resolved within the 64 MiB allowance at 3.73 MiB, 18.09 MiB and 36.01 MiB retained,
+   taking 1.07 ms, 5.35 ms and 9.41 ms cold and 2.36 to 2.65 µs warm. Uncached private
+   WAL replay succeeded at 10,000 delta quads and refused cleanly with
+   `incomplete-evidence` at 50,000 and 100,000 delta quads.
 3. **Source leases.** The resident source lease family was removed rather than adopted.
    [C26](C26-durable-jobs-and-delivery.md) does not use it.
 4. **Bindings and MCP.** The route is HTTP, OpenAPI and Rust only. MCP waits for Phase 3
@@ -885,11 +968,14 @@ nonce.
 
 The protection nonce is the operation marker that resolution decision 1 required.
 `managed.json` format 2 adds a `protections` map from each protected graph to a random
-UUID. Protecting a graph keeps its nonce while the owner keeps protecting it, detaching
-drops the nonce, and protecting it again chooses a new one. This build reads formats 1
-and 2 and writes format 2, and an older build refuses format 2 as written by a newer
-release. A format 1 registry has no nonces, so its graphs take no typed writes until
-the owner protects them again. Resolution now requires the receipt to be an
+UUID. Detaching a graph drops its nonce, and protecting it again chooses a new one.
+A continuously protected graph keeps its nonce unless it moves from a dedicated
+projection output with no record history into a record role. That transition chooses
+a new nonce. This build reads registry formats 1 through 4. A registry with any
+`projectionOnly` graphs writes format 4 so an older writer refuses the registry.
+Otherwise an unactivated store writes format 2 and an activated store writes format 3.
+A format 1 registry has no nonces, so its graphs take no typed writes until the owner
+protects them again. Resolution now requires the receipt to be an
 `ev:Operation` in the record's graph, and both the record and the receipt to carry that
 graph's current nonce as `ev:graphProtection`, otherwise the answer is
 `origin-not-reproduced`. A record written while its graph was detached cannot carry a
@@ -913,37 +999,50 @@ A proposal runs in this order.
 4. The references to existing records and stored facts are resolved under the caller's
    read access with the L4 resolver, so a reference the caller cannot read answers as a
    missing one.
-5. The stored facts of this dataset are held under a hold whose id is the operation
-   UUID, and the hold is durable before step 6 starts.
+5. The server checks the caller's authority to change holds on every referenced
+   dataset outside the proposing dataset. The registered names and identities stay
+   pinned through this check and hold acquisition. Each dataset that serves a
+   referenced stored fact acquires a hold under the operation UUID before step 6 starts.
+   Persistent datasets make each hold durable before acquiring the next.
 6. Under the branch writer, `ifHead` is checked as `409 head-changed`, the key is checked
    again, every record identity is checked, the commit is stamped and the record and
    operation quads are built. An existing identity in the same graph whose authenticated
    record has an equal digest is reported as `existing` and not written again, and any
    other existing identity is `409 immutable-record-conflict`. A publish hook then runs
-   on the committing thread inside the commit. It takes the holds' publication lock
-   shared, refuses when the hold is gone or holds other commits, and enters the host's
-   authority fence. The thread keeps both guards until the commit has published or been
-   refused.
+   on the committing thread inside the commit. It pins the same registered names
+   and handles for a cross-dataset proposal and takes the referenced datasets' hold publication
+   locks in ascending dataset UUID order. It verifies each hold and refuses if its
+   last file replacement is uncertain. It then enters the host's authority fence.
+   The thread keeps the guards until the commit has published or been refused.
 
-The hold comes before the commit because a reference recorded without a durable hold
-could lose its commit to retention before any hold existed. With this order a crash at
-any point leaves either nothing, a hold without a published operation or a published
-operation with its hold. A hold without an operation is an orphan. A retry with the same
-key acquires the same hold again, because the hold id is the operation UUID and the
-held commits are equal. `reconcile_operation_holds` releases each evidence hold that is
-older than its grace period and whose operation no graph of `main` or a branch
-describes as an `ev:Operation`, whatever its nonce. A changed protection does not show
-that an operation never published, so such a hold stays. Every published proposal runs
-the reconciliation with an hour's grace, after its commit, and its failure never fails
-the proposal. Every release takes the publication lock exclusively, and a
-reconciliation asks again under it which holds to keep, reading only the current
-snapshots of the stores it found and taking no writer. A commit's hold check also
-renews the hold, so a reconciliation that chose its candidates before the check does
-not release it. A release therefore either
-comes before a commit's hold check, which then refuses the commit, or waits until the
-commit has published, and a reconciliation never releases the hold of an operation
-that published after it first looked. A published operation always names a hold that
-protects it.
+Each source hold precedes publication so retention cannot collect the referenced
+commit before it is protected. A crash before publication can leave holds in some or
+all of the sources. A successful publication has all its holds. A retry of the same
+payload can reacquire the same holds. A competing payload under the same key may
+already have acquired holds before it loses at the writer check.
+
+`reconcile_operation_holds_in` checks whether each candidate past the grace period is
+accounted for by a receipt in the originating dataset. A new receipt records the exact
+hold set per source as digests in `ev:sourceHoldSets`. A receipt from an earlier build
+keeps the hold when it describes the operation but lacks that field. The first pass
+opens the origin's stores and checks that retained origin history cannot supply a
+foreign receipt to a historical fork. The second pass rechecks current heads under
+the target's exclusive publication lock. It excludes catalog management and pins
+the verified open and closed registrations and listed branches through the durable
+release. An unresolved registration keeps a foreign hold when it could name the
+target or the origin. It also tries to pin each relevant
+persistent writer while it confirms that the published head includes every commit
+that could recover at reopen. An uncertain writer or busy or changed membership
+keeps the hold. Publication renews each hold, so a reconciliation that selected the
+hold earlier leaves it in place.
+
+Each published proposal checks its own dataset and the datasets it held with an
+hour's grace. The checks share the request's cancellation and remaining time, capped
+at one second across all datasets. This path uses available branch stores and skips
+cold opens and change-log flushes. Any hold whose check cannot finish stays for later
+reconciliation. The outcome of this housekeeping does not affect the commit.
+`reconcile_operation_holds` and the legacy `reconcile_holds` callback are local-only.
+Use `reconcile_operation_holds_in` with the catalog to check foreign holds.
 
 The server's authority fence binds the commit to the caller's credential.
 `AuthorityRegistry::begin_hold` takes a shared guard on the authority generation, and
@@ -957,15 +1056,16 @@ fence also refuses a changed generation and an expired credential. The guard is 
 
 `POST /{ds}/claims` needs `write` on the dataset or branch through the update endpoint,
 an update grant on each written graph and read access to every referenced record and
-fact. Its principal is the caller's authenticated log name as a
-`urn:x-sparkles:principal:` IRI. A dry run checks everything except the hold and the
-fence and returns a preview of the inserted and deleted quads. The response gives the
+fact. It also needs `admin` on every branch and graph of each foreign dataset whose
+commits it will hold. Its principal is the caller's authenticated log name as a
+`urn:x-sparkles:principal:` IRI. A dry run checks the grants and returns a preview
+of the inserted and deleted quads without acquiring holds. The response gives the
 operation, whether it committed or replayed, the commit, branch, first availability,
 hold and each record's key, kind, IRI, graph, digest and `existing` flag. The new codes
 are `head-changed`, `idempotency-conflict` and `authority-changed`, and `GET /$/server`
 advertises `capabilities.claims` with profile 1 and both routes. The vocabulary adds
 `ev:Operation`, `ev:graphProtection`, `ev:payloadDigest`, `ev:idempotencyKey`,
-`ev:sourceHold`, `ev:recordDigest`, `ev:retainedBytes`, `ev:locator` and
+`ev:sourceHold`, `ev:sourceHoldSets`, `ev:recordDigest`, `ev:retainedBytes`, `ev:locator` and
 `ev:reportedRights`.
 
 Tests cover deterministic identities, graph choice, the server fields on every written
@@ -987,19 +1087,40 @@ reconciliation and a retry.
 
 #### Proposal decisions
 
-1. **Unverifiable selections.** A passage of an existing rendition, a reference to an
-   existing passage and a structured value outside a retained JSON revision of the
-   same batch answer `incomplete-evidence`, because this step cannot yet verify them
-   against retained content. Roadmap item 551 tracks their verification.
-2. **Holds in other datasets.** A stored fact of another dataset is verified but not held.
-   Roadmap item 550 tracks holding it under the operation.
-3. **Records of an earlier protection.** A detach and a new protection invalidate the
-   records written before them, which then answer `origin-not-reproduced`. Roadmap item
-   552 tracks an administered re-authentication.
-4. **Blank nodes.** Record content refuses blank nodes, except in a stored fact's
+1. **Selections of existing records.** An earlier revision returned `incomplete-evidence`
+   for a passage of an existing rendition, a reference to an existing passage and a
+   structured value outside a retained JSON revision of the same batch. Roadmap item 551
+   adds bounded verification of all three through the proposal's shared `Resolution` and
+   its 64 MiB preparation allowance, under the caller's read access and triple masks. A
+   proposed passage of an existing rendition checks that the rendition is authenticated
+   and derived from the passage's revision, then reads its single `ev:normalizedText`
+   once via `Preparation::with_simple_literal` to verify every grouped passage's
+   code-point offsets, optional quote and `ev:textDigest`. A reference to an existing
+   passage verifies the passage through `Resolver::record` and confirms that the
+   passage's own `ev:sourceRevision`, its `oa:hasSource` rendition and that rendition's
+   `prov:wasDerivedFrom` match the reference. A structured `json-lexical-utf8:1`
+   reference against an existing revision authenticates the revision, reads its single
+   `ev:retainedBytes` (`xsd:base64Binary`) once via `Preparation::with_typed_literal`,
+   reserves the decoded byte buffer before chunked base64 decoding, checks the decoded
+   bytes against `ev:contentDigest`, validates UTF-8 and JSON and evaluates all grouped
+   RFC 6901 pointers in one bounded traversal whose memory cap stays within the
+   remaining preparation allowance. Existing or local non-JSON revisions, mismatched
+   quotes, missing pointers, duplicate keys and mismatched digests answer
+   `span-mismatch`. Missing, unreadable, masked or metadata-only targets answer
+   `evidence-unavailable` identically, detached records under a prior protection answer
+   `origin-not-reproduced`, mismatched revision or rendition identities answer `invalid`,
+   and unsupported structured normalization methods or exhausted memory budgets answer
+   `incomplete-evidence`. Record IRIs, record digests, source holds and authority checks
+   remain unchanged.
+2. **Records of an earlier protection.** A detach and a new protection invalidate the
+   records written before them, which then answer `origin-not-reproduced`. Administered
+   re-authentication (`sparkles::evidence::reauthenticate` and
+   `POST /$/evidence/{ds}/reauthenticate`) reconciles those records as described under
+   [Re-authentication after a detach](#re-authentication-after-a-detach).
+3. **Blank nodes.** Record content refuses blank nodes, except in a stored fact's
    expected triple, so that the record digest and the conflict check compare ground
    content.
-5. **Bindings and MCP.** The route is HTTP, OpenAPI and Rust only. MCP waits for Phase 3
+4. **Bindings and MCP.** The route is HTTP, OpenAPI and Rust only. MCP waits for Phase 3
    and the bindings for roadmap item 509.
 
 Review decisions, accepted projections and withdrawals are the sixth Phase 2 step.
@@ -1104,17 +1225,19 @@ conformance of the written records to the shapes, and the HTTP routes.
    version change records a new projection record and applies to later decisions only.
 4. **Withdrawal rights.** Any caller with the grants may withdraw a claim, as for every
    other typed operation. A withdrawal is final, and a new occurrence must be proposed.
-5. **Reconciliation.** A projection whose protections changed is refused rather than
-   repaired. Roadmap item 581 tracks an administered reconciliation.
+5. **Reconciliation.** A review or withdrawal refuses a projection whose protections
+   changed rather than repairing it silently. An administrator reconciles it explicitly
+   through [Reconciling a projection after a changed protection](#reconciling-a-projection-after-a-changed-protection).
 6. **Identity decisions.** Identity proposals need their own record input, a matching
    policy and resolution-map semantics, so they are a later step of this phase. The
    current review policy is specific to claims.
 7. **Bindings and MCP.** The routes are HTTP, OpenAPI and Rust only. MCP waits for Phase 3
    and the bindings for roadmap item 509.
 8. **Output visibility.** A review checks the reviewer's access, and the output graph is
-   read under each reader's grants. The administrator must give the output's readers
-   the policy's boundary. Roadmap item 582 tracks support-aware visibility of
-   projections with F18.
+   read under each reader's grants. Support-aware visibility of accepted projections
+   (roadmap item 582) restricts readers of a policy's output graph to triples backed by at
+   least one live, authenticated acceptance support they can read; see
+   [Support-aware visibility of accepted projections](#support-aware-visibility-of-accepted-projections).
 9. **Bounds.** One review reads at most 10,000 evidence records, and one triple's
    supports, one target's decisions and one decision's successors are each read up to
    10,000 records, beyond which the operation answers `incomplete-evidence`.
@@ -1168,9 +1291,16 @@ an identity graph that has left the boundary or carries another nonce, and an ou
 that holds triples while no revision exists answer `projection-unavailable`. The
 clusters before an operation are recomputed from the boundary, so a map whose matches
 are no longer read would otherwise keep stale triples for entities the operation does
-not reach. A graph added to the boundary is accepted, since no proposal in it was
-accepted under the policy while the map was built. Rebuilding a map after a boundary
-change is roadmap item 643. A split is a superseding rejection, and accepting the
+not reach. A new graph added to the boundary with no current accepted proposals under the policy
+keeps the map available for unmasked callers, while an added boundary graph that holds
+authenticated proposals with current accepted decisions answers `projection-unavailable`
+until a rebuild reconciles the map. A caller whose view masks triples also receives
+`projection-unavailable` whenever the boundary includes an added identity graph not yet
+recorded on the latest revision, so the status depends only on caller-visible boundary
+state and never discloses whether a masked acceptance exists. An administrator can rebuild a map
+after a boundary or protection change through `sparkles::evidence::rebuild_resolution_map`
+and `POST /$/evidence/{ds}/identities/rebuild`, as described in
+[Rebuilding a resolution map after a boundary change](#rebuilding-a-resolution-map-after-a-boundary-change). A split is a superseding rejection, and accepting the
 match again restores the earlier map. Proposals, decisions and earlier revisions are
 never edited, and the output graph's history serves the map of any retained commit.
 `Changed::map` and the answer's `changed.map` name the policy, the new revision and its
@@ -1325,20 +1455,20 @@ anchored history or a covered commit cannot fall back to legacy absence when a
 reference, flag, generation or coverage file is missing. Complete accepted seals
 are authenticated before recovery can truncate a log or expose recovered data.
 
-The newer file versions are written only after activation, so a store that never
-activates stays readable by older releases. Such a store writes version 1 logs,
-generation `commit.json` format 1 and `managed.json` format 2, and its dataset
-records reader 5, or the managed-graph reader when it has managed graphs.
-Activation first raises the dataset reader of every branch to 8, the
-configuration-history reader. It then upgrades each current log header in place
-and publishes the registry root. From then on the family writes version 2 logs,
-`commit.json` format 2, `managed.json` format 3, `history.json` format 2 and
-`branch.json` format 2. Branches and captures of an activated family record reader 8
-before they write any of these. An older release refuses an activated dataset by its
-reader before it reads anything else. A dataset's recorded reader also bounds the
-versions this build accepts in it. Open and reidentification check every generation's
-log and `commit.json` and the dataset's settings and registry against it, before they
-read or change them. One of these versions in a dataset that records an older reader
+Before activation the evidence profile uses version 1 logs and generation
+`commit.json` format 1. A plain dataset records reader 5, and managed graphs require
+reader 6. A registry that marks dedicated outputs as `projectionOnly` can therefore
+use format 4 at reader 6.
+Activation raises the dataset reader of every branch to 8, upgrades each current log
+header in place and publishes the registry root. The family then writes version 2
+logs and format 2 for `commit.json`, `history.json` and `branch.json`. Its registry
+uses format 3 or 4. Each immutable configuration generation uses format 2 when its
+owners carry `projectionOnly` and format 1 otherwise. The lineage can contain both
+formats. Branches and captures record reader 8 before publishing an activated
+family's files. An older release refuses an activated dataset by its reader. A dataset's
+recorded reader also bounds the versions this build accepts in it. Open and
+reidentification check every generation's log and `commit.json` and the dataset's
+settings and registry against it before they read or change them. One of these versions in a dataset that records an older reader
 is refused as a newer release's file. Bounded history readers do not repeat the check,
 so it adds no read to their allowance.
 
@@ -1366,24 +1496,31 @@ integrity check and encrypted restores.
 
 Keeping a dataset identity preserves native bindings. A new identity preserves
 old generation bytes and original small identity and base documents as source
-provenance. Its versioned origin descriptor identifies the source family and
-logical branch and authenticates disjoint exact imported WAL intervals. Only those
-verified intervals permit imported RDF replay. Foreign references outside them
-refuse. Later own publications use a genuine destination generation, while old
-explicit revisions remain unavailable as native historical evidence of the new
-identity. Repeated identity changes retain earlier imported origins and add only
-new imported suffixes, without duplicating large WAL files. Rebuild clones have no
-old WAL history and establish their own destination root explicitly. The public
-restore keeps the identity of a dataset whose configuration history is activated. It
-refuses a new identity for such a dataset as `unsupported`, and roadmap item 764 adds
-that path.
+provenance under `evidence-history/imports/<digest>/`. Its format 2
+`evidence-history/origin.json` descriptor raises `minimumReader` to 11,
+identifies the source family and logical branch, establishes a fresh destination
+configuration-history root, and authenticates disjoint exact imported WAL
+intervals. Only those verified intervals permit imported RDF replay, and foreign
+references outside them refuse. Later own publications use a genuine destination
+generation, while old explicit revisions remain unavailable as native historical
+evidence of the new identity. Repeated identity changes retain earlier imported
+origins and add only new imported suffixes, without duplicating large WAL files.
+New-identity backup restores of activated stores run this reidentification and
+verification before publication, preserve paused view definitions and durable
+job recovery state, and emit `evidence-configuration-history/2` when backed up
+again.
 
-A clone of a dataset whose configuration history is activated is refused with an
-`unsupported` error before anything is captured or written, because a clone copies
-the registry's history root without the evidence-history closure and native
-generations that the root names. Such a dataset is copied by a backup and a restore
-that keeps its identity. Roadmap item 764 adds clones that carry or rebuild the
-closure.
+Clones of datasets with activated configuration history establish a fresh
+destination configuration-history root at sequence 0, pinned by `creationCommit`
+in format 2 `evidence-history/origin.json`, and carry source provenance under
+`evidence-history/imports/<digest>/`. Persistent clones across auto, link, copy,
+rebuild, past-state, graph-subset and branch modes write `minimumReader` 11,
+pause copied view definitions with reason `cloned`, start with an empty control
+keyspace, and stay independent of later source mutations. In-memory clones
+establish an independent in-memory history root at sequence 0. Incomplete
+clones, missing or corrupted closures, tampered imported WAL intervals or origin
+descriptors, lowered `minimumReader` values and unknown origin format versions
+refuse before opening or publication.
 
 Historical configuration supplies semantics, never current access. Source
 retention, current graph protections, caller grants and provider admission remain
@@ -1441,7 +1578,8 @@ preparation. Guarded Dataset queries and U02 readers still adopt them under item
 
 Roadmap item 650 delivers this contract in `recall`, `POST /{ds}/recall` and
 `POST /{ds}/ask`, with `sparkles::evidence::claim_states`, `with_policy_claims` and
-`resolve_entities_at` for Rust callers. Each decision states the adopted behaviour and
+`resolve_entities_at` for Rust callers, and roadmap item 767 delivers the same two
+options in `sparkles ask`. Each decision states the adopted behaviour and
 the strongest alternative that was rejected. Every choice keeps the current output
 of `recall` and Ask unchanged unless the caller names a policy, and a state that cannot
 be represented faithfully is refused with a stable code rather than reported in a
@@ -1473,18 +1611,27 @@ The claims section is bounded by a new `maxClaims` argument, 50 by default and a
 200, and its lines count toward `maxBytes`. Recall sets the section's own truncated flag
 when either bound cuts it. Its reads use the call's snapshot, graph view and query
 budgets, with the evidence resolver's shared preparation allowance. Finding the claims
-about the result reads every quad of each boundary proposal graph and refuses with
-`incomplete-evidence` past one million quads, and roadmap item 766 adds an index that
-avoids the scan. That bound counts every quad of the graph, hidden ones included, so a
-caller can learn only that a readable graph is that large. Each candidate passes the
-visibility check of the claim states below before it counts toward the bound of
-10,000 claims, so a hidden claim takes no place in it. A claim whose own decisions,
-withdrawals or supports exceed the record bound of 10,000 that review applies is read
-as a hidden occurrence, and a projected fact whose supports exceed it cites no claim.
-A support whose own records exceed it is left out while the fact keeps its other
-citations. Hidden records therefore never surface as a refusal. The identities the scan
-finds, and every identity the read looks up, stay charged to the read's preparation
-until the read ends.
+about the result looks them up through the reifier proposition-term index by each
+requested entity's subject or object position in each readable boundary proposal graph,
+reading only the matching claims. Each generation stores its sorted base index in the
+derived file `reifiers.bin` at format version 1, checksummed and verified by
+`sparkles check`, and omits the file when the generation holds no indexed reifiers.
+`Delta::reifiers_ins` tracks inserted `rdf:reifies` triple-term quads in a persistent
+`KeySet` across live writes, branches, overlays and WAL-replayed historical views, while
+base deletions filter against `Delta::del`. Lookups hash each requested IRI with the
+first 8 little-endian bytes of SHA-256 and verify the exact triple-term subject or object
+so a hash collision can never produce a false positive. Legacy generations written before
+this index existed, and a `reifiers.bin` of an unknown version, fall back to the bounded
+scan of up to one million quads, returning `incomplete-evidence` past that limit, until
+the next compaction writes the index.
+Each candidate passes the visibility check of the claim states below before it counts
+toward the bound of 10,000 claims, so a hidden claim takes no place in it. A claim whose
+own decisions, withdrawals or supports exceed the record bound of 10,000 that review
+applies is read as a hidden occurrence, and a projected fact whose supports exceed it
+cites no claim. A support whose own records exceed it is left out while the fact keeps its
+other citations. Hidden records therefore never surface as a refusal. The identities the
+lookup finds, and every identity the read looks up, stay charged to the read's
+preparation until the read ends.
 
 The rejected alternative cites only the supports of accepted projected facts. That
 cannot show unreviewed observations, hypotheses, denials or conflicting occurrences,
@@ -1618,14 +1765,19 @@ the view selects.
 
 #### Ask
 
-`POST /{ds}/ask` accepts the same two arguments and passes them to a new grounding
-stage, which calls `recall` with the policies for the linked entities at hop 0. MCP has
-no Ask tool, and an MCP client reads claims through `recall` itself. An ask that names
-a policy answers from the data, so `mode` `global` is refused with `400` and `auto`
-answers locally. Its policies and the store's configuration history are checked before
-any model call, with the refusals and HTTP statuses of `recall`. That check reads no
-entity and no claim. An ask with no linked entity, such as one that supplies its own
-query, carries an empty claims section.
+`POST /{ds}/ask` accepts the same two arguments. MCP exposes `ask`, `recall` for standalone claims, and `community_reports` for standalone reports.
+`sparkles ask` accepts `--review-policy` and `--matching-policy` with the same preflight
+checks, summary grounding, JSON output and event stream. Human output includes
+`# claims` and `# resolution` when present. Matching policy alone omits `claims`
+and `claimCitations`. In local
+mode, or when `auto` routes a question to the data, a grounding stage calls `recall` with
+the policies for the linked entities at hop 0, and community grounding filters any
+attached community summaries by `reviewPolicy`. In `global` mode, or when `auto` routes a
+question to community reports, Ask selects policy-filtered reports and resolves report
+identities as described in [Reading reports](#reading-reports) below. Its policies and
+the store's configuration history are checked before any model call, with the refusals
+and HTTP statuses of `recall`. That check reads no entity and no claim. An ask with no
+linked entity, such as one that supplies its own query, carries an empty claims section.
 
 The claims section enters only the summary step's context, under the same structural
 label, and the summary may cite occurrences as `[c1]`. That step's system prompt lets
@@ -1642,7 +1794,9 @@ through that context.
 The summary's JSON keeps its numeric `citations` for rows and gains `claimCitations`, a
 list of occurrence identifiers such as `"c1"`. The `summary` event and the final JSON
 carry the `claims` member that recall's JSON format defines, with its version, policy
-and occurrences. No earlier event carries claim content.
+and occurrences, and carry `resolution` when a matching policy is set. When no summary
+runs on an answered policy-bearing ask, a terminal `policy` event publishes the checked
+`claims` and `resolution` members before `usage`. No earlier event carries claim content.
 
 Before it emits the summary, Ask reads the claims section again with the same selector
 and the caller's current grants, protections and source holds, and compares it, with
@@ -1785,8 +1939,7 @@ references, the claims and one evidence link per claim.
 The C18 registration records the digest of the normalized text as the source's content
 digest when it keeps no other original bytes, which is the case for converted uploads.
 An upload and a later `source` run of the same registered source therefore describe the
-same revision. The passages are verified against the batch's own rendition text, which
-avoids the `incomplete-evidence` answer of proposal decision 1. A review verifies every
+same revision. The passages are verified against the batch's own rendition text. A review verifies every
 cited passage again against the rendition's retained `ev:normalizedText` before it
 accepts a claim, so the evidence rendition must keep the text. The text is therefore
 stored twice, once in the C18 chunks and once in the evidence rendition. That costs up
@@ -1885,10 +2038,33 @@ link, because extraction does not establish which occurrence corresponds to whic
 
 The two source revisions do correspond, because the registration replaced the current
 rendition of the same source. Both revisions name the same source through
-`prov:specializationOf`, and the C18 renditions keep their `prov:wasRevisionOf` chain.
-The source revision input has no field for a link to a predecessor revision, and adding
-one changes the record digests of revisions, so roadmap item 780 tracks a
-`prov:wasRevisionOf` link between evidence source revisions.
+`prov:specializationOf`, the C18 renditions keep their `prov:wasRevisionOf` chain, and
+the new evidence source revision carries an optional `wasRevisionOf` reference written as
+`prov:wasRevisionOf` to the prior authenticated `ev:SourceRevision` when one exists. The
+field is framed into the request payload digest only when present and omitted from the
+immutable triples when absent, so revisions without a predecessor keep their earlier
+record and payload digests. Self-links and cycles within a batch are refused, and an
+existing predecessor must resolve as an authenticated, caller-readable
+`ev:SourceRevision`. Claims ingestion sets `wasRevisionOf` automatically from the
+replaced C18 rendition's authenticated evidence source revision when the C18 relationship
+is visible under the caller's query policy, reading C18 edges and authenticating evidence
+records at one pinned branch commit (the registration plan head for uploads or the read
+commit for registered sources). It walks up to 64 source-attributable C18
+`prov:wasRevisionOf` renditions when intermediate renditions had no claims ingestion and
+also combines prior original-byte variants on the same normalized rendition with C18
+predecessors so restorations and byte-only updates both resolve chronologically. When
+multiple candidates survive, chronology is recovered from authenticated evidence
+`prov:wasRevisionOf` ancestry across configured evidence graphs and branch commit order,
+and `wasRevisionOf` is omitted when lineage remains ambiguous, encounters an
+unattributable transition shared with another source or under a query protection that can
+hide competing source memberships, or would otherwise choose from a partial frontier past
+the 64-rendition walk bound. For registered-source runs whose branch head moves before
+publication, publication retries at the new head only while the source still resolves to
+the same live rendition and provably equal observed digest, and otherwise refuses with
+`head-changed` without writing. When the same source revision already exists as an
+authenticated record in the target source-record graph, re-ingestion under another profile
+references that existing revision directly so its immutable record is preserved without
+disclosing masked edges.
 
 The rejected alternative applies the supersession of C18 §7.9 and withdraws the earlier
 occurrences that the new extraction does not repeat. A model omitting a fact is not
@@ -1930,7 +2106,10 @@ typing triple already supplies.
 
 The task result has `outcome` set to `proposed`, `already-proposed` or `no-facts`, and
 `mode` set to `claims`. A proposed result carries the operation, commit, branch, first
-availability and hold of the receipt, the revision and rendition IRIs, the counts of
+availability and hold of the receipt, the revision and rendition IRIs, `previousRevision`
+when an earlier authenticated evidence `SourceRevision` is linked (distinct from the C18
+`previousRendition` IRI and omitted when no predecessor is linked, when the recorded link
+is hidden from the caller or on an `already-proposed` response), the counts of
 records by kind, the records of the receipt, and the `failed` and `flagged` lists, with
 the registration's members that the other modes report. A run that extracts no fact
 still publishes the registration with a batch of its revision and rendition alone, and
@@ -2101,11 +2280,12 @@ of C22 §2.3 read the stored citations and carry no more than the reports hold.
 A report's footprint of C22 §6.2 also lists the policy's decisions and supports graphs
 and each configured proposal graph that the principal may read, besides the graphs its
 projection read. The stored citations name claims and decisions from those graphs, and
-their visibility was decided there, so a reader is admitted only when it may read every
-one of them under the same protections as the principal. A report therefore never shows
-a reader a claim or decision that its own view hides, and the coverage rules of C22 §6.3
-and the guard apply unchanged. The source-record graphs stay out of the footprint,
-because no field of a stored report is read from them.
+their visibility was decided there. The footprint records those graphs and their
+protections, but cannot prove access to the transitive dependencies of support-aware
+visibility. Reports built under a review policy or from a support-gated graph require
+unrestricted read access under the C22 §6.3 guard. The same guard applies to dependent
+report lookups. The source-record graphs stay out of the footprint because no field of
+a stored report is read from them.
 
 #### Refresh
 
@@ -2186,12 +2366,37 @@ them, so existing responses are unchanged. Every path reads the report through t
 guard of C22 §6, so the lists reach only readers for whom the reports graph is proven.
 `sparkles graphrag reports` lists titles and statuses and does not change.
 
-A global answer still refuses `reviewPolicy`, because recall's argument names the policy
-whose claims an answer reads, not the policy its reports were built under. Roadmap item
-811 lets a global answer name a policy and use only reports read under it, and adds
-identity resolution through a matching policy to reports. Roadmap item 810 adds a search
-for the reports whose activity used a changed record, as `claims/dependents` does for
-assessments, for F22's maintained analyses.
+Roadmap item 811 extends `community_reports` and global answers in `POST /{ds}/ask` with
+`reviewPolicy` and `matchingPolicy`. Both arguments require activated configuration
+history and read on the Head `BoundEvidenceView`, refusing inactive configuration history
+with `409 configuration-history-inactive`, unavailable projections or maps with `503
+projection-unavailable`, and unknown, wrong-kind or unauthorized policies with `400
+bad-argument` before reading reports or calling a model. With `reviewPolicy`, report counting, level selection, search ranking and retrieval admit
+only reports whose `gr:reviewPolicy` matches the requested policy's IRI, excluding
+reports built under other policies or no policy before search limits and rank fusion,
+while the C22 disclosure guard continues to enforce the reports graph's build footprint.
+With `matchingPolicy`, `community_reports` resolves the distinct entity IRIs referenced by
+the returned findings' `gr:about` and `gr:cites` triple terms through
+`sparkles::evidence::resolve_entities_at` in bounded chunks under the caller's access
+view, refusing selections that reference more than 10,000 distinct entities or exceed the
+identity response budget as `422 incomplete-evidence` and shortening cluster member lists
+with `membersComplete: false` when needed to stay within the aggregate member budget.
+Each finding keeps its source IRIs in `about`, each report records mapped `identities`,
+and the response carries `resolution` with the policy name, version, map revision IRI,
+map revision number and mapped `entities`. Global Ask passes both arguments to
+`community_reports`, pairs bounded identity links with their supporting findings inside
+the map prompt's data block without rewriting source IRIs, fences map and reduce calls
+with `AuthorityFence`, and re-verifies the caller's authority and report selection before
+publishing the answer, withholding it as `403 forbidden` if either changed in flight. In
+`auto` mode, policy preflight runs before any model call while full report loading and
+entity resolution wait until the draft routes globally, so exact-linked local questions
+are not aborted by report-only limits.
+
+`POST /{ds}/claims/dependents`,
+`find_evidence_dependents`, `sparkles::evidence::find_dependents` and
+`sparkles::evidence::find_dependents_at` also search guarded reports graphs through the
+C22 §6 disclosure guard for the reports whose activity used a changed record, as recorded
+below under [Delivered scope](#delivered-scope).
 
 #### Acceptance
 
@@ -2301,6 +2506,352 @@ graph, the state, the head commit, the model requests and the task list unchange
 also covers a withdrawal behind a cited claim and a state left behind the reports graph
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
+
+### Cloning and restoring activated configuration history
+
+Clones and new-identity backup restores of datasets with activated configuration
+history now publish a fresh destination configuration-history lineage and a format 2
+`evidence-history/origin.json` closure under dataset reader 11, while backup manifests
+carrying imported provenance declare `evidence-configuration-history/2`. Persistent
+clones across auto, link, copy, rebuild, past-state, graph-subset and branch modes pin
+their sequence-zero root with `creationCommit`, carry source provenance under
+`evidence-history/imports/<digest>/`, pause copied view definitions with reason
+`cloned` and start with an empty control keyspace. In-memory clones establish an
+independent in-memory lineage with retained origin provenance so materialized backups
+and restores remain valid from sequence zero onward. New-identity restores verify
+copied closures before publication, preserve paused definitions and durable job
+recovery across WAL header upgrades, authenticate disjoint imported WAL intervals
+without duplicating logs across repeated identity changes, and keep retained cold
+history and branch reads consistent with destination cutoffs.
+
+Roadmap item 810 extends `sparkles::evidence::find_dependents`,
+`POST /{ds}/claims/dependents` and the MCP tool `find_evidence_dependents` to search
+guarded reports graphs under `urn:x-sparkles:graphrag:` (excluding the disclosure
+footprints graph) for community reports whose generating activity recorded `prov:used`
+for a changed record, and adds `sparkles::evidence::find_dependents_at` for historical
+`BoundEvidenceView` reads. Each caller's `GraphAccess` has its undecided C22 §6 guards
+and triple protections bound against the exact snapshot being read under the shared
+preparation budget. An unproven or unreadable reports graph is skipped without counting
+against the 10,000-record bound, so restricted callers cannot infer hidden reports from
+counts or `incomplete-evidence` refusals, and a report or activity any of whose triples
+the caller's view masks is neither reported nor followed. Person-edited reports linked by
+`gr:editOf` carry no activity of their own and inherit the edited report's inputs at the
+same depth, while build replacements linked only by `prov:wasRevisionOf` are not
+followed. With `transitive: true`, dependent reports enter the search queue so higher-level
+reports whose activity used a dependent child report appear at `depth + 1`. Responses keep
+the existing `dependents` assessment array unchanged and add a sibling `reports` array of
+`{report, community, graph, on, dependence, depth}` entries sorted by depth and IRI. Unit
+tests in `crates/sparkles/tests/evidence_dependents.rs` and router tests in
+`crates/sparkles-server/src/http/router_tests/auth/graphrag_evidence.rs` cover direct and
+transitive claim, decision and source-revision lookups, `gr:editOf` chains, excluded
+unrelated and unguarded reports, C22 §6 footprint coverage, missing report graph grants,
+mismatched `?user` protection bindings, footprint removal, triple masks, branches,
+historical views, and the 10,000-record bound.
+
+### Holds for stored facts of other datasets
+
+Item 550 extends proposal holds to every catalog dataset that serves a referenced
+stored fact. Each dataset must be uniquely registered by UUID in the same catalog.
+All must be persistent or all must be in memory. HTTP, MCP and ingestion callers need
+`admin` on every branch and graph of each foreign source in addition to their read
+grants. Acquisition pins the names under which the caller is authorized. The
+publication hook revalidates the verified names and identities and preserves every
+source hold through publication. Replay returns the hold in the original receipt,
+including a null hold for older proposals that referenced only foreign facts.
+
+A foreign hold records the proposing dataset's UUID as `forDatasetId` in
+`holds.json` format 2. Files with only local holds remain in format 1.
+`GET /$/evidence/{ds}/holds` and the Rust `sparkles::evidence::hold_details` helper
+include the originating dataset for foreign holds.
+
+A hold stays while either dataset is unavailable or ambiguously registered.
+A pending or refused registration with an unknown UUID prevents automatic release
+until the catalog can establish the hold's origin.
+Deleting the origin leaves the foreign hold for an administrator to release until
+item 1315 adds durable cleanup. Automatic reconciliation currently runs after
+proposals publish on the target or acquire holds there. Item 1316 tracks scheduled
+cleanup and an index for large historical scans. A foreign hold also stays if its
+origin can recover an unpublished receipt or its history cannot be checked within
+the scan bounds.
+
+Tests cover catalog ambiguity, copied store handles, mixed persistence, foreign
+authority, both hold file versions, retention, crash recovery, a race between
+competing payloads and a fork from a historical receipt.
+
+### Rebuilding a resolution map after a boundary change
+
+`sparkles::evidence::rebuild_resolution_map` and `POST /$/evidence/{ds}/identities/rebuild`
+provide an administered rebuild of a matching policy's resolution map on `main` or a
+branch after a boundary or protection change makes reviews and reads answer
+`projection-unavailable`. The HTTP route requires unrestricted `admin` on the dataset or
+branch, respects read-only mode, declared-settings drift and the authority fence, and
+supports optional `policyVersion`, `ifHead`, `idempotencyKey`, `dryRun` and `message`
+fields.
+
+The rebuild enumerates the policy's current authenticated `ev:ReviewDecision` records in
+its decisions graph under the existing record and memory bounds, keeps the accepted
+decisions whose targets are authenticated `ev:IdentityProposal` records in the protected
+identity graphs of the policy's current boundary, recomputes the connected components and
+their deterministic representatives, verifies every effective `ev:DistinctEntities`
+constraint and refuses with `identity-conflict` if any two separated entities would share
+a cluster. It scans the policy's output graph under the shared preparation budget and
+rewrites the output graph atomically to hold only the recomputed `<member> ev:resolvesTo
+<representative>` triples, removing stale or detached-epoch triples.
+
+In the same commit it appends a fresh immutable `ev:ResolutionMap` revision in the maps
+graph with the current `decisions`, `maps` and `output` protection nonces and the current
+`ev:boundaryProtection` entries. When the latest prior revision in the maps graph still
+authenticates, the new revision links it through `prov:wasRevisionOf` and records the
+exact `ev:adds` and `ev:ends` delta against the fold of that chain so dependent lookups
+find consumers of the prior revision and of decisions whose effect ended. When the maps
+graph itself was detached and protected again, the rebuild checks that no higher revision
+exists past a numbering gap and starts a new authenticated chain at the next revision
+number while `latest` requires the highest contiguous revision to authenticate.
+
+Tests cover boundary removal, detaching and re-protecting boundary identity graphs,
+output, maps and decisions graphs, dry runs, idempotent replays and conflicts, SHACL
+shape conformance of written revisions, dependent assessment lookups, separation
+conflicts on re-added boundary graphs, branch-scoped rebuilds, persistent restart
+durability, non-admin and drift refusals, OpenAPI parity and client types.
+
+### Re-authentication after a detach
+
+Roadmap item 552 delivers administered re-authentication in
+`sparkles_core::evidence::reauth`, `sparkles::evidence::reauthenticate` and
+`POST /$/evidence/{ds}/reauthenticate`. Detaching a protected evidence graph drops its
+protection nonce and protecting it again assigns a new nonce, so records written under
+an earlier protection answer `origin-not-reproduced` and their identities refuse new
+proposals as `immutable-record-conflict`.
+
+An administrator with `admin` on the dataset and target branch reconciles one protected
+record-role graph (`sourceRecords`, `proposals`, `decisions`, `supports` or `identity`)
+at a time, either every profile record in the graph up to 10,000 records or an explicit
+list of record IRIs with optional expected `ev:recordDigest` values. Projection graphs
+are refused because they hold projected assertions rather than profile records.
+Re-authentication requires activated configuration history (`409 configuration-history-inactive`
+otherwise) so every stale candidate is independently checked against its retained,
+configuration-bound publication view (`BoundEvidenceView`) proving that the record and its
+receipt existed together under an earlier protection nonce at that commit with matching
+`ev:recordDigest`, receipt metadata and commit timestamp. Candidates whose publication
+view is not retained or predates activation are refused with `422 origin-not-reproduced`.
+Under the shared 64 MiB preparation allowance, the operation also verifies that each
+record is absent from all other record graphs, carries a single profile class, matches its
+recomputed canonical `ev:recordDigest` across its direct triples and fragment sub-nodes
+(canonicalizing blank-node labels inside reifier-anchored `ev:expectedTriple` terms, with
+publication-view verification for previously published records under the earlier raw-label
+scheme), matches any retained `ev:retainedBytes` (via bounded typed-literal streaming
+base64 hashing) or `ev:normalizedText` against its `ev:contentDigest`, matches its passage
+quote and unique retained rendition span when applicable, matches any retained JSON
+structured selection under the shared preparation allowance, rejects noncanonical nonce
+spellings and forbidden sub-node predicates, and verifies multi-detach nonce lineage
+through the original protection and authenticated reconciliation audit operations.
+
+Any tampered, missing, unretained or mismatched candidate refuses the entire operation
+without writing, returning `409 immutable-record-conflict`, `409 target-changed`,
+`422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable` or
+`422 incomplete-evidence`. When every candidate verifies and the audit subject carries no
+pre-existing triples in any record graph, one atomic managed-write commit rewrites
+`ev:graphProtection` on each verified record and its receipt operation to the graph's
+current nonce while preserving `ev:availabilityReceipt`, `prov:wasGeneratedBy`,
+`ev:recordDigest` and availability timestamps, and records an audit `ev:Operation` stamped
+with `ev:operationKind ev:Reauthentication` and `ev:reauthenticatedGraph`, linking renewed
+records via `prov:used`, already-authenticated records via `ev:alreadyAuthenticated`, and
+renewed receipts via `prov:wasInformedBy`. The operation checks idempotency keys across
+all configured record graphs before `ifHead`, honors `dryRun`, declared evidence-settings
+drift checks, the caller authority fence and streaming 4 MiB body limits, and reproduces
+both renewed and already-authenticated records on whole-graph replay. Replaying an
+idempotent proposal, review, withdrawal or identity review verifies that every record
+produced by the replayed operation remains authenticated, so a partial re-authentication
+never replays an unvouched record. Projection and resolution-map records keep their
+immutable nonce fields, so `projection-unavailable` remains enforced until the projection
+or map is reconciled.
+
+Unit, library, router and auth tests cover detach and re-protect cycles across all
+record kinds, retained bytes (including multi-MiB payloads and JSON selections) and
+normalized text tampering, changed records with recomputed digests, records absent from
+their publication commit, matching timestamp edits, detached-commit forged receipts,
+unactivated configuration history and unretained commits, untyped pre-existing audit
+subjects, multi-detach partial reconciliation across epochs in every order, reifier-backed
+blank-node `ev:expectedTriple` round-trips and legacy digests, preparation-budget and
+triple-count boundaries, noncanonical UUID nonces, passage and structured dependency
+duplicates and missing content, fragment sub-node `LARGE` predicates, partial-replay
+safety across proposals, reviews, withdrawals and identity reviews, cross-graph
+idempotency conflicts, keyed whole-graph mixed and all-current replays, dry runs, branch
+scoping, persistent reopen durability, streaming 4 MiB body caps, read-only, non-admin,
+branch-admin, graph-grant and drift refusals, and OpenAPI schema conformance.
+
+### Support-aware visibility of accepted projections
+
+Roadmap item 582 adds support-aware visibility for review-policy accepted projections using
+the triple-masking machinery of C12b §8 and F18 §7.1. When a dataset has enabled evidence
+settings with at least one review policy and a reader does not have unrestricted read
+access to the dataset, preparing a snapshot view filters each readable policy output graph
+so that a projected triple is visible only when at least one live, authenticated
+`ev:AcceptanceSupport` for that triple is completely readable under the caller's grants
+and triple protections.
+
+A support counts as readable and live when every part of its justification is authenticated
+under the current graph protections and visible to the caller. That check requires read
+access to the policy's decisions and supports graphs, an authenticating `ev:Projection`
+record whose stored protection nonces match the current protections of the decisions,
+supports and output graphs, an authenticated `ev:AcceptanceSupport` and `ev:ReviewDecision`
+that are neither masked by triple rules nor superseded by an authenticated decision, an
+authenticated `ev:Claim` in a configured proposal graph that is readable, unmasked across
+its record sub-nodes and not withdrawn in any configured proposal graph, a readable
+authenticated `ev:SourceRevision` when the claim cites one, and every authenticated
+`ev:Supports` link targeting the claim in the policy boundary or the claim's graph together
+with its `ev:EvidenceRef`, referenced source records and stored-fact target. A missing
+projection record, a changed protection nonce, an unreadable policy metadata graph, a
+cross-dataset or non-reproducible stored-fact reference, or a support scan past the 10,000
+record cap fails closed by hiding the affected projected triples without surfacing hidden
+evidence or errors.
+
+Because the filter joins `Snapshot::mask` in both the legacy and controlled masking paths
+and folds a deterministic fingerprint of the active evidence configuration and protection
+nonces into the mask cache key, SPARQL queries, Graph Store reads, Recall, Ask, GraphRAG
+and MCP tools enforce the same visibility boundary and reuse cached masks safely across
+commits and configuration changes. Live snapshots resolve the active configuration from the
+store's shared managed state with a single atomic load when no review policies exist.
+Historical reads through `snapshot_at`, `branch_snapshot_at`, `snapshot_pinned` and
+`BoundEvidenceView` pin the historical configuration generation and its recorded
+protection nonces when configuration history is active, while enforcing the caller's
+current grants and triple protections. Mask preparation charges every lookup, scan and
+temporary buffer to `Preparation` and enforces `MaskLimits::max_hidden`.
+
+Unit, library and HTTP router tests cover readers with one live support, readers with
+output or policy metadata grants alone, withdrawal of one of multiple supports,
+re-acceptance, superseding decisions, `ev:Supports` links to unreadable stored facts and
+passages, triple-protection masking of underlying claims, historical snapshot and branch
+reads, detached projections failing closed while historical snapshots retain their pinned
+configuration, bounded preparation memory refusal, and end-to-end SPARQL, Graph Store,
+Recall and Ask queries.
+
+### Evidence operations in the bindings
+
+Roadmap item 509 exposes the thirteen typed evidence operations in Python
+(`Dataset.evidence`), Node.js (`Dataset.evidence`) and the JVM
+(`DatasetGraphSparkles.evidence()`). Each binding delegates to the shared
+JSON codec in `sparkles::evidence::binding` over the same Rust operations that
+the HTTP server uses, covering settings reads, configuration, graph detachment,
+source hold listing, acquisition and release, exact stored-fact and record
+resolution, claim and identity proposals, reviews, withdrawals, policy claim-state
+reads, matching-policy entity resolution and dependent assessment lookups.
+
+Embedded callers are trusted and run without an HTTP authentication layer. When a
+proposal, review or withdrawal omits a principal, the bindings record
+`urn:x-sparkles:principal:local`, and call-level `branch`, `principal` or `author`
+arguments override values in the JSON body. Single-dataset binding resolution passes
+no catalog, so a stored-fact reference naming another dataset returns
+`evidence-unavailable`. Hold acquisition returns `{ created, hold }` and hold release
+returns a boolean, replacing the HTTP status distinctions. Policy claim-state reads
+require activated configuration history when an explicit `at` selector is given and fall
+back to a coherent live-head read under the current managed settings when `at` is
+omitted on a store without configuration history.
+
+Managed-boundary and branch refusals map globally to the bindings' typed exception
+classes and carry the stable machine code (`e.code` in Python and the JVM,
+`e.details.code` in Node.js), including `profile-managed-graph` refusals on ordinary
+writes (`ConflictError` in Python and Node.js and `SparklesTransactionException` on
+the JVM, replacing the earlier unmapped catch-all fallbacks). Closed-dataset and
+family-wide active-transaction guards refuse writes before taking the store writer
+lock, while hold listing reads only the branch table without taking writer locks. All
+thirteen `evidence.*` entries in `crates/sparkles/bindings.toml` name their concrete
+binding paths, and the Python parity test no longer defers any evidence operation.
+
+### Reconciling a projection after a changed protection
+
+Roadmap item 581 adds `sparkles::evidence::reconcile_projection` and
+`POST /$/evidence/{ds}/projections/reconcile` for an administrator to reconcile a
+review policy's accepted projection after a detach and new protection of its decisions,
+supports or output graph. The route needs `admin` on the dataset or selected branch,
+update grants on the policy's supports and output graphs and unmasked read grants on its
+decisions, supports and output graphs and on every configured proposal graph. It
+refuses while the server is read-only or while declared and recorded evidence settings
+differ (`409 evidence-settings-drift`), and publishes under the caller's authority
+fence (`503 authority-changed`).
+
+At the branch head (checked against optional `ifHead` and again under the writer), the
+operation collects every live `ev:AcceptanceSupport` of the policy in its supports graph
+that authenticates under the current protections, whose accepted `ev:ReviewDecision`
+authenticates in the decisions graph and is not superseded, and whose claim authenticates
+in a configured proposal graph under its current protection and has no authenticated
+`ev:Withdrawal` in any configured proposal graph. If a proposal graph is detached and
+protected again, prior claims and withdrawals there no longer authenticate, so
+reconciliation cannot establish that those claims were never withdrawn and drops their
+supports rather than reviving withdrawn claims. It scans the output
+graph under the shared 64 MiB memory allowance and 1,000,000-triple bound, removes every
+quad not owned by a vouched support (deleting by physical quad ID so blank nodes
+inserted while detached are removed), and inserts every missing vouched triple. When
+decisions or supports were detached and re-protected, prior records no longer
+authenticate, so the output graph is emptied.
+
+Before item 581, a format 2 registry could keep the same protection nonce while a
+graph served first as a record graph and then as a projection output. A projected
+triple identical to a published triple occupies the same RDF quad. Withdrawing its
+last support can therefore remove a publication link or receipt field. Format 2 records the
+owner and nonce but has no per-triple origin or history of graph roles.
+
+On upgrade, the store checks every branch in the family before marking a dedicated
+output as `projectionOnly`. A record with a SHA-256 `ev:recordDigest` can identify
+its currently protected `ev:Operation` through either `ev:availabilityReceipt` or
+`prov:wasGeneratedBy`. A currently protected record also identifies its publisher
+through a receipt to a distinct `ev:Operation` with the same protection. If the
+publisher has lost its operation type or its protection, the receipt still identifies
+a `prov:Activity` that retains the other marker when the record also has a generation
+link to that activity or a SHA-256 record digest.
+A projected copy of that evidence receives the same protection. A projected operation description alone
+does not establish record history. Format 4 prevents new mixed histories. The writer
+rejects record writes to outputs marked `projectionOnly`. Moving such an output into a
+record role rotates its nonce. A former record graph with surviving receipt evidence
+retains its nonce and reconciliation refuses to replace its contents.
+
+A reconciliation publishes its keyed operation in exactly one supports graph. A retry
+first checks current record-role graphs. When one contains the operation, its payload
+and read-grant checks decide replay. Statements in a legacy output cannot add a
+payload conflict, a read grant or a projection to that receipt.
+
+If the operation is absent from current record-role graphs, replay checks former
+record graphs among the unmarked outputs. In a graph with receipt history under its
+current nonce, a surviving operation field at the deterministic IRI or a protected
+record naming that IRI through a receipt or generation edge reserves the key.
+A protected `ev:Operation` bearing the requested key must also be accounted for.
+If a live support owns the matching key quad, the requested key, dataset and
+surviving principal association can still identify another principal's operation.
+That principal's use of the key is independent. An unrelated record receipt establishes graph history only.
+
+Replay excludes every triple owned by a live support of the output's current review
+policy from the receipt evidence. The remaining operation description must contain
+both activity types, the principal, end time, dataset, branch, commit, payload digest,
+key and current protection nonce. Each required field must have its expected type
+and cardinality. A projected replacement for a missing field cannot supply it.
+Replay requires one candidate graph, a matching payload and read access to that
+graph. It looks for an authenticated projection of the requested policy through
+`prov:wasGeneratedBy` or `prov:used`. The operation can
+name at most one reuse target, and qualifying links must agree on the projection.
+A generating edge must agree with the record's receipt. If neither link identifies
+a projection, replay checks `ev:availabilityReceipt` to recover a created
+projection whose generating edge was withdrawn. After support records have been
+cleared, format 2 cannot distinguish a fully copied publication from the original.
+Both are subject to the same replay checks.
+
+A different payload returns `409 idempotency-conflict`. Ambiguous legacy publishers,
+a missing or ambiguous projection association, or missing or ambiguous receipt
+metadata return `409 immutable-record-conflict`. In particular, a reuse operation
+whose shared `prov:used` edge was withdrawn has no creation receipt to fall back
+on. The refusal preserves the branch head, the old output and the current supports
+graph even if the retry omitted the policy version and the policy has since changed.
+
+In the same atomic commit of the evidence owner, the operation appends a fresh immutable
+`ev:Projection` record to the supports graph, minted from the policy, version, operation
+and three current protection nonces, with `prov:wasRevisionOf` naming every prior
+unsuperseded projection record of the policy. `check_projection` ignores any projection
+record superseded through `prov:wasRevisionOf` by a currently authenticated projection
+record of the same policy, while still refusing a supports, output or conflict-mode
+change made without raising `policy.version` under unchanged protections (including
+swapping protected outputs or supports graphs between policies). Reconciling an already-valid projection whose output matches
+its vouched supports reuses its active projection record and links the operation to it
+through `prov:used` so keyed replays return the original receipt. Normal reviews,
+withdrawals and policy reads resume after reconciliation.
 
 ### Scope changes
 

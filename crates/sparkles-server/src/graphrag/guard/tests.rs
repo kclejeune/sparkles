@@ -67,6 +67,8 @@ fn footprint(v: Option<&GraphAccess>, read: &[&str], c: &Caller) -> Footprint {
         caller: c,
         graphs: &graphs,
         reports: &[],
+        snap: None,
+        review_policy: false,
     })
     .unwrap()
 }
@@ -191,6 +193,8 @@ fn capture_refuses_what_it_cannot_describe() {
         caller: &c,
         graphs: &graphs,
         reports: &[],
+        snap: None,
+        review_policy: false,
     })
     .unwrap_err();
     assert_eq!(e, CaptureError::Unreadable(B.into()));
@@ -205,6 +209,8 @@ fn capture_refuses_what_it_cannot_describe() {
         caller: &c,
         graphs: &graphs,
         reports: &[],
+        snap: None,
+        review_policy: false,
     })
     .unwrap_err();
     assert!(matches!(e, CaptureError::Unrepresentable(_)));
@@ -256,8 +262,17 @@ fn footprints_are_named_by_their_digest_and_versioned() {
     assert!(fp.iri().starts_with(FOOTPRINT_PREFIX));
     assert_eq!(fp.iri().len(), FOOTPRINT_PREFIX.len() + 64);
     assert_eq!(Footprint::parse(&fp.to_json()).unwrap(), fp);
-    let newer = fp.to_json().replacen("\"version\":1", "\"version\":2", 1);
-    assert!(Footprint::parse(&newer).unwrap_err().contains("version 2"));
+    let next_ver = FOOTPRINT_VERSION + 1;
+    let newer = fp.to_json().replacen(
+        &format!("\"version\":{FOOTPRINT_VERSION}"),
+        &format!("\"version\":{next_ver}"),
+        1,
+    );
+    assert!(
+        Footprint::parse(&newer)
+            .unwrap_err()
+            .contains(&format!("version {next_ver}"))
+    );
     assert!(Footprint::parse("{}").is_err());
 }
 
@@ -303,7 +318,11 @@ fn reports_without_a_valid_footprint_are_unproven() {
     assert_ne!(forged, with_footprint(&fp));
     assert!(g.index(&store(&forged).snapshot()).proven(&r).is_empty());
     // a footprint of a newer version
-    let newer = with_footprint(&fp).replacen("\\\"version\\\":1", "\\\"version\\\":2", 1);
+    let newer = with_footprint(&fp).replacen(
+        &format!("\\\"version\\\":{FOOTPRINT_VERSION}"),
+        &format!("\\\"version\\\":{}", FOOTPRINT_VERSION + 1),
+        1,
+    );
     assert_ne!(newer, with_footprint(&fp));
     assert!(g.index(&store(&newer).snapshot()).proven(&r).is_empty());
     // a second footprint the reader does not cover
@@ -379,11 +398,12 @@ fn controlled_exemptions(
     v: &GraphAccess,
     p: &sparkles::access::Preparation,
 ) -> sparkles::Result<Vec<String>> {
+    let guard_snap = sparkles::access::GuardSnapshot::new(snap);
     let output = Decide {
         guard: g.clone(),
         view: v.clone(),
     }
-    .exempt_controlled(snap, p)?;
+    .exempt_controlled(&guard_snap, p)?;
     let mut values: Vec<_> = output.iter().map(str::to_string).collect();
     values.sort();
     Ok(values)
@@ -408,7 +428,13 @@ fn controlled_provider_matches_real_guard_for_cold_and_cached_footprints_and_cal
     for q in wide.quads(REPORTS) {
         two.push_str(&nq(&q));
     }
-    let forged = with_footprint(&fp).replacen("\\\"version\\\":1", "\\\"version\\\":2", 1);
+    let forged = with_footprint(&fp).replacen(
+        &format!("\\\"version\\\":{FOOTPRINT_VERSION}"),
+        &format!("\\\"version\\\":{}", FOOTPRINT_VERSION + 1),
+        1,
+    );
+    let mut legacy_v1 = fp.clone();
+    legacy_v1.version = 1;
     let mut newer = fp.clone();
     newer.version = FOOTPRINT_VERSION + 1;
     let missing = format!(
@@ -439,6 +465,7 @@ fn controlled_provider_matches_real_guard_for_cold_and_cached_footprints_and_cal
         with_footprint(&fp),
         two,
         forged,
+        with_footprint(&legacy_v1),
         with_footprint(&newer),
         missing,
         duplicate_literal,
@@ -486,11 +513,11 @@ fn controlled_guarded_access_uses_actual_provider_without_changing_write_permiss
             &Preparation::new(Control::none(), 16 << 20).unwrap(),
         )
         .unwrap();
-    assert_eq!(prepared.access(), old.as_ref());
-    assert!(prepared.access().read.allows_iri(REPORTS));
-    assert!(prepared.access().write.allows_iri(A));
-    assert!(!prepared.access().write.allows_iri(REPORTS));
-    assert!(std::ptr::eq(prepared.snapshot(), s.snapshot().as_ref()));
+    assert!(prepared.policy_matches(&old));
+    assert!(prepared.allows_read_iri(REPORTS));
+    assert!(prepared.writable_iri(A));
+    assert!(!prepared.writable_iri(REPORTS));
+    assert!(prepared.same_snapshot(&s.snapshot()));
 }
 
 #[test]

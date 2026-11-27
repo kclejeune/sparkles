@@ -779,6 +779,7 @@ impl viewsvc::ViewSource for PolicyView {
             rows: vec![(vec![Some(oxrdf::Literal::from(7).into())], 1)],
             commit: read.at,
             evaluated_under: None,
+            lease: None,
         })
     }
 }
@@ -957,7 +958,7 @@ impl crate::access::GuardDecision for WaitingPolicy {
     }
     fn exempt_controlled(
         &self,
-        _: &Arc<Snapshot>,
+        _: &crate::access::GuardSnapshot<'_>,
         preparation: &Preparation,
     ) -> Result<crate::access::Exemptions> {
         self.started.send(()).unwrap();
@@ -3587,12 +3588,12 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
         if rounds_expected {
             assert!(rounds > 1, "the star is planned in rounds");
         }
-        // For the chains apart, the checked plan takes the query context's first growth
-        // step, when it decodes a scan's constant term for the plan text (in its scan
-        // options), and the step stays as the context's admitted high point. Its live
-        // bytes are unchanged, and shrinking it returns the credit.
-        if apart {
-            assert_eq!(ctx.live_bytes(), live_before, "width {width}: live bytes");
+        // Ordinary plan text decodes through `plan_term` without touching the query
+        // context's eager grant, so when `ordinary` did not already take the context's
+        // first growth step, the checked plan takes it in `write_checked_plan_term`
+        // and `shrink_retained` returns it. Live bytes remain unchanged.
+        assert_eq!(ctx.live_bytes(), live_before, "width {width}: live bytes");
+        if prep.inner_used() > before {
             assert!(
                 prep.inner_used() <= before + (64 << 10),
                 "width {width}: one growth step"
@@ -4751,4 +4752,464 @@ fn checked_graph_r12_placed_filter_credit_outlives_refusal_storage() {
         );
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn checked_exists_rebinding_retains_projected_view_patterns_credit() {
+    let parsed = parse_query(
+        "SELECT ?outer WHERE {
+            VALUES ?outer { 1 }
+            FILTER EXISTS {
+                { SELECT REDUCED ?x WHERE { VALUES ?x { 1 1 } } ORDER BY ?x LIMIT 1 }
+            }
+        }",
+        None,
+        &[],
+    )
+    .unwrap();
+    let spargebra::Query::Select { pattern, .. } = &parsed else {
+        unreachable!();
+    };
+    let compiled = crate::incr::compile::compile(&parsed, None).unwrap();
+    let mut exists_gp = None;
+    super::walk::visit_algebra_ordinary::<()>(super::walk::Algebra::Pattern(pattern), |item| {
+        if let super::walk::Algebra::Expr(spargebra::algebra::Expression::Exists(p)) = item {
+            exists_gp = Some(p.as_ref());
+        }
+        Ok(())
+    })
+    .unwrap();
+    let exists_gp = exists_gp.expect("EXISTS pattern");
+
+    let preparation = Preparation::new(Control::none(), 2 << 20).unwrap();
+    let baseline = preparation.inner_used();
+    let mut sources = super::checked_syntax::Sources::new(pattern, &preparation).unwrap();
+    let checked_pattern = sources.get(exists_gp, &preparation).unwrap();
+    drop(sources);
+    let after_pattern = preparation.inner_used();
+    assert!(after_pattern > baseline);
+
+    let (projected, vp_charge) = compiled
+        .rebuild_patterns
+        .project_checked(exists_gp, &checked_pattern.syntax, &preparation)
+        .unwrap()
+        .expect("projected REDUCED occurrence");
+    let vp_bytes = vp_charge.bytes();
+    assert!(vp_bytes > 0);
+    let retained_vp = Arc::new(super::expr::RetainedViewPatterns::from_reservation(
+        projected, vp_charge,
+    ));
+    let spec_held = super::expr::ExistsSpec::reserve_checked(&preparation, 1, 0).unwrap();
+    let original_spec_bytes = spec_held.bytes();
+    assert!(original_spec_bytes > 0);
+    let original = super::expr::ExistsSpec::new_checked(
+        checked_pattern,
+        super::plan::ActiveGraph::Default,
+        vec![0],
+        Vec::new(),
+        Some(retained_vp),
+        spec_held,
+    );
+    let before_rebound = preparation.inner_used();
+    assert_eq!(
+        before_rebound,
+        after_pattern + vp_bytes + original_spec_bytes
+    );
+
+    let rebound = original
+        .with_bound_checked(0, crate::id::Id::from_i64(1).unwrap())
+        .unwrap();
+    let with_both = preparation.inner_used();
+    let rebound_spec_bytes = with_both - before_rebound;
+    assert!(rebound_spec_bytes >= original_spec_bytes);
+
+    drop(original);
+
+    // Dropping the original ExistsSpec must release exactly the original spec's
+    // reservation while keeping both the syntax and projected ViewPatterns reservations
+    // charged alongside the rebound spec's own reservation.
+    let used_while_rebound = preparation.inner_used();
+    assert_eq!(
+        with_both - used_while_rebound,
+        original_spec_bytes,
+        "dropping the original spec must release exactly its own reservation"
+    );
+    assert_eq!(
+        used_while_rebound,
+        after_pattern + vp_bytes + rebound_spec_bytes,
+        "rebound spec must keep syntax + ViewPatterns + rebound spec credit"
+    );
+    assert!(rebound.view_patterns().is_some());
+
+    drop(rebound);
+    assert_eq!(preparation.inner_used(), baseline);
+}
+
+#[test]
+fn checked_graph_branches_not_double_charged_in_plan_bytes() {
+    use plan::{ActiveGraph, Planner};
+    use std::fmt::Write;
+
+    let graphs = 20usize;
+    let rows = 256usize;
+    let store = checked_graph_fixture(graphs);
+    let mut values = String::new();
+    for i in 0..rows {
+        write!(values, "({i} {} {} {}) ", i + 1, i + 2, i + 3).unwrap();
+    }
+    let query_text = format!(
+        "SELECT ?g ?a ?b ?c ?d WHERE {{ GRAPH ?g {{ VALUES (?a ?b ?c ?d) {{ {values} }} }} }}"
+    );
+
+    // Inspect the prepared GraphBranches plan directly: `plan_bytes` must not re-charge
+    // the already-reserved branch nodes and VALUES tables held by `PreparedGraphBranches`.
+    let data = physical_default(&store);
+    let ctx = validation_query_context(&data, opts()).unwrap();
+    let prep = ctx.source_preparation.as_ref().unwrap().clone();
+    let before = prep.inner_used();
+    let Query::Select { pattern, .. } = parse_query(&query_text, None, &[]).unwrap() else {
+        unreachable!();
+    };
+    let mut planner = Planner::new(&ctx);
+    let plan = planner
+        .plan(&pattern, &ActiveGraph::Default, Vec::new())
+        .unwrap();
+    let group = checked_graph_group(&plan);
+    assert_eq!(group.inputs.len(), graphs);
+    let retained_branches_bytes = prep.inner_used() - before;
+    let single_values_bytes = (rows * 4 * size_of::<crate::id::Id>()) as u64;
+    let all_values_bytes = single_values_bytes * graphs as u64;
+    assert!(
+        retained_branches_bytes >= all_values_bytes,
+        "expected PreparedGraphBranches reservation ({retained_branches_bytes}) >= {all_values_bytes}"
+    );
+    let plan_est = cursor::plan_bytes(&plan);
+    assert!(
+        plan_est < single_values_bytes,
+        "plan_bytes must not re-charge checked GRAPH branch VALUES tables: got {plan_est}, single branch VALUES is {single_values_bytes}"
+    );
+    drop(plan);
+    drop(planner);
+    drop(ctx);
+
+    // End-to-end checked cursor under a tight budget that fits the retained branches plus
+    // one execution copy, but cannot pay for all branch VALUES tables a second time.
+    let policy = Arc::new(GraphAccess::all());
+    let wide_prep = Preparation::new(Control::none(), 32 << 20).unwrap();
+    let wide_view = store.prepare_read(policy.clone(), &wide_prep).unwrap();
+    let mut wide_cursor = select_source_cursor(
+        wide_view.read_source(),
+        &store,
+        &query_text,
+        &QueryOptions {
+            graphs: Some(policy.clone()),
+            ..opts()
+        },
+        &CursorOptions {
+            batch_rows: 16,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut total_rows = 0usize;
+    while let Some(batch) = wide_cursor.next_batch().unwrap() {
+        total_rows += batch.len();
+    }
+    assert_eq!(total_rows, graphs * rows);
+    let cursor_peak = wide_cursor.stats().mem_peak_bytes;
+    let cursor_budget = cursor_peak + (16 << 10);
+    assert!(
+        cursor_budget < all_values_bytes,
+        "cursor budget ({cursor_budget}) must stay below re-charging all branch VALUES ({all_values_bytes})"
+    );
+    drop(wide_cursor);
+    drop(wide_view);
+
+    let tight_prep = Preparation::new(Control::none(), 32 << 20).unwrap();
+    let tight_view = store.prepare_read(policy.clone(), &tight_prep).unwrap();
+    let mut tight_cursor = select_source_cursor(
+        tight_view.read_source(),
+        &store,
+        &query_text,
+        &QueryOptions {
+            graphs: Some(policy),
+            max_memory_bytes: Some(cursor_budget),
+            ..opts()
+        },
+        &CursorOptions {
+            batch_rows: 16,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut tight_rows = 0usize;
+    while let Some(batch) = tight_cursor.next_batch().unwrap() {
+        tight_rows += batch.len();
+    }
+    assert_eq!(tight_rows, graphs * rows);
+}
+
+#[test]
+fn ordinary_exists_deduped_vectors_compact_and_charge_capacity() {
+    use plan::{ActiveGraph, Planner};
+    use std::fmt::Write;
+
+    let store = store();
+    // Many repeated references to one variable inside EXISTS must not retain excess
+    // pre-dedup capacity after Planner::compile.
+    let repeats = 500usize;
+    let mut triples = String::new();
+    for i in 0..repeats {
+        write!(triples, "?x <urn:p:{i}> <urn:o> . ").unwrap();
+    }
+    let query_text =
+        format!("SELECT ?x WHERE {{ VALUES ?x {{ <urn:s> }} FILTER EXISTS {{ {triples} }} }}");
+    let Query::Select { pattern, .. } = parse_query(&query_text, None, &[]).unwrap() else {
+        unreachable!();
+    };
+    let mut exists_expr = None;
+    let mut exists_gp = None;
+    super::walk::visit_algebra_ordinary::<()>(super::walk::Algebra::Pattern(&pattern), |item| {
+        if let super::walk::Algebra::Expr(e @ spargebra::algebra::Expression::Exists(p)) = item {
+            exists_expr = Some(e.clone());
+            exists_gp = Some(p.as_ref());
+        }
+        Ok(())
+    })
+    .unwrap();
+    let exists_expr = exists_expr.expect("EXISTS expr");
+    let exists_gp = exists_gp.expect("EXISTS pattern");
+
+    let mut ctx = ctx::Ctx::new(store.snapshot());
+    ctx.mem_limit = 4 << 20;
+    let ctx = Arc::new(ctx);
+    ctx.attach_owner();
+    let planner = Planner::new(&ctx);
+    let compiled_expr = planner
+        .compile(&exists_expr, &ActiveGraph::Default)
+        .unwrap();
+    let expr::Expr::Exists(spec) = compiled_expr else {
+        panic!("expected Expr::Exists");
+    };
+    assert_eq!(spec.vars.len(), 1);
+    assert_eq!(
+        spec.vars.capacity(),
+        spec.vars.len(),
+        "Planner::compile must compact deduplicated EXISTS vars"
+    );
+    assert_eq!(spec.bound.capacity(), spec.bound.len());
+    drop(spec);
+
+    // Even if a caller passes a spare-capacity Vec directly, both direct admission and
+    // the plan_bytes fallback must charge the retained capacity.
+    let tiny = parse_query(
+        "SELECT ?x WHERE { VALUES ?x { 1 } FILTER EXISTS { VALUES ?x { 1 } } }",
+        None,
+        &[],
+    )
+    .unwrap();
+    let Query::Select {
+        pattern: tiny_pat, ..
+    } = &tiny
+    else {
+        unreachable!();
+    };
+    let mut tiny_gp = None;
+    super::walk::visit_algebra_ordinary::<()>(super::walk::Algebra::Pattern(tiny_pat), |item| {
+        if let super::walk::Algebra::Expr(spargebra::algebra::Expression::Exists(p)) = item {
+            tiny_gp = Some(p.as_ref());
+        }
+        Ok(())
+    })
+    .unwrap();
+    let tiny_gp = tiny_gp.expect("tiny EXISTS pattern");
+
+    let spare_cap = 16_384usize;
+    let spare_bytes = (spare_cap * size_of::<table::VarId>()) as u64;
+    let make_spare = || {
+        let mut v = Vec::with_capacity(spare_cap);
+        v.push(0 as table::VarId);
+        v
+    };
+
+    let base = ctx.live_bytes();
+    let admitted = expr::ExistsSpec::new_ordinary_charged(
+        &ctx,
+        tiny_gp,
+        None,
+        ActiveGraph::Default,
+        make_spare(),
+        Vec::new(),
+    )
+    .unwrap();
+    let charged = ctx.live_bytes() - base;
+    assert!(
+        charged >= spare_bytes,
+        "direct admission must charge retained vector capacity (>= {spare_bytes}), got {charged}"
+    );
+    drop(admitted);
+    assert_eq!(ctx.live_bytes(), base);
+
+    // Tight budget covering pattern + len()=1 but not spare_cap refuses direct admission.
+    let pattern_bytes = super::checked_layout::pattern_bytes(tiny_gp);
+    let mut tight_ctx = ctx::Ctx::new(store.snapshot());
+    tight_ctx.mem_limit = pattern_bytes + 4096;
+    assert!(tight_ctx.mem_limit < spare_bytes);
+    let tight_ctx = Arc::new(tight_ctx);
+    tight_ctx.attach_owner();
+    let tight_base = tight_ctx.live_bytes();
+    let err = expr::ExistsSpec::new_ordinary_charged(
+        &tight_ctx,
+        tiny_gp,
+        None,
+        ActiveGraph::Default,
+        make_spare(),
+        Vec::new(),
+    )
+    .err()
+    .expect("expected Memory BudgetExceeded for oversized retained vector capacity");
+    assert!(
+        matches!(
+            err,
+            Error::BudgetExceeded(ref b) if b.kind == crate::error::BudgetKind::Memory
+        ),
+        "expected Memory BudgetExceeded, got {err:?}"
+    );
+    assert_eq!(tight_ctx.live_bytes(), tight_base);
+
+    // Uncharged fallback (`plan_bytes`) also counts retained capacity.
+    let uncharged = Arc::new(expr::ExistsSpec::new(
+        tiny_gp.clone(),
+        ActiveGraph::Default,
+        make_spare(),
+        Vec::new(),
+    ));
+    let mut seen_patterns = rustc_hash::FxHashSet::default();
+    let mut seen_vp = rustc_hash::FxHashSet::default();
+    let fallback_bytes = uncharged.uncharged_retained_bytes(&mut seen_patterns, &mut seen_vp);
+    assert!(
+        fallback_bytes >= spare_bytes,
+        "uncharged_retained_bytes must charge retained capacity (>= {spare_bytes}), got {fallback_bytes}"
+    );
+    let filter_node = plan::Node {
+        kind: plan::Kind::Filter(vec![expr::Expr::Exists(uncharged)]),
+        children: Vec::new(),
+        vars: Vec::new(),
+        certain: Vec::new(),
+        sorted: Vec::new(),
+        est: 1.0,
+        cost: 1.0,
+        dist: Default::default(),
+        desc: String::new(),
+    };
+    assert!(
+        cursor::plan_bytes(&filter_node) >= spare_bytes,
+        "plan_bytes fallback must include retained capacity (>= {spare_bytes})"
+    );
+    let _ = exists_gp;
+}
+
+#[test]
+fn ordinary_exists_syntax_admission_refuses_at_boundary() {
+    use plan::{ActiveGraph, Planner};
+
+    let store = store();
+    let payload = "z".repeat(64 << 10);
+    let query_text = format!(
+        "SELECT ?outer WHERE {{
+            VALUES ?outer {{ 1 }}
+            FILTER EXISTS {{
+                {{ SELECT REDUCED ?x WHERE {{ VALUES ?x {{ \"{payload}\" }} }} }}
+            }}
+        }}"
+    );
+    let parsed = parse_query(&query_text, None, &[]).unwrap();
+    let Query::Select { pattern, .. } = &parsed else {
+        unreachable!();
+    };
+    let compiled = crate::incr::compile::compile(&parsed, None).unwrap();
+    let mut exists_expr = None;
+    let mut exists_gp = None;
+    super::walk::visit_algebra_ordinary::<()>(super::walk::Algebra::Pattern(pattern), |item| {
+        if let super::walk::Algebra::Expr(e @ spargebra::algebra::Expression::Exists(p)) = item {
+            exists_expr = Some(e.clone());
+            exists_gp = Some(p.as_ref());
+        }
+        Ok(())
+    })
+    .unwrap();
+    let exists_expr = exists_expr.expect("EXISTS expr");
+    let exists_gp = exists_gp.expect("EXISTS pattern");
+    let pattern_bytes = super::checked_layout::pattern_bytes(exists_gp);
+    assert!(pattern_bytes >= (64 << 10));
+
+    // Direct `ExistsSpec::new_ordinary_charged` refuses when the budget is below the
+    // ordinary syntax estimate, leaving zero leaked live bytes.
+    let mut direct_ctx = ctx::Ctx::new(store.snapshot());
+    direct_ctx.mem_limit = pattern_bytes - 1;
+    let direct_ctx = Arc::new(direct_ctx);
+    direct_ctx.attach_owner();
+    let direct_base = direct_ctx.live_bytes();
+    let err = expr::ExistsSpec::new_ordinary_charged(
+        &direct_ctx,
+        exists_gp,
+        Some(&compiled.rebuild_patterns),
+        ActiveGraph::Default,
+        vec![0],
+        Vec::new(),
+    )
+    .err()
+    .expect("expected direct syntax-admission refusal");
+    assert!(
+        matches!(
+            err,
+            Error::BudgetExceeded(ref b) if b.kind == crate::error::BudgetKind::Memory
+        ),
+        "expected Memory BudgetExceeded, got {err:?}"
+    );
+    assert_eq!(direct_ctx.live_bytes(), direct_base);
+
+    // Direct `Planner::compile` hits the same ordinary syntax-admission boundary without
+    // any outer view-staging estimate in front of it.
+    let mut planner_ctx = ctx::Ctx::new(store.snapshot());
+    planner_ctx.mem_limit = pattern_bytes - 1;
+    let planner_ctx = Arc::new(planner_ctx);
+    planner_ctx.attach_owner();
+    let planner_base = planner_ctx.live_bytes();
+    let planner = Planner::new(&planner_ctx);
+    let err = planner
+        .compile(&exists_expr, &ActiveGraph::Default)
+        .err()
+        .expect("expected Planner::compile syntax-admission refusal");
+    assert!(
+        matches!(
+            err,
+            Error::BudgetExceeded(ref b) if b.kind == crate::error::BudgetKind::Memory
+        ),
+        "expected Memory BudgetExceeded, got {err:?}"
+    );
+    assert_eq!(planner_ctx.live_bytes(), planner_base);
+
+    // Raising the budget above syntax + projected ViewPatterns + spec admits cleanly and
+    // releases every byte on drop.
+    let mut ok_ctx = ctx::Ctx::new(store.snapshot());
+    ok_ctx.mem_limit = pattern_bytes + (32 << 10);
+    let ok_ctx = Arc::new(ok_ctx);
+    ok_ctx.attach_owner();
+    let ok_base = ok_ctx.live_bytes();
+    let spec = expr::ExistsSpec::new_ordinary_charged(
+        &ok_ctx,
+        exists_gp,
+        Some(&compiled.rebuild_patterns),
+        ActiveGraph::Default,
+        vec![0],
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(ok_ctx.live_bytes() >= ok_base + pattern_bytes);
+    assert!(spec.view_patterns().is_some());
+    drop(spec);
+    assert_eq!(ok_ctx.live_bytes(), ok_base);
 }

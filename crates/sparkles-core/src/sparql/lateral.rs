@@ -318,7 +318,7 @@ pub(super) fn run(
         let rows = l.take_rows(&groups[key]);
         let joined = match &spec.optional {
             Some(expr) => {
-                let expr = expr.as_ref().map(|e| p.compile(e, &graph));
+                let expr = expr.as_ref().map(|e| p.compile(e, &graph)).transpose()?;
                 let mut note = None;
                 super::exec::left_join(ctx, &rows, r, expr.as_ref(), &mut note)?
             }

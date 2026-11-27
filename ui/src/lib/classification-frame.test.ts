@@ -46,8 +46,9 @@ function available(overrides: Partial<KeptClassification> = {}): KeptClassificat
       consistency: 'consistent',
       excludedCount: 0,
       incompleteCount: 0,
+      unmappedCount: 0,
     },
-    entity: { iri: 'urn:A', present: true, unsatisfiable: false },
+    entity: { iri: 'urn:A', present: true, unsatisfiable: false, incomplete: false },
     activity: null,
     staleCommit: null,
     page: null,
@@ -233,6 +234,7 @@ describe('one pinned class frame', () => {
               result,
               outcome: available().outcome,
               unsatisfiable: false,
+              incomplete: false,
               parents: { items: [], total: 0, truncated: false, limit: 100 },
               equivalents: { items, total: 101, truncated: true, limit: 100 },
               sources: {
@@ -266,5 +268,211 @@ describe('one pinned class frame', () => {
       limit: 100,
       lang: ['en'],
     });
+  });
+  it('preserves partial outcome, unknown consistency and per-class incomplete on projected frame', async () => {
+    const partialResult: ClassificationResult = { ...result, partialRequested: true };
+    const partialOutcome = {
+      tier: 'disjunctive' as const,
+      partial: true,
+      complete: false,
+      consistency: 'unknown' as const,
+      excludedCount: 0,
+      incompleteCount: 3,
+      unmappedCount: 0,
+    };
+    const calls = server((c) =>
+      c.init.method === 'POST'
+        ? response({
+            commit: 7,
+            frame: {
+              iri: 'urn:A',
+              result: partialResult,
+              outcome: partialOutcome,
+              unsatisfiable: false,
+              incomplete: true,
+              parents: { items: [name('urn:Parent')], total: 1, truncated: false, limit: 100 },
+              equivalents: { items: [], total: 0, truncated: false, limit: 100 },
+              sources: {
+                items: [{ kind: 'requestedGraph', ordinal: 0, graph: 'urn:open' }],
+                total: 1,
+                truncated: false,
+              },
+              excluded: { items: [], total: 0, truncated: false, limit: 100 },
+              retention: { kept: false, resultId: null },
+            },
+          })
+        : response(available({ status: 'unavailable', result: null, outcome: null, entity: null })),
+    );
+    const controller = new ClassificationFrame();
+    await controller.reset(view);
+    await controller.classify({ partial: true, timeoutMs: 2500, expansion: 'eager' });
+    const post = calls[1];
+    expect(post.url.searchParams.get('at')).toBe('commit:7');
+    expect(post.url.searchParams.get('timeout')).toBe('2.5');
+    expect(JSON.parse(String(post.init.body))).toMatchObject({
+      projection: 'frame',
+      about: 'urn:A',
+      partial: true,
+      expansion: 'eager',
+    });
+    expect(controller.isolated).toBe(true);
+    expect(controller.reply?.status).toBe('available');
+    expect(controller.reply?.outcome).toEqual(partialOutcome);
+    expect(controller.reply?.entity).toEqual({
+      iri: 'urn:A',
+      present: true,
+      unsatisfiable: false,
+      incomplete: true,
+    });
+    expect(controller.parts.parents.items).toEqual([name('urn:Parent')]);
+  });
+  it('keeps per-class incomplete on a retained finished result across refresh and language change', async () => {
+    const retainedIncomplete = {
+      outcome: {
+        tier: 'el' as const,
+        partial: false,
+        complete: false,
+        consistency: 'unknown' as const,
+        excludedCount: 1,
+        incompleteCount: 2,
+        unmappedCount: 0,
+      },
+      entity: { iri: 'urn:A', present: true, unsatisfiable: false, incomplete: true },
+    };
+    const calls = server((c) => page(c, retainedIncomplete));
+    const controller = new ClassificationFrame();
+    await controller.reset(view);
+    expect(controller.reply?.outcome?.partial).toBe(false);
+    expect(controller.reply?.outcome?.complete).toBe(false);
+    expect(controller.reply?.entity?.incomplete).toBe(true);
+    await controller.refresh();
+    expect(controller.reply?.outcome?.partial).toBe(false);
+    expect(controller.reply?.entity?.incomplete).toBe(true);
+    await controller.reset({ ...view, languages: ['fr'] });
+    expect(controller.reply?.outcome?.partial).toBe(false);
+    expect(controller.reply?.entity?.incomplete).toBe(true);
+    expect(calls.every((c) => c.init.method !== 'POST')).toBe(true);
+  });
+  it('rejects an unrequested partial frame POST before accepting a pin or publishing', async () => {
+    const acceptResult = vi.fn(() => true);
+    server((c) =>
+      c.init.method === 'POST'
+        ? response({
+            commit: 7,
+            frame: {
+              iri: 'urn:A',
+              result,
+              outcome: {
+                tier: 'disjunctive',
+                partial: true,
+                complete: false,
+                consistency: 'unknown',
+                excludedCount: 0,
+                incompleteCount: 2,
+                unmappedCount: 0,
+              },
+              unsatisfiable: false,
+              incomplete: true,
+              parents: { items: [], total: 0, truncated: false, limit: 100 },
+              equivalents: { items: [], total: 0, truncated: false, limit: 100 },
+              sources: { items: [], total: 0, truncated: false },
+              excluded: { items: [], total: 0, truncated: false, limit: 100 },
+              retention: { kept: false, resultId: null },
+            },
+          })
+        : response(available({ status: 'unavailable', result: null, outcome: null, entity: null })),
+    );
+    const controller = new ClassificationFrame(undefined, acceptResult);
+    await controller.reset(view);
+    await controller.classify({ timeoutMs: 500 });
+    expect(controller.reply).toBeNull();
+    expect(controller.isolated).toBe(false);
+    expect(controller.error).toMatch(
+      /partial classification was returned without being requested/i,
+    );
+    expect(acceptResult).not.toHaveBeenCalled();
+  });
+  it('rejects a partial frame projection that advertises shared retention', async () => {
+    const acceptResult = vi.fn(() => true);
+    server((c) =>
+      c.init.method === 'POST'
+        ? response({
+            commit: 7,
+            frame: {
+              iri: 'urn:A',
+              result: { ...result, partialRequested: true },
+              outcome: {
+                tier: 'disjunctive',
+                partial: true,
+                complete: false,
+                consistency: 'unknown',
+                excludedCount: 0,
+                incompleteCount: 1,
+                unmappedCount: 0,
+              },
+              unsatisfiable: false,
+              incomplete: true,
+              parents: { items: [], total: 0, truncated: false, limit: 100 },
+              equivalents: { items: [], total: 0, truncated: false, limit: 100 },
+              sources: { items: [], total: 0, truncated: false },
+              excluded: { items: [], total: 0, truncated: false, limit: 100 },
+              retention: { kept: true, resultId: result.resultId },
+            },
+          })
+        : response(available({ status: 'unavailable', result: null, outcome: null, entity: null })),
+    );
+    const controller = new ClassificationFrame(undefined, acceptResult);
+    await controller.reset(view);
+    await controller.classify({ partial: true, timeoutMs: 500 });
+    expect(controller.reply).toBeNull();
+    expect(controller.isolated).toBe(false);
+    expect(controller.error).toMatch(/cannot be retained/i);
+    expect(acceptResult).not.toHaveBeenCalled();
+  });
+  it('recovers directly from a failed POST timeout by retrying classify without refresh', async () => {
+    let posts = 0;
+    server((c) => {
+      if (c.init.method !== 'POST')
+        return response(
+          available({ status: 'unavailable', result: null, outcome: null, entity: null }),
+        );
+      posts++;
+      if (posts === 1) return response({ error: 'classification timed out' }, 408);
+      return response({
+        commit: 7,
+        frame: {
+          iri: 'urn:A',
+          result: { ...result, partialRequested: true },
+          outcome: {
+            tier: 'disjunctive',
+            partial: true,
+            complete: false,
+            consistency: 'consistent',
+            excludedCount: 0,
+            incompleteCount: 1,
+            unmappedCount: 0,
+          },
+          unsatisfiable: false,
+          incomplete: true,
+          parents: { items: [name('urn:Parent')], total: 1, truncated: false, limit: 100 },
+          equivalents: { items: [], total: 0, truncated: false, limit: 100 },
+          sources: { items: [], total: 0, truncated: false },
+          excluded: { items: [], total: 0, truncated: false, limit: 100 },
+          retention: { kept: false, resultId: null },
+        },
+      });
+    });
+    const controller = new ClassificationFrame();
+    await controller.reset(view);
+    await controller.classify({ timeoutMs: 200 });
+    expect(controller.reply).toBeNull();
+    expect(controller.isolated).toBe(false);
+    expect(controller.error).toMatch(/timed out/i);
+
+    await controller.classify({ partial: true, timeoutMs: 2000 });
+    expect(controller.error).toBeNull();
+    expect(controller.isolated).toBe(true);
+    expect(controller.reply?.outcome?.partial).toBe(true);
+    expect(controller.parts.parents.items).toEqual([name('urn:Parent')]);
   });
 });

@@ -56,15 +56,172 @@
 //!
 //! In-memory stores keep the same records in memory.
 
+#[cfg(test)]
+pub(super) mod open_tests;
+mod pager;
 mod readonly;
+
+pub(crate) use pager::HistoryPages;
+
+/// Test-only observation of changelog index and record read progress.
+#[cfg(feature = "failpoints")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeLogReadEvent {
+    IndexReadChunk,
+    IndexDecode,
+    CandidateCheck,
+    RecordReadChunk,
+    RecordDecode,
+}
+
+#[cfg(feature = "failpoints")]
+pub type ChangeLogReadObserver = Arc<dyn Fn(ChangeLogReadEvent) + Send + Sync>;
+
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static CHANGELOG_READ_OBSERVER: std::cell::RefCell<Option<ChangeLogReadObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a thread-local observer for changelog index and record reads.
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub fn set_changelog_read_observer(observer: Option<ChangeLogReadObserver>) {
+    CHANGELOG_READ_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(feature = "failpoints")]
+fn observe_changelog_read(event: ChangeLogReadEvent) {
+    let observer = CHANGELOG_READ_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(event);
+    }
+}
 
 use super::diff::{Keys, QuadKey};
 use super::*;
+use crate::budgeted::{BudgetControl, Control, FnMutControl, Unlimited};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Weak;
 use std::time::{Duration, Instant};
+
+pub(super) fn memory_budget(limit: u64, requested: u64) -> Error {
+    Error::BudgetExceeded(crate::Budget {
+        kind: crate::BudgetKind::Memory,
+        limit,
+        requested,
+    })
+}
+
+/// Tracks live bytes across overlapping allocations in a bounded history scan:
+/// accumulated results, access memo, unrecorded holes, cold index buffers,
+/// candidate cursor scratch, and the record currently being read or decoded.
+pub(crate) struct MemoryBudget {
+    limit: u64,
+    used: std::cell::Cell<u64>,
+}
+
+impl MemoryBudget {
+    pub(super) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            used: std::cell::Cell::new(0),
+        }
+    }
+
+    pub(super) fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    pub(super) fn used(&self) -> u64 {
+        self.used.get()
+    }
+
+    pub(super) fn guard(&self) -> BudgetGuard<'_> {
+        BudgetGuard {
+            budget: self,
+            bytes: 0,
+        }
+    }
+
+    pub(super) fn charge(&self, bytes: u64) -> Result<()> {
+        let next = self.used.get().saturating_add(bytes);
+        if next > self.limit {
+            return Err(memory_budget(self.limit, next));
+        }
+        self.used.set(next);
+        Ok(())
+    }
+
+    pub(super) fn release(&self, bytes: u64) {
+        self.used.set(self.used.get().saturating_sub(bytes));
+    }
+
+    pub(super) fn reserve(&self, bytes: u64) -> Result<BudgetGuard<'_>> {
+        self.charge(bytes)?;
+        Ok(BudgetGuard {
+            budget: self,
+            bytes,
+        })
+    }
+}
+
+pub(super) struct BudgetGuard<'a> {
+    budget: &'a MemoryBudget,
+    bytes: u64,
+}
+
+impl BudgetGuard<'_> {
+    pub(super) fn resize(&mut self, new_bytes: u64) -> Result<()> {
+        if new_bytes > self.bytes {
+            self.budget.charge(new_bytes - self.bytes)?;
+            self.bytes = new_bytes;
+        } else if new_bytes < self.bytes {
+            self.budget.release(self.bytes - new_bytes);
+            self.bytes = new_bytes;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BudgetGuard<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+/// The bytes a quad decoded from `k` can allocate, at most: each term's text is no
+/// longer than its key, a blank node's label is at most 64 bytes, and a triple term
+/// boxes its parts at each level of nesting.
+pub(super) fn quad_bytes(k: &QuadKey) -> u64 {
+    k.iter()
+        .map(|t| {
+            let nested = if t.first() == Some(&b'(') {
+                t.len() as u64 * 64
+            } else {
+                0
+            };
+            t.len() as u64 + 64 + nested
+        })
+        .sum()
+}
+
+/// The bytes the table of a hash map from graph keys to a flag allocates for
+/// `capacity` entries: its buckets of entries and their control bytes, as the standard
+/// map sizes them.
+pub(super) fn memo_table_bytes(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = match capacity {
+        0..4 => 4,
+        4..8 => 8,
+        n => (n.saturating_mul(8) / 7).next_power_of_two(),
+    } as u64;
+    buckets * (std::mem::size_of::<(Arc<[u8]>, bool)>() as u64 + 1) + 16
+}
 
 /// The directory of a persistent store's change log.
 pub const CHANGES_DIR: &str = "changes";
@@ -124,22 +281,59 @@ struct SettingsFile {
 }
 
 pub(crate) fn read_settings(root: &Path) -> Result<ChangeLogSettings> {
-    match std::fs::read(root.join(CHANGE_LOG_FILE)) {
-        Ok(b) => {
-            let mut v: serde_json::Value = serde_json::from_slice(&b)
-                .map_err(|e| Error::Corrupt(format!("{CHANGE_LOG_FILE}: {e}")))?;
-            crate::formats::check_settings(CHANGE_LOG_FILE, &v)?;
-            // a file without the member is format 1
-            if let Some(o) = v.as_object_mut() {
-                o.entry("format").or_insert(1.into());
-            }
-            let f: SettingsFile = serde_json::from_value(v)
-                .map_err(|e| Error::Corrupt(format!("{CHANGE_LOG_FILE}: {e}")))?;
-            Ok(f.settings)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ChangeLogSettings::default()),
-        Err(e) => Err(e.into()),
+    read_settings_with(root, &mut Unlimited)
+}
+
+/// Read `changelog.json` under `control`. Under [`Unlimited`], all accounting compiles
+/// away; under an accounting carrier, temporary path, file, and JSON buffers are charged
+/// and released before returning.
+pub(crate) fn read_settings_with<C: BudgetControl>(
+    root: &Path,
+    control: &mut C,
+) -> Result<ChangeLogSettings> {
+    let start = control.used();
+    if C::ACCOUNTS {
+        control.charge(
+            (root.as_os_str().len() as u64)
+                .saturating_mul(4)
+                .saturating_add(2048),
+        )?;
     }
+    let result = (|| {
+        let bytes = match control.read_file(&root.join(CHANGE_LOG_FILE)) {
+            Ok(bytes) => bytes,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ChangeLogSettings::default());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut raw: crate::store::cold::Loaded<serde_json::Value> =
+            control.json(&bytes, CHANGE_LOG_FILE)?;
+        if raw
+            .value
+            .get("format")
+            .is_some_and(|value| !value.is_null() && !value.is_number())
+        {
+            return Err(Error::Corrupt(
+                "changelog.json: format is not a version".into(),
+            ));
+        }
+        crate::formats::check_settings(CHANGE_LOG_FILE, &raw.value)?;
+        // a file without the member is format 1
+        if let Some(object) = raw.value.as_object_mut() {
+            object.entry("format").or_insert(1.into());
+        }
+        let file: SettingsFile = control.value(raw.value, CHANGE_LOG_FILE)?;
+        control.check(0)?;
+        Ok(file.settings)
+    })();
+    if C::ACCOUNTS {
+        control.release(control.used() - start);
+    }
+    result.and_then(|value| {
+        control.check(0)?;
+        Ok(value)
+    })
 }
 
 fn write_settings(root: &Path, s: &ChangeLogSettings) -> Result<()> {
@@ -315,7 +509,7 @@ fn put_str(out: &mut Vec<u8>, s: Option<&str>) {
 }
 
 /// A bounds-checked reader of a record body.
-struct Cur<'a> {
+pub(super) struct Cur<'a> {
     b: &'a [u8],
     i: usize,
 }
@@ -346,18 +540,95 @@ impl<'a> Cur<'a> {
         }
         None
     }
-
-    fn str(&mut self) -> Option<Option<Arc<str>>> {
-        let n = self.varint()? as usize;
-        let s = std::str::from_utf8(self.bytes(n)?).ok()?;
-        Some((!s.is_empty()).then(|| Arc::from(s)))
-    }
 }
 
 fn crc32(b: &[u8]) -> u32 {
-    let mut c = flate2::Crc::new();
-    c.update(b);
-    c.sum()
+    crc32_with(b, &Unlimited).expect("unlimited crc32 cannot fail")
+}
+
+/// Compute CRC-32 under `control`. Under [`Unlimited`], hashes `body` in one pass; under
+/// a checked control, hashes in 64 KiB chunks polling `control`.
+fn crc32_with<C: Control>(body: &[u8], control: &C) -> Result<u32> {
+    if !C::CHECKS {
+        let mut c = flate2::Crc::new();
+        c.update(body);
+        return Ok(c.sum());
+    }
+    control.check(0)?;
+    let mut crc = flate2::Crc::new();
+    for chunk in body.chunks(64 << 10) {
+        control.check(0)?;
+        #[cfg(test)]
+        open_tests::observe(open_tests::Event::IndexCrcChunk);
+        crc.update(chunk);
+    }
+    control.check(0)?;
+    Ok(crc.sum())
+}
+
+/// Copy opaque term bytes into an `Arc<[u8]>` under `control`. Under [`Unlimited`],
+/// copies in one shot; under a checked control, copies in 64 KiB cooperative chunks.
+pub(super) fn arc_bytes_with<C: Control>(bytes: &[u8], control: &C) -> Result<Arc<[u8]>> {
+    if !C::CHECKS {
+        return Ok(Arc::from(bytes));
+    }
+    control.check(0)?;
+    let mut owned = Arc::<[u8]>::new_uninit_slice(bytes.len());
+    let output = Arc::get_mut(&mut owned).expect("new byte storage is uniquely owned");
+    for (target, source) in output.chunks_mut(64 << 10).zip(bytes.chunks(64 << 10)) {
+        control.check(0)?;
+        for (slot, byte) in target.iter_mut().zip(source) {
+            slot.write(*byte);
+        }
+    }
+    control.check(0)?;
+    // SAFETY: all bytes of the uniquely owned exact-length allocation were
+    // initialized by the safe loop. An error drops MaybeUninit storage directly.
+    Ok(unsafe { owned.assume_init() })
+}
+
+/// Validate UTF-8 under `control`. Under [`Unlimited`], validates in one shot; under a
+/// checked control, validates in 64 KiB code-point-aligned chunks.
+pub(super) fn valid_utf8_with<C: Control>(bytes: &[u8], control: &C) -> Result<bool> {
+    if !C::CHECKS {
+        return Ok(std::str::from_utf8(bytes).is_ok());
+    }
+    let mut start = 0;
+    while start < bytes.len() {
+        control.check(0)?;
+        let mut end = start.saturating_add(64 << 10).min(bytes.len());
+        if end < bytes.len() {
+            // Keep a UTF-8 code point in one validation chunk. A malformed run of
+            // continuation bytes is rejected rather than making no progress.
+            while end > start && bytes[end] & 0xc0 == 0x80 {
+                end -= 1;
+            }
+        }
+        if end == start || std::str::from_utf8(&bytes[start..end]).is_err() {
+            return Ok(false);
+        }
+        start = end;
+    }
+    control.check(0)?;
+    Ok(true)
+}
+
+/// Validate and copy UTF-8 text into an `Arc<str>` under `control`.
+pub(super) fn arc_text_with<C: Control>(bytes: &[u8], control: &C) -> Result<Option<Arc<str>>> {
+    if !C::CHECKS {
+        return Ok(std::str::from_utf8(bytes).ok().map(Arc::from));
+    }
+    if !valid_utf8_with(bytes, control)? {
+        return Ok(None);
+    }
+    let owned = arc_bytes_with(bytes, control)?;
+    // SAFETY: the payload was validated as UTF-8 and copied without changes.
+    // str and [u8] have identical element alignment and length metadata, so this
+    // transfers the same Arc allocation exactly once with its existing reference
+    // count and deallocation layout. No reference to the old Arc remains.
+    let text = unsafe { Arc::from_raw(Arc::into_raw(owned) as *const str) };
+    control.check(0)?;
+    Ok(Some(text))
 }
 
 fn encode_meta(out: &mut Vec<u8>, c: &ChangeCommit) {
@@ -422,72 +693,533 @@ fn encode(r: &Record) -> Vec<u8> {
     out
 }
 
-fn decode_meta(c: &mut Cur<'_>, seq: u64) -> Option<ChangeCommit> {
-    let ts = c.u64()? as i64;
-    let kind = CommitKind::from_code(c.u8()?);
-    let flags = c.u8()?;
-    Some(ChangeCommit {
+pub(super) fn decode_meta_with<C: Control>(
+    c: &mut Cur<'_>,
+    seq: u64,
+    control: &C,
+) -> Result<Option<Arc<ChangeCommit>>> {
+    let Some((timestamp_ms, kind, bulk, inserted, deleted, author, message)) = (|| {
+        let timestamp_ms = c.u64()? as i64;
+        let kind = CommitKind::from_code(c.u8()?);
+        let bulk = c.u8()? & 1 != 0;
+        let inserted = c.varint()?;
+        let deleted = c.varint()?;
+        let n = usize::try_from(c.varint()?).ok()?;
+        let author = c.bytes(n)?;
+        let n = usize::try_from(c.varint()?).ok()?;
+        let message = c.bytes(n)?;
+        Some((timestamp_ms, kind, bulk, inserted, deleted, author, message))
+    })() else {
+        return Ok(None);
+    };
+    let author = if author.is_empty() {
+        None
+    } else {
+        let Some(text) = arc_text_with(author, control)? else {
+            return Ok(None);
+        };
+        Some(text)
+    };
+    let message = if message.is_empty() {
+        None
+    } else {
+        let Some(text) = arc_text_with(message, control)? else {
+            return Ok(None);
+        };
+        Some(text)
+    };
+    control.check(0)?;
+    Ok(Some(Arc::new(ChangeCommit {
         seq,
-        timestamp_ms: ts,
+        timestamp_ms,
         kind,
-        bulk: flags & 1 != 0,
-        inserted: c.varint()?,
-        deleted: c.varint()?,
-        author: c.str()?,
-        message: c.str()?,
-    })
+        bulk,
+        inserted,
+        deleted,
+        author,
+        message,
+    })))
+}
+
+/// Output builder for the unified [`decode_record_with`] record decoder (item 1062).
+///
+/// The same wire parser serves owned [`Record`] decoding (both unchecked and admitted),
+/// borrowed [`readonly::RecordView`] decoding (retaining the term table while borrowing
+/// validated change entries), and timestamp-only validation (allocating neither terms
+/// nor change vectors).
+pub(super) trait RecordSink<'a> {
+    type Output;
+    type Terms;
+
+    fn make_terms<C: Control>(&mut self, count: usize, control: &C) -> Result<Self::Terms>;
+    fn push_term<C: Control>(
+        &mut self,
+        terms: &mut Self::Terms,
+        idx: usize,
+        raw: &[u8],
+        control: &C,
+    ) -> Result<()>;
+    fn finish_changes<C: Control>(
+        self,
+        meta: Arc<ChangeCommit>,
+        terms: Self::Terms,
+        term_count: usize,
+        count: usize,
+        c: &mut Cur<'a>,
+        control: &C,
+    ) -> Result<Option<Self::Output>>;
+    fn finish_summary(self, meta: Arc<ChangeCommit>) -> Self::Output;
+    fn finish_gap(self, from: u64, through: u64) -> Self::Output;
+}
+
+/// Builds an owned [`Record`], either unchecked (`Unlimited`) or admitted/checked.
+#[derive(Default)]
+struct OwnedRecordSink {
+    bytes_since_check: usize,
+}
+
+impl<'a> RecordSink<'a> for OwnedRecordSink {
+    type Output = Record;
+    type Terms = Vec<Arc<[u8]>>;
+
+    #[inline]
+    fn make_terms<C: Control>(&mut self, count: usize, _control: &C) -> Result<Self::Terms> {
+        if !C::CHECKS {
+            return Ok(Vec::with_capacity(count.min(1 << 16)));
+        }
+        let mut terms = Vec::new();
+        terms.try_reserve_exact(count).map_err(|_| {
+            Error::HistoryUnsupported("history term-table allocation was refused".into())
+        })?;
+        Ok(terms)
+    }
+
+    #[inline]
+    fn push_term<C: Control>(
+        &mut self,
+        terms: &mut Self::Terms,
+        idx: usize,
+        raw: &[u8],
+        control: &C,
+    ) -> Result<()> {
+        if !C::CHECKS {
+            terms.push(Arc::from(raw));
+            return Ok(());
+        }
+        if idx.is_multiple_of(CHECK_STRIDE) {
+            control.check(0)?;
+            self.bytes_since_check = 0;
+        }
+        if raw.len() > (64 << 10) {
+            terms.push(arc_bytes_with(raw, control)?);
+            self.bytes_since_check = 0;
+        } else {
+            if self.bytes_since_check.saturating_add(raw.len()) > (64 << 10) {
+                control.check(0)?;
+                self.bytes_since_check = 0;
+            }
+            terms.push(Arc::from(raw));
+            self.bytes_since_check = self.bytes_since_check.saturating_add(raw.len());
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn finish_changes<C: Control>(
+        self,
+        meta: Arc<ChangeCommit>,
+        terms: Self::Terms,
+        _term_count: usize,
+        count: usize,
+        c: &mut Cur<'a>,
+        control: &C,
+    ) -> Result<Option<Self::Output>> {
+        if C::CHECKS {
+            control.check(0)?;
+        }
+        let mut changes = if !C::CHECKS {
+            Vec::with_capacity(count.min(1 << 16))
+        } else {
+            let mut changes = Vec::new();
+            changes.try_reserve_exact(count).map_err(|_| {
+                Error::HistoryUnsupported("history change-table allocation was refused".into())
+            })?;
+            changes
+        };
+        for idx in 0..count {
+            if C::CHECKS && idx.is_multiple_of(CHECK_STRIDE) {
+                control.check(0)?;
+            }
+            let Some(add_byte) = c.u8() else {
+                return Ok(None);
+            };
+            let add = add_byte == 1;
+            let mut k: [Option<Arc<[u8]>>; 4] = Default::default();
+            for slot in &mut k {
+                let Some(tid) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                    return Ok(None);
+                };
+                let Some(term) = terms.get(tid) else {
+                    return Ok(None);
+                };
+                *slot = Some(term.clone());
+            }
+            changes.push((add, k.map(|t| t.expect("filled above"))));
+        }
+        Ok(Some(Record::Changes(meta, changes)))
+    }
+
+    #[inline]
+    fn finish_summary(self, meta: Arc<ChangeCommit>) -> Self::Output {
+        Record::Summary(meta)
+    }
+
+    #[inline]
+    fn finish_gap(self, from: u64, through: u64) -> Self::Output {
+        Record::Gap { from, through }
+    }
+}
+
+/// Decode a record body (its CRC already checked) into the sink's representation under
+/// `control`. Under [`Unlimited`], all control checks compile away.
+pub(super) fn decode_record_with<'a, C: Control, S: RecordSink<'a>>(
+    body: &'a [u8],
+    control: &C,
+    mut sink: S,
+) -> Result<Option<S::Output>> {
+    control.check(0)?;
+    let mut c = Cur { b: body, i: 0 };
+    let Some((ty, seq)) = c.u8().zip(c.u64()) else {
+        return Ok(None);
+    };
+    let record = match ty {
+        REC_GAP => {
+            let Some(from) = c.u64() else {
+                return Ok(None);
+            };
+            if from > seq {
+                return Ok(None);
+            }
+            sink.finish_gap(from, seq)
+        }
+        REC_SUMMARY => {
+            let Some(meta) = decode_meta_with(&mut c, seq, control)? else {
+                return Ok(None);
+            };
+            sink.finish_summary(meta)
+        }
+        REC_CHANGES => {
+            let Some(meta) = decode_meta_with(&mut c, seq, control)? else {
+                return Ok(None);
+            };
+            let Some(n) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                return Ok(None);
+            };
+            if n > body.len() - c.i {
+                return Ok(None);
+            }
+            let mut terms = sink.make_terms(n, control)?;
+            for idx in 0..n {
+                let Some(len) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                    return Ok(None);
+                };
+                let Some(raw) = c.bytes(len) else {
+                    return Ok(None);
+                };
+                sink.push_term(&mut terms, idx, raw, control)?;
+            }
+            let Some(m) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                return Ok(None);
+            };
+            if m > (body.len() - c.i) / 5 {
+                return Ok(None);
+            }
+            let Some(record) = sink.finish_changes(meta, terms, n, m, &mut c, control)? else {
+                return Ok(None);
+            };
+            record
+        }
+        _ => return Ok(None),
+    };
+    control.check(0)?;
+    Ok((c.i == body.len()).then_some(record))
 }
 
 /// Decode a record body (its CRC already checked).
 fn decode(body: &[u8]) -> Option<Record> {
+    decode_record_with(body, &Unlimited, OwnedRecordSink::default())
+        .expect("unlimited record decode cannot fail")
+}
+
+/// The bytes an `Arc<[u8]>` or `Arc<str>` of `len` bytes allocates.
+pub(super) fn arc_slice_bytes(len: usize) -> u64 {
+    (16 + len as u64).next_multiple_of(8)
+}
+
+/// What decoding a record body allocates, read from its length prefixes before
+/// anything is allocated (item 829): the commit's metadata with its author and message,
+/// the term table with its terms, and the vector of changes. `None` at damage, and
+/// when a count is larger than the bytes left could hold, so a damaged count is never
+/// admitted.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Footprint {
+    pub(super) meta: u64,
+    pub(super) terms: u64,
+    pub(super) changes: u64,
+}
+
+/// Maximum entries processed between cooperative cancellation polls in history
+/// reads and decoding.
+const CHECK_STRIDE: usize = 1024;
+
+pub(super) fn footprint_with<C: Control>(body: &[u8], control: &C) -> Result<Option<Footprint>> {
+    control.check(0)?;
     let mut c = Cur { b: body, i: 0 };
-    let ty = c.u8()?;
-    let seq = c.u64()?;
-    let r = match ty {
-        REC_GAP => {
-            let from = c.u64()?;
-            if from > seq {
-                return None;
-            }
-            Record::Gap { from, through: seq }
-        }
-        REC_SUMMARY => Record::Summary(Arc::new(decode_meta(&mut c, seq)?)),
-        REC_CHANGES => {
-            let meta = Arc::new(decode_meta(&mut c, seq)?);
-            let n = c.varint()? as usize;
-            let mut terms: Vec<Arc<[u8]>> = Vec::with_capacity(n.min(1 << 16));
-            for _ in 0..n {
-                let len = c.varint()? as usize;
-                terms.push(Arc::from(c.bytes(len)?));
-            }
-            let m = c.varint()? as usize;
-            let mut changes = Vec::with_capacity(m.min(1 << 16));
-            for _ in 0..m {
-                let add = c.u8()? == 1;
-                let mut k: [Option<Arc<[u8]>>; 4] = Default::default();
-                for slot in &mut k {
-                    *slot = Some(terms.get(c.varint()? as usize)?.clone());
-                }
-                changes.push((add, k.map(|t| t.expect("filled above"))));
-            }
-            Record::Changes(meta, changes)
-        }
-        _ => return None,
+    let Some((ty, _)) = c.u8().zip(c.u64()) else {
+        return Ok(None);
     };
-    (c.i == body.len()).then_some(r)
+    let mut f = Footprint::default();
+    if ty == REC_GAP {
+        control.check(0)?;
+        return Ok(Some(f));
+    }
+    if ty != REC_SUMMARY && ty != REC_CHANGES {
+        return Ok(None);
+    }
+    if c.u64().is_none()
+        || c.u8().is_none()
+        || c.u8().is_none()
+        || c.varint().is_none()
+        || c.varint().is_none()
+    {
+        return Ok(None);
+    }
+    f.meta = arc_slice_bytes(std::mem::size_of::<ChangeCommit>());
+    for _ in 0..2 {
+        let Some(n) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+            return Ok(None);
+        };
+        if c.bytes(n).is_none() {
+            return Ok(None);
+        }
+        if n > 0 {
+            f.meta += arc_slice_bytes(n);
+        }
+    }
+    if ty == REC_SUMMARY {
+        control.check(0)?;
+        return Ok(Some(f));
+    }
+    let Some(n) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+        return Ok(None);
+    };
+    // each term takes at least its one-byte length
+    if n > body.len() - c.i {
+        return Ok(None);
+    }
+    f.terms = n as u64 * std::mem::size_of::<Arc<[u8]>>() as u64;
+    for idx in 0..n {
+        if C::CHECKS && idx.is_multiple_of(CHECK_STRIDE) {
+            control.check(0)?;
+        }
+        let Some(len) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+            return Ok(None);
+        };
+        if c.bytes(len).is_none() {
+            return Ok(None);
+        }
+        f.terms += arc_slice_bytes(len);
+    }
+    let Some(m) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+        return Ok(None);
+    };
+    // each change takes at least five bytes
+    if m > (body.len() - c.i) / 5 {
+        return Ok(None);
+    }
+    f.changes = m as u64 * std::mem::size_of::<(bool, QuadKey)>() as u64;
+    control.check(0)?;
+    Ok(Some(f))
+}
+
+#[cfg(test)]
+pub(super) fn footprint_checked(
+    body: &[u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<Footprint>> {
+    footprint_with(body, &FnMutControl::new(check))
+}
+
+#[cfg(test)]
+fn decode_admitted_checked(
+    body: &[u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<Record>> {
+    decode_record_with(body, &FnMutControl::new(check), OwnedRecordSink::default())
+}
+
+#[cfg(test)]
+fn frame_checked<'a>(
+    buf: &'a [u8],
+    at: usize,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<(&'a [u8], usize)>> {
+    frame_with(buf, at, &FnMutControl::new(check))
+}
+
+/// The next framed record of `buf` at `at` under `control`: (body, the offset after it).
+/// `None` at the end, at a torn record or at damage.
+fn frame_with<'a, C: Control>(
+    buf: &'a [u8],
+    at: usize,
+    control: &C,
+) -> Result<Option<(&'a [u8], usize)>> {
+    control.check(0)?;
+    let Some(end_h) = at.checked_add(8) else {
+        return Ok(None);
+    };
+    let Some(h) = buf.get(at..end_h) else {
+        return Ok(None);
+    };
+    let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+    let crc = u32::from_le_bytes(h[4..8].try_into().unwrap());
+    if len == 0 {
+        return Ok(None);
+    }
+    let Some(end) = end_h.checked_add(len) else {
+        return Ok(None);
+    };
+    let Some(body) = buf.get(end_h..end) else {
+        return Ok(None);
+    };
+    Ok((crc32_with(body, control)? == crc).then_some((body, end)))
 }
 
 /// The next framed record of `buf` at `at`: (body, the offset after it). `None` at the
 /// end, at a torn record or at damage.
 fn frame(buf: &[u8], at: usize) -> Option<(&[u8], usize)> {
-    let h = buf.get(at..at + 8)?;
-    let len = u32::from_le_bytes(h[0..4].try_into().ok()?) as usize;
-    let crc = u32::from_le_bytes(h[4..8].try_into().ok()?);
-    if len == 0 {
-        return None;
+    frame_with(buf, at, &Unlimited).expect("unlimited frame read cannot fail")
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FRAME_ALLOC_REFUSAL_MIN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct RefuseFrameAlloc {
+    prev: Option<usize>,
+}
+
+#[cfg(test)]
+impl RefuseFrameAlloc {
+    pub(super) fn new(min_len: usize) -> Self {
+        let prev = FRAME_ALLOC_REFUSAL_MIN.with(|cell| cell.replace(Some(min_len)));
+        Self { prev }
     }
-    let body = buf.get(at + 8..at + 8 + len)?;
-    (crc32(body) == crc).then_some((body, at + 8 + len))
+}
+
+#[cfg(test)]
+impl Drop for RefuseFrameAlloc {
+    fn drop(&mut self) {
+        FRAME_ALLOC_REFUSAL_MIN.with(|cell| cell.set(self.prev));
+    }
+}
+
+#[inline]
+fn reserve_frame_body(len: usize) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    if FRAME_ALLOC_REFUSAL_MIN.with(|cell| cell.get().is_some_and(|min| len >= min)) {
+        return Err(Error::HistoryUnsupported(
+            "history-log record allocation was refused".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    body.try_reserve_exact(len).map_err(|_| {
+        Error::HistoryUnsupported("history-log record allocation was refused".into())
+    })?;
+    Ok(body)
+}
+
+/// Read one framed record body from `file` at `offset` under `control`, verifying its
+/// CRC-32 and admitting its allocation before reserving. Returns `Ok(None)` when `offset`
+/// or the declared frame extends past `max_end`, when the length is zero, or when the
+/// CRC does not match. When `FALLIBLE_ALLOC` is true, even `!C::CHECKS` callers reserve
+/// the frame body fallibly instead of aborting on allocator refusal.
+pub(super) fn read_file_frame_with<const FALLIBLE_ALLOC: bool, C: Control>(
+    file: &File,
+    offset: u64,
+    max_end: Option<u64>,
+    header_in_admit: bool,
+    observe_chunk: bool,
+    control: &C,
+    admit: &mut impl FnMut(u64) -> Result<()>,
+) -> Result<Option<Vec<u8>>> {
+    control.check(0)?;
+    if let Some(extent) = max_end
+        && offset.checked_add(8).is_none_or(|end| end > extent)
+    {
+        return Ok(None);
+    }
+    let mut h = [0u8; 8];
+    read_exact_at_with(file, &mut h, offset, control)?;
+    let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+    let expected_crc = u32::from_le_bytes(h[4..8].try_into().unwrap());
+    if len == 0 {
+        return Ok(None);
+    }
+    if let Some(extent) = max_end
+        && offset
+            .checked_add(8)
+            .and_then(|n| n.checked_add(len as u64))
+            .is_none_or(|end| end > extent)
+    {
+        return Ok(None);
+    }
+    if !C::CHECKS {
+        let mut body = if FALLIBLE_ALLOC {
+            let mut body = reserve_frame_body(len)?;
+            body.resize(len, 0);
+            body
+        } else {
+            vec![0u8; len]
+        };
+        read_exact_at_with(file, &mut body, offset + 8, control)?;
+        if observe_chunk {
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
+        }
+        return Ok((crc32(&body) == expected_crc).then_some(body));
+    }
+    let header_bytes = if header_in_admit { 8u64 } else { 0u64 };
+    control.check(0)?;
+    admit(header_bytes + len as u64)?;
+    control.check(0)?;
+    let mut body = reserve_frame_body(len)?;
+    if header_in_admit && body.capacity() > len {
+        admit(header_bytes + body.capacity() as u64)?;
+        control.check(0)?;
+    }
+    let mut crc = flate2::Crc::new();
+    while body.len() < len {
+        control.check(0)?;
+        let start = body.len();
+        let end = start.saturating_add(64 << 10).min(len);
+        body.resize(end, 0);
+        let read_offset = offset
+            .checked_add(8)
+            .and_then(|n| n.checked_add(start as u64))
+            .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
+        read_exact_at_with(file, &mut body[start..end], read_offset, control)?;
+        if observe_chunk {
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
+        }
+        control.check(0)?;
+        crc.update(&body[start..end]);
+    }
+    control.check(0)?;
+    Ok((crc.sum() == expected_crc).then_some(body))
 }
 
 /// The FNV-1a hash of a term key in a role (graph, subject, predicate, object). Stable
@@ -515,6 +1247,375 @@ struct RecEntry {
     /// a summary or gap record: its commits' changes are not recorded
     hole: Option<(u64, UnrecordedReason)>,
 }
+
+impl RecEntry {
+    fn decode(c: &mut Cur<'_>) -> Option<Self> {
+        let seq = c.u64()?;
+        let offset = c.u64()?;
+        let ts = c.u64()? as i64;
+        let hole = match c.u8()? {
+            0 => None,
+            1 => Some((c.u64()?, UnrecordedReason::Bulk)),
+            _ => Some((c.u64()?, UnrecordedReason::Gap)),
+        };
+        Some(Self {
+            seq,
+            offset,
+            ts,
+            hole,
+        })
+    }
+}
+
+/// A sorted, deduplicated slice of record ordinals within a segment's `[lo, hi)`.
+#[derive(Clone, Copy)]
+enum PostingRun<'a> {
+    Sealed(&'a [(u64, u32)]),
+    Live(&'a [u32]),
+}
+
+impl<'a> PostingRun<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Sealed(s) => s.len(),
+            Self::Live(s) => s.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn pop(&mut self, descending: bool) -> Option<u32> {
+        match (self, descending) {
+            (Self::Sealed(s), false) => {
+                let (&(_, o), rest) = s.split_first()?;
+                *s = rest;
+                Some(o)
+            }
+            (Self::Sealed(s), true) => {
+                let (&(_, o), rest) = s.split_last()?;
+                *s = rest;
+                Some(o)
+            }
+            (Self::Live(s), false) => {
+                let (&o, rest) = s.split_first()?;
+                *s = rest;
+                Some(o)
+            }
+            (Self::Live(s), true) => {
+                let (&o, rest) = s.split_last()?;
+                *s = rest;
+                Some(o)
+            }
+        }
+    }
+
+    fn contains(&self, ord: u32) -> bool {
+        match self {
+            Self::Sealed(s) => s.binary_search_by_key(&ord, |&(_, o)| o).is_ok(),
+            Self::Live(s) => s.binary_search(&ord).is_ok(),
+        }
+    }
+}
+
+/// Streams distinct candidate record ordinals in ascending or descending order
+/// without copying posting lists.
+enum CandidateStream<'a> {
+    Range {
+        lo: u32,
+        hi: u32,
+        descending: bool,
+    },
+    Single {
+        run: PostingRun<'a>,
+        descending: bool,
+    },
+    Merge {
+        runs: Vec<PostingRun<'a>>,
+        heap: std::collections::BinaryHeap<(u32, usize)>,
+        descending: bool,
+        last: Option<u32>,
+    },
+}
+
+impl<'a> CandidateStream<'a> {
+    fn next_ord(
+        &mut self,
+        checked: bool,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<u32>> {
+        match self {
+            Self::Range { lo, hi, descending } => {
+                if *lo >= *hi {
+                    return Ok(None);
+                }
+                if *descending {
+                    *hi -= 1;
+                    Ok(Some(*hi))
+                } else {
+                    let o = *lo;
+                    *lo += 1;
+                    Ok(Some(o))
+                }
+            }
+            Self::Single { run, descending } => Ok(run.pop(*descending)),
+            Self::Merge {
+                runs,
+                heap,
+                descending,
+                last,
+            } => {
+                let mut dups = 0usize;
+                while let Some((key, idx)) = heap.pop() {
+                    if checked && dups != 0 && dups.is_multiple_of(CHECK_STRIDE) {
+                        check()?;
+                    }
+                    let ord = if *descending { key } else { u32::MAX - key };
+                    if let Some(next) = runs[idx].pop(*descending) {
+                        let next_key = if *descending { next } else { u32::MAX - next };
+                        heap.push((next_key, idx));
+                    }
+                    if *last != Some(ord) {
+                        *last = Some(ord);
+                        return Ok(Some(ord));
+                    }
+                    dups += 1;
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn hole_key(h: &Unrecorded) -> (u64, u8, u64) {
+    (h.from, h.reason as u8, h.to)
+}
+
+fn reverse_holes_with<C: Control>(holes: &mut [Unrecorded], control: &C) -> Result<()> {
+    let len = holes.len();
+    for i in 0..(len / 2) {
+        if C::CHECKS && i != 0 && i.is_multiple_of(CHECK_STRIDE) {
+            control.check(0)?;
+        }
+        holes.swap(i, len - 1 - i);
+    }
+    Ok(())
+}
+
+pub(super) fn sort_holes_with<const PER_STEP: bool, C: Control, K: Ord>(
+    holes: &mut [Unrecorded],
+    control: &C,
+    key: impl Fn(&Unrecorded) -> K,
+) -> Result<()> {
+    let len = holes.len();
+    if len <= 1 {
+        return Ok(());
+    }
+    let mut steps = 0usize;
+    let mut sift_down = |slice: &mut [Unrecorded], mut root: usize, end: usize| -> Result<()> {
+        loop {
+            if C::CHECKS && (PER_STEP || (steps != 0 && steps.is_multiple_of(CHECK_STRIDE))) {
+                control.check(0)?;
+            }
+            steps += 1;
+            let left = root * 2 + 1;
+            if left >= end {
+                break;
+            }
+            let mut swap = root;
+            if key(&slice[swap]) < key(&slice[left]) {
+                swap = left;
+            }
+            let right = left + 1;
+            if right < end && key(&slice[swap]) < key(&slice[right]) {
+                swap = right;
+            }
+            if swap == root {
+                break;
+            }
+            slice.swap(root, swap);
+            root = swap;
+        }
+        Ok(())
+    };
+    for start in (0..(len / 2)).rev() {
+        sift_down(holes, start, len)?;
+    }
+    for end in (1..len).rev() {
+        holes.swap(0, end);
+        sift_down(holes, 0, end)?;
+    }
+    if C::CHECKS && PER_STEP {
+        control.check(0)?;
+    }
+    Ok(())
+}
+
+pub(super) fn dedup_holes_with<const PER_STEP: bool, C: Control>(
+    holes: &mut Vec<Unrecorded>,
+    control: &C,
+) -> Result<()> {
+    if holes.len() <= 1 {
+        if C::CHECKS && PER_STEP {
+            control.check(0)?;
+        }
+        return Ok(());
+    }
+    let mut write = 0usize;
+    for read in 1..holes.len() {
+        if C::CHECKS && (PER_STEP || read.is_multiple_of(CHECK_STRIDE)) {
+            control.check(0)?;
+        }
+        let b = holes[read];
+        let a = &mut holes[write];
+        if a.reason == b.reason && b.from <= a.to.saturating_add(1) {
+            a.to = a.to.max(b.to);
+        } else {
+            write += 1;
+            holes[write] = b;
+        }
+    }
+    holes.truncate(write + 1);
+    if C::CHECKS && PER_STEP {
+        control.check(0)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn reverse_holes_checked(
+    holes: &mut [Unrecorded],
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    if checked {
+        reverse_holes_with(holes, &FnMutControl::new(check))
+    } else {
+        reverse_holes_with(holes, &Unlimited)
+    }
+}
+
+#[cfg(test)]
+fn sort_holes_checked(
+    holes: &mut [Unrecorded],
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    if checked {
+        sort_holes_with::<false, _, _>(holes, &FnMutControl::new(check), hole_key)
+    } else {
+        sort_holes_with::<false, _, _>(holes, &Unlimited, hole_key)
+    }
+}
+
+#[cfg(test)]
+fn dedup_holes_checked(
+    holes: &mut Vec<Unrecorded>,
+    checked: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    if checked {
+        dedup_holes_with::<false, _>(holes, &FnMutControl::new(check))
+    } else {
+        dedup_holes_with::<false, _>(holes, &Unlimited)
+    }
+}
+
+/// Collects unrecorded ranges incrementally, merging adjacent/overlapping ranges of the
+/// same reason on arrival and normalizing cooperatively on [`HoleCollector::finish`].
+struct HoleCollector<'a> {
+    holes: Vec<Unrecorded>,
+    guard: Option<BudgetGuard<'a>>,
+    descending: bool,
+    ordered: bool,
+}
+
+impl<'a> HoleCollector<'a> {
+    fn new(budget: Option<&'a MemoryBudget>, descending: bool) -> Self {
+        Self {
+            holes: Vec::new(),
+            guard: budget.map(MemoryBudget::guard),
+            descending,
+            ordered: true,
+        }
+    }
+
+    fn push(&mut self, hole: Unrecorded) -> Result<()> {
+        if hole.from > hole.to {
+            self.ordered = false;
+        } else if self.ordered
+            && let Some(last) = self.holes.last_mut()
+        {
+            if self.descending {
+                if last.reason == hole.reason
+                    && hole.to <= last.to
+                    && hole.to.saturating_add(1) >= last.from
+                {
+                    last.from = last.from.min(hole.from);
+                    return Ok(());
+                }
+                if hole.to >= last.from {
+                    self.ordered = false;
+                }
+            } else {
+                if last.reason == hole.reason
+                    && hole.from >= last.from
+                    && hole.from <= last.to.saturating_add(1)
+                {
+                    last.to = last.to.max(hole.to);
+                    return Ok(());
+                }
+                if last.to >= hole.from {
+                    self.ordered = false;
+                }
+            }
+        }
+        if self.holes.len() == self.holes.capacity()
+            && let Some(guard) = self.guard.as_mut()
+        {
+            let size = std::mem::size_of::<Unrecorded>() as u64;
+            let old = (self.holes.capacity() as u64).saturating_mul(size);
+            let more = self.holes.capacity().max(16);
+            let new = (self.holes.capacity().saturating_add(more) as u64).saturating_mul(size);
+            guard.resize(old.saturating_add(new))?;
+            self.holes.try_reserve_exact(more).map_err(|_| {
+                Error::HistoryUnsupported("history unrecorded-range allocation was refused".into())
+            })?;
+            guard.resize((self.holes.capacity() as u64).saturating_mul(size))?;
+        }
+        self.holes.push(hole);
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        checked: bool,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Vec<Unrecorded>> {
+        if checked {
+            self.finish_with(&FnMutControl::new(check))
+        } else {
+            self.finish_with(&Unlimited)
+        }
+    }
+
+    fn finish_with<C: Control>(mut self, control: &C) -> Result<Vec<Unrecorded>> {
+        control.check(0)?;
+        if self.ordered {
+            if self.descending {
+                reverse_holes_with(&mut self.holes, control)?;
+            }
+        } else {
+            sort_holes_with::<false, _, _>(&mut self.holes, control, hole_key)?;
+            dedup_holes_with::<false, _>(&mut self.holes, control)?;
+        }
+        control.check(0)?;
+        Ok(self.holes)
+    }
+}
+
+type DecodedSegIndex<'a> = (u64, u64, SegIndex, Option<BudgetGuard<'a>>);
 
 /// The index of one segment.
 #[derive(Clone, Default)]
@@ -565,18 +1666,30 @@ impl SegIndex {
         self.postings = p;
     }
 
-    /// The record numbers that may hold `hash`, ascending.
-    fn lookup(&self, hash: u64, out: &mut Vec<u32>) {
-        let lo = self.postings.partition_point(|p| p.0 < hash);
-        out.extend(
-            self.postings[lo..]
-                .iter()
-                .take_while(|p| p.0 == hash)
-                .map(|p| p.1),
-        );
-        if let Some(v) = self.live.get(&hash) {
-            out.extend_from_slice(v);
-        }
+    /// Sorted, deduplicated posting runs for `hash` restricted to `lo..hi`.
+    fn runs_in_range(&self, hash: u64, lo: u32, hi: u32) -> [PostingRun<'_>; 2] {
+        let p_lo = self
+            .postings
+            .partition_point(|&(h, o)| h < hash || (h == hash && o < lo));
+        let p_hi = if self
+            .postings
+            .get(p_lo)
+            .is_some_and(|&(h, o)| h == hash && o < hi)
+        {
+            p_lo + self.postings[p_lo..].partition_point(|&(h, o)| h == hash && o < hi)
+        } else {
+            p_lo
+        };
+        let sealed = PostingRun::Sealed(&self.postings[p_lo..p_hi]);
+        let live = match self.live.get(&hash) {
+            Some(v) => {
+                let l_lo = v.partition_point(|&o| o < lo);
+                let l_hi = l_lo + v[l_lo..].partition_point(|&o| o < hi);
+                PostingRun::Live(&v[l_lo..l_hi])
+            }
+            None => PostingRun::Live(&[]),
+        };
+        [sealed, live]
     }
 
     fn encode(&self, dataset_id: uuid::Uuid, first: u64, last: u64) -> Vec<u8> {
@@ -618,44 +1731,113 @@ impl SegIndex {
 
     /// Decode an index file: (first, last, index).
     fn decode(b: &[u8], dataset_id: uuid::Uuid) -> Option<(u64, u64, SegIndex)> {
+        Self::decode_with(b, dataset_id, &Unlimited, None)
+            .ok()
+            .flatten()
+            .map(|(first, last, ix, _)| (first, last, ix))
+    }
+
+    fn decode_with<'a, C: Control>(
+        b: &[u8],
+        dataset_id: uuid::Uuid,
+        control: &C,
+        budget: Option<&'a MemoryBudget>,
+    ) -> Result<Option<DecodedSegIndex<'a>>> {
         if b.len() < IDX_HEADER || &b[0..8] != IDX_MAGIC {
-            return None;
+            return Ok(None);
         }
         let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
         let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
         if u32_at(8) != FORMAT || b[16..32] != *dataset_id.as_bytes() {
-            return None;
+            return Ok(None);
         }
         let (first, last) = (u64_at(32), u64_at(40));
         let (nrecs, nposts) = (u32_at(48) as usize, u32_at(52) as usize);
         let body = &b[IDX_HEADER..];
-        if crc32(body) != u32_at(56) {
-            return None;
+        let actual_crc = if C::CHECKS {
+            crc32_with(body, control)?
+        } else {
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexCrcChunk);
+            crc32(body)
+        };
+        if actual_crc != u32_at(56) {
+            return Ok(None);
+        }
+        let min_bytes = (nrecs as u64)
+            .saturating_mul(25)
+            .saturating_add((nposts as u64).saturating_mul(12));
+        if min_bytes > body.len() as u64 {
+            return Ok(None);
         }
         let mut c = Cur { b: body, i: 0 };
         let mut ix = SegIndex::default();
-        for _ in 0..nrecs {
-            let seq = c.u64()?;
-            let offset = c.u64()?;
-            let ts = c.u64()? as i64;
-            let hole = match c.u8()? {
-                0 => None,
-                1 => Some((c.u64()?, UnrecordedReason::Bulk)),
-                _ => Some((c.u64()?, UnrecordedReason::Gap)),
+        let decoded_guard = if let Some(budget) = budget {
+            let decoded = arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                .saturating_add(
+                    (nrecs as u64).saturating_mul(std::mem::size_of::<RecEntry>() as u64),
+                )
+                .saturating_add(
+                    (nposts as u64).saturating_mul(std::mem::size_of::<(u64, u32)>() as u64),
+                );
+            let mut guard = budget.reserve(decoded)?;
+            ix.recs.try_reserve_exact(nrecs).map_err(|_| {
+                Error::HistoryUnsupported("history-log index allocation was refused".into())
+            })?;
+            ix.postings.try_reserve_exact(nposts).map_err(|_| {
+                Error::HistoryUnsupported("history-log index allocation was refused".into())
+            })?;
+            let actual = arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                .saturating_add(
+                    (ix.recs.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<RecEntry>() as u64),
+                )
+                .saturating_add(
+                    (ix.postings.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<(u64, u32)>() as u64),
+                );
+            guard.resize(actual)?;
+            Some(guard)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        open_tests::observe(open_tests::Event::IndexRecords);
+        #[cfg(feature = "failpoints")]
+        observe_changelog_read(ChangeLogReadEvent::IndexDecode);
+        for idx in 0..nrecs {
+            if C::CHECKS && idx.is_multiple_of(CHECK_STRIDE) {
+                control.check(0)?;
+            }
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexRecord);
+            let Some(entry) = RecEntry::decode(&mut c) else {
+                return Ok(None);
             };
-            ix.recs.push(RecEntry {
-                seq,
-                offset,
-                ts,
-                hole,
-            });
+            ix.recs.push(entry);
         }
-        for _ in 0..nposts {
-            let h = c.u64()?;
-            let o = u32::from_le_bytes(c.bytes(4)?.try_into().ok()?);
+        let mut prev_posting: Option<(u64, u32)> = None;
+        for idx in 0..nposts {
+            if C::CHECKS && idx.is_multiple_of(CHECK_STRIDE) {
+                control.check(0)?;
+            }
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexPosting);
+            let Some((h, raw)) = c.u64().zip(c.bytes(4)) else {
+                return Ok(None);
+            };
+            let o = u32::from_le_bytes(raw.try_into().unwrap());
+            if o as usize >= nrecs || prev_posting.is_some_and(|prev| prev >= (h, o)) {
+                return Ok(None);
+            }
+            prev_posting = Some((h, o));
             ix.postings.push((h, o));
         }
-        (c.i == body.len()).then_some((first, last, ix))
+        if c.i != body.len() {
+            return Ok(None);
+        }
+        control.check(0)?;
+        Ok(Some((first, last, ix, decoded_guard)))
     }
 }
 
@@ -755,6 +1937,12 @@ pub struct ChangeLog {
     settings: Mutex<ChangeLogSettings>,
     enabled: AtomicBool,
     inner: Mutex<Inner>,
+    /// The first commits that history readers still need, with the number of readers
+    /// pinning each (see [`LogPin`]). Retention keeps every segment at or after the
+    /// oldest, and the log cannot be turned off while any is held. Lock order: `inner`
+    /// before `pins`, and only `settings` is locked while `pins` is held, by
+    /// [`ChangeLog::set_settings`].
+    pins: Mutex<std::collections::BTreeMap<u64, usize>>,
     pending: Mutex<VecDeque<Pending>>,
     /// the background writer has been told about the queue
     scheduled: AtomicBool,
@@ -782,6 +1970,9 @@ pub struct ChangeLogStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
+
+/// `(author, message)` metadata recorded for one commit in the change log.
+pub type CommitChangeMeta = (Option<Arc<str>>, Option<Arc<str>>);
 
 impl ChangeLog {
     pub(super) fn read_only_through(&self) -> Option<u64> {
@@ -818,6 +2009,7 @@ impl ChangeLog {
             settings: Mutex::new(settings),
             enabled: AtomicBool::new(enabled),
             inner: Mutex::new(inner),
+            pins: Mutex::new(std::collections::BTreeMap::new()),
             pending: Mutex::new(VecDeque::new()),
             scheduled: AtomicBool::new(false),
             background: AtomicBool::new(true),
@@ -1241,30 +2433,139 @@ impl ChangeLog {
 
     /// The index of segment `i`.
     fn index(&self, inner: &mut Inner, i: usize) -> Result<Arc<SegIndex>> {
+        Ok(self.index_with(inner, i, &Unlimited, None)?.0)
+    }
+
+    fn index_with<'a, C: Control>(
+        &self,
+        inner: &mut Inner,
+        i: usize,
+        control: &C,
+        budget: Option<&'a MemoryBudget>,
+    ) -> Result<(Arc<SegIndex>, Option<BudgetGuard<'a>>)> {
         if let Some(ix) = &inner.segs[i].index {
-            return Ok(ix.clone());
+            return Ok((ix.clone(), None));
         }
         let first = inner.segs[i].first;
         if let Some(p) = inner.cache.iter().position(|c| c.0 == first) {
             let c = inner.cache.remove(p).expect("found");
             let ix = c.1.clone();
             inner.cache.push_front(c);
-            return Ok(ix);
+            return Ok((ix, None));
         }
         let path = inner.segs[i]
             .idx_path()
             .expect("a sealed persistent segment");
-        let b = std::fs::read(&path)?;
-        let (_, _, ix) = SegIndex::decode(&b, self.dataset_id)
-            .ok_or_else(|| Error::Corrupt(format!("{}: damaged index", path.display())))?;
+        let (b, raw_guard) = Self::read_index_with(&path, control, budget)?;
+        let (_, _, ix, decoded_guard) =
+            SegIndex::decode_with(&b, self.dataset_id, control, budget)?
+                .ok_or_else(|| Error::Corrupt(format!("{}: damaged index", path.display())))?;
+        drop(b);
+        drop(raw_guard);
         let ix = Arc::new(ix);
-        inner.cache.push_front((first, ix.clone()));
-        inner.cache.truncate(INDEX_CACHE);
-        Ok(ix)
+        if budget.is_none() {
+            inner.cache.push_front((first, ix.clone()));
+            inner.cache.truncate(INDEX_CACHE);
+        }
+        Ok((ix, decoded_guard))
+    }
+
+    /// Read the entire sidecar under `control`. Under [`Unlimited`], reads in one pass;
+    /// under a checked control, polls before each read chunk and every interrupted retry.
+    fn read_index_with<'a, C: Control>(
+        path: &Path,
+        control: &C,
+        budget: Option<&'a MemoryBudget>,
+    ) -> Result<(Vec<u8>, Option<BudgetGuard<'a>>)> {
+        if !C::CHECKS {
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexReadAttempt);
+            let bytes = std::fs::read(path)?;
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexReadChunk);
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::IndexReadChunk);
+            let guard = match budget {
+                Some(budget) => Some(budget.reserve(bytes.capacity() as u64)?),
+                None => None,
+            };
+            return Ok((bytes, guard));
+        }
+        control.check(0)?;
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let mut bytes = Vec::new();
+        let mut guard = match budget {
+            Some(budget) => {
+                let cap = usize::try_from(file_len).map_err(|_| {
+                    memory_budget(budget.limit(), budget.used().saturating_add(file_len))
+                })?;
+                let mut guard = budget.reserve(file_len)?;
+                if cap > 0 {
+                    bytes.try_reserve_exact(cap).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+                    })?;
+                    guard.resize(bytes.capacity() as u64)?;
+                }
+                Some(guard)
+            }
+            None => None,
+        };
+        let mut chunk = [0; 64 << 10];
+        loop {
+            control.check(0)?;
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexReadAttempt);
+            match file.read(&mut chunk) {
+                Ok(0) => return Ok((bytes, guard)),
+                Ok(n) => {
+                    if bytes.capacity() - bytes.len() < n {
+                        let next_len = (bytes.len() as u64).saturating_add(n as u64);
+                        if let Some(guard) = guard.as_mut() {
+                            let old_cap = bytes.capacity() as u64;
+                            // Growing reallocates while holding both old and new buffers.
+                            guard.resize(old_cap.saturating_add(next_len))?;
+                            bytes.try_reserve_exact(n).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+                            })?;
+                            guard.resize(bytes.capacity() as u64)?;
+                        } else {
+                            bytes.try_reserve(n).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+                            })?;
+                        }
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    #[cfg(test)]
+                    open_tests::observe(open_tests::Event::IndexReadChunk);
+                    #[cfg(feature = "failpoints")]
+                    observe_changelog_read(ChangeLogReadEvent::IndexReadChunk);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// Read the record of segment `i` at `offset`.
     fn read(&self, inner: &Inner, i: usize, offset: u64) -> Result<Record> {
+        let mut no_admit = |_| Ok(());
+        self.read_with(inner, i, offset, &mut no_admit, &Unlimited)
+    }
+
+    /// Read the record of segment `i` at `offset` under `control`. Under [`Unlimited`],
+    /// reads and decodes directly; under a checked control, admits each allocation before
+    /// it is made (item 829) and polls `control` across reads, CRC chunks, admissions,
+    /// footprint scanning and decoding.
+    fn read_with<C: Control>(
+        &self,
+        inner: &Inner,
+        i: usize,
+        offset: u64,
+        admit: &mut Admit<'_>,
+        control: &C,
+    ) -> Result<Record> {
+        control.check(0)?;
         let seg = &inner.segs[i];
         let damaged = || {
             Error::Corrupt(format!(
@@ -1272,20 +2573,51 @@ impl ChangeLog {
                 seg.first
             ))
         };
+        let decode_body =
+            |body: &[u8], frame_bytes: u64, admit: &mut Admit<'_>| -> Result<(Record, u64)> {
+                let held = if C::CHECKS {
+                    let f = footprint_with(body, control)?.ok_or_else(damaged)?;
+                    let held = f.meta + f.terms + f.changes;
+                    control.check(0)?;
+                    admit(frame_bytes + held)?;
+                    control.check(0)?;
+                    held
+                } else {
+                    0
+                };
+                #[cfg(feature = "failpoints")]
+                observe_changelog_read(ChangeLogReadEvent::RecordDecode);
+                let r = decode_record_with(body, control, OwnedRecordSink::default())?
+                    .ok_or_else(damaged)?;
+                Ok((r, held))
+            };
         if seg.path.is_none() {
-            let (body, _) = frame(&seg.mem, offset as usize).ok_or_else(damaged)?;
-            return decode(body).ok_or_else(damaged);
+            let (body, _) = frame_with(&seg.mem, offset as usize, control)?.ok_or_else(damaged)?;
+            if !C::CHECKS {
+                #[cfg(feature = "failpoints")]
+                observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
+            }
+            return Ok(decode_body(body, 0, admit)?.0);
         }
         let path = seg.path.as_ref().expect("checked");
         let f = File::open(path)?;
-        let mut h = [0u8; 8];
-        read_exact_at(&f, &mut h, offset)?;
-        let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
-        let mut buf = vec![0u8; 8 + len];
-        buf[..8].copy_from_slice(&h);
-        read_exact_at(&f, &mut buf[8..], offset + 8)?;
-        let (body, _) = frame(&buf, 0).ok_or_else(damaged)?;
-        decode(body).ok_or_else(damaged)
+        let body =
+            read_file_frame_with::<false, _>(&f, offset, None, true, true, control, &mut |b| {
+                admit(b)
+            })?
+            .ok_or_else(damaged)?;
+        let frame_bytes = if C::CHECKS {
+            8 + body.capacity() as u64
+        } else {
+            0
+        };
+        let (r, held) = decode_body(&body, frame_bytes, admit)?;
+        drop(body);
+        if C::CHECKS {
+            admit(held)?;
+            control.check(0)?;
+        }
+        Ok(r)
     }
 
     /// Drop sealed segments that retention no longer keeps. `now_ms` applies the age
@@ -1302,8 +2634,13 @@ impl ChangeLog {
         let head = inner.last.unwrap_or(0);
         let mut total: u64 = inner.segs.iter().map(|s| s.bytes).sum();
         let mut dropped = 0;
+        // a history reader's pin keeps its commits, past the size limit too
+        let pinned = self.pins.lock().first_key_value().map(|(c, _)| *c);
         while inner.segs.len() > 1 && inner.segs[0].sealed {
             let seg = &inner.segs[0];
+            if pinned.is_some_and(|c| seg.last >= c) {
+                break;
+            }
             // a segment some limit keeps stays, unless the size limit needs the room
             let kept_by_count = s
                 .keep_commits
@@ -1365,12 +2702,22 @@ impl ChangeLog {
     /// at the next commit (`head` is the current one).
     pub(crate) fn set_settings(&self, s: ChangeLogSettings, head: u64) -> Result<()> {
         self.require_writable()?;
+        let on = s.enabled.unwrap_or(self.limits.default_on);
+        // Turning the log off waits for no reader: it is refused while a history
+        // reader pins the log, before the settings are written. The pins stay locked
+        // until the log is off, so a reader pinning later sees it off.
+        let pins = (!on).then(|| self.pins.lock());
+        if pins.as_ref().is_some_and(|p| !p.is_empty()) {
+            return Err(Error::Conflict(
+                "the change log cannot be turned off while a history query reads it".into(),
+            ));
+        }
         if let Some(root) = &self.root {
             write_settings(root, &s)?;
         }
-        let on = s.enabled.unwrap_or(self.limits.default_on);
         let was = self.enabled.swap(on, Ordering::AcqRel);
         *self.settings.lock() = s;
+        drop(pins);
         if was && !on {
             self.remove_all()?;
         } else if !was && on {
@@ -1432,6 +2779,7 @@ impl ChangeLog {
         &self,
         ms: i64,
         check: &mut dyn FnMut() -> Result<()>,
+        budget: Option<&MemoryBudget>,
     ) -> Result<Option<u64>> {
         if let Some(reader) = &self.readonly {
             return reader.commit_at_time(ms, check);
@@ -1440,92 +2788,152 @@ impl ChangeLog {
         let mut inner = self.inner.lock();
         let mut best = None;
         for i in 0..inner.segs.len() {
-            let ix = self.index(&mut inner, i)?;
+            check()?;
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::TimestampIndex);
+            // Keep the decoded index guard bound before `ix` so `ix` always drops before
+            // its budget charge is released on every exit path.
+            let (_ix_guard, ix) = {
+                let control = FnMutControl::new(check);
+                let (ix, guard) = self.index_with(&mut inner, i, &control, budget)?;
+                (guard, ix)
+            };
             let n = ix.recs.partition_point(|r| r.ts <= ms);
             // a gap tells no time of its own
-            if let Some(r) = ix.recs[..n]
-                .iter()
-                .rev()
-                .find(|r| !matches!(r.hole, Some((_, UnrecordedReason::Gap))))
-            {
-                best = Some(r.seq);
+            for (idx, r) in ix.recs[..n].iter().rev().enumerate() {
+                if idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                    check()?;
+                }
+                #[cfg(test)]
+                open_tests::observe(open_tests::Event::TimestampRecord);
+                if !matches!(r.hole, Some((_, UnrecordedReason::Gap))) {
+                    best = Some(r.seq);
+                    break;
+                }
             }
-            if n < ix.recs.len() {
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::TimestampIndexed);
+            let done = n < ix.recs.len();
+            drop(ix);
+            drop(_ix_guard);
+            if done {
                 break;
             }
         }
+        check()?;
         Ok(best)
     }
 
     /// Read the changes of commits `from` through `to` that match `filter`, in commit
     /// order (newest first with `descending`), calling `visit` for each until it
     /// returns `false`. Returns the commits in the range whose changes are not
-    /// recorded.
+    /// recorded, and without `holes_after_stop` only those found before the scan stops.
+    /// With `paged`, each record is read by [`ChangeLog::read_admitted`] and released
+    /// (an admission of 0) once its changes are visited, and the scan stops where the
+    /// page is full, before the index of a segment is loaded and before a record is
+    /// read; a read-only log is not read so.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan(
         &self,
         from: u64,
         to: u64,
         filter: &LogFilter,
         descending: bool,
+        holes_after_stop: bool,
+        no_wait: bool,
+        budget: Option<&MemoryBudget>,
         check: &mut dyn FnMut() -> Result<()>,
+        mut paged: Option<&mut PageHooks<'_, '_>>,
         visit: &mut Visit<'_>,
     ) -> Result<Vec<Unrecorded>> {
         if let Some(reader) = &self.readonly {
             return reader.scan(from, to, filter, descending, check, visit);
         }
-        let mut inner = self.inner.lock();
-        let mut holes: Vec<Unrecorded> = Vec::new();
+        let checked = no_wait || paged.is_some() || budget.is_some();
+        if checked {
+            check()?;
+        }
+        let mut inner = if no_wait {
+            self.inner.try_lock().ok_or(Error::WriterBusy)?
+        } else {
+            self.inner.lock()
+        };
+        if checked {
+            check()?;
+        }
+        let mut holes = HoleCollector::new(budget, descending);
         if from > to {
-            return Ok(holes);
+            if checked {
+                check()?;
+            }
+            return Ok(Vec::new());
         }
         let Some(newest) = inner.last else {
             holes.push(Unrecorded {
                 from,
                 to,
                 reason: UnrecordedReason::BeforeLog,
-            });
-            return Ok(holes);
+            })?;
+            return holes.finish(checked, check);
         };
         let oldest = inner.segs.first().map_or(newest + 1, |s| s.first);
-        if from < oldest {
+        if !descending && from < oldest {
             holes.push(Unrecorded {
                 from,
                 to: to.min(oldest - 1),
                 reason: UnrecordedReason::BeforeLog,
-            });
+            })?;
         }
-        if to > newest {
+        if descending && to > newest {
             holes.push(Unrecorded {
                 from: from.max(newest + 1),
                 to,
                 reason: UnrecordedReason::Gap,
-            });
+            })?;
         }
         let hashes = filter.hashes();
         let n = inner.segs.len();
-        let order: Vec<usize> = if descending {
-            (0..n).rev().collect()
-        } else {
-            (0..n).collect()
-        };
         let mut stop = false;
-        'segs: for i in order {
+        'segs: for step in 0..n {
+            let i = if descending { n - 1 - step } else { step };
+            if checked {
+                check()?;
+            }
             let (sf, sl) = (inner.segs[i].first, inner.segs[i].last);
             if sl < from || sf > to {
                 continue;
             }
             // holes between segments (damage) are reported as gaps
-            if i > 0 && inner.segs[i - 1].last + 1 < sf {
+            if !descending && i > 0 && inner.segs[i - 1].last + 1 < sf {
                 let (a, b) = (inner.segs[i - 1].last + 1, sf - 1);
                 if a <= to && b >= from {
                     holes.push(Unrecorded {
                         from: a.max(from),
                         to: b.min(to),
                         reason: UnrecordedReason::Gap,
-                    });
+                    })?;
                 }
             }
-            let ix = self.index(&mut inner, i)?;
+            // a full page stops before it loads the next segment's index; a commit is
+            // one record, so the segment holds no part of the commit read last
+            if !stop
+                && let Some(p) = paged.as_deref_mut()
+                && (p.full)(if descending { sl.min(to) } else { sf.max(from) })
+            {
+                stop = true;
+            }
+            if stop && !holes_after_stop {
+                break;
+            }
+            // Keep the decoded index guard bound before `ix` so `ix` always drops before
+            // its budget charge is released on every exit path.
+            let (_ix_guard, ix) = if checked {
+                let control = FnMutControl::new(check);
+                let (ix, guard) = self.index_with(&mut inner, i, &control, budget)?;
+                (guard, ix)
+            } else {
+                (None, self.index(&mut inner, i)?)
+            };
             let lo = ix.recs.partition_point(|r| r.seq < from);
             let hi = ix.recs.partition_point(|r| r.seq <= to);
             // A gap can begin in the requested window but end after it. That
@@ -1537,81 +2945,297 @@ impl ChangeLog {
                         .get(hi)
                         .is_some_and(|record| record.hole.is_some_and(|(first, _)| first <= to)),
                 );
-            for r in &ix.recs[lo..hole_hi] {
-                if let Some((f, reason)) = r.hole {
-                    holes.push(Unrecorded {
-                        from: f.max(from),
-                        to: r.seq.min(to),
-                        reason,
-                    });
+            if descending {
+                for (idx, r) in ix.recs[lo..hole_hi].iter().rev().enumerate() {
+                    if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                        check()?;
+                    }
+                    if let Some((f, reason)) = r.hole {
+                        holes.push(Unrecorded {
+                            from: f.max(from),
+                            to: r.seq.min(to),
+                            reason,
+                        })?;
+                    }
+                }
+                if i > 0 && inner.segs[i - 1].last + 1 < sf {
+                    let (a, b) = (inner.segs[i - 1].last + 1, sf - 1);
+                    if a <= to && b >= from {
+                        holes.push(Unrecorded {
+                            from: a.max(from),
+                            to: b.min(to),
+                            reason: UnrecordedReason::Gap,
+                        })?;
+                    }
+                }
+            } else {
+                for (idx, r) in ix.recs[lo..hole_hi].iter().enumerate() {
+                    if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                        check()?;
+                    }
+                    if let Some((f, reason)) = r.hole {
+                        holes.push(Unrecorded {
+                            from: f.max(from),
+                            to: r.seq.min(to),
+                            reason,
+                        })?;
+                    }
                 }
             }
             if stop {
                 continue;
             }
-            // the records that may match
-            let cands: Vec<u32> = match &hashes {
-                None => (lo as u32..hi as u32).collect(),
+            // Stream candidate ordinals without copying posting lists: short-circuit
+            // immediately if any constrained role has zero postings in lo..hi, and
+            // drive traversal from the smallest constrained role.
+            let mut cand_guard = budget.map(MemoryBudget::guard);
+            let mut cand_fixed_bytes = 0u64;
+            let (mut cands, other_roles) = match &hashes {
+                None => (
+                    CandidateStream::Range {
+                        lo: lo as u32,
+                        hi: hi as u32,
+                        descending,
+                    },
+                    Vec::new(),
+                ),
                 Some(roles) => {
-                    let mut acc: Option<Vec<u32>> = None;
-                    for hs in roles {
-                        let mut v = Vec::new();
-                        for h in hs {
-                            ix.lookup(*h, &mut v);
-                        }
-                        v.retain(|&o| (lo as u32..hi as u32).contains(&o));
-                        v.sort_unstable();
-                        v.dedup();
-                        acc = Some(match acc {
-                            None => v,
-                            Some(a) => a
-                                .into_iter()
-                                .filter(|o| v.binary_search(o).is_ok())
-                                .collect(),
-                        });
+                    let mut role_runs: Vec<Vec<PostingRun<'_>>> = Vec::new();
+                    if let Some(guard) = cand_guard.as_mut() {
+                        let outer = (roles.len() as u64)
+                            .saturating_mul(std::mem::size_of::<Vec<PostingRun<'_>>>() as u64);
+                        guard.resize(outer)?;
                     }
-                    acc.unwrap_or_default()
+                    role_runs.try_reserve_exact(roles.len()).map_err(|_| {
+                        Error::HistoryUnsupported(
+                            "history candidate role allocation was refused".into(),
+                        )
+                    })?;
+                    if let Some(guard) = cand_guard.as_mut() {
+                        cand_fixed_bytes = (role_runs.capacity() as u64)
+                            .saturating_mul(std::mem::size_of::<Vec<PostingRun<'_>>>() as u64);
+                        guard.resize(cand_fixed_bytes)?;
+                    }
+                    let mut drive_idx = 0usize;
+                    let mut drive_count = usize::MAX;
+                    let mut empty_role = false;
+                    for (role_i, hs) in roles.iter().enumerate() {
+                        if checked {
+                            check()?;
+                        }
+                        let mut runs: Vec<PostingRun<'_>> = Vec::new();
+                        let mut count = 0usize;
+                        for (h_i, &h) in hs.iter().enumerate() {
+                            if checked && h_i != 0 && h_i.is_multiple_of(CHECK_STRIDE) {
+                                check()?;
+                            }
+                            for run in ix.runs_in_range(h, lo as u32, hi as u32) {
+                                if !run.is_empty() {
+                                    count = count.saturating_add(run.len());
+                                    if runs.len() == runs.capacity() {
+                                        let size = std::mem::size_of::<PostingRun<'_>>() as u64;
+                                        let old = (runs.capacity() as u64).saturating_mul(size);
+                                        let more = runs.capacity().max(4);
+                                        let new = (runs.capacity().saturating_add(more) as u64)
+                                            .saturating_mul(size);
+                                        if let Some(guard) = cand_guard.as_mut() {
+                                            guard.resize(
+                                                cand_fixed_bytes
+                                                    .saturating_add(old)
+                                                    .saturating_add(new),
+                                            )?;
+                                        }
+                                        runs.try_reserve_exact(more).map_err(|_| {
+                                            Error::HistoryUnsupported(
+                                                "history candidate cursor allocation was refused"
+                                                    .into(),
+                                            )
+                                        })?;
+                                        if let Some(guard) = cand_guard.as_mut() {
+                                            let actual =
+                                                (runs.capacity() as u64).saturating_mul(size);
+                                            guard
+                                                .resize(cand_fixed_bytes.saturating_add(actual))?;
+                                        }
+                                    }
+                                    runs.push(run);
+                                }
+                            }
+                        }
+                        if count == 0 {
+                            empty_role = true;
+                            break;
+                        }
+                        cand_fixed_bytes = cand_fixed_bytes.saturating_add(
+                            (runs.capacity() as u64)
+                                .saturating_mul(std::mem::size_of::<PostingRun<'_>>() as u64),
+                        );
+                        if count < drive_count {
+                            drive_count = count;
+                            drive_idx = role_i;
+                        }
+                        role_runs.push(runs);
+                    }
+                    if empty_role {
+                        continue 'segs;
+                    }
+                    let mut drive_runs = role_runs.swap_remove(drive_idx);
+                    let stream = if drive_runs.len() == 1 {
+                        CandidateStream::Single {
+                            run: drive_runs[0],
+                            descending,
+                        }
+                    } else {
+                        let mut entries: Vec<(u32, usize)> = Vec::new();
+                        let entry_size = std::mem::size_of::<(u32, usize)>() as u64;
+                        if let Some(guard) = cand_guard.as_mut() {
+                            let need = (drive_runs.len() as u64).saturating_mul(entry_size);
+                            guard.resize(cand_fixed_bytes.saturating_add(need))?;
+                        }
+                        entries.try_reserve_exact(drive_runs.len()).map_err(|_| {
+                            Error::HistoryUnsupported(
+                                "history candidate heap allocation was refused".into(),
+                            )
+                        })?;
+                        if let Some(guard) = cand_guard.as_mut() {
+                            let actual = (entries.capacity() as u64).saturating_mul(entry_size);
+                            guard.resize(cand_fixed_bytes.saturating_add(actual))?;
+                        }
+                        for (idx, run) in drive_runs.iter_mut().enumerate() {
+                            if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                                check()?;
+                            }
+                            if let Some(ord) = run.pop(descending) {
+                                let key = if descending { ord } else { u32::MAX - ord };
+                                entries.push((key, idx));
+                            }
+                        }
+                        CandidateStream::Merge {
+                            runs: drive_runs,
+                            heap: std::collections::BinaryHeap::from(entries),
+                            descending,
+                            last: None,
+                        }
+                    };
+                    (stream, role_runs)
                 }
             };
-            let iter: Box<dyn Iterator<Item = &u32>> = if descending {
-                Box::new(cands.iter().rev())
-            } else {
-                Box::new(cands.iter())
-            };
-            for &o in iter {
+            let mut cand_steps = 0usize;
+            while let Some(o) = cands.next_ord(checked, check)? {
+                if checked && cand_steps.is_multiple_of(CHECK_STRIDE) {
+                    #[cfg(test)]
+                    open_tests::observe(open_tests::Event::CandidateCheck);
+                    #[cfg(feature = "failpoints")]
+                    observe_changelog_read(ChangeLogReadEvent::CandidateCheck);
+                    check()?;
+                }
+                cand_steps += 1;
+                if !other_roles.is_empty() {
+                    let mut matched = true;
+                    for other in &other_roles {
+                        let mut hit = false;
+                        for (r_idx, run) in other.iter().enumerate() {
+                            if checked && r_idx != 0 && r_idx.is_multiple_of(CHECK_STRIDE) {
+                                check()?;
+                            }
+                            if run.contains(o) {
+                                hit = true;
+                                break;
+                            }
+                        }
+                        if !hit {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        continue;
+                    }
+                }
                 check()?;
                 let e = ix.recs[o as usize];
                 if e.hole.is_some() {
                     continue;
                 }
-                let Record::Changes(c, changes) = self.read(&inner, i, e.offset)? else {
-                    continue;
+                if let Some(p) = paged.as_deref_mut()
+                    && (p.full)(e.seq)
+                {
+                    stop = true;
+                    break;
+                }
+                let mut record_guard = budget.map(MemoryBudget::guard);
+                let record = match paged.as_deref_mut() {
+                    Some(p) => {
+                        let control = FnMutControl::new(check);
+                        self.read_with(&inner, i, e.offset, p.admit, &control)?
+                    }
+                    None if checked => {
+                        let control = FnMutControl::new(check);
+                        let mut admit = |bytes: u64| {
+                            if let Some(guard) = record_guard.as_mut() {
+                                guard.resize(bytes)
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        self.read_with(&inner, i, e.offset, &mut admit, &control)?
+                    }
+                    None => self.read(&inner, i, e.offset)?,
                 };
-                for (add, k) in &changes {
-                    if filter.matches(k) && !visit(&c, *add, k)? {
-                        stop = true;
-                        if descending {
-                            break 'segs;
+                if let Record::Changes(c, changes) = &record {
+                    #[cfg(test)]
+                    let is_paged = paged.is_some();
+                    for (idx, (add, k)) in changes.iter().enumerate() {
+                        if checked && idx.is_multiple_of(CHECK_STRIDE) {
+                            check()?;
                         }
-                        break;
+                        #[cfg(test)]
+                        if is_paged {
+                            settings_format_tests::observe_paged_filter();
+                        }
+                        if filter.matches(k) && !visit(c, *add, k)? {
+                            stop = true;
+                            break;
+                        }
                     }
                 }
+                drop(record);
+                drop(record_guard);
+                if let Some(p) = paged.as_deref_mut() {
+                    (p.admit)(0)?;
+                    check()?;
+                }
                 if stop {
+                    if descending {
+                        break 'segs;
+                    }
                     break;
                 }
             }
-        }
-        holes.sort_by_key(|h| h.from);
-        // a hole reported twice (a gap past the end and a gap record) is merged
-        holes.dedup_by(|b, a| {
-            if a.reason == b.reason && b.from <= a.to + 1 {
-                a.to = a.to.max(b.to);
-                true
-            } else {
-                false
+            drop(cands);
+            drop(other_roles);
+            drop(cand_guard);
+            drop(ix);
+            drop(_ix_guard);
+            if stop && !holes_after_stop {
+                break;
             }
-        });
-        Ok(holes)
+        }
+        if !descending && to > newest {
+            holes.push(Unrecorded {
+                from: from.max(newest + 1),
+                to,
+                reason: UnrecordedReason::Gap,
+            })?;
+        }
+        if descending && from < oldest {
+            holes.push(Unrecorded {
+                from,
+                to: to.min(oldest - 1),
+                reason: UnrecordedReason::BeforeLog,
+            })?;
+        }
+        holes.finish(checked, check)
     }
 
     /// Read the records of commits `from` through `to` in commit order, calling `visit`
@@ -1671,6 +3295,67 @@ impl ChangeLog {
         Ok(())
     }
 
+    /// Read only the commit metadata `(author, message)` for the requested commit
+    /// sequence numbers without decoding term tables or quad changes. Flushes pending
+    /// queued entries first so recent commits are visible immediately, and covers both
+    /// change records (including 0-quad commits) and summary-only bulk commits.
+    pub(crate) fn commit_metas(&self, seqs: &[u64]) -> Result<HashMap<u64, CommitChangeMeta>> {
+        let mut out = HashMap::new();
+        if seqs.is_empty() || !self.is_enabled() || self.readonly.is_some() {
+            return Ok(out);
+        }
+        self.flush(false)?;
+        let mut wanted: Vec<u64> = seqs.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        let mut inner = self.inner.lock();
+        let seg_count = inner.segs.len();
+        let mut wi = 0usize;
+        for seg_idx in 0..seg_count {
+            while wi < wanted.len() && wanted[wi] < inner.segs[seg_idx].first {
+                wi += 1;
+            }
+            if wi >= wanted.len() {
+                break;
+            }
+            let seg_last = inner.segs[seg_idx].last;
+            if wanted[wi] > seg_last {
+                continue;
+            }
+            let start_wi = wi;
+            while wi < wanted.len() && wanted[wi] <= seg_last {
+                wi += 1;
+            }
+            let ix = self.index(&mut inner, seg_idx)?;
+            let seg = &inner.segs[seg_idx];
+            let file = match &seg.path {
+                Some(path) => Some(File::open(path)?),
+                None => None,
+            };
+            for &seq in &wanted[start_wi..wi] {
+                let pos = ix.recs.partition_point(|r| r.seq < seq);
+                let Some(rec) = ix.recs.get(pos) else {
+                    continue;
+                };
+                if rec.seq != seq {
+                    continue;
+                }
+                if matches!(rec.hole, Some((_, UnrecordedReason::Gap))) {
+                    continue;
+                }
+                let meta = match (&file, &seg.mem) {
+                    (Some(f), _) => read_record_meta_from_file(f, rec.offset, seq)?,
+                    (None, mem) => read_record_meta_from_mem(mem, rec.offset as usize, seq)?,
+                };
+                if meta.author.is_some() || meta.message.is_some() {
+                    out.insert(seq, (meta.author, meta.message));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The bytes on disk (or in memory).
     pub fn bytes(&self) -> u64 {
         if let Some(reader) = &self.readonly {
@@ -1702,6 +3387,116 @@ fn sorted(mut v: Vec<(QuadKey, bool)>) -> Vec<(bool, QuadKey)> {
     v.into_iter().map(|(k, add)| (add, k)).collect()
 }
 
+fn decode_record_meta_prefix(prefix: &[u8], expected_seq: u64) -> Option<ChangeCommit> {
+    let mut c = Cur { b: prefix, i: 0 };
+    let ty = c.u8()?;
+    let seq = c.u64()?;
+    if seq != expected_seq {
+        return None;
+    }
+    match ty {
+        REC_CHANGES | REC_SUMMARY => decode_meta_with(&mut c, seq, &Unlimited)
+            .ok()
+            .flatten()
+            .map(Arc::unwrap_or_clone),
+        _ => None,
+    }
+}
+
+fn read_record_meta_from_mem(mem: &[u8], offset: usize, expected_seq: u64) -> Result<ChangeCommit> {
+    let Some((body, _)) = frame(mem, offset) else {
+        return Err(Error::Corrupt(format!(
+            "corrupt change-log record frame for commit {expected_seq} at offset {offset}"
+        )));
+    };
+    decode_record_meta_prefix(body, expected_seq).ok_or_else(|| {
+        Error::Corrupt(format!(
+            "corrupt change-log record metadata for commit {expected_seq} at offset {offset}"
+        ))
+    })
+}
+
+fn read_record_meta_from_file(f: &File, offset: u64, expected_seq: u64) -> Result<ChangeCommit> {
+    const INITIAL_PREFIX: usize = 4096;
+    const MAX_META_PREFIX: usize = 1 << 20;
+    const CRC_CHUNK: usize = 64 << 10;
+    let map_eof = |e: Error| {
+        if matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+            Error::Corrupt(format!(
+                "truncated change-log record for commit {expected_seq} at offset {offset}"
+            ))
+        } else {
+            e
+        }
+    };
+    let mut h = [0u8; 8];
+    read_exact_at_with(f, &mut h, offset, &Unlimited).map_err(map_eof)?;
+    let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+    let expected_crc = u32::from_le_bytes(h[4..8].try_into().unwrap());
+    if len == 0 {
+        return Err(Error::Corrupt(format!(
+            "zero-length change-log record for commit {expected_seq} at offset {offset}"
+        )));
+    }
+    let first_read = len.min(INITIAL_PREFIX);
+    let mut buf = vec![0u8; first_read];
+    read_exact_at_with(f, &mut buf, offset + 8, &Unlimited).map_err(map_eof)?;
+
+    let mut crc = flate2::Crc::new();
+    crc.update(&buf);
+    let mut hashed = first_read;
+
+    let meta = if let Some(meta) = decode_record_meta_prefix(&buf, expected_seq) {
+        meta
+    } else {
+        // Check record header type and seq before expanding the read buffer.
+        let mut header_cur = Cur { b: &buf, i: 0 };
+        let header_ok = matches!(header_cur.u8(), Some(REC_CHANGES | REC_SUMMARY))
+            && header_cur.u64() == Some(expected_seq);
+        if len > first_read && header_ok {
+            let cap = len.min(MAX_META_PREFIX);
+            buf.resize(cap, 0);
+            read_exact_at_with(
+                f,
+                &mut buf[first_read..],
+                offset + 8 + first_read as u64,
+                &Unlimited,
+            )
+            .map_err(map_eof)?;
+            crc.update(&buf[first_read..]);
+            hashed = cap;
+            decode_record_meta_prefix(&buf, expected_seq).ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "corrupt change-log record metadata for commit {expected_seq} at offset {offset}"
+                ))
+            })?
+        } else {
+            return Err(Error::Corrupt(format!(
+                "corrupt change-log record metadata for commit {expected_seq} at offset {offset}"
+            )));
+        }
+    };
+
+    // Stream any remaining record body bytes in bounded chunks to verify the full frame
+    // CRC-32 without loading large change-log records into memory.
+    if hashed < len {
+        let mut chunk = vec![0u8; (len - hashed).min(CRC_CHUNK)];
+        while hashed < len {
+            let n = (len - hashed).min(chunk.len());
+            read_exact_at_with(f, &mut chunk[..n], offset + 8 + hashed as u64, &Unlimited)
+                .map_err(map_eof)?;
+            crc.update(&chunk[..n]);
+            hashed += n;
+        }
+    }
+    if crc.sum() != expected_crc {
+        return Err(Error::Corrupt(format!(
+            "corrupt change-log record CRC for commit {expected_seq} at offset {offset}"
+        )));
+    }
+    Ok(meta)
+}
+
 /// Write a file through a temporary one, durably.
 fn write_synced_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(crate::fsutil::write_atomic_via(
@@ -1711,27 +3506,80 @@ fn write_synced_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     )?)
 }
 
-#[cfg(unix)]
-fn read_exact_at(f: &File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
-    std::os::unix::fs::FileExt::read_exact_at(f, buf, at)
+/// Positional reads do not share a cursor across concurrent queries. Under a checked
+/// control, every kernel request is at most 64 KiB and an interrupted syscall polls
+/// controls before retry. Under [`Unlimited`], reads the whole buffer directly.
+pub(super) fn read_exact_at_loop_with<C: Control>(
+    mut output: &mut [u8],
+    mut offset: u64,
+    control: &C,
+    mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<()> {
+    while !output.is_empty() {
+        control.check(0)?;
+        let length = if C::CHECKS {
+            output.len().min(64 << 10)
+        } else {
+            output.len()
+        };
+        match read_at(&mut output[..length], offset) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
+            Ok(count) => {
+                offset = offset
+                    .checked_add(count as u64)
+                    .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
+                output = &mut output[count..];
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    control.check(0)
 }
 
-#[cfg(windows)]
-fn read_exact_at(f: &File, mut buf: &mut [u8], mut at: u64) -> std::io::Result<()> {
-    while !buf.is_empty() {
-        let n = std::os::windows::fs::FileExt::seek_read(f, buf, at)?;
-        if n == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        buf = &mut buf[n..];
-        at += n as u64;
+pub(super) fn read_exact_at_with<C: Control>(
+    file: &File,
+    output: &mut [u8],
+    offset: u64,
+    control: &C,
+) -> Result<()> {
+    #[cfg(unix)]
+    if !C::CHECKS {
+        return Ok(std::os::unix::fs::FileExt::read_exact_at(
+            file, output, offset,
+        )?);
     }
-    Ok(())
+    read_exact_at_loop_with(output, offset, control, |buf, at| {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(file, buf, at)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_read(file, buf, at)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (file, buf, at);
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    })
 }
 
 /// What a scan calls for each change: its commit, `true` for an addition, and its quad.
 /// Returning `false` stops the scan.
 pub(crate) type Visit<'a> = dyn FnMut(&Arc<ChangeCommit>, bool, &QuadKey) -> Result<bool> + 'a;
+/// Told the bytes a record being read holds now, before each allocation (item 829).
+pub(crate) type Admit<'a> = dyn FnMut(u64) -> Result<()> + 'a;
+
+/// What a paged history read gives [`ChangeLog::scan`] (item 829).
+pub(crate) struct PageHooks<'a, 'b> {
+    /// told the bytes a record being read holds now, before each allocation
+    pub(crate) admit: &'a mut Admit<'b>,
+    /// whether the page is full before a record of commit `seq` is read, or before a
+    /// segment whose next commit is `seq` is opened: the scan stops there
+    pub(crate) full: &'a mut dyn FnMut(u64) -> bool,
+}
 
 /// Which changes a scan returns: for each of graph, subject, predicate and object, the
 /// keys it may have (`None`: any).
@@ -1998,6 +3846,17 @@ impl Store {
         self.sync_change_log()
     }
 
+    /// Read `(author, message)` commit metadata for the given `seqs` from this store's
+    /// change log without decoding quad changes. Flushes pending queued entries first so
+    /// recent writes are immediately visible.
+    pub fn commit_change_metas(&self, seqs: &[u64]) -> Result<HashMap<u64, CommitChangeMeta>> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        match &self.changelog {
+            Some(log) if log.is_enabled() => log.commit_metas(seqs),
+            _ => Ok(HashMap::new()),
+        }
+    }
+
     /// Append what is queued and sync, before the generation whose write-ahead log holds
     /// the queued changes may go.
     pub(super) fn sync_change_log(&self) -> Result<()> {
@@ -2156,6 +4015,38 @@ pub(crate) fn quad_key(q: &Quad) -> QuadKey {
 #[cfg(test)]
 mod settings_format_tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static PAGED_FILTER_EVALUATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn observe_paged_filter() {
+        PAGED_FILTER_EVALUATIONS.with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            }
+        });
+    }
+
+    struct CountPagedFilters;
+
+    impl CountPagedFilters {
+        fn new() -> Self {
+            PAGED_FILTER_EVALUATIONS.with(|count| assert!(count.replace(Some(0)).is_none()));
+            Self
+        }
+
+        fn get(&self) -> usize {
+            PAGED_FILTER_EVALUATIONS.with(|count| count.get().unwrap())
+        }
+    }
+
+    impl Drop for CountPagedFilters {
+        fn drop(&mut self) {
+            PAGED_FILTER_EVALUATIONS.with(|count| count.set(None));
+        }
+    }
 
     #[test]
     fn a_newer_change_log_file_is_refused() {
@@ -2175,5 +4066,2236 @@ mod settings_format_tests {
         ));
         std::fs::write(dir.path().join(CHANGE_LOG_FILE), r#"{"keepCommits": 5}"#).unwrap();
         assert_eq!(read_settings(dir.path()).unwrap().keep_commits, Some(5));
+    }
+
+    fn test_commit(seq: u64, author: Option<String>, message: Option<String>) -> Arc<ChangeCommit> {
+        Arc::new(ChangeCommit {
+            seq,
+            timestamp_ms: 1_700_000_000_000,
+            kind: CommitKind::Update,
+            bulk: false,
+            inserted: 1,
+            deleted: 0,
+            author: author.map(Arc::from),
+            message: message.map(Arc::from),
+        })
+    }
+
+    /// Checked footprint, CRC, decode and filtered-scan helpers poll within the 1,024-entry
+    /// and 64 KiB bounds and propagate typed stop errors instead of `Corrupt`.
+    #[test]
+    fn admitted_history_decode_checks_inside_large_records() {
+        let g: Arc<[u8]> = Arc::from(&[][..]);
+        let s: Arc<[u8]> = Arc::from(id::iri_key("urn:s"));
+        let p: Arc<[u8]> = Arc::from(id::iri_key("urn:p"));
+
+        // 1. Large single term (256 KiB): CRC and decode both poll in <= 64 KiB chunks.
+        let big_term: Arc<[u8]> = Arc::from(id::term_key(&Term::Literal(
+            oxrdf::Literal::new_simple_literal("t".repeat(256 << 10)),
+        )));
+        let big_frame = encode(&Record::Changes(
+            test_commit(1, None, None),
+            vec![(true, [g.clone(), s.clone(), p.clone(), big_term])],
+        ));
+        let mut crc_polls = 0usize;
+        let (big_body, _) = frame_checked(&big_frame, 0, &mut || {
+            crc_polls += 1;
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(crc_polls >= 6, "expected >= 6 CRC polls, got {crc_polls}");
+        let mut stop_at = 0usize;
+        let err = frame_checked(&big_frame, 0, &mut || {
+            stop_at += 1;
+            if stop_at == 3 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(err, Err(Error::Cancelled)));
+
+        let mut decode_polls = 0usize;
+        assert!(
+            decode_admitted_checked(big_body, &mut || {
+                decode_polls += 1;
+                Ok(())
+            })
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            decode_polls >= 6,
+            "expected >= 6 decode polls for 256 KiB term, got {decode_polls}"
+        );
+        for fail_on in [2usize, 4] {
+            let mut n = 0usize;
+            let res = decode_admitted_checked(big_body, &mut || {
+                n += 1;
+                if n == fail_on {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(res, Err(Error::Cancelled)), "fail_on={fail_on}");
+        }
+
+        // 2. Many terms (3,000 distinct terms): footprint and decode poll every <= 1,024 terms.
+        let many_terms_changes: Vec<(bool, QuadKey)> = (0..3_000u32)
+            .map(|i| {
+                let o: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:o:{i}")));
+                (true, [g.clone(), s.clone(), p.clone(), o])
+            })
+            .collect();
+        let many_terms_frame = encode(&Record::Changes(
+            test_commit(2, None, None),
+            many_terms_changes,
+        ));
+        let many_terms_body = &many_terms_frame[8..];
+        let mut fp_polls = 0usize;
+        assert!(
+            footprint_checked(many_terms_body, &mut || {
+                fp_polls += 1;
+                Ok(())
+            })
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            fp_polls >= 3_000 / CHECK_STRIDE + 2,
+            "expected >= {} footprint polls, got {fp_polls}",
+            3_000 / CHECK_STRIDE + 2
+        );
+        let mut n = 0usize;
+        assert!(matches!(
+            footprint_checked(many_terms_body, &mut || {
+                n += 1;
+                if n == 2 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(Error::Cancelled)
+        ));
+
+        let mut dt_polls = 0usize;
+        assert!(
+            decode_admitted_checked(many_terms_body, &mut || {
+                dt_polls += 1;
+                Ok(())
+            })
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            dt_polls >= 2 * (3_000 / CHECK_STRIDE) + 2,
+            "expected polls across both terms and changes, got {dt_polls}"
+        );
+
+        // 3. Many changes (3,000 changes over a 4-term table): change loop polls every <= 1,024.
+        let o0: Arc<[u8]> = Arc::from(id::iri_key("urn:o:0"));
+        let many_changes: Vec<(bool, QuadKey)> = (0..3_000usize)
+            .map(|i| {
+                (
+                    i.is_multiple_of(2),
+                    [g.clone(), s.clone(), p.clone(), o0.clone()],
+                )
+            })
+            .collect();
+        let many_changes_frame = encode(&Record::Changes(test_commit(3, None, None), many_changes));
+        let many_changes_body = &many_changes_frame[8..];
+        assert!(
+            decode_admitted_checked(many_changes_body, &mut || Ok(()))
+                .unwrap()
+                .is_some()
+        );
+        // Four polls precede the change loop. Its second poll must occur after
+        // decoding change 1,023 and before decoding change 1,024.
+        let change_bytes = 5;
+        let changes_start = many_changes_body.len() - 3_000 * change_bytes;
+        for index in [1_023, 1_024] {
+            let mut damaged = many_changes_body.to_vec();
+            damaged[changes_start + index * change_bytes + 4] = 99;
+            assert!(matches!(
+                decode_admitted_checked(&damaged, &mut || Ok(())),
+                Ok(None)
+            ));
+            let mut polls = 0;
+            let result = decode_admitted_checked(&damaged, &mut || {
+                polls += 1;
+                if polls == 6 {
+                    Err(Error::Timeout)
+                } else {
+                    Ok(())
+                }
+            });
+            if index == 1_023 {
+                assert!(
+                    matches!(result, Ok(None)),
+                    "damage must precede the stride poll"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::Timeout)),
+                    "the decode stride poll must precede damage"
+                );
+            }
+        }
+
+        // 4. Large author and message (256 KiB each): UTF-8 and copy walks poll every <= 64 KiB.
+        let big_meta_frame = encode(&Record::Summary(test_commit(
+            4,
+            Some("a".repeat(256 << 10)),
+            Some("m".repeat(256 << 10)),
+        )));
+        let big_meta_body = &big_meta_frame[8..];
+        let mut meta_polls = 0usize;
+        assert!(
+            decode_admitted_checked(big_meta_body, &mut || {
+                meta_polls += 1;
+                Ok(())
+            })
+            .unwrap()
+            .is_some()
+        );
+        // 2 fields * (UTF-8 4 chunks + copy 4 chunks) >= 16 polls
+        assert!(
+            meta_polls >= 16,
+            "expected >= 16 metadata polls, got {meta_polls}"
+        );
+        let mut n = 0usize;
+        assert!(matches!(
+            decode_admitted_checked(big_meta_body, &mut || {
+                n += 1;
+                if n == 8 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(Error::Cancelled)
+        ));
+
+        // 5. All changes rejected by a filter in paged scan still poll every <= 1,024 changes.
+        let store = Store::in_memory(StoreOptions::default());
+        store.change_log().unwrap().set_background(false);
+        let mut mixed =
+            String::from("<urn:s_match> <urn:p_other> 1 . <urn:s_other> <urn:p_match> 2 . ");
+        for j in 0..3_500 {
+            mixed.push_str(&format!("<urn:s_match> <urn:p_other> {j} . "));
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {mixed} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let log = store.change_log().unwrap().clone();
+        // Both `<urn:s_match>` and `<urn:p_match>` appear in commit 1, so the segment index
+        // selects commit 1, yet no quad has both subject `<urn:s_match>` and predicate `<urn:p_match>`.
+        let reject_all = LogFilter {
+            keys: [
+                None,
+                Some(vec![id::iri_key("urn:s_match")]),
+                Some(vec![id::iri_key("urn:p_match")]),
+                None,
+            ],
+        };
+        let mut visited = 0usize;
+        let evaluated = CountPagedFilters::new();
+        let mut admit = |_: u64| Ok(());
+        let mut full = |_: u64| false;
+        log.scan(
+            1,
+            1,
+            &reject_all,
+            false,
+            false,
+            false,
+            None,
+            &mut || Ok(()),
+            Some(&mut PageHooks {
+                admit: &mut admit,
+                full: &mut full,
+            }),
+            &mut |_, _, _| {
+                visited += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(visited, 0, "filter must reject every change");
+        // One of the initial changes is also in the generated range.
+        assert_eq!(evaluated.get(), 3_501);
+        drop(evaluated);
+
+        let evaluated = CountPagedFilters::new();
+        let mut released = false;
+        let res = log.scan(
+            1,
+            1,
+            &reject_all,
+            false,
+            false,
+            false,
+            None,
+            &mut || {
+                if evaluated.get() == 1_024 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            Some(&mut PageHooks {
+                admit: &mut |bytes| {
+                    released |= bytes == 0;
+                    Ok(())
+                },
+                full: &mut full,
+            }),
+            &mut |_, _, _| {
+                visited += 1;
+                Ok(true)
+            },
+        );
+        assert!(
+            matches!(res, Err(Error::Cancelled)),
+            "the filter stride poll must stop the scan: {res:?}"
+        );
+        assert_eq!(evaluated.get(), 1_024);
+        assert_eq!(visited, 0);
+        assert!(
+            !released,
+            "the scan must stop before its record release admission"
+        );
+        drop(evaluated);
+
+        // 6. Malformed trailing reference: Ok(None) without stop, Cancelled if stopped earlier.
+        let mut bad_body = many_changes_body.to_vec();
+        // The last byte is the object term index varint (0..3) of the 3,000th change; set to 99.
+        *bad_body.last_mut().unwrap() = 99;
+        assert!(
+            decode_admitted_checked(&bad_body, &mut || Ok(()))
+                .unwrap()
+                .is_none(),
+            "malformed trailing term reference must decode as None (corrupt)"
+        );
+        let mut n = 0usize;
+        assert!(
+            matches!(
+                decode_admitted_checked(&bad_body, &mut || {
+                    n += 1;
+                    if n == 3 {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err(Error::Cancelled)
+            ),
+            "cancellation before the malformed tail must report Cancelled, not Corrupt"
+        );
+    }
+
+    /// Positional chunked reads bound each kernel read and advance between polls to 64 KiB,
+    /// poll before retrying an `Interrupted` read, and stop file-backed `read_admitted` with
+    /// the typed stop error.
+    #[test]
+    fn admitted_history_reads_check_between_chunks() {
+        use std::cell::Cell;
+
+        // 1. Direct chunk-size, offset-stride and EINTR retry test via `read_exact_at_loop_with`.
+        let src: Vec<u8> = (0..(256 << 10)).map(|i| (i % 251) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        let mut calls = 0usize;
+        let mut max_chunk = 0usize;
+        let mut last_polled_offset = 0u64;
+        let current_offset = Cell::new(0u64);
+        let mut max_advance = 0u64;
+        let mut interrupted_once = false;
+        let polls = Cell::new(0usize);
+        let mut polls_at_eintr = 0usize;
+        let mut poll = || {
+            polls.set(polls.get() + 1);
+            let cur = current_offset.get();
+            max_advance = max_advance.max(cur - last_polled_offset);
+            last_polled_offset = cur;
+            Ok(())
+        };
+        read_exact_at_loop_with(&mut dst, 0, &FnMutControl::new(&mut poll), |buf, at| {
+            calls += 1;
+            max_chunk = max_chunk.max(buf.len());
+            if calls == 2 && !interrupted_once {
+                interrupted_once = true;
+                polls_at_eintr = polls.get();
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            let start = at as usize;
+            buf.copy_from_slice(&src[start..start + buf.len()]);
+            current_offset.set(at + buf.len() as u64);
+            Ok(buf.len())
+        })
+        .unwrap();
+        assert_eq!(dst, src);
+        assert!(interrupted_once);
+        assert!(max_chunk <= (64 << 10), "max_chunk={max_chunk}");
+        assert!(max_advance <= (64 << 10), "max_advance={max_advance}");
+        assert!(polls.get() > polls_at_eintr);
+
+        // Cancel on the poll immediately after EINTR: must not retry another read.
+        let mut dst2 = vec![0u8; src.len()];
+        let mut calls2 = 0usize;
+        let mut polls2 = 0usize;
+        let eintr_hit = Cell::new(false);
+        let mut saw_retry_after_cancel = false;
+        let mut poll2 = || {
+            polls2 += 1;
+            if eintr_hit.get() {
+                return Err(Error::Cancelled);
+            }
+            Ok(())
+        };
+        let res =
+            read_exact_at_loop_with(&mut dst2, 0, &FnMutControl::new(&mut poll2), |buf, at| {
+                calls2 += 1;
+                if eintr_hit.get() {
+                    saw_retry_after_cancel = true;
+                }
+                if calls2 == 2 {
+                    eintr_hit.set(true);
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                let start = at as usize;
+                buf.copy_from_slice(&src[start..start + buf.len()]);
+                Ok(buf.len())
+            });
+        assert!(matches!(res, Err(Error::Cancelled)));
+        assert!(eintr_hit.get());
+        assert!(!saw_retry_after_cancel);
+        assert_eq!(calls2, 2);
+        assert_eq!(polls2, 3);
+
+        // 2. File-backed `ChangeLog::read_admitted` over a > 256 KiB record.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        store.change_log().unwrap().set_background(false);
+        crate::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ <urn:s> <urn:p> \"{}\" }}",
+                "q".repeat(256 << 10)
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let log = store.change_log().unwrap().clone();
+        let inner = log.inner.lock();
+        let mut total_polls = 0usize;
+        let mut total_admits = 0usize;
+        let mut check_fn = || {
+            total_polls += 1;
+            Ok(())
+        };
+        let rec = log
+            .read_with(
+                &inner,
+                0,
+                SEG_HEADER as u64,
+                &mut |_| {
+                    total_admits += 1;
+                    Ok(())
+                },
+                &FnMutControl::new(&mut check_fn),
+            )
+            .unwrap();
+        assert!(matches!(rec, Record::Changes(_, ref c) if c.len() == 1));
+        assert!(total_polls >= 12, "expected >= 12 polls, got {total_polls}");
+        assert_eq!(total_admits, 3);
+
+        // Cancelling mid-read returns Cancelled (never Corrupt) and stops before decoded admission.
+        for (fail_poll, expected_timeout) in [(2usize, false), (5, false), (7, true)] {
+            let mut n = 0usize;
+            let mut admits = 0usize;
+            let mut cancel_fn = || {
+                n += 1;
+                if n == fail_poll {
+                    Err(if expected_timeout {
+                        Error::Timeout
+                    } else {
+                        Error::Cancelled
+                    })
+                } else {
+                    Ok(())
+                }
+            };
+            let res = log.read_with(
+                &inner,
+                0,
+                SEG_HEADER as u64,
+                &mut |_| {
+                    admits += 1;
+                    Ok(())
+                },
+                &FnMutControl::new(&mut cancel_fn),
+            );
+            if expected_timeout {
+                assert!(matches!(res, Err(Error::Timeout)), "fail_poll={fail_poll}");
+            } else {
+                assert!(
+                    matches!(res, Err(Error::Cancelled)),
+                    "fail_poll={fail_poll}"
+                );
+            }
+            assert!(
+                admits <= 1,
+                "fail_poll={fail_poll}: expected at most frame admission before decode, got {admits}"
+            );
+        }
+    }
+
+    #[test]
+    fn published_history_changes_check_cold_indexes_and_bound_records() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::rc::Rc;
+
+        // 1. Cold sealed index (> 128 KiB): cancel, deadline, and budget refusal before full read.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 4096,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts.clone()).unwrap();
+        store.change_log().unwrap().set_background(false);
+        let mut triples = String::new();
+        use std::fmt::Write as _;
+        for i in 0..8_000 {
+            writeln!(&mut triples, "<urn:idx{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let big_payload = "r".repeat(256 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:target> <urn:p> \"{big_payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let head = store.head_commit().seq;
+        let log = store.change_log().unwrap().clone();
+        let first_idx_len = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs.len() >= 2);
+            assert!(inner.segs[0].sealed);
+            inner.cache.clear();
+            inner.segs[0].idx_path().unwrap().metadata().unwrap().len()
+        };
+        assert!(first_idx_len > (128 << 10));
+
+        for no_wait in [true, false] {
+            // 1a. Mid-read cancellation during cold index load stops before chunk 2 and decode.
+            log.inner.lock().cache.clear();
+            let flag = Arc::new(AtomicBool::new(false));
+            let stop = flag.clone();
+            let progress = Rc::new(Cell::new((0usize, 0usize)));
+            let witness = progress.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                let (mut chunks, mut after) = witness.get();
+                match event {
+                    open_tests::Event::IndexReadChunk => {
+                        if chunks == 0 {
+                            chunks = 1;
+                            stop.store(true, Ordering::Relaxed);
+                        } else {
+                            after += 1;
+                        }
+                    }
+                    open_tests::Event::IndexCrcChunk
+                    | open_tests::Event::IndexRecords
+                    | open_tests::Event::IndexRecord
+                    | open_tests::Event::IndexPosting
+                        if chunks > 0 =>
+                    {
+                        after += 1;
+                    }
+                    _ => {}
+                }
+                witness.set((chunks, after));
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(head)),
+                cancel: Some(flag.clone()),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 16 << 20)
+            } else {
+                store.published_history_changes(&q, 16 << 20)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::Cancelled)),
+                "no_wait={no_wait}: {res:?}"
+            );
+            assert_eq!(progress.get(), (1, 0), "no_wait={no_wait}");
+            assert!(
+                log.inner.lock().cache.is_empty(),
+                "cancelled cold index must not be cached"
+            );
+
+            // 1b. Deadline expiration after the first cold index chunk stops with Timeout.
+            log.inner.lock().cache.clear();
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let expired = Rc::new(Cell::new((0usize, 0usize)));
+            let witness = expired.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                let (mut chunks, mut after) = witness.get();
+                match event {
+                    open_tests::Event::IndexReadChunk => {
+                        if chunks == 0 {
+                            chunks = 1;
+                            while Instant::now() <= deadline {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                        } else {
+                            after += 1;
+                        }
+                    }
+                    open_tests::Event::IndexCrcChunk | open_tests::Event::IndexRecords
+                        if chunks > 0 =>
+                    {
+                        after += 1;
+                    }
+                    _ => {}
+                }
+                witness.set((chunks, after));
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(head)),
+                deadline: Some(deadline),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 16 << 20)
+            } else {
+                store.published_history_changes(&q, 16 << 20)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::Timeout)),
+                "no_wait={no_wait}: {res:?}"
+            );
+            assert_eq!(expired.get(), (1, 0), "no_wait={no_wait}");
+
+            // 1c. Oversized cold index is refused before reading any chunk.
+            log.inner.lock().cache.clear();
+            let attempts = Rc::new(Cell::new(0usize));
+            let witness = attempts.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                if event == open_tests::Event::IndexReadAttempt {
+                    witness.set(witness.get() + 1);
+                }
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(head)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 64 << 10)
+            } else {
+                store.published_history_changes(&q, 64 << 10)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: {res:?}"
+            );
+            assert_eq!(attempts.get(), 0, "no_wait={no_wait}");
+
+            // 2. Oversized matching record (> 256 KiB) is refused before reading when budget is small,
+            //    and succeeds when the budget covers frame + decoded footprint.
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:target"))],
+                from: Some(HistoryBound::Commit(head)),
+                to: Some(HistoryBound::Commit(head)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 64 << 10)
+            } else {
+                store.published_history_changes(&q, 64 << 10)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: {res:?}"
+            );
+
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 16 << 20)
+            } else {
+                store.published_history_changes(&q, 16 << 20)
+            }
+            .unwrap();
+            assert_eq!(res.changes.len(), 1, "no_wait={no_wait}");
+            assert_eq!(res.changes[0].commit.seq, head, "no_wait={no_wait}");
+        }
+    }
+
+    #[test]
+    fn cold_sidecar_capacity_and_overlap_memory_budget() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::rc::Rc;
+
+        // 1. Direct spare-capacity check: b.len() + decoded fits limit, while
+        //    b.capacity() + decoded exceeds limit.
+        let dataset_id = uuid::Uuid::new_v4();
+        let mut synth = SegIndex::default();
+        synth.recs.push(RecEntry {
+            seq: 1,
+            offset: SEG_HEADER as u64,
+            ts: 1,
+            hole: None,
+        });
+        for i in 0..4_000u64 {
+            synth.postings.push((i + 1, 0));
+        }
+        let encoded = synth.encode(dataset_id, 1, 1);
+        let decoded_bytes = arc_slice_bytes(std::mem::size_of::<SegIndex>())
+            + std::mem::size_of::<RecEntry>() as u64
+            + 4_000u64 * std::mem::size_of::<(u64, u32)>() as u64;
+        let mut raw_with_spare = Vec::with_capacity(encoded.len() + (64 << 10));
+        raw_with_spare.extend_from_slice(&encoded);
+        assert!(raw_with_spare.capacity() >= raw_with_spare.len() + (64 << 10));
+        let spare_limit = raw_with_spare.len() as u64 + decoded_bytes + 4096;
+        assert!(
+            raw_with_spare.capacity() as u64 + decoded_bytes > spare_limit,
+            "spare capacity must push total past spare_limit"
+        );
+        let decoded_events = Rc::new(Cell::new(0usize));
+        let witness = decoded_events.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            if event == open_tests::Event::IndexRecords {
+                witness.set(witness.get() + 1);
+            }
+        });
+        let budget = MemoryBudget::new(spare_limit);
+        let _raw_guard = budget.reserve(raw_with_spare.capacity() as u64).unwrap();
+        let res = SegIndex::decode_with(&raw_with_spare, dataset_id, &Unlimited, Some(&budget));
+        drop(observer);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected spare-capacity rejection, got {:?}",
+            res.as_ref().err()
+        );
+        assert_eq!(
+            decoded_events.get(),
+            0,
+            "allocated index records despite capacity overrun"
+        );
+        drop(_raw_guard);
+        assert_eq!(budget.used(), 0);
+
+        let exact_budget = MemoryBudget::new(raw_with_spare.capacity() as u64 + decoded_bytes);
+        let _raw_guard = exact_budget
+            .reserve(raw_with_spare.capacity() as u64)
+            .unwrap();
+        let (_, _, _, decoded_guard) =
+            SegIndex::decode_with(&raw_with_spare, dataset_id, &Unlimited, Some(&exact_budget))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            exact_budget.used(),
+            raw_with_spare.capacity() as u64 + decoded_bytes
+        );
+        drop(_raw_guard);
+        assert_eq!(exact_budget.used(), decoded_bytes);
+        drop(decoded_guard);
+        assert_eq!(exact_budget.used(), 0);
+
+        // 2. End-to-end persistent store:
+        //    - Segment 0 (commit 1): matching ~96 KiB literal for <urn:overlap>
+        //    - Segment 1 (commit 2): 6,000 triples -> cold .idx > 128 KiB
+        //    - Segment 2 (commit 3): second matching ~96 KiB literal for <urn:overlap>
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 4096,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts).unwrap();
+        store.change_log().unwrap().set_background(false);
+
+        let payload_a = "a".repeat(96 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:overlap> <urn:p> \"{payload_a}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c1 = store.head_commit().seq;
+
+        let mut triples = String::new();
+        use std::fmt::Write as _;
+        for i in 0..6_000 {
+            writeln!(&mut triples, "<urn:cap{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c2 = store.head_commit().seq;
+
+        let payload_b = "b".repeat(96 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:overlap> <urn:p> \"{payload_b}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c3 = store.head_commit().seq;
+
+        let log = store.change_log().unwrap().clone();
+        let (seg1_idx_path, seg1_idx_len) = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs.len() >= 3);
+            assert!(inner.segs[1].sealed);
+            inner.cache.clear();
+            let path = inner.segs[1].idx_path().unwrap();
+            let len = path.metadata().unwrap().len();
+            (path, len)
+        };
+        assert!(
+            seg1_idx_len > (128 << 10),
+            "expected cold .idx > 128 KiB (non-power-of-two growth test), got {seg1_idx_len}"
+        );
+
+        // 2a. read_index_checked reserves exact capacity without geometric 2x jump past idx_len.
+        let exact_raw_budget = MemoryBudget::new(seg1_idx_len);
+        let mut noop = || Ok(());
+        let (raw_bytes, raw_guard) = ChangeLog::read_index_with(
+            &seg1_idx_path,
+            &FnMutControl::new(&mut noop),
+            Some(&exact_raw_budget),
+        )
+        .unwrap();
+        assert_eq!(raw_bytes.len() as u64, seg1_idx_len);
+        assert!(raw_bytes.capacity() as u64 <= seg1_idx_len);
+        let seg1_decoded_bytes = {
+            let (_, _, ix) = SegIndex::decode(&raw_bytes, log.dataset_id).unwrap();
+            arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                + (ix.recs.len() as u64) * (std::mem::size_of::<RecEntry>() as u64)
+                + (ix.postings.len() as u64) * (std::mem::size_of::<(u64, u32)>() as u64)
+        };
+        drop(raw_bytes);
+        drop(raw_guard);
+        assert_eq!(exact_raw_budget.used(), 0);
+
+        // 2b. Cold sidecar whose file length fits limit, while raw capacity + decoded exceeds limit.
+        let len_only_limit = seg1_idx_len + 16_384;
+        assert!(seg1_idx_len + seg1_decoded_bytes > len_only_limit);
+        for no_wait in [true, false] {
+            log.inner.lock().cache.clear();
+            let stats = Rc::new(Cell::new((0usize, 0usize)));
+            let witness = stats.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                let (mut chunks, mut decodes) = witness.get();
+                match event {
+                    open_tests::Event::IndexReadChunk => chunks += 1,
+                    open_tests::Event::IndexRecords => decodes += 1,
+                    _ => {}
+                }
+                witness.set((chunks, decodes));
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(c2)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, len_only_limit)
+            } else {
+                store.published_history_changes(&q, len_only_limit)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: {res:?}"
+            );
+            let (chunks, decodes) = stats.get();
+            assert!(
+                chunks > 0,
+                "no_wait={no_wait}: file length fit limit so raw read should proceed"
+            );
+            assert_eq!(
+                decodes, 0,
+                "no_wait={no_wait}: decoded index must be rejected before allocating entries"
+            );
+            assert!(log.inner.lock().cache.is_empty());
+        }
+
+        // 2c. Live overlap between accumulated results (commit 1) and cold index load (commit 2).
+        let overlap_idx_limit = seg1_idx_len + seg1_decoded_bytes + (32 << 10);
+        for no_wait in [true, false] {
+            // Segment 1 alone fits overlap_idx_limit.
+            log.inner.lock().cache.clear();
+            let q_only_c2 = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                from: Some(HistoryBound::Commit(c2)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let solo = if no_wait {
+                store.try_published_history_changes(&q_only_c2, overlap_idx_limit)
+            } else {
+                store.published_history_changes(&q_only_c2, overlap_idx_limit)
+            }
+            .unwrap();
+            assert!(solo.changes.is_empty());
+
+            // Segment 0 (~96 KiB result) + cold Segment 1 index exceeds overlap_idx_limit.
+            log.inner.lock().cache.clear();
+            let q_c1_c2 = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q_c1_c2, overlap_idx_limit)
+            } else {
+                store.published_history_changes(&q_c1_c2, overlap_idx_limit)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: expected accumulated-result + cold-index overlap refusal, got {res:?}"
+            );
+        }
+
+        // 2d. Live overlap between accumulated results (commit 1) and record read (commit 3)
+        //     with warm indexes so no cold index load intervenes.
+        //     Single commit peak is ~201 KiB (frame + decoded or decoded + result);
+        //     overlapping commit 1 result (~96 KiB) with commit 3 read (~193 KiB) peaks near 297 KiB.
+        let single_record_limit = 240 << 10;
+        for no_wait in [true, false] {
+            // Warm all segment indexes via an unbounded scan first.
+            let warm_q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c3)),
+                ..Default::default()
+            };
+            store.history_changes(&warm_q).unwrap();
+
+            // Commit 1 alone and commit 3 alone each fit single_record_limit.
+            for seq in [c1, c3] {
+                let q_one = HistoryQuery {
+                    subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                    from: Some(HistoryBound::Commit(seq)),
+                    to: Some(HistoryBound::Commit(seq)),
+                    ..Default::default()
+                };
+                let ok = if no_wait {
+                    store.try_published_history_changes(&q_one, single_record_limit)
+                } else {
+                    store.published_history_changes(&q_one, single_record_limit)
+                }
+                .unwrap();
+                assert_eq!(ok.changes.len(), 1);
+            }
+
+            // Combined commit 1..=3 overflows when commit 1's live results overlap commit 3's read.
+            let q_both = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c3)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q_both, single_record_limit)
+            } else {
+                store.published_history_changes(&q_both, single_record_limit)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: expected accumulated-result + record overlap refusal, got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warm_segment_candidate_traversal_short_circuits_and_polls() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+
+        let store = Store::in_memory(StoreOptions {
+            change_log_segment_bytes: 64 << 20,
+            ..Default::default()
+        });
+        let log = store.change_log().unwrap().clone();
+        log.set_background(false);
+
+        // Populate one warm/live segment directly so we get > CHECK_STRIDE commits quickly:
+        // - 1,200 commits with rdf:type
+        // - 1,100 commits with <urn:sparse> and <urn:other> (none with rdf:type)
+        // - 1 commit with <urn:hit> and rdf:type
+        let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+        let hold_sets = NamedNode::new_unchecked("urn:x-sparkles:evidence:sourceHoldSets");
+        let other_pred = NamedNode::new_unchecked("urn:other");
+        let rdf_type_key: Arc<[u8]> = Arc::from(id::iri_key(rdf_type.as_str()));
+        let other_pred_key: Arc<[u8]> = Arc::from(id::iri_key(other_pred.as_str()));
+        let sparse_key: Arc<[u8]> = Arc::from(id::iri_key("urn:sparse"));
+        let hit_key: Arc<[u8]> = Arc::from(id::iri_key("urn:hit"));
+        let thing_key: Arc<[u8]> = Arc::from(id::iri_key("urn:Thing"));
+        let default_g: Arc<[u8]> = Arc::from(&[][..]);
+
+        let make_commit = |seq: u64| {
+            Arc::new(ChangeCommit {
+                seq,
+                timestamp_ms: seq as i64,
+                kind: CommitKind::Update,
+                bulk: false,
+                inserted: 1,
+                deleted: 0,
+                author: None,
+                message: None,
+            })
+        };
+
+        let mut seq = 0u64;
+        {
+            let mut inner = log.inner.lock();
+            for i in 0..1_200u64 {
+                seq += 1;
+                let s: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:noise:{i}")));
+                let q: QuadKey = [
+                    default_g.clone(),
+                    s,
+                    rdf_type_key.clone(),
+                    thing_key.clone(),
+                ];
+                log.append(
+                    &mut inner,
+                    Record::Changes(make_commit(seq), vec![(true, q)]),
+                )
+                .unwrap();
+            }
+            for i in 0..1_100u64 {
+                seq += 1;
+                let o: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:val:{i}")));
+                let q: QuadKey = [
+                    default_g.clone(),
+                    sparse_key.clone(),
+                    other_pred_key.clone(),
+                    o,
+                ];
+                log.append(
+                    &mut inner,
+                    Record::Changes(make_commit(seq), vec![(true, q)]),
+                )
+                .unwrap();
+            }
+            seq += 1;
+            let hit_q: QuadKey = [
+                default_g.clone(),
+                hit_key.clone(),
+                rdf_type_key.clone(),
+                thing_key.clone(),
+            ];
+            log.append(
+                &mut inner,
+                Record::Changes(make_commit(seq), vec![(true, hit_q)]),
+            )
+            .unwrap();
+            assert_eq!(inner.segs.len(), 1);
+            assert!(inner.segs[0].index.is_some());
+        }
+        let hit_seq = seq;
+
+        // 1. Missing subject with frequent rdf:type short-circuits with tiny max_bytes
+        //    (far below the ~4,800 bytes copying 1,200 rdf:type postings would require).
+        for descending in [false, true] {
+            let filter = LogFilter {
+                keys: [
+                    None,
+                    Some(vec![id::iri_key("urn:missing")]),
+                    Some(vec![
+                        id::iri_key(rdf_type.as_str()),
+                        id::iri_key(hold_sets.as_str()),
+                    ]),
+                    None,
+                ],
+            };
+            let budget = MemoryBudget::new(256);
+            let mut visited = 0usize;
+            let holes = log
+                .scan(
+                    1,
+                    hit_seq,
+                    &filter,
+                    descending,
+                    true,
+                    true,
+                    Some(&budget),
+                    &mut || Ok(()),
+                    None,
+                    &mut |_, _, _| {
+                        visited += 1;
+                        Ok(true)
+                    },
+                )
+                .unwrap();
+            assert!(holes.is_empty());
+            assert_eq!(visited, 0);
+            assert_eq!(budget.used(), 0);
+        }
+
+        // 2. Sparse matching subject with frequent rdf:type drives from the subject role
+        //    without copying rdf:type's 1,200 postings.
+        for descending in [false, true] {
+            let filter = LogFilter {
+                keys: [
+                    None,
+                    Some(vec![id::iri_key("urn:hit")]),
+                    Some(vec![
+                        id::iri_key(rdf_type.as_str()),
+                        id::iri_key(hold_sets.as_str()),
+                    ]),
+                    None,
+                ],
+            };
+            let budget = MemoryBudget::new(2048);
+            let mut found = Vec::new();
+            log.scan(
+                1,
+                hit_seq,
+                &filter,
+                descending,
+                true,
+                true,
+                Some(&budget),
+                &mut || Ok(()),
+                None,
+                &mut |c, _, _| {
+                    found.push(c.seq);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(found, [hit_seq]);
+            assert_eq!(budget.used(), 0);
+        }
+
+        // 3. Multi-run merge across two predicates matches unfiltered order both ways.
+        for descending in [false, true] {
+            let filter = LogFilter {
+                keys: [
+                    None,
+                    None,
+                    Some(vec![
+                        id::iri_key(rdf_type.as_str()),
+                        id::iri_key(other_pred.as_str()),
+                    ]),
+                    None,
+                ],
+            };
+            let mut merged = Vec::new();
+            log.scan(
+                1_195,
+                1_210,
+                &filter,
+                descending,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || Ok(()),
+                None,
+                &mut |c, _, _| {
+                    merged.push(c.seq);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            let mut expected: Vec<u64> = (1_195..=1_210).collect();
+            if descending {
+                expected.reverse();
+            }
+            assert_eq!(merged, expected, "descending={descending}");
+        }
+
+        // 4. Cooperative polling inside candidate traversal stops at CHECK_STRIDE
+        //    even when no record matches. Key cancellation to the 2nd CandidateCheck
+        //    event (cand_steps == CHECK_STRIDE) rather than a raw poll counter.
+        let filter = LogFilter {
+            keys: [
+                None,
+                Some(vec![id::iri_key("urn:sparse")]),
+                Some(vec![
+                    id::iri_key(rdf_type.as_str()),
+                    id::iri_key(hold_sets.as_str()),
+                ]),
+                None,
+            ],
+        };
+        let candidate_checks = std::rc::Rc::new(Cell::new(0usize));
+        let witness = candidate_checks.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            if event == open_tests::Event::CandidateCheck {
+                witness.set(witness.get() + 1);
+            }
+        });
+        #[cfg(feature = "failpoints")]
+        let (fp_candidate_checks, _fp_reset) = {
+            use std::sync::atomic::AtomicUsize;
+            struct ResetObserver;
+            impl Drop for ResetObserver {
+                fn drop(&mut self) {
+                    set_changelog_read_observer(None);
+                }
+            }
+            let counts = Arc::new(AtomicUsize::new(0));
+            let c = counts.clone();
+            set_changelog_read_observer(Some(Arc::new(move |event| {
+                if event == ChangeLogReadEvent::CandidateCheck {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            })));
+            (counts, ResetObserver)
+        };
+        let mut visited = 0usize;
+        let res = log.scan(
+            1,
+            hit_seq,
+            &filter,
+            false,
+            true,
+            true,
+            Some(&MemoryBudget::new(4096)),
+            &mut || {
+                if candidate_checks.get() >= 2 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            None,
+            &mut |_, _, _| {
+                visited += 1;
+                Ok(true)
+            },
+        );
+        drop(observer);
+        #[cfg(feature = "failpoints")]
+        drop(_fp_reset);
+        assert!(matches!(res, Err(Error::Cancelled)), "{res:?}");
+        assert_eq!(
+            candidate_checks.get(),
+            2,
+            "expected cancellation on the 2nd CandidateCheck (cand_steps == CHECK_STRIDE)"
+        );
+        #[cfg(feature = "failpoints")]
+        assert_eq!(
+            fp_candidate_checks.load(Ordering::SeqCst),
+            2,
+            "expected failpoints CandidateCheck observer to observe the 2nd traversal stride"
+        );
+        assert_eq!(visited, 0);
+
+        // Also exercise published_history_changes against the real HistoryQuery wrapper.
+        let q = HistoryQuery {
+            subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+            predicates: vec![rdf_type, hold_sets],
+            from: Some(HistoryBound::Commit(1)),
+            to: Some(HistoryBound::Commit(hit_seq)),
+            ..Default::default()
+        };
+        let res = log.query_with(&q, hit_seq, true, Some(256)).unwrap();
+        assert!(res.changes.is_empty());
+    }
+
+    #[test]
+    fn cold_index_and_record_overlap_memory_budget() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::fmt::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 768 << 10,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts).unwrap();
+        store.change_log().unwrap().set_background(false);
+
+        let mut triples = String::new();
+        for i in 0..6_000 {
+            writeln!(&mut triples, "<urn:pad{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c1 = store.head_commit().seq;
+
+        let payload = "x".repeat(160 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:coldhit> <urn:p> \"{payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c2 = store.head_commit().seq;
+
+        let seal_payload = "s".repeat(512 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:seal> <urn:p> \"{seal_payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+
+        let log = store.change_log().unwrap().clone();
+        let (seg0_idx_path, seg0_idx_len) = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs[0].sealed, "segment 0 must be sealed");
+            assert!(
+                inner.segs[0].first <= c1 && inner.segs[0].last >= c2,
+                "c1={c1} and c2={c2} must share sealed segment 0 ({}..={})",
+                inner.segs[0].first,
+                inner.segs[0].last
+            );
+            inner.cache.clear();
+            let path = inner.segs[0].idx_path().unwrap();
+            let len = path.metadata().unwrap().len();
+            (path, len)
+        };
+        let raw_bytes = std::fs::read(&seg0_idx_path).unwrap();
+        let seg0_decoded_bytes = {
+            let (_, _, ix) = SegIndex::decode(&raw_bytes, log.dataset_id).unwrap();
+            arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                + (ix.recs.len() as u64) * (std::mem::size_of::<RecEntry>() as u64)
+                + (ix.postings.len() as u64) * (std::mem::size_of::<(u64, u32)>() as u64)
+        };
+        let limit = (seg0_idx_len + seg0_decoded_bytes).max(360 << 10) + (24 << 10);
+        assert!(
+            seg0_decoded_bytes + (320 << 10) > limit,
+            "decoded index ({seg0_decoded_bytes}) + record peak (~320 KiB) must exceed limit ({limit})"
+        );
+
+        for no_wait in [true, false] {
+            // 1. Cold index decode alone fits limit, and bounded scans leave the shared cache empty.
+            log.inner.lock().cache.clear();
+            let q_missing = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let ok = if no_wait {
+                store.try_published_history_changes(&q_missing, limit)
+            } else {
+                store.published_history_changes(&q_missing, limit)
+            }
+            .unwrap();
+            assert!(ok.changes.is_empty(), "no_wait={no_wait}");
+            assert!(
+                log.inner.lock().cache.is_empty(),
+                "no_wait={no_wait}: bounded cold scan must not insert decoded index into shared cache"
+            );
+
+            // 2. Matching record alone (with warm index loaded by an unbounded scan) fits limit.
+            store.history_changes(&q_missing).unwrap();
+            assert!(!log.inner.lock().cache.is_empty());
+            let q_hit = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:coldhit"))],
+                from: Some(HistoryBound::Commit(c2)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let ok = if no_wait {
+                store.try_published_history_changes(&q_hit, limit)
+            } else {
+                store.published_history_changes(&q_hit, limit)
+            }
+            .unwrap();
+            assert_eq!(ok.changes.len(), 1, "no_wait={no_wait}");
+
+            // 3. Cold index + matching record live overlap exceeds limit and is refused.
+            log.inner.lock().cache.clear();
+            let res = if no_wait {
+                store.try_published_history_changes(&q_hit, limit)
+            } else {
+                store.published_history_changes(&q_hit, limit)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: expected cold index + record live overlap refusal, got {res:?}"
+            );
+            assert!(
+                log.inner.lock().cache.is_empty(),
+                "no_wait={no_wait}: failed bounded cold scan must leave shared cache empty"
+            );
+        }
+    }
+
+    #[test]
+    fn time_bound_cold_sidecar_memory_budget() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::fmt::Write as _;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 768 << 10,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts).unwrap();
+        store.change_log().unwrap().set_background(false);
+
+        let mut triples = String::new();
+        for i in 0..6_000 {
+            writeln!(&mut triples, "<urn:pad{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c1 = store.head_commit().seq;
+
+        let payload = "x".repeat(160 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:coldhit> <urn:p> \"{payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c2_commit = store.head_commit();
+        let c2 = c2_commit.seq;
+        let c2_ts = c2_commit.timestamp_ms;
+
+        let seal_payload = "s".repeat(512 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:seal> <urn:p> \"{seal_payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+
+        let log = store.change_log().unwrap().clone();
+        let (seg0_idx_path, seg0_idx_len) = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs[0].sealed, "segment 0 must be sealed");
+            assert!(
+                inner.segs[0].first <= c1 && inner.segs[0].last >= c2,
+                "c1={c1} and c2={c2} must share sealed segment 0 ({}..={})",
+                inner.segs[0].first,
+                inner.segs[0].last
+            );
+            inner.cache.clear();
+            let path = inner.segs[0].idx_path().unwrap();
+            let len = path.metadata().unwrap().len();
+            (path, len)
+        };
+        let raw_bytes = std::fs::read(&seg0_idx_path).unwrap();
+        let seg0_decoded_bytes = {
+            let (_, _, ix) = SegIndex::decode(&raw_bytes, log.dataset_id).unwrap();
+            arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                + (ix.recs.len() as u64) * (std::mem::size_of::<RecEntry>() as u64)
+                + (ix.postings.len() as u64) * (std::mem::size_of::<(u64, u32)>() as u64)
+        };
+
+        let q_missing = HistoryQuery {
+            subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+            from: Some(HistoryBound::Time(c2_ts)),
+            to: Some(HistoryBound::Time(c2_ts)),
+            ..Default::default()
+        };
+        let q_hit = HistoryQuery {
+            subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:coldhit"))],
+            from: Some(HistoryBound::Time(c2_ts)),
+            to: Some(HistoryBound::Time(c2_ts)),
+            ..Default::default()
+        };
+
+        // 1. Cap smaller than the cold sidecar refuses before reading raw chunks and leaves cache empty.
+        let tiny_limit = seg0_idx_len / 2;
+        log.inner.lock().cache.clear();
+        let stats = Rc::new(Cell::new((0usize, 0usize)));
+        let witness = stats.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            let (mut chunks, mut decodes) = witness.get();
+            match event {
+                open_tests::Event::IndexReadChunk => chunks += 1,
+                open_tests::Event::IndexRecords => decodes += 1,
+                _ => {}
+            }
+            witness.set((chunks, decodes));
+        });
+        let res = store.published_history_changes(&q_missing, tiny_limit);
+        drop(observer);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected cold sidecar refusal under tiny time-bound cap, got {res:?}"
+        );
+        assert_eq!(
+            stats.get(),
+            (0, 0),
+            "sidecar larger than cap must fail before reading chunks or decoding"
+        );
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "refused time-bound lookup must leave shared cache empty"
+        );
+
+        // 2. Cap fitting raw sidecar length but not raw + decoded refuses before decoding and leaves cache empty.
+        let len_only_limit = seg0_idx_len + 16_384;
+        assert!(seg0_idx_len + seg0_decoded_bytes > len_only_limit);
+        log.inner.lock().cache.clear();
+        let stats = Rc::new(Cell::new((0usize, 0usize)));
+        let witness = stats.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            let (mut chunks, mut decodes) = witness.get();
+            match event {
+                open_tests::Event::IndexReadChunk => chunks += 1,
+                open_tests::Event::IndexRecords => decodes += 1,
+                _ => {}
+            }
+            witness.set((chunks, decodes));
+        });
+        let res = store.published_history_changes(&q_missing, len_only_limit);
+        drop(observer);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected raw + decoded refusal under time-bound cap, got {res:?}"
+        );
+        let (chunks, decodes) = stats.get();
+        assert!(chunks > 0, "file length fit cap so raw read should proceed");
+        assert_eq!(
+            decodes, 0,
+            "decoded index must be refused before allocating entries"
+        );
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "refused time-bound decode must leave shared cache empty"
+        );
+
+        // 3. Cap fitting cold index succeeds for missing subject while leaving shared cache empty.
+        let limit = (seg0_idx_len + seg0_decoded_bytes).max(360 << 10) + (24 << 10);
+        assert!(
+            seg0_decoded_bytes + (320 << 10) > limit,
+            "decoded index ({seg0_decoded_bytes}) + record peak (~320 KiB) must exceed limit ({limit})"
+        );
+        log.inner.lock().cache.clear();
+        let ok = store.published_history_changes(&q_missing, limit).unwrap();
+        assert!(ok.changes.is_empty());
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "budgeted time-bound lookup and scan must leave shared cache empty"
+        );
+
+        // 4. Cold index + matching record overlap is still refused under time bounds because
+        //    timestamp resolution did not populate the shared cache.
+        log.inner.lock().cache.clear();
+        let res = store.published_history_changes(&q_hit, limit);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected cold index + record overlap refusal under time bounds, got {res:?}"
+        );
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "failed time-bound overlap scan must leave shared cache empty"
+        );
+
+        // 5. Once warmed by an unbounded scan, the same time-bound query fits `limit`.
+        store.history_changes(&q_missing).unwrap();
+        assert!(!log.inner.lock().cache.is_empty());
+        let ok = store.published_history_changes(&q_hit, limit).unwrap();
+        assert_eq!(ok.changes.len(), 1);
+    }
+
+    #[test]
+    fn hole_normalization_polls_and_checks_before_return() {
+        let store = Store::in_memory(StoreOptions {
+            change_log_segment_bytes: 64 << 20,
+            ..Default::default()
+        });
+        let log = store.change_log().unwrap().clone();
+        log.set_background(false);
+
+        let default_g: Arc<[u8]> = Arc::from(&[][..]);
+        let pred_key: Arc<[u8]> = Arc::from(id::iri_key("urn:p"));
+        let val_key: Arc<[u8]> = Arc::from(id::iri_key("urn:v"));
+
+        // 5,000 alternating Changes/Summary commits -> 2,500 non-adjacent Bulk holes
+        // (1,250 swaps in descending reverse, exceeding CHECK_STRIDE = 1,024),
+        // followed by two adjacent Bulk commits and a trailing Gap commit.
+        let mut seq = 0u64;
+        {
+            let mut inner = log.inner.lock();
+            for i in 0..2_500u64 {
+                seq += 1;
+                let s: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:s:{i}")));
+                let q: QuadKey = [default_g.clone(), s, pred_key.clone(), val_key.clone()];
+                let c = Arc::new(ChangeCommit {
+                    seq,
+                    timestamp_ms: seq as i64,
+                    kind: CommitKind::Update,
+                    bulk: false,
+                    inserted: 1,
+                    deleted: 0,
+                    author: None,
+                    message: None,
+                });
+                log.append(&mut inner, Record::Changes(c, vec![(true, q)]))
+                    .unwrap();
+                seq += 1;
+                let summary = Arc::new(ChangeCommit {
+                    seq,
+                    timestamp_ms: seq as i64,
+                    kind: CommitKind::Update,
+                    bulk: true,
+                    inserted: 1,
+                    deleted: 0,
+                    author: None,
+                    message: None,
+                });
+                log.append(&mut inner, Record::Summary(summary)).unwrap();
+            }
+            // Adjacent bulk summary merges with seq 5,000.
+            seq += 1;
+            let adjacent_bulk = Arc::new(ChangeCommit {
+                seq,
+                timestamp_ms: seq as i64,
+                kind: CommitKind::Update,
+                bulk: true,
+                inserted: 1,
+                deleted: 0,
+                author: None,
+                message: None,
+            });
+            log.append(&mut inner, Record::Summary(adjacent_bulk))
+                .unwrap();
+            // Trailing gap record merges with to > newest gap.
+            let gap_from = seq + 1;
+            seq += 3;
+            log.append(
+                &mut inner,
+                Record::Gap {
+                    from: gap_from,
+                    through: seq,
+                },
+            )
+            .unwrap();
+        }
+        let head = seq;
+        let filter = LogFilter {
+            keys: [None, Some(vec![id::iri_key("urn:missing")]), None, None],
+        };
+
+        // 1. Ascending and descending produce identical normalized holes including merges.
+        let asc = log
+            .scan(
+                1,
+                head + 5,
+                &filter,
+                false,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || Ok(()),
+                None,
+                &mut |_, _, _| Ok(true),
+            )
+            .unwrap();
+        let desc = log
+            .scan(
+                1,
+                head + 5,
+                &filter,
+                true,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || Ok(()),
+                None,
+                &mut |_, _, _| Ok(true),
+            )
+            .unwrap();
+        assert_eq!(asc, desc);
+        assert_eq!(asc.len(), 2_501);
+        assert_eq!(
+            asc[2_499],
+            Unrecorded {
+                from: 5_000,
+                to: 5_001,
+                reason: UnrecordedReason::Bulk,
+            }
+        );
+        assert_eq!(
+            asc[2_500],
+            Unrecorded {
+                from: 5_002,
+                to: head + 5,
+                reason: UnrecordedReason::Gap,
+            }
+        );
+
+        // 2. Cancellation and deadline expiration right after hole collection completes
+        //    must stop before returning from scan (both ascending and descending).
+        for descending in [false, true] {
+            for use_deadline in [false, true] {
+                let mut polls = 0usize;
+                let mut armed = false;
+                let mut deadline: Option<Instant> = None;
+                let res = log.scan(
+                    1,
+                    head,
+                    &filter,
+                    descending,
+                    true,
+                    true,
+                    Some(&MemoryBudget::new(1 << 20)),
+                    &mut || {
+                        polls += 1;
+                        if let Some(limit) = deadline {
+                            if Instant::now() >= limit {
+                                return Err(Error::Timeout);
+                            }
+                        } else if armed {
+                            return Err(Error::Cancelled);
+                        }
+                        // Polls: 1=entry, 2=post-lock, 3=seg, 4..7=hole@1024..4096, 8=role0.
+                        // Trigger stop right after hole collection finishes on role0.
+                        if polls == 8 {
+                            if use_deadline {
+                                let d = Instant::now() + Duration::from_millis(2);
+                                while Instant::now() < d {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                deadline = Some(d);
+                            } else {
+                                armed = true;
+                            }
+                        }
+                        Ok(())
+                    },
+                    None,
+                    &mut |_, _, _| Ok(true),
+                );
+                if use_deadline {
+                    assert!(
+                        matches!(res, Err(Error::Timeout)),
+                        "descending={descending}: expected Timeout before return, got {res:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(res, Err(Error::Cancelled)),
+                        "descending={descending}: expected Cancelled before return, got {res:?}"
+                    );
+                }
+            }
+        }
+
+        // 3. End-to-end scan poll accounting distinguishes reverse stride and final pre-return checks.
+        //    Ascending polls: 1..8 up to role0, 9=finish entry, 10=finish final.
+        //    Descending polls: 1..8 up to role0, 9=finish entry, 10=reverse@CHECK_STRIDE, 11=finish final.
+        let mut asc_total_polls = 0usize;
+        log.scan(
+            1,
+            head,
+            &filter,
+            false,
+            true,
+            true,
+            Some(&MemoryBudget::new(1 << 20)),
+            &mut || {
+                asc_total_polls += 1;
+                Ok(())
+            },
+            None,
+            &mut |_, _, _| Ok(true),
+        )
+        .unwrap();
+        let mut desc_total_polls = 0usize;
+        log.scan(
+            1,
+            head,
+            &filter,
+            true,
+            true,
+            true,
+            Some(&MemoryBudget::new(1 << 20)),
+            &mut || {
+                desc_total_polls += 1;
+                Ok(())
+            },
+            None,
+            &mut |_, _, _| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(asc_total_polls, 10);
+        assert_eq!(desc_total_polls, 11);
+
+        // Letting entry and reverse stride checks pass still cancels on the final pre-return check.
+        for (descending, stop_at) in [
+            (false, asc_total_polls),
+            (true, desc_total_polls - 1),
+            (true, desc_total_polls),
+        ] {
+            let mut polls = 0usize;
+            let res = log.scan(
+                1,
+                head,
+                &filter,
+                descending,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || {
+                    polls += 1;
+                    if polls >= stop_at {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                None,
+                &mut |_, _, _| Ok(true),
+            );
+            assert!(
+                matches!(res, Err(Error::Cancelled)),
+                "descending={descending} stop_at={stop_at}: {res:?}"
+            );
+            assert_eq!(polls, stop_at);
+        }
+
+        // 4. Directly exercise `reverse_holes_checked` with >1 stride of work (2 stride polls)
+        //    and ordered `HoleCollector::finish` entry, mid-reverse, and final pre-return checks.
+        let rev_len = 2 * (2 * CHECK_STRIDE + 50);
+        let desc_holes: Vec<Unrecorded> = (0..rev_len as u64)
+            .rev()
+            .map(|idx| Unrecorded {
+                from: idx * 2 + 1,
+                to: idx * 2 + 1,
+                reason: UnrecordedReason::Bulk,
+            })
+            .collect();
+        let asc_holes: Vec<Unrecorded> = desc_holes.iter().copied().rev().collect();
+
+        let mut rev_ok = desc_holes.clone();
+        let mut rev_polls = 0usize;
+        reverse_holes_checked(&mut rev_ok, true, &mut || {
+            rev_polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rev_ok, asc_holes);
+        assert_eq!(
+            rev_polls, 2,
+            "expected two reverse stride polls for {rev_len} holes"
+        );
+
+        for (stop_poll, checked_idx) in [(1usize, CHECK_STRIDE), (2usize, 2 * CHECK_STRIDE)] {
+            let mut partial = desc_holes.clone();
+            let mut polls = 0usize;
+            let err = reverse_holes_checked(&mut partial, true, &mut || {
+                polls += 1;
+                if polls >= stop_poll {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(err, Err(Error::Cancelled)), "{err:?}");
+            assert_eq!(polls, stop_poll);
+            assert_eq!(
+                partial[checked_idx - 1],
+                asc_holes[checked_idx - 1],
+                "swaps before poll {stop_poll} must have run"
+            );
+            assert_eq!(
+                partial[checked_idx], desc_holes[checked_idx],
+                "cancellation at poll {stop_poll} must stop before swap {checked_idx}"
+            );
+        }
+
+        let mut desc_collector = HoleCollector::new(None, true);
+        for &h in &desc_holes {
+            desc_collector.push(h).unwrap();
+        }
+        assert!(desc_collector.ordered);
+        let mut desc_finish_polls = 0usize;
+        let desc_got = desc_collector
+            .finish(true, &mut || {
+                desc_finish_polls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(desc_got, asc_holes);
+        assert_eq!(
+            desc_finish_polls,
+            1 + rev_polls + 1,
+            "ordered descending finish must poll entry + reverse strides + final"
+        );
+
+        for stop_at in [1usize, 2, 3, desc_finish_polls] {
+            let mut c = HoleCollector::new(None, true);
+            for &h in &desc_holes {
+                c.push(h).unwrap();
+            }
+            let mut polls = 0usize;
+            let err = c.finish(true, &mut || {
+                polls += 1;
+                if polls >= stop_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(err, Err(Error::Cancelled)),
+                "descending finish stop_at={stop_at}: {err:?}"
+            );
+            assert_eq!(polls, stop_at);
+        }
+
+        let mut asc_collector = HoleCollector::new(None, false);
+        for &h in &asc_holes {
+            asc_collector.push(h).unwrap();
+        }
+        assert!(asc_collector.ordered);
+        let mut asc_finish_polls = 0usize;
+        let asc_got = asc_collector
+            .finish(true, &mut || {
+                asc_finish_polls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(asc_got, asc_holes);
+        assert_eq!(
+            asc_finish_polls, 2,
+            "ordered ascending finish must poll entry and final pre-return checks"
+        );
+        for stop_at in [1usize, 2] {
+            let mut c = HoleCollector::new(None, false);
+            for &h in &asc_holes {
+                c.push(h).unwrap();
+            }
+            let mut polls = 0usize;
+            let err = c.finish(true, &mut || {
+                polls += 1;
+                if polls >= stop_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(err, Err(Error::Cancelled)),
+                "ascending finish stop_at={stop_at}: {err:?}"
+            );
+            assert_eq!(polls, stop_at);
+        }
+
+        // 5. Directly exercise `sort_holes_checked` and `dedup_holes_checked` with >1 stride of work,
+        //    and verify unordered `HoleCollector::finish` polls entry + sort + dedup + final.
+        let mut raw = Vec::new();
+        for i in (0..2_500u64).rev() {
+            raw.push(Unrecorded {
+                from: i * 3 + 1,
+                to: i * 3 + 1,
+                reason: UnrecordedReason::Bulk,
+            });
+            if i % 5 == 0 {
+                raw.push(Unrecorded {
+                    from: i * 3 + 2,
+                    to: i * 3 + 2,
+                    reason: UnrecordedReason::Bulk,
+                });
+            }
+        }
+        assert_eq!(raw.len(), 3_000);
+        let mut expected_sorted = raw.clone();
+        expected_sorted.sort_unstable_by_key(|h| (h.from, h.reason as u8, h.to));
+        let mut expected = expected_sorted.clone();
+        expected.dedup_by(|b, a| {
+            if a.reason == b.reason && b.from <= a.to + 1 {
+                a.to = a.to.max(b.to);
+                true
+            } else {
+                false
+            }
+        });
+
+        let mut sorted = raw.clone();
+        let mut sort_polls = 0usize;
+        sort_holes_checked(&mut sorted, true, &mut || {
+            sort_polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sorted, expected_sorted);
+        assert!(
+            sort_polls > 1,
+            "expected >1 heapsort stride poll, got {sort_polls}"
+        );
+        let mut sort_cancel_buf = raw.clone();
+        let mut sort_cancel_polls = 0usize;
+        let sort_err = sort_holes_checked(&mut sort_cancel_buf, true, &mut || {
+            sort_cancel_polls += 1;
+            if sort_cancel_polls >= 2 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(sort_err, Err(Error::Cancelled)), "{sort_err:?}");
+        assert_eq!(sort_cancel_polls, 2);
+
+        let mut deduped = expected_sorted.clone();
+        let mut dedup_polls = 0usize;
+        dedup_holes_checked(&mut deduped, true, &mut || {
+            dedup_polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(deduped, expected);
+        assert_eq!(
+            dedup_polls,
+            2,
+            "expected two dedup stride polls for {} sorted holes",
+            expected_sorted.len()
+        );
+        for stop_poll in [1usize, 2] {
+            let mut partial = expected_sorted.clone();
+            let mut polls = 0usize;
+            let err = dedup_holes_checked(&mut partial, true, &mut || {
+                polls += 1;
+                if polls >= stop_poll {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(err, Err(Error::Cancelled)), "{err:?}");
+            assert_eq!(polls, stop_poll);
+            assert_eq!(
+                partial.len(),
+                expected_sorted.len(),
+                "mid-dedup cancellation at poll {stop_poll} must stop before truncate"
+            );
+        }
+
+        let mut collector = HoleCollector::new(None, false);
+        for &h in &raw {
+            collector.push(h).unwrap();
+        }
+        assert!(!collector.ordered);
+        let mut norm_polls = 0usize;
+        let got = collector
+            .finish(true, &mut || {
+                norm_polls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(
+            norm_polls,
+            1 + sort_polls + dedup_polls + 1,
+            "unordered finish must poll entry + sort strides + dedup strides + final"
+        );
+
+        for stop_at in [
+            1usize,
+            1 + 2,
+            1 + sort_polls + 1,
+            1 + sort_polls + dedup_polls,
+            norm_polls,
+        ] {
+            let mut cancel_collector = HoleCollector::new(None, false);
+            for &h in &raw {
+                cancel_collector.push(h).unwrap();
+            }
+            let mut cancel_polls = 0usize;
+            let cancelled = cancel_collector.finish(true, &mut || {
+                cancel_polls += 1;
+                if cancel_polls >= stop_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(cancelled, Err(Error::Cancelled)),
+                "unordered finish stop_at={stop_at}: {cancelled:?}"
+            );
+            assert_eq!(cancel_polls, stop_at);
+        }
+    }
+
+    #[test]
+    fn unified_changelog_decoder_and_settings_parity_across_controls() {
+        use crate::history::{HistoryOptions, ReadLimit};
+        use crate::store::cold::ColdBudget;
+        use std::sync::atomic::AtomicBool;
+
+        // 1. Settings parity between Unlimited and ColdBudget, plus tight-budget refusal
+        //    and uncapped cancellation/timeout enforcement.
+        let dir = tempfile::tempdir().unwrap();
+        let wanted = ChangeLogSettings {
+            enabled: Some(true),
+            keep_commits: Some(42),
+            keep_age_ms: Some(60_000),
+            max_bytes: Some(8 << 20),
+        };
+        write_settings(dir.path(), &wanted).unwrap();
+        assert_eq!(
+            read_settings_with(dir.path(), &mut Unlimited).unwrap(),
+            wanted
+        );
+
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        })
+        .unwrap();
+        assert_eq!(read_settings_with(dir.path(), &mut budget).unwrap(), wanted);
+        assert_eq!(budget.used(), 0);
+
+        let mut tiny = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(16),
+            held: 0,
+        })
+        .unwrap();
+        assert!(matches!(
+            read_settings_with(dir.path(), &mut tiny),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(tiny.used(), 0);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_opts = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        let mut uncapped_cancel = ColdBudget::new(ReadLimit {
+            options: &cancel_opts,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            read_settings_with(dir.path(), &mut uncapped_cancel),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(uncapped_cancel.used(), 0);
+
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let expired_opts = HistoryOptions {
+            cancel: None,
+            deadline: Some(deadline),
+        };
+        let mut uncapped_timeout = ColdBudget::new(ReadLimit {
+            options: &expired_opts,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            read_settings_with(dir.path(), &mut uncapped_timeout),
+            Err(Error::Timeout)
+        ));
+        assert_eq!(uncapped_timeout.used(), 0);
+
+        // 2. Unified record decoder, framing, payload, and hole helpers agree between
+        //    Unlimited and checked Control carriers and honour cancellation/timeouts.
+        let meta = Arc::new(ChangeCommit {
+            seq: 7,
+            timestamp_ms: 123_456,
+            kind: CommitKind::Update,
+            bulk: false,
+            inserted: 1,
+            deleted: 0,
+            author: Some(Arc::from("alice")),
+            message: Some(Arc::from("unified codec")),
+        });
+        let quad: QuadKey = [b"".as_slice(), b"<urn:s>", b"<urn:p>", b"\"obj\""].map(Arc::from);
+        let wire = encode(&Record::Changes(meta.clone(), vec![(true, quad.clone())]));
+
+        let mut ok = || Ok(());
+        let (u_body, u_next) = frame_with(&wire, 0, &Unlimited).unwrap().unwrap();
+        let (c_body, c_next) = frame_with(&wire, 0, &FnMutControl::new(&mut ok))
+            .unwrap()
+            .unwrap();
+        assert_eq!((u_body, u_next), (c_body, c_next));
+
+        let u_rec = decode_record_with(u_body, &Unlimited, OwnedRecordSink::default())
+            .unwrap()
+            .unwrap();
+        let mut ok = || Ok(());
+        let c_rec = decode_record_with(
+            c_body,
+            &FnMutControl::new(&mut ok),
+            OwnedRecordSink::default(),
+        )
+        .unwrap()
+        .unwrap();
+        match (u_rec, c_rec) {
+            (Record::Changes(um, uc), Record::Changes(cm, cc)) => {
+                assert_eq!(um, cm);
+                assert_eq!(uc, cc);
+            }
+            _ => panic!("expected changes records"),
+        }
+
+        let mut cancel_fn = || Err(Error::Cancelled);
+        assert!(matches!(
+            frame_with(&wire, 0, &FnMutControl::new(&mut cancel_fn)),
+            Err(Error::Cancelled)
+        ));
+        let mut timeout_fn = || Err(Error::Timeout);
+        assert!(matches!(
+            decode_record_with(
+                u_body,
+                &FnMutControl::new(&mut timeout_fn),
+                OwnedRecordSink::default(),
+            ),
+            Err(Error::Timeout)
+        ));
     }
 }

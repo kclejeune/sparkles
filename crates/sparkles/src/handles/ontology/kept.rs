@@ -223,7 +223,7 @@ pub(super) fn content_fingerprint(
     excluded: &[Excluded],
     opts: &QueryOptions,
 ) -> Result<String> {
-    let mut hash = start_hash(b"sparkles-classification-content-v1\n");
+    let mut hash = start_hash(b"sparkles-classification-content-v2\n");
     hash_json(
         &mut hash,
         &(
@@ -231,7 +231,9 @@ pub(super) fn content_fingerprint(
             cl.consistent,
             consistency(cl),
             cl.complete,
+            cl.complete_for_taken,
             ClassNames(&cl.incomplete),
+            cl.stats.unmapped,
         ),
     )?;
     for (i, n) in cl.taxonomy.nodes().iter().enumerate() {
@@ -284,7 +286,10 @@ impl KeptClassification {
         excluded: Arc<Vec<Excluded>>,
         opts: &QueryOptions,
     ) -> Result<Arc<Self>> {
-        let controls = super::classify::result_options(opts, classification.complete);
+        let controls = super::classify::result_options(
+            opts,
+            !super::classify::acknowledged_stop(&classification),
+        );
         let opts = &controls;
         let source = Arc::new(Provenance::capture(h, req, c, o, opts)?);
         let content_fingerprint = content_fingerprint(&classification, &excluded, opts)?;
@@ -309,19 +314,35 @@ impl KeptClassification {
 pub(super) struct Active {
     pub token: Uuid,
     pub key: InputKey,
+    pub el_only: bool,
     pub commit: u64,
     pub kind: &'static str,
 }
-/// The slot owns only references/status while a flight owns its mutable entry.
+/// One mode slot (`el_only = false` or `el_only = true`) of the dataset's kept cache.
 #[derive(Default)]
-pub(crate) struct KeptCache {
+pub(super) struct KeptSlot {
     pub(super) entry: Option<CacheEntry>,
     pub(super) publication: Option<Arc<KeptClassification>>,
     pub(super) active: Option<Arc<Active>>,
 }
+/// The cache owns separate slots for default and EL-only runs so they never clobber
+/// or mis-serve each other, while total retained bytes stay within [`retention_cap`].
+#[derive(Default)]
+pub(crate) struct KeptCache {
+    slots: [KeptSlot; 2],
+}
+impl KeptCache {
+    pub(super) fn slot(&self, el_only: bool) -> &KeptSlot {
+        &self.slots[usize::from(el_only)]
+    }
+    pub(super) fn slot_mut(&mut self, el_only: bool) -> &mut KeptSlot {
+        &mut self.slots[usize::from(el_only)]
+    }
+}
 
 pub(super) struct KeptFlight<'a> {
     state: &'a DatasetState,
+    el_only: bool,
     entry: Option<CacheEntry>,
     token: Uuid,
     finalized: bool,
@@ -332,6 +353,7 @@ impl<'a> KeptFlight<'a> {
         state: &'a DatasetState,
         flight: MutexGuard<'a, ()>,
         key: InputKey,
+        el_only: bool,
         commit: u64,
         kind: &'static str,
     ) -> Self {
@@ -339,28 +361,33 @@ impl<'a> KeptFlight<'a> {
         let active = Arc::new(Active {
             token,
             key: key.clone(),
+            el_only,
             commit,
             kind,
         });
         let (entry, retired) = {
-            let mut slot = state.classify_cache.lock();
+            let mut cache = state.classify_cache.lock();
+            let slot = cache.slot_mut(el_only);
             let entry = slot.entry.take();
-            let same = entry.as_ref().is_some_and(|e| e.key == key);
+            let same = entry
+                .as_ref()
+                .is_some_and(|e| e.key == key && e.el_only == el_only);
             let retired = if same { None } else { slot.publication.take() };
             slot.active = Some(active);
             (entry, retired)
         };
         drop(retired);
         let mut entry = match entry {
-            Some(e) if e.key == key => e,
+            Some(e) if e.key == key && e.el_only == el_only => e,
             other => {
                 drop(other);
-                CacheEntry::new(key)
+                CacheEntry::new(key, el_only)
             }
         };
         entry.mutated = false;
         Self {
             state,
+            el_only,
             entry: Some(entry),
             token,
             finalized: false,
@@ -374,12 +401,24 @@ impl<'a> KeptFlight<'a> {
         let entry = if keep { self.entry.take() } else { None };
         let publication = entry.as_ref().and_then(|e| e.result.clone());
         let retired = {
-            let mut slot = self.state.classify_cache.lock();
+            let mut cache = self.state.classify_cache.lock();
+            let other_retired = if let Some(ref kept) = entry {
+                let other = cache.slot_mut(!self.el_only);
+                let other_bytes = other.entry.as_ref().map_or(0, |o| o.retained_bytes);
+                if kept.retained_bytes.saturating_add(other_bytes) > retention_cap() {
+                    (other.entry.take(), other.publication.take())
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+            let slot = cache.slot_mut(self.el_only);
             assert!(slot.active.as_ref().is_some_and(|a| a.token == self.token));
             let old_entry = std::mem::replace(&mut slot.entry, entry);
             let old_result = std::mem::replace(&mut slot.publication, publication);
             let old_active = slot.active.take();
-            (old_entry, old_result, old_active)
+            (old_entry, old_result, old_active, other_retired)
         };
         self.finalized = true;
         drop(retired);
@@ -391,7 +430,8 @@ impl Drop for KeptFlight<'_> {
             return;
         }
         let retired = {
-            let mut slot = self.state.classify_cache.lock();
+            let mut cache = self.state.classify_cache.lock();
+            let slot = cache.slot_mut(self.el_only);
             if slot.active.as_ref().is_some_and(|a| a.token == self.token) {
                 (
                     slot.entry.take(),
@@ -440,7 +480,12 @@ pub(super) fn retain_dl(e: &mut CacheEntry, saturation: usize) -> bool {
     if dl_retained_bytes(e, saturation) > retention_cap() {
         e.drop_taxonomy();
     }
-    dl_retained_bytes(e, saturation) <= retention_cap()
+    let bytes = dl_retained_bytes(e, saturation);
+    let keep = bytes <= retention_cap();
+    if keep {
+        e.retained_bytes = bytes;
+    }
+    keep
 }
 
 /// Bounded portions of an immutable kept result.
@@ -464,6 +509,8 @@ pub struct KeptQuery {
     pub limit: usize,
     pub result_id: Option<Uuid>,
     pub languages: Vec<String>,
+    /// Read the kept EL-only classification instead of the default classification.
+    pub el_only: bool,
 }
 impl Default for KeptQuery {
     fn default() -> Self {
@@ -474,6 +521,7 @@ impl Default for KeptQuery {
             limit: 100,
             result_id: None,
             languages: Vec::new(),
+            el_only: false,
         }
     }
 }
@@ -589,11 +637,12 @@ impl KeptClassification {
         let c = &self.classification;
         Outcome {
             tier: c.stats.tier.as_str(),
-            partial: !c.complete,
+            partial: !c.complete_for_taken,
             complete: c.complete && self.excluded.is_empty(),
             consistency: consistency(c),
             excluded_count: self.excluded.len(),
             incomplete_count: c.incomplete.len(),
+            unmapped_count: c.stats.unmapped,
         }
     }
 }
@@ -606,6 +655,9 @@ pub struct Outcome {
     pub consistency: &'static str,
     pub excluded_count: usize,
     pub incomplete_count: usize,
+    /// The triples of the input that map to no axiom, each of which leaves the answer
+    /// incomplete although no `excluded` entry names it
+    pub unmapped_count: usize,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -613,6 +665,7 @@ pub struct EntityStatus {
     pub iri: String,
     pub present: bool,
     pub unsatisfiable: Option<bool>,
+    pub incomplete: Option<bool>,
     pub representative: Option<String>,
     pub equivalence_count: Option<usize>,
     pub children: Option<usize>,
@@ -684,11 +737,14 @@ impl Ontologies {
         // Only clone pointers under the slot lock. Keys, names, counts and all
         // fingerprint/estimate work are inspected outside it.
         let (publication, active) = {
-            let slot = self.ds.state().classify_cache.lock();
+            let cache = self.ds.state().classify_cache.lock();
+            let slot = cache.slot(query.el_only);
             (slot.publication.clone(), slot.active.clone())
         };
-        let publication = publication.filter(|p| p.source.input == key);
-        let active = active.filter(|a| a.key == key && a.commit == snapshot.commit);
+        let publication =
+            publication.filter(|p| p.source.input == key && p.source.el_only == query.el_only);
+        let active = active
+            .filter(|a| a.key == key && a.el_only == query.el_only && a.commit == snapshot.commit);
         let selected = if let Some(id) = query.result_id {
             match publication {
                 Some(p) if p.id == id && p.source.commit == snapshot.commit => Some(p),
@@ -744,6 +800,8 @@ impl Ontologies {
                 iri: iri.clone(),
                 present,
                 unsatisfiable: present.then(|| taxonomy.is_unsatisfiable(&class)),
+                incomplete: present
+                    .then(|| p.classification.incomplete.binary_search(&class).is_ok()),
                 representative: node
                     .and_then(|node| node.classes.first())
                     .map(|class| class.as_str().to_string()),

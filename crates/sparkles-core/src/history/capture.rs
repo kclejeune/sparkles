@@ -43,7 +43,7 @@ pub(crate) fn reidentified(
     let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
     crate::formats::check_settings("history.json", &raw.value)?;
     let mut file: HistoryFile = budget.value(raw.value)?;
-    checked_document(&file, bytes, old, &|| budget.check())?;
+    checked_document(&file, bytes, old, &budget)?;
     for pin in &mut file.snapshots {
         preparation.check()?;
         if let Some(configuration) = &mut pin.configuration
@@ -101,7 +101,7 @@ pub(crate) fn validate_persistent(
         memory: Some(allowance),
         held: 0,
     })?;
-    let decoded = decode_file(bytes, dataset_id, Some(&mut budget))?;
+    let decoded = decode_file_with(bytes, dataset_id, &mut budget)?;
     if decoded.retention != actual.retention
         || decoded.schedules != actual.schedules
         || decoded.catalog != actual.catalog
@@ -313,7 +313,7 @@ mod reidentify_tests {
                     before.configuration.as_ref().unwrap().selector
                 );
             }
-            let decoded = decode_file(bytes, id, None).unwrap();
+            let decoded = decode_file_with(bytes, id, &mut crate::budgeted::Unlimited).unwrap();
             assert_eq!(
                 decoded.pins["head"].configuration.as_ref().unwrap().binding,
                 ConfigurationBinding::ImportedUnbound { source: identity() }
@@ -358,7 +358,10 @@ mod reidentify_tests {
                 .all(|pin| pin.configuration.is_none())
         );
         assert_eq!(
-            decode_file(&output.value, new, None).unwrap().pins["dup"].seq,
+            decode_file_with(&output.value, new, &mut crate::budgeted::Unlimited)
+                .unwrap()
+                .pins["dup"]
+                .seq,
             2
         );
         drop(output);

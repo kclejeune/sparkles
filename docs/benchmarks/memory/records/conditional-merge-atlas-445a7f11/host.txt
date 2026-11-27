@@ -1,0 +1,34 @@
+base=fc7b0bb9015d96f19e4c5cc3f1d9bfe1f9a2896b
+lane=445a7f11b8b60f779db41d9d0b161761fe2ab438
+cand_tree=40c5aaafced4f80105a318a93849f1f785d7a297
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+mbx 1.30.0
+Linux atlas 7.3.3 #1-NixOS SMP PREEMPT_DYNAMIC @1793989110 x86_64 GNU/Linux
+CPU CORE    MAXMHZ ONLINE
+  0    0 4800.0000    yes
+  1    0 4800.0000    yes
+  2    1 4800.0000    yes
+  3    1 4800.0000    yes
+  4    2 4800.0000    yes
+  5    2 4800.0000    yes
+  6    3 4800.0000    yes
+  7    3 4800.0000    yes
+  8    4 4800.0000    yes
+  9    4 4800.0000    yes
+ 10    5 4800.0000    yes
+ 11    5 4800.0000    yes
+ 12    6 3500.0000    yes
+ 13    7 3500.0000    yes
+ 14    8 3500.0000    yes
+ 15    9 3500.0000    yes
+ 16   10 3500.0000    yes
+ 17   11 3500.0000    yes
+ 18   12 3500.0000    yes
+ 19   13 3500.0000    yes
+/home/kclejeune/lanes/fanout-570-look/store-base
+store device=65026 inode=5243723 mtime=2026-11-17 20:18:24.000000000 -0500
+server CPU 2; client CPU 4; one Rayon thread; six ABBA rounds; 12 timed requests per query per process
+before base-cand: 1.00 2.90 2.44 1/638 3393714
+before off-cand: 1.00 1.51 1.93 1/611 3403986
+before base-base: 0.87 1.19 1.64 1/607 3414268
+after all: 1.09 1.18 1.46 1/601 3424363

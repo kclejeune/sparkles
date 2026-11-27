@@ -15,6 +15,7 @@ use crate::commit::{self, CommitInfo};
 use crate::error::{Error, Result};
 use crate::store::{Generation, Snapshot};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -636,7 +637,23 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
     let Some(bytes) = read_bytes(root)? else {
         return Ok(HistoryConfig::default());
     };
-    decode_file(&bytes, dataset_id, None)
+    decode_file_with(&bytes, dataset_id, &mut crate::budgeted::Unlimited)
+}
+
+/// Read `history.json` under `budget` without opening the store.
+pub(crate) fn read_file_controlled(
+    root: &Path,
+    dataset_id: uuid::Uuid,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<HistoryConfig> {
+    let bytes = match budget.read_file(&root.join("history.json")) {
+        Ok(b) => b,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HistoryConfig::default());
+        }
+        Err(e) => return Err(e),
+    };
+    decode_file_with(&bytes, dataset_id, budget)
 }
 
 /// Validate current history metadata without startup writers or recovery cleanup.
@@ -654,46 +671,30 @@ pub(crate) fn preflight_file(root: &Path) -> Result<()> {
     let dataset_id = commit::read_dataset_file(root)?.ok_or_else(|| {
         Error::Corrupt("history.json requires its recorded dataset.json identity".into())
     })?;
-    checked_document(&f, &bytes, dataset_id, &|| Ok(()))
+    checked_document(&f, &bytes, dataset_id, &crate::budgeted::Unlimited)
 }
 
 // The capture reader uses the same legacy semantics and format2 validation as
 // ordinary open. Its caller retains a real Preparation loan across all decoded
 // containers; no decoded metadata escapes that loan.
-fn decode_file(
+fn decode_file_with<C: crate::budgeted::BudgetControl>(
     bytes: &[u8],
     dataset_id: uuid::Uuid,
-    budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
+    control: &mut C,
 ) -> Result<HistoryConfig> {
-    if let Some(budget) = budget {
-        return decode_file_controlled(bytes, dataset_id, budget);
-    }
-    let v: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
-    crate::formats::check_settings("history.json", &v)?;
-    let f: HistoryFile =
-        serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
-    checked_file(f, bytes, dataset_id, &|| Ok(()))
-}
-
-fn decode_file_controlled(
-    bytes: &[u8],
-    dataset_id: uuid::Uuid,
-    budget: &mut crate::store::cold::ColdBudget<'_>,
-) -> Result<HistoryConfig> {
-    let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
+    let raw: crate::store::cold::Loaded<serde_json::Value> = control.json(bytes, "history.json")?;
     crate::formats::check_settings("history.json", &raw.value)?;
-    let f: HistoryFile = budget.value(raw.value)?;
-    checked_file(f, bytes, dataset_id, &|| budget.check())
+    let f: HistoryFile = control.value(raw.value, "history.json")?;
+    checked_file(f, bytes, dataset_id, control)
 }
 
-fn checked_document(
+fn checked_document<C: crate::budgeted::Control>(
     f: &HistoryFile,
     bytes: &[u8],
     dataset_id: uuid::Uuid,
-    check: &dyn Fn() -> Result<()>,
+    control: &C,
 ) -> Result<()> {
-    check()?;
+    control.check(0)?;
     if f.format == 1 && f.snapshots.iter().any(|pin| pin.configuration.is_some()) {
         return Err(Error::Corrupt(
             "legacy history cannot certify a configuration binding".into(),
@@ -711,7 +712,7 @@ fn checked_document(
         }
         let mut names = std::collections::BTreeSet::new();
         for pin in &f.snapshots {
-            check()?;
+            control.check(0)?;
             let configuration = pin.configuration.as_ref().ok_or_else(|| {
                 Error::Corrupt("named snapshot configuration binding is missing".into())
             })?;
@@ -741,19 +742,19 @@ fn checked_document(
             f.dataset_id
         )));
     }
-    check()
+    control.check(0)
 }
 
-fn checked_file(
+fn checked_file<C: crate::budgeted::Control>(
     f: HistoryFile,
     bytes: &[u8],
     dataset_id: uuid::Uuid,
-    check: &dyn Fn() -> Result<()>,
+    control: &C,
 ) -> Result<HistoryConfig> {
-    checked_document(&f, bytes, dataset_id, check)?;
+    checked_document(&f, bytes, dataset_id, control)?;
     let mut pins = BTreeMap::new();
     for p in f.snapshots {
-        check()?;
+        control.check(0)?;
         let created_ms = commit::parse_rfc3339_ms(&p.created).unwrap_or(0);
         pins.insert(
             p.name,
@@ -767,7 +768,7 @@ fn checked_file(
             },
         );
     }
-    check()?;
+    control.check(0)?;
     Ok(HistoryConfig {
         pins,
         retention: f.retention,
@@ -922,38 +923,17 @@ pub(crate) struct HistoryState {
     /// the durable source holds on this store's commits, read when collecting
     pub(crate) held: Option<crate::holds::HeldView>,
     /// the byte budget the cached states are charged to, shared with other stores when
-    /// the server shares its caches
+    /// the server shares its caches. Individual cached snapshots own a
+    /// [`BudgetHold`](crate::store::caches::BudgetHold) against this budget so evicted
+    /// states stay accounted while any view pins them.
     pub budget: Arc<crate::store::caches::ByteBudget>,
-    /// what this state has charged to `budget`
-    charged: u64,
-}
-
-impl Drop for HistoryState {
-    fn drop(&mut self) {
-        self.budget.settle(self.charged, 0);
-    }
 }
 
 impl HistoryState {
-    /// Charge the cached states to `budget` from now on.
+    /// Charge newly cached states to `budget` from now on.
     pub fn use_budget(&mut self, budget: Arc<crate::store::caches::ByteBudget>) {
-        self.budget.settle(self.charged, 0);
-        self.charged = 0;
+        debug_assert!(self.cache.is_empty());
         self.budget = budget;
-        self.settle();
-    }
-
-    /// Bring the charge to the budget in line with the cached states. Call it after the
-    /// cache changes.
-    pub fn settle(&mut self) {
-        let now: u64 = self.cache.iter().map(|e| e.bytes).sum();
-        self.settle_precounted(now);
-    }
-
-    /// A controlled caller has already summed the entries before publishing a change.
-    pub(crate) fn settle_precounted(&mut self, now: u64) {
-        self.budget.settle(self.charged, now);
-        self.charged = now;
     }
 
     pub fn new(pins: BTreeMap<String, Pin>, retention: Retention) -> HistoryState {
@@ -975,7 +955,6 @@ impl HistoryState {
             branch_pins: Vec::new(),
             held: None,
             budget: Arc::new(crate::store::caches::ByteBudget::new(u64::MAX)),
-            charged: 0,
         }
     }
 
@@ -1275,19 +1254,36 @@ impl MemHistory {
         seq: u64,
         limit: &C,
     ) -> Result<Option<Arc<Snapshot>>> {
-        if C::ACCOUNTS {
-            limit.check(0)?;
-        }
+        self.get_checked(seq, &|| if C::ACCOUNTS { limit.check(0) } else { Ok(()) })
+    }
+
+    /// Check before the map lookups and before each window or pin entry compared.
+    pub(crate) fn get_checked(
+        &self,
+        seq: u64,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<Option<Arc<Snapshot>>> {
+        check()?;
         if let Some((_, snapshot)) = self.branch_bases.get(&seq) {
             return Ok(Some(snapshot.clone()));
         }
         if let Some((_, snapshot)) = self.held.get(&seq) {
             return Ok(Some(snapshot.clone()));
         }
-        for snapshot in self.window.iter().chain(self.pins.values().map(|(_, s)| s)) {
-            if C::ACCOUNTS {
-                limit.check(0)?;
+        let mut low = 0;
+        let mut high = self.window.len();
+        while low < high {
+            check()?;
+            let mid = low + (high - low) / 2;
+            let snapshot = &self.window[mid];
+            match snapshot.commit.cmp(&seq) {
+                Ordering::Less => low = mid + 1,
+                Ordering::Greater => high = mid,
+                Ordering::Equal => return Ok(Some(snapshot.clone())),
             }
+        }
+        for (_, snapshot) in self.pins.values() {
+            check()?;
             if snapshot.commit == seq {
                 return Ok(Some(snapshot.clone()));
             }
@@ -1999,5 +1995,110 @@ mod tests {
             .err()
             .expect("refused");
         assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    }
+
+    #[test]
+    fn decode_file_with_matches_unlimited_and_cold_budget_and_refuses_cancel() {
+        use crate::store::cold::ColdBudget;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut pins = BTreeMap::new();
+        pins.insert(
+            "release-1".to_string(),
+            Pin {
+                seq: 3,
+                created_ms: 1_700_000_000_000,
+                note: Some("baseline".to_string()),
+                expires_ms: None,
+                warm: true,
+                configuration: None,
+            },
+        );
+        write_file(
+            dir.path(),
+            id,
+            &pins,
+            Retention::default(),
+            &[],
+            CatalogHorizon::default(),
+        )
+        .unwrap();
+        let bytes = std::fs::read(dir.path().join("history.json")).unwrap();
+
+        let plain = decode_file_with(&bytes, id, &mut crate::budgeted::Unlimited).unwrap();
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        })
+        .unwrap();
+        let controlled = decode_file_with(&bytes, id, &mut budget).unwrap();
+        assert_eq!(plain.pins.len(), controlled.pins.len());
+        assert_eq!(
+            plain.pins["release-1"].seq,
+            controlled.pins["release-1"].seq
+        );
+
+        let mut tiny = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(16),
+            held: 0,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_file_with(&bytes, id, &mut tiny),
+            Err(Error::BudgetExceeded(_))
+        ));
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_opts = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        let mut cancelled = ColdBudget::new(ReadLimit {
+            options: &cancel_opts,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            decode_file_with(&bytes, id, &mut cancelled),
+            Err(Error::Cancelled)
+        ));
+
+        struct SwitchTimeout(AtomicBool);
+        impl ReadControl for SwitchTimeout {
+            fn check_read(&self) -> Result<()> {
+                if self.0.load(Ordering::Relaxed) {
+                    Err(Error::Timeout)
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+        let timeout = SwitchTimeout(AtomicBool::new(false));
+        let mut timed_out = ColdBudget::new(ReadLimit {
+            options: &timeout,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        timeout.0.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            decode_file_with(&bytes, id, &mut timed_out),
+            Err(Error::Timeout)
+        ));
+        assert_eq!(timed_out.used(), 0);
     }
 }

@@ -19,10 +19,9 @@ const THING: &str = "http://www.w3.org/2002/07/owl#Thing";
 const NOTHING: &str = "http://www.w3.org/2002/07/owl#Nothing";
 
 /// The cases of the families `horn-shiq` and `horn-sroiq` that the classifier takes
-/// whole: all 50 of `horn-shiq` and the 35 of `horn-sroiq` without an at-least restriction
-/// above one, since the Horn rules with individuals leave such a restriction out beside
-/// individuals (roadmap item 867).
-const HORN_WHOLE: usize = 85;
+/// whole: all 50 of `horn-shiq` and all 50 of `horn-sroiq`, including the 15 cases with
+/// at-least restrictions above one beside individuals (roadmap item 867).
+const HORN_WHOLE: usize = 100;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603")
@@ -155,7 +154,7 @@ fn the_classifier_is_sound_everywhere_and_complete_on_what_it_takes_whole() {
                 }
             }
             answers.push(got);
-            fell.push(out.stats.dl_over_budget || !out.complete);
+            fell.push(out.stats.dl_over_budget || !out.complete_for_taken);
         }
         // the runs that stayed in Tier D's bound give one answer, and so do those that fell
         // back: a schedule can decide which of the two a run gives near the bound, and the
@@ -180,7 +179,11 @@ fn the_classifier_is_sound_everywhere_and_complete_on_what_it_takes_whole() {
                 }
             }
         }
-        let c = counts.entry(family(stem).to_string()).or_default();
+        let fam = family(stem);
+        if matches!(fam, "horn-shiq" | "horn-sroiq") && fell.iter().any(|&f| f) {
+            failures.push(format!("{stem}: Horn fixture fell back or was incomplete"));
+        }
+        let c = counts.entry(fam.to_string()).or_default();
         c.0 += 1;
         c.1 += whole as usize;
     }
@@ -326,12 +329,13 @@ fn the_cases_past_the_bound_fall_back_on_every_schedule() {
 /// qualifiers: `tests/fixtures/dl897/generate.py` wrote 300 with its default seed, and
 /// these are the 25 on which a run that gave such a qualifier no name reported an answer
 /// other than HermiT's as complete, with `qz-0202` and `qz-0082`, which finished then and
-/// pass the bound on derived conclusions now. Each of the 25 is taken whole within the
-/// default bound with HermiT's answer, on one thread, four and eight. `qz-0048` stays
-/// within the bound on one thread because a context gives way to the contexts it woke:
-/// the context of `C1` equates six successors under a maximum of three, and the
-/// successors' contexts find that `C0` has no model. The other two fall back on every
-/// schedule to an answer that HermiT entails.
+/// passed the bound once qualifiers were named. Each of the 25 and `qz-0082` (with item
+/// 896's counting refinements) is taken whole within the default bound with HermiT's
+/// answer, on one thread, four and eight. `qz-0048` stays within the bound on one thread
+/// because a context gives way to the contexts it woke: the context of `C1` equates six
+/// successors under a maximum of three, and the successors' contexts find that `C0` has
+/// no model. `qz-0202` still falls back on every schedule to an answer that HermiT
+/// entails.
 #[test]
 fn the_compound_qualifier_cases_give_hermits_answer_within_the_bound() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl897");
@@ -352,7 +356,7 @@ fn the_compound_qualifier_cases_give_hermits_answer_within_the_bound() {
             .file_stem()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        let past = ["qz-0082", "qz-0202"].contains(&stem);
+        let past = stem == "qz-0202";
         let doc = ofn_read::parse(&std::fs::read_to_string(case).unwrap()).unwrap();
         let mut classes: BTreeSet<String> = doc
             .axioms
@@ -512,7 +516,7 @@ fn the_rooted_run_is_exact_on_the_shoi_fixtures_within_its_bound() {
                 })
                 .unwrap();
             assert!(
-                out.complete,
+                out.complete_for_taken,
                 "{stem}: a run without a deadline answered in part"
             );
             let mut got = BTreeSet::new();
@@ -589,4 +593,103 @@ fn the_rooted_run_is_exact_on_the_shoi_fixtures_within_its_bound() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
     assert_eq!(exact, 96);
+}
+
+/// The coverage of a run that leaves axioms out (roadmap item 1271): on every case, for
+/// the default run and for a run by the OWL 2 EL rules alone, each class outside
+/// `incomplete` has HermiT's superclasses, and HermiT's equivalent classes when it is
+/// satisfiable, and a known consistency is HermiT's.
+#[test]
+fn the_classes_outside_incomplete_have_hermits_answer() {
+    use sparkles_owl::classify::Consistency;
+    let dir = fixtures();
+    let mut cases: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".ofn") && n.matches('.').count() == 1)
+        })
+        .collect();
+    cases.sort();
+    assert_eq!(cases.len(), 640);
+    let mut failures = Vec::new();
+    // runs that left something out, the classes they asked about, those they called
+    // complete, and the runs whose consistency stayed known
+    let (mut left_runs, mut asked, mut decided, mut known) = (0usize, 0usize, 0usize, 0usize);
+    for case in &cases {
+        let stem = case
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let doc = ofn_read::parse(&std::fs::read_to_string(case).unwrap()).unwrap();
+        let mut classes: BTreeSet<String> = doc
+            .axioms
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AxiomKind::Declaration(Entity::Class(c)) => Some(c.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        classes.insert(THING.to_string());
+        classes.insert(NOTHING.to_string());
+        let text = std::fs::read_to_string(case.with_extension("hermit.ofn")).unwrap();
+        let want = reference(&text, &classes);
+        let inconsistent = want.contains(&(THING.to_string(), NOTHING.to_string()));
+        for el_only in [false, true] {
+            let mut k = Classifier::of(&doc.axioms);
+            let out = k
+                .classify(&Limits {
+                    threads: 1,
+                    el_only,
+                    ..Limits::default()
+                })
+                .unwrap();
+            let run = format!("{stem}, el_only {el_only}");
+            let left = !k.excluded().is_empty();
+            if out.complete != (!left && out.complete_for_taken) {
+                failures.push(format!("{run}: complete {}", out.complete));
+            }
+            if !left || out.stats.dl_over_budget {
+                continue;
+            }
+            left_runs += 1;
+            match out.consistency {
+                Consistency::Unknown => {}
+                c => {
+                    known += 1;
+                    if (c == Consistency::Inconsistent) != inconsistent {
+                        failures.push(format!("{run}: consistency {c:?}"));
+                    }
+                }
+            }
+            let sub = |a: &str, b: &str| out.taxonomy.is_subclass(&Class::new(a), &Class::new(b));
+            for a in &classes {
+                if a == THING || a == NOTHING {
+                    continue;
+                }
+                asked += 1;
+                if out.incomplete.contains(&Class::new(a.as_str())) {
+                    continue;
+                }
+                decided += 1;
+                let unsat = want.contains(&(a.clone(), NOTHING.to_string()));
+                for b in &classes {
+                    let w = want.contains(&(a.clone(), b.clone()));
+                    if w != sub(a, b) {
+                        failures.push(format!("{run}: {a} below {b}: {w} in HermiT"));
+                    }
+                    if !unsat && w && want.contains(&(b.clone(), a.clone())) && !sub(b, a) {
+                        failures.push(format!("{run}: {b} equivalent to {a} missing"));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "runs that left axioms out {left_runs}, consistency known {known}, classes {asked}, complete {decided}"
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(decided > 0 && decided < asked && known > 0);
 }

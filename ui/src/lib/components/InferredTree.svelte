@@ -4,6 +4,8 @@
   import type { InferredPins } from '$lib/inferred-read';
   import { isGroup, groupIri } from '$lib/individual-tree.svelte';
   import { iriForm } from '$lib/iri-form.svelte';
+  import { fmtCount } from '$lib/format';
+  import { consistencyInfo } from '$lib/ontology';
   import OntoTree from './OntoTree.svelte';
   import MaterializationNotice from './MaterializationNotice.svelte';
   let {
@@ -131,20 +133,47 @@
     {#if commit == null}<p>Waiting for the displayed source commit.</p>{/if}
     {#if model.error}<p class="error-box" role="alert">{model.error}</p>{/if}
     {#if kind === 'Class' && model.reply?.result}
+      {@const outcome = model.reply.outcome}
+      {@const consistency = outcome
+        ? consistencyInfo(outcome.consistency, undefined, outcome.partial)
+        : null}
+      {#if outcome}
+        <div class="status-row" role="status">
+          {#if outcome.tier}<span class="status-badge">{outcome.tier.toUpperCase()}</span>{/if}
+          {#if outcome.partial}
+            <span class="status-badge warn"
+              >Partial · {fmtCount(outcome.incompleteCount, 'open class', 'open classes')}</span
+            >
+          {/if}
+          {#if consistency}
+            <span
+              class="status-badge"
+              class:ok={consistency.tone === 'ok'}
+              class:warn={consistency.tone === 'warn'}
+              class:danger={consistency.tone === 'danger'}>{consistency.label}</span
+            >
+          {/if}
+        </div>
+      {/if}
       <p class="faint">
         Kept classification at commit {model.reply.commit}.
-        {#if model.reply.outcome?.partial}
-          Partial classification. {model.reply.outcome.incompleteCount}
-          {model.reply.outcome.incompleteCount === 1 ? 'class remains' : 'classes remain'} incomplete.
-        {:else if model.reply.outcome?.complete}
+        {#if outcome?.partial}
+          Partial classification. {outcome.incompleteCount}
+          {outcome.incompleteCount === 1 ? 'class remains' : 'classes remain'} incomplete.
+        {:else if outcome?.complete}
           Complete for its supported source.
-        {:else if model.reply.outcome && model.reply.outcome.excludedCount > 0}
-          Classification completed with {model.reply.outcome.excludedCount} omitted or partly used axioms.
         {:else}
           Classification is incomplete.
         {/if}
-        {#if model.reply.outcome?.consistency === 'unknown'}Consistency is unknown.{/if}
-        {model.reply.outcome?.consistency === 'inconsistent'
+        {#if outcome && !outcome.complete && outcome.excludedCount > 0}
+          {outcome.excludedCount} omitted or partly used axioms.
+        {/if}
+        {#if outcome && !outcome.complete && outcome.unmappedCount > 0}
+          {outcome.unmappedCount}
+          {outcome.unmappedCount === 1 ? 'triple' : 'triples'} of the input map to no axiom.
+        {/if}
+        {#if outcome?.consistency === 'unknown'}Consistency is unknown.{/if}
+        {outcome?.consistency === 'inconsistent'
           ? 'The ontology is inconsistent; every class is unsatisfiable.'
           : ''}
       </p>
@@ -183,13 +212,16 @@
         count={(id) =>
           individuals ? (isGroup(id) ? model.individuals.counts[id] : 0) : model.tree.counts[id]}
         badge={(id) => {
+          if (individuals && !isGroup(id))
+            return (model.individuals.types[id] ?? []).map(name).join(', ') || null;
           const n = model.names[id]?.equivalenceCount ?? 1;
-          return individuals && !isGroup(id)
-            ? (model.individuals.types[id] ?? []).map(name).join(', ') || null
-            : n > 1
-              ? `${n} equivalent names`
-              : null;
+          const isOpen = !individuals && !!model.incomplete?.[id];
+          const parts: string[] = [];
+          if (n > 1) parts.push(`${n} equivalent names`);
+          if (isOpen) parts.push('open');
+          return parts.length ? parts.join(' · ') : null;
         }}
+        badgeTone={(id) => (!individuals && model.incomplete?.[id] ? 'warn' : null)}
         onselect={select}
         ontoggle={toggle}
       />
@@ -235,5 +267,32 @@
   }
   .panel-body > :global(:last-child) {
     margin-bottom: 0;
+  }
+  .status-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .status-badge {
+    font-size: var(--fs-xs);
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--surface-2, var(--hover));
+    color: var(--text-2);
+    font-weight: 500;
+  }
+  .status-badge.ok {
+    color: var(--ok);
+    background: var(--ok-soft);
+  }
+  .status-badge.warn {
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+  }
+  .status-badge.danger {
+    color: var(--danger);
+    background: var(--danger-soft);
   }
 </style>

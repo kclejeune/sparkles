@@ -1,7 +1,8 @@
 //! The shared tail of a commit: what every path does once the write that makes a commit
-//! durable has returned (X16 phase 2).
+//! durable has returned (X16 phases 2 and 6).
 //!
-//! The serial path, the group leader and the bulk rebuild publish a [logical
+//! The group leader (which handles every persistent WAL commit, including a solo group
+//! of one), the in-memory commit path and the bulk rebuild publish a [logical
 //! commit](Publication::Commit), and a compaction publishes a [generation
 //! switch](Publication::Switch). Each path still performs its own write and its own
 //! synchronization before it calls the tail, so the tail moves no write. It publishes
@@ -12,14 +13,14 @@
 //! The guard learns of a commit before the commit is published. A writer that waits for
 //! the publication of commit N and then validates must check against the state that N
 //! left, and only this order guarantees it. The compaction tap is not part of the tail:
-//! the serial path pushes it under the writer lock once its write has returned and the
-//! group path under the same lock before it enqueues, and a tail that the group leader
-//! runs after the fence, without the lock, would change that contract.
+//! each path pushes it under the writer lock before it enqueues or publishes, and a tail
+//! that the group leader runs after the fence, without the lock, would change that
+//! contract.
 //!
-//! The caller serializes publication. The serial, bulk and compaction paths hold the
-//! writer lock, and the group coordinator publishes a prefix's commits in order without
-//! acquiring that lock, while every other path drains the grouped work before it
-//! publishes, so no two publications run at once.
+//! The caller serializes publication. The in-memory, solo-fence, bulk and compaction
+//! paths hold the writer lock, and the group coordinator publishes a prefix's commits in
+//! order without acquiring that lock, while every other path drains the grouped work
+//! before it publishes, so no two publications run at once.
 
 use super::*;
 
@@ -114,7 +115,16 @@ impl Store {
         {
             log.push(change);
         }
-        self.catalog.lock().append(c.info);
+        // Persistent WAL commits share their quota across branches. Count catalog
+        // growth before the next commit can check that quota.
+        let measures = c.log_end.map(|_| self.quota.measures());
+        let catalog_growth = self.catalog.lock().append(c.info);
+        if let Some(measures) = measures {
+            match catalog_growth {
+                Some(bytes) => self.quota.account_append(bytes, measures),
+                None => self.quota.invalidate(),
+            }
+        }
         // An in-memory store keeps annotations and past states only for the window its
         // catalog keeps. A store with a log keeps them on disk, so it has neither step.
         if self.root.is_none() {

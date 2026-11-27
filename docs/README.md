@@ -1,71 +1,97 @@
 # Documentation
 
-This index lists the Sparkles documentation by what a reader wants to do. The repository's
-[README](../README.md) introduces Sparkles, its performance and a quick start.
+This index organizes the Sparkles documentation by task. Start with the
+[README](../README.md) for a high-level overview, headline benchmarks, and a quick start.
 
-## Using Sparkles
+## Evaluating Sparkles
 
 | Document | What it covers |
 |---|---|
-| [Getting started and operations](GETTING-STARTED.md) | Build and try Sparkles, evaluate compatibility, secure a server and plan recovery. |
-| [Usage](USAGE.md) | How to run the server, load and query data, and operate datasets, with the [CLI tools](USAGE.md#command-line-tools), [Docker](USAGE.md#docker) and [NixOS](USAGE.md#deploying-on-nixos). |
-| [Libraries and bindings](USAGE.md#embedding-the-library) | How to embed the engine from [Rust](USAGE.md#embedding-the-library), [Python](USAGE.md#python), the [JVM through Jena](USAGE.md#jvm-apache-jena) and [Node.js](USAGE.md#javascript-and-typescript), or connect with the [Rust client](USAGE.md#rust-client). |
-| [Agents and models](USAGE.md#mcp-server-llm-agents) | How to connect an agent over MCP, use [agent memory](USAGE.md#agent-memory) and [answer questions with a model](USAGE.md#asking-questions-with-a-model). |
-| [HTTP API](API.md) | The request and response contract of every endpoint, with status codes, parameters, formats and protocol semantics. |
-| [OpenAPI](openapi.json) | The machine-readable HTTP contract, checked against the server's route table. |
-| [Editor integration](editors.md) | How to format SPARQL and RDF in an editor and use the language server. |
+| [Features](FEATURES.md) | The capability matrix, compatibility boundaries, known gaps, and links to every category guide. |
+| [Comparison](COMPARISON.md) | Feature differences and design tradeoffs against Jena/Fuseki, QLever, Fluree, and Oxigraph. |
+| [Benchmark summary](BENCHMARKS.md) | Representative results, coverage limits, and recorded comparisons where other engines lead. |
+| [Web UI tour](visualization/README.md#web-ui-tour) | Visual walkthrough of the embedded web UI across querying, history, GraphRAG, and authoring. |
+
+## Getting started and operating
+
+| Document | What it covers |
+|---|---|
+| [Getting started and operations](GETTING-STARTED.md) | Install and try Sparkles, evaluate compatibility, secure a server, and plan backups and recovery. |
+| [Usage](USAGE.md) | Run the server, operate datasets, and use the [CLI tools](USAGE.md#command-line-tools), [Docker](USAGE.md#docker), and [NixOS](USAGE.md#deploying-on-nixos). |
+| [HTTP API](API.md) | Exact request and response contracts for Fuseki endpoints and Sparkles extensions. |
+| [OpenAPI specification](openapi.json) | Machine-readable HTTP contract verified against the server's route table. |
+| [Agents and models](USAGE.md#mcp-server-llm-agents) | Connect agents over MCP, use [agent memory](USAGE.md#agent-memory), and [ask questions with a model](USAGE.md#asking-questions-with-a-model). |
+| [Editor integration](editors.md) | Format SPARQL and RDF in an editor and configure the language server. |
 
 ## Libraries and clients
 
-The engine can be embedded with [Rust](USAGE.md#embedding-the-library),
-[Python](USAGE.md#python), [Java and Kotlin through Jena](USAGE.md#jvm-apache-jena),
-or [Node.js](USAGE.md#javascript-and-typescript). The
-[Rust HTTP client](USAGE.md#rust-client) connects to a server. The
-[integration guide](integrations/README.md#libraries-and-bindings) describes the
-surfaces and limits of each binding.
+Applications can embed the engine in process from [Rust](USAGE.md#embedding-the-library),
+[Python](USAGE.md#python), [Java and Kotlin through Jena](USAGE.md#jvm-apache-jena), or
+[Node.js](USAGE.md#javascript-and-typescript), or connect over HTTP with the
+[Rust client](USAGE.md#rust-client). The
+[integration guide](integrations/README.md#libraries-and-bindings) lists the API surfaces
+and limitations of each binding.
 
-## Understanding Sparkles
+## Feature guides
+
+Each category guide documents current capabilities, configuration, usage links, known
+gaps, and roadmap items for its area.
+
+| Guide | Area |
+|---|---|
+| [Querying](querying/README.md) | SPARQL 1.0–1.2, RDF 1.2, Jena ARQ extensions, federation, incremental views, CLI, and formatting. |
+| [Storage and history](storage/README.md) | Columnar indexes, vocabulary encoding, bulk loading, transactions, snapshots, diffs, and branches. |
+| [Search and graph analysis](search/README.md) | BM25 full-text search, HNSW vector indexes, hybrid ranking, GeoSPARQL 1.1, path search, and graph algorithms. |
+| [Reasoning and validation](reasoning/README.md) | RDFS, OWL 2 RL, OWL 2 EL classification, Jena rules, OWL 2 ontologies, SHACL, and ShEx 2.2. |
+| [Server and security](server/README.md) | Fuseki endpoints, `/$/` admin API, authentication, dataset/graph/triple grants, budgets, and telemetry. |
+| [AI and agents](ai/README.md) | MCP server, Ask pipeline, cited agent memory, document ingestion, GraphRAG communities, and evidence profiles. |
+| [Visualization and editing](visualization/README.md) | Embedded SvelteKit UI, visual query builder, graph explorer, maps, forms, and ontology/SKOS/SHACL editors. |
+| [Libraries and integrations](integrations/README.md) | Rust, Python, JVM (`DatasetGraph`), Node.js, TypeScript, GraphQL, and tabular/RML mappings. |
+| [Operations](operations/README.md) | Backup repositories, integrity checks, format migrations, degraded startup, and notifications. |
+
+## Benchmarks
 
 | Document | What it covers |
 |---|---|
-| [Features](FEATURES.md) | The capability matrix and category guides with current scope, configuration, usage, limitations and roadmap links. |
-| [Architecture](ARCHITECTURE.md) | The library boundaries, storage, execution and the main design decisions. |
-| [Comparison](COMPARISON.md) | The gaps and tradeoffs against Jena, QLever, Fluree and Oxigraph, and where Sparkles departs from Jena on purpose. |
-| [Benchmarks](benchmarks/README.md) | Workload guides, published results, raw-run catalogs and generated charts, including the measured losses and comparison limits. |
-| [Query optimizations](internals/OPTIMIZATIONS.md) | Operator fast paths, when they apply and the local cost-model measurements behind them. |
+| [Benchmark summary](BENCHMARKS.md) | Headline numbers, measured losses, and rules for interpreting comparisons. |
+| [Workload index](benchmarks/README.md) | Per-suite methodology, published results, generated charts, and immutable raw run catalogs. |
+| [Running benchmarks](BENCHMARKING.md) | Harness modes, regression screens, instruction-count checks, and reproduction steps. |
+| [Performance experiments](PERFORMANCE-EXPERIMENTS.md) | Measured optimizations that were reverted because they were not faster, with conditions where they could still pay off. |
 
-## Design and planning
+## Internals and design specs
 
 | Document | What it covers |
 |---|---|
-| [Roadmap](ROADMAP.md) | Planned work in priority order, with the size, impact and design spec of each item. |
-| [Design specs](specs/README.md) | The rationale, status and outcome of each larger feature. |
-| [Provenance](specs/PROVENANCE.md) | An index to per-spec and shared records of design sources, adopted dependencies, licenses and rejected alternatives. |
-| [Source audit](AUDIT.md) | The original audit of Jena, QLever and Oxigraph that set the first design choices. |
+| [Architecture](ARCHITECTURE.md) | Library boundaries, storage formats, query planner, execution modes, and architectural tradeoffs. |
+| [Query optimizations](internals/OPTIMIZATIONS.md) | Operator fast paths, eligibility rules, and the local cost-model measurements behind them. |
+| [Roadmap](ROADMAP.md) | Planned work in priority order, with size, impact, dependencies, and design spec links. |
+| [Design specs](specs/README.md) | Design rationale, contracts, status, and recorded outcomes for each major feature. |
+| [Provenance](specs/PROVENANCE.md) | Index of design sources, adopted dependencies, licenses, and rejected alternatives. |
+| [Source audit](AUDIT.md) | Historical audit of Jena, QLever, and Oxigraph that informed the initial architecture. |
 
 ## Contributing
 
 | Document | What it covers |
 |---|---|
-| [Development](DEVELOPMENT.md) | The project layout, builds, tests, mise tasks and Nix setup. |
-| [Running benchmarks](BENCHMARKING.md) | The benchmark harness, its modes and outputs, and how to measure a regression. |
-| [UI development](../ui/README.md) | How to build, test and change the web UI. |
+| [Development](DEVELOPMENT.md) | Workspace layout, Boxington builds, test suites, batch gates, mise tasks, and Nix setup. |
+| [UI development](../ui/README.md) | Building, testing, and modifying the SvelteKit web UI. |
+| [Remote executors](REMOTE-EXECUTORS.md) | Running builds, gates, and benchmark screens on local and Boat workers. |
 
 ## Maintaining documentation
 
-* Workflows and examples belong in Usage, exact HTTP contracts in API, and system
-  structure in Architecture. Link between them when a reader needs the other view.
-* FEATURES holds the capability matrix. Its category guides own current capability
-  details and limitations, with configuration, usage and roadmap links. Comparison
-  explains what those limits mean for compatibility or migration.
-* Benchmark categories hold methodology, results and immutable run catalogs. Keep
-  manually maintained reports distinct from generated reports and their explicit source
-  selections. Local optimization measurements stay with their rationale and say that
-  they are local.
-* A spec keeps its original design. Its status and Outcome change with the behavior, and
-  the user guide changes with them. A specified phase is not a shipped capability.
-* The source audit is historical context, and the guides describe supported behavior.
-* Keep heading anchors when moving sections, or update every link to them. Check local
-  links and cited source paths after a move. `mise run lint:doc-paths` checks cited source
-  paths and links on the public entry pages. `mise run test:quickstart` runs the README's
-  query examples against a freshly built server.
+* Keep workflows and examples in [Usage](USAGE.md), exact HTTP contracts in
+  [HTTP API](API.md), and system design in [Architecture](ARCHITECTURE.md). Link between
+  them instead of duplicating content.
+* [Features](FEATURES.md) owns the capability matrix, while the category guides own
+  current scope, configuration, usage links, and known gaps. [Comparison](COMPARISON.md)
+  explains what those boundaries mean when migrating from another engine.
+* Benchmark categories keep methodology, manual reports, generated tables, and immutable
+  run catalogs distinct. Local optimization notes stay in
+  [Query optimizations](internals/OPTIMIZATIONS.md) and identify themselves as local.
+* Design specs preserve their original design. Update a spec's status and Outcome section
+  alongside user-facing guides when phases ship; a specified phase is not a shipped
+  feature.
+* Preserve heading anchors when editing or moving sections, or update every link that
+  targets them. Run `mise run lint:doc-paths` to check cited source paths and links on
+  public entry pages, and `mise run test:quickstart` to test the README quick start
+  against a freshly built server.

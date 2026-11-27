@@ -2,6 +2,7 @@
 
 use super::router;
 use crate::obs::Phase;
+use crate::state::tests::HookPoint;
 use crate::state::{AppState, DbType};
 use axum::Router;
 use axum::body::Body;
@@ -101,6 +102,151 @@ async fn send(app: &Router, req: Request<Body>) -> Resp {
         headers,
         body,
     }
+}
+
+#[tokio::test]
+async fn recreate_source_during_rename_cleanup_conflicts_before_publication() {
+    let s = server();
+    let original = s.state.create("a", DbType::Mem).unwrap().store.dataset_id();
+    let (paused, at_cleanup) = std::sync::mpsc::channel();
+    let (resume, release) = std::sync::mpsc::channel();
+    s.state
+        .lifecycle_hooks
+        .set(HookPoint::RenameCleanup, "a", move || {
+            paused.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(15)).unwrap();
+        });
+    let renaming = {
+        let st = s.state.clone();
+        std::thread::spawn(move || st.rename("a", "b").unwrap())
+    };
+    at_cleanup.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    assert_eq!(s.state.catalog.get("b").unwrap().dataset_id(), original);
+    let create = || {
+        Request::post("/$/datasets")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"dbName":"a","dbType":"persistent"}"#))
+            .unwrap()
+    };
+    let conflict = send(&s.app, create()).await;
+    let reservation_conflict = s.state.reserve("a", "reserve-test").is_err();
+    let published = s.state.catalog.get("a").is_some();
+    let directory_created = s.state.data_dir.join("databases/a").exists();
+    resume.send(()).unwrap();
+    renaming.join().unwrap();
+
+    assert_eq!(conflict.status, StatusCode::CONFLICT, "{}", conflict.text());
+    assert!(reservation_conflict);
+    assert!(!published);
+    assert!(!directory_created);
+    drop(s.state.reserve("a", "reserve-test").unwrap());
+    let recreated = send(&s.app, create()).await;
+    assert_eq!(
+        recreated.status,
+        StatusCode::CREATED,
+        "{}",
+        recreated.text()
+    );
+    let id = s.state.get("a").unwrap().store.dataset_id();
+    assert_ne!(id, original);
+    assert_eq!(recreated.json()["id"], id.to_string());
+}
+
+#[tokio::test]
+async fn persistent_rename_recovery_moves_request_metrics_before_source_reuse() {
+    let s = server_with(|st| st.metrics = crate::obs::Metrics::new(true, 3));
+    let original = {
+        let a = s.state.create("a", DbType::Persistent).unwrap();
+        a.dataset
+            .update("INSERT DATA { <urn:original> <urn:p> 1 }")
+            .unwrap();
+        a.store.dataset_id()
+    };
+    let query =
+        |name| format!("/{name}/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D");
+    let series = |name| format!(r#"sparkles_rows_produced_total{{dataset="{name}"}}"#);
+    let peaks = |name| format!(r#"sparkles_query_memory_peak_bytes_count{{dataset="{name}"}}"#);
+    assert_eq!(get(&s.app, &query("a")).await.status, StatusCode::OK);
+    let before = metrics_once(&s.app, &peaks("a"), 1.0).await;
+    let original_rows = sample(&before, &series("a")).unwrap();
+    assert!(original_rows > 0.0);
+
+    sparkles::Catalog::fail_next_rename_registry_sync();
+    let error = s.state.rename("a", "b").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected rename registry sync failure")
+    );
+    assert!(s.state.get("a").is_none());
+    assert_eq!(s.state.get("b").unwrap().store.dataset_id(), original);
+
+    let recovered = metrics(&s.app).await;
+    assert_eq!(sample(&recovered, &series("b")), Some(original_rows));
+    assert_eq!(sample(&recovered, &peaks("b")), Some(1.0));
+    assert_eq!(sample(&recovered, &series("a")), None);
+    assert_eq!(get(&s.app, &query("b")).await.status, StatusCode::OK);
+    let queried = metrics_once(&s.app, &peaks("b"), 2.0).await;
+    let destination_rows = sample(&queried, &series("b")).unwrap();
+    assert!(destination_rows > original_rows);
+
+    {
+        let recreated = s.state.create("a", DbType::Persistent).unwrap();
+        assert_ne!(recreated.store.dataset_id(), original);
+        recreated
+            .dataset
+            .update("INSERT DATA { <urn:fresh> <urn:p> 2 }")
+            .unwrap();
+    }
+    let fresh = metrics(&s.app).await;
+    assert_eq!(sample(&fresh, &series("a")), Some(0.0));
+    assert_eq!(sample(&fresh, &peaks("a")), None);
+    assert_eq!(get(&s.app, &query("a")).await.status, StatusCode::OK);
+    let after = metrics_once(&s.app, &peaks("a"), 1.0).await;
+    assert!(sample(&after, &series("a")).unwrap() > 0.0);
+    assert_eq!(sample(&after, &series("b")), Some(destination_rows));
+    assert_eq!(sample(&after, &peaks("b")), Some(2.0));
+}
+
+#[tokio::test]
+async fn persistent_rename_with_detached_destination_clears_source_request_metrics() {
+    let s = server_with(|st| st.metrics = crate::obs::Metrics::new(true, 3));
+    let original = {
+        let a = s.state.create("a", DbType::Persistent).unwrap();
+        a.dataset
+            .update("INSERT DATA { <urn:original> <urn:p> 1 }")
+            .unwrap();
+        a.store.dataset_id()
+    };
+    let query = "/a/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D";
+    let rows = r#"sparkles_rows_produced_total{dataset="a"}"#;
+    let peaks = r#"sparkles_query_memory_peak_bytes_count{dataset="a"}"#;
+    assert_eq!(get(&s.app, query).await.status, StatusCode::OK);
+    let before = metrics_once(&s.app, peaks, 1.0).await;
+    assert!(sample(&before, rows).unwrap() > 0.0);
+
+    sparkles::Catalog::fail_next_rename_registry_sync();
+    sparkles::Catalog::fail_next_rename_recovery_reopen();
+    let error = s.state.rename("a", "b").unwrap_err().to_string();
+    assert!(
+        error.contains("injected rename registry sync failure"),
+        "{error}"
+    );
+    assert!(
+        error.contains("reopening the dataset failed too"),
+        "{error}"
+    );
+    assert_eq!(s.state.catalog.closed(), ["b"]);
+    assert!(s.state.get("b").is_none());
+
+    let recreated = s.state.create("a", DbType::Persistent).unwrap();
+    assert_ne!(recreated.store.dataset_id(), original);
+    let fresh = metrics(&s.app).await;
+    assert_eq!(
+        (sample(&fresh, rows), sample(&fresh, peaks)),
+        (Some(0.0), None)
+    );
 }
 
 async fn get(app: &Router, uri: &str) -> Resp {
@@ -282,11 +428,215 @@ async fn metrics_count_requests_by_dataset_operation_and_outcome() {
     }
 }
 
+async fn metrics_json_resp(app: &Router) -> J {
+    let r = get(app, "/$/metrics?format=json").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+/// Assert that the JSON snapshot agrees with Prometheus text on every Phase 2 series
+/// (`rows_produced`, `query_memory_peak`, `rebuilds`, `rebuild_duration`) for `label`.
+fn assert_prom_json_phase2_parity(prom: &str, json: &J, label: &str) {
+    let mem_bounds: Vec<u64> = json["queryMemoryPeakBucketBounds"]
+        .as_array()
+        .expect("queryMemoryPeakBucketBounds")
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    assert_eq!(mem_bounds, crate::obs::MEMORY_BUCKETS);
+
+    let rebuild_bounds: Vec<f64> = json["rebuildDurationBucketBounds"]
+        .as_array()
+        .expect("rebuildDurationBucketBounds")
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    assert_eq!(rebuild_bounds, sparkles::store::REBUILD_BUCKETS);
+
+    let ds = json["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == label)
+        .unwrap_or_else(|| panic!("dataset {label} missing from JSON snapshot: {json}"));
+
+    // rows_produced
+    let rows_produced = ds["rowsProduced"].as_u64().expect("rowsProduced");
+    assert_eq!(
+        sample(
+            prom,
+            &format!(r#"sparkles_rows_produced_total{{dataset="{label}"}}"#)
+        ),
+        Some(rows_produced as f64),
+        "rows_produced mismatch for {label}\n{prom}\n{ds}"
+    );
+
+    // query_memory_peak
+    if ds["queryMemoryPeak"].is_null() {
+        assert!(
+            !prom.contains(&format!(
+                r#"sparkles_query_memory_peak_bytes_count{{dataset="{label}"}}"#
+            )),
+            "unexpected query_memory_peak series in Prometheus for {label}\n{prom}"
+        );
+    } else {
+        let peak = &ds["queryMemoryPeak"];
+        let count = peak["count"].as_u64().unwrap();
+        let sum = peak["sumBytes"].as_u64().unwrap();
+        let buckets: Vec<u64> = peak["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert_eq!(buckets.len(), mem_bounds.len() + 1);
+        assert_eq!(*buckets.last().unwrap(), count);
+        assert_eq!(
+            sample(
+                prom,
+                &format!(r#"sparkles_query_memory_peak_bytes_count{{dataset="{label}"}}"#)
+            ),
+            Some(count as f64),
+            "query_memory_peak count mismatch for {label}"
+        );
+        assert_eq!(
+            sample(
+                prom,
+                &format!(r#"sparkles_query_memory_peak_bytes_sum{{dataset="{label}"}}"#)
+            ),
+            Some(sum as f64),
+            "query_memory_peak sum mismatch for {label}"
+        );
+        for (i, b) in buckets.iter().enumerate() {
+            let le = mem_bounds
+                .get(i)
+                .map_or("+Inf".to_string(), |v| v.to_string());
+            assert_eq!(
+                sample(
+                    prom,
+                    &format!(
+                        r#"sparkles_query_memory_peak_bytes_bucket{{dataset="{label}",le="{le}"}}"#
+                    )
+                ),
+                Some(*b as f64),
+                "query_memory_peak bucket le={le} mismatch for {label}"
+            );
+        }
+    }
+
+    // rebuilds + rebuild_duration by reason
+    let rebuilds = ds["rebuilds"].as_object().expect("rebuilds object");
+    assert_eq!(rebuilds.len(), 2);
+    for reason in sparkles::store::RebuildReason::ALL {
+        let r = reason.as_str();
+        let entry = &rebuilds[r];
+        let count = entry["count"].as_u64().unwrap();
+        assert_eq!(
+            sample(
+                prom,
+                &format!(r#"sparkles_rebuilds_total{{dataset="{label}",reason="{r}"}}"#)
+            ),
+            Some(count as f64),
+            "rebuilds_total mismatch for {label}/{r}"
+        );
+        if count == 0 {
+            assert!(
+                entry["duration"].is_null(),
+                "zero rebuilds must have null duration for {label}/{r}: {entry}"
+            );
+            assert!(
+                !prom.contains(&format!(
+                    r#"sparkles_rebuild_duration_seconds_count{{dataset="{label}",reason="{r}"}}"#
+                )),
+                "unexpected rebuild_duration in Prometheus for {label}/{r}\n{prom}"
+            );
+        } else {
+            let dur = &entry["duration"];
+            let dcount = dur["count"].as_u64().unwrap();
+            let dsum = dur["sumSeconds"].as_f64().unwrap();
+            let buckets: Vec<u64> = dur["buckets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect();
+            assert_eq!(dcount, count);
+            assert_eq!(buckets.len(), rebuild_bounds.len() + 1);
+            assert_eq!(*buckets.last().unwrap(), dcount);
+            assert_eq!(
+                sample(
+                    prom,
+                    &format!(
+                        r#"sparkles_rebuild_duration_seconds_count{{dataset="{label}",reason="{r}"}}"#
+                    )
+                ),
+                Some(dcount as f64),
+                "rebuild_duration count mismatch for {label}/{r}"
+            );
+            let psum = sample(
+                prom,
+                &format!(
+                    r#"sparkles_rebuild_duration_seconds_sum{{dataset="{label}",reason="{r}"}}"#
+                ),
+            )
+            .unwrap();
+            assert!(
+                (psum - dsum).abs() <= 1e-9,
+                "rebuild_duration sum mismatch for {label}/{r}: prom={psum} json={dsum}"
+            );
+            for (i, b) in buckets.iter().enumerate() {
+                let le = rebuild_bounds
+                    .get(i)
+                    .map_or("+Inf".to_string(), |v| v.to_string());
+                assert_eq!(
+                    sample(
+                        prom,
+                        &format!(
+                            r#"sparkles_rebuild_duration_seconds_bucket{{dataset="{label}",reason="{r}",le="{le}"}}"#
+                        )
+                    ),
+                    Some(*b as f64),
+                    "rebuild_duration bucket le={le} mismatch for {label}/{r}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn metrics_count_work_memory_peaks_and_rebuilds() {
-    let s = server();
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(
+            dir.path(),
+            StoreOptions {
+                bulk_threshold: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    let ds = state.attach("ds", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    // Also attach an untouched empty dataset with zero rebuilds and zero queries.
+    state.attach("empty", DbType::Mem, None).unwrap();
+    state.set_phase(Phase::Ready);
+    let s = Server {
+        _dir: dir,
+        app: router(state.clone()),
+        state,
+    };
+
     // the fixture's load into an empty dataset was a bulk commit
     let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
     for (series, v) in [
         (
             r#"sparkles_rebuilds_total{dataset="ds",reason="bulk"}"#,
@@ -309,6 +659,21 @@ async fn metrics_count_work_memory_peaks_and_rebuilds() {
         !m.contains(r#"sparkles_rebuild_duration_seconds_count{dataset="ds",reason="compact"}"#)
     );
     assert!(!m.contains("sparkles_query_memory_peak_bytes_count"), "{m}");
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "empty");
+
+    let empty_ds = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "empty")
+        .unwrap();
+    assert_eq!(empty_ds["rowsProduced"], 0);
+    assert!(empty_ds["queryMemoryPeak"].is_null());
+    assert_eq!(empty_ds["rebuilds"]["compact"]["count"], 0);
+    assert!(empty_ds["rebuilds"]["compact"]["duration"].is_null());
+    assert_eq!(empty_ds["rebuilds"]["bulk"]["count"], 0);
+    assert!(empty_ds["rebuilds"]["bulk"]["duration"].is_null());
 
     assert_eq!(get(&s.app, ALL).await.status, StatusCode::OK);
     let rq = Request::post("/ds/update")
@@ -319,9 +684,75 @@ async fn metrics_count_work_memory_peaks_and_rebuilds() {
         ))
         .unwrap();
     assert_eq!(send(&s.app, rq).await.status, StatusCode::OK);
+
+    // Failed bulk load, dry-run bulk load, and cancelled compaction publish nothing and
+    // must not increment rebuild counters or histograms in either format.
     let ds = s.state.datasets()["ds"].clone();
+    assert!(
+        ds.store
+            .load(&[Source::from_bytes(
+                b"not valid ntriples".to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .is_err()
+    );
+    let bulk_nt: String = (0..30)
+        .map(|i| format!("<http://example.org/b{i}> <http://example.org/p> \"{i}\" .\n"))
+        .collect();
+    let dry = sparkles::guard::WriteOptions {
+        dry_run: Some(sparkles::preview::DryRun::default()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        ds.store.load_with(
+            &[Source::from_bytes(
+                bulk_nt.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )],
+            sparkles::commit::CommitKind::Load,
+            &dry,
+        ),
+        Err(sparkles::Error::DryRun(_))
+    ));
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    assert!(matches!(
+        ds.store.compact_with(&sparkles::store::CompactOptions {
+            cancel: Some(cancel),
+            ..Default::default()
+        }),
+        Err(sparkles::Error::Cancelled)
+    ));
+    let m_after_failed = metrics(&s.app).await;
+    let j_after_failed = metrics_json_resp(&s.app).await;
+    assert_eq!(
+        sample(
+            &m_after_failed,
+            r#"sparkles_rebuilds_total{dataset="ds",reason="bulk"}"#
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        sample(
+            &m_after_failed,
+            r#"sparkles_rebuilds_total{dataset="ds",reason="compact"}"#
+        ),
+        Some(0.0)
+    );
+    assert_prom_json_phase2_parity(&m_after_failed, &j_after_failed, "ds");
+
+    // Successful compaction and a second bulk publication.
     ds.store.compact().unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            bulk_nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
     let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
     // the query's 9 rows at least, and the rows of the update's WHERE
     let produced = sample(&m, r#"sparkles_rows_produced_total{dataset="ds"}"#).unwrap();
     assert!(produced >= 11.0, "{m}");
@@ -343,6 +774,14 @@ async fn metrics_count_work_memory_peaks_and_rebuilds() {
             r#"sparkles_rebuild_duration_seconds_bucket{dataset="ds",reason="compact",le="+Inf"}"#,
             1.0,
         ),
+        (
+            r#"sparkles_rebuilds_total{dataset="ds",reason="bulk"}"#,
+            2.0,
+        ),
+        (
+            r#"sparkles_rebuild_duration_seconds_bucket{dataset="ds",reason="bulk",le="+Inf"}"#,
+            2.0,
+        ),
     ] {
         assert_eq!(sample(&m, series), Some(v), "{series}\n{m}");
     }
@@ -351,6 +790,536 @@ async fn metrics_count_work_memory_peaks_and_rebuilds() {
         r#"sparkles_rebuild_duration_seconds_sum{dataset="ds",reason="compact"}"#,
     );
     assert!(sum.unwrap() > 0.0, "{m}");
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "empty");
+}
+
+#[tokio::test]
+async fn metrics_parity_dataset_cap_reset_reopen_and_auth() {
+    // 1. Dataset-label cap (`--metrics-max-datasets=1`): overflow datasets aggregate into `$other`.
+    let s = server_with(|st| st.metrics = crate::obs::Metrics::new(true, 1));
+    // Trigger `ds` first so it claims the 1 named slot.
+    assert_eq!(get(&s.app, ALL).await.status, StatusCode::OK);
+    for extra in ["extra1", "extra2"] {
+        let d = s.state.attach(extra, DbType::Mem, None).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        d.store.compact().unwrap();
+        assert_eq!(
+            get(
+                &s.app,
+                &format!("/{extra}/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D")
+            )
+            .await
+            .status,
+            StatusCode::OK
+        );
+    }
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert!(!m.contains("extra1") && !m.contains("extra2"), "{m}");
+    assert!(
+        !j["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "extra1" || d["name"] == "extra2"),
+        "{j}"
+    );
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["queryMemoryPeak"]["count"], 2);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 2);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 2);
+
+    // Deleting one overflow dataset must keep `$other` counters and rebuilds monotonic.
+    assert!(s.state.delete("extra1").unwrap());
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["queryMemoryPeak"]["count"], 2);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 2);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 2);
+
+    // Deleting the final overflow dataset keeps `$other` in both Prometheus and JSON
+    // with zero live quads and preserved monotonic counters/rebuilds.
+    assert!(s.state.delete("extra2").unwrap());
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["quads"], 0);
+    assert_eq!(other["queryMemoryPeak"]["count"], 2);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 2);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 2);
+
+    // Adding a new overflow dataset continues `$other` monotonically.
+    {
+        let d = s.state.attach("extra3", DbType::Mem, None).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        d.store.compact().unwrap();
+    }
+    assert_eq!(
+        get(
+            &s.app,
+            "/extra3/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D"
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["queryMemoryPeak"]["count"], 3);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 3);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 3);
+
+    // Deleting the named slot (`ds`) promotes `extra3` cleanly to its own named slot
+    // while retiring `extra3`'s earlier rebuilds into `$other` without double counting.
+    assert!(s.state.delete("ds").unwrap());
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert!(!m.contains(r#"dataset="ds""#), "{m}");
+    assert_prom_json_phase2_parity(&m, &j, "extra3");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let promoted = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "extra3")
+        .unwrap();
+    assert_eq!(promoted["rowsProduced"], 0);
+    assert_eq!(promoted["rebuilds"]["bulk"]["count"], 0);
+    assert_eq!(promoted["rebuilds"]["compact"]["count"], 0);
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 3);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 3);
+
+    // 2. Rename preserves Phase 2 counters and histograms, then delete/recreate resets them.
+    let s = server();
+    let create = Request::post("/$/datasets")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"dbName":"tmp","dbType":"mem"}"#))
+        .unwrap();
+    assert_eq!(send(&s.app, create).await.status, StatusCode::CREATED);
+    {
+        let tmp = s.state.get("tmp").unwrap();
+        tmp.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        tmp.store.compact().unwrap();
+    }
+    assert_eq!(
+        get(
+            &s.app,
+            "/tmp/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D"
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let m_before = metrics(&s.app).await;
+    let j_before = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m_before, &j_before, "tmp");
+    let tmp_before = j_before["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "tmp")
+        .unwrap()
+        .clone();
+    s.state.rename("tmp", "tmp_renamed").unwrap();
+    let m_renamed = metrics(&s.app).await;
+    let j_renamed = metrics_json_resp(&s.app).await;
+    assert!(!m_renamed.contains(r#"dataset="tmp""#), "{m_renamed}");
+    assert!(
+        !j_renamed["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "tmp"),
+        "{j_renamed}"
+    );
+    assert_prom_json_phase2_parity(&m_renamed, &j_renamed, "tmp_renamed");
+    let renamed_ds = j_renamed["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "tmp_renamed")
+        .unwrap();
+    assert_eq!(renamed_ds["rowsProduced"], tmp_before["rowsProduced"]);
+    assert_eq!(renamed_ds["queryMemoryPeak"], tmp_before["queryMemoryPeak"]);
+    assert_eq!(renamed_ds["rebuilds"], tmp_before["rebuilds"]);
+
+    let del = Request::delete("/$/datasets/tmp_renamed")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&s.app, del).await.status, StatusCode::OK);
+    let m_del = metrics(&s.app).await;
+    let j_del = metrics_json_resp(&s.app).await;
+    assert!(!m_del.contains(r#"dataset="tmp_renamed""#), "{m_del}");
+    assert!(
+        !j_del["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "tmp_renamed"),
+        "{j_del}"
+    );
+    let create = Request::post("/$/datasets")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"dbName":"tmp_renamed","dbType":"mem"}"#))
+        .unwrap();
+    assert_eq!(send(&s.app, create).await.status, StatusCode::CREATED);
+    let m_new = metrics(&s.app).await;
+    let j_new = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m_new, &j_new, "tmp_renamed");
+    let new_ds = j_new["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "tmp_renamed")
+        .unwrap();
+    assert_eq!(new_ds["rowsProduced"], 0);
+    assert!(new_ds["queryMemoryPeak"].is_null());
+    assert_eq!(new_ds["rebuilds"]["compact"]["count"], 0);
+    assert!(new_ds["rebuilds"]["compact"]["duration"].is_null());
+    assert_eq!(new_ds["rebuilds"]["bulk"]["count"], 0);
+    assert!(new_ds["rebuilds"]["bulk"]["duration"].is_null());
+
+    // 3. Reopening a persistent dataset resets rebuild counts and durations to zero.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let st = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        let d = st.create("disk", DbType::Persistent).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        d.store.compact().unwrap();
+        st.set_phase(Phase::Ready);
+        let app = router(st);
+        let m = metrics(&app).await;
+        let j = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m, &j, "disk");
+        let disk = j["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "disk")
+            .unwrap();
+        assert_eq!(disk["rebuilds"]["bulk"]["count"], 1);
+        assert_eq!(disk["rebuilds"]["compact"]["count"], 1);
+    }
+    {
+        let st = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        st.set_phase(Phase::Ready);
+        let app = router(st);
+        let m = metrics(&app).await;
+        let j = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m, &j, "disk");
+        let disk = j["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "disk")
+            .unwrap();
+        assert_eq!(disk["quads"], 11);
+        assert_eq!(disk["rowsProduced"], 0);
+        assert!(disk["queryMemoryPeak"].is_null());
+        assert_eq!(disk["rebuilds"]["bulk"]["count"], 0);
+        assert!(disk["rebuilds"]["bulk"]["duration"].is_null());
+        assert_eq!(disk["rebuilds"]["compact"]["count"], 0);
+        assert!(disk["rebuilds"]["compact"]["duration"].is_null());
+    }
+
+    // 3b. Persistent overflow rename conserves `$other` rebuilds, promoted persistent
+    //     rename drops stale `promoted_offset`, and unscraped named-eligible delete does
+    //     not leak into `$other`.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = AppState::new(
+            dir.path(),
+            StoreOptions {
+                bulk_threshold: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        st.metrics = crate::obs::Metrics::new(true, 1);
+        let st = Arc::new(st);
+        st.create("a", DbType::Mem).unwrap();
+        {
+            let b = st.create("b", DbType::Persistent).unwrap();
+            b.store
+                .load(&[Source::from_bytes(
+                    DATA.as_bytes().to_vec(),
+                    oxrdfio::RdfFormat::TriG,
+                    None,
+                )])
+                .unwrap();
+        }
+        st.set_phase(Phase::Ready);
+        let app = router(st.clone());
+        assert_eq!(
+            get(&app, "/a/sparql?query=ASK%7B%7D").await.status,
+            StatusCode::OK
+        );
+        let m1 = metrics(&app).await;
+        let j1 = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m1, &j1, "$other");
+        // Persistent overflow rename `b -> c` keeps `$other` at 1.
+        st.rename("b", "c").unwrap();
+        let m2 = metrics(&app).await;
+        let j2 = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m2, &j2, "$other");
+        let other2 = j2["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "$other")
+            .unwrap();
+        assert_eq!(other2["rebuilds"]["bulk"]["count"], 1);
+        // Promote `c` after deleting `a`, then persistent rename `c -> d`: fresh `d`
+        // reports its first post-rename rebuild as 1 without stale `promoted_offset`.
+        {
+            let c = st.get("c").unwrap();
+            let nt: String = (0..5)
+                .map(|i| format!("<http://example.org/n1_{i}> <http://example.org/p> \"{i}\" .\n"))
+                .collect();
+            c.store
+                .load(&[Source::from_bytes(
+                    nt.into_bytes(),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+        }
+        let _ = metrics_json_resp(&app).await;
+        assert!(st.delete("a").unwrap());
+        let _ = metrics_json_resp(&app).await;
+        st.rename("c", "d").unwrap();
+        {
+            let d = st.get("d").unwrap();
+            let nt: String = (0..5)
+                .map(|i| format!("<http://example.org/n2_{i}> <http://example.org/p> \"{i}\" .\n"))
+                .collect();
+            d.store
+                .load(&[Source::from_bytes(
+                    nt.into_bytes(),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+        }
+        let m3 = metrics(&app).await;
+        let j3 = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m3, &j3, "d");
+        let d3 = j3["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "d")
+            .unwrap();
+        assert_eq!(d3["rebuilds"]["bulk"]["count"], 1);
+        // Delete `d` so `named = 0 < 1` while `$other` exists; unscraped `x` must not leak.
+        assert!(st.delete("d").unwrap());
+        let j4 = metrics_json_resp(&app).await;
+        let before = j4["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "$other")
+            .unwrap()["rebuilds"]["bulk"]["count"]
+            .as_u64()
+            .unwrap();
+        {
+            let x = st.create("x", DbType::Mem).unwrap();
+            x.store
+                .load(&[Source::from_bytes(
+                    DATA.as_bytes().to_vec(),
+                    oxrdfio::RdfFormat::TriG,
+                    None,
+                )])
+                .unwrap();
+        }
+        assert!(st.delete("x").unwrap());
+        let j5 = metrics_json_resp(&app).await;
+        let after = j5["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "$other")
+            .unwrap()["rebuilds"]["bulk"]["count"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    // 4. Access policy: both Prometheus and JSON require `metrics` permission and never
+    //    leak unauthorized or nonexistent dataset names.
+    #[cfg(feature = "auth")]
+    {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let reader_pw = crate::auth::hash_password_with("reader-pw", 8, 1, 1).unwrap();
+        let obs_pw = crate::auth::hash_password_with("obs-pw", 8, 1, 1).unwrap();
+        let cfg_path = dir.path().join("auth.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+version = 1
+
+[[users]]
+name = "reader"
+password = "{reader_pw}"
+datasets = {{ ds = "read" }}
+
+[[users]]
+name = "observer"
+password = "{obs_pw}"
+server = ["metrics"]
+"#
+            ),
+        )
+        .unwrap();
+        let mut st =
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        st.auth = Some(Arc::new(
+            crate::auth::Auth::open(&cfg_path, dir.path()).unwrap().0,
+        ));
+        let st = Arc::new(st);
+        let d = st.attach("ds", DbType::Mem, None).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        st.set_phase(Phase::Ready);
+        let app = router(st);
+        let basic = |u: &str, p: &str| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"))
+            )
+        };
+        for path in ["/$/metrics", "/$/metrics?format=json"] {
+            assert_eq!(get(&app, path).await.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                get_with(&app, path, "authorization", &basic("reader", "reader-pw"))
+                    .await
+                    .status,
+                StatusCode::FORBIDDEN
+            );
+        }
+        // Reader probes a nonexistent dataset and runs a query on `ds`.
+        assert_eq!(
+            get_with(
+                &app,
+                "/secret/sparql?query=ASK%7B%7D",
+                "authorization",
+                &basic("reader", "reader-pw"),
+            )
+            .await
+            .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_with(&app, ALL, "authorization", &basic("reader", "reader-pw"))
+                .await
+                .status,
+            StatusCode::OK
+        );
+        let auth_hdr = basic("observer", "obs-pw");
+        let prom = get_with(&app, "/$/metrics", "authorization", &auth_hdr).await;
+        let json_r = get_with(&app, "/$/metrics?format=json", "authorization", &auth_hdr).await;
+        assert_eq!(prom.status, StatusCode::OK);
+        assert_eq!(json_r.status, StatusCode::OK);
+        let m = prom.text();
+        let j = json_r.json();
+        assert!(!m.contains("secret"), "{m}");
+        assert!(!j.to_string().contains("secret"), "{j}");
+        // `$none` belongs to request series only, never dataset work/memory series.
+        assert!(
+            m.contains(r#"sparkles_requests_total{dataset="$none""#),
+            "{m}"
+        );
+        assert!(
+            !m.contains(r#"sparkles_rows_produced_total{dataset="$none"}"#),
+            "{m}"
+        );
+        assert!(
+            !m.contains(r#"sparkles_query_memory_peak_bytes_count{dataset="$none"}"#),
+            "{m}"
+        );
+        assert!(
+            !j["datasets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["name"] == "$none"),
+            "{j}"
+        );
+        assert_prom_json_phase2_parity(&m, &j, "ds");
+    }
 }
 
 #[tokio::test]
@@ -680,11 +1649,13 @@ async fn updates_have_their_own_timeout() {
 #[tokio::test]
 async fn memory_budget_fails_with_507() {
     // A one-row answer charges its result backing, variables and table, which
-    // need more than 1 KiB, so the budget is 4 KiB.
-    let s = server_with(|st| st.limits.query_memory_bytes = Some(4096));
+    // need more than 1 KiB, and its writer charges its 8 KiB output buffer and first
+    // row marks (9 KiB) at its first byte, so the budget is 16 KiB, which a cross
+    // product of three patterns over the test data exceeds.
+    let s = server_with(|st| st.limits.query_memory_bytes = Some(16 << 10));
     let r = get(
         &s.app,
-        "/ds/sparql?query=SELECT%20*%20WHERE%20%7B%3Fa%20%3Fb%20%3Fc%20.%20%3Fd%20%3Fe%20%3Ff%7D",
+        "/ds/sparql?query=SELECT%20*%20WHERE%20%7B%3Fa%20%3Fb%20%3Fc%20.%20%3Fd%20%3Fe%20%3Ff%20.%20%3Fg%20%3Fh%20%3Fi%7D",
     )
     .await;
     assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
@@ -697,8 +1668,8 @@ async fn memory_budget_fails_with_507() {
         "{j}"
     );
     assert_eq!(j["budget"], "memory");
-    assert_eq!(j["limit"], 4096);
-    assert!(j["requested"].as_u64().unwrap() > 4096);
+    assert_eq!(j["limit"], 16 << 10);
+    assert!(j["requested"].as_u64().unwrap() > 16 << 10);
     let m = metrics(&s.app).await;
     assert_eq!(
         sample(
@@ -725,7 +1696,7 @@ async fn memory_budget_fails_with_507() {
     let upd = Request::post("/ds/update")
         .header(header::CONTENT_TYPE, "application/sparql-update")
         .body(Body::from(
-            "INSERT { ?a <urn:x> ?d } WHERE { ?a ?b ?c . ?d ?e ?f }",
+            "INSERT { ?a <urn:x> ?d } WHERE { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i }",
         ))
         .unwrap();
     let r = send(&s.app, upd).await;
@@ -926,6 +1897,13 @@ fn access_lines(access_log: bool) -> Vec<String> {
 
 /// The `sparkles::access` lines logged while `run` runs on a current-thread runtime.
 fn access_lines_of<F: std::future::Future<Output = ()>>(run: impl FnOnce() -> F) -> Vec<String> {
+    access_lines_with_runtime(tokio::runtime::Builder::new_current_thread(), run)
+}
+
+fn access_lines_with_runtime<F: std::future::Future<Output = ()>>(
+    mut runtime: tokio::runtime::Builder,
+    run: impl FnOnce() -> F,
+) -> Vec<String> {
     // While a single dispatcher exists, tracing computes the interest of a callsite first
     // hit on another thread from that thread's default (none, in parallel tests) and
     // caches it for everyone; a second live dispatcher turns that shortcut off.
@@ -941,11 +1919,7 @@ fn access_lines_of<F: std::future::Future<Output = ()>>(run: impl FnOnce() -> F)
         // callsites first hit by tests running in parallel (without a subscriber) may
         // have cached that they are disabled
         tracing::callsite::rebuild_interest_cache();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(run());
+        runtime.enable_all().build().unwrap().block_on(run());
     });
     let text = String::from_utf8(buf.0.lock().clone()).unwrap();
     text.lines()
@@ -1284,10 +2258,6 @@ async fn cursor_rejects_unsupported_modes_and_preserves_early_errors() {
         (
             format!("{ALL}&execution=bad&format=json"),
             StatusCode::BAD_REQUEST,
-        ),
-        (
-            format!("{ALL}&execution=streaming&format=application%2Fsparql-results%2Bthrift"),
-            StatusCode::NOT_IMPLEMENTED,
         ),
         (
             "/ds/sparql?execution=streaming&format=json&query=SELEKT".into(),
@@ -1673,6 +2643,389 @@ fn late_streamed_byte_budget_aborts_and_reports_the_rows_sent() {
     }
 }
 
+/// A body cut by `--max-result-mb` while its reader has stopped reading cannot send the
+/// chunk it had buffered, because the idle timer ends the transfer first. The rows logged
+/// are the rows whose ends lie in the bytes the transport accepted, which leaves out the
+/// rows of that unsent chunk (item 243). Short rows end many to a piece of the writer's
+/// buffer. Rows longer than the buffer go to the transport as direct writes, which are
+/// copied into its buffer in parts, and rows longer than a chunk end in a later chunk
+/// than the one they start in.
+#[test]
+fn a_failed_budget_flush_reports_only_the_rows_sent() {
+    let chunk = super::stream::CHUNK;
+    for (rows, len) in [(5000, 512), (120, 20 << 10), (40, chunk + chunk / 8)] {
+        for format in ["tsv", "thrift"] {
+            failed_budget_flush_case(rows, len, format);
+        }
+    }
+}
+
+/// A body that the result-size budget stops before the response is committed is answered
+/// with 507, and none of its rows reached the client, so the access log reports no rows,
+/// even though whole rows had already been copied into the buffer that the error
+/// discards.
+#[test]
+fn a_budget_error_before_the_commit_reports_no_rows() {
+    // The budget lets several of the writer's 8 KiB pieces through and refuses a later
+    // one, below both the eager switch and a stream's first bytes.
+    let budget = 40 << 10;
+    assert!(budget < super::stream::FIRST_BYTES_AFTER);
+    let data = (0..5000)
+        .map(|i| format!("<urn:big:{i}> <urn:big> \"{}\" .\n", "x".repeat(512)))
+        .collect::<String>();
+    for execution in ["eager", "streaming"] {
+        for format in ["tsv", "thrift"] {
+            let lines = access_lines_of(|| async {
+                let s = server_with(|st| {
+                    st.access_log = true;
+                    st.limits.max_result_bytes = Some(budget as u64);
+                });
+                s.state
+                    .get("ds")
+                    .unwrap()
+                    .store
+                    .load(&[Source::from_bytes(
+                        data.clone().into_bytes(),
+                        oxrdfio::RdfFormat::NTriples,
+                        None,
+                    )])
+                    .unwrap();
+                let uri = format!(
+                    "/ds/sparql?execution={execution}&format={format}&query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn:big%3E%20%3Fo%7D"
+                );
+                let r = get(&s.app, &uri).await;
+                assert_eq!(
+                    r.status,
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "{execution} {format}: {}",
+                    r.text()
+                );
+            })
+            .into_iter()
+            .filter(|l| l.contains(r#""route":"/{ds}/sparql""#))
+            .collect::<Vec<_>>();
+            assert_eq!(lines.len(), 1, "{execution} {format}: {lines:#?}");
+            let j: J = serde_json::from_str(&lines[0]).unwrap();
+            let f = &j["fields"];
+            assert_eq!(f["outcome"], "budget", "{execution} {format}: {f}");
+            assert_eq!(f["status"], 507, "{execution} {format}: {f}");
+            assert!(
+                f.get("rows").is_none_or(J::is_null),
+                "{execution} {format}: an error response sent no rows: {f}"
+            );
+        }
+    }
+}
+
+#[test]
+fn http1_fixed_length_cursor_responses_keep_their_status() {
+    use super::cursor::{AutoOutcome, AutoRequest, run_in_place_with_mode};
+    use super::{OutFormat, Params, inline::QuickQueries, stream};
+    use sparkles::sparql::{ExecutionMode, results::SolutionsFormat};
+    use tracing::instrument::WithSubscriber;
+
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.worker_threads(2);
+    let lines = access_lines_with_runtime(runtime, || async {
+        let s = server_with(|st| st.access_log = true);
+        let ds = s.state.get("ds").unwrap();
+        let payload = "x".repeat(256);
+        let data: String = (0..2000)
+            .map(|i| format!("<urn:fixed:{i}> <urn:fixed:p> \"{payload}\" .\n"))
+            .collect();
+        ds.store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+
+        // Exercise the in-place cursor response path independently of auto admission.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let app = Router::new()
+            .route(
+                "/ds/sparql",
+                axum::routing::post({
+                    let state = s.state.clone();
+                    move |uri: axum::http::Uri, query: String| {
+                        let (options, guard) = super::query_options_for_test(&state, &ds);
+                        let ds = ds.clone();
+                        async move {
+                            let key = QuickQueries::key(&ds.name, &query);
+                            let outcome = run_in_place_with_mode(
+                                ds,
+                                AutoRequest {
+                                    timeouts: stream::Timeouts::default(),
+                                    query,
+                                    options,
+                                    at: None,
+                                    params: &Params(Default::default()),
+                                    uri: &uri,
+                                    guard,
+                                    limit: Some(48 << 10),
+                                    format: SolutionsFormat::Tsv,
+                                    thrift: false,
+                                    rdf_format: OutFormat::Rdf(oxrdfio::RdfFormat::NTriples),
+                                    native_graph: false,
+                                    prefixes: Default::default(),
+                                    io: None,
+                                    quick_key: key,
+                                    auto: true,
+                                    trial: false,
+                                    claim: None,
+                                },
+                                ExecutionMode::Streaming,
+                            )
+                            .await
+                            .unwrap_or_else(|e| panic!("cursor failed to open: {} {}", e.0, e.1));
+                            let AutoOutcome::Responded(response) = outcome else {
+                                panic!("expected a cursor response");
+                            };
+                            if response.status().is_success() {
+                                assert_eq!(super::cursor::route_stats::in_place_whole(key), 1);
+                            }
+                            response
+                        }
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                s.state.clone(),
+                crate::obs::observe,
+            ))
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    next.run(req).with_subscriber(dispatch.clone())
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/ds/sparql", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        for (id, query, status, empty) in [
+            (
+                "fixed-whole",
+                "SELECT ?s WHERE { ?s <urn:fixed:p> ?o }",
+                StatusCode::OK,
+                false,
+            ),
+            (
+                "fixed-empty",
+                "CONSTRUCT { ?s <urn:fixed:empty> ?o } WHERE { ?s <urn:fixed:empty> ?o }",
+                StatusCode::OK,
+                true,
+            ),
+            (
+                "fixed-budget",
+                "SELECT ?s ?o WHERE { ?s <urn:fixed:p> ?o }",
+                StatusCode::INSUFFICIENT_STORAGE,
+                false,
+            ),
+        ] {
+            let response = client
+                .post(&url)
+                .header(header::CONTENT_TYPE, "application/sparql-query")
+                .header("x-request-id", id)
+                .body(query)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.version(), reqwest::Version::HTTP_11);
+            assert_eq!(response.status(), status);
+            let len: usize = response.headers()[header::CONTENT_LENGTH]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(len == 0, empty);
+            assert_eq!(response.bytes().await.unwrap().len(), len);
+        }
+
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    });
+
+    let mut observed = lines
+        .iter()
+        .map(|line| {
+            let log: J = serde_json::from_str(line).unwrap();
+            (
+                log["span"]["request_id"].as_str().unwrap().to_owned(),
+                log["fields"]["status"].as_u64().unwrap(),
+                log["fields"]["outcome"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    observed.sort_unstable();
+    assert_eq!(
+        observed,
+        [
+            ("fixed-budget".into(), 507, "budget".into()),
+            ("fixed-empty".into(), 200, "ok".into()),
+            ("fixed-whole".into(), 200, "ok".into()),
+        ]
+    );
+}
+
+/// The end offset of every row of a whole SPARQL Results Thrift body of `?s ?o`, whose rows
+/// the TSV body `tsv` holds in the same order, from the library's encoder.
+fn thrift_row_ends(tsv: &[u8], thrift: &[u8]) -> Vec<usize> {
+    let vars = ["s".to_string(), "o".to_string()];
+    let mut out = sparkles::jena_formats::ThriftResults::new(Vec::new(), &vars).unwrap();
+    let mut ends = Vec::new();
+    for line in std::str::from_utf8(tsv).unwrap().lines().skip(1) {
+        let (s, o) = line.split_once('\t').unwrap();
+        let s = oxrdf::NamedNode::new(s.trim_start_matches('<').trim_end_matches('>')).unwrap();
+        let o = oxrdf::Literal::new_simple_literal(o.trim_matches('"'));
+        out.row(&[Some(s.into()), Some(o.into())]).unwrap();
+        ends.push(out.get_mut().len());
+    }
+    let whole = out.finish().unwrap();
+    assert_eq!(whole, thrift, "the test's encoding is the server's");
+    ends
+}
+
+fn failed_budget_flush_case(rows: usize, len: usize, format: &str) {
+    let data = (0..rows)
+        .map(|i| format!("<urn:big:{i}> <urn:big> \"{}\" .\n", "x".repeat(len)))
+        .collect::<String>();
+    let load = |s: &Server| {
+        s.state
+            .get("ds")
+            .unwrap()
+            .store
+            .load(&[Source::from_bytes(
+                data.clone().into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    };
+    for execution in ["eager", "streaming"] {
+        let uri_in = |format: &str| {
+            format!(
+                "/ds/sparql?execution={execution}&format={format}&query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn:big%3E%20%3Fo%7D"
+            )
+        };
+        let uri = uri_in(format);
+        // the whole body, and the whole TSV body, from a server without the budget
+        let (mut whole, mut tsv) = (Vec::new(), Vec::new());
+        access_lines_of(|| async {
+            let s = server_with(|st| st.limits.max_result_bytes = None);
+            load(&s);
+            for (format, out) in [(format, &mut whole), ("tsv", &mut tsv)] {
+                let res = s
+                    .app
+                    .clone()
+                    .oneshot(Request::get(uri_in(format)).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                *out = axum::body::to_bytes(res.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec();
+            }
+        });
+        let ends: Vec<usize> = if format == "thrift" {
+            thrift_row_ends(&tsv, &whole)
+        } else {
+            whole
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &b)| (b == b'\n').then_some(i + 1))
+                .skip(1)
+                .collect()
+        };
+        // The switch sends `switch + 1` bytes, then `CHANNEL_CAP - 1` full chunks fill
+        // the channel while the reader reads nothing. A streaming request switches at
+        // `FIRST_BYTES_AFTER`. Choose the budget at the first encoded row end strictly
+        // past the full queue so the admitted prefix leaves a partial chunk buffered for
+        // the final flush and the next row fails the budget.
+        let switch = if execution == "eager" {
+            super::stream::STREAM_AFTER
+        } else {
+            super::stream::FIRST_BYTES_AFTER
+        };
+        let full_queue = switch + 1 + super::stream::CHUNK * (super::stream::CHANNEL_CAP - 1);
+        // `RowOut` buffers short rows in 8 KiB pieces before writing to `LimitedWriter`,
+        // so leave at least two pieces past `full_queue` for short rows while keeping the
+        // admitted tail under one `CHUNK` so the producer blocks in the final budget flush.
+        let min_accepted = if len < (8 << 10) {
+            full_queue + (16 << 10)
+        } else {
+            full_queue + 1
+        };
+        let accepted = *ends
+            .iter()
+            .find(|&&end| end >= min_accepted)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{execution} {format} {len}: body ({}) did not reach min_accepted ({min_accepted})",
+                    whole.len()
+                )
+            });
+        assert!(
+            accepted < whole.len(),
+            "{execution} {format} {len}: accepted ({accepted}) must leave a refused row"
+        );
+        assert!(
+            accepted - full_queue < super::stream::CHUNK,
+            "{execution} {format} {len}: accepted ({accepted}) must leave a partial chunk beyond full_queue ({full_queue})"
+        );
+        let lines = access_lines_of(|| async {
+            let s = server_with(|st| {
+                st.access_log = true;
+                st.stream_idle_timeout = Duration::from_millis(300);
+                st.limits.max_result_bytes = Some(accepted as u64);
+            });
+            load(&s);
+            let res = s
+                .app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{execution} {len}");
+            // the idle timer ends the transfer while the budget flush waits for room
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            drop(res);
+        })
+        .into_iter()
+        .filter(|l| l.contains(r#""route":"/{ds}/sparql""#))
+        .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "{execution} {format} {len}: {lines:#?}");
+        let j: J = serde_json::from_str(&lines[0]).unwrap();
+        let f = &j["fields"];
+        assert_eq!(f["outcome"], "budget", "{execution} {format} {len}: {f}");
+        let bytes = f["response_bytes"].as_u64().unwrap() as usize;
+        assert_eq!(
+            bytes, full_queue,
+            "{execution} {format} {len}: logged bytes must exclude the unsent partial chunk ({accepted} - {full_queue} bytes): {f}"
+        );
+        // every whole row within the bytes the transport accepted
+        let sent = ends.iter().filter(|&&end| end <= bytes).count() as u64;
+        assert_eq!(
+            f["rows"].as_u64(),
+            Some(sent),
+            "{execution} {format} {len}: the rows logged are the rows in the {bytes} bytes sent: {f}"
+        );
+    }
+}
+
 /// A HEAD request for a large eager answer gets its headers, and the server drops the
 /// streamed body on purpose. That is recorded as a complete request, not a cancelled one.
 #[tokio::test]
@@ -1915,19 +3268,44 @@ async fn the_default_streams_a_large_scan_and_eager_opts_out() {
     );
 }
 
-#[tokio::test]
-async fn the_default_runs_thrift_eagerly() {
-    let s = server();
-    million(&s);
-    // the cursor writer has no Thrift encoding, so a streamed answer would be an error
-    let r = get(&s.app, &format!("{BIG_SCAN}&format=thrift")).await;
-    assert_eq!(
-        r.status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&r.body[..r.body.len().min(200)])
-    );
-    assert!(r.header("content-type").contains("thrift"));
+/// SPARQL Results Thrift has a cursor writer, so the default, automatic execution streams a
+/// large scan in it from the cursor, with the bytes of the eager answer.
+#[test]
+fn the_default_streams_thrift_with_the_eager_bytes() {
+    let mut bodies = Vec::new();
+    let lines = access_lines_of(|| async {
+        let s = server_with(|st| st.access_log = true);
+        million(&s);
+        for execution in ["", "&execution=eager", "&execution=streaming"] {
+            let r = get(&s.app, &format!("{BIG_SCAN}&format=thrift{execution}")).await;
+            assert_eq!(
+                r.status,
+                StatusCode::OK,
+                "{execution}: {}",
+                String::from_utf8_lossy(&r.body[..r.body.len().min(200)])
+            );
+            assert_eq!(
+                r.header("content-type"),
+                "application/sparql-results+thrift",
+                "{execution}"
+            );
+            bodies.push(r.body);
+        }
+    })
+    .into_iter()
+    .filter(|l| l.contains(r#""route":"/{ds}/sparql""#))
+    .collect::<Vec<_>>();
+    assert_eq!(bodies[0], bodies[1], "the automatic body is the eager one");
+    assert_eq!(bodies[2], bodies[1], "the streamed body is the eager one");
+    assert_eq!(lines.len(), 3, "{lines:#?}");
+    let status = |l: &str| {
+        let j: J = serde_json::from_str(l).unwrap();
+        j["fields"]["cursor_status"].clone()
+    };
+    // the automatic and streamed requests ran a cursor to its end, the eager one none
+    assert_eq!(status(&lines[0]), "complete", "{}", lines[0]);
+    assert_eq!(status(&lines[1]), J::Null, "{}", lines[1]);
+    assert_eq!(status(&lines[2]), "complete", "{}", lines[2]);
 }
 
 #[tokio::test]
@@ -2066,7 +3444,7 @@ async fn a_late_failure_of_a_default_stream_aborts_the_transfer() {
 #[tokio::test]
 async fn explicit_streaming_commits_after_the_first_batch() {
     let s = server();
-    for format in ["json", "xml", "csv", "tsv", "sparkles"] {
+    for format in ["json", "xml", "csv", "tsv", "sparkles", "thrift"] {
         let streamed = get(
             &s.app,
             &format!("{ALL}&format={format}&execution=streaming"),

@@ -6,6 +6,253 @@ use crate::history::{At, ReadLimit};
 use crate::{Error, Result};
 use std::sync::{Arc, Weak};
 
+// Admitted transaction-view owner retained inline inside PreparedTxnView's
+// PreparedView. Never exposes a `'static` handle outside PreparedTxnView<'a>.
+pub(crate) struct PreparedTxn {
+    snapshot: Arc<super::Snapshot>,
+    family: Weak<super::family::Family>,
+    dataset: uuid::Uuid,
+    logical_branch: uuid::Uuid,
+    _held: Reservation,
+}
+
+impl PreparedTxn {
+    pub(crate) fn new(
+        snapshot: Arc<super::Snapshot>,
+        store: &super::Store,
+        held: Reservation,
+    ) -> Self {
+        Self {
+            snapshot,
+            family: Arc::downgrade(&store.family),
+            dataset: store.owner_dataset_id(),
+            logical_branch: store.branch_id(),
+            _held: held,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> &Arc<super::Snapshot> {
+        &self.snapshot
+    }
+
+    pub(crate) fn validate_instance(&self, store: &super::Store) -> Result<()> {
+        if self.dataset != store.owner_dataset_id()
+            || self.logical_branch != store.branch_id()
+            || !self.family.ptr_eq(&Arc::downgrade(&store.family))
+        {
+            return Err(Error::invalid(
+                "transaction read view belongs to another Store instance",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A budgeted transaction read view coupled to the lifetime of its [`super::WriteTxn`].
+///
+/// Borrowing the writer prevents mutating, committing, calling
+/// [`super::WriteTxn::discard_terms`], or rolling back a dry run while this view or any
+/// [`ScopedQueryResult`] derived from it is alive.
+///
+/// ```compile_fail
+/// use sparkles_core::access::Preparation;
+/// use sparkles_core::store::Store;
+/// use sparkles_core::task::Control;
+/// fn outlive_discard(store: &Store) {
+///     let mut txn = store.write();
+///     let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+///     let view = txn.prepare_read_view(&prep).unwrap();
+///     txn.discard_terms().unwrap();
+///     let _ = view.len();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use sparkles_core::access::Preparation;
+/// use sparkles_core::store::Store;
+/// use sparkles_core::task::Control;
+/// fn outlive_drop(store: &Store) {
+///     let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+///     let view = {
+///         let txn = store.write();
+///         txn.prepare_read_view(&prep).unwrap()
+///     };
+///     let _ = view.len();
+/// }
+/// ```
+pub struct PreparedTxnView<'a> {
+    store: &'a super::Store,
+    view: PreparedView,
+}
+
+impl<'a> PreparedTxnView<'a> {
+    pub(crate) fn new(store: &'a super::Store, view: PreparedView) -> Self {
+        Self { store, view }
+    }
+
+    /// Execute a SPARQL query against this scoped transaction view under `opts`.
+    /// The returned [`ScopedQueryResult`] stays bound to this view's lifetime so the
+    /// transaction snapshot cannot survive vocabulary rollback.
+    ///
+    /// Owning provider callbacks that receive an `Arc<Snapshot>`
+    /// ([`crate::sparql::QueryOptions::reasoning`] and
+    /// [`crate::sparql::QueryOptions::views`]) are refused with
+    /// [`Error::Unsupported`] so a callback cannot retain the transaction snapshot
+    /// past drop or rollback.
+    pub fn query<'q>(
+        &'q self,
+        q: &str,
+        opts: &crate::sparql::QueryOptions,
+    ) -> Result<ScopedQueryResult<'q>> {
+        if opts.reasoning.is_some() {
+            return Err(Error::Unsupported(
+                "query-time reasoning is not supported on a scoped transaction view".into(),
+            ));
+        }
+        if opts.views.is_some() {
+            return Err(Error::Unsupported(
+                "view providers are not supported on a scoped transaction view".into(),
+            ));
+        }
+        let result = crate::sparql::query_source(self.view.read_source(), self.store, q, opts)?;
+        Ok(ScopedQueryResult {
+            result,
+            _view: std::marker::PhantomData,
+        })
+    }
+
+    /// Whether the graph named by `term` (the default graph when `None`) is readable.
+    pub fn readable(&self, term: Option<&oxrdf::Term>) -> bool {
+        self.view.readable(term)
+    }
+
+    /// Whether the graph named by `iri` is readable under this prepared policy.
+    pub fn allows_read_iri(&self, iri: &str) -> bool {
+        self.view.allows_read_iri(iri)
+    }
+
+    /// Whether the graph named by `term` (the default graph when `None`) is writable.
+    pub fn writable(&self, term: Option<&oxrdf::Term>) -> bool {
+        self.view.writable(term)
+    }
+
+    /// Whether the graph named by `iri` is writable under this prepared policy.
+    pub fn writable_iri(&self, iri: &str) -> bool {
+        self.view.writable_iri(iri)
+    }
+
+    /// Whether reads see every graph without graph-level filtering.
+    pub fn reads_all(&self) -> bool {
+        self.view.reads_all()
+    }
+
+    /// Whether reads see every graph and every triple without a mask.
+    pub fn reads_everything(&self) -> bool {
+        self.view.reads_everything()
+    }
+
+    /// Whether this prepared policy hides triples from reads.
+    pub fn hides_triples(&self) -> bool {
+        self.view.hides_triples()
+    }
+
+    /// Commit sequence reflected by this transaction view.
+    pub fn commit(&self) -> u64 {
+        self.view.commit()
+    }
+
+    /// Number of quads in the underlying masked snapshot (before graph-level filtering).
+    pub fn len(&self) -> u64 {
+        self.view.len()
+    }
+
+    /// Whether the underlying masked snapshot has no quads.
+    pub fn is_empty(&self) -> bool {
+        self.view.is_empty()
+    }
+
+    /// Whether the prepared snapshot carries a triple-level access mask.
+    pub fn has_mask(&self) -> bool {
+        self.view.has_mask()
+    }
+
+    /// Visit each quad visible under both this view's triple mask and graph read policy.
+    pub fn for_each_visible_quad(
+        &self,
+        f: impl FnMut([crate::id::Id; 4]) -> Result<()>,
+    ) -> Result<()> {
+        self.view.for_each_visible_quad(f)
+    }
+}
+
+/// A query result bound to the lifetime of a [`PreparedTxnView`].
+///
+/// Neither this result nor the transaction snapshot behind it can outlive the
+/// borrowing [`super::WriteTxn`] or survive [`super::WriteTxn::discard_terms`] or
+/// dry-run rollback.
+///
+/// ```compile_fail
+/// use sparkles_core::access::Preparation;
+/// use sparkles_core::sparql::QueryOptions;
+/// use sparkles_core::store::Store;
+/// use sparkles_core::task::Control;
+/// fn result_outlives_discard(store: &Store) {
+///     let mut txn = store.write();
+///     let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+///     let view = txn.prepare_read_view(&prep).unwrap();
+///     let res = view.query("SELECT * WHERE { ?s ?p ?o }", &QueryOptions::default()).unwrap();
+///     drop(view);
+///     txn.discard_terms().unwrap();
+///     let _ = res.boolean();
+/// }
+/// ```
+pub struct ScopedQueryResult<'a> {
+    result: crate::sparql::QueryResult,
+    _view: std::marker::PhantomData<&'a ()>,
+}
+
+impl ScopedQueryResult<'_> {
+    pub fn kind(&self) -> crate::sparql::QueryKind {
+        self.result.kind
+    }
+
+    pub fn boolean(&self) -> bool {
+        self.result.boolean
+    }
+
+    pub fn timing(&self) -> &crate::sparql::Timing {
+        &self.result.timing
+    }
+
+    pub fn triples(&self) -> &[oxrdf::Triple] {
+        self.result.triples()
+    }
+
+    pub fn quads(&self) -> &[oxrdf::Quad] {
+        self.result.quads()
+    }
+
+    /// Visit each decoded SELECT row while keeping the underlying query context
+    /// scoped to the transaction view.
+    pub fn for_each_row(
+        &self,
+        mut f: impl FnMut(&[Option<oxrdf::Term>]) -> Result<()>,
+    ) -> Result<()> {
+        let rows = self.result.rows()?;
+        for row in rows.iter() {
+            f(row.values())?;
+        }
+        Ok(())
+    }
+
+    /// Decode SELECT rows into application-owned vectors of RDF terms that retain
+    /// no reference to the transaction snapshot, delta vocabulary, or query credit.
+    pub fn collect_rows(&self) -> Result<Vec<Vec<Option<oxrdf::Term>>>> {
+        let rows = self.result.rows()?;
+        Ok(rows.iter().map(|row| row.values().to_vec()).collect())
+    }
+}
+
 // Only Store factories construct this inline owner. It has no Clone, public
 // constructor or raw extractor. Payloads precede the actual selection loan.
 pub(crate) struct PreparedRead {
@@ -108,32 +355,21 @@ impl super::Store {
         preparation: &Preparation,
         inherited: bool,
     ) -> Result<PreparedView> {
-        preparation.check()?;
+        let selection = preparation.selection_scope();
+        selection.check()?;
         // The estimate below is not admission. This atomic reservation must
         // succeed before any cold metadata/decoder/source allocation. Another
         // grant can take the free granules first, so a refused estimate retries
         // once with the room the grant already covers.
-        let (allowance, mut held) = {
-            let allowance = preparation.selection_room();
-            match preparation.reserve(allowance) {
-                Ok(held) => (allowance, held),
-                Err(Error::BudgetExceeded(_)) => {
-                    let covered = preparation.covered_room();
-                    (covered, preparation.reserve(covered)?)
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        let snapshot = if inherited {
-            let (snapshot, resolved, _) =
-                self.snapshot_at_prepared(logical, at, preparation, allowance)?;
-            drop(resolved);
-            snapshot
+        let (allowance, mut held) = selection.reserve_available()?;
+        let (snapshot, resolved_seq, charge) = if inherited {
+            let (snapshot, resolved, _, charge) =
+                self.snapshot_at_prepared(logical, at, &selection, allowance)?;
+            (snapshot, resolved.commit.seq, charge)
         } else {
-            let (snapshot, resolved) =
-                logical.snapshot_at_inner(at, preparation, Some(allowance))?;
-            drop(resolved);
-            snapshot
+            let (snapshot, resolved, charge) =
+                logical.snapshot_at_inner(at, &selection, Some(allowance))?;
+            (snapshot, resolved.commit.seq, charge)
         };
         if snapshot.mask.is_some() {
             return Err(Error::invalid(
@@ -141,21 +377,29 @@ impl super::Store {
             ));
         }
         let limit = ReadLimit {
-            options: preparation,
+            options: &selection,
             memory: Some(allowance),
             held: 0,
         };
-        let retained = snapshot
-            .retained_preparation_bytes()
-            .checked_add(snapshot.generation.retained_bytes_limited(&limit)?)
+        let retained = charge
+            .delta_bytes
+            .checked_add(snapshot.generation.retained_bytes_with(&limit)?)
             .and_then(|bytes| bytes.checked_add(crate::history::READ_METADATA_BYTES))
-            .ok_or_else(|| preparation.exhausted())?;
+            .ok_or_else(|| selection.exhausted())?;
         if retained > allowance {
-            return Err(preparation.exhausted());
+            return Err(selection.exhausted());
         }
         // Read temporaries are gone. Keep the actual selected snapshot and its
         // remaining credit coupled before any permission-mask construction.
         held.release_to(retained);
+        let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+            let (pinned_snap, pin_held) =
+                self.pin_historical_evidence(logical, at, resolved_seq, snapshot, &selection)?;
+            held.merge(pin_held);
+            pinned_snap
+        } else {
+            snapshot
+        };
         let selected = PreparedRead {
             snapshot,
             identity: Arc::downgrade(&policy),
@@ -165,7 +409,10 @@ impl super::Store {
             logical_branch: logical.branch_id(),
             _held: held,
         };
-        crate::access::triples::controlled::prepare_selected(selected, preparation)
+        crate::access::triples::controlled::prepare_selected(
+            selected,
+            &preparation.without_selection_scope(),
+        )
     }
 }
 
@@ -217,7 +464,7 @@ impl BoundReadSource {
     pub(crate) fn validate_query_instance(&self, store: &super::Store) -> crate::Result<()> {
         match &self.source {
             Source::Evidence(view) => view.validate_instance(store),
-            Source::Prepared(_) => Ok(()),
+            Source::Prepared(view) => view.validate_query_instance(store),
         }
     }
 
@@ -256,6 +503,10 @@ impl BoundReadSource {
         Self {
             source: Source::Prepared(view),
         }
+    }
+
+    pub(crate) fn is_txn(&self) -> bool {
+        matches!(&self.source, Source::Prepared(view) if view.is_txn())
     }
 }
 

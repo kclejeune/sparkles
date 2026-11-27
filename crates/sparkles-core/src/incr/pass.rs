@@ -12,14 +12,17 @@
 //! reads. Protections that depend on the data never reach a pass: such a circuit is one
 //! `recompute` node over its masked snapshot.
 
+use super::budget::{BudgetHandle, ScratchLease};
+use super::prov::{self, AChanges, Ann, AnnMap};
 use super::terms::Terms;
-use super::zset::{Changes, Row};
+use super::zset::{Changes, Row, row_bytes};
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
 use crate::id::{self, Id, Tag};
 use crate::index::Perm;
 use crate::sparql::ctx::Ctx;
 use crate::sparql::expr;
+use crate::sparql::pool::QueryPool;
 use crate::sparql::table::{Table, VarId};
 use crate::sparql::value::Value;
 use crate::store::{Chunk, Snapshot};
@@ -121,6 +124,12 @@ pub struct PassStats {
     pub recomputes: u64,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct BuildChecks<'a> {
+    pub check: &'a dyn Fn() -> Result<()>,
+    pub cancellation: &'a crate::task::Cancellation,
+}
+
 pub struct Pass<'a> {
     pub new: Arc<Snapshot>,
     /// `new` before the changes (absent when the pass builds from scratch)
@@ -131,7 +140,8 @@ pub struct Pass<'a> {
     pub terms: &'a mut Terms,
     pub vis: &'a Vis,
     pub access: Option<Arc<GraphAccess>>,
-    pub control: &'a Control,
+    control: &'a Control,
+    pub(super) build_checks: Option<BuildChecks<'a>>,
     /// the circuit's variable names
     pub vars: &'a [String],
     pub stats: PassStats,
@@ -139,6 +149,14 @@ pub struct Pass<'a> {
     pub full: bool,
     /// the budget of one evaluation's intermediate results
     pub max_memory_bytes: Option<u64>,
+    /// hierarchical budget handle for the owning circuit, when attached
+    pub(crate) budget: Option<BudgetHandle>,
+    /// query pool backing the owning circuit's memory domain, when attached
+    pub(crate) pool: Option<Arc<QueryPool>>,
+    /// current window scratch bytes reserved on `budget` during this pass
+    window_scratch: u64,
+    /// scratch leases for intermediate operator outputs carried across boundaries
+    output_leases: Vec<ScratchLease>,
     /// the query's base IRI
     pub base: Option<oxiri::Iri<String>>,
     /// the dataset's inference, which evaluations read with
@@ -159,11 +177,66 @@ pub struct Pass<'a> {
     #[cfg(test)]
     pub estimated: std::cell::Cell<u64>,
     ctx: Option<Arc<Ctx>>,
+    /// Dedicated context for grouping accumulators, backed directly by `self.terms`
+    /// during each call so `Tag::Local` ids resolve and intern on demand.
+    agg_ctx: Option<Arc<Ctx>>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
 }
 
+/// Changes from absorbing annotations into an arrangement, with their live charge.
+pub(super) struct EffectiveChanges {
+    rows: AChanges,
+    ann_bytes: u64,
+    lease: ScratchLease,
+}
+
+impl EffectiveChanges {
+    pub(super) fn new(pass: &Pass<'_>) -> Self {
+        Self {
+            rows: AChanges::new(),
+            ann_bytes: 0,
+            lease: pass.scratch_lease(),
+        }
+    }
+
+    pub(super) fn push(
+        &mut self,
+        pass: &Pass<'_>,
+        width: usize,
+        state: &mut AnnMap,
+        (row, weight, ann): (Row, i64, Ann),
+    ) -> Result<()> {
+        let bound = ann.effective_bytes(state.get(&row), pass.prov.max_witnesses());
+        pass.preadmit_achanges_push(
+            &self.rows,
+            width,
+            &mut self.ann_bytes,
+            bound,
+            &mut self.lease,
+        )?;
+        let effective = prov::absorb_row(state, &row, ann, pass.prov);
+        let excess = bound - effective.bytes_with_spare_supports();
+        self.ann_bytes -= excess;
+        self.lease.release(excess);
+        self.rows.push((row, weight, effective));
+        Ok(())
+    }
+
+    pub(super) fn into_parts(self) -> (AChanges, ScratchLease) {
+        (self.rows, self.lease)
+    }
+}
+
 impl<'a> Pass<'a> {
+    pub(super) fn check_control(&self) -> Result<()> {
+        self.control.check()?;
+        if let Some(checks) = self.build_checks {
+            (checks.check)()?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         new: Arc<Snapshot>,
@@ -187,10 +260,15 @@ impl<'a> Pass<'a> {
             vis,
             access,
             control,
+            build_checks: None,
             vars,
             stats: PassStats::default(),
             full,
             max_memory_bytes: None,
+            budget: None,
+            pool: None,
+            window_scratch: 0,
+            output_leases: Vec::new(),
             base: None,
             inference: None,
             aggregate_errors,
@@ -202,6 +280,7 @@ impl<'a> Pass<'a> {
             #[cfg(test)]
             estimated: std::cell::Cell::new(0),
             ctx: None,
+            agg_ctx: None,
             union_changes: None,
             work: 0,
         }
@@ -211,9 +290,187 @@ impl<'a> Pass<'a> {
     pub fn tick(&mut self) -> Result<()> {
         self.work += 1;
         if self.work.is_multiple_of(1024) {
-            self.control.check()?;
+            self.check_control()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn budget_handle(&self) -> Option<BudgetHandle> {
+        self.budget.clone()
+    }
+
+    pub(crate) fn scratch_lease(&self) -> ScratchLease {
+        ScratchLease::new(self.budget.clone())
+    }
+
+    pub(crate) fn output_lease_mark(&self) -> usize {
+        self.output_leases.len()
+    }
+
+    pub(crate) fn push_output_lease(&mut self, lease: ScratchLease) {
+        if lease.bytes() > 0 {
+            self.output_leases.push(lease);
+        }
+    }
+
+    pub(crate) fn take_output_leases_since(&mut self, mark: usize) -> Vec<ScratchLease> {
+        self.output_leases.split_off(mark)
+    }
+
+    pub(crate) fn take_output_lease(&mut self) -> ScratchLease {
+        let mut total = 0u64;
+        for mut l in self.output_leases.drain(..) {
+            total = total.saturating_add(l.take_bytes());
+        }
+        ScratchLease::from_reserved(self.budget.clone(), total)
+    }
+
+    /// Pre-admit growth of a [`Changes`] output vector before pushing one row of `width`
+    /// ids, covering both the backing `Vec` slots and the boxed row allocations.
+    pub(crate) fn preadmit_changes_push(
+        &self,
+        out: &Changes,
+        width: usize,
+        lease: &mut ScratchLease,
+    ) -> Result<()> {
+        let next_cap = sparkles_budget::sizes::vec_grown(
+            out.capacity(),
+            out.len(),
+            1,
+            std::mem::size_of::<(Row, i64)>(),
+        );
+        let vec_bytes = (next_cap as u64) * std::mem::size_of::<(Row, i64)>() as u64;
+        let row_payload = (out.len() as u64 + 1).saturating_mul((width as u64) * 8);
+        let need = vec_bytes.saturating_add(row_payload);
+        if need > lease.bytes() {
+            lease.try_set(need)?;
+        }
+        Ok(())
+    }
+
+    /// Pre-admit growth of an [`AChanges`] output vector before pushing one annotated
+    /// row of `width` ids and `ann_bytes` annotation bytes.
+    pub(crate) fn preadmit_achanges_push(
+        &self,
+        out: &AChanges,
+        width: usize,
+        ann_bytes_total: &mut u64,
+        next_ann_bytes: u64,
+        lease: &mut ScratchLease,
+    ) -> Result<()> {
+        let next_cap = sparkles_budget::sizes::vec_grown(
+            out.capacity(),
+            out.len(),
+            1,
+            std::mem::size_of::<(Row, i64, super::prov::Ann)>(),
+        );
+        let vec_bytes =
+            (next_cap as u64) * std::mem::size_of::<(Row, i64, super::prov::Ann)>() as u64;
+        let row_payload = (out.len() as u64 + 1).saturating_mul((width as u64) * 8);
+        let next_ann_total = ann_bytes_total.saturating_add(next_ann_bytes);
+        let need = vec_bytes
+            .saturating_add(row_payload)
+            .saturating_add(next_ann_total);
+        if need > lease.bytes() {
+            lease.try_set(need)?;
+        }
+        *ann_bytes_total = next_ann_total;
+        Ok(())
+    }
+
+    pub(crate) fn reserve_pass(&mut self, delta: u64) -> Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        if let Some(budget) = &self.budget {
+            budget.try_reserve_pass(delta)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_pass(&mut self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(budget) = &self.budget {
+            budget.release_pass(delta);
+        }
+    }
+
+    pub(crate) fn move_scratch_to_pass(&mut self, lease: &mut ScratchLease, bytes: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
+        if let Some(budget) = &self.budget {
+            budget.move_scratch_to_pass(lease, bytes)
+        } else {
+            let take = bytes.min(lease.bytes());
+            lease.release(take);
+            take
+        }
+    }
+
+    /// Reconcile an operator's tracked byte estimate during a pass so growth is
+    /// pre-admitted against both the local budget and the parent pool.
+    pub(crate) fn sync_op_state(&mut self, tracked: &mut u64, current: u64) -> Result<()> {
+        if current > *tracked {
+            let delta = current - *tracked;
+            self.reserve_pass(delta)?;
+            *tracked = current;
+        } else if current < *tracked {
+            let delta = *tracked - current;
+            self.release_pass(delta);
+            *tracked = current;
+        }
+        Ok(())
+    }
+
+    /// Admit a window operator's estimated peak memory (`total_used`, which includes its
+    /// existing `base_state` bytes already accounted in the circuit's persistent state).
+    pub(crate) fn charge_window(&mut self, total_used: u64, base_state: u64) -> Result<()> {
+        if let Some(max) = self.max_memory_bytes
+            && total_used > max
+        {
+            return Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                limit: max,
+                requested: total_used,
+            }));
+        }
+        let extra = total_used.saturating_sub(base_state);
+        if extra > self.window_scratch {
+            let delta = extra - self.window_scratch;
+            self.reserve_pass(delta)?;
+            self.window_scratch = extra;
+        } else if extra < self.window_scratch {
+            let delta = self.window_scratch - extra;
+            self.release_pass(delta);
+            self.window_scratch = extra;
+        }
+        Ok(())
+    }
+
+    /// Transition window scratch bytes into persistent pass-time state accounting after
+    /// `Window::kept` has been replaced/updated, releasing only the scratch excess while
+    /// keeping the newly retained window state charged for enclosing operators.
+    pub(crate) fn commit_window_state(&mut self, next_state: u64, base_state: u64) -> Result<()> {
+        let kept_growth = next_state.saturating_sub(base_state);
+        let prev_scratch = self.window_scratch;
+        self.window_scratch = 0;
+        if kept_growth > prev_scratch {
+            self.reserve_pass(kept_growth - prev_scratch)?;
+        } else if prev_scratch > kept_growth {
+            self.release_pass(prev_scratch - kept_growth);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_window_scratch(&mut self) {
+        if self.window_scratch > 0 {
+            let prev = self.window_scratch;
+            self.window_scratch = 0;
+            self.release_pass(prev);
+        }
     }
 
     pub fn snap(&self, w: Which) -> &Arc<Snapshot> {
@@ -419,8 +676,20 @@ impl<'a> Pass<'a> {
             c.base_iri = self.base.clone();
             c.deadline = self.control.deadline;
             c.cancel = self.control.cancel.flag();
-            if let Some(m) = self.max_memory_bytes {
+            c.cancellation = self.build_checks.map(|checks| checks.cancellation.clone());
+            if let Some(m) = self
+                .budget
+                .as_ref()
+                .and_then(BudgetHandle::remaining_local)
+                .or(self.max_memory_bytes)
+            {
                 c.mem_limit = m;
+            }
+            if let Some(budget) = &self.budget
+                && let Some((parent, grant)) = budget.child_parent(self.pool.as_ref())?
+            {
+                c.set_grant(grant);
+                c.set_memory_parent(parent)?;
             }
             c.allow_service = false;
             c.forbid_service = true;
@@ -429,6 +698,59 @@ impl<'a> Pass<'a> {
             self.ctx = Some(c.into_shared());
         }
         Ok(self.ctx.as_deref().expect("made above"))
+    }
+
+    /// Run `f` with a [`Ctx`] backed directly by `self.terms`, so `Tag::Local` ids
+    /// resolve and intern on demand without copying historical local keys and while
+    /// enforcing the pass's memory budget, deadline, and cancellation flag.
+    pub(crate) fn with_agg_ctx<T>(&mut self, f: impl FnOnce(&Ctx) -> Result<T>) -> Result<T> {
+        if self.agg_ctx.is_none() {
+            let mut c = Ctx::new(self.new.clone());
+            c.use_cache = false;
+            c.aggregate_errors = self.aggregate_errors;
+            c.base_iri = self.base.clone();
+            c.deadline = self.control.deadline;
+            c.cancel = self.control.cancel.flag();
+            c.cancellation = self.build_checks.map(|checks| checks.cancellation.clone());
+            if let Some(m) = self
+                .budget
+                .as_ref()
+                .and_then(BudgetHandle::remaining_local)
+                .or(self.max_memory_bytes)
+            {
+                c.mem_limit = m;
+            }
+            if let Some(budget) = &self.budget
+                && let Some((parent, grant)) = budget.child_parent(self.pool.as_ref())?
+            {
+                c.set_grant(grant);
+                c.set_memory_parent(parent)?;
+            }
+            c.allow_service = false;
+            c.forbid_service = true;
+            self.agg_ctx = Some(c.into_shared());
+        }
+        let ctx = self.agg_ctx.as_ref().expect("made above").clone();
+        struct Restore<'a> {
+            ctx: Arc<Ctx>,
+            terms: &'a mut Terms,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                *self.terms = self.ctx.take_circuit_terms();
+            }
+        }
+        let moved = std::mem::take(self.terms);
+        ctx.swap_circuit_terms(moved);
+        let guard = Restore {
+            ctx: ctx.clone(),
+            terms: self.terms,
+        };
+        let res = f(&ctx);
+        drop(guard);
+        let val = res?;
+        ctx.check()?;
+        Ok(val)
     }
 
     /// Evaluate `e` over rows of `schema` (circuit variables): the id of each value, or
@@ -460,7 +782,8 @@ impl<'a> Pass<'a> {
                 }
             }
         }
-        let ctx = self.ctx()?;
+        let ctx = Arc::clone(self.ctx.as_ref().expect("initialized above"));
+        let ctx = ctx.as_ref();
         let to_ctx: FxHashMap<Id, Id> = local
             .into_iter()
             .map(|(i, t)| (i, ctx.intern_term(&t)))
@@ -500,8 +823,12 @@ impl<'a> Pass<'a> {
             Id(Option<Id>),
             Term(Term),
         }
+        let outs_credit = ctx.charge((rows.len() * std::mem::size_of::<Out>()) as u64)?;
         let mut outs: Vec<Out> = Vec::with_capacity(rows.len());
         for i in 0..rows.len() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
             let row = expr::Row {
                 table: &table,
                 i,
@@ -510,38 +837,60 @@ impl<'a> Pass<'a> {
                 exists: None,
             };
             if ebv {
-                let b = expr::ebv(&compiled, &row, ctx).unwrap_or(false);
+                let b = match expr::ebv(&compiled, &row, ctx) {
+                    Ok(b) => b,
+                    Err(_) if ctx.has_memory_failure() => {
+                        ctx.check()?;
+                        false
+                    }
+                    Err(_) => false,
+                };
                 outs.push(Out::Id(Some(Id::from_bool(b))));
                 continue;
             }
-            outs.push(match expr::eval(&compiled, &row, ctx) {
-                Err(_) => Out::Id(None),
+            let out = match expr::eval(&compiled, &row, ctx) {
+                Err(_) => {
+                    if ctx.has_memory_failure() {
+                        ctx.check()?;
+                    }
+                    Out::Id(None)
+                }
                 Ok(expr::Val::Id(i)) | Ok(expr::Val::Dec(i, _)) => {
                     if i.tag() == Tag::Local
                         || (i.tag() == Tag::BNode && i.payload() & Id::LOCAL_BNODE_BIT != 0)
                     {
-                        ctx.term(i).map_or(Out::Id(None), Out::Term)
+                        ctx.term_checked_into(i, &outs_credit)?
+                            .map_or(Out::Id(None), Out::Term)
                     } else {
                         Out::Id(Some(i))
                     }
                 }
                 Ok(expr::Val::V(Value::Integer(n))) => match Id::from_i64(i64::from(n)) {
                     Some(i) => Out::Id(Some(i)),
-                    None => Out::Term(Value::Integer(n).to_term()),
+                    None => {
+                        outs_credit.add(128)?;
+                        Out::Term(Value::Integer(n).to_term())
+                    }
                 },
                 Ok(expr::Val::V(Value::Bool(b))) => Out::Id(Some(Id::from_bool(b))),
-                Ok(expr::Val::V(v)) => Out::Term(v.to_term()),
-            });
+                Ok(expr::Val::V(v)) => {
+                    outs_credit.add(crate::sparql::ctx::ValueCache::entry_bytes(&v))?;
+                    Out::Term(v.to_term())
+                }
+            };
+            outs.push(out);
         }
         ctx.check()?;
         let snap = self.new.clone();
-        Ok(outs
+        let interned: Vec<Option<Id>> = outs
             .into_iter()
             .map(|o| match o {
                 Out::Id(x) => x,
                 Out::Term(t) => Some(self.terms.intern(&snap, &t)),
             })
-            .collect())
+            .collect();
+        drop(outs_credit);
+        Ok(interned)
     }
 
     /// The value of an id of this circuit's space.
@@ -596,12 +945,27 @@ impl<'a> Pass<'a> {
             },
             base_iri: self.base.clone(),
         };
+        let child = match &self.budget {
+            Some(b) => b.child_parent(self.pool.as_ref())?,
+            None => None,
+        };
+        let (parent, grant) = match child {
+            Some((p, g)) => (Some(p), g),
+            None => (None, None),
+        };
+        let max_memory_bytes = self
+            .budget
+            .as_ref()
+            .and_then(BudgetHandle::remaining_local)
+            .or(self.max_memory_bytes);
         let opts = crate::sparql::QueryOptions {
             graphs: self.access.clone(),
             deadline: self.control.deadline,
             cancel: Some(self.control.cancel.flag()),
+            cancellation: self.build_checks.map(|checks| checks.cancellation.clone()),
             no_cache: true,
-            max_memory_bytes: self.max_memory_bytes,
+            max_memory_bytes,
+            grant,
             allow_service: false,
             forbid_service: true,
             defaults_applied: true,
@@ -614,11 +978,17 @@ impl<'a> Pass<'a> {
                 .unwrap_or_default(),
             ..Default::default()
         };
-        let r = crate::sparql::execute_query(self.new.clone(), &q, &opts, 0.0)?;
+        let r = if parent.is_some() {
+            crate::sparql::execute_query_with_parent(self.new.clone(), &q, &opts, 0.0, parent)?
+        } else {
+            crate::sparql::execute_query(self.new.clone(), &q, &opts, 0.0)?
+        };
         let snap = self.new.clone();
         let width = r.table().width();
         let mut z = super::zset::ZSet::new();
         let mut decoded: FxHashMap<Id, Id> = FxHashMap::default();
+        let mut z_lease = self.scratch_lease();
+        let mut terms_tracked = self.terms.bytes();
         for i in 0..r.table().len() {
             let mut row: Vec<Id> = Vec::with_capacity(width);
             for c in 0..width {
@@ -643,19 +1013,38 @@ impl<'a> Pass<'a> {
                 row.push(m);
             }
             let row: Row = row.into();
+            let next_bytes = (z.len() as u64 + 1)
+                .saturating_mul(row_bytes(width))
+                .saturating_add((decoded.len() as u64) * 24);
+            if next_bytes > z_lease.bytes() {
+                z_lease.try_set(next_bytes)?;
+            }
             z.add(row, 1);
+            if i % 1024 == 1023 {
+                let now_terms = self.terms.bytes();
+                self.sync_op_state(&mut terms_tracked, now_terms)?;
+            }
             if i % 4096 == 4095 {
-                self.control.check()?;
+                self.check_control()?;
             }
         }
+        let now_terms = self.terms.bytes();
+        self.sync_op_state(&mut terms_tracked, now_terms)?;
+        let r_width = r.table().width();
+        drop(decoded);
+        drop(r);
         self.stats.recompute += t0.elapsed();
         self.stats.recomputes += 1;
-        if r.table().width() != vars.len() {
+        if r_width != vars.len() {
             return Err(Error::Corrupt(
                 "a recompute node's evaluation returned other columns".into(),
             ));
         }
-        Ok(z.into_changes())
+        let changes = z.into_changes();
+        let changes_bytes = (changes.len() as u64).saturating_mul(row_bytes(width));
+        z_lease.try_set(changes_bytes)?;
+        self.push_output_lease(z_lease);
+        Ok(changes)
     }
 }
 
@@ -672,5 +1061,46 @@ fn scan_prefix(s: Option<Id>, p: Option<Id>, o: Option<Id>, g: GraphSel) -> (Per
         (None, None, None, GraphSel::Exact(g)) => (Perm::Gspo, vec![g.0]),
         (None, None, None, GraphSel::Default) => (Perm::Gspo, vec![Id::DEFAULT_GRAPH.0]),
         (None, None, None, GraphSel::Named) => (Perm::Spo, vec![]),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn pass_refuses_decoding_a_locally_bound_result() {
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::Literal;
+
+    let snap = Store::in_memory(StoreOptions::default()).snapshot();
+    let vis = Vis::new(None, &snap);
+    let control = Control::none();
+    let vars = ["value".to_owned()];
+    let expression = Expression::Variable(Variable::new_unchecked("value"));
+    let mut terms = Terms::default();
+    for (value, fits) in [("small".to_owned(), true), ("x".repeat(8 << 10), false)] {
+        let term = Term::Literal(Literal::new_simple_literal(value));
+        let id = terms.intern(&snap, &term);
+        assert_eq!(id.tag(), Tag::Local);
+        let row = [id];
+        let mut pass = Pass::new(
+            snap.clone(),
+            None,
+            &[],
+            &[],
+            &mut terms,
+            &vis,
+            None,
+            &control,
+            &vars,
+        );
+        pass.max_memory_bytes = Some(24 << 10);
+        let result = pass.eval(&[0], &[&row], &expression, false);
+        if fits {
+            assert_eq!(result.unwrap(), vec![Some(id)]);
+        } else {
+            assert!(
+                matches!(result, Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory),
+                "{result:?}"
+            );
+        }
     }
 }

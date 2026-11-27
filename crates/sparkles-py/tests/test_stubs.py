@@ -97,3 +97,43 @@ def test_async_consumer_types(tmp_path: Path) -> None:
     assert 'Argument 1 to "select"' in result.stdout
     assert 'has no attribute "__iter__"' in result.stdout
     assert 'has no attribute "__enter__"' in result.stdout
+
+
+def test_branch_update_note_types(tmp_path: Path) -> None:
+    """Branches.update accepts omitted, str, and None note arguments and rejects invalid types."""
+    source = tmp_path / "branch_note_types.py"
+    source.write_text(
+        "from sparkles import Dataset\n"
+        "def check(ds: Dataset) -> None:\n"
+        "    ds.branches.update('work')\n"
+        "    ds.branches.update('work', protected=True)\n"
+        "    ds.branches.update('work', note='text')\n"
+        "    ds.branches.update('work', note=None)\n"
+        "    ds.branches.update('work', protected=False, note=None, new_name='next')\n"
+    )
+    env = dict(
+        os.environ,
+        MYPY_CACHE_DIR=str(tmp_path / "mypy-cache"),
+    )
+    env.pop("MYPYPATH", None)
+    package_parent = Path(sparkles.__file__).resolve().parent.parent
+    if package_parent not in {Path(path).resolve() for path in site.getsitepackages()}:
+        env["MYPYPATH"] = str(package_parent)
+    command = [sys.executable, "-m", "mypy", "--no-incremental", str(source)]
+    result = subprocess.run(
+        command, capture_output=True, text=True, env=env, check=False, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    source.write_text(
+        "from sparkles import Dataset\n"
+        "def wrong(ds: Dataset) -> None:\n"
+        "    ds.branches.update('work', note=123)\n"
+        "    ds.branches.update('work', note=...)\n"
+    )
+    result = subprocess.run(
+        command, capture_output=True, text=True, env=env, check=False, timeout=30
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert 'Argument "note" to "update" of "Branches"' in result.stdout
+    assert "ellipsis" in result.stdout.lower()

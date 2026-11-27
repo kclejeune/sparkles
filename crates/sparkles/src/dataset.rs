@@ -55,6 +55,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_OPEN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The name of the file in which a persistent clone records where it came from.
 pub const ORIGIN_FILE: &str = "origin.json";
@@ -169,8 +172,11 @@ impl From<StoreOptions> for DatasetOptions {
 /// may change between releases; programs use the methods of [`Dataset`].
 #[doc(hidden)]
 pub struct DatasetState {
+    /// Process-local monotonic identifier assigned once per opened store instance.
+    pub open_id: u64,
     pub(crate) branches: Mutex<BTreeMap<String, Dataset>>,
     pub(crate) branch_handles: Mutex<Vec<StateReference>>,
+    pub(crate) owner: Option<StateReference>,
     pub(crate) reference: StateReference,
     pub(crate) closure_cache_triples: usize,
     pub(crate) pool: Option<Arc<crate::sparql::pool::QueryPool>>,
@@ -247,7 +253,7 @@ impl DatasetState {
         }
         *self.reasoning.write() = record;
         // views and live queries switch to the new default graph
-        self.views.kick();
+        self.views.mode_changed();
         Ok(())
     }
 }
@@ -338,7 +344,14 @@ impl Dataset {
     /// [`from_store`](Self::from_store) with the library's settings of `opts` (its
     /// `store` options are those `store` was opened with and are not read).
     pub fn from_store_with(store: impl Into<StoreHandle>, opts: DatasetOptions) -> Dataset {
-        let store: StoreHandle = store.into();
+        Dataset::from_store_with_owner(store.into(), None, opts)
+    }
+
+    fn from_store_with_owner(
+        store: StoreHandle,
+        owner: Option<StateReference>,
+        opts: DatasetOptions,
+    ) -> Dataset {
         let shown = || {
             opts.name
                 .as_deref()
@@ -400,14 +413,21 @@ impl Dataset {
             StoreHandle::Own(s) => s.root().map(Path::to_path_buf),
             StoreHandle::Branch(_) => None,
         };
-        let views = crate::incr::Runtime::open(views_root, store.dataset_id(), opts.views.clone());
+        let views = crate::incr::Runtime::open_with_pool(
+            views_root,
+            store.dataset_id(),
+            opts.views.clone(),
+            opts.pool.clone(),
+        );
         // backups and clones capture the views' definitions from the runtime, at the
         // same writer-lock boundary as the data
         if let StoreHandle::Own(s) = &store {
             let source: Arc<dyn crate::store::DefinitionSource> = views.clone();
             s.register_definitions(Arc::downgrade(&source));
         }
+        let open_id = NEXT_OPEN_ID.fetch_add(1, Ordering::Relaxed);
         let inner = Arc::new_cyclic(|weak| DatasetState {
+            open_id,
             reference: StateReference {
                 link: crate::store::lifecycle::WeakLink::new(weak.clone()),
             },
@@ -415,6 +435,7 @@ impl Dataset {
             views_worker: std::sync::OnceLock::new(),
             branches: Mutex::new(BTreeMap::new()),
             branch_handles: Mutex::new(Vec::new()),
+            owner,
             closure_cache_triples: opts.closure_cache_triples,
             pool: opts.pool,
             name: opts.name,
@@ -453,8 +474,25 @@ impl Dataset {
 
     /// A dataset around a store others share (a branch's, which its dataset keeps open),
     /// with the state the branch's directory configures.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_shared(store: Arc<Store>, opts: DatasetOptions) -> Dataset {
         Dataset::from_store_with(StoreHandle::Branch(store), opts)
+    }
+
+    /// A dataset around a store others share (a branch's, which its dataset keeps open),
+    /// with the state the branch's directory configures and a weak link to its owner.
+    pub(crate) fn from_shared_with_owner(
+        store: Arc<Store>,
+        owner: StateReference,
+        opts: DatasetOptions,
+    ) -> Dataset {
+        Dataset::from_store_with_owner(StoreHandle::Branch(store), Some(owner), opts)
+    }
+
+    /// Upgrade this branch handle's owning dataset state, if it is a branch handle whose
+    /// owner is still open.
+    pub(crate) fn owner_state(&self) -> Option<Arc<DatasetState>> {
+        self.inner.owner.as_ref()?.upgrade()
     }
 
     fn branches_in_use(&self) -> bool {
@@ -535,8 +573,9 @@ impl Dataset {
     pub(crate) fn close_for_disposal(
         self,
         release_entries: impl FnOnce(),
+        on_closed: impl FnOnce(u64, &Store),
     ) -> std::result::Result<Option<ReasoningRecord>, RefusedClose> {
-        lifecycle::close(self, release_entries)
+        lifecycle::close(self, release_entries, on_closed)
     }
 
     /// The name a catalog or a server gave the dataset, if any.
@@ -650,8 +689,12 @@ impl Dataset {
                 None => Default::default(),
             },
         };
-        sparkles_reasoner::query::QueryReasoner::new(profile, &extras, inputs)
-            .map_err(crate::handles::from_anyhow)
+        let mut reasoner = sparkles_reasoner::query::QueryReasoner::new(profile, &extras, inputs)
+            .map_err(crate::handles::from_anyhow)?;
+        if let Some(pool) = &self.inner.pool {
+            reasoner = reasoner.with_pool(pool.clone());
+        }
+        Ok(reasoner)
     }
 
     /// Under the `owl-ql` query-time profile (spec F17 §7), what the rewriting reads of
@@ -669,16 +712,22 @@ impl Dataset {
         }
         let reasoner = self.query_reasoner(None)?;
         let snap = self.snapshot();
-        let readable = opts.graphs.clone().filter(|a| !a.reads_all()).map(|a| {
-            let s = snap.clone();
-            Arc::new(move |g: crate::id::Id| a.readable_id(&s, g))
-                as Arc<dyn Fn(crate::id::Id) -> bool + Send + Sync>
-        });
+        let readable = opts
+            .graphs
+            .as_ref()
+            .filter(|a| !a.reads_all())
+            .map(|a| a.bound(&snap));
+        let memory_parent = opts
+            .grant
+            .as_ref()
+            .map(|g| g.memory_parent())
+            .or_else(|| self.inner.pool.as_ref().map(|p| p.work_parent()));
         let req = SessionRequest {
             snap,
             readable,
             stop: Arc::new(|| Ok(())),
             max_memory: opts.max_memory_bytes,
+            memory_parent,
             no_cache: false,
         };
         let Some(t) = reasoner.owl_ql_tbox(&req)? else {
@@ -702,6 +751,11 @@ impl Dataset {
     /// Current read snapshot.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner.store.snapshot()
+    }
+
+    /// The shared query memory pool attached to this dataset, if any.
+    pub fn pool(&self) -> Option<&Arc<crate::sparql::pool::QueryPool>> {
+        self.inner.pool.as_ref()
     }
 
     // ------------------------------------------------------------------ loading ------
@@ -1546,6 +1600,11 @@ impl Transaction<'_> {
 
     pub fn insert_triple(&mut self, t: &Triple) -> Result<bool> {
         self.insert(t.as_ref().in_graph(GraphNameRef::DefaultGraph))
+    }
+
+    /// Stage prefixes to be persisted jointly with this transaction's commit.
+    pub(crate) fn stage_prefixes(&mut self, prefixes: BTreeMap<String, String>) {
+        self.txn.stage_prefixes(prefixes);
     }
 
     /// Remove a quad; blank nodes are matched by the labels this store hands out

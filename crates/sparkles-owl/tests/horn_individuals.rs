@@ -315,13 +315,16 @@ fn distinct_predecessors_of_a_nominal_do_not_clash() {
 }
 
 #[test]
-fn an_at_least_restriction_above_one_stays_out_beside_individuals() {
-    let (out, ex) = run("SubClassOf(:A ObjectMinCardinality(2 :r ObjectOneOf(:a)))
+fn an_at_least_restriction_above_one_with_nominal_filler_makes_the_class_unsatisfiable() {
+    let out = unsat(
+        "SubClassOf(:A ObjectMinCardinality(2 :r ObjectOneOf(:a)))
          SubClassOf(:A ObjectAllValuesFrom(:r :B))
-         ClassAssertion(:C :c)");
-    assert_eq!(ex.len(), 1, "{ex:#?}");
+         ClassAssertion(:C :c)",
+        &["A"],
+        &["B", "C"],
+    );
     assert_eq!(out.stats.tier, Tier::Horn);
-    assert_eq!(out.stats.outside_el.taken, 1);
+    assert_eq!(out.stats.outside_el.taken, 2);
 }
 
 #[test]
@@ -675,4 +678,470 @@ fn a_covered_successor_preserves_the_classification_of_a_witness() {
     assert!(t.is_subclass(&role_domain, &domain_superclass));
     assert!(!t.is_subclass(&domain_superclass, &role_domain));
     assert!(!t.is_subclass(&role_domain, &neighbor_of_c4));
+}
+
+// Roadmap item 867: at-least restrictions above one beside individuals, unfolded by
+// Lemma 2 into fresh, pairwise disjoint fillers.
+
+#[test]
+fn at_least_above_one_beside_individuals_satisfiable_cases() {
+    // ≥2 r.C and ≥3 r.C beside individuals derive existential and universal consequences
+    // without falsely collapsing distinct classes or making them unsatisfiable.
+    let out = check(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:A ObjectAllValuesFrom(:r :D))
+         SubClassOf(:B ObjectMinCardinality(3 :r :C))
+         SubClassOf(ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :D)) :E)
+         SubClassOf(ObjectSomeValuesFrom(:r :C) :F)
+         ClassAssertion(:A :a)
+         EquivalentClasses(:Qa ObjectOneOf(:a))",
+        &[
+            ("A", "E"),
+            ("A", "F"),
+            ("B", "F"),
+            ("Qa", "A"),
+            ("Qa", "E"),
+            ("Qa", "F"),
+        ],
+        &[("A", "B"), ("B", "A"), ("B", "E"), ("C", "D"), ("E", "A")],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    // ≥2 r.C alongside a nominal successor in C ⊓ D and ≤1 r.D stays consistent because
+    // C is not contained in D, so the fresh fillers need not merge with the nominal.
+    let out = check(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:o)))
+         SubClassOf(:A ObjectMaxCardinality(1 :r :D))
+         ClassAssertion(:C :o)
+         ClassAssertion(:D :o)
+         ClassAssertion(:A :a)
+         EquivalentClasses(:Qa ObjectOneOf(:a))",
+        &[("Qa", "A")],
+        &[("A", "Qa"), ("C", "D"), ("D", "C")],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    // ≥2 r.C beside ≤1 r.D without C ⊑ D stays consistent and satisfiable.
+    let out = unsat(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:A ObjectMaxCardinality(1 :r :D))
+         ClassAssertion(:A :a)",
+        &[],
+        &["A", "C", "D"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+}
+
+#[test]
+fn at_least_above_one_with_nominal_filler_universal_or_range_is_unsatisfiable() {
+    // ≥3 r.{a} makes A unsatisfiable while the ontology stays consistent.
+    let out = unsat(
+        "SubClassOf(:A ObjectMinCardinality(3 :r ObjectOneOf(:a)))
+         ClassAssertion(:C :c)",
+        &["A"],
+        &["C"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    // Real instance of A with ≥2 r.{a} makes the ontology inconsistent.
+    let (out, ex) = run("SubClassOf(:A ObjectMinCardinality(2 :r ObjectOneOf(:a)))
+         ClassAssertion(:A :x)");
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+
+    // ∀r.{a} forces every r-successor of A to be a, clashing with ≥2 r.C.
+    let out = unsat(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:A ObjectAllValuesFrom(:r ObjectOneOf(:a)))
+         ClassAssertion(:D :d)",
+        &["A"],
+        &["C", "D"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    // Self-referential real individual a ∈ A with ≥2 r.C and ∀r.{a} is inconsistent.
+    let (out, ex) = run("ClassAssertion(:A :a)
+         SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:A ObjectAllValuesFrom(:r ObjectOneOf(:a)))");
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+
+    // Nominal range on r forces all r-successors to be a, making A unsatisfiable.
+    let out = unsat(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         ObjectPropertyRange(:r ObjectOneOf(:a))
+         ClassAssertion(:D :d)",
+        &["A"],
+        &["C", "D"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    // Dual form: DisjointClasses(:A ≤1 r.C) moves ≤1 r.C to the right as ≥2 r.C.
+    let out = unsat(
+        "DisjointClasses(:A ObjectMaxCardinality(1 :r :C))
+         ObjectPropertyRange(:r ObjectOneOf(:a))
+         ClassAssertion(:D :d)",
+        &["A"],
+        &["C", "D"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+}
+
+#[test]
+fn at_least_above_one_clashes_with_functionality_and_at_most_beside_individuals() {
+    // Functional superproperty r forces s-successors to merge.
+    let out = unsat(
+        "FunctionalObjectProperty(:r)
+         SubObjectPropertyOf(:s :r)
+         SubClassOf(:A ObjectMinCardinality(2 :s :C))
+         SubClassOf(:E ObjectMinCardinality(1 :s :C))
+         ClassAssertion(:E :e)",
+        &["A"],
+        &["C", "E"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    // ≥3 s.C with s ⊑ r and ≤1 r.C on a real instance is inconsistent.
+    let (out, ex) = run("SubObjectPropertyOf(:s :r)
+         SubClassOf(:A ObjectMinCardinality(3 :s :C))
+         SubClassOf(:A ObjectMaxCardinality(1 :r :C))
+         ClassAssertion(:A :a)");
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+
+    // Qualified ≤1 r.D with C ⊑ D merges the disjoint fillers of ≥2 r.C.
+    let out = unsat(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:A ObjectMaxCardinality(1 :r :D))
+         SubClassOf(:C :D)
+         ClassAssertion(:E :e)",
+        &["A"],
+        &["C", "D", "E"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+}
+
+#[test]
+fn at_least_above_one_interacts_with_inverses_subproperties_and_different_individuals() {
+    // Every C has s to o and s is inverse functional, so C has at most one instance.
+    // R7 at o merges the fresh fillers of ≥2 r.C in A's world.
+    let out = unsat(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:C ObjectSomeValuesFrom(:s ObjectOneOf(:o)))
+         InverseFunctionalObjectProperty(:s)
+         ClassAssertion(:D :d)",
+        &["A"],
+        &["C", "D"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    let (out, ex) = run("SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:C ObjectSomeValuesFrom(:s ObjectOneOf(:o)))
+         InverseFunctionalObjectProperty(:s)
+         ClassAssertion(:A :a)");
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+
+    // InverseObjectProperties with InverseFunctionalObjectProperty makes rinv functional.
+    let out = unsat(
+        "InverseObjectProperties(:r :rinv)
+         InverseFunctionalObjectProperty(:r)
+         SubClassOf(:A ObjectMinCardinality(2 :rinv :C))
+         ClassAssertion(:B :b)",
+        &["A"],
+        &["B", "C"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    // Inverse universal propagates back to A and its individual a.
+    check(
+        "InverseObjectProperties(:r :rinv)
+         SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:C ObjectAllValuesFrom(:rinv :D))
+         ClassAssertion(:A :a)
+         EquivalentClasses(:Qa ObjectOneOf(:a))",
+        &[("A", "D"), ("Qa", "A"), ("Qa", "D")],
+        &[("D", "A"), ("C", "D")],
+    );
+
+    // SubObjectPropertyOf propagates existential consequences from ≥2 r.C to s.
+    check(
+        "SubObjectPropertyOf(:r :s)
+         SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(ObjectSomeValuesFrom(:s :C) :E)
+         ClassAssertion(:A :a)
+         EquivalentClasses(:Qa ObjectOneOf(:a))",
+        &[("A", "E"), ("Qa", "A"), ("Qa", "E")],
+        &[("E", "A"), ("C", "E")],
+    );
+
+    // DifferentIndividuals beside ≥2 r.C stays consistent.
+    let out = unsat(
+        "DifferentIndividuals(:a :b)
+         ClassAssertion(:A :x)
+         SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         ObjectPropertyAssertion(:r :x :a)
+         ObjectPropertyAssertion(:r :x :b)
+         ClassAssertion(:C :a)
+         ClassAssertion(:C :b)",
+        &[],
+        &["A", "C"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    // Negative ≥2 r.C (dual ≤1 r.C) with two DifferentIndividuals is inconsistent.
+    let (out, ex) = run("DifferentIndividuals(:a :b)
+         ObjectPropertyAssertion(:r :x :a)
+         ObjectPropertyAssertion(:r :x :b)
+         ClassAssertion(:C :a)
+         ClassAssertion(:C :b)
+         SubClassOf(ObjectMinCardinality(2 :r :C) owl:Nothing)");
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+
+    // AsymmetricObjectProperty clashes via R8 when C links back to real individual a.
+    let (out, ex) = run("AsymmetricObjectProperty(:r)
+         ClassAssertion(:A :a)
+         SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:C ObjectSomeValuesFrom(:r ObjectOneOf(:a)))");
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+}
+
+#[test]
+fn at_least_above_one_beside_individuals_keeps_simple_role_and_bound_guards() {
+    // Non-simple role in ≥2 stays left out and reported.
+    let (out, ex) = run("TransitiveObjectProperty(:r)
+         SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         ClassAssertion(:A :a)");
+    assert_eq!(ex.len(), 1, "{ex:#?}");
+    assert_eq!(out.stats.tier, Tier::Horn);
+
+    // Top object property in ≥2 beside individuals is not simple and stays left out.
+    let (out, ex) = run(
+        "SubClassOf(:A ObjectMinCardinality(2 owl:topObjectProperty :C))
+         ClassAssertion(:A :a)",
+    );
+    assert_eq!(ex.len(), 1, "{ex:#?}");
+    assert_eq!(out.stats.tier, Tier::Horn);
+
+    // Cardinality above MAX_AT_LEAST (64) stays left out and reported.
+    let (out, ex) = run("SubClassOf(:A ObjectMinCardinality(65 :r :C))
+         ClassAssertion(:A :a)");
+    assert_eq!(ex.len(), 1, "{ex:#?}");
+    assert_eq!(out.stats.tier, Tier::Horn);
+}
+
+#[test]
+fn at_least_above_one_with_keys_self_anonymous_nesting_and_el_datatypes() {
+    // HasKey applies only to named individuals, so it equates named instances :c1 and :c2
+    // sharing :s-successor :o without falsely collapsing the fresh anonymous fillers of ≥2 r.C.
+    let out = check(
+        "HasKey(:C (:s) ())
+         SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:C ObjectSomeValuesFrom(:s ObjectOneOf(:o)))
+         ClassAssertion(:C :c1)
+         ClassAssertion(:C :c2)
+         ObjectPropertyAssertion(:s :c1 :o)
+         ObjectPropertyAssertion(:s :c2 :o)
+         ClassAssertion(:M :c1)
+         EquivalentClasses(:Qc1 ObjectOneOf(:c1))
+         EquivalentClasses(:Qc2 ObjectOneOf(:c2))",
+        &[("Qc1", "Qc2"), ("Qc2", "Qc1"), ("Qc2", "M")],
+        &[("A", "C"), ("C", "A")],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+
+    // ≥2 r.C alongside ObjectHasSelf(:r) and an anonymous individual derives both
+    // self-loop and existential consequences without false unsatisfiability.
+    let out = check(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:A ObjectHasSelf(:r))
+         SubClassOf(ObjectHasSelf(:r) :S)
+         SubClassOf(ObjectSomeValuesFrom(:r :C) :E)
+         ClassAssertion(:A _:b0)
+         ClassAssertion(:D :a)",
+        &[("A", "S"), ("A", "E")],
+        &[("S", "A"), ("E", "A"), ("A", "C")],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+
+    // An irreflexive role beside ObjectHasSelf(:r) and ≥2 r.C on an anonymous individual
+    // is inconsistent.
+    let (out, ex) = run("IrreflexiveObjectProperty(:r)
+         SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:A ObjectHasSelf(:r))
+         ClassAssertion(:A _:b0)");
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+
+    // Nested ≥2 r.(≥2 s.C) beside individuals stays satisfiable and propagates consequences.
+    let out = check(
+        "SubClassOf(:A ObjectMinCardinality(2 :r ObjectMinCardinality(2 :s :C)))
+         SubClassOf(ObjectSomeValuesFrom(:s :C) :M)
+         SubClassOf(ObjectSomeValuesFrom(:r :M) :E)
+         ClassAssertion(:A :a)
+         EquivalentClasses(:Qa ObjectOneOf(:a))",
+        &[("A", "E"), ("Qa", "A"), ("Qa", "E")],
+        &[("E", "A"), ("M", "A"), ("A", "M")],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    // Nested ≥2 r.(≥2 s.C) with functional s makes A unsatisfiable while keeping C and D satisfiable.
+    let out = unsat(
+        "FunctionalObjectProperty(:s)
+         SubClassOf(:A ObjectMinCardinality(2 :r ObjectMinCardinality(2 :s :C)))
+         ClassAssertion(:D :d)",
+        &["A"],
+        &["C", "D"],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    // ≥2 r.C where C requires two disjoint OWL 2 EL datatypes on one non-functional data
+    // property stays consistent and derives consequences for A and its individual.
+    let out = check(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:C DataSomeValuesFrom(:d xsd:integer))
+         SubClassOf(:C DataSomeValuesFrom(:d xsd:string))
+         SubClassOf(ObjectIntersectionOf(DataSomeValuesFrom(:d xsd:integer) DataSomeValuesFrom(:d xsd:string)) :Both)
+         SubClassOf(ObjectSomeValuesFrom(:r :Both) :E)
+         ClassAssertion(:A :a)
+         DataPropertyAssertion(:d :c1 \"1\"^^xsd:integer)
+         DataPropertyAssertion(:d :c1 \"s\"^^xsd:string)
+         DataPropertyAssertion(:d :c2 \"2\"^^xsd:integer)
+         DataPropertyAssertion(:d :c2 \"t\"^^xsd:string)
+         EquivalentClasses(:Qa ObjectOneOf(:a))",
+        &[("C", "Both"), ("A", "E"), ("Qa", "A"), ("Qa", "E")],
+        &[("E", "A"), ("Both", "C")],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("C")));
+
+    // Making :d functional renders the two disjoint EL datatype existentials unsatisfiable,
+    // making :C and :A unsatisfiable and the ontology inconsistent through :a ∈ :A.
+    let (out, ex) = run("FunctionalDataProperty(:d)
+         SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(:C DataSomeValuesFrom(:d xsd:integer))
+         SubClassOf(:C DataSomeValuesFrom(:d xsd:string))
+         ClassAssertion(:A :a)");
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+}
+
+#[test]
+fn at_least_above_one_with_non_horn_finite_data_cover_stays_sound() {
+    // O_KILLER: consistent under OWL 2 Direct Semantics (y1, y2, y3 form a 3-cycle of
+    // r-successors with d in {1, 2, 3}), whereas its Lemma 2 unfolding would be
+    // unsatisfiable under full case analysis over DataOneOf(1, 2, 3). The Horn tier
+    // unfolds ≥2 r.C (deriving :A ⊑ :E, which ABox assertions alone cannot entail) while
+    // never splitting data covers, so it stays sound (consistent) and reports the exact
+    // finite-cover diagnostic as used in part.
+    const COVER_REASON: &str =
+        "a case analysis over data values, which the Horn tier does not make";
+    let (out, ex) = run(
+        "SubClassOf(:A ObjectMinCardinality(2 :r :C))
+         SubClassOf(ObjectSomeValuesFrom(:r :C) :E)
+         SubClassOf(:A ObjectMaxCardinality(1 :r DataHasValue(:d \"1\"^^xsd:integer)))
+         SubClassOf(:A ObjectMaxCardinality(1 :r DataHasValue(:d \"2\"^^xsd:integer)))
+         SubClassOf(:A ObjectMaxCardinality(1 :r DataHasValue(:d \"3\"^^xsd:integer)))
+         SubClassOf(:C DataAllValuesFrom(:d DataOneOf(\"1\"^^xsd:integer \"2\"^^xsd:integer \"3\"^^xsd:integer)))
+         SubClassOf(:C DataSomeValuesFrom(:d xsd:integer))
+         FunctionalDataProperty(:d)
+         ClassAssertion(:A :x1) ClassAssertion(:A :x2) ClassAssertion(:A :x3)
+         ObjectPropertyAssertion(:r :x1 :y1) ObjectPropertyAssertion(:r :x1 :y2)
+         ObjectPropertyAssertion(:r :x2 :y2) ObjectPropertyAssertion(:r :x2 :y3)
+         ObjectPropertyAssertion(:r :x3 :y3) ObjectPropertyAssertion(:r :x3 :y1)
+         ClassAssertion(:C :y1) ClassAssertion(:C :y2) ClassAssertion(:C :y3)
+         DataPropertyAssertion(:d :y1 \"1\"^^xsd:integer)
+         DataPropertyAssertion(:d :y2 \"2\"^^xsd:integer)
+         DataPropertyAssertion(:d :y3 \"3\"^^xsd:integer)
+         ClassAssertion(ObjectMaxCardinality(0 :r DataHasValue(:d \"3\"^^xsd:integer)) :x1)
+         ClassAssertion(ObjectMaxCardinality(0 :r DataHasValue(:d \"1\"^^xsd:integer)) :x2)
+         ClassAssertion(ObjectMaxCardinality(0 :r DataHasValue(:d \"2\"^^xsd:integer)) :x3)",
+    );
+    assert!(
+        !ex.is_empty()
+            && ex
+                .iter()
+                .all(|e| matches!(e.gap, sparkles_owl::classify::Gap::Partial(COVER_REASON))),
+        "expected only finite-cover partial reports, got: {ex:#?}"
+    );
+    assert!(
+        ex.iter().any(|e| matches!(
+            &e.axiom,
+            AxiomKind::SubClassOf(_, ClassExpression::DataAllValuesFrom(..))
+        )),
+        "expected the DataAllValuesFrom finite-cover axiom in partial reports, got: {ex:#?}"
+    );
+    assert!(
+        !ex.iter().any(|e| matches!(
+            &e.axiom,
+            AxiomKind::SubClassOf(_, ClassExpression::ObjectMinCardinality(2, _, _))
+        )),
+        "expected ObjectMinCardinality(2 :r :C) to be accepted, got: {ex:#?}"
+    );
+    assert!(out.consistent);
+    assert_eq!(out.consistency, Consistency::Unknown);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("E")));
+    assert!(!out.taxonomy.is_subclass(&c("E"), &c("A")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("C")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("E")));
+    assert!(!out.complete);
+}
+
+#[test]
+fn incremental_add_and_remove_of_at_least_above_one_beside_individuals() {
+    let base = axioms(
+        "ClassAssertion(:D :d)
+         ObjectPropertyRange(:r ObjectOneOf(:a))
+         SubClassOf(:A :B)
+         SubClassOf(:C :D)",
+    );
+    let more = axioms("SubClassOf(:A ObjectMinCardinality(2 :r :C))");
+    let mut fresh = Classifier::of(&base);
+    let fresh_out = fresh.classify(&Limits::default()).unwrap();
+    assert!(
+        fresh.excluded().is_empty(),
+        "left out: {:#?}",
+        fresh.excluded()
+    );
+
+    let mut k = Classifier::of(&base);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+
+    k.add(&more);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(k.excluded().is_empty(), "left out: {:#?}", k.excluded());
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("C")));
+
+    k.remove(&more);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(k.excluded().is_empty(), "left out: {:#?}", k.excluded());
+    assert_eq!(out.consistency, fresh_out.consistency);
+    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+    let pairs = |o: &Classification| -> Vec<(String, String)> {
+        let t = &o.taxonomy;
+        let cs: Vec<Class> = t.classes().cloned().collect();
+        let mut v = Vec::new();
+        for x in &cs {
+            for y in &cs {
+                if t.is_subclass(x, y) {
+                    v.push((x.as_str().to_string(), y.as_str().to_string()));
+                }
+            }
+        }
+        v.sort();
+        v
+    };
+    assert_eq!(pairs(&out), pairs(&fresh_out));
 }

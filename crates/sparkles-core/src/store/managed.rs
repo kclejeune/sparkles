@@ -25,11 +25,12 @@ pub(super) fn load_dir(root: &Path) -> Option<ManagedState> {
             });
         }
     };
-    // format 3 is written only once configuration history is activated, so in a
-    // dataset without it the file is a newer release's registry
+    // format 3, and format 4+ carrying configurationHistory, is written only once
+    // configuration history is activated, so in a dataset without it the file is a
+    // newer release's registry
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
         && let Some(format) = value.get("format").and_then(serde_json::Value::as_u64)
-        && format >= 3
+        && (format == 3 || (format >= 4 && value.get("configurationHistory").is_some()))
         && let Some(reader) = crate::commit::read_dataset_versions(root)
             .ok()
             .flatten()
@@ -159,6 +160,13 @@ impl Store {
         }
     }
 
+    /// Whether `capability` still matches this dataset's currently installed managed-graph
+    /// registry (the same pointer identity checked by write admission at commit time).
+    pub fn managed_writer_current(&self, capability: &ManagedWrite) -> bool {
+        self.managed_state()
+            .is_some_and(|current| Arc::ptr_eq(&current, &capability.state))
+    }
+
     /// The managed graphs of this store's dataset, `None` when no owner manages any.
     /// Fails with `managed-unavailable` when the registry cannot be enforced.
     pub fn managed_graphs(&self) -> Result<Option<ManagedGraphs>> {
@@ -224,7 +232,13 @@ impl Store {
         entry: OwnerEntry,
         settings: &[u8],
     ) -> Result<ManagedGraphs> {
-        self.enable_managed_checked(owner, entry, settings, None)
+        self.enable_managed_checked(
+            owner,
+            entry,
+            settings,
+            None,
+            &crate::guard::WriteOptions::default(),
+        )
     }
 
     /// [`enable_managed`](Self::enable_managed) only while the registry's revision is
@@ -239,7 +253,47 @@ impl Store {
         settings: &[u8],
         expected: u64,
     ) -> Result<ManagedGraphs> {
-        self.enable_managed_checked(owner, entry, settings, Some(expected))
+        self.enable_managed_checked(
+            owner,
+            entry,
+            settings,
+            Some(expected),
+            &crate::guard::WriteOptions::default(),
+        )
+    }
+
+    /// [`enable_managed_at`](Self::enable_managed_at) honoring the cancellation flag and
+    /// deadline of `options` while waiting for the writer lock and before the first
+    /// durable registry mutation. Once the registry is published, the family barrier
+    /// still runs to completion so every previously admitted writer finishes.
+    pub fn enable_managed_at_with(
+        &self,
+        owner: OwnerKind,
+        entry: OwnerEntry,
+        settings: &[u8],
+        expected: u64,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<ManagedGraphs> {
+        self.enable_managed_checked(owner, entry, settings, Some(expected), options)
+    }
+
+    /// Monotonic counter incremented on every managed-graph registry publication or
+    /// availability transition for this store's family, including same-commit changes.
+    pub fn managed_generation(&self) -> u64 {
+        self.family.managed_generation()
+    }
+
+    /// The installed registry revision, or zero before its first publication.
+    /// Reads one in-memory snapshot and never takes a dataset writer.
+    pub fn managed_revision(&self) -> Result<u64> {
+        match self.managed_state().as_deref() {
+            None => Ok(0),
+            Some(ManagedState::Installed(i)) => Ok(i.graphs.revision),
+            Some(ManagedState::Unavailable { reason, .. }) => Err(ManagedError::error(
+                ManagedErrorKind::Unavailable,
+                reason.clone(),
+            )),
+        }
     }
 
     /// The bytes of `owner`'s settings file as the installed registry records them,
@@ -262,7 +316,9 @@ impl Store {
         entry: OwnerEntry,
         settings: &[u8],
         expected: Option<u64>,
+        options: &crate::guard::WriteOptions,
     ) -> Result<ManagedGraphs> {
+        options.check()?;
         if !owner.supports_profile(entry.profile) {
             return Err(ManagedError::error(
                 ManagedErrorKind::UnsupportedProfile,
@@ -299,7 +355,7 @@ impl Store {
                 owner.settings_file()
             )));
         }
-        self.change_managed(|current| {
+        self.change_managed(options, |current| {
             let revision = current.map_or(0, |i| i.graphs.revision);
             if let Some(expected) = expected
                 && expected != revision
@@ -319,19 +375,86 @@ impl Store {
             graphs.revision = graphs.revision.checked_add(1)
                 .ok_or_else(|| Error::invalid("managed registry revision overflow"))?;
             // A graph that stays protected keeps its nonce; one that becomes protected
-            // gets a new random one, which nobody could have known before.
+            // gets a new random one, which nobody could have known before. Dedicated
+            // evidence projection outputs are recorded in `entry.projection_only`
+            // (writing `managed.json` format 4) rather than encoding role bits in the
+            // UUID, so upgrading a legacy pre-format-4 dedicated output that holds no
+            // genuinely published `ev:Operation` history anywhere in the family
+            // preserves its existing protection nonce for active resolution maps and
+            // same-version rival drift guards. Promoting a projection-only output into
+            // a record role without detaching drops it from `projection_only` and
+            // rotates its nonce so previously projected lookalikes cannot authenticate
+            // as published records, while a record-role graph moved into `projections`
+            // without detaching stays out of `projection_only` and keeps its nonce so
+            // its record history remains protected and discoverable for replay.
+            let new_roles = if owner == OwnerKind::Evidence {
+                evidence_graph_roles(settings)
+            } else {
+                EvidenceGraphRoles::default()
+            };
             let previous = graphs.owners.get(&owner);
+            let prev_roles = if owner == OwnerKind::Evidence {
+                current
+                    .and_then(|i| i.settings.get(&OwnerKind::Evidence))
+                    .filter(|b| {
+                        previous
+                            .is_some_and(|p| crate::managed::settings_digest(b) == p.settings_digest)
+                    })
+                    .map(|b| evidence_graph_roles(b))
+                    .unwrap_or_default()
+            } else {
+                EvidenceGraphRoles::default()
+            };
             let mut entry = entry;
-            entry.protections = entry
-                .graphs
-                .iter()
-                .map(|g| {
-                    let kept = previous
-                        .filter(|p| p.graphs.contains(g))
-                        .and_then(|p| p.protections.get(g).copied());
-                    (g.clone(), kept.unwrap_or_else(uuid::Uuid::new_v4))
-                })
-                .collect();
+            let mut protections = BTreeMap::new();
+            let mut projection_only = std::collections::BTreeSet::new();
+            for g in &entry.graphs {
+                let is_projection =
+                    owner == OwnerKind::Evidence && new_roles.projection_only.contains(g);
+                let kept = previous
+                    .filter(|p| p.graphs.contains(g))
+                    .and_then(|p| p.protections.get(g).copied());
+                let was_projection_only = previous
+                    .is_some_and(|p| p.graphs.contains(g) && p.projection_only.contains(g));
+                let (nonce, mark_projection_only) = match kept {
+                    Some(_) if !is_projection && was_projection_only => {
+                        (uuid::Uuid::new_v4(), false)
+                    }
+                    Some(prev) if is_projection && was_projection_only => (prev, true),
+                    Some(prev)
+                        if owner == OwnerKind::Evidence
+                            && is_projection
+                            && !was_projection_only
+                            && prev_roles.projection_only.contains(g) =>
+                    {
+                        let mark = !self.output_has_published_operation_in_family(
+                            g,
+                            prev,
+                        );
+                        (prev, mark)
+                    }
+                    Some(prev)
+                        if owner == OwnerKind::Evidence
+                            && !is_projection
+                            && !was_projection_only
+                            && prev_roles.projection_only.contains(g)
+                            && !self.output_has_published_operation_in_family(
+                                g,
+                                prev,
+                                ) =>
+                    {
+                        (uuid::Uuid::new_v4(), false)
+                    }
+                    Some(prev) => (prev, false),
+                    None => (uuid::Uuid::new_v4(), is_projection),
+                };
+                protections.insert(g.clone(), nonce);
+                if mark_projection_only {
+                    projection_only.insert(g.clone());
+                }
+            }
+            entry.protections = protections;
+            entry.projection_only = projection_only;
             graphs.owners.insert(owner, entry);
             files.insert(owner, Arc::from(settings));
             Ok((Installed::new(graphs, files)?, Some(owner)))
@@ -424,7 +547,7 @@ impl Store {
         graph: &str,
         expected: Option<u64>,
     ) -> Result<ManagedGraphs> {
-        self.change_managed(|current| {
+        self.change_managed(&crate::guard::WriteOptions::default(), |current| {
             let Some(current) = current else {
                 return Err(not_enabled(owner));
             };
@@ -445,10 +568,37 @@ impl Store {
                     "graph <{graph}> is not managed by {owner}"
                 )));
             };
+            // A legacy record-role detach also upgrades dedicated outputs
+            // whose current protection has no record history in the family.
+            if owner == OwnerKind::Evidence
+                && let Some(settings_bytes) = current.settings.get(&OwnerKind::Evidence)
+                && crate::managed::settings_digest(settings_bytes) == entry.settings_digest
+            {
+                let roles = evidence_graph_roles(settings_bytes);
+                if roles.record_roles.contains(graph) {
+                    let candidates: Vec<(String, uuid::Uuid)> = roles
+                        .projection_only
+                        .iter()
+                        .filter(|out| {
+                            out.as_str() != graph && !entry.projection_only.contains(out.as_str())
+                        })
+                        .filter_map(|out| {
+                            let &nonce = entry.protections.get(out)?;
+                            Some((out.clone(), nonce))
+                        })
+                        .collect();
+                    for (out, out_nonce) in candidates {
+                        if !self.output_has_published_operation_in_family(&out, out_nonce) {
+                            entry.projection_only.insert(out);
+                        }
+                    }
+                }
+            }
             entry.graphs.remove(at);
             // Protecting the graph again chooses a new nonce, so a record written while
             // it is detached never carries the nonce of a protection.
             entry.protections.remove(graph);
+            entry.projection_only.remove(graph);
             graphs.revision = graphs
                 .revision
                 .checked_add(1)
@@ -461,6 +611,7 @@ impl Store {
     /// owner settings file of the owner it names first.
     fn change_managed(
         &self,
+        options: &crate::guard::WriteOptions,
         change: impl FnOnce(Option<&Installed>) -> Result<(Installed, Option<OwnerKind>)>,
     ) -> Result<ManagedGraphs> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
@@ -469,11 +620,14 @@ impl Store {
                 "managed graphs are changed through the dataset's main store",
             ));
         }
-        let o = crate::guard::WriteOptions::default();
-        let w = self.lock_writer(&o)?;
+        options.check()?;
+        let _managed_change =
+            super::branching::controlled_lock(&self.family.managed_change, options)?;
+        let w = self.lock_writer(options)?;
         if w.poisoned {
             return Err(Error::Poisoned);
         }
+        options.check()?;
         let current = self.managed_state();
         let installed = match current.as_deref() {
             None => None,
@@ -591,6 +745,7 @@ impl Store {
             self.check_memory(data)?;
             next.history_memory = Some(memory);
         }
+        options.check()?;
         // From the first registry file written until the new registry is installed,
         // the files may no longer match the installed registry. An error or unwind
         // in between leaves the family refusing every write, so that no ordinary
@@ -666,8 +821,7 @@ impl Store {
         let graphs = next.graphs.clone();
         // 4. main and every branch admit against the new registry from here on
         self.family
-            .managed
-            .store(Some(Arc::new(ManagedState::Installed(next))));
+            .store_managed(Some(Arc::new(ManagedState::Installed(next))));
         fence.armed = false;
         drop(w);
         self.managed_barrier()?;
@@ -795,7 +949,7 @@ impl Store {
         &self,
         graphs: impl Iterator<Item = &'k [u8]>,
     ) -> Result<()> {
-        let state = self.family.managed.load();
+        let state = self.family.managed.load_full();
         let Some(admission) = Admission::start(state.as_ref(), None)? else {
             return Ok(());
         };
@@ -898,7 +1052,42 @@ impl Store {
                 .find(|(n, _)| *n == owner.settings_file())
                 .map(|(_, b)| b.clone()))
         });
-        self.family.managed.store(Some(Arc::new(state)));
+        self.family.store_managed(Some(Arc::new(state)));
+    }
+    /// Whether `output` holds any genuinely published `ev:Operation` under its legacy
+    /// v4 protection `nonce` on `main` or any listed branch (failing safe to `true` if
+    /// any branch is broken or unreadable or if preparation fails).
+    fn output_has_published_operation_in_family(&self, output: &str, nonce: uuid::Uuid) -> bool {
+        let Ok(preparation) = crate::access::Preparation::new(
+            crate::task::Control::none(),
+            crate::evidence::resolve::MEMORY_BYTES,
+        ) else {
+            return true;
+        };
+        let check_store = |store: &Store| -> bool {
+            let snap = store.snapshot();
+            let reads = crate::evidence::write::Reads::new(&preparation, &snap);
+            reads
+                .has_published_operation_in_output(output, Some(nonce))
+                .unwrap_or(true)
+        };
+        if check_store(self) {
+            return true;
+        }
+        if let Some(set) = self.branch_set() {
+            let Some(branch_ids) = set.listed_branch_ids_if_healthy() else {
+                return true;
+            };
+            for id in branch_ids {
+                let Ok(branch_store) = set.open_store(id) else {
+                    return true;
+                };
+                if check_store(&branch_store) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -923,8 +1112,7 @@ impl Drop for UncertainRegistry<'_> {
         if self.armed {
             tracing::error!(target: "sparkles::store", "a managed-graph registry change did not complete; writes are refused until it is made again");
             self.family
-                .managed
-                .store(Some(Arc::new(ManagedState::Unavailable {
+                .store_managed(Some(Arc::new(ManagedState::Unavailable {
                     reason: "a change of the registry did not complete; enable the owner again"
                         .into(),
                     repairable: true,
@@ -1010,6 +1198,54 @@ fn rootless_repair(reason: &str) -> Error {
         ManagedErrorKind::Unavailable,
         format!("{reason}; a store without a directory has no recorded registry to repair it from"),
     )
+}
+
+#[derive(Default)]
+struct EvidenceGraphRoles {
+    projection_only: std::collections::BTreeSet<String>,
+    record_roles: std::collections::BTreeSet<String>,
+}
+
+fn evidence_graph_roles(settings: &[u8]) -> EvidenceGraphRoles {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(settings) else {
+        return EvidenceGraphRoles::default();
+    };
+    let mut projection_only: std::collections::BTreeSet<String> = v
+        .get("projections")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    for section in ["policies", "matchingPolicies"] {
+        if let Some(map) = v.get(section).and_then(serde_json::Value::as_object) {
+            for pol in map.values() {
+                if let Some(output) = pol.get("output").and_then(serde_json::Value::as_str) {
+                    projection_only.insert(output.to_owned());
+                }
+            }
+        }
+    }
+    let mut record_roles = std::collections::BTreeSet::new();
+    for role in [
+        "sourceRecords",
+        "proposals",
+        "decisions",
+        "supports",
+        "identity",
+    ] {
+        if let Some(arr) = v.get(role).and_then(serde_json::Value::as_array) {
+            for g in arr.iter().filter_map(serde_json::Value::as_str) {
+                projection_only.remove(g);
+                record_roles.insert(g.to_owned());
+            }
+        }
+    }
+    EvidenceGraphRoles {
+        projection_only,
+        record_roles,
+    }
 }
 
 fn not_enabled(owner: OwnerKind) -> Error {

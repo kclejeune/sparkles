@@ -25,10 +25,11 @@
 //! history lock waits for the holds' lock. An acquisition never takes a writer lock, and
 //! a collection reads the protection without taking the holds' lock.
 
-use super::{Store, write_atomic};
+use super::Store;
 use crate::branch::CommitRef;
 use crate::error::{Error, Result};
-use crate::holds::{self, HeldIndex, HoldsState, Record, SourceHold};
+use crate::guard::WriteOptions;
+use crate::holds::{self, HeldIndex, HoldsState, Record, SourceHold, SourceHoldInfo};
 use crate::managed::OwnerKind;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -47,6 +48,12 @@ pub struct Acquired {
 pub struct HoldPublication(
     #[allow(dead_code)] parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, ()>,
 );
+
+/// Keeps a store's published head free of uncertain durable writes during hold release.
+#[doc(hidden)]
+pub struct PublishedWriter {
+    _writer: parking_lot::ArcMutexGuard<parking_lot::RawMutex, super::WriterState>,
+}
 
 /// Puts the protection back to what `holds.json` records when an acquisition fails.
 struct Unpublished<'a> {
@@ -85,6 +92,22 @@ impl Store {
         }
     }
 
+    /// Every source hold with its originating dataset, when foreign.
+    pub fn source_hold_details(&self) -> Result<Vec<SourceHoldInfo>> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        match &*self.family.holds.state.lock() {
+            HoldsState::Ready(r) => Ok(r.values().map(Self::hold_info).collect()),
+            HoldsState::Unavailable(reason) => Err(holds::unavailable(reason)),
+        }
+    }
+
+    fn hold_info(record: &Record) -> SourceHoldInfo {
+        SourceHoldInfo {
+            hold: record.hold.clone(),
+            for_dataset: record.for_dataset,
+        }
+    }
+
     /// The commits all the holds name together.
     pub fn held_commits(&self) -> Result<usize> {
         match &*self.family.holds.state.lock() {
@@ -115,6 +138,20 @@ impl Store {
         id: uuid::Uuid,
         commits: &[CommitRef],
     ) -> Result<Acquired> {
+        self.acquire_hold_for(owner, id, commits, None)
+    }
+
+    /// [`Store::acquire_hold`] for an operation in `for_dataset`, when it differs from
+    /// this dataset. A `for_dataset` equal to this dataset's id is normalized to `None`.
+    /// Acquiring an existing hold with a different `for_dataset` is a `hold-conflict`.
+    /// Any hold that names another dataset writes `holds.json` as format 2.
+    pub fn acquire_hold_for(
+        &self,
+        owner: OwnerKind,
+        id: uuid::Uuid,
+        commits: &[CommitRef],
+        for_dataset: Option<uuid::Uuid>,
+    ) -> Result<Acquired> {
         self.holds_main()?;
         if commits.is_empty() {
             return Err(Error::invalid("a source hold names at least one commit"));
@@ -122,6 +159,7 @@ impl Store {
         if commits.len() > holds::MAX_COMMITS {
             return Err(holds::limit(0, commits.len()));
         }
+        let for_dataset = for_dataset.filter(|&d| d != self.owner_dataset_id());
         let mut commits = commits.to_vec();
         commits.sort_unstable();
         commits.dedup();
@@ -157,7 +195,10 @@ impl Store {
         };
         let touch = self.family.holds.touches.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(existing) = records.get_mut(&id) {
-            if existing.hold.owner == owner && existing.hold.commits == commits {
+            if existing.hold.owner == owner
+                && existing.hold.commits == commits
+                && existing.for_dataset == for_dataset
+            {
                 // a reconciliation that looked before this no longer releases it
                 existing.touch = touch;
                 existing.acquired_ms = existing.acquired_ms.max(self.now_ms());
@@ -165,6 +206,7 @@ impl Store {
                 // the hold is durable before it is acknowledged again
                 if self.family.holds.uncertain.load(Ordering::Relaxed) {
                     self.persist_holds(records)?;
+                    self.family.holds.uncertain.store(false, Ordering::Relaxed);
                 }
                 return Ok(Acquired {
                     hold,
@@ -191,6 +233,7 @@ impl Store {
             id,
             Record {
                 hold: hold.clone(),
+                for_dataset,
                 stores: stores.clone(),
                 touch,
                 acquired_ms: now,
@@ -261,13 +304,36 @@ impl Store {
         id: uuid::Uuid,
         commits: &[CommitRef],
     ) -> Result<HoldPublication> {
+        self.hold_publication_for(owner, id, commits, None)
+    }
+
+    /// [`Store::hold_publication`] for a hold whose originating dataset is `for_dataset`
+    /// (`None` or this dataset's id for local holds).
+    pub fn hold_publication_for(
+        &self,
+        owner: OwnerKind,
+        id: uuid::Uuid,
+        commits: &[CommitRef],
+        for_dataset: Option<uuid::Uuid>,
+    ) -> Result<HoldPublication> {
         let guard = self.family.holds.publishing.read_arc();
+        let for_dataset = for_dataset.filter(|&d| d != self.owner_dataset_id());
         let mut commits = commits.to_vec();
         commits.sort_unstable();
         commits.dedup();
-        match &mut *self.family.holds.state.lock() {
+        let mut state = self.family.holds.state.lock();
+        if self.family.holds.uncertain.load(Ordering::Relaxed) {
+            return Err(holds::unavailable(
+                "the last change to the holds file is uncertain",
+            ));
+        }
+        match &mut *state {
             HoldsState::Ready(r) => match r.get_mut(&id) {
-                Some(rec) if rec.hold.owner == owner && rec.hold.commits == commits => {
+                Some(rec)
+                    if rec.hold.owner == owner
+                        && rec.hold.commits == commits
+                        && rec.for_dataset == for_dataset =>
+                {
                     // a reconciliation that looked before this no longer releases it
                     rec.touch = self.family.holds.touches.fetch_add(1, Ordering::Relaxed) + 1;
                 }
@@ -292,10 +358,22 @@ impl Store {
         self.release_where(|r| r.hold.owner == owner && ids.contains(&r.hold.id))
     }
 
-    /// Release the holds of `owner` last acquired at least `grace_ms` milliseconds ago that
-    /// `keep` does not keep, as after an operation that acquired them never published
-    /// the commit that refers to them. `keep` is asked outside every lock, and a hold
-    /// acquired again in the meantime, even with the same commits, is not released.
+    /// Pin a writer whose snapshot includes every commit that could survive reopening.
+    /// A busy or poisoned writer, or a pending group commit, is inconclusive.
+    /// The caller can try this while holding the target's publication lock.
+    #[doc(hidden)]
+    pub fn try_pin_published_writer(&self) -> Option<PublishedWriter> {
+        let writer = self.writer.try_lock_arc()?;
+        (!writer.poisoned
+            && writer.head.seq == self.snapshot().commit
+            && self.group.as_ref().is_none_or(|g| g.try_idle()))
+        .then_some(PublishedWriter { _writer: writer })
+    }
+
+    /// Release local holds of `owner` last acquired at least `grace_ms` milliseconds ago
+    /// that `keep` does not keep. Foreign holds require the origin-aware
+    /// [`Store::reconcile_holds_checked`] callback and are kept here. The callback runs
+    /// outside the holds state lock. A hold acquired again in the meantime stays.
     /// Returns the released ids.
     pub fn reconcile_holds(
         &self,
@@ -303,47 +381,102 @@ impl Store {
         grace_ms: i64,
         keep: &mut dyn FnMut(&SourceHold) -> Result<bool>,
     ) -> Result<Vec<uuid::Uuid>> {
+        self.reconcile_holds_checked::<()>(owner, grace_ms, |info, _| {
+            if info.for_dataset.is_some() {
+                return Ok(true);
+            }
+            keep(&info.hold)
+        })
+    }
+
+    /// Reconcile with separate preparation and confirmation passes. The confirmation
+    /// pass receives state that can retain nonblocking validation guards through the
+    /// durable release. It runs under the target's exclusive hold publication lock
+    /// and must not wait for a store writer or branch table.
+    pub fn reconcile_holds_checked<G: Default>(
+        &self,
+        owner: OwnerKind,
+        grace_ms: i64,
+        keep: impl FnMut(&SourceHoldInfo, Option<&mut G>) -> Result<bool>,
+    ) -> Result<Vec<uuid::Uuid>> {
+        self.reconcile_holds_checked_with(owner, grace_ms, &WriteOptions::default(), keep)
+    }
+
+    /// Run reconciliation under the caller's deadline, cancellation and lock-wait policy.
+    #[doc(hidden)]
+    pub fn reconcile_holds_checked_with<G: Default>(
+        &self,
+        owner: OwnerKind,
+        grace_ms: i64,
+        options: &WriteOptions,
+        mut keep: impl FnMut(&SourceHoldInfo, Option<&mut G>) -> Result<bool>,
+    ) -> Result<Vec<uuid::Uuid>> {
         self.holds_main()?;
+        options.check()?;
         let cutoff = self.now_ms().saturating_sub(grace_ms.max(0));
-        let candidates: Vec<(SourceHold, u64)> = match &*self.family.holds.state.lock() {
-            HoldsState::Ready(r) => r
-                .values()
-                .filter(|r| r.hold.owner == owner && r.acquired_ms <= cutoff)
-                .map(|r| (r.hold.clone(), r.touch))
-                .collect(),
-            HoldsState::Unavailable(reason) => return Err(holds::unavailable(reason)),
+        let candidates = {
+            let state = super::branching::controlled_lock(&self.family.holds.state, options)?;
+            let records = match &*state {
+                HoldsState::Ready(records) => records,
+                HoldsState::Unavailable(reason) => return Err(holds::unavailable(reason)),
+            };
+            let mut candidates = Vec::new();
+            for r in records.values() {
+                options.check()?;
+                if r.hold.owner == owner && r.acquired_ms <= cutoff {
+                    candidates.push((Self::hold_info(r), r.touch));
+                }
+            }
+            candidates
         };
-        let mut orphans: Vec<(SourceHold, u64)> = Vec::new();
+        let mut orphans: Vec<(SourceHoldInfo, u64)> = Vec::new();
         for (h, touch) in candidates {
-            if !keep(&h)? {
+            options.check()?;
+            if !keep(&h, None)? {
                 orphans.push((h, touch));
             }
         }
         if orphans.is_empty() {
             return Ok(Vec::new());
         }
-        let _family = self.shared_family(&Default::default())?;
+        let _family = self.shared_family(options)?;
         // No commit is publishing a reference to a hold from here on, so asking again
         // sees every publication that passed its check before this point, and a later
         // one finds its hold gone and is refused.
-        let publishing = self.family.holds.publishing.write();
-        let mut confirmed: Vec<(uuid::Uuid, u64)> = Vec::new();
+        let publishing = if options.no_wait {
+            let Some(publishing) = self.family.holds.publishing.try_write() else {
+                return Ok(Vec::new());
+            };
+            publishing
+        } else {
+            self.family.holds.publishing.write()
+        };
+        let mut confirmed = BTreeMap::new();
+        let mut guards = G::default();
         for (h, touch) in &orphans {
-            if !keep(h)? {
-                confirmed.push((h.id, *touch));
+            options.check()?;
+            if !keep(h, Some(&mut guards))? {
+                confirmed.insert(h.hold.id, *touch);
             }
         }
-        self.release_locked(publishing, |r| {
-            confirmed
-                .iter()
-                .any(|(id, touch)| r.hold.id == *id && r.touch == *touch)
+        self.failpoint("holds-reconcile-confirmed");
+        options.check()?;
+        // A validation guard may pin the target's own branch table. Acquisitions
+        // take the holds state before that table, so never wait for state here.
+        let Some(state) = self.family.holds.state.try_lock() else {
+            return Ok(Vec::new());
+        };
+        self.release_locked(publishing, state, guards, options, |r| {
+            confirmed.get(&r.hold.id) == Some(&r.touch)
         })
     }
 
     /// Release the holds `which` selects.
     fn release_where(&self, which: impl Fn(&Record) -> bool) -> Result<Vec<uuid::Uuid>> {
+        self.failpoint("holds-release-waiting");
         let publishing = self.family.holds.publishing.write();
-        self.release_locked(publishing, which)
+        let state = self.family.holds.state.lock();
+        self.release_locked(publishing, state, (), &WriteOptions::default(), which)
     }
 
     /// [`Store::release_where`] under the exclusive publication lock `publishing`,
@@ -351,9 +484,11 @@ impl Store {
     fn release_locked(
         &self,
         publishing: parking_lot::RwLockWriteGuard<'_, ()>,
+        mut state: parking_lot::MutexGuard<'_, HoldsState>,
+        guards: impl Sized,
+        options: &WriteOptions,
         which: impl Fn(&Record) -> bool,
     ) -> Result<Vec<uuid::Uuid>> {
-        let mut state = self.family.holds.state.lock();
         let records = match &*state {
             HoldsState::Ready(r) => r,
             HoldsState::Unavailable(reason) => return Err(holds::unavailable(reason)),
@@ -368,12 +503,16 @@ impl Store {
         for id in &ids {
             next.remove(id);
         }
+        options.check()?;
         self.persist_holds(&next)?;
+        drop(guards);
         self.failpoint("holds-release-published");
         self.install_holds(&mut state, next, &touched);
         drop(state);
         drop(publishing);
-        self.collect_members(&touched);
+        if !options.no_wait {
+            self.collect_members(&touched);
+        }
         Ok(ids)
     }
 
@@ -398,26 +537,26 @@ impl Store {
             .index
             .store(Arc::new(HeldIndex::of(next.values())));
         *state = HoldsState::Ready(next);
+        self.family.holds.uncertain.store(false, Ordering::Relaxed);
         self.settle_members(touched);
     }
 
     /// Write `holds.json` for `records` durably (nothing for an in-memory store), under
-    /// the holds' lock. A failure leaves the file uncertain until a later write succeeds.
+    /// the holds' lock. The state stays uncertain until the caller installs the written map.
     pub(super) fn persist_holds(&self, records: &BTreeMap<uuid::Uuid, Record>) -> Result<()> {
         let Some(root) = self.managed_root() else {
             return Ok(());
         };
-        let written = crate::commit::require_reader(&root, holds::READER).and_then(|()| {
-            write_atomic(
-                &root.join(holds::FILE),
-                &holds::encode(self.owner_dataset_id(), records),
-            )
-        });
-        self.family
-            .holds
-            .uncertain
-            .store(written.is_err(), Ordering::Relaxed);
-        written
+        self.family.holds.uncertain.store(true, Ordering::Relaxed);
+        crate::commit::require_reader(&root, holds::READER)?;
+        let path = root.join(holds::FILE);
+        crate::fsutil::write_atomic_via_then(
+            &path,
+            &path.with_extension("tmp"),
+            &holds::encode(self.owner_dataset_id(), records),
+            || self.failpoint("holds-replaced"),
+        )?;
+        Ok(())
     }
 
     /// Fail with `410 history-gone` unless commit `seq` of this store is readable now,

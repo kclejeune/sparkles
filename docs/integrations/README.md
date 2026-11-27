@@ -1,236 +1,68 @@
-# Libraries and integrations capabilities
+# Libraries and integrations
 
-This page describes the available capabilities and their current limits. The
-[capability matrix](../FEATURES.md#capability-status) records delivery status within
-each stated scope.
+Sparkles embeds directly inside Rust, Python, JVM (Apache Jena), and Node.js applications without a separate server, alongside native Rust (`sparkles-client`) and TypeScript (`@sparkles-rdf/client`) HTTP clients for remote endpoints. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+
+| Surface | Package / crate | Highlights |
+|---|---|---|
+| Rust embedded | `sparkles` | Full engine, query builder, catalog, typed handles, and `Control` cancellation. |
+| Rust HTTP client | `sparkles-client` | Async (Tokio) and blocking SPARQL, Graph Store, and typed Sparkles admin APIs. |
+| Python | `sparkles` (`crates/sparkles-py`) | GIL-releasing sync and `sparkles.aio` async APIs, `rdflib` store plugin, and abi3 wheels. |
+| JVM (Apache Jena) | `sparkles-jena` | Jena `DatasetGraph`, transactions, Fuseki assembler, TDB2 import, and `jena-ontapi` bridge. |
+| Node.js / TypeScript | `@sparkles-rdf/engine`, `@sparkles-rdf/client` | Node-API native addon with RDF/JS terms, Comunica source, and Fetch HTTP client. |
 
 ## Libraries and bindings
 
-The engine is a Rust library, and the Python, JVM and Node.js packages embed the same
-engine in process. Thread destruction preserves query callback family checks and
-the visibility limits of captured callback views.
+All four embedded bindings run the same Rust storage and query engine in process. Thread teardown preserves query callback family checks and the visibility limits of captured callback views.
 
-Each binding tests many quads for membership in one call. `Dataset::contains_all` in
-Rust, `Dataset.contains_all` in Python, `DatasetGraphSparkles.containsAll` on the JVM
-and `Dataset.hasAll` in Node.js answer a batch in the order given, from one state of the
-dataset. The Python, JVM and JavaScript sections of [USAGE](../USAGE.md#python) describe
-each call.
+### Language APIs
 
-Store shutdown finishes embedding record output even if a caller retains the
-Embedder. If a clean-close validation callback panics, shutdown first revokes
-retained writers and finishes pending output, then propagates the original unwind.
+* **Rust embedded library (`sparkles`).** `sparkles::Dataset` exposes the full engine alongside `sparkles::querybuilder` ([USAGE.md](../USAGE.md#embedding-the-library), [P06](../specs/P06-library-admin-api.md)). Opening a dataset automatically installs its write-time validation, RDFS on read, stored queries, and GraphQL schema just as the server does. Sub-handles manage snapshots and history, indexes, settings, schema reports, stored queries, reasoning, validation, GraphQL, and backups under one `Control` for cancellation and progress. A catalog manages multiple datasets, clones, and restores. Optional capabilities (reasoner, validators, backups, GraphQL) are cargo features off by default and enabled together via `full`.
+* **Python (`sparkles`, `crates/sparkles-py`).** Ships abi3 wheels for CPython 3.10+ on Linux and macOS ([USAGE.md](../USAGE.md#python), [P01](../specs/P01-python-bindings.md)). Covers datasets, streaming file-object bulk loads without temporary copies, SPARQL, transactions, history, search indexes, reasoning, validation, an `rdflib` store plugin, and the query builder. Calls release the GIL and honor `Ctrl-C`. `sparkles.aio` provides async queries, bounded cursors, and transactions with owned cancellation and explicit async cleanup. Synchronous branch `get`, `update`, and `delete` refuse with a conflict if the calling Python thread holds a write transaction on that named branch, leaving the transaction usable, and `branches.update` clears a branch note on explicit `note=None` while leaving it unchanged when `note` is omitted.
+* **JVM / Apache Jena (`sparkles-jena`).** Provides a Jena `DatasetGraph` with transactions, native query and update execution (falling back to ARQ when needed), bulk loads, historical reads, dumps, typed administration, a Fuseki assembler, and TDB2 import ([USAGE.md](../USAGE.md#jvm-apache-jena)). Passes Jena's contract tests for datasets, graphs, transactions, updates, and prefixes. `DatasetGraphSparkles.algorithms()` manages named graph-algorithm projections, runs queries, returns statistics, and writes results in batched commits (note that a failure mid-write can leave earlier batches committed; callers close returned query executions; roadmap [item 8](../ROADMAP.md)).
+* **Node.js and TypeScript (`@sparkles-rdf/*`).** `@sparkles-rdf/engine` embeds Sparkles through Node-API with RDF/JS terms, bounded async results, streams, transactions, administration, and a Comunica source; repeated quad operations reuse cached term handles and result rows decode RDF/JS terms lazily ([USAGE.md](../USAGE.md#javascript-and-typescript)). `@sparkles-rdf/client` provides streaming SPARQL, Graph Store operations, and typed HTTP administration over Fetch. Both share terms, results, and errors via `@sparkles-rdf/common`.
+* **Rust HTTP client (`crates/sparkles-client`).** Provides async (Tokio) and blocking clients speaking SPARQL 1.1 and Graph Store protocols to Sparkles, Fuseki, QLever, Oxigraph, or Wikidata, streaming results as `oxrdf` terms ([USAGE.md](../USAGE.md#rust-client), [P02](../specs/P02-rust-client.md)). Against Sparkles servers it adds point-in-time reads, stored queries, uploads, batches, commits, datasets, tasks, backups, statistics, and schema reports. Both forms support per-call cancellation and deadlines, honor `Retry-After` and `RateLimit` headers, and never retry writes with unknown outcomes. Typed methods such as `dataset.schema_typed(None)`, `dataset.stats_typed(None)`, `put_stored_query_typed`, and typed history/snapshot/branch/diff methods (including force and reparent branch deletion) return generated models (`SchemaSummary`, `DatasetStats`, `StoredQuery`, `BackupList`). Models retain unknown fields in `extra`, keep enums as strings for forward compatibility, use `i128` for JSON integers, and do not enforce schema bounds; legacy untyped JSON methods remain unchanged.
 
-Stores in one persistent opening and their BranchSet share ownership of the dataset
-root's process lock. Dropping main leaves that lock held while an embedded caller retains
-a branch Store or BranchSet. Removed and retired branch stores keep the same lease
-until their resources are destroyed. Release those owners before reopening the
-dataset directory. In-memory branches share runtime ownership without a file lock.
+### Shared cross-binding capabilities
 
-Publishing a directory change by catalog deletion, persistent rename or backup
-replacement also requires proof of exclusive runtime ownership. Raw Strong or Weak aliases
-to a participating DatasetState, branch Store or BranchSet conservatively make disposal
-busy. Refusal preserves the original allocations and files. Release those aliases and
-retry. An in-place restore retries the proof itself until its drain time ends. Built-in
-worker and branch references use revocable links, so idle cached branches can close
-without changing the public StoreHandle variants. Close callbacks run after catalog lookup
-exclusion ends. Callbacks may look up datasets. A catalog management call from a callback
-on the disposing thread, such as create, delete or rename, fails at once with a
-`catalog-disposing` conflict. `Catalog::defer` queues the call instead, and the delete,
-rename or restore runs it on the same thread after releasing the catalog and before
-returning. A deferred call that panics is logged and later calls still run. Calls that
-deferred calls defer in turn run in the same loop. A reserved clone or restore publication
-refused this way leaves its files and staged directory in place. A deferred open or an
-expected attach refused this way keeps its name opening or expected for the startup code
-that owns it. Deferred calls are kept only in memory, so callbacks must be idempotent.
-Management calls from other threads wait for the disposal as before. Members closed during
-unwinding can skip checkpoints that require a clean close. The runtime retains root
-exclusion through required resource shutdown.
+* **Batch quad membership.** Every embedded binding tests many quads against one snapshot in a single call, returning results in input order: `Dataset::contains_all` (Rust), `Dataset.contains_all` (Python), `DatasetGraphSparkles.containsAll` (JVM), and `Dataset.hasAll` (Node.js) ([USAGE.md](../USAGE.md#python)).
+* **R2RML, RML, and YARRRML mappings.** Rust `Dataset::run_mapping_with` and `StoredMappings::run` accept `guard::WriteOptions` so cancellation, deadlines, graph permissions, preconditions, previews, and commit metadata apply across both conversion and final loader publication (while `Dataset::run_mapping` and `RunOptions.check` remain unchanged for conversion-only checks). JVM `DatasetGraphSparkles.mappings()` and Node.js `Dataset.mappings` manage stored mappings and run inline or stored mappings with cancellation and deadlines through conversion and loading (default JVM and Node.js builds exclude SQLite and Parquet sources). Python `Dataset.run_mapping` and `Dataset.mappings.run` do not accept cancellation tokens, timeouts, or `Ctrl-C`.
+* **OWL 2 ontology handles and `jena-ontapi`.** Python (`Dataset.ontology`), Node.js (`dataset.ontology`), and JVM (`DatasetGraphSparkles.ontology()`) expose ontology summaries, axiom listings, profile checks, edits, entity removal, and commit diffs in the `/$/ontology` JSON format ([API.md](../API.md#ontology)). Python wraps axioms in frozen hashable `Axiom` objects; Node.js streams paged axioms as an async iterable pinned to the first page's commit; all three accept native cancellation and timeouts (`cancel`/`timeout`, operation options, or `SparklesOperation`). On the JVM, `SparklesOnt.model(dataset, graphIri, spec)` copies a graph in one native call into a Jena `OntModel` (requires the caller to add `org.apache.jena:jena-ontapi` matching its Jena version) so writes commit atomically inside the thread's Sparkles write transaction and roll back on abort. Like standard Jena in-memory models, `OntModel` instances require external locking for concurrent threads and do not observe external commits made through other handles.
+* **Evidence settings, holds, resolution, and typed writes.** Python (`Dataset.evidence`), Node.js (`Dataset.evidence`), and the JVM (`DatasetGraphSparkles.evidence()`) expose evidence settings reads, configuration, graph detachment, durable source hold listing, acquisition and release, stored-fact and record resolution, claim and identity proposals, policy reviews, claim withdrawals, policy claim-state reads, matching-policy entity resolution, and dependent assessment lookups ([C25](../specs/C25-evidence-and-assessments.md#evidence-operations-in-the-bindings)). Embedded callers are trusted, default to principal `urn:x-sparkles:principal:local` when none is supplied, and let call-level `branch`, `principal`, and `author` arguments override fields in the JSON payload. Single-dataset resolution passes no catalog, so stored-fact references into another dataset return `evidence-unavailable`. Hold acquisition returns `{ created, hold }` and hold release returns a boolean. Policy claim-state reads accept an optional `at` selector. Passing `at` opens a bound historical evidence view and requires activated configuration history, failing with `configuration-history-inactive` otherwise. Omitting `at` reads a bound live view when configuration history is active and falls back to the live head with the current managed settings when it is not. Each binding maps managed-boundary and branch refusals to typed exception classes with the engine's stable refusal codes (`code` in Python and the JVM, `details.code` in Node.js)—including `profile-managed-graph` on ordinary updates—and enforces closed-dataset and family-wide open-transaction guards.
 
-After runtime close commits, an I/O failure can reopen the existing dataset through a
-fresh runtime. Recovery verifies its original UUID and existing CURRENT before opening.
-If a delete cannot synchronize its rollback, the catalog leaves the dataset unavailable
-and reports the retained data path. Unresolved moved bytes stay in
-`databases/.kept-<name>-<token>` and catalog startup does not remove them. `Catalog::open`
-refuses alone only a registered dataset whose directory or CURRENT file is missing, or
-whose format this release does not read. It serves the other datasets, keeps the refused
-one registered and names its expected path in the refusal. A server keeps any dataset
-that fails to open closed in the same way ([API.md](../API.md#startup)).
-Moving the retained directory back to that path and restarting recovers the dataset.
-A close callback that panics after the runtime close commits leaves the dataset
-registered and closed, and the next catalog open reopens it. Restore publication
-verifies the restored identity separately from the original identity required for
-rollback.
+### Runtime ownership, locking, and recovery
 
-`sparkles::evidence::resolve::Resolution` finds a dataset among a catalog's registered
-datasets by its UUID and reads a branch by its UUID at an exact commit, without opening a
-cold branch store. The embedding decides the caller's access on the current names before
-anything is read. Durable source holds, not live openings, keep referenced commits
-readable. Runtime ownership checks do not authorize removal of source bytes required by a
-durable consumer.
-
-* The embedded Rust API is `sparkles::Dataset`, with a fluent query builder in
-  `sparkles::querybuilder` ([USAGE.md](../USAGE.md#embedding-the-library),
-  [P06](../specs/P06-library-admin-api.md)). Opening a dataset installs its write-time
-  validation, RDFS on read, stored queries and GraphQL schema as the server does. Handles
-  on `Dataset` manage snapshots and history, indexes, settings, schema reports, stored
-  queries, reasoning, validation, GraphQL and backups, with one `Control` for
-  cancellation and progress. A catalog manages datasets, restores and clones. The
-  reasoner, validators, backups and GraphQL are cargo features of the `sparkles` crate,
-  off by default and all on with `full`.
-* The Python package `sparkles` in `crates/sparkles-py` ships abi3 wheels for CPython 3.10
-  and later on Linux and macOS ([USAGE.md](../USAGE.md#python),
-  [P01](../specs/P01-python-bindings.md)). It covers datasets, loads, SPARQL, transactions,
-  history, search indexes, reasoning and validation, and has an rdflib store plugin and
-  the query builder. Calls release the GIL, and Ctrl-C stops a running query. A load
-  from a file object streams it to the bulk loader once, with no temporary copy, and
-  Ctrl-C stops it too.
-  `sparkles.aio` provides async queries, bounded cursors and transactions, with owned
-  cancellation and explicit async cleanup. Synchronous branch get, update and delete
-  refuse a named branch transaction owned by the calling Python thread before waiting
-  for its worker. Refusal leaves the transaction usable.
-* `sparkles-jena` is a Jena `DatasetGraph` backed by Sparkles for JVM programs
-  ([USAGE.md](../USAGE.md#jvm-apache-jena)). It has Jena's transactions, query and update
-  engines that run in Sparkles with ARQ as the fallback, bulk loads, historical reads,
-  dumps, typed administration, a Fuseki assembler and an import of TDB2 databases. It
-  passes Jena's contract tests for datasets, graphs, transactions, updates and prefixes.
-* `@sparkles-rdf/engine` embeds the database in Node.js through Node-API, with RDF/JS
-  terms, bounded async results, streams, transactions, administration and a Comunica
-  source ([USAGE.md](../USAGE.md#javascript-and-typescript)). `@sparkles-rdf/client` gives
-  streaming SPARQL, Graph Store operations and typed administration over Fetch. Both
-  share terms, result types and errors through `@sparkles-rdf/common`.
-  Repeated quad operations reuse term handles, whose native kind checks borrow the
-  cached terms. Result rows decode their RDF/JS terms lazily.
-* `crates/sparkles-client` is a Rust client of remote servers, async on tokio with a
-  blocking form ([USAGE.md](../USAGE.md#rust-client), [P02](../specs/P02-rust-client.md)). It
-  speaks the SPARQL 1.1 Protocol and the Graph Store Protocol to Sparkles, Fuseki,
-  QLever, Oxigraph or Wikidata and streams results as `oxrdf` terms. On a Sparkles server
-  it adds point-in-time reads, stored queries, uploads, batches, commits, datasets, tasks,
-  backups, statistics and the schema report. The `*_typed` methods read generated models
-  for schema reports, server and dataset statistics, stored queries and backup listings.
-  Typed history methods read snapshot and branch metadata and bounded JSON diffs, and
-  create and delete snapshots and branches. Both client forms support per-call
-  cancellation and deadlines. Branch deletion accepts force and reparent options.
-  The existing JSON methods keep their signatures. It retries as `Retry-After` and
-  `RateLimit` direct, and never repeats a write whose outcome is unknown.
-
-The JVM `DatasetGraphSparkles.algorithms()` handle lists, gets, stores and deletes
-named projections. It also builds query text, runs queries, returns statistics and writes
-results. Callers close the returned query execution. Writes use batched commits, so a
-later failure can leave earlier batches committed. Other algorithm surfaces are planned.
-Roadmap item 8.
-
-The JVM `DatasetGraphSparkles.mappings()` and Node.js `Dataset.mappings` handles list,
-version, store, delete and run mappings. Their `runMapping` methods run mapping text.
-Both return the commit receipt and mapping statistics. The default JVM and Node.js
-packages do not enable SQLite or Parquet mapping sources. Their direct and stored runs
-carry cancellation and deadlines through conversion and the final load. Python
-`Dataset.run_mapping` and `Dataset.mappings.run` take no cancellation token or
-timeout, and Ctrl-C does not stop them.
-
-Native Rust callers use `Dataset::run_mapping_with` with `guard::WriteOptions` for
-controls that cover conversion and the final load. `StoredMappings::run` applies the
-cancellation sources and deadline of its write options to conversion in the same way. The complete write options retain
-all cancellation sources, the deadline, graph permissions, preconditions, preview
-settings and commit metadata. Checks run at conversion boundaries and existing reader
-checkpoints, and the loader applies the same controls while acquiring the writer and
-before publication. A refusal leaves committed data unchanged. A stop requested after
-the loader publishes does not retract the successful receipt.
-
-The existing `Dataset::run_mapping` signature and `mapping::RunOptions` fields remain
-unchanged. `RunOptions.check` remains a conversion-only callback and is also honored
-by the controlled variant. Use the structured write options for cancellation or a
-deadline that must reach the final writer wait.
-
-Each binding has an OWL 2 ontology handle, namely Python's `Dataset.ontology`, Node.js's
-`dataset.ontology` and the JVM's `DatasetGraphSparkles.ontology()`. Each handle reads the
-summary and the axioms, checks the profiles, edits axioms, removes entities and diffs
-commits, and answers in the JSON forms of the `/$/ontology` routes
-([API.md](../API.md#ontology)). Python's `Axiom` is a frozen axiom with structural
-equality and hashing, read from functional-style syntax or the JSON form, and the listings
-carry `Axiom` objects. Node.js's `axioms` is an async iterable that reads pages from the
-commit of the first page, and its `timeout` bounds the whole listing. Python takes
-`cancel` and `timeout`, Node.js the operation options, and the JVM a
-`SparklesOperation`.
-
-`SparklesOnt.model(dataset, graphIri, spec)` returns the `OntModel` that Jena's
-`OntModelFactory` builds over a Sparkles graph with an `OntSpecification`, so Jena
-programs use `jena-ontapi`'s own interfaces. One native call copies the graph into a
-Jena in-memory graph, from the thread's transaction or the head. Writes through the
-model go to the copy and to the Sparkles graph in the thread's write transaction, so a
-transaction's edits make one commit. A transaction that aborts undoes its writes in the
-copy too. A commit made through another handle later is not seen by the model, except
-for the triples a transaction of the model wrote, which are read back once it ends. Like
-Jena's in-memory models, the model needs the caller's locking when threads use it at
-once. `jena-ontapi` is not bundled, and a program that calls `model`
-adds `org.apache.jena:jena-ontapi` of its Jena version. `SparklesOnt.check` and the
-other `SparklesOnt` functions run the native operations over one graph.
-
-Covered package roots and version rules follow the
-[API compatibility policy](../DEVELOPMENT.md#api-compatibility). HTTP and standard CLI
-development-baseline checks are available. Public Rust and binding release comparisons
-are planned. Roadmap item 60. Native libraries and JVM JARs must still have matching
-versions.
-
-## Known gaps
-
-These limits name the roadmap items that address them. Current priorities and
-dependencies are recorded in the [central roadmap](../ROADMAP.md).
-
-### Rust HTTP client
-
-The remaining administration routes use `call_json` where no typed method exists.
-Typed change feeds, clones, merges, search, reasoning, validation and settings are
-planned, as are proactive rate-limit pacing and isolated integration tests for
-environment and saved credentials. Roadmap item 47.
-
-### Bindings and packaging
-
-* Public library and binding release compatibility checks remain. Roadmap item 60.
-* There is no WebAssembly build of the engine. Roadmap item 44.
-* The Python package is not on PyPI and has no PyPy or free-threaded wheels. The JVM
-  library is not on Maven Central, and the JavaScript packages are not on npm. Release
-  workflows build for Linux on x86_64 and arm64 and for macOS on Apple silicon only, with
-  no Windows or Intel macOS packages, and Linux is the platform tested locally. The JVM
-  library has no musl build. Roadmap item 58.
-* Python mapping runs cannot be cancelled and have no timeout. Roadmap item 404.
-* Python `branches.update(name, note=None)` leaves the note unchanged, as omitting the
-  argument does. Explicit clearing needs argument presence handling. Roadmap item 755.
-* Python async administration and bulk operations are planned. The available async
-  surface covers queries, updates, bounded cursors and transactions. Roadmap item 58.
-* JVM functions registered in Java run through ARQ. Roadmap item 25.
-* Branch administration still needs logical caller ownership checks for Node.js manual
-  transactions and raw FFI calls, nested upstream dependencies, Python and Node.js
-  branch listings, and deletion cleanup beside an unrelated transaction worker.
-  Such a call can wait for its own transaction. Roadmap item 754.
-* The server and CLI need the host's system CA certificates, even for loopback commands
-  such as `sparkles ping`, because the HTTP client loads them when it starts. Minimal
-  images such as bare Debian leave them out. Roadmap item 59.
+* **Process lock and branch handles.** Persistent stores and their `BranchSet` share ownership of `sparkles.lock` at the dataset root. Dropping the main store keeps the lock held until every retained, removed, or retired branch `Store` and `BranchSet` is destroyed; release all handles before reopening the directory. In-memory branches share runtime ownership without a file lock. Store shutdown completes pending embedding record output even if a caller retains an `Embedder`, and a panicking validation callback still revokes retained writers and flushes output before unwinding.
+* **Catalog disposal and `Catalog::defer`.** Catalog deletions, persistent renames, and backup replacements require exclusive runtime ownership. Any retained strong or weak alias to a `DatasetState`, branch `Store`, or `BranchSet` causes disposal to fail safely without altering files, while in-place restores retry until their drain window expires. Built-in workers and cached branches use revocable links so idle branches close cleanly. Close callbacks run after catalog lookup locks drop and may look up datasets; re-entrant management calls (`create`, `delete`, `rename`) on the disposing thread fail with `catalog-disposing`, whereas `Catalog::defer` queues idempotent in-memory callbacks to run on the same thread right after disposal finishes.
+* **Failure recovery and UUID resolution.** If an I/O error occurs after runtime close commits, recovery verifies the dataset's UUID and `CURRENT` before reopening. Managed persistent deletes record a versioned `delete.json` intent and synchronize the staged root before removing its UUID from `config.json`. Catalog startup validates the journal before recovery and requires the dataset process lock before cleaning up a committed delete. It preserves failed rollbacks and warns about retained bytes. The [operations guide](../operations/README.md#interrupted-dataset-deletes) describes the recovery and refusal conditions. `Catalog::open` isolates datasets with missing directories, missing `CURRENT`, or unreadable formats while serving all healthy datasets ([API.md](../API.md#startup)). `sparkles::evidence::resolve::Resolution` locates datasets and branches by UUID without opening cold branch stores; callers enforce access checks on current names first, and durable source holds (not live handles) keep referenced commits retained.
+* **API compatibility.** Covered package roots follow the [API compatibility policy](../DEVELOPMENT.md#api-compatibility). HTTP and standard CLI baselines are checked in development; public Rust and binding release comparisons remain planned (roadmap [item 60](../ROADMAP.md)). Native libraries and JVM JARs must match versions.
 
 ## Configuration and usage
 
-The following guides describe configuration and supported UI, command-line, HTTP
-or library workflows. Exact HTTP contracts remain in the API reference.
+| Topic | Reference |
+|---|---|
+| Embedded Rust library | [Embedding the library](../USAGE.md#embedding-the-library) |
+| Python sync and async APIs | [Python](../USAGE.md#python), [Async datasets and cursors](../USAGE.md#async-datasets-and-cursors) |
+| JVM and Apache Jena | [JVM (Apache Jena)](../USAGE.md#jvm-apache-jena) |
+| JavaScript and TypeScript | [JavaScript and TypeScript](../USAGE.md#javascript-and-typescript) |
+| Rust HTTP client | [Rust client](../USAGE.md#rust-client) |
 
-* Read [Embedding the library](../USAGE.md#embedding-the-library).
-* Read [Python](../USAGE.md#python) and [async datasets and cursors](../USAGE.md#async-datasets-and-cursors).
-* Read [JVM (Apache Jena)](../USAGE.md#jvm-apache-jena).
-* Read [JavaScript and TypeScript](../USAGE.md#javascript-and-typescript).
-* Read [Rust client](../USAGE.md#rust-client).
+## Known gaps
 
-For example, `dataset.schema_typed(None).await?` returns
-`sparkles_client::admin_types::SchemaSummary`, and
-`dataset.stats_typed(None).await?` returns `DatasetStats`. The blocking client exposes
-the same methods. `put_stored_query_typed` accepts a `StoredQuery` model and returns
-the stored definition. Generated objects retain unknown members in `extra`, and open
-objects retain JSON maps. String enums remain strings so new server values remain
-readable. Integer fields use `i128` to retain signed and unsigned 64-bit JSON integers.
-Models represent response shapes and do not validate schema bounds or enum values.
-`BackupList` uses an untagged enum for pages and dataset listings, with the dataset
-listing tried first.
+Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
+
+### Rust HTTP client
+
+Administration routes without dedicated typed methods still use `call_json`. Typed change feeds, clones, merges, search, reasoning, validation, and settings methods, proactive rate-limit pacing, and isolated integration tests for environment and saved credentials remain planned (roadmap [item 47](../ROADMAP.md)).
+
+### Bindings and packaging
+
+* **Package publication and platforms.** None of the Python (PyPI), JVM (Maven Central), or Node.js (npm) packages are published to public registries. Release workflows target Linux (`x86_64`, `arm64`) and Apple silicon macOS only, with local testing on Linux and no Windows, Intel macOS, JVM musl, Python PyPy, or free-threaded Python wheels (roadmap [item 58](../ROADMAP.md)). No WebAssembly build of the database engine exists (roadmap [item 44](../ROADMAP.md)). Public Rust and binding release compatibility checks remain planned (roadmap [item 60](../ROADMAP.md)).
+* **System CA certificates.** The server and CLI load host system CA certificates on startup even for loopback commands such as `sparkles ping`, which fails in minimal images without `ca-certificates` (roadmap [item 59](../ROADMAP.md)).
+* **Python gaps.** Python mapping runs (`run_mapping`, `mappings.run`) lack cancellation tokens, timeouts, and `Ctrl-C` support (roadmap [item 404](../ROADMAP.md)). Async administration and bulk operations remain planned beyond queries, updates, bounded cursors, and transactions (roadmap [item 58](../ROADMAP.md)).
+* **JVM and branch-ownership gaps.** Java functions registered through Jena run in ARQ rather than natively in Sparkles (roadmap [item 25](../ROADMAP.md)). Logical caller ownership checks for branch administration remain incomplete for Node.js manual transactions, raw FFI calls, nested upstream dependencies, Python/Node.js branch listings, and deletion cleanup beside unrelated transaction workers (roadmap [item 754](../ROADMAP.md)).
 
 ## Roadmap
 
-The remaining work described above refers to [item 25](../ROADMAP.md), [item 44](../ROADMAP.md), [item 47](../ROADMAP.md), [item 58](../ROADMAP.md) and [item 60](../ROADMAP.md).
-The central roadmap owns priority and dependencies. Its
-[completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
-link partially complete specs to their remaining work and acceptance criteria.
+Core design specifications for this area are [P01](../specs/P01-python-bindings.md), [P02](../specs/P02-rust-client.md), [P03](../specs/P03-query-extensions.md), [P04](../specs/P04-jvm-bindings/SPEC.md), [P05](../specs/P05-node-bindings.md), and [P06](../specs/P06-library-admin-api.md). Binding measurements live in [docs/benchmarks/bindings/RESULTS.md](../benchmarks/bindings/RESULTS.md).
+
+The central [roadmap](../ROADMAP.md) owns priorities and dependencies, and its [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs) cover items 8, 25, 44, 47, 58, 59, 60, 404, and 754.

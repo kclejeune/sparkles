@@ -684,6 +684,7 @@ fn the_kept_taxonomy_counts_beside_a_query_saturation() {
         ds.state()
             .classify_cache
             .lock()
+            .slot(false)
             .entry
             .as_ref()
             .map(|e| e.taxonomy_memory())
@@ -692,4 +693,146 @@ fn the_kept_taxonomy_counts_beside_a_query_saturation() {
     assert!(before > 0);
     query(&ds, "teaches some Course");
     assert_eq!(kept(), Some(before));
+}
+
+#[test]
+fn dl663_dataset_dl_query_returns_the_named_source() {
+    let ds = dataset(
+        "Declaration(ObjectProperty(:r)) Declaration(ObjectProperty(:t))
+         Declaration(Class(:C)) Declaration(Class(:D))
+         Declaration(NamedIndividual(:a)) Declaration(NamedIndividual(:b))
+         Declaration(NamedIndividual(:c))
+         SubObjectPropertyOf(ObjectPropertyChain(:r owl:topObjectProperty) :t)
+         ObjectPropertyDomain(:t :D)
+         ObjectPropertyAssertion(:r :a :b)
+         ClassAssertion(:C :c)",
+    );
+    let answer = query(&ds, "D");
+    assert_eq!(answer.reasoning.engine, DlEngine::El);
+    assert!(!answer.reasoning.complete);
+    assert_eq!(answer.reasoning.instances_complete, Some(false));
+    assert!(matches!(&answer.reasoning.gaps[..], [gap] if gap.partial
+        && gap.message == "used in part: property chains through the top object property"));
+    assert_eq!(
+        answer.instances,
+        Some(vec![Individual::named(ex("a"))]),
+        "dl663 missing: Dataset DL query source instance",
+    );
+    // EL-only mode reproduces ELK and omits the top-chain domain projection.
+    let h = ds.ontology();
+    let req = OntologyRequest::default();
+    let mut q = DlQueryRequest::new(ClassExpression::Class(c("D")));
+    q.el_only = true;
+    let elk = h.dl_query(&req, &q, &Default::default()).unwrap();
+    assert_eq!(elk.reasoning.engine, DlEngine::El);
+    assert!(elk.reasoning.el_only);
+    assert!(!elk.reasoning.complete);
+    assert_eq!(elk.instances, Some(vec![]));
+    println!("dl663 ok: Dataset DL query source instance");
+}
+
+#[test]
+fn el_only_dl_query_reproduces_elk_and_keeps_full_cache_intact() {
+    let ds = dataset(
+        "Declaration(Class(:A)) Declaration(Class(:B)) Declaration(Class(:C)) Declaration(Class(:D))
+         Declaration(ObjectProperty(:r))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:A ObjectAllValuesFrom(:r :C))
+         SubClassOf(ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C)) :D)",
+    );
+    let h = ds.ontology();
+    let req = OntologyRequest::default();
+    // Warm the full kept classification first.
+    let full = h
+        .classify(&req, &ClassifyRequest::default(), &Default::default())
+        .unwrap();
+    assert!(full.classification.taxonomy.is_subclass(&c("A"), &c("D")));
+
+    let expr = ClassExpression::some(
+        ObjectProperty::new(ex("r")),
+        ClassExpression::ObjectIntersectionOf(
+            [
+                ClassExpression::Class(c("B")),
+                ClassExpression::Class(c("C")),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+
+    // Default classifier with reasoning=el runs the Horn rules and finds :A.
+    let mut q_horn = DlQueryRequest::new(expr.clone());
+    q_horn.reasoning = DlReasoning::El;
+    q_horn.answers.instances = false;
+    let horn = h.dl_query(&req, &q_horn, &Default::default()).unwrap();
+    assert_eq!(horn.reasoning.engine, DlEngine::El);
+    assert!(!horn.reasoning.el_only);
+    assert!(horn.reasoning.complete);
+    assert_eq!(horn.subclasses, Some(vec![c("A")]));
+
+    // el_only=true with either Auto or El runs OWL 2 EL rules alone, omits :A, and reports the gap.
+    for reasoning in [DlReasoning::Auto, DlReasoning::El] {
+        let mut q_elk = DlQueryRequest::new(expr.clone());
+        q_elk.reasoning = reasoning;
+        q_elk.el_only = true;
+        q_elk.answers.instances = false;
+        let elk = h.dl_query(&req, &q_elk, &Default::default()).unwrap();
+        assert_eq!(elk.reasoning.engine, DlEngine::El);
+        assert!(elk.reasoning.el_only);
+        assert!(!elk.reasoning.complete);
+        assert_eq!(elk.reasoning.gaps.len(), 1);
+        assert_eq!(elk.subclasses, Some(vec![]));
+        assert!(elk.incremental);
+    }
+
+    // The EL-only DL queries must not have clobbered the full kept classification.
+    let reused = h
+        .classify(&req, &ClassifyRequest::default(), &Default::default())
+        .unwrap();
+    assert!(reused.reused);
+    assert_eq!(reused.publication.id, full.publication.id);
+
+    // el_only=true with reasoning=rl is refused.
+    let mut bad_rl = DlQueryRequest::new(expr);
+    bad_rl.reasoning = DlReasoning::Rl;
+    bad_rl.el_only = true;
+    assert!(matches!(
+        h.dl_query(&req, &bad_rl, &Default::default()),
+        Err(Error::Invalid(_))
+    ));
+
+    // el_only=true with an expression outside OWL 2 EL is refused under both Auto and El,
+    // advising callers to leave out elOnly and use reasoning=auto or rl.
+    let non_el = ClassExpression::ObjectAllValuesFrom(
+        ObjectProperty::new(ex("r")).into(),
+        Box::new(ClassExpression::Class(c("C"))),
+    );
+    for reasoning in [DlReasoning::Auto, DlReasoning::El] {
+        let mut bad_expr = DlQueryRequest::new(non_el.clone());
+        bad_expr.reasoning = reasoning;
+        bad_expr.el_only = true;
+        let err = h
+            .dl_query(&req, &bad_expr, &Default::default())
+            .err()
+            .expect("expected EL-only refusal");
+        assert!(matches!(err, Error::Invalid(_)), "{reasoning:?}: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("leave out elOnly and use reasoning=auto or rl"),
+            "{reasoning:?}: {msg}"
+        );
+    }
+
+    // Explicit reasoning=el with el_only=false preserves its existing diagnostic.
+    let mut explicit_el = DlQueryRequest::new(non_el);
+    explicit_el.reasoning = DlReasoning::El;
+    let err = h
+        .dl_query(&req, &explicit_el, &Default::default())
+        .err()
+        .expect("expected explicit EL refusal");
+    assert!(matches!(err, Error::Invalid(_)), "{err}");
+    assert!(
+        err.to_string().contains("ask for reasoning=rl or auto"),
+        "{err}"
+    );
 }

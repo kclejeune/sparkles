@@ -278,6 +278,7 @@ async fn identity_proposals_reviews_reversals_and_dependents() {
     let dependents = success(&s, "find_evidence_dependents", dep_request.clone()).await;
     let found = dependents["dependents"].as_array().unwrap();
     assert_eq!(found.len(), 2);
+    assert_eq!(dependents["reports"], json!([]));
     assert!(
         found
             .iter()
@@ -752,4 +753,27 @@ async fn explicit_keys_replay_each_write_receipt_without_moving_the_head() {
         assert!(replay["changed"][field].as_array().unwrap().is_empty());
     }
     no_projection(&s);
+}
+
+#[tokio::test]
+async fn declared_drift_refuses_mcp_proposals_and_reads() {
+    use crate::settings::{Declared, Providers};
+    let s = configured(vec!["--mcp-allow-update"], false);
+    let proposed = success(&s, "propose_claims", proposal()).await;
+    let before = head(&s);
+    let declared = Declared::parse(
+        r#"{"datasets":{"ev":{"evidence":{"enabled":true,"sourceRecords":["urn:ev:changed"],"proposals":["urn:ev:claims"]}}}}"#,
+        Providers::Unchecked,
+    ).unwrap();
+    s.state
+        .settings
+        .replace_declared_for_test(Arc::new(declared));
+
+    let result = invoke(&s, "evw", "propose_claims", proposal()).await;
+    assert_eq!(tool_error(&result), "evidence-settings-drift", "{result}");
+    let result = invoke(&s, "evr", "resolve_evidence", json!({
+        "references":[{"key":"claim","record":{"iri":record(&proposed, "claim")["iri"],"kinds":["Claim"]}}]
+    })).await;
+    assert_eq!(tool_error(&result), "evidence-settings-drift", "{result}");
+    assert_eq!(head(&s), before);
 }

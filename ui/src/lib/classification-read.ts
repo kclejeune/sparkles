@@ -1,6 +1,14 @@
 // Read-only kept classification pages and the deliberate one-request frame action.
 import { request } from './api';
-import type { AxiomItem, Selection } from './ontology';
+import {
+  formatTimeoutSeconds,
+  type AxiomItem,
+  type ClassificationExpansion,
+  type ClassifyOptions,
+  type Selection,
+} from './ontology';
+
+export type { ClassificationExpansion, ClassifyOptions };
 
 export const CLASSIFICATION_PAGE_SIZE = 100;
 export const CLASSIFICATION_DISPLAY_CAP = 1000;
@@ -58,6 +66,7 @@ export type ClassificationOutcome = {
   consistency: 'consistent' | 'inconsistent' | 'unknown';
   excludedCount: number;
   incompleteCount: number;
+  unmappedCount: number;
 };
 export type ClassificationPage = {
   part: ClassificationPart;
@@ -78,6 +87,7 @@ export type KeptClassification = {
     iri: string;
     present: boolean;
     unsatisfiable: boolean | null;
+    incomplete: boolean | null;
     representative?: string | null;
     equivalenceCount?: number | null;
     children?: number | null;
@@ -102,6 +112,7 @@ export type ProjectedClassification = {
     result: ClassificationResult;
     outcome: ClassificationOutcome;
     unsatisfiable: boolean;
+    incomplete: boolean;
     parents: { items: ClassificationName[]; total: number; truncated: boolean; limit: number };
     equivalents: { items: ClassificationName[]; total: number; truncated: boolean; limit: number };
     sources: { items: ClassificationSourceRow[]; total: number; truncated: boolean };
@@ -150,23 +161,27 @@ export async function readKeptClassification(
 export async function projectClassification(
   view: ClassificationView,
   signal?: AbortSignal,
+  options?: ClassifyOptions,
 ): Promise<ProjectedClassification> {
-  const res = await request(
-    `/$/ontology/${encodeURIComponent(view.target)}/classify?${new URLSearchParams({ at: `commit:${view.commit}` })}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({
-        graph: view.selection.graph ?? 'default',
-        imports: view.selection.imports,
-        mode: view.mode,
-        projection: 'frame',
-        about: view.iri,
-        limit: CLASSIFICATION_PAGE_SIZE,
-        lang: view.languages,
-      }),
-      signal,
-    },
-  );
+  const params = new URLSearchParams({ at: `commit:${view.commit}` });
+  const timeoutSec = formatTimeoutSeconds(options?.timeoutMs);
+  if (timeoutSec) params.set('timeout', timeoutSec);
+  const body: Record<string, unknown> = {
+    graph: view.selection.graph ?? 'default',
+    imports: view.selection.imports,
+    mode: view.mode,
+    projection: 'frame',
+    about: view.iri,
+    limit: CLASSIFICATION_PAGE_SIZE,
+    lang: view.languages,
+  };
+  if (options?.partial) body.partial = true;
+  if (options?.expansion) body.expansion = options.expansion;
+  const res = await request(`/$/ontology/${encodeURIComponent(view.target)}/classify?${params}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  });
   return await res.json();
 }

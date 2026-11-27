@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# mutate.sh: runs tests/dl_automata.rs on the unchanged tree and under two wrong reductions,
+# a covered drop by the superrole (reversed sub) and a merge that ignores final states,
+# restoring the sources after each, and writes each run's failures to evidence/mutations.
+set -u
+W=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/dl-automata-712
+E=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/lanes/dl-automata-712/evidence/mutations
+cd $W
+N=crates/sparkles-owl/src/classify/dl_norm.rs; H=crates/sparkles-owl/src/classify/horn.rs
+run() { ~/.local/bin/sparkles-heavy-run 8 mbx test -p sparkles-owl --test dl_automata > $E/$1.log 2>&1; grep -E "^(hand|gen)-|^test |test result" $E/$1.log | cut -c1-160 | sort -u > $E/$1.txt; }
+run none
+sed -i 's/a.reduce(level > 1, &|x, y| rb.sub(x, y), rb.sub_cost());/a.reduce(level > 1, \&|x, y| rb.sub(y, x), rb.sub_cost());/' $N
+grep -q "rb.sub(y, x)" $N && run reversed-sub
+git checkout -- $N
+sed -i 's/let mut block: Vec<u32> = self.finals.iter().map(|&f| f as u32).collect();/let mut block: Vec<u32> = self.finals.iter().map(|_| 0).collect();/' $H
+grep -q "map(|_| 0)" $H && run merge-ignores-finals
+git checkout -- $H
+git diff --stat -- crates/sparkles-owl/src
+echo MUTATE-DONE

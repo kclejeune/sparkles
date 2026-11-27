@@ -49,10 +49,11 @@ use crate::sparql::QueryOptions;
 use oxrdf::{NamedOrBlankNode, Term, Triple};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use sparkles_owl::classify::{Classification, Excluded, logical};
+use sparkles_owl::classify::{Classification, Excluded, Unmapped, logical};
 use sparkles_owl::ofn::Renderer;
 use sparkles_owl::profiles::{CheckOptions, Checker, Report};
 use sparkles_owl::read::{self, Mode, ReadOptions};
+use sparkles_owl::transform::Dropped;
 use sparkles_owl::{Axiom, AxiomKind, ClassExpression, Entity, ObjectPropertyExpression, vocab};
 use sparkles_reasoner::inputs::{GraphRef, Import, ImportMode, MAX_IMPORTS};
 use std::collections::{BTreeMap, BTreeSet};
@@ -75,6 +76,9 @@ pub struct OntologyFile {
     pub warnings: Vec<String>,
     /// the triples outside the terminology, in the order a store scans them
     assertions: Vec<Triple>,
+    /// the triples that map to no axiom of the input a chained command read before the
+    /// document this file holds, which its classifications count as left out
+    carried: Unmapped,
     /// an empty database with the file's prefixes, for the dataset defaults and the
     /// renderer a load of the file gives
     ds: Dataset,
@@ -85,6 +89,15 @@ pub struct FileClassification {
     pub classification: Classification,
     /// the axioms left out, as outside OWL 2 EL, or used only in part
     pub excluded: Vec<Excluded>,
+}
+
+impl FileClassification {
+    /// Whether every subsumption between named classes that the ontology entails is in
+    /// the taxonomy: true when no axiom is left out or used only in part and the run was
+    /// not stopped part way ([`ClassifyRequest::partial`]).
+    pub fn complete(&self) -> bool {
+        self.excluded.is_empty() && self.classification.complete
+    }
 }
 
 impl OntologyFile {
@@ -209,6 +222,7 @@ impl OntologyFile {
             imports,
             warnings,
             assertions,
+            carried: Unmapped::default(),
             ds,
         })
     }
@@ -218,11 +232,14 @@ impl OntologyFile {
     /// functional-style document splits them: an assertion that a store would stream
     /// becomes its triples, which `assertions` options then include or leave out, and
     /// every other axiom is in the terminology as it is. The imports of the header do not
-    /// resolve, as a file's do not.
+    /// resolve, as a file's do not. `unmapped` are the triples of the input the document
+    /// was read from that map to no axiom, which the document has lost and which the
+    /// file's classifications count as left out, as a classification of that input does.
     pub fn from_document(
         name: String,
         doc: sparkles_owl::transform::Document,
         prefixes: BTreeMap<String, String>,
+        unmapped: Unmapped,
     ) -> Result<OntologyFile> {
         let imports: Vec<String> = doc
             .header
@@ -260,7 +277,7 @@ impl OntologyFile {
         });
         assertions.dedup();
         let ontology = read::Ontology::from_axioms(doc.header, terminology, Mode::Lenient);
-        OntologyFile::new(
+        let mut file = OntologyFile::new(
             name,
             RdfSyntax::OwlFunctional,
             ontology,
@@ -268,26 +285,46 @@ impl OntologyFile {
             prefixes,
             (imports, Vec::new()),
             &OntologyRequest::default(),
-        )
+        )?;
+        file.carried = unmapped;
+        Ok(file)
     }
 
     /// The header and every axiom of the file, the terminology and the assertions that
     /// map to axioms, as a document a command transforms. A triple that maps to no axiom
     /// is left out, as the reverse mapping leaves it out of the ontology.
     pub fn into_document(self, opts: &QueryOptions) -> Result<sparkles_owl::transform::Document> {
+        Ok(self.into_counted_document(opts)?.0)
+    }
+
+    /// [`into_document`](Self::into_document), with the number of triples that map to no
+    /// axiom, which a classification of the document counts as left out.
+    pub(crate) fn into_counted_document(
+        self,
+        opts: &QueryOptions,
+    ) -> Result<(sparkles_owl::transform::Document, Unmapped)> {
         let mut axioms: Vec<Axiom> = Vec::new();
-        self.assertions(opts, |ax, _| {
-            if let Some(ax) = ax {
-                axioms.push(ax.into_owned());
+        let mut unread = Unmapped::default();
+        self.assertions(opts, |ax, t| {
+            match (ax, t) {
+                (Some(ax), _) => axioms.push(ax.into_owned()),
+                (None, Some(t)) => unread.push(t),
+                (None, None) => unread.count += 1,
             }
             Ok(true)
         })?;
+        let unmapped =
+            super::classify::unmapped_of(&self.ontology, &unread, &std::cell::RefCell::new(None))
+                .merge(&self.carried);
         let (header, terminology): (_, Vec<Axiom>) = match Arc::try_unwrap(self.ontology) {
             Ok(o) => (o.header, o.axioms.into_keys().collect()),
             Err(o) => (o.header.clone(), o.axioms.keys().cloned().collect()),
         };
         axioms.extend(terminology);
-        Ok(sparkles_owl::transform::Document::new(header, axioms))
+        Ok((
+            sparkles_owl::transform::Document::new(header, axioms),
+            unmapped,
+        ))
     }
 
     /// The members of the read that answers carry, as a read of the loaded file gives them.
@@ -370,16 +407,46 @@ impl OntologyFile {
         let opts = self.ds.ontology().anchored(opts)?;
         let mut owned: Vec<Axiom> = Vec::new();
         let mut axioms = logical_axioms(&self.ontology);
+        // the assertion triples that map to no axiom
+        let mut unread = Unmapped::default();
         if c.assertions {
-            self.assertions(&opts, |ax, _| {
-                if let Some(ax) = ax {
-                    owned.push(ax.into_owned());
+            self.assertions(&opts, |ax, t| {
+                match (ax, t) {
+                    (Some(ax), _) => owned.push(ax.into_owned()),
+                    (None, Some(t)) => unread.push(t),
+                    (None, None) => unread.count += 1,
                 }
                 Ok(true)
             })?;
             axioms.extend(owned.iter().map(|a| &a.kind).filter(|k| logical(k)));
         }
-        let (classification, excluded) = classify_once(&axioms, c, &opts)?;
+        // A classification of the terminology alone counts the assertions it did not read
+        // as left out when one has logical content, and every run counts the triples that
+        // map to no axiom.
+        let seen = std::cell::RefCell::new(None);
+        let mut dropped = |f: &mut dyn FnMut(&AxiomKind) -> bool| {
+            self.assertions(&opts, |ax, t| {
+                Ok(match ax {
+                    Some(ax) => f(&ax.kind),
+                    None => {
+                        *seen.borrow_mut() = t.cloned();
+                        false
+                    }
+                })
+            })
+            .is_ok()
+        };
+        let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
+        let unmapped =
+            || super::classify::unmapped_of(&self.ontology, &unread, &seen).merge(&self.carried);
+        let (classification, excluded) = classify_once(&axioms, c, &opts, dropped, &unmapped)?;
+        if c.strict && !classification.complete {
+            return Err(super::classify::refuse_strict(
+                &classification,
+                &excluded,
+                &opts,
+            ));
+        }
         if let Some(about) = &c.about
             && classification
                 .taxonomy
@@ -572,8 +639,10 @@ fn from_triples(
             }
         }
     }
-    // the assertions: every other triple, but not a class assertion of a structural type
-    // or a class expression, which the terminology reads or leaves out
+    // the assertions: every other triple, but not a class assertion of a structural type,
+    // which the terminology reads or leaves out. A class assertion of a blank node is
+    // taken above when the blank node is a class expression the terminology reads, and
+    // otherwise stays an assertion, which maps to no axiom.
     let rest: Vec<bool> = triples
         .iter()
         .enumerate()
@@ -581,6 +650,7 @@ fn from_triples(
             !taken[i]
                 && !main[i]
                 && !(t.predicate.as_str() == vocab::RDF_TYPE
+                    && matches!(&t.object, Term::NamedNode(_))
                     && read::is_terminological(t, &|_| false))
         })
         .collect();
@@ -882,7 +952,8 @@ fn round_trips(doc: &sparkles_owl::ofn_read::Document) -> bool {
                 ps.len() == 2 || ps.len() > 2 && ps.iter().all(|p| matches!(p, Ope::Property(_)))
             }
             AxiomKind::EquivalentDataProperties(ps) => ps.len() >= 2,
-            AxiomKind::SameIndividual(is) | AxiomKind::DifferentIndividuals(is) => is.len() >= 2,
+            AxiomKind::SameIndividual(is) => is.len() >= 2,
+            AxiomKind::DifferentIndividuals(is) => is.len() >= 2,
             AxiomKind::DisjointClasses(cs) => cs.len() >= 2,
             AxiomKind::DisjointUnion(_, cs) => cs.len() >= 2,
             AxiomKind::DisjointObjectProperties(ps) => ps.len() >= 2,

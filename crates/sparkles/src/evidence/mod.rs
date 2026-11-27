@@ -89,13 +89,21 @@ pub fn profile(version: u32) -> Option<&'static Profile> {
     (version == V1.version).then_some(&V1)
 }
 
+#[doc(hidden)]
+pub mod binding;
 pub mod propose;
+pub mod reauth;
 pub mod resolve;
 pub mod review;
 
 pub use propose::{
     AuthorityFence, Options as ProposeOptions, OrdinaryChanges, Proposed, ProposedRecord,
     operation_id, operation_iri, operation_recorded, propose, reconcile_operation_holds,
+    reconcile_operation_holds_in,
+};
+pub use reauth::{
+    MAX_REAUTHENTICATE_RECORDS, MAX_RECORD_TRIPLES, ReauthenticateOptions, ReauthenticateRecord,
+    Reauthenticated, ReauthenticatedRecord, reauthenticate,
 };
 pub use review::claims::{
     self, ClaimOccurrence, ClaimOrigin, ClaimState, MAX_CLAIM_SCAN, MAX_CLAIMS, MEM_INSTRUCTIONS,
@@ -103,24 +111,29 @@ pub use review::claims::{
     with_policy_claims,
 };
 pub use review::dependents::{
-    self, Dependence, Dependent, Dependents, MAX_CHANGED, dependents as find_dependents,
+    self, Dependence, Dependent, Dependents, MAX_CHANGED, ReportDependent,
+    dependents as find_dependents, dependents_at as find_dependents_at,
 };
 pub use review::identity::{
-    self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, ResolvedEntity,
-    resolve as resolve_entities, resolve_at as resolve_entities_at,
+    self, EntityResolution, MAX_MEMBERS, MAX_RESOLVE, RESOLVES_TO, RebuiltMap, ResolvedEntity,
+    rebuild as rebuild_resolution_map, resolve as resolve_entities,
+    resolve_at as resolve_entities_at,
 };
 pub use review::{
-    Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, Reviewed, Withdrawn,
-    WithdrawnClaim, review, withdraw,
+    Changed, Decided, MapChange, Options as ReviewOptions, ProjectionChange, ReconciledProjection,
+    Reviewed, Withdrawn, WithdrawnClaim, reconcile_projection, reconcile_projection_prepared,
+    review, withdraw,
 };
-pub use sparkles_core::evidence::review::{DecisionInput, Disposition, WithdrawalInput};
+pub use sparkles_core::evidence::review::{
+    DecisionInput, Disposition, MAX_DECISIONS, WithdrawalInput,
+};
 pub use sparkles_core::evidence::{
     ASSESSMENT_INPUT_KINDS, MAX_ASSESSMENT_INPUTS, MAX_CLAIMS as MAX_BATCH_CLAIMS, MAX_IDENTITIES,
-    MAX_IDENTITY_ENTITIES, MIN_IDENTITY_ENTITIES, prepare_input,
+    MAX_IDENTITY_ENTITIES, MAX_LINKS, MIN_IDENTITY_ENTITIES, prepare_input,
 };
 pub use sparkles_core::evidence::{
     AssessmentInput, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,
-    EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, JSON_LEXICAL_UTF8_V1,
+    EvidenceRefInput, EvidenceRefTarget, EvidenceRelation, IdentityNamespace, JSON_LEXICAL_UTF8_V1,
     JSON_LEXICAL_UTF8_VERSION, MethodRef, PassageInput, Polarity, RecordKey, RecordRef,
     RecordVersion, RenditionContent, RenditionInput, Scope, SourceContent, SourceLineage,
     SourceMetadata, SourceRevisionInput, SourceTimes,
@@ -132,8 +145,8 @@ pub use sparkles_core::evidence::{
 // ------------------------------------------------------------ settings ------------
 
 pub use sparkles_core::evidence::{
-    CanonicalSettings, ClaimKind, ConflictMode, IdentityInput, IdentityRelation, MatchingPolicy,
-    Policy, RecordKind, Settings, Sha256Digest,
+    CanonicalSettings, ClaimKind, ConflictMode, IdentityInput, IdentityRelation,
+    MAX_POLICY_NAME_BYTES, MatchingPolicy, Policy, RecordKind, Settings, Sha256Digest,
 };
 
 use crate::managed::{OwnerEntry, OwnerKind};
@@ -161,6 +174,13 @@ pub struct SettingsStatus {
 /// The evidence settings of `dataset`. Fails with `managed-unavailable` when the
 /// dataset's managed-graph registry cannot be enforced.
 pub fn settings(dataset: &Dataset) -> Result<SettingsStatus> {
+    settings_with_overrides(dataset).map(|(status, _)| status)
+}
+
+/// The recorded evidence settings and their sparse runtime layer from one registry.
+pub fn settings_with_overrides(
+    dataset: &Dataset,
+) -> Result<(SettingsStatus, Option<crate::managed::EvidenceOverrides>)> {
     let snapshot = dataset.store().managed_snapshot()?;
     if let Some(reason) = snapshot.as_ref().and_then(|s| s.unavailable.as_ref()) {
         return Err(unavailable(reason.clone()));
@@ -168,7 +188,11 @@ pub fn settings(dataset: &Dataset) -> Result<SettingsStatus> {
     let bytes = snapshot
         .as_ref()
         .and_then(|s| s.settings.get(&OwnerKind::Evidence).cloned());
-    status_from(snapshot.as_ref().map(|s| &s.graphs), bytes.as_deref())
+    let status = status_from(snapshot.as_ref().map(|s| &s.graphs), bytes.as_deref())?;
+    let overrides = snapshot
+        .and_then(|mut s| s.graphs.owners.remove(&OwnerKind::Evidence))
+        .and_then(|entry| entry.evidence_overrides);
+    Ok((status, overrides))
 }
 
 fn unavailable(reason: String) -> Error {
@@ -263,6 +287,40 @@ pub fn configure(
     settings: &Settings,
     control: &Control,
 ) -> Result<SettingsStatus> {
+    configure_recorded(dataset, settings, OverrideUpdate::Preserve, None, control)
+}
+
+/// Record settings and replace their sparse runtime layer in the same publication.
+/// `None` for `overrides` means no declaration applies. An empty declared layer can
+/// reconcile an unconfigured disabled template without recording any settings.
+pub fn configure_layered(
+    dataset: &Dataset,
+    settings: &Settings,
+    overrides: Option<serde_json::Map<String, serde_json::Value>>,
+    expected: Option<u64>,
+    control: &Control,
+) -> Result<SettingsStatus> {
+    configure_recorded(
+        dataset,
+        settings,
+        OverrideUpdate::Replace(overrides),
+        expected,
+        control,
+    )
+}
+
+enum OverrideUpdate {
+    Preserve,
+    Replace(Option<serde_json::Map<String, serde_json::Value>>),
+}
+
+fn configure_recorded(
+    dataset: &Dataset,
+    settings: &Settings,
+    overrides: OverrideUpdate,
+    expected: Option<u64>,
+    control: &Control,
+) -> Result<SettingsStatus> {
     let store = dataset.store();
     let canonical = settings.canonical(control).map_err(unsupported_profile)?;
     // A registry whose settings file does not match, as after a crash between the
@@ -270,6 +328,13 @@ pub fn configure(
     // records and repaired by this configuration.
     let snapshot = store.managed_snapshot()?;
     let revision = snapshot.as_ref().map_or(0, |s| s.graphs.revision);
+    if let Some(expected) = expected
+        && revision != expected
+    {
+        return Err(Error::Conflict(format!(
+            "the managed-graph registry is at revision {revision}, not {expected}; read it again"
+        )));
+    }
     let current = snapshot
         .as_ref()
         .and_then(|s| s.graphs.owners.get(&OwnerKind::Evidence));
@@ -286,8 +351,13 @@ pub fn configure(
         )));
     }
     if current.is_none() && !settings.enabled {
-        let defaults = Settings::default().canonical(control)?;
-        if canonical.bytes() != defaults.bytes() {
+        let allowed_noop = match &overrides {
+            OverrideUpdate::Replace(Some(patch)) => patch.is_empty(),
+            OverrideUpdate::Preserve | OverrideUpdate::Replace(None) => {
+                canonical.bytes() == Settings::default().canonical(control)?.bytes()
+            }
+        };
+        if !allowed_noop {
             return Err(Error::invalid(
                 "the evidence profile is not enabled; enable it before storing disabled settings",
             ));
@@ -301,9 +371,23 @@ pub fn configure(
         return status_from(snapshot.as_ref().map(|s| &s.graphs), bytes.as_deref());
     }
     control.check()?;
-    let entry = OwnerEntry::for_settings(settings.profile, roles, canonical.bytes());
-    let graphs =
-        store.enable_managed_at(OwnerKind::Evidence, entry, canonical.bytes(), revision)?;
+    let mut entry = OwnerEntry::for_settings(settings.profile, roles, canonical.bytes());
+    entry.evidence_overrides = match overrides {
+        OverrideUpdate::Preserve => current.and_then(|entry| entry.evidence_overrides.clone()),
+        OverrideUpdate::Replace(patch) => patch.and_then(crate::managed::EvidenceOverrides::new),
+    };
+    let write_options = crate::guard::WriteOptions {
+        cancel: Some(control.cancel.flag()),
+        deadline: control.deadline,
+        ..Default::default()
+    };
+    let graphs = store.enable_managed_at_with(
+        OwnerKind::Evidence,
+        entry,
+        canonical.bytes(),
+        revision,
+        &write_options,
+    )?;
     status_from(Some(&graphs), Some(canonical.bytes()))
 }
 
@@ -335,7 +419,7 @@ pub fn detach(dataset: &Dataset, graph: &str) -> Result<SettingsStatus> {
 // --------------------------------------------------------------- holds ------------
 
 pub use sparkles_core::branch::CommitRef;
-pub use sparkles_core::holds::{DEFAULT_GRACE_MS, MAX_COMMITS, SourceHold};
+pub use sparkles_core::holds::{DEFAULT_GRACE_MS, MAX_COMMITS, SourceHold, SourceHoldInfo};
 pub use sparkles_core::store::Acquired;
 
 /// The durable source holds of the evidence profile in `dataset` and its branches, by
@@ -347,6 +431,13 @@ pub fn holds(dataset: &Dataset) -> Result<Vec<SourceHold>> {
         .into_iter()
         .filter(|h| h.owner == OwnerKind::Evidence)
         .collect())
+}
+
+/// The evidence holds with their originating dataset IDs when foreign.
+pub fn hold_details(dataset: &Dataset) -> Result<Vec<SourceHoldInfo>> {
+    let mut holds = dataset.store().source_hold_details()?;
+    holds.retain(|h| h.hold.owner == OwnerKind::Evidence);
+    Ok(holds)
 }
 
 /// Keep `commits` readable for the evidence profile under the hold `id`. Each commit
@@ -361,9 +452,21 @@ pub fn holds(dataset: &Dataset) -> Result<Vec<SourceHold>> {
 /// commits, so repeat the acquisition, release it or reconcile it. The first hold raises
 /// the dataset reader to 7.
 pub fn acquire_hold(dataset: &Dataset, id: uuid::Uuid, commits: &[CommitRef]) -> Result<Acquired> {
+    acquire_hold_for(dataset, id, commits, None)
+}
+
+/// [`acquire_hold`] for an operation in `for_dataset`, when it differs from `dataset`.
+/// A `for_dataset` equal to `dataset`'s id is normalized to `None`. Any hold naming
+/// another dataset writes `holds.json` as format 2.
+pub fn acquire_hold_for(
+    dataset: &Dataset,
+    id: uuid::Uuid,
+    commits: &[CommitRef],
+    for_dataset: Option<uuid::Uuid>,
+) -> Result<Acquired> {
     dataset
         .store()
-        .acquire_hold(OwnerKind::Evidence, id, commits)
+        .acquire_hold_for(OwnerKind::Evidence, id, commits, for_dataset)
 }
 
 /// Release the evidence hold `id`, returning whether it existed. Its commits can be
@@ -375,9 +478,10 @@ pub fn release_hold(dataset: &Dataset, id: uuid::Uuid) -> Result<bool> {
         .is_empty())
 }
 
-/// Release the evidence holds acquired at least `grace_ms` milliseconds ago that `keep`
-/// does not keep, such as holds whose referencing commit never published. Returns the
-/// released ids.
+/// Release local evidence holds acquired at least `grace_ms` milliseconds ago that
+/// `keep` does not keep. Foreign holds stay in place and are never passed to the
+/// callback. Use [`reconcile_operation_holds_in`] to verify and release foreign holds.
+/// Returns the released ids.
 pub fn reconcile_holds(
     dataset: &Dataset,
     grace_ms: i64,

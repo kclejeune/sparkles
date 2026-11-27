@@ -1,7 +1,9 @@
-# Shared entity representation, convergence and evolution
+# A01: Shared entity representation, convergence and evolution
+
+> **Status:** implemented in part
 
 A01 defines roadmap item 396. Versioned profile resources, independent acceptance
-fixtures and bounded private offline replay are available. Managed integration remains.
+fixtures and bounded private offline replay are available; managed integration remains.
 
 The application profile separates source descriptions from domain entities and makes
 identity resolution, qualified relationships and changes reproducible. It reuses C25

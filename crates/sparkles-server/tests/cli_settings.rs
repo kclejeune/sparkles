@@ -1,83 +1,55 @@
 //! Layered dataset settings (spec C19) with a server process: `serve --settings`, a
 //! reload on SIGHUP, a dataset of `--loc`, and `sparkles settings check`.
 
+mod common;
+
 use serde_json::{Value as J, json};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+#[cfg(feature = "auth")]
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
 
 /// A server started by the test, stopped when dropped.
 struct Server {
-    child: Child,
+    child: common::ServerProcess,
     port: u16,
 }
 
 impl Server {
-    /// Start on the first free port of 47130–47149.
     fn start(data: &Path, extra: &[&str]) -> Server {
-        Server::start_in(data, extra, 47130..47150)
-    }
-
-    /// Start on the first free port of `ports`. The ports lie in the kernel's ephemeral
-    /// range, so another process can take a port between the check and the server's bind.
-    /// A server that exits before it answers because its port is in use moves on to the
-    /// next free port. Any other early exit fails with the server's error output.
-    fn start_in(data: &Path, extra: &[&str], ports: std::ops::Range<u16>) -> Server {
-        for port in ports.clone() {
-            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
-                continue;
-            }
-            let log = data.with_extension(format!("server-{port}.log"));
-            let child = Command::new(BIN)
-                .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
+        let log = data.with_extension("server.log");
+        let (child, port) = common::ServerProcess::start(
+            common::serve()
                 .arg("--data")
                 .arg(data)
                 .args(extra)
-                .env_remove("SPARKLES_BACKUP_CONFIG")
-                .stdout(Stdio::null())
-                .stderr(std::fs::File::create(&log).unwrap())
-                .spawn()
-                .unwrap();
-            let mut s = Server { child, port };
-            let t0 = Instant::now();
-            let mut exited = false;
-            while s.call("GET", "/$/ready", None).0 != 200 {
-                // a server that could not bind the port leaves it to whatever holds it
-                if s.child.try_wait().unwrap().is_some() {
-                    exited = true;
-                    break;
-                }
-                assert!(
-                    t0.elapsed() < Duration::from_secs(30),
-                    "server did not start"
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if !exited {
-                return s;
-            }
-            let err = std::fs::read_to_string(&log).unwrap_or_default();
+                .env_remove("SPARKLES_BACKUP_CONFIG"),
+            &log,
+        );
+        let mut s = Server { child, port };
+        let t0 = Instant::now();
+        while s.call("GET", "/$/ready", None).0 != 200 {
             assert!(
-                port_taken(&err, port),
-                "the server exited before it answered on port {port}: {err}"
+                s.child.try_wait().unwrap().is_none(),
+                "server exited; see {log:?}"
             );
+            assert!(
+                t0.elapsed() < Duration::from_secs(30),
+                "server did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("no server started on a free port in {ports:?}")
+        s
     }
 
     fn call(&self, method: &str, path: &str, body: Option<J>) -> (u16, J) {
         let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
             return (0, J::Null);
         };
-        // While nothing listens on the port, the kernel may pick the port itself as the
-        // ephemeral source, and the socket connects to itself: the read below would then
-        // return the request and wait forever for an end that never comes.
-        if c.local_addr().ok() == c.peer_addr().ok() {
-            return (0, J::Null);
-        }
         // a server that accepts and never answers fails the test instead of hanging it
         let _ = c.set_read_timeout(Some(Duration::from_secs(60)));
         let _ = c.set_write_timeout(Some(Duration::from_secs(60)));
@@ -107,23 +79,6 @@ impl Server {
             unsafe { libc::kill(self.child.id() as i32, libc::SIGHUP) },
             0
         );
-    }
-}
-
-/// Whether a server's error output says that binding the listener on `port` failed
-/// because the address is in use. The server reports every bind failure as `binding
-/// ADDR`, so the cause after that context must be the OS's address-in-use error. Any other
-/// bind failure, such as a descriptor limit, or an unrelated resource in use is not one.
-fn port_taken(err: &str, port: u16) -> bool {
-    let context = format!("binding 127.0.0.1:{port}");
-    err.find(&context)
-        .is_some_and(|at| err[at + context.len()..].contains("Address already in use"))
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -164,7 +119,7 @@ fn settings_file_restart_reload_and_declared_datasets() {
             "--host",
             "127.0.0.1",
             "--port",
-            "47149",
+            "0",
             "--settings",
             &f_arg,
         ])
@@ -376,10 +331,9 @@ fn settings_commands() {
         .to_string(),
     )
     .unwrap();
-    let s = Server::start_in(
+    let s = Server::start(
         &dir.path().join("data"),
         &["--settings", f.to_str().unwrap(), "--mem", "demo"],
-        47200..47220,
     );
     let (st, v) = s.call(
         "POST",
@@ -645,7 +599,7 @@ fn memory_init_and_maintenance() {
         json!({ "datasets": { "locked": { "locked": ["assistant.send"] } } }).to_string(),
     )
     .unwrap();
-    let s = Server::start_in(
+    let s = Server::start(
         &dir.path().join("data"),
         &[
             "--settings",
@@ -659,7 +613,6 @@ fn memory_init_and_maintenance() {
             "--mem",
             "plain",
         ],
-        47220..47240,
     );
     let mem = |ds: &str, args: &[&str]| {
         let mut a = vec!["memory", "--dataset", ds];
@@ -872,7 +825,7 @@ fn declared_prefixes() {
     let args = ["--settings", f_arg.as_str(), "--loc", loc_arg.as_str()];
     let run = |s: &Server, a: &[&str]| cli(s, &home, a, "", &[]);
     {
-        let s = Server::start_in(&data, &args, 47740..47760);
+        let s = Server::start(&data, &args);
         let (st, v) = s.call("GET", "/$/prefixes/slurp", None);
         assert_eq!(st, 200, "{v}");
         assert_eq!(v["prefixes"]["notes"], NOTES);
@@ -898,7 +851,7 @@ fn declared_prefixes() {
         assert!(o.stdout.contains("prefixes.notes"), "{}", o.stdout);
     }
     // the removal outlives a restart, and a reset brings the declared value back
-    let s = Server::start_in(&data, &args, 47740..47760);
+    let s = Server::start(&data, &args);
     let (_, v) = s.call("GET", "/$/prefixes/slurp", None);
     assert!(v["prefixes"].get("notes").is_none(), "{v}");
     assert_eq!(v["prefixes"]["ex"], "http://ex.org/");
@@ -910,41 +863,4 @@ fn declared_prefixes() {
         .json();
     assert_eq!(j["sources"]["kclj"], "locked");
     assert_eq!(j["warnings"][0]["prefix"], "mem");
-}
-
-/// A real address collision is the one early exit that moves on to another port.
-#[test]
-fn only_a_port_in_use_moves_the_server_to_another_port() {
-    let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = holder.local_addr().unwrap().port();
-    let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(BIN)
-        .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
-        .arg("--data")
-        .arg(dir.path().join("data"))
-        .env_remove("SPARKLES_BACKUP_CONFIG")
-        .stdout(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(port_taken(&err, port), "{err}");
-    drop(holder);
-
-    for err in [
-        format!(
-            "Error: binding 127.0.0.1:{port}\n\nCaused by:\n    Too many open files (os error 24)"
-        ),
-        format!(
-            "Error: binding 127.0.0.1:{port}\n\nCaused by:\n    Permission denied (os error 13)"
-        ),
-        "Error: dataset already in use".to_string(),
-        format!(
-            "Error: binding 127.0.0.1:{}\n\nCaused by:\n    Address already in use (os error 98)",
-            port.wrapping_add(1)
-        ),
-        format!("Error: Address already in use (os error 98)\nError: binding 127.0.0.1:{port}"),
-    ] {
-        assert!(!port_taken(&err, port), "{err}");
-    }
 }

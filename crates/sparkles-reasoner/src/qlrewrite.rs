@@ -48,7 +48,7 @@ use sparkles_core::error::Result;
 use sparkles_core::id::Id;
 use sparkles_core::index::Perm;
 use sparkles_core::sparql::exec::PlanInfo;
-use sparkles_core::sparql::reasoning::{Rewritten, SessionRequest};
+use sparkles_core::sparql::reasoning::{GuardedRewritten, Rewritten, SessionRequest};
 use sparkles_core::store::{Chunk, Snapshot};
 use sparkles_owl::model::{
     AxiomKind, ClassExpression as Ce, DataRange, ObjectPropertyExpression as Ope,
@@ -428,8 +428,10 @@ impl Tbox {
         snap: &Snapshot,
         graphs: &[Id],
         stop: &dyn Fn() -> Result<()>,
-        budget: &crate::budget::Budget,
+        budget: &Arc<crate::budget::Budget>,
     ) -> Result<Tbox> {
+        // Declared before `triples` so payload drops before held credit returns.
+        let mut held = crate::budget::Held::new(budget);
         let mut triples = Vec::new();
         let (mut visited, mut kept) = (0usize, 0usize);
         // each key as the scan visits it: the stop function and the budget are checked
@@ -444,8 +446,7 @@ impl Tbox {
                 return Ok(());
             }
             if kept.is_multiple_of(1024) {
-                budget
-                    .try_charge(1024 * TRIPLE_BYTES)
+                held.try_grow(1024 * TRIPLE_BYTES)
                     .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL axioms"))?;
             }
             kept += 1;
@@ -555,52 +556,77 @@ pub fn clear() {
     TBOXES.lock().clear();
 }
 
+/// An active OWL 2 QL TBox whose estimated memory stays charged to the calling budget
+/// until this guard drops. Declared with `tbox` before `_held` so payload drops first.
+pub(crate) struct ChargedTbox {
+    pub(crate) tbox: Arc<Tbox>,
+    _held: crate::budget::Held,
+}
+
 /// The TBox of the input graphs of `inputs` that the caller of `req` reads, from the
-/// TBoxes kept for the same generation, commit and view, or read from the snapshot.
-pub(crate) fn tbox(req: &SessionRequest, inputs: &Inputs) -> Result<Arc<Tbox>> {
+/// TBoxes kept for the same generation, commit and view, or read from the snapshot,
+/// admitted against `budget` on both cache hits and misses.
+pub(crate) fn tbox_charged(
+    req: &SessionRequest,
+    inputs: &Inputs,
+    budget: &Arc<crate::budget::Budget>,
+) -> Result<ChargedTbox> {
     let snap = &req.snap;
     let resolved = match &req.readable {
-        Some(readable) => inputs::resolve_readable(snap, inputs, &|g| readable(g)),
-        None => inputs::resolve(snap, inputs),
+        Some(access) if !access.reads_all() => {
+            inputs::resolve_readable_iri(snap, inputs, &|g| match g {
+                inputs::GraphRef::Default => access.read.default_graph(),
+                inputs::GraphRef::Named(iri) => access.read.allows_named_iri(iri),
+            })
+        }
+        _ => inputs::resolve(snap, inputs),
     };
-    let mut graphs = resolved.ids(snap);
-    if let Some(readable) = &req.readable {
-        graphs.retain(|g| readable(*g));
-    }
+    let graphs = match &req.readable {
+        Some(access) if !access.reads_all() => resolved.readable_ids(snap, &|g| match g {
+            inputs::GraphRef::Default => access.read.default_graph(),
+            inputs::GraphRef::Named(iri) => access.read.allows_named_iri(iri),
+        }),
+        _ => resolved.ids(snap),
+    };
     let key = (snap.cacheable && !req.no_cache).then(|| {
         format!(
             "{}|{}|{}|{:?}",
             snap.generation.uid,
             snap.commit,
-            snap.mask.as_ref().map_or("", |m| m.key.as_str()),
+            snap.mask_key().unwrap_or(""),
             graphs
         )
     });
     if let Some(k) = &key {
-        let mut kept = TBOXES.lock();
-        if let Some(i) = kept.iter().position(|(x, _)| x == k) {
-            let e = kept.remove(i);
-            let t = e.1.clone();
-            kept.push(e);
-            return Ok(t);
+        let hit = {
+            let mut kept = TBOXES.lock();
+            kept.iter().position(|(x, _)| x == k).map(|i| {
+                let e = kept.remove(i);
+                let t = e.1.clone();
+                kept.push(e);
+                t
+            })
+        };
+        if let Some(t) = hit {
+            let _held = crate::budget::Held::try_new(budget, t.approx_bytes())
+                .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL axioms"))?;
+            return Ok(ChargedTbox { tbox: t, _held });
         }
     }
     // the TBox and the triples it is read from live while the query plans, so the
     // query's memory budget bounds them
-    let budget =
-        crate::budget::Budget::new(req.max_memory.map(|m| m.min(usize::MAX as u64) as usize));
-    let t = Arc::new(Tbox::read(snap, &graphs, &*req.stop, &budget)?);
-    budget
-        .try_charge(t.approx_bytes())
+    let t = Arc::new(Tbox::read(snap, &graphs, &*req.stop, budget)?);
+    let _held = crate::budget::Held::try_new(budget, t.approx_bytes())
         .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL axioms"))?;
     if let Some(k) = key {
-        let mut kept = TBOXES.lock();
-        kept.push((k, t.clone()));
-        if kept.len() > KEPT_TBOXES {
-            kept.remove(0);
-        }
+        let evicted = {
+            let mut kept = TBOXES.lock();
+            kept.push((k, t.clone()));
+            (kept.len() > KEPT_TBOXES).then(|| kept.remove(0))
+        };
+        drop(evicted);
     }
-    Ok(t)
+    Ok(ChargedTbox { tbox: t, _held })
 }
 
 // ------------------------------------------------------------------ the queries ------
@@ -840,19 +866,25 @@ impl Bgp<'_> {
     }
 
     /// PerfectRef from `q0`, or `None` when the rewriting passes `max` queries. The
-    /// queries it keeps are charged to `budget` while it runs, and released when it
-    /// returns, whether it succeeds, passes the bound or fails.
+    /// queries it keeps are charged to `budget` while it runs; on success the surviving
+    /// queries' credit is returned in `Held` so they stay charged while rendered, and on
+    /// bound overflow or error all credit is released on unwind/return.
     fn perfect_ref(
         &self,
         q0: Cq,
         max: usize,
         stop: &dyn Fn() -> Result<()>,
-        budget: &crate::budget::Budget,
-    ) -> Result<Option<Vec<Cq>>> {
-        let mut charged = 0usize;
-        let r = self.perfect_ref_charged(q0, max, stop, budget, &mut charged);
-        budget.release(charged);
-        r
+        budget: &Arc<crate::budget::Budget>,
+    ) -> Result<Option<(Vec<Cq>, crate::budget::Held)>> {
+        let mut held = crate::budget::Held::new(budget);
+        let Some(out) = self.perfect_ref_charged(q0, max, stop, &mut held)? else {
+            return Ok(None);
+        };
+        let kept_bytes = out
+            .iter()
+            .fold(0usize, |acc, q| acc.saturating_add(cq_bytes(q)));
+        held.shrink(held.bytes().saturating_sub(kept_bytes));
+        Ok(Some((out, held)))
     }
 
     fn perfect_ref_charged(
@@ -860,17 +892,14 @@ impl Bgp<'_> {
         q0: Cq,
         max: usize,
         stop: &dyn Fn() -> Result<()>,
-        budget: &crate::budget::Budget,
-        charged: &mut usize,
+        held: &mut crate::budget::Held,
     ) -> Result<Option<Vec<Cq>>> {
         let q0 = self.normalize(q0);
         let mut seen: FxHashSet<Cq> = FxHashSet::default();
         let mut order: Vec<Cq> = Vec::new();
         let n = 2 * cq_bytes(&q0);
-        budget
-            .try_charge(n)
+        held.try_grow(n)
             .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
-        *charged += n;
         seen.insert(q0.clone());
         order.push(q0);
         let mut next = 0;
@@ -887,10 +916,8 @@ impl Bgp<'_> {
             let mut add = |f: Cq, order: &mut Vec<Cq>| -> Result<bool> {
                 if !seen.contains(&f) {
                     let n = 2 * cq_bytes(&f);
-                    budget
-                        .try_charge(n)
+                    held.try_grow(n)
                         .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
-                    *charged += n;
                     seen.insert(f.clone());
                     order.push(f);
                     if order.len() > max {
@@ -1066,6 +1093,113 @@ impl Rendered {
     }
 }
 
+// The prefix plus the largest decimal usize on supported targets.
+const FRESH_NAME_BYTES: usize = "__ql".len() + 20;
+
+/// Size the heap owned by a temporary branch and its group key, excluding the
+/// slots in the group vectors.
+fn estimate_rendered_bytes(
+    q: &Cq,
+    consts: &[Term],
+    names: &[Variable],
+    iri: impl Fn(u32) -> usize,
+) -> usize {
+    let term_len = |t: T| -> usize {
+        match t {
+            T::Const(c) => match &consts[c as usize] {
+                Term::NamedNode(n) => n.as_str().len(),
+                Term::Literal(l) => {
+                    l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+                }
+                _ => 64,
+            },
+            T::Free => FRESH_NAME_BYTES,
+            T::Var(v) => names[v as usize].as_str().len(),
+        }
+    };
+    let pattern_slot = size_of::<TriplePattern>().max(3 * 48);
+    let binding_slot = size_of::<(u32, Expression)>().max(128);
+    let rdf_type_len = oxrdf::vocab::rdf::TYPE.as_str().len();
+    let patterns: usize = q.atoms.iter().fold(0usize, |acc, a| {
+        let atom_bytes = match *a {
+            Atom::C(c, x) => term_len(x)
+                .saturating_add(rdf_type_len)
+                .saturating_add(iri(c))
+                .saturating_add(pattern_slot),
+            Atom::R(p, s, o) => term_len(s)
+                .saturating_add(iri(p))
+                .saturating_add(term_len(o))
+                .saturating_add(pattern_slot),
+        };
+        acc.saturating_add(atom_bytes)
+    });
+    let mut binds: usize = 0;
+    let mut bind_names: usize = 0;
+    for &(v, t) in &q.binds {
+        // The binding vector reserves a slot even for a binding that gives no value.
+        binds = binds.saturating_add(binding_slot);
+        if t != T::Free {
+            binds = binds.saturating_add(term_len(t));
+            bind_names = bind_names.saturating_add(names[v as usize].as_str().len());
+        }
+    }
+    let set_bytes = q
+        .atoms
+        .len()
+        .saturating_mul(2)
+        .saturating_add(q.binds.len())
+        .saturating_mul(size_of::<u32>());
+    patterns
+        .saturating_add(binds)
+        .saturating_add(bind_names)
+        .saturating_add(set_bytes)
+}
+
+/// Admit the new buffer alongside the old one before growing a group vector.
+fn reserve_group_slot<T>(vec: &mut Vec<T>, held: &mut crate::budget::Held) -> Result<()> {
+    let old = vec.capacity();
+    let elem = size_of::<T>();
+    let next = sparkles_budget::sizes::vec_grown(old, vec.len(), 1, elem);
+    if next > old {
+        held.try_grow(next.saturating_mul(elem))
+            .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+        vec.reserve_exact(next - vec.len());
+        held.shrink(old * elem);
+    }
+    Ok(())
+}
+
+/// Build the sorted, deduplicated list of bound variables of `q` into a pre-sized `Vec`
+/// without allocating intermediate hash sets.
+fn bound_vars_sorted(q: &Cq) -> Vec<u32> {
+    let mut out = Vec::with_capacity(
+        q.atoms
+            .len()
+            .saturating_mul(2)
+            .saturating_add(q.binds.len()),
+    );
+    for a in &q.atoms {
+        for t in a.terms() {
+            if let T::Var(v) = t {
+                out.push(v);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    let atom_var_count = out.len();
+    for &(v, t) in &q.binds {
+        match t {
+            T::Const(_) => out.push(v),
+            T::Var(w) if out[..atom_var_count].binary_search(&w).is_ok() => out.push(v),
+            _ => {}
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// What became of one basic graph pattern.
 enum Outcome {
     /// no inclusion changes it
@@ -1080,8 +1214,6 @@ struct Rewriter<'a> {
     tbox: &'a Tbox,
     max_union: usize,
     stop: &'a dyn Fn() -> Result<()>,
-    /// the query's memory budget, which the queries of the rewriting are charged to
-    budget: Arc<crate::budget::Budget>,
     /// the values of the query's initial bindings, by variable name
     bound: FxHashMap<String, Term>,
     /// the occurrences of each name in the whole query
@@ -1094,6 +1226,11 @@ struct Rewriter<'a> {
     derive: Vec<Vec<TriplePattern>>,
     nodes: Vec<PlanInfo>,
     warnings: Vec<String>,
+    /// charge for emitted rewritten algebra (first branch copies and wider-group filters);
+    /// drops before `budget`
+    emitted_held: crate::budget::Held,
+    /// the query's memory budget, declared last so buffers and `Held` drop before parent credit returns
+    budget: Arc<crate::budget::Budget>,
 }
 
 impl Rewriter<'_> {
@@ -1238,51 +1375,67 @@ impl Rewriter<'_> {
             binds: Vec::new(),
         };
         let start = bgp.normalize(q0.clone());
-        let Some(branches) = bgp.perfect_ref(q0, self.max_union, self.stop, &self.budget)? else {
+        let Some((branches, branches_held)) =
+            bgp.perfect_ref(q0, self.max_union, self.stop, &self.budget)?
+        else {
             return Ok(Outcome::Derive(format!(
                 "its rewriting passed budget.maxUnion ({} branches)",
                 self.max_union
             )));
         };
+        // Bind `branches_held` before `branches` so `branches` drops before credit returns.
+        let (branches_held, branches) = (branches_held, branches);
         // no inclusion applied: the pattern keeps its own form and multiplicities
         if branches.len() == 1 && branches[0] == start {
             return Ok(Outcome::Unchanged);
         }
-        let iri = |s: u32| -> NamedNode {
+        let iri = |s: u32| -> &str {
             if s >= base {
-                extra[(s - base) as usize].clone()
+                extra[(s - base) as usize].as_str()
             } else {
-                NamedNode::new_unchecked(
-                    tbox.names[s as usize]
-                        .clone()
-                        .expect("a branch names no property of the normalization"),
-                )
+                tbox.names[s as usize]
+                    .as_deref()
+                    .expect("a branch names no property of the normalization")
             }
         };
-        // each variable of the pattern under its own name, and each blank node under a
-        // variable of its own, the same in every branch
-        let mut names: Vec<Variable> = Vec::with_capacity(bgp.vars.len());
+        // The branches share names for the query's variables and for blank nodes.
+        let names_bytes = bgp.vars.iter().fold(0usize, |bytes, (term, _)| {
+            let len = match term {
+                TermPattern::Variable(v) => v.as_str().len(),
+                _ => FRESH_NAME_BYTES,
+            };
+            bytes.saturating_add(size_of::<Variable>().saturating_add(len))
+        });
+        let mut names_held = crate::budget::Held::try_new(&self.budget, names_bytes)
+            .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+        let mut names = Vec::with_capacity(bgp.vars.len());
+        let mut visible_len = 0;
+        let mut visible_bytes = 0usize;
         for (x, _) in &bgp.vars {
             names.push(match x {
-                TermPattern::Variable(v) => v.clone(),
+                TermPattern::Variable(v) => {
+                    visible_len += 1;
+                    visible_bytes =
+                        visible_bytes.saturating_add(size_of::<Variable>() + v.as_str().len());
+                    v.clone()
+                }
                 _ => self.fresh_var(),
             });
         }
-        let visible: Vec<Variable> = bgp
-            .vars
-            .iter()
-            .filter_map(|(x, _)| match x {
-                TermPattern::Variable(v) => Some(v.clone()),
-                _ => None,
-            })
-            .collect();
         let n = branches.len();
         // the branches grouped by the variables they give a value: a branch that gives
         // every variable one answers as the stored and derived facts would, and one that
         // leaves some to unnamed individuals answers only where no branch that names more
-        // of them gives the same values to the ones it names
+        // of them gives the same values to the ones it names.
+        // `groups_held` is declared before `groups` so temporary rendered branches drop
+        // before their credit returns.
+        let mut groups_held = crate::budget::Held::new(&self.budget);
         let mut groups: Vec<(Vec<u32>, Vec<Rendered>)> = Vec::new();
         for q in &branches {
+            let est_bytes = estimate_rendered_bytes(q, &bgp.consts, &names, |s| iri(s).len());
+            groups_held
+                .try_grow(est_bytes)
+                .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
             let tp = |t: T, rw: &mut Self| -> TermPattern {
                 match t {
                     T::Const(c) => match &bgp.consts[c as usize] {
@@ -1300,11 +1453,11 @@ impl Rewriter<'_> {
                     Atom::C(c, x) => TriplePattern {
                         subject: tp(x, self),
                         predicate: NamedNodePattern::NamedNode(oxrdf::vocab::rdf::TYPE.into()),
-                        object: TermPattern::NamedNode(iri(c)),
+                        object: TermPattern::NamedNode(NamedNode::new_unchecked(iri(c))),
                     },
                     Atom::R(p, s, o) => TriplePattern {
                         subject: tp(s, self),
-                        predicate: NamedNodePattern::NamedNode(iri(p)),
+                        predicate: NamedNodePattern::NamedNode(NamedNode::new_unchecked(iri(p))),
                         object: tp(o, self),
                     },
                 });
@@ -1322,8 +1475,7 @@ impl Rewriter<'_> {
                 };
                 binds.push((v, expression));
             }
-            let mut set: Vec<u32> = q.bound_vars().into_iter().collect();
-            set.sort_unstable();
+            let set = bound_vars_sorted(q);
             let bind_names = binds
                 .iter()
                 .map(|(v, _)| names[*v as usize].as_str().len())
@@ -1334,10 +1486,24 @@ impl Rewriter<'_> {
                 bind_names,
             };
             match groups.iter_mut().find(|(s, _)| *s == set) {
-                Some((_, g)) => g.push(b),
-                None => groups.push((set, vec![b])),
+                Some((_, g)) => {
+                    let key_bytes = set.capacity() * size_of::<u32>();
+                    drop(set);
+                    groups_held.shrink(key_bytes);
+                    reserve_group_slot(g, &mut groups_held)?;
+                    g.push(b);
+                }
+                None => {
+                    reserve_group_slot(&mut groups, &mut groups_held)?;
+                    groups_held
+                        .try_grow(size_of::<Rendered>())
+                        .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+                    groups.push((set, vec![b]));
+                }
             }
         }
+        drop(branches);
+        drop(branches_held);
         // a branch's bindings: `BIND` for a variable the branch gives its value, and a
         // test of the value for one that the row of an outer `NOT EXISTS` already holds,
         // since a substituted variable cannot be bound again
@@ -1388,17 +1554,20 @@ impl Rewriter<'_> {
                 self.max_union
             )));
         }
-        // the bytes of the copies, with the strings of their terms
+        // Admit both the first emitted copy of every branch and every wider-group
+        // `NOT EXISTS` copy while `groups_held` stays charged for the overlapping
+        // temporary `Rendered` state.
         let mut bytes = 0usize;
-        for (set, _) in &groups {
+        for (set, group) in &groups {
+            bytes = bytes.saturating_add(group.iter().map(Rendered::bytes).sum::<usize>());
             for (s, g) in &groups {
                 if s.len() > set.len() && set.iter().all(|v| s.contains(v)) {
                     bytes = bytes.saturating_add(g.iter().map(Rendered::bytes).sum::<usize>());
                 }
             }
         }
-        self.budget
-            .try_charge(bytes)
+        self.emitted_held
+            .try_grow(bytes)
             .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
         let mut parts = Vec::with_capacity(groups.len());
         for (set, group) in &groups {
@@ -1421,16 +1590,30 @@ impl Rewriter<'_> {
                 },
             });
         }
+        drop(groups);
+        drop(groups_held);
         let union = union_of(parts).expect("the rewriting keeps the query it starts from");
+        self.emitted_held
+            .try_merge(&mut names_held)
+            .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+        drop(names_held);
         // each solution of the pattern's variables and blank nodes once, as matching the
         // stored and derived facts gives it, with the blank nodes then left out
         let mut gp = GraphPattern::Distinct {
             inner: Box::new(GraphPattern::Project {
                 inner: Box::new(union),
-                variables: names.clone(),
+                variables: names,
             }),
         };
-        if visible.len() < names.len() {
+        if visible_len < bgp.vars.len() {
+            self.emitted_held
+                .try_grow(visible_bytes)
+                .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+            let mut visible = Vec::with_capacity(visible_len);
+            visible.extend(bgp.vars.iter().filter_map(|(term, _)| match term {
+                TermPattern::Variable(v) => Some(v.clone()),
+                _ => None,
+            }));
             gp = GraphPattern::Project {
                 inner: Box::new(gp),
                 variables: visible,
@@ -1688,6 +1871,59 @@ pub fn rewrite_query(
     max_memory: Option<u64>,
     stop: &dyn Fn() -> Result<()>,
 ) -> Result<Option<Rewritten>> {
+    rewrite_query_with_parent(query, bound, tbox, max_union, max_memory, None, stop)
+}
+
+/// [`rewrite_query`], reserving from `memory_parent` when present.
+pub fn rewrite_query_with_parent(
+    query: &Query,
+    bound: &[(String, Term)],
+    tbox: &Tbox,
+    max_union: usize,
+    max_memory: Option<u64>,
+    memory_parent: Option<crate::ParentHandle>,
+    stop: &dyn Fn() -> Result<()>,
+) -> Result<Option<Rewritten>> {
+    Ok(rewrite_query_guarded_with_parent(
+        query,
+        bound,
+        tbox,
+        max_union,
+        max_memory,
+        memory_parent,
+        stop,
+    )?
+    .map(GuardedRewritten::into_rewritten))
+}
+
+/// [`rewrite_query_with_parent`], returning the rewritten query paired with its memory
+/// guard so emitted algebra stays charged until the caller drops it.
+pub fn rewrite_query_guarded_with_parent(
+    query: &Query,
+    bound: &[(String, Term)],
+    tbox: &Tbox,
+    max_union: usize,
+    max_memory: Option<u64>,
+    memory_parent: Option<crate::ParentHandle>,
+    stop: &dyn Fn() -> Result<()>,
+) -> Result<Option<GuardedRewritten>> {
+    let budget = crate::budget::Budget::with_parent(
+        max_memory.map(|m| m.min(usize::MAX as u64) as usize),
+        memory_parent,
+    );
+    rewrite_query_in_budget(query, bound, tbox, max_union, &budget, stop)
+}
+
+/// [`rewrite_query`], sharing an existing `budget` (so an active [`ChargedTbox`] and the
+/// rewriting buffers charge the same local and parent limits concurrently).
+pub(crate) fn rewrite_query_in_budget(
+    query: &Query,
+    bound: &[(String, Term)],
+    tbox: &Tbox,
+    max_union: usize,
+    budget: &Arc<crate::budget::Budget>,
+    stop: &dyn Fn() -> Result<()>,
+) -> Result<Option<GuardedRewritten>> {
     // the projection that ASK wraps its pattern in names every variable, and none of them
     // is an answer, so it does not count
     let sse = match query {
@@ -1709,11 +1945,11 @@ pub fn rewrite_query(
     for (name, _) in bound {
         *counts.entry(format!("?{name}")).or_default() += 1;
     }
+    let emitted_held = crate::budget::Held::new(budget);
     let mut rw = Rewriter {
         tbox,
         max_union,
         stop,
-        budget: crate::budget::Budget::new(max_memory.map(|m| m.min(usize::MAX as u64) as usize)),
         bound: bound.iter().cloned().collect(),
         counts,
         all_distinguished: sse.contains("(count)") || sse.contains("(count distinct)"),
@@ -1722,6 +1958,8 @@ pub fn rewrite_query(
         derive: Vec::new(),
         nodes: Vec::new(),
         warnings: tbox.warnings(),
+        emitted_held,
+        budget: budget.clone(),
     };
     let rewrite = |p: &GraphPattern, rw: &mut Rewriter| rw.pattern(p);
     let query = match query {
@@ -1759,12 +1997,17 @@ pub fn rewrite_query(
         // query-time reasoning refuses DESCRIBE before it rewrites
         Query::Describe { .. } => return Ok(None),
     };
-    Ok(Some(Rewritten {
-        query,
-        derive: rw.derive,
-        nodes: rw.nodes,
-        warnings: rw.warnings,
-    }))
+    let memory_guard = (rw.emitted_held.bytes() > 0)
+        .then(|| Arc::new(rw.emitted_held) as Arc<dyn std::any::Any + Send + Sync>);
+    Ok(Some(GuardedRewritten::with_guard(
+        Rewritten {
+            query,
+            derive: rw.derive,
+            nodes: rw.nodes,
+            warnings: rw.warnings,
+        },
+        memory_guard,
+    )))
 }
 
 #[cfg(test)]

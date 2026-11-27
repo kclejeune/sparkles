@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9ee6407284056889096dd48696619e98f2106915b661b941cf6bd8f43dfb3da9 # shrinks to atoms = [(0, true, 2, And(Not(Or(Int, IntRange(None, None))), Or(Str, One([B(false)]))))], sub = true, disjoint = false, range = Some(Or(Bool, Or(One([S("b")]), Bool)))

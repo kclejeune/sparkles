@@ -1,0 +1,11 @@
+Prefix(:=<http://ex.org/>)
+Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+Ontology(
+SubObjectPropertyOf(ObjectPropertyChain(:a :b) :r)
+SubObjectPropertyOf(ObjectPropertyChain(:c :d) :b)
+ObjectPropertyRange(:r :D)
+ObjectPropertyRange(:b :D)
+InverseObjectProperties(:r :ri)
+SubClassOf(:A ObjectSomeValuesFrom(:a ObjectSomeValuesFrom(:c ObjectSomeValuesFrom(:d :B))))
+EquivalentClasses(:X ObjectSomeValuesFrom(:a ObjectSomeValuesFrom(:c ObjectSomeValuesFrom(:d ObjectIntersectionOf(:B :D)))))
+)

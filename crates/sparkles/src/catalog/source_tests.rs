@@ -15,6 +15,10 @@ fn source_lookup_obeys_controls_while_entries_are_contended() {
         catalog.try_get_by_id(dataset.dataset_id(), &no_wait),
         Err(Error::WriterBusy)
     ));
+    assert!(matches!(
+        catalog.pin_dataset_identities([&dataset], &crate::task::Control::none(), true),
+        Err(Error::WriterBusy)
+    ));
     let deadline = WriteOptions {
         deadline: Some(Instant::now() + Duration::from_millis(20)),
         ..Default::default()

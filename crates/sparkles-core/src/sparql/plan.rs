@@ -8,9 +8,9 @@
 //! placement through OPTIONAL / UNION / MINUS / BIND, filter-equality substitution,
 //! top-k for ORDER BY + LIMIT).
 
-use super::ctx::Ctx;
+use super::ctx::{Charge, Ctx};
 use super::exec::PlanPattern;
-use super::expr::{Compiler, ExistsSpec, Expr};
+use super::expr::{ExistsSpec, Expr};
 use super::table::{Table, VarId};
 use crate::access::{
     Preparation, PreparationBuffer, PreparationMap, PreparationText, Reservation, sort_by_prepared,
@@ -983,6 +983,7 @@ pub struct Planner<'a> {
     pub scoped: FxHashSet<VarId>,
     pub(super) property_inputs: FxHashSet<VarId>,
     bnode_scope: u32,
+    pub(super) view_patterns: Option<&'a super::viewsvc::ViewPatterns>,
     /// RDF 1.2 triple-term patterns created while translating triple patterns
     unpacks: std::cell::RefCell<Vec<UnpackItem>>,
     /// the whole query being planned, if known: a search output it mentions nowhere else
@@ -995,6 +996,10 @@ pub struct Planner<'a> {
     seen: std::cell::RefCell<FxHashMap<SeenPattern, u32>>,
     /// how many times each pattern occurs in the source
     source_counts: std::cell::OnceCell<FxHashMap<SeenPattern, u32>>,
+    /// Live planning charge for speculative EXISTS planning so ordinary VALUES tables and
+    /// unattached nested EXISTS syntax reserve memory before allocating.
+    plan_charge: Option<&'a super::ctx::Charge<'a>>,
+    pub(super) sample_filters: bool,
 }
 
 #[cfg(test)]
@@ -1056,12 +1061,38 @@ impl<'a> Planner<'a> {
             scoped: FxHashSet::default(),
             property_inputs: FxHashSet::default(),
             bnode_scope: 0,
+            view_patterns: None,
             unpacks: Default::default(),
             source: None,
             source_sse: Default::default(),
             seen: Default::default(),
             source_counts: Default::default(),
+            plan_charge: None,
+            sample_filters: ctx.opt.sampled_filters,
         }
+    }
+
+    pub(super) fn for_exists(ctx: &'a Ctx, spec: &'a ExistsSpec) -> Self {
+        Self::for_exists_with_charge(ctx, spec, None)
+    }
+
+    pub(super) fn for_exists_with_charge(
+        ctx: &'a Ctx,
+        spec: &'a ExistsSpec,
+        plan_charge: Option<&'a super::ctx::Charge<'a>>,
+    ) -> Self {
+        let mut planner = Self::new(ctx);
+        planner.view_patterns = spec.view_patterns();
+        planner.plan_charge = plan_charge;
+        planner
+    }
+
+    /// Install a request binding before planning and return the IDs for result projection.
+    pub(super) fn bind_initial(&mut self, name: &str, term: &Term) -> (VarId, Id) {
+        let var = self.ctx.var(name.trim_start_matches(['?', '$']));
+        let id = self.ctx.intern_outside_term(term);
+        self.subst.insert(var, id);
+        (var, id)
     }
 
     /// Whether the variable or blank node `t`, which a property function call binds,
@@ -1092,32 +1123,32 @@ impl<'a> Planner<'a> {
         mentions != 1
     }
 
-    pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Expr {
+    pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Result<Expr> {
         let ctx = self.ctx;
         let subst = &self.subst;
-        let exists = |p: &GraphPattern| -> Arc<ExistsSpec> {
-            let mut names = Vec::new();
-            collect_pattern_vars(p, &mut names);
-            let mut vars: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
-            vars.sort_unstable();
-            vars.dedup();
-            let bound = vars
-                .iter()
-                .filter_map(|v| subst.get(v).map(|id| (*v, *id)))
-                .collect();
-            Arc::new(ExistsSpec::new(p.clone(), graph.clone(), vars, bound))
+        let exists = |p: &GraphPattern| -> Result<Arc<ExistsSpec>> {
+            Ok(Arc::new(ExistsSpec::compile_ordinary_with_admission(
+                ctx,
+                p,
+                self.view_patterns,
+                graph.clone(),
+                subst,
+                self.plan_charge,
+            )?))
         };
-        Compiler {
-            ctx,
-            subst,
-            exists: &exists,
-        }
-        .compile(e)
+        let admit = |expr: &Expression| -> Result<()> {
+            if let Some(held) = self.plan_charge {
+                ctx.check()?;
+                held.add(super::checked_layout::expression_compile_bytes(expr))?;
+            }
+            Ok(())
+        };
+        super::expr::compile_expression(ctx, subst, &exists, &admit, &|name| Ok(ctx.var(name)), e)
     }
 
     fn compile_in_branch(&self, e: &Expression, graph: &ActiveGraph) -> Result<Expr> {
         if self.checked_exists.borrow().is_none() {
-            return Ok(self.compile(e, graph));
+            return self.compile(e, graph);
         }
         let ctx = self.ctx;
         let subst = &self.subst;
@@ -1146,6 +1177,16 @@ impl<'a> Planner<'a> {
             ids.dedup();
             let bound_len = ids.iter().filter(|id| subst.contains_key(id)).count();
             let held = ExistsSpec::reserve_checked(preparation, ids.len(), bound_len)?;
+            let view_patterns = match self.view_patterns {
+                Some(vp) => vp.project_checked(p, &pattern.syntax, preparation)?.map(
+                    |(projected, charge)| {
+                        Arc::new(super::expr::RetainedViewPatterns::from_reservation(
+                            projected, charge,
+                        ))
+                    },
+                ),
+                None => None,
+            };
             let mut vars = Vec::with_capacity(ids.len());
             let mut bound = Vec::with_capacity(bound_len);
             for &id in &*ids {
@@ -1160,6 +1201,7 @@ impl<'a> Planner<'a> {
                 graph.clone(),
                 vars,
                 bound,
+                view_patterns,
                 held,
             )))
         };
@@ -1245,6 +1287,43 @@ impl<'a> Planner<'a> {
             credit.grow_by(bytes)?;
         }
         Ok(())
+    }
+
+    pub(super) fn plan_scratch(
+        &self,
+        measure: impl FnOnce(&mut super::checked_layout::Layout<'_>) -> Result<()>,
+    ) -> Result<Option<Charge<'a>>> {
+        let Some(held) = self.plan_charge else {
+            return Ok(None);
+        };
+        self.ctx.check()?;
+        let mut layout = super::checked_layout::Layout::unchecked(false);
+        measure(&mut layout)?;
+        let part = held.part();
+        part.add(layout.bytes())?;
+        Ok(Some(part))
+    }
+
+    pub(super) fn retain_plan_scratch(&self, mut scratch: Option<Charge<'_>>) -> Result<()> {
+        if let Some(held) = self.plan_charge
+            && scratch.is_some()
+        {
+            held.adopt_charge(&mut scratch)?;
+        }
+        Ok(())
+    }
+
+    fn plan_filter_copy(&self, filters: &[Expr]) -> Result<Option<Charge<'a>>> {
+        if filters.is_empty() {
+            return Ok(None);
+        }
+        self.plan_scratch(|layout| {
+            layout.slice(filters)?;
+            for filter in filters {
+                layout.expression(filter)?;
+            }
+            Ok(())
+        })
     }
 
     fn admit_expression(&self, expr: &Expression) -> Result<()> {
@@ -1522,12 +1601,18 @@ impl<'a> Planner<'a> {
                             .count()
                     })
                 };
-                if let Some(pushed) =
-                    super::valuespush::rewrite(gp, &|patterns| calls(self.ctx, patterns), &graphs)
+                // These rewrites clone algebra. View rebuilds plan the saved occurrences
+                // whose semantics the incremental compiler recorded.
+                if self.view_patterns.is_none()
+                    && let Some(pushed) = super::valuespush::rewrite(
+                        gp,
+                        &|patterns| calls(self.ctx, patterns),
+                        &graphs,
+                    )
                 {
                     return self.plan(&pushed, g, filters);
                 }
-                let consider_union = !self.ctx.calls_extensions
+                let consider_union = self.view_patterns.is_none() && !self.ctx.calls_extensions
                     // Preserve outer filters' ordinary evaluation boundary, including
                     // extension aliases and dynamic calls that might be volatile.
                     && filters.is_empty();
@@ -1641,11 +1726,23 @@ impl<'a> Planner<'a> {
                 let mut branches = self.planning_vec()?;
                 flatten_union(gp, &mut branches)?;
                 let mut children = self.planning_vec()?;
-                for branch in branches {
-                    self.admit_payload(|layout| layout.expressions(&filters))?;
-                    let child = self.plan(branch, g, filters.clone())?;
+                let mut filters = filters;
+                let checked = self.branch_payload.borrow().is_some();
+                let mut iter = branches.into_iter().peekable();
+                while let Some(branch) = iter.next() {
+                    let copy;
+                    let branch_filters = if !checked && iter.peek().is_none() {
+                        copy = None;
+                        std::mem::take(&mut filters)
+                    } else {
+                        self.admit_payload(|layout| layout.expressions(&filters))?;
+                        copy = self.plan_filter_copy(&filters)?;
+                        filters.clone()
+                    };
+                    let child = self.plan(branch, g, branch_filters)?;
                     if !child.is_empty() {
                         children.push(child)?;
+                        self.retain_plan_scratch(copy)?;
                     }
                 }
                 self.union_for_branch(children)
@@ -1808,30 +1905,105 @@ impl<'a> Planner<'a> {
                 variables,
                 bindings,
             } => {
+                let native = self
+                    .view_patterns
+                    .is_some_and(|patterns| patterns.contains(gp));
                 if self.branch_payload.borrow().is_some() {
-                    let values = self.checked_values(variables, bindings)?;
+                    let values = self.checked_values(variables, bindings, native)?;
                     return self.apply_filters(values, filters);
                 }
                 let vars: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
+                let width = vars.len();
+                let rows = bindings.len();
+                let table_bytes = (rows as u64)
+                    .saturating_mul((width as u64).saturating_mul(std::mem::size_of::<Id>() as u64))
+                    .saturating_add(
+                        (width as u64).saturating_mul(std::mem::size_of::<Vec<Id>>() as u64),
+                    )
+                    .saturating_add(
+                        (width as u64).saturating_mul(std::mem::size_of::<VarId>() as u64),
+                    );
+                if let Some(held) = self.plan_charge {
+                    held.add(table_bytes)?;
+                }
                 let mut t = Table::new(vars.clone());
+                if self.plan_charge.is_some() {
+                    for col in &mut t.cols {
+                        col.try_reserve_exact(rows)
+                            .map_err(|_| self.ctx.memory_exceeded(table_bytes))?;
+                    }
+                }
                 // a term repeated in the table is looked up once
                 let mut seen: FxHashMap<&GroundTerm, Id> = FxHashMap::default();
-                for row in bindings {
-                    let ids: Vec<Id> = row
-                        .iter()
-                        .map(|t| match t {
+                let seen_charge = self.plan_charge.map(|_| self.ctx.charge(0)).transpose()?;
+                let mut seen_full = false;
+                let mut row_ids = Vec::with_capacity(width);
+                for (row_idx, row) in bindings.iter().enumerate() {
+                    if row_idx % 1024 == 0 {
+                        self.ctx.check()?;
+                    }
+                    row_ids.clear();
+                    for term in row {
+                        let id = match term {
                             None => Id::UNDEF,
-                            Some(t) => *seen.entry(t).or_insert_with(|| match t {
-                                GroundTerm::NamedNode(n) => {
-                                    self.ctx.intern_term(&Term::NamedNode(n.clone()))
+                            Some(term) => {
+                                if let Some(&id) = seen.get(term) {
+                                    id
+                                } else {
+                                    let id = match term {
+                                        GroundTerm::NamedNode(n) => {
+                                            self.ctx.intern_term(&Term::NamedNode(n.clone()))
+                                        }
+                                        GroundTerm::Literal(l) if !native => {
+                                            self.ctx.intern_query_literal(l)
+                                        }
+                                        _ => self.ctx.intern_term(&ground_term(term)),
+                                    };
+                                    if !seen_full {
+                                        if let Some(charge) = &seen_charge {
+                                            let cap = seen.capacity();
+                                            let grown = sparkles_budget::sizes::table_grown(
+                                                cap,
+                                                seen.len(),
+                                                1,
+                                            );
+                                            if grown > cap {
+                                                let slot = std::mem::size_of::<(&GroundTerm, Id)>();
+                                                let old_bytes = if cap == 0 {
+                                                    0
+                                                } else {
+                                                    sparkles_budget::sizes::table_bytes(cap, slot)
+                                                        as u64
+                                                };
+                                                let new_bytes = sparkles_budget::sizes::table_bytes(
+                                                    grown, slot,
+                                                )
+                                                    as u64;
+                                                let peak = old_bytes.saturating_add(new_bytes);
+                                                if charge.resize(peak).is_ok() {
+                                                    seen.insert(term, id);
+                                                    let _ = charge.resize(new_bytes);
+                                                } else {
+                                                    seen_full = true;
+                                                }
+                                            } else {
+                                                seen.insert(term, id);
+                                            }
+                                        } else {
+                                            seen.insert(term, id);
+                                        }
+                                    }
+                                    id
                                 }
-                                GroundTerm::Literal(l) => self.ctx.intern_query_literal(l),
-                                GroundTerm::Triple(_) => self.ctx.intern_term(&ground_term(t)),
-                            }),
-                        })
-                        .collect();
-                    t.push_row(&ids);
+                            }
+                        };
+                        row_ids.push(id);
+                    }
+                    t.push_row(&row_ids);
                 }
+                drop(seen);
+                drop(seen_charge);
+                self.ctx.check()?;
                 // substituted variables (initial bindings, filter equalities): keep only
                 // compatible rows and fill their UNDEF cells with the bound value, so the
                 // table agrees with the substitution the rest of the plan assumes
@@ -1940,7 +2112,15 @@ impl<'a> Planner<'a> {
                 let n = self.project_for_branch(child?, vars)?;
                 self.apply_filters(n, filters)
             }
-            GP::Distinct { inner } => {
+            GP::Reduced { inner }
+                if self
+                    .view_patterns
+                    .is_none_or(|patterns| !patterns.contains(gp)) =>
+            {
+                let child = self.plan(inner, g, Vec::new())?;
+                self.apply_filters(child, filters)
+            }
+            GP::Distinct { inner } | GP::Reduced { inner } => {
                 // SELECT DISTINCT ?p over ?s ?p ?o: the predicates the patterns list
                 if let GP::Project {
                     inner: pinner,
@@ -1962,10 +2142,6 @@ impl<'a> Planner<'a> {
                 }
                 self.apply_filters(n, filters)
             }
-            GP::Reduced { inner } => {
-                let child = self.plan(inner, g, Vec::new())?;
-                self.apply_filters(child, filters)
-            }
             GP::Slice {
                 inner,
                 start,
@@ -1973,7 +2149,7 @@ impl<'a> Planner<'a> {
             } => {
                 let mut child = self.plan(inner, g, Vec::new())?;
                 super::demand::plan_slice(self.ctx, &mut child, *start, *length);
-                let n = slice(child, *start, *length, self.ctx);
+                let n = slice(child, *start, *length, self.ctx)?;
                 self.apply_filters(n, filters)
             }
             GP::Group {
@@ -2102,7 +2278,7 @@ impl<'a> Planner<'a> {
                     };
                 // the constants in force (initial bindings, the row of an EXISTS or a
                 // LATERAL) are sent as values
-                let subst = super::enhancer::planner_subst(self, inner);
+                let (subst, subst_credit) = super::enhancer::planner_subst(self, inner)?;
                 let mut names = Vec::new();
                 collect_pattern_vars(inner, &mut names);
                 let mut vars: Vec<VarId> = names
@@ -2122,6 +2298,8 @@ impl<'a> Planner<'a> {
                 } else {
                     super::enhancer::single_request(&super::enhancer::substitute(inner, &subst))
                 };
+                drop(subst);
+                drop(subst_credit);
                 let mut n = Node::leaf(
                     Kind::Service {
                         endpoint,
@@ -2152,7 +2330,7 @@ impl<'a> Planner<'a> {
         if self.branch_payload.borrow().is_none() || filters.is_empty() {
             let (push, top) = filters
                 .into_iter()
-                .partition(|f| !f.has_exists() && f.var_set().iter().all(&ok));
+                .partition(|f| filter_binds(f, true, |v| ok(&v)));
             return Ok((push, top, list_credit(None)));
         }
         let mut top = filters;
@@ -3581,6 +3759,7 @@ impl<'a> Planner<'a> {
         &self,
         variables: &[oxrdf::Variable],
         bindings: &[Vec<Option<GroundTerm>>],
+        native: bool,
     ) -> Result<Node> {
         let preparation = self.ctx.source_preparation.as_ref().expect("checked GRAPH");
         let mut layout = super::checked_layout::Layout::new(preparation);
@@ -3632,7 +3811,9 @@ impl<'a> Planner<'a> {
                         layout.ground(term)?;
                         let _term = preparation.reserve(layout.bytes())?;
                         let id = match term {
-                            GroundTerm::Literal(literal) => self.ctx.intern_query_literal(literal),
+                            GroundTerm::Literal(literal) if !native => {
+                                self.ctx.intern_query_literal(literal)
+                            }
                             _ => self.ctx.intern_term(&ground_term(term)),
                         };
                         self.ctx.check()?;
@@ -4388,8 +4569,8 @@ impl<'a> Planner<'a> {
             }
             leaves.push(options);
         }
-        if self.ctx.opt.sampled_filters && !filters.is_empty() {
-            super::sample::prepare(self.ctx, &leaves, &filters);
+        if self.sample_filters && !filters.is_empty() {
+            super::sample::prepare(self.ctx, &leaves, &filters, self.plan_charge)?;
         }
         if self.ctx.opt.characteristic_sets {
             use super::charsets::Term;
@@ -4448,9 +4629,10 @@ impl<'a> Planner<'a> {
         let late;
         (settled, late, _late_list) =
             if self.branch_payload.borrow().is_none() || deferred.is_empty() {
-                let (settled, late): (Vec<Expr>, Vec<Expr>) = deferred
-                    .into_iter()
-                    .partition(|f| !f.var_set().into_iter().any(binds_late));
+                let (settled, late): (Vec<Expr>, Vec<Expr>) = deferred.into_iter().partition(|f| {
+                    f.visit_vars(&mut |v| if binds_late(v) { Err(()) } else { Ok(()) })
+                        .is_ok()
+                });
                 (settled, late, list_credit(None))
             } else {
                 // The late filters move out of the deferred list, the settled ones stay.
@@ -4577,7 +4759,10 @@ impl<'a> Planner<'a> {
             .iter()
             .enumerate()
             .any(|(j, o)| j != i && o.t.contains(&PT::V(v)))
-            || filters.iter().any(|f| f.var_set().contains(&v));
+            || filters.iter().any(|f| {
+                f.visit_vars(&mut |var| if var == v { Err(()) } else { Ok(()) })
+                    .is_err()
+            });
         if !used
             || filters
                 .iter()
@@ -4731,22 +4916,50 @@ impl<'a> Planner<'a> {
                 let opts = items.into_iter().next().unwrap();
                 if preparation.is_some() {
                     self.choose_checked_scan(opts, filters)?
+                } else if opts.len() == 1 {
+                    let o = opts.into_iter().next().unwrap();
+                    self.place_filters(o, filters)?
                 } else {
+                    struct Candidate<'a> {
+                        node: Node,
+                        rest: Vec<Expr>,
+                        copy: Option<Charge<'a>>,
+                        kept: Option<Charge<'a>>,
+                    }
                     // the first of the cheapest, as `min_by` takes it
-                    let mut best: Option<(Node, Vec<Expr>)> = None;
-                    for o in opts {
-                        let mut f = filters.clone();
-                        let n = self.place_filters(o, &mut f)?;
+                    let mut best: Option<Candidate<'_>> = None;
+                    let mut iter = opts.into_iter().peekable();
+                    while let Some(o) = iter.next() {
+                        self.ctx.check()?;
+                        let (copy, mut f) = if iter.peek().is_none() {
+                            (None, std::mem::take(filters))
+                        } else {
+                            (self.plan_filter_copy(filters)?, filters.clone())
+                        };
+                        let (n, kept) = self.place_plan_where(o, &mut f, false)?;
+                        let candidate = Candidate {
+                            node: n,
+                            rest: f,
+                            copy,
+                            kept,
+                        };
                         if best
                             .as_ref()
-                            .is_none_or(|(b, _)| n.cost.total_cmp(&b.cost).is_lt())
+                            .is_none_or(|b| candidate.node.cost.total_cmp(&b.node.cost).is_lt())
                         {
-                            best = Some((n, f));
+                            best = Some(candidate);
                         }
                     }
-                    let (best, rest) = best.unwrap();
+                    let Candidate {
+                        node,
+                        rest,
+                        copy,
+                        kept,
+                    } = best.unwrap();
                     *filters = rest;
-                    best
+                    drop(copy);
+                    self.retain_plan_scratch(kept)?;
+                    node
                 }
             } else {
                 #[cfg(test)]
@@ -4767,7 +4980,7 @@ impl<'a> Planner<'a> {
             *append_credit = self.grow_filters(filters, more, 4, |f| f.append(settled))?;
         }
         // components connected by a spatial conjunct are joined on it
-        super::geojoin::spatial_joins(&mut parts, filters, self.ctx);
+        super::geojoin::spatial_joins(&mut parts, filters, self.ctx)?;
         // cross products between components, smallest first
         parts.sort_by(|a, b| a.est.total_cmp(&b.est));
         let mut it = parts.into_iter();
@@ -4826,12 +5039,8 @@ impl<'a> Planner<'a> {
         {
             return self.place_filters(super::joinorder::join_admitted(a, b, self)?, filters);
         }
-        let bound = |f: &Expr| {
-            !f.has_exists() && {
-                let vs = f.var_set();
-                !vs.is_empty() && vs.iter().all(|v| a.vars.contains(v) || b.vars.contains(v))
-            }
-        };
+        let bound =
+            |f: &Expr| filter_binds(f, false, |v| a.vars.contains(&v) || b.vars.contains(&v));
         let Some((x, y)) = filters
             .iter()
             .filter(|f| bound(f))
@@ -4852,21 +5061,7 @@ impl<'a> Planner<'a> {
             // The credit is declared before the list, which is freed first on a refusal.
             let _now_list;
             let now = {
-                let (now, now_list) = self.extract_filters(filters, |f| {
-                    !f.has_exists() && {
-                        let mut any = false;
-                        f.visit_vars(&mut |v| {
-                            any = true;
-                            if a.vars.contains(&v) || b.vars.contains(&v) {
-                                Ok(())
-                            } else {
-                                Err(())
-                            }
-                        })
-                        .is_ok()
-                            && any
-                    }
-                })?;
+                let (now, now_list) = self.extract_filters(filters, bound)?;
                 #[cfg(test)]
                 if let Some(credit) = &now_list {
                     watch_list(5, &now, credit);
@@ -4939,68 +5134,32 @@ impl<'a> Planner<'a> {
     ) -> Result<(Node, Option<Reservation>)> {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::within(6);
-        let applies = |f: &Expr| {
-            !f.has_exists() && {
-                let vs = f.var_set();
-                (constant || !vs.is_empty()) && vs.iter().all(|v| n.vars.contains(v))
-            }
-        };
-        // The same test without allocating: every occurrence of a variable is bound by
-        // `n`, and there is one unless `constant`.
-        let bound = |f: &Expr| {
-            !f.has_exists() && {
-                let mut any = false;
-                f.visit_vars(&mut |v| {
-                    any = true;
-                    if n.vars.contains(&v) { Ok(()) } else { Err(()) }
-                })
-                .is_ok()
-                    && (constant || any)
-            }
-        };
-        // The reservation is declared before the list it covers, which is freed first on
-        // a refusal.
-        let mut partition;
-        let (held, now) = if self.branch_payload.borrow().is_some() && !filters.is_empty() {
-            self.planning_stage(FILTER_PHASE)?;
-            let placed = filters.iter().filter(|f| bound(f)).count();
-            #[cfg(test)]
-            BOUND_TERMS.with(|terms| {
-                let mut t = terms.get();
-                t[2] = t[2].max(filters.len() as u64);
-                terms.set(t);
-            });
-            // The filters placed here move into a list of their own, made to its size,
-            // and the rest stay in the caller's list, which allocates nothing here.
-            let partition = self
-                .planning_scratch(|layout| layout.slots::<Expr>(placed))?
-                .expect("checked filter partition");
-            let mut now = Vec::new();
-            now.try_reserve_exact(placed)
-                .map_err(|_| partition.preparation().exhausted())?;
-            now.extend(filters.extract_if(.., |f| bound(f)));
-            debug_assert_eq!(now.len(), placed);
-            #[cfg(test)]
-            watch_list(PARTITION_WATCH, &now, &partition);
-            (Some(partition), now)
-        } else {
-            let (now, later) = std::mem::take(filters).into_iter().partition(applies);
-            *filters = later;
-            (None, now)
-        };
-        partition = match held {
-            Some(held) => held,
-            None => {
-                return Ok((
-                    if now.is_empty() {
-                        n
-                    } else {
-                        filter(n, now, self.ctx)
-                    },
-                    None,
-                ));
-            }
-        };
+        if self.branch_payload.borrow().is_none() || filters.is_empty() {
+            let (n, kept) = self.place_plan_where(n, filters, constant)?;
+            self.retain_plan_scratch(kept)?;
+            return Ok((n, None));
+        }
+        let bound = |f: &Expr| filter_binds(f, constant, |v| n.vars.contains(&v));
+        self.planning_stage(FILTER_PHASE)?;
+        let placed = filters.iter().filter(|f| bound(f)).count();
+        #[cfg(test)]
+        BOUND_TERMS.with(|terms| {
+            let mut t = terms.get();
+            t[2] = t[2].max(filters.len() as u64);
+            terms.set(t);
+        });
+        // Placed filters move into a list sized before allocation. The rest stay in
+        // the caller's list.
+        let mut partition = self
+            .planning_scratch(|layout| layout.slots::<Expr>(placed))?
+            .expect("checked filter partition");
+        let mut now = Vec::new();
+        now.try_reserve_exact(placed)
+            .map_err(|_| partition.preparation().exhausted())?;
+        now.extend(filters.extract_if(.., |f| bound(f)));
+        debug_assert_eq!(now.len(), placed);
+        #[cfg(test)]
+        watch_list(PARTITION_WATCH, &now, &partition);
         let (n, kept) = if now.is_empty() {
             (n, None)
         } else {
@@ -5016,6 +5175,75 @@ impl<'a> Planner<'a> {
             partition.merge(kept);
         }
         Ok((n, Some(partition)))
+    }
+
+    fn place_plan_where(
+        &self,
+        n: Node,
+        filters: &mut Vec<Expr>,
+        constant: bool,
+    ) -> Result<(Node, Option<Charge<'a>>)> {
+        let applies = |f: &Expr| filter_binds(f, constant, |v| n.vars.contains(&v));
+        if self.plan_charge.is_none() {
+            let (now, later): (Vec<_>, _) = std::mem::take(filters).into_iter().partition(applies);
+            *filters = later;
+            return Ok((
+                if now.is_empty() {
+                    n
+                } else {
+                    filter_checked(n, now, self.ctx)?
+                },
+                None,
+            ));
+        }
+        let placed = filters.iter().filter(|f| applies(f)).count();
+        if placed == 0 {
+            return Ok((n, None));
+        }
+        let mut scratch =
+            self.plan_filter_scratch(&n, filters.iter().filter(|f| applies(f)), false)?;
+        if let Some(held) = &scratch {
+            held.add((placed as u64).saturating_mul(size_of::<Expr>() as u64))?;
+        }
+        let mut now = Vec::with_capacity(placed);
+        now.extend(filters.extract_if(.., |f| applies(f)));
+        let owned = super::checked_layout::expressions_owned_bytes(now.iter());
+        let n = self.filter_plan_held(&mut scratch, n, now, owned)?;
+        Ok((n, scratch))
+    }
+
+    pub(super) fn plan_filter_scratch<'e>(
+        &self,
+        n: &Node,
+        exprs: impl Iterator<Item = &'e Expr> + Clone,
+        copies: bool,
+    ) -> Result<Option<Charge<'a>>> {
+        self.plan_scratch(|layout| filter_bound(layout, n, exprs, copies, self.ctx))
+    }
+
+    pub(super) fn filter_plan_held(
+        &self,
+        scratch: &mut Option<Charge<'_>>,
+        n: Node,
+        exprs: Vec<Expr>,
+        owned: u64,
+    ) -> Result<Node> {
+        let Some(held) = scratch else {
+            return filter_checked(n, exprs, self.ctx);
+        };
+        let shallow = |node: &Node| {
+            let mut layout = super::checked_layout::Layout::unchecked(true);
+            let _ = layout.shallow(node);
+            layout.bytes()
+        };
+        let before = shallow(&n);
+        let f = filter_checked(n, exprs, self.ctx)?;
+        let after = shallow(&f).saturating_add(match f.kind {
+            Kind::Filter(_) => shallow(&f.children[0]),
+            _ => 0,
+        });
+        held.resize(after.saturating_sub(before).saturating_sub(owned))?;
+        Ok(f)
     }
 
     /// The credit for [`filter`] of `n` under the filters `exprs` lists, taken before the
@@ -5059,14 +5287,14 @@ impl<'a> Planner<'a> {
         owned: u64,
     ) -> Result<(Node, Option<Reservation>)> {
         let Some(mut held) = scratch else {
-            return Ok((filter(n, exprs, self.ctx), None));
+            return Ok((filter_checked(n, exprs, self.ctx)?, None));
         };
         let before = {
             let mut layout = super::checked_layout::Layout::retained(held.preparation());
             layout.shallow(&n)?;
             layout.bytes()
         };
-        let f = filter(n, exprs, self.ctx);
+        let f = filter_checked(n, exprs, self.ctx)?;
         // The FILTER, and the scan under it that range pushdown made in place of `n`,
         // or `n` itself, whose storage `before` measured.
         let (after, spatial) = {
@@ -5103,6 +5331,14 @@ impl<'a> Planner<'a> {
     fn filter_admitted(&self, n: Node, exprs: Vec<Expr>) -> Result<Node> {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::within(6);
+        if self.plan_charge.is_some() {
+            let mut scratch = self.plan_filter_scratch(&n, exprs.iter(), false)?;
+            let owned = super::checked_layout::expressions_owned_bytes(exprs.iter())
+                .saturating_add((exprs.capacity() as u64).saturating_mul(size_of::<Expr>() as u64));
+            let n = self.filter_plan_held(&mut scratch, n, exprs, owned)?;
+            self.retain_plan_scratch(scratch)?;
+            return Ok(n);
+        }
         let mut scratch = self.filter_scratch(&n, exprs.iter(), false)?;
         // A list that filters were moved out of in place keeps its capacity, which the
         // FILTER keeps with it. That storage was made before this stage, so its credit
@@ -6321,7 +6557,7 @@ fn keyed_left_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &C
 /// estimated as a join on one variable whose result the rest of the condition filters.
 fn keyed_inner_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &Ctx) -> Node {
     let joined = join_est_from(l.est, r.est, l.d(a).max(r.d(b)));
-    let conjuncts = expr.clone().conjuncts().len().max(1);
+    let conjuncts = expr.conjunct_count().max(1);
     let est = (joined * FILTER_SELECTIVITY.powi(conjuncts as i32 - 1)).max(1.0);
     let mut vars = l.vars.clone();
     vars.extend(r.vars.iter().filter(|v| !l.vars.contains(v)));
@@ -6542,6 +6778,19 @@ fn list_credit(held: Option<Reservation>) -> ListCredit {
     held
 }
 
+fn filter_binds(f: &Expr, constant: bool, contains: impl Fn(VarId) -> bool) -> bool {
+    if f.has_exists() {
+        return false;
+    }
+    let mut any = false;
+    f.visit_vars(&mut |v| {
+        any = true;
+        if contains(v) { Ok(()) } else { Err(()) }
+    })
+    .is_ok()
+        && (constant || any)
+}
+
 /// The most that [`filter`] of `n` under `exprs` allocates at once, counting what the
 /// FILTER keeps but not what it keeps of `n`, and the copies of `exprs` when `copies`.
 /// Moving range conjuncts into a scan of `n` splits the filters into their conjuncts,
@@ -6556,19 +6805,13 @@ pub(super) fn filter_bound<'e>(
     copies: bool,
     ctx: &Ctx,
 ) -> Result<()> {
-    struct Count(usize);
-    impl std::fmt::Write for Count {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            self.0 = self.0.saturating_add(s.len());
-            Ok(())
-        }
-    }
-    let (mut count, mut conjuncts, mut text, mut most) = (0usize, 0usize, Count(0), 0usize);
+    let (mut count, mut conjuncts, mut text, mut most) = (0usize, 0usize, 0usize, 0usize);
     for e in exprs.clone() {
         count += 1;
         conjuncts = conjuncts.saturating_add(e.conjunct_count());
-        text.0 = text.0.saturating_add(8);
-        let _ = e.write_description(ctx, &mut text);
+        text = text
+            .saturating_add(8)
+            .saturating_add(e.description_bytes(ctx)?);
         let mut occurrences = 0usize;
         let _ = e.visit_vars(&mut |_| {
             occurrences += 1;
@@ -6587,29 +6830,56 @@ pub(super) fn filter_bound<'e>(
         copy(layout)?;
     }
     let slots = conjuncts.max(4);
-    // every rendered conjunct, separator and note, as a list, joined and formatted
-    let texts = text
-        .0
+    let checked = layout.is_checked();
+    // The individual strings can each hold nearly twice their text. Their joined
+    // copy costs one more, and a selectivity note can cause a further reformat.
+    let text = text
         .saturating_add(conjuncts.saturating_mul(4))
-        .saturating_add(n.desc.len())
-        .saturating_add(64)
-        .saturating_mul(6);
+        .saturating_add(64);
+    let texts = if checked {
+        text.saturating_add(n.desc.len()).saturating_mul(6)
+    } else if ctx.has_sampled() {
+        text.saturating_mul(3)
+            .saturating_add(conjuncts.saturating_mul(512))
+    } else {
+        text.saturating_mul(3)
+    };
     if let Kind::Scan(spec) = &n.kind {
-        // range pushdown splits the filters into their conjuncts and partitions them
+        // Range pushdown splits the filters into their conjuncts and partitions them.
         layout.slots::<Expr>(slots.saturating_mul(8))?;
+        if !checked && super::geopf::copies_filters(n, exprs.clone(), ctx) {
+            copy(layout)?;
+        }
+        fn compares(e: &Expr) -> bool {
+            match e {
+                Expr::And(a, b) => compares(a) || compares(b),
+                Expr::Cmp(..) | Expr::Eq(..) => true,
+                _ => false,
+            }
+        }
+        let range = checked
+            || (ctx.opt.range_pushdown
+                && spec
+                    .cols
+                    .first()
+                    .is_some_and(|&(c, _)| c == spec.prefix.len() && c != spec.graph_col)
+                && exprs.clone().any(compares));
         #[cfg(test)]
         let sizes = std::cell::Cell::new((0u64, 0u64, 0usize));
-        // Then either range conjuncts move into a range scan, which the key ranges of
-        // the start do not read, or none do and the scan may read key ranges.
+        // Range conjuncts can move into a range scan. Otherwise the scan can read
+        // key ranges using the same expressions by reference.
         layout.larger(
             |layout| {
+                if !range {
+                    return Ok(());
+                }
                 #[cfg(test)]
                 let start = layout.bytes();
                 // the atoms, the id ranges, the rendered conjuncts and the scan's copy
                 layout.slots::<(RangeOp, super::value::Value)>(slots.saturating_mul(2))?;
                 layout.slots::<IdRange>(64)?;
                 layout.slots::<String>(conjuncts)?;
-                layout.add(texts)?;
+                layout.add(texts.saturating_add(n.desc.len().saturating_mul(2)))?;
                 layout.scan(spec)?;
                 #[cfg(test)]
                 sizes.set((layout.bytes() - start, sizes.get().1, sizes.get().2));
@@ -6618,11 +6888,12 @@ pub(super) fn filter_bound<'e>(
             |layout| {
                 #[cfg(test)]
                 let start = layout.bytes();
-                // copies of the conjuncts on the sorted column, their key tests with the
-                // prefixes they give, and the id ranges of those prefixes
-                layout.slots::<Expr>(slots.saturating_mul(2))?;
-                for e in exprs.clone() {
-                    layout.expression(e)?;
+                // The key tests, their prefixes, and the resulting ID ranges.
+                if checked {
+                    layout.slots::<Expr>(slots.saturating_mul(2))?;
+                    for e in exprs.clone() {
+                        layout.expression(e)?;
+                    }
                 }
                 if let Some(&(_, v)) = spec.cols.first() {
                     let mut tests = 0usize;
@@ -6641,7 +6912,7 @@ pub(super) fn filter_bound<'e>(
             },
         )?;
         #[cfg(test)]
-        {
+        if checked {
             // the terms of the branch that sets the bound
             let (range, keys, tests) = sizes.get();
             BOUND_TERMS.with(|terms| {
@@ -6670,25 +6941,50 @@ pub(super) fn filter_bound<'e>(
 }
 
 pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
+    match filter_checked(n.clone(), exprs.clone(), ctx) {
+        Ok(out) => out,
+        Err(error) => {
+            ctx.fail_memory(&error);
+            let texts: Vec<String> = exprs.iter().map(|e| e.display(ctx)).collect();
+            Node::unary(Kind::Filter(exprs), n, texts.join(" && "))
+        }
+    }
+}
+
+pub(super) fn filter_checked(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Result<Node> {
     #[cfg(test)]
     let _stage = crate::test_alloc::Stage::within(6);
-    let (n, exprs) = push_range(n, exprs, ctx);
+    let (n, exprs) = push_range(n, exprs, ctx)?;
     let (n, exprs) = {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::enter(9);
-        super::geopf::push_spatial(n, exprs, ctx)
+        super::geopf::push_spatial_checked(n, exprs, ctx)?
     };
     if exprs.is_empty() {
-        return n;
+        return Ok(n);
     }
     let texts: Vec<String> = exprs.iter().map(|e| e.display(ctx)).collect();
     let sampled: Vec<Option<super::sample::Sampled>> =
         texts.iter().map(|t| ctx.sampled(t)).collect();
     let sel = super::sample::combine(sampled.iter().map(|s| s.map(|s| s.sel)));
-    let mut desc = texts.join(" && ");
-    if let Some(note) = super::sample::note(&sampled) {
-        desc = format!("{desc} {note}");
-    }
+    let desc = if let Some(note) = super::sample::note(&sampled) {
+        let size = texts.iter().map(String::len).sum::<usize>()
+            + 4 * texts.len().saturating_sub(1)
+            + 1
+            + note.len();
+        let mut desc = String::with_capacity(size);
+        for (i, text) in texts.iter().enumerate() {
+            if i > 0 {
+                desc.push_str(" && ");
+            }
+            desc.push_str(text);
+        }
+        desc.push(' ');
+        desc.push_str(&note);
+        desc
+    } else {
+        texts.join(" && ")
+    };
     // a conjunct evaluated once per distinct value sorts its input column, unless the
     // input is sorted on it already (an index scan can be read in that order instead).
     // Costed whether or not the expression cache is on, so that switching it off does
@@ -6710,7 +7006,7 @@ pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
     for d in f.dist.values_mut() {
         *d = d.min(f.est.max(1.0));
     }
-    f
+    Ok(f)
 }
 
 /// The rows a FILTER over scan `n` reads, and the key ranges it reads them in, when a
@@ -6731,14 +7027,16 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
         return None;
     }
     // the conjuncts over the column alone, as the executor tests them
-    let on_key: Vec<Expr> = exprs
+    let on_key = exprs
         .iter()
-        .filter(|e| super::exprcache::input(&[e]) == Ok(Some(v)))
-        .cloned()
-        .collect();
-    let prefixes = super::keyfilter::KeyFilter::plan_prefixes(&on_key, v)?;
+        .filter(|e| super::exprcache::input(&[e]) == Ok(Some(v)));
     #[cfg(test)]
-    REACHED.with(|r| r.set((r.get().0, r.get().1.max(on_key.len()))));
+    let mut key_filters = 0;
+    #[cfg(test)]
+    let on_key = on_key.inspect(|_| key_filters += 1);
+    let prefixes = super::keyfilter::KeyFilter::plan_prefixes(on_key, v)?;
+    #[cfg(test)]
+    REACHED.with(|r| r.set((r.get().0, r.get().1.max(key_filters))));
     let vocab = &ctx.snap.generation.vocab;
     let mut ids = vec![(0, Id::vocab(0).0 - 1)];
     for p in prefixes {
@@ -6891,7 +7189,22 @@ pub(super) enum RangeOp {
 
 /// `?v op c` for a filter conjunct comparing variable `v` with a numeric literal.
 pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, super::value::Value)> {
-    compare_atom(e, v, ctx, super::value::Value::is_numeric)
+    match range_atom_checked(e, v, ctx) {
+        Ok(v) => v,
+        Err(error) => {
+            ctx.fail_memory(&error);
+            None
+        }
+    }
+}
+
+/// [`range_atom`], propagating any memory or control refusal with its original error.
+pub(super) fn range_atom_checked(
+    e: &Expr,
+    v: VarId,
+    ctx: &Ctx,
+) -> Result<Option<(RangeOp, super::value::Value)>> {
+    compare_atom_checked(e, v, ctx, super::value::Value::is_numeric)
 }
 
 /// `?v op c` for a filter conjunct comparing variable `v` with a constant `c` that
@@ -6902,19 +7215,38 @@ pub(super) fn compare_atom(
     ctx: &Ctx,
     accept: fn(&super::value::Value) -> bool,
 ) -> Option<(RangeOp, super::value::Value)> {
+    match compare_atom_checked(e, v, ctx, accept) {
+        Ok(v) => v,
+        Err(error) => {
+            ctx.fail_memory(&error);
+            None
+        }
+    }
+}
+
+/// [`compare_atom`], propagating any memory or control refusal with its original error.
+pub(super) fn compare_atom_checked(
+    e: &Expr,
+    v: VarId,
+    ctx: &Ctx,
+    accept: fn(&super::value::Value) -> bool,
+) -> Result<Option<(RangeOp, super::value::Value)>> {
     use super::expr::CmpOp;
     let (a, b, op) = match e {
         Expr::Cmp(a, b, op) => (a, b, Some(*op)),
         Expr::Eq(a, b) => (a, b, None),
-        _ => return None,
+        _ => return Ok(None),
     };
-    fn constant(e: &Expr, ctx: &Ctx) -> Option<super::value::Value> {
+    fn constant(e: &Expr, ctx: &Ctx) -> Result<Option<super::value::Value>> {
         use super::value::{NumOp, Value, arith};
-        match e {
+        Ok(match e {
             Expr::Lit(_, c) => Some(c.clone()),
-            Expr::Const(id) => ctx.value(*id),
-            Expr::Neg(x) => arith(NumOp::Sub, &Value::Integer(0.into()), &constant(x, ctx)?).ok(),
-            Expr::Pos(x) => constant(x, ctx).filter(|c| c.is_numeric()),
+            Expr::Const(id) => ctx.value_checked(*id)?,
+            Expr::Neg(x) => match constant(x, ctx)? {
+                Some(x) => arith(NumOp::Sub, &Value::Integer(0.into()), &x).ok(),
+                None => None,
+            },
+            Expr::Pos(x) => constant(x, ctx)?.filter(|c| c.is_numeric()),
             Expr::Arith(x, y, op) => {
                 use super::expr::ArithOp;
                 let op = match op {
@@ -6923,23 +7255,30 @@ pub(super) fn compare_atom(
                     ArithOp::Mul => NumOp::Mul,
                     ArithOp::Div => NumOp::Div,
                 };
-                let (x, y) = (constant(x, ctx)?, constant(y, ctx)?);
+                let (Some(x), Some(y)) = (constant(x, ctx)?, constant(y, ctx)?) else {
+                    return Ok(None);
+                };
                 if !(x.is_numeric() && y.is_numeric()) {
-                    return None;
+                    return Ok(None);
                 }
                 arith(op, &x, &y).ok()
             }
             _ => None,
-        }
+        })
     }
-    let constant = |e: &Expr| constant(e, ctx);
     let (c, flip) = match (&**a, &**b) {
-        (Expr::Var(x), c) if *x == v => (constant(c)?, false),
-        (c, Expr::Var(x)) if *x == v => (constant(c)?, true),
-        _ => return None,
+        (Expr::Var(x), c) if *x == v => match constant(c, ctx)? {
+            Some(c) => (c, false),
+            None => return Ok(None),
+        },
+        (c, Expr::Var(x)) if *x == v => match constant(c, ctx)? {
+            Some(c) => (c, true),
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
     };
     if !accept(&c) {
-        return None;
+        return Ok(None);
     }
     let op = match (op, flip) {
         (None, _) => RangeOp::Eq,
@@ -6948,7 +7287,7 @@ pub(super) fn compare_atom(
         (Some(CmpOp::Gt), false) | (Some(CmpOp::Lt), true) => RangeOp::Gt,
         (Some(CmpOp::Ge), false) | (Some(CmpOp::Le), true) => RangeOp::Ge,
     };
-    Some((op, c))
+    Ok(Some((op, c)))
 }
 
 /// Id ranges whose values satisfy every atom (see [`RangeSpec`]).
@@ -7001,16 +7340,24 @@ pub(super) fn numeric_segment(
     lo: u64,
     hi: u64,
 ) -> Option<IdRange> {
-    use super::value::compare;
+    use super::value::{Value, compare};
     use std::cmp::Ordering;
+    let _ = ctx;
+    debug_assert!(matches!(tag, Tag::Int | Tag::Decimal));
     // the atoms split into lower bounds (false, then true along a segment in value order)
     // and upper bounds (true, then false); `=` is both
     let cmp = |id: u64| {
-        ctx.value(Id(id)).map(|x| {
+        let id = Id(id);
+        let x = match id.tag() {
+            Tag::Int => Value::Integer(id.as_i64().into()),
+            Tag::Decimal => Value::Decimal(crate::id::unpack_decimal(id.payload())),
+            _ => return None,
+        };
+        Some(
             atoms
                 .iter()
-                .map(move |(op, c)| (*op, compare(&x, c).ok().flatten()))
-        })
+                .map(move |(op, c)| (*op, compare(&x, c).ok().flatten())),
+        )
     };
     let lower_ok = |id: u64| {
         cmp(id).is_some_and(|mut it| {
@@ -7064,27 +7411,31 @@ thread_local! {
 }
 
 /// Move numeric range conjuncts on a scan's sorted column into an [`Kind::RangeScan`].
-fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
+fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Result<(Node, Vec<Expr>)> {
     let Kind::Scan(spec) = &n.kind else {
-        return (n, exprs);
+        return Ok((n, exprs));
     };
     let Some(&(col, v)) = spec.cols.first() else {
-        return (n, exprs);
+        return Ok((n, exprs));
     };
     if !ctx.opt.range_pushdown || col != spec.prefix.len() || spec.graph_col == col {
-        return (n, exprs);
+        return Ok((n, exprs));
     }
-    let (pushed, rest): (Vec<Expr>, Vec<Expr>) = exprs
-        .into_iter()
-        .flat_map(Expr::conjuncts)
-        .partition(|e| range_atom(e, v, ctx).is_some());
+    let mut pushed = Vec::new();
+    let mut rest = Vec::new();
+    let mut atoms = Vec::new();
+    for e in exprs.into_iter().flat_map(Expr::conjuncts) {
+        match range_atom_checked(&e, v, ctx)? {
+            Some(atom) => {
+                pushed.push(e);
+                atoms.push(atom);
+            }
+            None => rest.push(e),
+        }
+    }
     if pushed.is_empty() {
-        return (n, rest);
+        return Ok((n, rest));
     }
-    let atoms: Vec<_> = pushed
-        .iter()
-        .filter_map(|e| range_atom(e, v, ctx))
-        .collect();
     let ranges = numeric_ranges(&atoms, ctx);
     let exact = ranges.iter().filter(|r| r.exact).count();
     let desc = format!(
@@ -7114,7 +7465,7 @@ fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
                 .count_between(spec.perm, bound(r.lo, 0), bound(r.hi, u64::MAX))
         };
         let Ok(rows) = counted else {
-            return (n, rest.into_iter().chain(pushed).collect());
+            return Ok((n, rest.into_iter().chain(pushed).collect()));
         };
         let rows = rows as f64;
         if r.exact {
@@ -7146,7 +7497,7 @@ fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
     for d in r.dist.values_mut() {
         *d = d.min(r.est.max(1.0));
     }
-    (r, rest)
+    Ok((r, rest))
 }
 
 /// Id segments of a key column in id order, covering every id, with how ids order the
@@ -7228,7 +7579,8 @@ const LEXICAL_PROBE_ROWS: usize = 32;
 /// another kind, the generic plan answers after the first step, so the planner keeps
 /// the plain sort for columns that do not start with plain strings, such
 /// as language-tagged labels. Only the plan depends on this check.
-fn plain_strings_first(ctx: &Ctx, scan: &ScanSpec, lo: u64, hi: u64) -> bool {
+pub(super) fn plain_strings_first(ctx: &Ctx, scan: &ScanSpec, lo: u64, hi: u64) -> Result<bool> {
+    ctx.check()?;
     let col = scan.prefix.len();
     let bound = |id: u64, fill: u64| {
         let mut key = crate::index::pad(&scan.prefix, fill);
@@ -7248,15 +7600,23 @@ fn plain_strings_first(ctx: &Ctx, scan: &ScanSpec, lo: u64, hi: u64) -> bool {
             }
             Ok(ids.len() < LEXICAL_PROBE_ROWS)
         });
-    let vocab = &ctx.snap.generation.vocab;
-    read.is_ok()
-        && !ids.is_empty()
-        && ids.iter().all(|&id| {
-            Id(id).tag() == Tag::Vocab
-                && vocab.get(Id(id).payload()).is_some_and(|k| {
-                    k.first() == Some(&b'"') && k.last() == Some(&crate::id::KEY_SEP)
-                })
-        })
+    if read.is_err() || ids.is_empty() {
+        return Ok(false);
+    }
+    for &id in &ids {
+        if Id(id).tag() != Tag::Vocab {
+            return Ok(false);
+        }
+        let plain = ctx
+            .with_controlled_vocab_key(Id(id).payload(), |k| {
+                Ok(k.first() == Some(&b'"') && k.last() == Some(&crate::id::KEY_SEP))
+            })?
+            .unwrap_or(false);
+        if !plain {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// What placing the read steps at the best end of a monotone [`OrderedTopK`] piece costs,
@@ -7280,19 +7640,19 @@ fn force_ordered_topk() -> bool {
 /// `ORDER BY ?v LIMIT k` over a single scan (and FILTERs over it), with `?v` one of the
 /// scan's variables: an [`OrderedTopK`] when the scan can be read in the order of `?v`
 /// and that reads at most half of its rows (counted exactly per id piece).
-fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
+fn ordered_topk(n: Node, ctx: &Ctx) -> Result<Node> {
     let Kind::OrderBy {
         keys,
         limit: Some(k),
     } = &n.kind
     else {
-        return n;
+        return Ok(n);
     };
     if !ctx.opt.ordered_topk || *k == 0 {
-        return n;
+        return Ok(n);
     }
     let [(Expr::Var(v), asc)] = keys.as_slice() else {
-        return n;
+        return Ok(n);
     };
     let (v, asc, k) = (*v, *asc, *k);
     let child = &n.children[0];
@@ -7304,19 +7664,19 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
         .iter()
         .any(|e| e.has_exists() || !super::cache::deterministic(e))
     {
-        return n;
+        return Ok(n);
     }
     let (spec, range) = match &leaf.kind {
         Kind::Scan(spec) => (spec, None),
         Kind::RangeScan(spec, range) => (spec, Some(range)),
-        _ => return n,
+        _ => return Ok(n),
     };
     let Some(scan) = reorder_scan(spec, v) else {
-        return n;
+        return Ok(n);
     };
     let col = scan.prefix.len();
     if scan.graph_col == col || scan.cols.first().map(|c| c.1) != Some(v) {
-        return n;
+        return Ok(n);
     }
     // the generic plan's rows come in its scan's key order
     let mut tie: Vec<(usize, VarId)> = spec.cols.clone();
@@ -7378,7 +7738,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
                 .snap
                 .count_between(scan.perm, bound(lo, 0), bound(hi, u64::MAX))
             else {
-                return n;
+                return Ok(n);
             };
             if rows == 0 {
                 continue;
@@ -7399,7 +7759,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
             // when they look like plain strings there
             let lexical = asc
                 && literals.is_some_and(|(a, b)| a <= lo && hi <= b)
-                && (force_ordered_topk() || plain_strings_first(ctx, &scan, lo, hi));
+                && (force_ordered_topk() || plain_strings_first(ctx, &scan, lo, hi)?);
             read += match mono {
                 Some(_) => rows.min(TOPK_EDGE_ROWS + k as f64 / sel),
                 None if lexical => rows.min(TOPK_EDGE_ROWS + k as f64 / sel),
@@ -7415,7 +7775,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
         }
     }
     if pieces.is_empty() || read * 2.0 > total && !force_ordered_topk() {
-        return n;
+        return Ok(n);
     }
     let desc = format!(
         "{desc} | {} limit {k} [{} of {} id pieces in value order]",
@@ -7432,7 +7792,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
     for d in dist.values_mut() {
         *d = d.min(est.max(1.0));
     }
-    Node {
+    Ok(Node {
         vars: n.vars.clone(),
         certain: n.certain.clone(),
         kind: Kind::OrderedTopK(Box::new(OrderedTopK {
@@ -7452,7 +7812,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
         cost: read + seeks + est,
         dist,
         desc,
-    }
+    })
 }
 
 pub fn project(n: Node, vars: Vec<VarId>, ctx: &Ctx) -> Node {
@@ -7478,7 +7838,7 @@ fn project_described(n: Node, vars: Vec<VarId>, desc: String) -> Node {
     p
 }
 
-fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
+fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Result<Node> {
     // ORDER BY + LIMIT → top-k (also through a projection), over a single scan read in
     // value order when that is cheaper
     let limit = length.map(|l| l.saturating_add(start));
@@ -7498,9 +7858,9 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
                 *limit = Some(k);
             }
             ordered_topk(
-                super::geojoin::spatial_knn(super::vectortopk::vector_topk(n, ctx), ctx),
+                super::geojoin::spatial_knn(super::vectortopk::vector_topk(n, ctx)?, ctx)?,
                 ctx,
-            )
+            )?
         }
         (mut n, Some(k))
             if matches!(n.kind, Kind::Project(_))
@@ -7512,9 +7872,9 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
             }
             let order = n.children.pop().unwrap();
             n.children.push(ordered_topk(
-                super::geojoin::spatial_knn(super::vectortopk::vector_topk(order, ctx), ctx),
+                super::geojoin::spatial_knn(super::vectortopk::vector_topk(order, ctx)?, ctx)?,
                 ctx,
-            ));
+            )?);
             n
         }
         (n, _) => n,
@@ -7543,7 +7903,7 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
     if let Some(l) = length {
         n.est = n.est.min(l as f64);
     }
-    n
+    Ok(n)
 }
 
 /// Pass a LIMIT of `k` rows without OFFSET into an operator below it whose first `k`
@@ -8086,9 +8446,11 @@ fn defer_open_filters(
         return Vec::new();
     }
     let open = |v: VarId| open_filter_var(v, triples, paths, nodes, unpacks);
-    let (deferred, kept): (Vec<Expr>, Vec<Expr>) = std::mem::take(filters)
-        .into_iter()
-        .partition(|f| f.var_set().into_iter().any(open));
+    let (deferred, kept): (Vec<Expr>, Vec<Expr>) =
+        std::mem::take(filters).into_iter().partition(|f| {
+            f.visit_vars(&mut |v| if open(v) { Err(()) } else { Ok(()) })
+                .is_err()
+        });
     *filters = kept;
     deferred
 }
@@ -8416,14 +8778,33 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
 }
 
 fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
-    gp.on_in_scope_variable(|v| out(v.as_str()));
+    let _ = try_visit_pattern_vars(gp, &mut |name| {
+        out(name);
+        Ok::<(), std::convert::Infallible>(())
+    });
+}
+
+pub(super) fn try_visit_pattern_vars<E>(
+    gp: &GraphPattern,
+    out: &mut impl FnMut(&str) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
+    let mut status = Ok(());
+    gp.on_in_scope_variable(|v| {
+        if status.is_ok() {
+            status = out(v.as_str());
+        }
+    });
+    status?;
     // variables used only in filters also matter for substitution
-    fn walk(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
+    fn walk<E>(
+        gp: &GraphPattern,
+        out: &mut impl FnMut(&str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         use GraphPattern as GP;
         match gp {
             GP::Filter { expr, inner } => {
-                visit_expr_vars(expr, out);
-                walk(inner, out);
+                try_visit_expr_vars(expr, out)?;
+                walk(inner, out)
             }
             GP::LeftJoin {
                 left,
@@ -8431,10 +8812,10 @@ fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
                 expression,
             } => {
                 if let Some(e) = expression {
-                    visit_expr_vars(e, out);
+                    try_visit_expr_vars(e, out)?;
                 }
-                walk(left, out);
-                walk(right, out);
+                walk(left, out)?;
+                walk(right, out)
             }
             GP::Join { left, right }
             | GP::Lateral { left, right }
@@ -8442,8 +8823,8 @@ fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
             | GP::Minus { left, right }
             | GP::SemiJoin { left, right }
             | GP::AntiJoin { left, right } => {
-                walk(left, out);
-                walk(right, out);
+                walk(left, out)?;
+                walk(right, out)
             }
             GP::Extend {
                 inner, expression, ..
@@ -8454,25 +8835,24 @@ fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
             | GP::Unfold {
                 inner, expression, ..
             } => {
-                visit_expr_vars(expression, out);
-                walk(inner, out);
+                try_visit_expr_vars(expression, out)?;
+                walk(inner, out)
             }
             GP::Graph { inner, .. }
             | GP::Distinct { inner }
             | GP::Reduced { inner }
             | GP::Slice { inner, .. }
             | GP::OrderBy { inner, .. } => walk(inner, out),
-            _ => {}
+            _ => Ok(()),
         }
     }
-    walk(gp, out);
+    walk(gp, out)
 }
 
-pub(super) fn expr_vars(e: &Expression, out: &mut Vec<String>) {
-    visit_expr_vars(e, &mut |name| out.push(name.to_string()));
-}
-
-fn visit_expr_vars(e: &Expression, out: &mut impl FnMut(&str)) {
+pub(super) fn try_visit_expr_vars<E>(
+    e: &Expression,
+    out: &mut impl FnMut(&str) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
     use Expression as E;
     match e {
         E::Variable(v) | E::Bound(v) => out(v.as_str()),
@@ -8488,22 +8868,30 @@ fn visit_expr_vars(e: &Expression, out: &mut impl FnMut(&str)) {
         | E::Subtract(a, b)
         | E::Multiply(a, b)
         | E::Divide(a, b) => {
-            visit_expr_vars(a, out);
-            visit_expr_vars(b, out);
+            try_visit_expr_vars(a, out)?;
+            try_visit_expr_vars(b, out)
         }
-        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => visit_expr_vars(a, out),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => try_visit_expr_vars(a, out),
         E::In(a, l) => {
-            visit_expr_vars(a, out);
-            l.iter().for_each(|x| visit_expr_vars(x, out));
+            try_visit_expr_vars(a, out)?;
+            for x in l {
+                try_visit_expr_vars(x, out)?;
+            }
+            Ok(())
         }
         E::If(a, b, c) => {
-            visit_expr_vars(a, out);
-            visit_expr_vars(b, out);
-            visit_expr_vars(c, out);
+            try_visit_expr_vars(a, out)?;
+            try_visit_expr_vars(b, out)?;
+            try_visit_expr_vars(c, out)
         }
-        E::Coalesce(l) | E::FunctionCall(_, l) => l.iter().for_each(|x| visit_expr_vars(x, out)),
-        E::Exists(p) => visit_pattern_vars(p, out),
-        _ => {}
+        E::Coalesce(l) | E::FunctionCall(_, l) => {
+            for x in l {
+                try_visit_expr_vars(x, out)?;
+            }
+            Ok(())
+        }
+        E::Exists(p) => try_visit_pattern_vars(p, out),
+        _ => Ok(()),
     }
 }
 
@@ -8581,36 +8969,38 @@ pub fn short(t: &Term) -> String {
 
 /// Evaluate `EXISTS { pattern }` for one outer binding (substitution semantics).
 pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -> Result<bool> {
-    let mut p = Planner::new(ctx);
-    if ctx.calls_extensions {
-        p.property_inputs.extend(schema.iter().copied());
-    }
-    for (v, id) in spec.vars.iter().zip(key) {
-        if !id.is_undef() {
-            p.subst.insert(*v, *id);
+    super::depth::guard_exists(|| {
+        let mut p = Planner::for_exists(ctx, spec);
+        if ctx.calls_extensions {
+            p.property_inputs.extend(schema.iter().copied());
         }
-    }
-    let graph = match &spec.graph {
-        ActiveGraph::Var(v) => match p.subst.get(v) {
-            Some(id) => ActiveGraph::Named(*id),
-            None => spec.graph.clone(),
-        },
-        g => g.clone(),
-    };
-    let node = p.plan(spec.pattern(), &graph, Vec::new())?;
-    // A substituted pattern of one triple or a table of values reads its first row
-    // directly, as the per-row evaluation of EXISTS stays eager until item 829. A larger
-    // pattern pulls its first solution through cursor operators, as a LIMIT does, or
-    // runs whole when it is small enough that a LIMIT would.
-    if let Some((rows, _, _)) = super::exec::leaf_rows(ctx, &node, 1)? {
-        return Ok(!rows.table.is_empty());
-    }
-    if super::demand::runs_whole(ctx, &node, 1)
-        && let Some((rows, _)) = super::exec::whole_or_refused(ctx, &node)?
-    {
-        return Ok(!rows.table.is_empty());
-    }
-    super::cursor::has_solution(ctx, &node)
+        for (v, id) in spec.vars.iter().zip(key) {
+            if !id.is_undef() {
+                p.subst.insert(*v, *id);
+            }
+        }
+        let graph = match &spec.graph {
+            ActiveGraph::Var(v) => match p.subst.get(v) {
+                Some(id) => ActiveGraph::Named(*id),
+                None => spec.graph.clone(),
+            },
+            g => g.clone(),
+        };
+        let node = p.plan(spec.pattern(), &graph, Vec::new())?;
+        // A substituted pattern of one triple or a table of values reads its first row
+        // directly, as the per-row evaluation of EXISTS stays eager until item 829. A larger
+        // pattern pulls its first solution through cursor operators, as a LIMIT does, or
+        // runs whole when it is small enough that a LIMIT would.
+        if let Some((rows, _, _)) = super::exec::leaf_rows(ctx, &node, 1)? {
+            return Ok(!rows.table.is_empty());
+        }
+        if super::demand::runs_whole(ctx, &node, 1)
+            && let Some((rows, _)) = super::exec::whole_or_refused(ctx, &node)?
+        {
+            return Ok(!rows.table.is_empty());
+        }
+        super::cursor::has_solution(ctx, &node)
+    })
 }
 
 /// Literal helper for tests.
@@ -8755,7 +9145,7 @@ impl Planner<'_> {
             let mut v = Vec::new();
             for o in opts {
                 let (o, fm, kept) =
-                    super::joinorder::place_masked(self, o, 0, filters, &filter_vars)?;
+                    super::joinorder::place_masked(self, o, 0, filters, &filter_vars, None)?;
                 if let Some(kept) = kept {
                     self.retain_planning(kept);
                 }
@@ -8789,6 +9179,7 @@ impl Planner<'_> {
                                         fa | fb,
                                         filters,
                                         &filter_vars,
+                                        None,
                                     )?;
                                     if let Some(kept) = kept {
                                         self.retain_planning(kept);

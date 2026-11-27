@@ -140,12 +140,14 @@ pub struct Report {
 pub struct SessionRequest {
     /// the caller's view of the data
     pub snap: Arc<Snapshot>,
-    /// whether the caller may read a graph (`None`: every graph)
-    pub readable: Option<Arc<dyn Fn(Id) -> bool + Send + Sync>>,
+    /// the caller's bound graph access (`None`: every graph)
+    pub readable: Option<Arc<crate::access::GraphAccess>>,
     /// fails with [`Error::Timeout`] or [`Error::Cancelled`] when the query must stop
     pub stop: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     /// the query's memory budget, in bytes
     pub max_memory: Option<u64>,
+    /// the parent memory handle the session or rewriter reserves from (`None`: unpooled)
+    pub memory_parent: Option<sparkles_budget::ParentHandle>,
     /// neither read nor fill the cache of derived tables
     pub no_cache: bool,
 }
@@ -164,6 +166,53 @@ pub struct Rewritten {
     pub nodes: Vec<PlanInfo>,
     /// warnings for the response, such as axioms the rewriting ignored
     pub warnings: Vec<String>,
+}
+
+/// A [`Rewritten`] query paired with an optional opaque credit guard that keeps
+/// rewritten algebra allocations charged until planning and execution release them.
+/// Declared with `rewritten` before `memory_guard` so the algebra drops before credit
+/// returns. Moving the wrapper transfers the query and its admission together.
+#[derive(Debug)]
+pub struct GuardedRewritten {
+    pub rewritten: Rewritten,
+    pub memory_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl GuardedRewritten {
+    /// Wrap a [`Rewritten`] query with no attached memory guard.
+    pub fn unguarded(rewritten: Rewritten) -> Self {
+        Self {
+            rewritten,
+            memory_guard: None,
+        }
+    }
+
+    /// Wrap a [`Rewritten`] query with an optional opaque memory guard.
+    pub fn with_guard(
+        rewritten: Rewritten,
+        memory_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Self {
+        Self {
+            rewritten,
+            memory_guard,
+        }
+    }
+
+    /// Borrow the inner [`Rewritten`] query.
+    pub fn rewritten(&self) -> &Rewritten {
+        &self.rewritten
+    }
+
+    /// Clone the optional opaque memory guard.
+    pub fn memory_guard(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.memory_guard.clone()
+    }
+
+    /// Consume the wrapper and return the inner [`Rewritten`] query, dropping any
+    /// attached memory guard.
+    pub fn into_rewritten(self) -> Rewritten {
+        self.rewritten
+    }
 }
 
 /// A reasoner that derives facts for queries (see the module documentation).
@@ -186,6 +235,13 @@ pub trait ReasoningProvider: Send + Sync {
         let _ = req;
         None
     }
+    /// Whether [`rewrite`](Self::rewrite) can rewrite a query. Defaults to `true` so
+    /// custom providers that override `rewrite` keep working without opting in.
+    /// Providers that never rewrite can return `false` so callers avoid creating a child
+    /// memory parent when no rewriting runs.
+    fn rewrites(&self) -> bool {
+        true
+    }
     /// The query rewritten before planning, for the snapshot and view of `req`, or
     /// `None` when the provider rewrites nothing (spec F17 §7). The rewriting reads the
     /// provider's schema and not the query's data, and stops when `req.stop` fails.
@@ -199,6 +255,20 @@ pub trait ReasoningProvider: Send + Sync {
     ) -> Result<Option<Rewritten>> {
         let _ = (query, bound, req);
         Ok(None)
+    }
+    /// Like [`rewrite`](Self::rewrite), also returning an opaque memory guard that keeps
+    /// rewritten algebra credit charged until planning and execution release it.
+    /// Defaults to calling [`rewrite`](Self::rewrite) with no attached guard so custom
+    /// providers implementing only `rewrite` keep compiling and running unchanged.
+    fn rewrite_guarded(
+        &self,
+        query: &spargebra::Query,
+        bound: &[(String, Term)],
+        req: &SessionRequest,
+    ) -> Result<Option<GuardedRewritten>> {
+        Ok(self
+            .rewrite(query, bound, req)?
+            .map(GuardedRewritten::unguarded))
     }
 }
 
@@ -737,19 +807,13 @@ pub(crate) fn request(ctx: &Ctx, opts: &QueryOptions) -> SessionRequest {
             Ok(())
         }) as Arc<dyn Fn() -> Result<()> + Send + Sync>
     };
-    let readable: Option<Arc<dyn Fn(Id) -> bool + Send + Sync>> = match &ctx.graphs {
-        Some(a) if !a.reads_all() => {
-            let a = a.clone();
-            let snap = ctx.snap.clone();
-            Some(Arc::new(move |g: Id| a.readable_id(&snap, g)))
-        }
-        _ => None,
-    };
+    let readable = ctx.graphs.clone().filter(|a| !a.reads_all());
     SessionRequest {
         snap: ctx.snap.clone(),
         readable,
         stop,
         max_memory: opts.max_memory_bytes,
+        memory_parent: None,
         no_cache: opts.no_cache,
     }
 }
@@ -761,13 +825,18 @@ pub(crate) fn rewrite(
     provider: &Arc<dyn ReasoningProvider>,
     query: &spargebra::Query,
     opts: &QueryOptions,
-) -> Result<Option<Rewritten>> {
+) -> Result<Option<GuardedRewritten>> {
+    if !provider.rewrites() {
+        return Ok(None);
+    }
+    let mut req = request(ctx, opts);
+    req.memory_parent = Some(ctx.memory_parent()?);
     let bound: Vec<(String, Term)> = opts
         .initial_bindings
         .iter()
         .map(|(name, t)| (name.trim_start_matches(['?', '$']).to_string(), t.clone()))
         .collect();
-    provider.rewrite(query, &bound, &request(ctx, opts))
+    provider.rewrite_guarded(query, &bound, &req)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -814,6 +883,8 @@ fn apply_derive(
                 .into(),
         ));
     }
+    let mut req = req;
+    req.memory_parent = Some(ctx.memory_parent()?);
     let mut session = provider.start(req)?;
     // ---- under `auto`, whether the materialized inferences answer (spec F17 §4.1, §4.2)
     let materialization = if auto {
@@ -1582,5 +1653,175 @@ mod tests {
             reason: "stale".into(),
         };
         assert!(a.reads_inferred());
+    }
+
+    #[test]
+    fn memory_parent_is_lazy_on_reads_all_and_populated_on_rewrite_and_start() {
+        use crate::sparql::pool::QueryPool;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ProbeSession;
+        impl ReasoningSession for ProbeSession {
+            fn intensional(
+                &self,
+                _s: Option<&Term>,
+                _p: Option<&Term>,
+                _o: Option<&Term>,
+            ) -> Result<bool> {
+                Ok(false)
+            }
+            fn prepare(
+                &mut self,
+                _demands: &[Demand],
+                _estimates: bool,
+            ) -> Result<Vec<DemandInfo>> {
+                Ok(Vec::new())
+            }
+            fn derive(&mut self, _seeds: Vec<(usize, Vec<u64>)>) -> Result<Derived> {
+                Ok(Derived::default())
+            }
+            fn report(&self) -> Report {
+                Report::default()
+            }
+        }
+
+        struct ProbeProvider {
+            auto: bool,
+            reads_all: bool,
+            rewrites: bool,
+            expected_domain: sparkles_budget::DomainId,
+            rewrite_calls: AtomicUsize,
+            start_calls: AtomicUsize,
+        }
+
+        impl ReasoningProvider for ProbeProvider {
+            fn label(&self) -> String {
+                "probe".into()
+            }
+            fn auto(&self) -> bool {
+                self.auto
+            }
+            fn reads_all(&self, req: &SessionRequest) -> Option<Materialization> {
+                assert!(
+                    req.memory_parent.is_none(),
+                    "reads_all must not eagerly construct ctx.memory_parent()"
+                );
+                self.reads_all.then_some(Materialization::Fresh)
+            }
+            fn rewrites(&self) -> bool {
+                self.rewrites
+            }
+            fn rewrite(
+                &self,
+                _query: &spargebra::Query,
+                _bound: &[(String, Term)],
+                req: &SessionRequest,
+            ) -> Result<Option<Rewritten>> {
+                self.rewrite_calls.fetch_add(1, Ordering::SeqCst);
+                let parent = req
+                    .memory_parent
+                    .as_ref()
+                    .expect("rewrite must receive ctx.memory_parent()");
+                assert_eq!(parent.domain(), self.expected_domain);
+                Ok(None)
+            }
+            fn start(&self, req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
+                self.start_calls.fetch_add(1, Ordering::SeqCst);
+                let parent = req
+                    .memory_parent
+                    .as_ref()
+                    .expect("start must receive ctx.memory_parent()");
+                assert_eq!(parent.domain(), self.expected_domain);
+                Ok(Box::new(ProbeSession))
+            }
+        }
+
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = QueryPool::new(16 << 20);
+
+        // 1. auto + reads_all + !rewrites: neither rewrite nor start is called.
+        let p_auto = Arc::new(ProbeProvider {
+            auto: true,
+            reads_all: true,
+            rewrites: false,
+            expected_domain: pool.domain(),
+            rewrite_calls: AtomicUsize::new(0),
+            start_calls: AtomicUsize::new(0),
+        });
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            reasoning: Some(p_auto.clone()),
+            ..Default::default()
+        };
+        query(store.snapshot(), "SELECT * WHERE { ?s ?p ?o }", &opts).unwrap();
+        assert_eq!(p_auto.rewrite_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(p_auto.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.granted(), 0);
+
+        // 2. demand + rewrites: both rewrite and start receive a parent in pool.domain().
+        let p_ql = Arc::new(ProbeProvider {
+            auto: false,
+            reads_all: false,
+            rewrites: true,
+            expected_domain: pool.domain(),
+            rewrite_calls: AtomicUsize::new(0),
+            start_calls: AtomicUsize::new(0),
+        });
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            reasoning: Some(p_ql.clone()),
+            ..Default::default()
+        };
+        query(store.snapshot(), "SELECT * WHERE { ?s ?p ?o }", &opts).unwrap();
+        assert_eq!(p_ql.rewrite_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(p_ql.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.granted(), 0);
+
+        // 3. Custom provider overriding `rewrite` without overriding `rewrites()` still runs.
+        struct CustomRewriteProvider {
+            expected_domain: sparkles_budget::DomainId,
+            rewrite_calls: AtomicUsize,
+        }
+        impl ReasoningProvider for CustomRewriteProvider {
+            fn label(&self) -> String {
+                "custom-rewrite".into()
+            }
+            fn rewrite(
+                &self,
+                query: &spargebra::Query,
+                _bound: &[(String, Term)],
+                req: &SessionRequest,
+            ) -> Result<Option<Rewritten>> {
+                self.rewrite_calls.fetch_add(1, Ordering::SeqCst);
+                let parent = req
+                    .memory_parent
+                    .as_ref()
+                    .expect("custom rewrite must receive ctx.memory_parent()");
+                assert_eq!(parent.domain(), self.expected_domain);
+                Ok(Some(Rewritten {
+                    query: query.clone(),
+                    derive: Vec::new(),
+                    nodes: Vec::new(),
+                    warnings: Vec::new(),
+                }))
+            }
+            fn start(&self, _req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
+                Ok(Box::new(ProbeSession))
+            }
+        }
+        let custom = Arc::new(CustomRewriteProvider {
+            expected_domain: pool.domain(),
+            rewrite_calls: AtomicUsize::new(0),
+        });
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            reasoning: Some(custom.clone()),
+            ..Default::default()
+        };
+        query(store.snapshot(), "SELECT * WHERE { ?s ?p ?o }", &opts).unwrap();
+        assert_eq!(custom.rewrite_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.granted(), 0);
     }
 }

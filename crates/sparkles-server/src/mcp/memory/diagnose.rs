@@ -386,7 +386,7 @@ impl Tools<'_> {
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let deadline = self.call.arrived + timeout;
+        let deadline = self.deadline(timeout);
         let parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
         let reader: Reader =
             self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?;
@@ -401,14 +401,14 @@ impl Tools<'_> {
             )
             .map_err(|e| ctx.engine(e))?;
         let asker = Asker {
-            snap: &reader.snap,
+            snap: reader.snap(),
             opts,
             query: &parsed,
             deadline,
             each: timeout / 10,
         };
         let mut terms = Terms::new(&prefixes, 200);
-        let mut out = json!({ "dataset": ds.name, "commit": reader.snap.commit });
+        let mut out = json!({ "dataset": ds.name, "commit": reader.commit() });
         let has_rows = asker
             .ask(whole(&parsed).clone())
             .map_err(|e| ctx.engine(e))?;
@@ -496,7 +496,7 @@ impl Tools<'_> {
                     continue;
                 }
                 let occurs = match c {
-                    Term::NamedNode(_) | Term::Literal(_) => match reader.snap.lookup_term(c) {
+                    Term::NamedNode(_) | Term::Literal(_) => match reader.snap().lookup_term(c) {
                         None => false,
                         Some(_) => reader
                             .ask(&exists_term(&reader), vec![("t".into(), c.clone())])
@@ -563,17 +563,17 @@ impl Tools<'_> {
                 // historical reads, instead of asking the current dataset head.
                 let snap = match &reader.opts.graphs {
                     Some(a) => a
-                        .bound(&reader.snap)
-                        .masked(&reader.snap)
+                        .bound(reader.snap())
+                        .masked(reader.snap())
                         .map_err(|e| ctx.engine(e))?,
-                    None => reader.snap.clone(),
+                    None => reader.snap().clone(),
                 };
-                let readable = reader.opts.graphs.as_ref().map(|a| {
-                    let a = a.clone();
-                    let snap = reader.snap.clone();
-                    Arc::new(move |g| a.bound(&snap).readable_id(&snap, g))
-                        as Arc<dyn Fn(sparkles::id::Id) -> bool + Send + Sync>
-                });
+                let readable = reader
+                    .opts
+                    .graphs
+                    .as_ref()
+                    .filter(|a| !a.reads_all())
+                    .map(|a| a.bound(reader.snap()));
                 let triple: [Term; 3] = s.constants.clone().try_into().expect("three constants");
                 let input = sparkles_reasoner::explain::DemandInput {
                     reasoner: &reasoner,
@@ -590,6 +590,12 @@ impl Tools<'_> {
                             .limits
                             .query_memory_bytes
                             .map(|m| m as usize),
+                        memory_parent: reader
+                            .opts
+                            .grant
+                            .as_ref()
+                            .map(|g| g.memory_parent())
+                            .or_else(|| ds.dataset.pool().map(|p| p.work_parent())),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -600,7 +606,7 @@ impl Tools<'_> {
                         if intensional {
                             sparkles::reasoning::hypotheses::check_consistency(
                                 &ds.dataset,
-                                &reader.snap,
+                                reader.snap(),
                                 &reasoner,
                                 &sparkles::reasoning::analysis::AnalysisOptions {
                                     timeout: Some(
@@ -617,7 +623,7 @@ impl Tools<'_> {
                             let e = sparkles::reasoning::explain::Explanation {
                                 explained: sparkles::explain::Explained::NotFound,
                                 why_not: Some(answer),
-                                commit: reader.snap.commit,
+                                commit: reader.commit(),
                                 source: Some(sparkles::reasoning::explain::ExplainSource::Demand),
                                 read_at_head: false,
                                 freshness: None,
@@ -627,10 +633,8 @@ impl Tools<'_> {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        if e.chain()
-                            .any(|c| matches!(c.downcast_ref::<Error>(), Some(Error::Cancelled)))
-                        {
-                            return Err(ctx.engine(Error::Cancelled));
+                        if let Some(fatal) = fatal_why_not_error(&e) {
+                            return Err(ctx.engine(fatal));
                         }
                         f["whyNotError"] = e.to_string().into();
                     }
@@ -687,5 +691,74 @@ pub(crate) fn verdict(first: &Value) -> &'static str {
         Some("join" | "filter") if !absent => "data",
         Some("pattern") if absent => "data",
         _ => "unknown",
+    }
+}
+
+#[cfg(feature = "reasoning")]
+fn fatal_why_not_error(e: &anyhow::Error) -> Option<Error> {
+    let core = e
+        .downcast_ref::<Error>()
+        .or_else(|| e.chain().find_map(|c| c.downcast_ref::<Error>()))?;
+    match core {
+        Error::Cancelled => Some(Error::Cancelled),
+        Error::BudgetExceeded(b) if b.kind == sparkles::BudgetKind::ServerMemory => {
+            Some(Error::BudgetExceeded(*b))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "reasoning"))]
+mod tests {
+    use super::fatal_why_not_error;
+    use oxrdf::{NamedNode, Term};
+    use sparkles::sparql::pool::QueryPool;
+    use sparkles::store::{Store, StoreOptions};
+    use sparkles::{Budget, BudgetKind, Error};
+
+    #[test]
+    fn why_not_target_intern_refusal_is_recovered_as_server_memory() {
+        let store = Store::in_memory(StoreOptions::default());
+        let reasoner = sparkles_reasoner::query::QueryReasoner::new(
+            sparkles_reasoner::Profile::RdfsSimple,
+            &sparkles_reasoner::Extras::default(),
+            sparkles_reasoner::Inputs::default(),
+        )
+        .unwrap();
+        let snap = store.snapshot();
+        // Pool fits Session::new (~128 KiB) but refuses interning a 512 KiB target IRI
+        // via `try_id_for_controlled` after the demand session opens.
+        let pool = QueryPool::new(256 * 1024);
+        let input = sparkles_reasoner::explain::DemandInput {
+            reasoner: &reasoner,
+            snap,
+            readable: None,
+        };
+        let huge_iri = format!("http://ex.org/{}", "a".repeat(512 * 1024));
+        let triple = [
+            Term::NamedNode(NamedNode::new_unchecked(huge_iri)),
+            Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()),
+            Term::NamedNode(NamedNode::new_unchecked("http://ex.org/Class")),
+        ];
+        let options = sparkles_reasoner::whynot::WhyNotOptions {
+            explain: sparkles_reasoner::explain::ExplainOptions {
+                max_memory: Some(16 << 20),
+                memory_parent: Some(pool.work_parent()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = sparkles_reasoner::whynot::why_not(&input, &triple, &options).unwrap_err();
+        assert!(
+            matches!(
+                fatal_why_not_error(&err),
+                Some(Error::BudgetExceeded(Budget {
+                    kind: BudgetKind::ServerMemory,
+                    ..
+                }))
+            ),
+            "expected ServerMemory recovery, got: {err:#}"
+        );
+        assert_eq!(pool.granted(), 0);
     }
 }

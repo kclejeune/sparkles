@@ -27,8 +27,9 @@
 //! that older releases read. Each circuit reads only its own format: a file of the other
 //! is left for the next checkpoint to remove, and the view is built from the data.
 
+use super::budget::BudgetHandle;
 use super::terms::Terms;
-use super::zset::{Row, ZSet};
+use super::zset::{Row, ZSet, row_bytes};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::store::Snapshot;
@@ -216,6 +217,8 @@ pub struct Reader<'a> {
     body: &'a [u8],
     at: usize,
     ids: Vec<Id>,
+    budget: Option<BudgetHandle>,
+    ids_lease: super::budget::ScratchLease,
 }
 
 fn short() -> Error {
@@ -224,17 +227,90 @@ fn short() -> Error {
 
 impl<'a> Reader<'a> {
     pub fn new(data: &'a [u8], snap: &Snapshot, terms: &mut Terms) -> Result<Reader<'a>> {
+        Self::with_budget(data, snap, terms, None)
+    }
+
+    pub(crate) fn with_budget(
+        data: &'a [u8],
+        snap: &Snapshot,
+        terms: &mut Terms,
+        budget: Option<BudgetHandle>,
+    ) -> Result<Reader<'a>> {
+        let ids_lease = super::budget::ScratchLease::new(budget.clone());
         let mut r = Reader {
             body: data,
             at: 0,
             ids: vec![Id::UNDEF],
+            budget,
+            ids_lease,
         };
         let n = r.u64()?;
         for _ in 0..n {
-            let k = r.bytes()?.to_vec();
-            r.ids.push(terms.intern_key(snap, &k));
+            let k = r.bytes()?;
+            // Pre-admit id table growth and any new local-term storage before inserting.
+            let next_ids_cap = sparkles_budget::sizes::vec_grown(
+                r.ids.capacity(),
+                r.ids.len(),
+                1,
+                std::mem::size_of::<Id>(),
+            );
+            let next_ids_bytes = (next_ids_cap as u64) * std::mem::size_of::<Id>() as u64;
+            if next_ids_bytes > r.ids_lease.bytes() {
+                r.ids_lease.try_set(next_ids_bytes)?;
+            }
+            let id = terms.intern_key_budgeted(snap, k, |delta| r.charge_state(delta))?;
+            r.ids.push(id);
         }
         Ok(r)
+    }
+
+    pub(crate) fn budget_handle(&self) -> Option<BudgetHandle> {
+        self.budget.clone()
+    }
+
+    /// Pre-admit decoded persistent state bytes against the circuit's budget during
+    /// checkpoint loading.
+    pub(crate) fn charge_state(&self, delta: u64) -> Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        if let Some(budget) = &self.budget {
+            budget.try_reserve_pass(delta)?;
+        }
+        Ok(())
+    }
+
+    /// Release excess pre-admitted persistent state bytes when an actual allocation is
+    /// smaller than its conservative preflight estimate.
+    pub(crate) fn release_state(&self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(budget) = &self.budget {
+            budget.release_pass(delta);
+        }
+    }
+
+    pub(crate) fn scratch_lease(&self) -> super::budget::ScratchLease {
+        super::budget::ScratchLease::new(self.budget.clone())
+    }
+
+    /// Atomically move `bytes` from `lease` into pass/state credit without releasing
+    /// or re-reserving against the upstream pool.
+    pub(crate) fn commit_scratch_to_state(
+        &self,
+        lease: &mut super::budget::ScratchLease,
+        bytes: u64,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(budget) = &self.budget {
+            let moved = budget.move_scratch_to_pass(lease, bytes);
+            debug_assert_eq!(moved, bytes);
+        } else {
+            lease.release(bytes);
+        }
     }
 
     pub fn u64(&mut self) -> Result<u64> {
@@ -295,12 +371,41 @@ impl<'a> Reader<'a> {
         (0..n).map(|_| self.id()).collect()
     }
 
+    /// Decode a row whose encoded width must equal `expected`, pre-admitting
+    /// `expected * size_of::<Id>()` bytes into `lease` before allocating the row buffer.
+    pub(crate) fn row_exact_leased(
+        &mut self,
+        expected: usize,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<Row> {
+        let n = self.u64()?;
+        if n != expected as u64 {
+            return Err(Error::Corrupt(format!(
+                "a view's state has a row of width {n}, expected {expected}"
+            )));
+        }
+        let row_bytes = (expected as u64).saturating_mul(std::mem::size_of::<Id>() as u64);
+        lease.try_reserve(row_bytes)?;
+        let mut out = Vec::with_capacity(expected);
+        for _ in 0..expected {
+            out.push(self.id()?);
+        }
+        Ok(out.into_boxed_slice())
+    }
+
     pub fn zset(&mut self) -> Result<ZSet> {
         let n = self.u64()?;
         let mut z = ZSet::new();
+        let mut charged = 0u64;
         for _ in 0..n {
             let r = self.row()?;
+            let width = r.len();
             let w = self.i64()?;
+            let next = (z.len() as u64 + 1).saturating_mul(row_bytes(width));
+            if next > charged {
+                self.charge_state(next - charged)?;
+                charged = next;
+            }
             z.add(r, w);
         }
         Ok(z)

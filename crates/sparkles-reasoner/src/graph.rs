@@ -86,6 +86,10 @@ pub(crate) struct Graph {
     /// the graph's heap, charged to the run's budget. Returned only after every owned
     /// graph payload above has been destroyed.
     held: Held,
+    /// per-graph atomic list lookup instrumentation for tests (captures Rayon workers
+    /// without cross-test interference)
+    #[cfg(test)]
+    pub(crate) list_probe: ListProbe,
 }
 
 impl Default for Graph {
@@ -101,6 +105,8 @@ impl Default for Graph {
             in_base: shards(),
             live: 0,
             pending: None,
+            #[cfg(test)]
+            list_probe: ListProbe::default(),
         }
     }
 }
@@ -160,6 +166,7 @@ impl Graph {
     }
 
     /// Charge the graph's heap to `budget` from now on, or fail when it does not fit.
+    #[cfg(test)]
     pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
         self.held = Held::try_new(budget, self.heap_bytes())?;
         Ok(())
@@ -252,12 +259,49 @@ impl Graph {
 
     /// A graph whose ids `[0, base.len)` are the base tier (at least one id, so that
     /// a base tier that grows later, see [`set_base`](Self::set_base), is still read).
+    #[cfg(test)]
     pub fn with_base(base: Arc<Base>) -> Graph {
         Graph {
             tier: Tier::new(base.len().max(1)),
             base: Some(base),
             ..Graph::default()
         }
+    }
+
+    /// [`with_base`](Self::with_base), charging the shard vectors to `budget` before
+    /// constructing the graph.
+    pub(crate) fn with_base_in(
+        base: Arc<Base>,
+        budget: &Arc<Budget>,
+    ) -> Result<Graph, BudgetFailure> {
+        let held = Held::try_new(budget, Self::fixed_heap_bytes())?;
+        Ok(Graph {
+            tier: Tier::new(base.len().max(1)),
+            base: Some(base),
+            index: shards(),
+            in_base: shards(),
+            live: 0,
+            pending: None,
+            hidden: None,
+            relations: false,
+            hides: false,
+            held,
+            #[cfg(test)]
+            list_probe: ListProbe::default(),
+        })
+    }
+
+    /// [`with_base_in`](Self::with_base_in) with pre-admitted capacity for `n` derived facts.
+    pub(crate) fn try_with_base_capacity(
+        base: Arc<Base>,
+        n: usize,
+        budget: &Arc<Budget>,
+    ) -> Result<Graph, BudgetFailure> {
+        let offset = base.len().max(1);
+        let mut g = Graph::try_with_capacity(n, budget)?;
+        g.tier.set_offset(offset);
+        g.base = Some(base);
+        Ok(g)
     }
 
     /// A graph over the same base tier and id numbers as this one, with room for `n`
@@ -315,6 +359,13 @@ impl Graph {
     /// The base tier, to change, while no one else shares it.
     pub fn base_mut(&mut self) -> Option<&mut Base> {
         self.base.as_mut().and_then(Arc::get_mut)
+    }
+
+    /// Whether the base tier cannot be mutated exclusively.
+    pub(crate) fn base_is_shared(&self) -> bool {
+        self.base
+            .as_ref()
+            .is_some_and(|b| Arc::strong_count(b) > 1 || Arc::weak_count(b) > 0)
     }
 
     /// The base tier, if the graph has one.
@@ -1104,14 +1155,21 @@ impl Graph {
         })
     }
 
-    /// Whether `t` is a live fact among ids `< hi`.
+    /// Whether `t` is a live fact among ids `< hi`. A fact present in the derived tier at
+    /// row `>= hi` (such as a newly inserted explicit row appended at `start` during
+    /// incremental saturation) did not hold before `hi` even when the new snapshot's base
+    /// tier already holds it.
     pub fn holds_before(&self, memo: &mut Memo, t: &Triple, hi: u32) -> bool {
-        self.position(t).is_some_and(|r| r < hi)
-            || (self.reads_base(0, hi)
-                && self
-                    .base
-                    .as_ref()
-                    .is_some_and(|b| b.contains_with(memo, t).unwrap_or(false)))
+        match self.position(t) {
+            Some(r) => r < hi,
+            None => {
+                self.reads_base(0, hi)
+                    && self
+                        .base
+                        .as_ref()
+                        .is_some_and(|b| b.contains_with(memo, t).unwrap_or(false))
+            }
+        }
     }
 
     /// The objects of `(s p ?)` among ids `< hi`, the base tier's first and the derived
@@ -1165,6 +1223,86 @@ impl Graph {
         f: impl FnMut(u64) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()> {
         self.each_end(memo, None, p, Some(o), hi, 0, f)
+    }
+
+    /// [`Graph::each_object`], metering every raw base-tier row and derived-tier candidate
+    /// inspected before filtering through `meter`.
+    pub(crate) fn each_object_metered(
+        &self,
+        memo: &mut Memo,
+        s: u64,
+        p: u64,
+        hi: u32,
+        meter: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+        f: impl FnMut(u64) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        self.each_end_metered(memo, Some(s), p, None, hi, 2, meter, f)
+    }
+
+    /// [`Graph::each_subject`], metering every raw base-tier row and derived-tier candidate
+    /// inspected before filtering through `meter`.
+    pub(crate) fn each_subject_metered(
+        &self,
+        memo: &mut Memo,
+        p: u64,
+        o: u64,
+        hi: u32,
+        meter: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+        f: impl FnMut(u64) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        self.each_end_metered(memo, None, p, Some(o), hi, 0, meter, f)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn each_end_metered(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: u64,
+        o: Option<u64>,
+        hi: u32,
+        at: usize,
+        meter: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+        mut f: impl FnMut(u64) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        if let Some(b) = &self.base
+            && self.reads_base(0, hi)
+        {
+            let mut stop: Option<anyhow::Result<()>> = None;
+            b.for_each_with_metered(memo, s, Some(p), o, meter, |t| match f(t[at]) {
+                Ok(true) => true,
+                Ok(false) => {
+                    stop = Some(Ok(()));
+                    false
+                }
+                Err(e) => {
+                    stop = Some(Err(e));
+                    false
+                }
+            })?;
+            if let Some(r) = stop {
+                return r;
+            }
+        }
+        let mut pending: u64 = 0;
+        for r in self.cands(s, Some(p), o, 0, hi).iter() {
+            pending += 1;
+            if pending >= 1024 {
+                meter(std::mem::take(&mut pending))?;
+            }
+            if !self.alive(r) {
+                continue;
+            }
+            let t = self.triple(r);
+            if s.is_none_or(|x| x == t[0]) && t[1] == p && o.is_none_or(|x| x == t[2]) && !f(t[at])?
+            {
+                break;
+            }
+        }
+        if pending > 0 {
+            meter(pending)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1221,6 +1359,37 @@ impl Graph {
         nil: u64,
         hi: u32,
     ) -> Option<Vec<u64>> {
+        self.list_filtered(memo, head, first, rest, nil, hi, false)
+    }
+
+    /// Members of an RDF list reading only explicit (`base` and flagged) `rdf:first` and
+    /// `rdf:rest` triples, ignoring unflagged derived rows (such as removed list triples
+    /// temporarily held as deletion candidates).
+    pub fn list_explicit(
+        &self,
+        memo: &mut Memo,
+        head: u64,
+        first: u64,
+        rest: u64,
+        nil: u64,
+        hi: u32,
+    ) -> Option<Vec<u64>> {
+        #[cfg(test)]
+        self.list_probe.record_explicit_list_walk();
+        self.list_filtered(memo, head, first, rest, nil, hi, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn list_filtered(
+        &self,
+        memo: &mut Memo,
+        head: u64,
+        first: u64,
+        rest: u64,
+        nil: u64,
+        hi: u32,
+        explicit_only: bool,
+    ) -> Option<Vec<u64>> {
         const MAX_LEN: usize = 1 << 20;
         let mut out = Vec::new();
         let mut cur = head;
@@ -1231,10 +1400,164 @@ impl Graph {
             }
             // with several values (e.g. copies made by owl:sameAs replacement) the
             // earliest (asserted) one wins
-            out.push(*self.objects(memo, cur, first, hi).first()?);
-            cur = *self.objects(memo, cur, rest, hi).first()?;
+            let first_val = self.first_object(memo, cur, first, hi, explicit_only)?;
+            out.push(first_val);
+            cur = self.first_object(memo, cur, rest, hi, explicit_only)?;
         }
         Some(out)
+    }
+
+    /// The earliest object of `(s p ?)` among ids `< hi`, restricting derived rows to
+    /// flagged-explicit ones when `explicit_only` is set.
+    fn first_object(
+        &self,
+        memo: &mut Memo,
+        s: u64,
+        p: u64,
+        hi: u32,
+        explicit_only: bool,
+    ) -> Option<u64> {
+        if let Some(b) = &self.base
+            && self.reads_base(0, hi)
+        {
+            let mut found = None;
+            let _ = b.for_each_with(memo, Some(s), Some(p), None, |t| {
+                found = Some(t[2]);
+                false
+            });
+            if found.is_some() {
+                return found;
+            }
+        }
+        let mut best: Option<(u32, u64)> = None;
+        for i in self.cands(Some(s), Some(p), None, 0, hi).iter() {
+            #[cfg(test)]
+            self.list_probe.record_first_object_cand();
+            if self.alive(i) && (!explicit_only || self.flagged(i)) {
+                let t = self.triple(i);
+                if t[0] == s && t[1] == p && best.is_none_or(|(bi, _)| i < bi) {
+                    best = Some((i, t[2]));
+                }
+            }
+        }
+        best.map(|(_, o)| o)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ListProbePhase {
+    Other = 0,
+    Prepare = 1,
+    Proof = 2,
+    Replay = 3,
+}
+
+#[cfg(test)]
+pub(crate) struct ListProbe {
+    phase: std::sync::atomic::AtomicU8,
+    first_object_cands: [std::sync::atomic::AtomicU64; 4],
+    explicit_list_walks: [std::sync::atomic::AtomicU64; 4],
+    list_override_hits: [std::sync::atomic::AtomicU64; 4],
+    removed_list_checks: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl Default for ListProbe {
+    fn default() -> Self {
+        Self {
+            phase: std::sync::atomic::AtomicU8::new(ListProbePhase::Other as u8),
+            first_object_cands: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            explicit_list_walks: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            list_override_hits: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            removed_list_checks: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ListProbePhaseGuard<'a> {
+    probe: &'a ListProbe,
+    prev: u8,
+}
+
+#[cfg(test)]
+impl Drop for ListProbePhaseGuard<'_> {
+    fn drop(&mut self) {
+        self.probe
+            .phase
+            .store(self.prev, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl ListProbe {
+    pub(crate) fn enter_phase(&self, phase: ListProbePhase) -> ListProbePhaseGuard<'_> {
+        let prev = self
+            .phase
+            .swap(phase as u8, std::sync::atomic::Ordering::AcqRel);
+        ListProbePhaseGuard { probe: self, prev }
+    }
+
+    #[inline]
+    fn phase_idx(&self) -> usize {
+        (self.phase.load(std::sync::atomic::Ordering::Acquire) as usize).min(3)
+    }
+
+    #[inline]
+    pub(crate) fn record_first_object_cand(&self) {
+        self.first_object_cands[self.phase_idx()]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_explicit_list_walk(&self) {
+        self.explicit_list_walks[self.phase_idx()]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_list_override_hit(&self) {
+        self.list_override_hits[self.phase_idx()]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_removed_list_check(&self) {
+        self.removed_list_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn reset(&self) {
+        for c in &self.first_object_cands {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        for c in &self.explicit_list_walks {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        for c in &self.list_override_hits {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.removed_list_checks
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn first_object_cands(&self, phase: ListProbePhase) -> u64 {
+        self.first_object_cands[phase as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn explicit_list_walks(&self, phase: ListProbePhase) -> u64 {
+        self.explicit_list_walks[phase as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn list_override_hits(&self, phase: ListProbePhase) -> u64 {
+        self.list_override_hits[phase as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn removed_list_checks(&self) -> u64 {
+        self.removed_list_checks
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

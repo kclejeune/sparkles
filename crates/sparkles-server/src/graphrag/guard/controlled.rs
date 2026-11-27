@@ -1,6 +1,6 @@
 //! Request-bounded disclosure preparation. Legacy guard methods are unchanged.
 use super::*;
-use sparkles::access::{Exemptions, Preparation, Reservation};
+use sparkles::access::{Exemptions, GuardSnapshot, Preparation, Reservation};
 use sparkles::{Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -111,12 +111,12 @@ struct CachedIndex {
 
 pub(super) fn exempt(
     guard: &Guard,
-    snap: &Arc<Snapshot>,
+    snap: &GuardSnapshot<'_>,
     view: &GraphAccess,
     preparation: &Preparation,
 ) -> Result<Exemptions> {
     preparation.check()?;
-    if let Some(key) = CacheKey::of(snap) {
+    if let Some(key) = CacheKey::of_guard(snap) {
         let cached = {
             let indexes = preparation.lock(&guard.indexes)?;
             indexes
@@ -133,7 +133,7 @@ pub(super) fn exempt(
             };
             let mut output = Exemptions::new(preparation)?;
             for (name, state) in &cached.value.graphs {
-                if proven(name, state, view, preparation)? {
+                if proven(snap, name, state, view, preparation)? {
                     output.push(name)?;
                 }
             }
@@ -147,7 +147,7 @@ pub(super) fn exempt(
     let mut output = Exemptions::new(preparation)?;
     for bucket in index.value.graphs.values() {
         for graph in bucket {
-            if proven(&graph.name, &graph.state, view, preparation)? {
+            if proven(snap, &graph.name, &graph.state, view, preparation)? {
                 output.push(&graph.name)?;
             }
         }
@@ -203,22 +203,22 @@ fn graph<'a>(
     Ok(&mut bucket[at])
 }
 
-fn iri(snap: &Snapshot, id: Id, workspace: &mut Workspace<'_>) -> Result<Option<String>> {
+fn iri(snap: &GuardSnapshot<'_>, id: Id, workspace: &mut Workspace<'_>) -> Result<Option<String>> {
     let preparation = workspace.preparation;
-    preparation.with_term(snap, id, |term| match term {
+    snap.with_term(preparation, id, |term| match term {
         Some(oxrdf::Term::NamedNode(node)) => workspace.copy(node.as_str()).map(Some),
         _ => Ok(None),
     })
 }
 
 fn predicate(
-    snap: &Snapshot,
+    snap: &GuardSnapshot<'_>,
     name: &str,
     preparation: &Preparation,
     mut each: impl FnMut([Id; 4]) -> Result<()>,
 ) -> Result<()> {
-    if let Some(id) = preparation.lookup_iri(snap, name)? {
-        preparation.scan(snap, Perm::Pso, &[id.0], |quad| {
+    if let Some(id) = snap.lookup_iri(preparation, name)? {
+        snap.scan(preparation, Perm::Pso, &[id.0], |quad| {
             each(quad)?;
             Ok(true)
         })?;
@@ -226,13 +226,13 @@ fn predicate(
     preparation.check()
 }
 
-fn read_index(snap: &Snapshot, preparation: &Preparation) -> Result<OwnedIndex> {
+fn read_index(snap: &GuardSnapshot<'_>, preparation: &Preparation) -> Result<OwnedIndex> {
     let mut workspace = Workspace::new(preparation)?;
     let mut inputs = Workspace::new(preparation)?;
     let mut covers: HashMap<Id, Vec<String>> = HashMap::new();
     let mut json: HashMap<Id, Vec<String>> = HashMap::new();
     let mut index = LocalIndex::default();
-    let dg = preparation.lookup_iri(snap, DISCLOSURE_GRAPH)?;
+    let dg = snap.lookup_iri(preparation, DISCLOSURE_GRAPH)?;
     if let Some(dg) = dg {
         predicate(
             snap,
@@ -266,7 +266,7 @@ fn read_index(snap: &Snapshot, preparation: &Preparation) -> Result<OwnedIndex> 
                 if graph != dg {
                     return Ok(());
                 }
-                let text = preparation.with_term(snap, object, |term| match term {
+                let text = snap.with_term(preparation, object, |term| match term {
                     Some(oxrdf::Term::Literal(literal)) => inputs.copy(literal.value()),
                     _ => inputs.copy(""),
                 })?;
@@ -411,7 +411,10 @@ fn parse(name: &str, text: &str, workspace: &mut Workspace<'_>) -> Result<Option
         return Err(error);
     }
     workspace.preparation.check()?;
-    let Some(fp) = parsed.ok().filter(|fp| fp.version == FOOTPRINT_VERSION) else {
+    let Some(fp) = parsed
+        .ok()
+        .filter(|fp| (1..=FOOTPRINT_VERSION).contains(&fp.version))
+    else {
         return Ok(None);
     };
     // The parsing workspace ends here. Only the actual retained model remains
@@ -584,7 +587,12 @@ fn normalized(a: &[String], b: &[String], preparation: &Preparation) -> Result<b
     Ok(true)
 }
 
-fn coverage(view: &GraphAccess, fp: &Footprint, preparation: &Preparation) -> Result<Decision> {
+fn coverage(
+    snap: &GuardSnapshot<'_>,
+    view: &GraphAccess,
+    fp: &Footprint,
+    preparation: &Preparation,
+) -> Result<Decision> {
     preparation.check()?;
     if view.read.is_all() {
         let mut hides = false;
@@ -601,12 +609,19 @@ fn coverage(view: &GraphAccess, fp: &Footprint, preparation: &Preparation) -> Re
             return Ok(Decision::Proven);
         }
     }
-    if fp.version != FOOTPRINT_VERSION {
+    if fp.version != FOOTPRINT_VERSION || fp.evidence_gated {
         return Ok(Decision::Unproven);
     }
     for graph in &fp.graphs {
         if !preparation.allows_iri(&view.read, &graph.graph)? {
             return Ok(Decision::Denied);
+        }
+        // Footprints do not prove support-aware projection visibility dependencies;
+        // fail closed for restricted readers whenever an input graph was support-gated
+        // at capture time, is currently a review-policy output graph, or evidence
+        // configuration is unavailable.
+        if graph.support_gated || snap.is_evidence_output_or_unavailable(&graph.graph) {
+            return Ok(Decision::Unproven);
         }
         if let Some(rules) = &view.triples {
             for rule in &rules.rules {
@@ -657,6 +672,7 @@ fn coverage(view: &GraphAccess, fp: &Footprint, preparation: &Preparation) -> Re
 }
 
 fn proven(
+    snap: &GuardSnapshot<'_>,
     name: &str,
     state: &GraphFootprints,
     view: &GraphAccess,
@@ -670,7 +686,7 @@ fn proven(
         let Some(fp) = fp else {
             return Ok(false);
         };
-        if coverage(view, fp, preparation)? != Decision::Proven {
+        if coverage(snap, view, fp, preparation)? != Decision::Proven {
             return Ok(false);
         }
     }
@@ -788,6 +804,7 @@ mod tests {
             endpoint: "query".into(),
             graphs: Vec::new(),
             reports: (0..1000).map(|i| format!("urn:report:{i}")).collect(),
+            evidence_gated: false,
         };
         let text = fp.to_json();
         let name = fp.iri();

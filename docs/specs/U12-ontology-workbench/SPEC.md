@@ -1,6 +1,6 @@
 # U12: Ontology workbench
 
-> **Status:** partially complete. The ontology editor, DL Query, thesaurus editor and visual SHACL editor
+> **Status:** implemented in part. The ontology editor, DL Query, thesaurus editor and visual SHACL editor
 > phases are built, and the editable schema diagram is planned.
 >
 > **Roadmap:** [item 457](../../ROADMAP.md) holds this work. Each candidate phase below gets
@@ -422,6 +422,16 @@ passed, a dataset that drains after a rename, a graph and a first hierarchy edge
 appear after the follower bound a generation, the follower's names of hierarchy nodes
 that came and went, and the mail cases that C21's Outcome lists. `ui/src/lib/watches.test.ts`,
 `ui/tests/mock/watches.spec.ts` and `ui/tests/e2e/watches.spec.ts` cover the UI.
+
+### Pattern-based axiom generation
+
+Item 623 adds a **Patterns** tab to the ontology editor and a spreadsheet-to-axiom engine in `sparkles_owl::patterns` for the pattern-generation part of the "Patterns, imports, rendering and bulk edits" phase. The engine reads RFC 4180 CSV or TSV inputs with automatic or explicit delimiter detection and evaluates two declarative specification modes against the open ontology's vocabulary and prefixes.
+
+In `robot` mode, column directives follow ROBOT template conventions (`ID`, `LABEL` and `LABEL@lang`, `TYPE`, `SC`, `EC`, `DC`, `SP`, `C`, `I`, `TI`, `A`, `AL`, `AT`, `AI`, `SPLIT=<sep>`, and axiom annotations `>A`, `>AL`, `>AT`, `>AI`), read from row 2 of the table, from explicit column directive mappings, or merged with explicit overrides on top of row 2. Multiple `EC` expressions on a row combine into one `EquivalentClasses` intersection axiom, and `TI` emits class assertions for the row's named individual. In `pattern` mode, DOSDP- and Cellfie-style parameterized rules expand `${col}` and typed or escaped placeholder filters (`iri`, `slug`, `str`, `lang(...)`, `type(...)`) into OWL 2 Manchester syntax or functional-style syntax axioms, with optional entity declarations, per-column cell splitting, and axiom annotations. Evaluation runs in two passes so entities and labels declared on earlier or later rows of the same table resolve inside Manchester expressions across the batch. Each row is staged and validated through `sparkles_owl::validate::axiom` before merging into deduplicated results with 1-based source line provenance, so any error on a row discards all axioms and declarations from that row. Inputs and work are bounded to 2 MiB, 5,000 data rows, 128 columns, 50,000 unique generated axioms, 100,000 evaluation attempts, 250,000 projected triples, 1,000 recorded diagnostics, and 256 split values or rule combinations per row.
+
+Two server routes expose preview and atomic commit over HTTP. `POST /$/ontology/{ds}/patterns/preview` requires dataset read access and returns deduplicated generated axioms (capped at 2,000 per response, 200 by default) with Manchester and functional-style renderings, new versus existing status matching both terminology and stored assertions, auto-declarations matching `POST /$/ontology/{ds}/axioms`, estimated RDF triple count, per-row diagnostics, and the pattern preview entity tag encoding the head commit, import-target digest, and dataset prefix binding digest. `POST /$/ontology/{ds}/patterns/apply` requires dataset write access on the `update` endpoint, evaluates against the head snapshot under the writer lock after checking read-only mode, protected branches, target graph write grants, and `If-Match` preconditions (including import-target and dataset prefix binding digest parity), supports `receipt=true` and `dryRun=true` preview parity, and commits all generated axioms as one atomic ontology edit. By default (`onError: "abort"`), any diagnostic error refuses the commit with `422` (`pattern-errors`) without writing; `onError: "skip"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either error policy.
+
+The workbench **Patterns** tab offers CSV/TSV file upload or paste, starter presets for ROBOT hierarchies, existential restrictions with `SPLIT`, DOSDP/Cellfie Manchester rules, and TSV individuals, column placeholder chips, live preview with status and text filtering, diagnostics display, dry-run triple diff inspection, and single-commit apply. Readers and protected branches can preview tables and templates without committing.
 
 ### Bulk edits
 
@@ -1110,6 +1120,59 @@ with classification in item 588, search at a past state in item 658 and other se
 term pages in item 461. The kept named-class and strict materialization-backed slices
 do not complete these parent items, compute on a read miss or use RL witnesses as
 classification explanations.
+
+### Ontology summary head
+
+Item 735 adds `view=head` to `GET /$/ontology/{ds}`, with the same `view` on the Rust JSON
+`summary` operation and the Python `summary()`. The head answers the dataset, commit, mode,
+graphs, imports, warnings, inferences, header, entity counts and closure of the summary, and
+leaves out the axioms, the triple counts, the unmapped triples and the diagnostics, which need
+the mapping of the whole ontology. The ontology editor reads the head when it opens. Its
+Header tab reads the full summary, and the header panel beside the tree reads it when
+**Count the axioms** is pressed.
+
+**Reads.** The header comes from the quads of the ontology nodes and of the `owl:Axiom` and
+`owl:Annotation` nodes that annotate their triples, and the counts from the `rdf:type`
+triples of each declaring type, with the OWL 1 property rules of the full read. A counted
+subject with a reified type triple is mapped from its own type triples and reifiers. The
+head reads through the caller's masked view, at the requested branch or past state, and has
+its own entity tag, which an edit's `If-Match` can name.
+
+**Closure.** The head answers from these reads only when an allow-list shows that no other
+triple can change the answer, and otherwise opens the ontology and answers every member
+from its mapping. An ontology node may hold its type, `owl:imports`, `owl:versionIRI` and
+annotation triples. A reifier is a blank node with exactly one type, `owl:Annotation`, or
+`owl:Axiom` when it annotates a root triple, with its source, property, target and
+annotations, and only the reifiers of its own annotations may name it. A reified property is
+an annotation property, `owl:imports` or `owl:versionIRI` on an ontology node, or
+`rdf:type` with a structural OWL, RDF Schema or RDF type on a root triple. The ontology also opens when a graph types
+`rdf:type` or another structural predicate as an OWL property, when an IRI the header uses
+has an annotated declaration, and past the head's bounds of 1,000 ontology nodes, 100,000
+fragment quads and 10,000 reified type triples. The argument walks each step of the full
+read that can use a triple of the fragment, which are the choice of header candidates, the
+order of first triples, the annotation nodes keyed by source, property and target, the
+blank axiom types and the expression parses that consume blank nodes.
+
+**Tests.** `head_tests.rs` checks the head against the full summary on 41 fixtures pinned in
+`head_fixtures.json`, most of them in both modes, among them header candidates, punning, OWL 1 properties,
+reified declarations and annotation properties and blank axiom types on header nodes, and
+covers grants, masked views, past states, cancellation and the bounds.
+`head_gen_tests.rs` builds 6,000 seeded random ontologies by default, with ontology nodes,
+both reifier types, nested reifiers, blank axiom types on those nodes, declared and custom
+annotation properties, terminology elsewhere, several graphs and both modes. It checks that
+the head equals the full summary on each and that at least a fifth of them answer without
+opening the ontology. `SPARKLES_HEAD_GEN_CASES` and `SPARKLES_HEAD_GEN_SEED` set the number
+of cases and the first seed.
+
+**Measurements.** On `wally` the head's first call takes 9.6 ms on ChEBI lite, 8.7 ms on a
+taxonomy of 300,000 classes and 25.1 ms on one of 1 million, against 2.77, 1.35 and 5.63 s
+for the full summary, and the server holds 175 to 203 MB after it instead of 1.36 to
+4.21 GB. The [web UI at scale results](../../benchmarks/web-ui-scale/RESULTS.md#the-head-of-the-summary)
+give the table.
+
+**Remaining work.** Item 1297 narrows the fallbacks, such as nested `owl:Axiom` nodes, IRI
+reifiers, reifiers of custom predicates and the bound on reified type triples, which counts
+class assertions. Item 736 speeds up the mapping that the full summary and a fallback pay.
 
 ### Rendering preferences
 

@@ -244,6 +244,10 @@ fn run_update(
     let mut wopts = opts.write.clone();
     if wopts.graphs.is_none() {
         wopts.graphs = opts.graphs.clone();
+    } else if let Some(access) = wopts.graphs.as_ref() {
+        for op in &parsed.operations {
+            check_constant_graphs(access, op)?;
+        }
     }
     if wopts.cancel.is_none() {
         wopts.cancel = opts.cancel.clone();
@@ -260,6 +264,30 @@ fn run_update(
                 .cancellation
                 .as_ref()
                 .map_or_else(|| query_flags.clone(), |c| c.combine(&query_flags)),
+        );
+    }
+    // A LOAD that is the only operation of its request uses the unified load plan
+    // (spec X16, item 846): large unrestricted loads take the bulk rebuild path and
+    // smaller or graph-restricted loads stay transactional. Multi-operation requests
+    // stay in one write transaction below so all operations remain atomic together.
+    if let [
+        GraphUpdateOperation::Load {
+            silent,
+            source,
+            destination,
+        },
+    ] = parsed.operations.as_slice()
+    {
+        return run_single_load(
+            store,
+            *silent,
+            source,
+            destination,
+            &req,
+            wopts,
+            kind,
+            parse_ms,
+            t1,
         );
     }
     // only a store that groups commits drains on a refusal, so only it needs a copy
@@ -459,7 +487,7 @@ fn run_op(
             // the WHERE clause reads the request's graph view only
             super::restrict_ctx(&mut ctx, req.opts.graphs.as_ref())?;
             if let Some(r) = &req.opts.rdfs {
-                ctx.rdfs = Some(r.schema_controlled(&ctx.snap, &mut || ctx.check())?);
+                ctx.rdfs = Some(r.schema_in_ctx(&ctx)?);
             }
             let pattern = super::rdfs::apply(&ctx, pattern);
             let node = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new())?;
@@ -505,13 +533,16 @@ fn run_op(
                             id: Id|
              -> Result<Option<Id>> {
                 Ok(match id.tag() {
-                    Tag::Local => match ctx.term(id) {
-                        Some(t) => {
-                            let t = minted.stored(txn, &t);
-                            Some(txn.intern(&t)?)
+                    Tag::Local => {
+                        let decode = ctx.charge(0)?;
+                        match ctx.term_checked_into(id, &decode)? {
+                            Some(t) => {
+                                let t = minted.stored(txn, &t);
+                                Some(txn.intern(&t)?)
+                            }
+                            None => None,
                         }
-                        None => None,
-                    },
+                    }
                     Tag::BNode => Some(minted.id(txn, id)),
                     _ => Some(id),
                 })
@@ -520,8 +551,8 @@ fn run_op(
             let mut ins = Vec::new();
             for i in 0..table.len() {
                 for q in delete {
-                    let gt = |t: &GroundTermPattern| -> Option<Id> {
-                        match t {
+                    let gt = |t: &GroundTermPattern| -> Result<Option<Id>> {
+                        Ok(match t {
                             GroundTermPattern::Variable(v) => get(&ctx, v.as_str(), i),
                             GroundTermPattern::NamedNode(n) => {
                                 ctx.snap.lookup_term(&Term::NamedNode(n.clone()))
@@ -532,21 +563,35 @@ fn run_op(
                             GroundTermPattern::Triple(tp) => {
                                 // a ground triple pattern is a template without blank nodes
                                 let pat = ground_pattern_to_term_pattern(tp);
+                                let decode = ctx.charge(0)?;
+                                let mut decode_err = None;
                                 let term = super::instantiate(
                                     &pat,
-                                    &mut |v| get(&ctx, v, i).and_then(|id| ctx.term(id)),
+                                    &mut |v| {
+                                        let id = get(&ctx, v, i)?;
+                                        match ctx.term_checked_into(id, &decode) {
+                                            Ok(t) => t,
+                                            Err(err) => {
+                                                decode_err.get_or_insert(err);
+                                                None
+                                            }
+                                        }
+                                    },
                                     &mut |_| Term::BlankNode(oxrdf::BlankNode::default()),
-                                )?;
-                                ctx.snap.lookup_term(&term)
+                                );
+                                if let Some(err) = decode_err {
+                                    return Err(err);
+                                }
+                                term.and_then(|t| ctx.snap.lookup_term(&t))
                             }
-                        }
+                        })
                     };
                     if let GraphNamePattern::Variable(v) = &q.graph_name {
                         check(get(&ctx, v.as_str(), i))?;
                     }
-                    let s = gt(&q.subject);
+                    let s = gt(&q.subject)?;
                     let p = named_pat(&ctx, &q.predicate, |n| get(&ctx, n, i), true);
-                    let o = gt(&q.object);
+                    let o = gt(&q.object)?;
                     let g = graph_pat(&ctx, &q.graph_name, |n| get(&ctx, n, i), true);
                     if let (Some(s), Some(p), Some(o), Some(g)) = (s, p, o, g) {
                         dels.push([s, p, o, g]);
@@ -589,11 +634,26 @@ fn run_op(
                                     };
                                     Term::BlankNode(crate::store::bnode_for(id))
                                 };
-                                match super::instantiate(
+                                let decode = ctx.charge(0)?;
+                                let mut decode_err = None;
+                                let term = super::instantiate(
                                     t,
-                                    &mut |v| get(&ctx, v, i).and_then(|id| ctx.term(id)),
+                                    &mut |v| {
+                                        let id = get(&ctx, v, i)?;
+                                        match ctx.term_checked_into(id, &decode) {
+                                            Ok(t) => t,
+                                            Err(err) => {
+                                                decode_err.get_or_insert(err);
+                                                None
+                                            }
+                                        }
+                                    },
                                     &mut bn,
-                                ) {
+                                );
+                                if let Some(err) = decode_err {
+                                    return Err(err);
+                                }
+                                match term {
                                     Some(term) => {
                                         let term = minted.stored(txn, &term);
                                         Some(txn.intern(&term)?)
@@ -641,9 +701,9 @@ fn run_op(
                     ins.push([s, p, o, g]);
                 }
             }
-            // Decoding a template term records a refused memory budget on the context
-            // instead of returning it, so the context is checked before anything of the
-            // update is applied: a refused term must fail the update, not skip its quad.
+            // Template decoders propagate decode refusals directly; re-check the
+            // context before applying mutations in case another path latched a refusal
+            // or the request was cancelled or timed out.
             ctx.check()?;
             req.check()?;
             for (i, q) in dels.into_iter().enumerate() {
@@ -728,7 +788,8 @@ fn run_op(
 
 /// [`Error::NotPermitted`] unless graph `g` (an id of the WHERE clause's context) may
 /// be written.
-fn check_graph_id(access: &crate::access::GraphAccess, ctx: &Ctx, g: Id) -> Result<()> {
+pub(super) fn check_graph_id(access: &crate::access::GraphAccess, ctx: &Ctx, g: Id) -> Result<()> {
+    ctx.check()?;
     if g == Id::DEFAULT_GRAPH {
         return if access.writable(None) {
             Ok(())
@@ -736,14 +797,14 @@ fn check_graph_id(access: &crate::access::GraphAccess, ctx: &Ctx, g: Id) -> Resu
             Err(crate::access::GraphAccess::refused(None))
         };
     }
-    let t = match g.tag() {
-        Tag::BNode => Some(Term::BlankNode(crate::store::bnode_for(g))),
-        _ => ctx.term(g),
+    let decode = ctx.charge(0)?;
+    let Some(t) = ctx.term_checked_into(g, &decode)? else {
+        return Err(Error::invalid("graph variable holds no RDF term"));
     };
-    if access.writable(t.as_ref()) {
+    if access.writable(Some(&t)) {
         Ok(())
     } else {
-        Err(crate::access::GraphAccess::refused(t.as_ref()))
+        Err(crate::access::GraphAccess::refused(Some(&t)))
     }
 }
 
@@ -914,6 +975,321 @@ fn bnode(txn: &mut WriteTxn<'_>, map: &mut FxHashMap<String, Id>, b: &BlankNode)
     id
 }
 
+const LOAD_ACCEPT: &str = "text/turtle, application/n-triples, application/n-quads, \
+    application/trig, application/rdf+xml, application/ld+json;q=0.9, \
+    application/trix+xml;q=0.8, application/rdf+thrift;q=0.8, \
+    application/rdf+protobuf;q=0.8, application/rdf+json;q=0.8, text/owl-functional;q=0.7";
+
+fn resolve_http_format(url: &str, ct: &str) -> Result<RdfSyntax> {
+    let url_path = std::path::Path::new(url);
+    JenaFormat::from_media_type(ct)
+        .map(RdfSyntax::Jena)
+        .or_else(|| crate::io::format_for_media_type(ct).map(RdfSyntax::Rdf))
+        .or_else(|| RdfSyntax::from_name(ct).filter(|s| *s == RdfSyntax::OwlFunctional))
+        .or_else(|| RdfSyntax::from_path(url_path))
+        .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))
+}
+
+/// Wraps an HTTP `LOAD` [`outbound::Body`](crate::outbound::Body) beneath codec sniffing
+/// and decompression so write cancellation and deadlines stop raw socket reads inside
+/// decoders, and outbound timeouts, raw response-size ceilings and budgets are recorded
+/// directly even if a decompressor wraps or replaces the underlying `io::Error`.
+struct LoadHttpBody {
+    inner: crate::outbound::Body,
+    url: String,
+    opts: crate::guard::WriteOptions,
+    fatal: Arc<parking_lot::Mutex<Option<Error>>>,
+}
+
+impl LoadHttpBody {
+    fn uncounted(self) -> (Self, Arc<RequestBudget>) {
+        let (inner, budget) = self.inner.uncounted();
+        (
+            Self {
+                inner,
+                url: self.url,
+                opts: self.opts,
+                fatal: self.fatal,
+            },
+            budget,
+        )
+    }
+}
+
+impl Read for LoadHttpBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Err(e) = self.opts.check() {
+            let saved = match &e {
+                Error::Cancelled => Error::Cancelled,
+                Error::Timeout => Error::Timeout,
+                other => Error::invalid(other.to_string()),
+            };
+            self.fatal.lock().get_or_insert(saved);
+            return Err(std::io::Error::other(e));
+        }
+        self.inner.read(buf).inspect_err(|e| {
+            if let Some(limit) = e
+                .get_ref()
+                .and_then(|i| i.downcast_ref::<crate::outbound::LimitError>())
+            {
+                let saved = if matches!(limit, crate::outbound::LimitError::Timeout(_)) {
+                    match self.opts.check() {
+                        Err(control) => control,
+                        Ok(()) => Error::invalid(format!("LOAD {}: {limit}", self.url)),
+                    }
+                } else {
+                    Error::invalid(format!("LOAD {}: {limit}", self.url))
+                };
+                self.fatal.lock().get_or_insert(saved);
+                return;
+            }
+            if let Some(Error::BudgetExceeded(b)) =
+                e.get_ref().and_then(|i| i.downcast_ref::<Error>())
+            {
+                self.fatal.lock().get_or_insert(Error::BudgetExceeded(*b));
+            }
+        })
+    }
+}
+
+/// Wraps an HTTP `LOAD` body reader so plain I/O failures (connection drops, corrupt
+/// compressed payloads) become `Error::Invalid("LOAD <url>: …")` while typed engine
+/// errors (budgets, cancellation, timeout) keep their own variants, including when a
+/// decompressor masked a control or budget error recorded by [`LoadHttpBody`].
+struct LoadHttpReader<R> {
+    inner: R,
+    url: String,
+    fatal: Arc<parking_lot::Mutex<Option<Error>>>,
+}
+
+impl<R: Read> Read for LoadHttpReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).map_err(|e| {
+            let err = match crate::codec::io_error(e) {
+                Error::Io(raw) => {
+                    if let Some(f) = self.fatal.lock().as_ref().and_then(|err| match err {
+                        Error::Cancelled => Some(Error::Cancelled),
+                        Error::Timeout => Some(Error::Timeout),
+                        Error::BudgetExceeded(b) => Some(Error::BudgetExceeded(*b)),
+                        _ => None,
+                    }) {
+                        f
+                    } else {
+                        Error::invalid(format!("LOAD {}: {raw}", self.url))
+                    }
+                }
+                other => other,
+            };
+            std::io::Error::other(err)
+        })
+    }
+}
+
+type PreparedLoad = (
+    crate::io::Source,
+    Option<Arc<parking_lot::Mutex<Option<Error>>>>,
+);
+
+/// Build a [`crate::io::Source`] for a single-operation SPARQL `LOAD`, checking file or
+/// outbound permissions and write controls before the writer lock is acquired.
+fn prepare_load_source(
+    source: &NamedNode,
+    dest: &GraphName,
+    req: &Request<'_>,
+    wopts: &crate::guard::WriteOptions,
+) -> std::result::Result<PreparedLoad, crate::store::SparqlLoadError> {
+    use crate::outbound::{LimitError, SendFailure};
+    use crate::store::SparqlLoadError;
+
+    wopts.check().map_err(SparqlLoadError::Store)?;
+    let opts = req.opts;
+    let url = source.as_str();
+    let graph = match dest {
+        GraphName::NamedNode(n) => Some(n.clone()),
+        GraphName::DefaultGraph => None,
+    };
+    if url.starts_with("file:") {
+        if opts.forbid_file_load {
+            return Err(SparqlLoadError::Store(Error::NotPermitted(
+                "LOAD <file:…> requires server-admin".into(),
+            )));
+        }
+        let path = opts.file_loads.check(url).map_err(|e| match e {
+            Error::NotPermitted(_) => SparqlLoadError::Store(e),
+            other => SparqlLoadError::Source(other),
+        })?;
+        let mut src =
+            crate::io::Source::from_path(&path, graph).map_err(SparqlLoadError::Source)?;
+        src.base = Some(url.to_string());
+        src.name = path.display().to_string();
+        // Open and inspect the file's magic bytes before taking the writer lock, so a
+        // missing file or unsupported codec fails here as a source error.
+        let _ = src.codec().map_err(SparqlLoadError::Source)?;
+        return Ok((src, None));
+    }
+    if opts.forbid_remote_load {
+        return Err(SparqlLoadError::Store(Error::NotPermitted(
+            "LOAD <http…> requires the federate permission".into(),
+        )));
+    }
+    let policy = &opts.outbound;
+    let timeout = wopts.deadline.map_or(policy.timeout, |d| {
+        d.saturating_duration_since(Instant::now())
+    });
+    let resp = policy
+        .send_classified(&req.budget, url, timeout, |client, u| {
+            client.get(u).header("Accept", LOAD_ACCEPT)
+        })
+        .map_err(|f| match f {
+            SendFailure::Refused(m) => {
+                SparqlLoadError::Store(Error::NotPermitted(format!("LOAD <{url}>: {m}")))
+            }
+            SendFailure::Budget(b) => SparqlLoadError::Store(Error::BudgetExceeded(b)),
+            SendFailure::Limit(LimitError::Timeout(m)) => {
+                if let Err(control) = wopts.check() {
+                    SparqlLoadError::Store(control)
+                } else {
+                    SparqlLoadError::Store(Error::invalid(format!("LOAD {url}: {m}")))
+                }
+            }
+            SendFailure::Limit(LimitError::ResponseTooLarge(m)) => {
+                SparqlLoadError::Store(Error::invalid(format!("LOAD {url}: {m}")))
+            }
+            SendFailure::Failed(m) => {
+                if let Err(control) = wopts.check() {
+                    SparqlLoadError::Store(control)
+                } else {
+                    SparqlLoadError::Source(Error::invalid(format!("LOAD {url}: {m}")))
+                }
+            }
+        })?;
+    if !resp.status.is_success() {
+        return Err(SparqlLoadError::Source(Error::invalid(format!(
+            "LOAD {url}: {}",
+            resp.status
+        ))));
+    }
+    let format = resolve_http_format(url, &resp.content_type).map_err(SparqlLoadError::Source)?;
+    let url_path = std::path::Path::new(url);
+    let fatal = Arc::new(parking_lot::Mutex::new(None));
+    let mut body = LoadHttpBody {
+        inner: resp.body,
+        url: url.to_string(),
+        opts: wopts.clone(),
+        fatal: Arc::clone(&fatal),
+    };
+    let (codec, head) = crate::io::sniff_codec(&mut body, Some(url_path), url).map_err(|e| {
+        if let Some(f) = fatal.lock().take() {
+            return SparqlLoadError::Store(f);
+        }
+        match e {
+            Error::BudgetExceeded(_) | Error::Cancelled | Error::Timeout => {
+                SparqlLoadError::Store(e)
+            }
+            other => SparqlLoadError::Source(read_error(url, other)),
+        }
+    })?;
+    // Compressed data counts in the request's budget once decompressed, and is held to
+    // the response ceiling then too.
+    let (body, count) = if codec == crate::codec::Codec::None {
+        (body, None)
+    } else {
+        let (body, budget) = body.uncounted();
+        (body, Some(budget))
+    };
+    let r = codec
+        .reader_send(
+            std::io::Cursor::new(head).chain(body),
+            Some(policy.max_response_bytes),
+        )
+        .map_err(|e| {
+            if let Some(f) = fatal.lock().take() {
+                return SparqlLoadError::Store(f);
+            }
+            SparqlLoadError::Source(e)
+        })?;
+    let r: Box<dyn Read + Send> = match count {
+        Some(budget) => Box::new(crate::outbound::Counted { inner: r, budget }),
+        None => r,
+    };
+    let mut src = crate::io::Source::from_decoded_reader(
+        LoadHttpReader {
+            inner: r,
+            url: url.to_string(),
+            fatal: Arc::clone(&fatal),
+        },
+        format,
+        graph,
+    );
+    src.base = Some(url.to_string());
+    src.name = url.to_string();
+    src.max_decompressed = Some(policy.max_response_bytes);
+    Ok((src, Some(fatal)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_single_load(
+    store: &Store,
+    silent: bool,
+    source: &NamedNode,
+    destination: &GraphName,
+    req: &Request<'_>,
+    wopts: crate::guard::WriteOptions,
+    kind: crate::commit::CommitKind,
+    parse_ms: f64,
+    t1: Instant,
+) -> Result<UpdateStats> {
+    use crate::store::SparqlLoadError;
+
+    wopts.check()?;
+    if let Some(m) = &wopts.message {
+        crate::annotations::validate_message(m)?;
+    }
+    let noop = |wopts: crate::guard::WriteOptions| -> Result<crate::commit::Receipt> {
+        wopts.check()?;
+        store.try_write_with(kind, wopts)?.commit()
+    };
+    let receipt = match prepare_load_source(source, destination, req, &wopts) {
+        Ok((src, fatal)) => match store.load_sparql(&src, kind, &wopts) {
+            Ok(r) => r,
+            Err(SparqlLoadError::Store(e)) => return Err(e),
+            Err(SparqlLoadError::Source(e)) => {
+                if let Some(f) = fatal.as_ref().and_then(|slot| slot.lock().take()) {
+                    return Err(f);
+                }
+                if silent {
+                    noop(wopts)?
+                } else {
+                    return Err(e);
+                }
+            }
+        },
+        Err(SparqlLoadError::Source(_)) if silent => noop(wopts)?,
+        Err(other) => return Err(other.into_inner()),
+    };
+    let inserted = if receipt.committed {
+        receipt.commit.inserted
+    } else {
+        0
+    };
+    let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    Ok(UpdateStats {
+        inserted,
+        deleted: 0,
+        operations: 1,
+        timing: Timing {
+            parse_ms,
+            plan_ms: 0.0,
+            exec_ms,
+            serialize_ms: 0.0,
+            total_ms: parse_ms + exec_ms,
+        },
+        commit: Some(receipt),
+        mem_peak_bytes: 0,
+        rows_produced: 0,
+    })
+}
+
 fn load(
     txn: &mut WriteTxn<'_>,
     source: &NamedNode,
@@ -960,13 +1336,7 @@ fn load(
     });
     let resp = policy
         .send(&req.budget, url, timeout, |client, u| {
-            client.get(u).header(
-                "Accept",
-                "text/turtle, application/n-triples, application/n-quads, application/trig, \
-                 application/rdf+xml, application/ld+json;q=0.9, application/trix+xml;q=0.8, \
-                 application/rdf+thrift;q=0.8, application/rdf+protobuf;q=0.8, \
-                 application/rdf+json;q=0.8, text/owl-functional;q=0.7",
-            )
+            client.get(u).header("Accept", LOAD_ACCEPT)
         })
         .map_err(|f| {
             f.into_error(&format!("LOAD <{url}>"), |m| {
@@ -976,14 +1346,8 @@ fn load(
     if !resp.status.is_success() {
         return Err(Error::invalid(format!("LOAD {url}: {}", resp.status)));
     }
-    let ct = resp.content_type;
+    let format = resolve_http_format(url, &resp.content_type)?;
     let url_path = std::path::Path::new(url);
-    let format = JenaFormat::from_media_type(&ct)
-        .map(RdfSyntax::Jena)
-        .or_else(|| crate::io::format_for_media_type(&ct).map(RdfSyntax::Rdf))
-        .or_else(|| RdfSyntax::from_name(&ct).filter(|s| *s == RdfSyntax::OwlFunctional))
-        .or_else(|| RdfSyntax::from_path(url_path))
-        .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?;
     let mut body = resp.body;
     let (codec, head) =
         crate::io::sniff_codec(&mut body, Some(url_path), url).map_err(|e| read_error(url, e))?;

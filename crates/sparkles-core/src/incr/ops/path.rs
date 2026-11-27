@@ -20,7 +20,10 @@
 //! exists, which is how the query engine evaluates them. Neither needs state: the nodes
 //! and graphs that the changed quads name are checked at both snapshots.
 
-use super::super::fixpoint::{self, Change, FixedPoint, HashStore, NewStore, Program, Sink};
+use super::super::budget::{BudgetHandle, ScratchLease};
+use super::super::fixpoint::{
+    self, Change, FactStore, FixedPoint, HashStore, NewStore, Program, Sink,
+};
 use super::super::pass::{GraphSel, Pass, Which};
 use super::super::persist::{Reader, Writer};
 use super::super::prov::{AChanges, Ann, Atom, Provenance, Witness};
@@ -88,7 +91,7 @@ struct Cache {
     /// direction (`true`: forward)
     next: FxHashMap<(bool, bool, Id, Id), Arc<[Id]>>,
     /// the changed steps
-    edges: Option<Vec<Edge>>,
+    edges: Option<Arc<[Edge]>>,
     /// the nodes that reach a node at a snapshot, the node itself among them
     reach: FxHashMap<(bool, Id, Id), Arc<[Id]>>,
     /// the approximate memory of the memos above
@@ -160,22 +163,36 @@ impl Closure {
         from: Option<Id>,
         to: Option<Id>,
         g: Id,
-    ) -> Result<Vec<Fact>> {
+    ) -> Result<(Vec<Fact>, ScratchLease)> {
         self.ensure(p);
+        let mut out_lease = p.scratch_lease();
         let mut out = Vec::new();
         for (i, s) in self.steps.iter().enumerate() {
             let seed = self.seed(s, from, to, g);
-            for (r, _) in s.bgp.probe_with(p, &self.cache.rps[i], w, &seed)? {
+            let (probed, probe_lease) =
+                s.bgp.probe_with_charged(p, &self.cache.rps[i], w, &seed)?;
+            for (r, _) in probed {
                 let (a, b) = if self.forward {
                     (r[s.x], r[s.y])
                 } else {
                     (r[s.y], r[s.x])
                 };
                 let gg = s.g.map_or(Id::UNDEF, |gp| r[gp]);
+                let next_cap = sparkles_budget::sizes::vec_grown(
+                    out.capacity(),
+                    out.len(),
+                    1,
+                    std::mem::size_of::<Fact>(),
+                );
+                let need = (next_cap as u64) * std::mem::size_of::<Fact>() as u64;
+                if need > out_lease.bytes() {
+                    out_lease.try_set(need)?;
+                }
                 out.push([gg, a, b]);
             }
+            drop(probe_lease);
         }
-        Ok(out)
+        Ok((out, out_lease))
     }
 
     /// The nodes one step from `z` in graph `g` at `w`, walking forward or backward.
@@ -184,19 +201,25 @@ impl Closure {
         if let Some(v) = self.cache.next.get(&key) {
             return Ok(v.clone());
         }
-        let rows = if fwd {
+        let (rows, rows_lease) = if fwd {
             self.rows(p, w, Some(z), None, g)?
         } else {
             self.rows(p, w, None, Some(z), g)?
         };
+        let mut v_lease = p.scratch_lease();
+        v_lease.try_reserve((rows.len() as u64) * std::mem::size_of::<Id>() as u64)?;
         let mut v: Vec<Id> = rows
             .into_iter()
             .map(|r| if fwd { r[2] } else { r[1] })
             .collect();
+        drop(rows_lease);
         v.sort_unstable();
         v.dedup();
+        let added = memo_bytes(v.len());
+        p.reserve_pass(added)?;
         let v: Arc<[Id]> = v.into();
-        self.cache.bytes += memo_bytes(v.len());
+        drop(v_lease);
+        self.cache.bytes += added;
         self.cache.next.insert(key, v.clone());
         Ok(v)
     }
@@ -215,8 +238,8 @@ impl Closure {
         let mut err = None;
         for s in &self.steps {
             let seed = self.seed(s, Some(a), Some(b), g);
-            match s.bgp.probe_a(p, w, &seed) {
-                Ok(rows) => {
+            match s.bgp.probe_a_charged(p, w, &seed) {
+                Ok((rows, rows_lease)) => {
                     for (_, _, ann) in rows {
                         if let Ann::Why(x) = ann {
                             for (wit, _) in x.supports {
@@ -226,6 +249,7 @@ impl Closure {
                             }
                         }
                     }
+                    drop(rows_lease);
                 }
                 Err(e) => {
                     err = Some(e);
@@ -241,39 +265,84 @@ impl Closure {
     }
 
     /// The steps the pass's changes touch, each with whether it holds before and after.
-    fn edges(&mut self, p: &mut Pass) -> Result<Vec<Edge>> {
+    fn edges(&mut self, p: &mut Pass) -> Result<Arc<[Edge]>> {
         self.ensure(p);
         if let Some(e) = &self.cache.edges {
             return Ok(e.clone());
         }
+        let mut seen_lease = p.scratch_lease();
         let mut seen: FxHashSet<Fact> = FxHashSet::default();
+        let fact_sz = std::mem::size_of::<Fact>();
         if !(p.added.is_empty() && p.removed.is_empty()) {
             for s in &mut self.steps {
-                let rows: Vec<Row> = if p.prov.is_none() {
-                    s.bgp.delta(p)?.into_iter().map(|(r, _)| r).collect()
+                let mark = p.output_lease_mark();
+                if p.prov.is_none() {
+                    let delta = s.bgp.delta(p)?;
+                    let leases = p.take_output_leases_since(mark);
+                    for (r, _) in delta {
+                        let (a, b) = if self.forward {
+                            (r[s.x], r[s.y])
+                        } else {
+                            (r[s.y], r[s.x])
+                        };
+                        let g = s.g.map_or(Id::UNDEF, |gp| r[gp]);
+                        let f = [g, a, b];
+                        if !seen.contains(&f) {
+                            let next_cap =
+                                sparkles_budget::sizes::table_grown(seen.capacity(), seen.len(), 1);
+                            let need =
+                                sparkles_budget::sizes::table_bytes(next_cap, fact_sz) as u64;
+                            if need > seen_lease.bytes() {
+                                seen_lease.try_set(need)?;
+                            }
+                            seen.insert(f);
+                        }
+                    }
+                    drop(leases);
                 } else {
-                    s.bgp.delta_a(p)?.into_iter().map(|(r, _, _)| r).collect()
-                };
-                for r in rows {
-                    let (a, b) = if self.forward {
-                        (r[s.x], r[s.y])
-                    } else {
-                        (r[s.y], r[s.x])
-                    };
-                    let g = s.g.map_or(Id::UNDEF, |gp| r[gp]);
-                    seen.insert([g, a, b]);
+                    let delta = s.bgp.delta_a(p)?;
+                    let leases = p.take_output_leases_since(mark);
+                    for (r, _, _) in delta {
+                        let (a, b) = if self.forward {
+                            (r[s.x], r[s.y])
+                        } else {
+                            (r[s.y], r[s.x])
+                        };
+                        let g = s.g.map_or(Id::UNDEF, |gp| r[gp]);
+                        let f = [g, a, b];
+                        if !seen.contains(&f) {
+                            let next_cap =
+                                sparkles_budget::sizes::table_grown(seen.capacity(), seen.len(), 1);
+                            let need =
+                                sparkles_budget::sizes::table_bytes(next_cap, fact_sz) as u64;
+                            if need > seen_lease.bytes() {
+                                seen_lease.try_set(need)?;
+                            }
+                            seen.insert(f);
+                        }
+                    }
+                    drop(leases);
                 }
             }
         }
-        let mut out = Vec::with_capacity(seen.len());
-        let mut seen: Vec<Fact> = seen.into_iter().collect();
-        seen.sort_unstable();
-        for [g, a, b] in seen {
+        let mut vec_lease = p.scratch_lease();
+        let seen_vec_bytes = (seen.len() as u64).saturating_mul(fact_sz as u64);
+        let out_vec_bytes = (seen.len() as u64).saturating_mul(std::mem::size_of::<Edge>() as u64);
+        vec_lease.try_reserve(seen_vec_bytes.saturating_add(out_vec_bytes))?;
+        let mut seen_vec: Vec<Fact> = seen.into_iter().collect();
+        drop(seen_lease);
+        seen_vec.sort_unstable();
+        let mut out = Vec::with_capacity(seen_vec.len());
+        for [g, a, b] in seen_vec {
             let old = self.edge(p, Which::Old, g, a, b)?;
             let new = self.edge(p, Which::New, g, a, b)?;
             out.push((g, a, b, old, new));
         }
-        self.cache.bytes += 32 * out.len() as u64;
+        let added = 32 * out.len() as u64;
+        p.reserve_pass(added)?;
+        let out: Arc<[Edge]> = out.into();
+        drop(vec_lease);
+        self.cache.bytes += added;
         self.cache.edges = Some(out.clone());
         Ok(out)
     }
@@ -284,19 +353,42 @@ impl Closure {
         if let Some(v) = self.cache.reach.get(&key) {
             return Ok(v.clone());
         }
+        let mut walk_lease = p.scratch_lease();
         let mut seen: FxHashSet<Id> = FxHashSet::default();
+        let mut stack: Vec<Id> = Vec::new();
+        let id_sz = std::mem::size_of::<Id>();
+        let preadmit_walk =
+            |seen: &FxHashSet<Id>, stack: &Vec<Id>, lease: &mut ScratchLease| -> Result<()> {
+                let next_seen_cap =
+                    sparkles_budget::sizes::table_grown(seen.capacity(), seen.len(), 1);
+                let next_stack_cap =
+                    sparkles_budget::sizes::vec_grown(stack.capacity(), stack.len(), 1, id_sz);
+                let need = (sparkles_budget::sizes::table_bytes(next_seen_cap, id_sz) as u64)
+                    .saturating_add((next_stack_cap as u64) * id_sz as u64);
+                if need > lease.bytes() {
+                    lease.try_set(need)?;
+                }
+                Ok(())
+            };
+        preadmit_walk(&seen, &stack, &mut walk_lease)?;
         seen.insert(z);
-        let mut stack = vec![z];
+        stack.push(z);
         while let Some(x) = stack.pop() {
             p.tick()?;
             for &y in self.next(p, w, false, g, x)?.iter() {
-                if seen.insert(y) {
+                if !seen.contains(&y) {
+                    preadmit_walk(&seen, &stack, &mut walk_lease)?;
+                    seen.insert(y);
                     stack.push(y);
                 }
             }
         }
+        let added = memo_bytes(seen.len());
+        p.reserve_pass(added)?;
         let v: Arc<[Id]> = seen.into_iter().collect::<Vec<_>>().into();
-        self.cache.bytes += memo_bytes(v.len());
+        drop(stack);
+        drop(walk_lease);
+        self.cache.bytes += added;
         self.cache.reach.insert(key, v.clone());
         Ok(v)
     }
@@ -311,10 +403,164 @@ impl Closure {
     }
 }
 
+/// A [`HashStore`] for path closures that routes fixed-point buffer reservations and
+/// map capacity growth through the owning circuit's [`BudgetHandle`] during a pass.
+#[derive(Debug)]
+pub struct PathStore {
+    inner: HashStore<Fact, Id>,
+    budget: Option<BudgetHandle>,
+    base: u64,
+    pass_reserved: u64,
+}
+
+impl Clone for PathStore {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            budget: None,
+            base: 0,
+            pass_reserved: 0,
+        }
+    }
+}
+
+impl PathStore {
+    fn new() -> Self {
+        Self {
+            // the key, the record and the map's slot overhead
+            inner: HashStore::new(24 + 8 + 8),
+            budget: None,
+            base: 0,
+            pass_reserved: 0,
+        }
+    }
+
+    fn attach_budget(&mut self, budget: Option<BudgetHandle>) {
+        self.budget = budget;
+        self.base = self.inner.bytes();
+        self.pass_reserved = 0;
+    }
+
+    fn detach_budget(&mut self) {
+        self.budget = None;
+        self.base = 0;
+        self.pass_reserved = 0;
+    }
+
+    fn sync_store_pass(&mut self, target_bytes: u64) -> Result<()> {
+        let needed = target_bytes.saturating_sub(self.base);
+        if needed > self.pass_reserved {
+            let delta = needed - self.pass_reserved;
+            if let Some(budget) = &self.budget {
+                budget.try_reserve_pass(delta)?;
+            }
+            self.pass_reserved = needed;
+        } else if needed < self.pass_reserved {
+            let excess = self.pass_reserved - needed;
+            if let Some(budget) = &self.budget {
+                budget.release_pass(excess);
+            }
+            self.pass_reserved = needed;
+        }
+        Ok(())
+    }
+}
+
+impl FactStore<Fact, Id> for PathStore {
+    type Error = Error;
+
+    #[inline]
+    fn contains(&self, f: &Fact) -> bool {
+        self.inner.contains(f)
+    }
+
+    #[inline]
+    fn record(&self, f: &Fact) -> Option<Id> {
+        self.inner.record(f)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn for_each(&self, visit: &mut dyn FnMut(&Fact, &Id)) {
+        self.inner.for_each(visit);
+    }
+
+    fn bytes(&self) -> u64 {
+        self.inner.bytes()
+    }
+
+    #[inline]
+    fn insert(&mut self, f: Fact, r: Id) -> Result<bool> {
+        if self.inner.contains(&f) {
+            return Ok(false);
+        }
+        let cap = self.inner.capacity();
+        let len = self.inner.len();
+        if len >= cap {
+            let next_cap = sparkles_budget::sizes::table_grown(cap, len, 1);
+            let predicted = (next_cap as u64).saturating_mul(self.inner.fact_bytes());
+            if predicted > self.base.saturating_add(self.pass_reserved) {
+                self.sync_store_pass(predicted)?;
+            }
+        }
+        let inserted = self.inner.insert(f, r)?;
+        if inserted {
+            let actual = self.inner.bytes();
+            if let Err(e) = self.sync_store_pass(actual) {
+                let _ = self.inner.remove(&f);
+                return Err(e);
+            }
+        }
+        Ok(inserted)
+    }
+
+    #[inline]
+    fn set_record(&mut self, f: Fact, r: Id) -> Result<()> {
+        self.inner.set_record(f, r)
+    }
+
+    #[inline]
+    fn remove(&mut self, f: &Fact) -> Result<bool> {
+        self.inner.remove(f)
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        self.inner.clear()
+    }
+
+    fn reserve(&self, bytes: u64) -> Result<()> {
+        if let Some(budget) = &self.budget {
+            budget.try_reserve_scratch(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn release(&self, bytes: u64) {
+        if let Some(budget) = &self.budget {
+            budget.release_scratch(bytes);
+        }
+    }
+
+    fn reserve_pass(&self, bytes: u64) -> Result<()> {
+        if let Some(budget) = &self.budget {
+            budget.try_reserve_pass(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn release_pass(&self, bytes: u64) {
+        if let Some(budget) = &self.budget {
+            budget.release_pass(bytes);
+        }
+    }
+}
+
 impl NewStore for Closure {
-    fn new_store(&self) -> HashStore<Fact, Id> {
-        // the key, the record and the map's slot overhead
-        HashStore::new(24 + 8 + 8)
+    fn new_store(&self) -> PathStore {
+        PathStore::new()
     }
 }
 
@@ -323,7 +569,7 @@ impl Program for Closure {
     type Record = Id;
     type Cx<'c> = Pass<'c>;
     type Error = Error;
-    type Store = HashStore<Fact, Id>;
+    type Store = PathStore;
 
     fn premises(&self, f: &Fact, r: &Id, out: &mut Sink<'_, Fact, Error>) -> Result<()> {
         if !r.is_undef() {
@@ -335,22 +581,26 @@ impl Program for Closure {
     fn axioms(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         out: &mut Sink<'_, (Fact, Id), Error>,
     ) -> Result<()> {
         self.ensure(p);
         match self.start {
             Some(_) => {
                 if let Some(s) = self.cache.start {
-                    for f in self.rows(p, Which::New, Some(s), None, Id::UNDEF)? {
+                    let (rows, rows_lease) = self.rows(p, Which::New, Some(s), None, Id::UNDEF)?;
+                    for f in rows {
                         out.push((f, Id::UNDEF))?;
                     }
+                    drop(rows_lease);
                 }
             }
             None => {
                 for i in 0..self.steps.len() {
                     let s = &self.steps[i];
+                    let mark = p.output_lease_mark();
                     let rows = p.evaluate(&s.bgp.source, &s.schema, None)?;
+                    let rows_leases = p.take_output_leases_since(mark);
                     for (r, _) in rows {
                         let (a, b) = if self.forward {
                             (r[s.x], r[s.y])
@@ -363,6 +613,7 @@ impl Program for Closure {
                         let g = s.g.map_or(Id::UNDEF, |gp| r[gp]);
                         out.push(([g, a, b], Id::UNDEF))?;
                     }
+                    drop(rows_leases);
                 }
             }
         }
@@ -372,7 +623,7 @@ impl Program for Closure {
     fn consequences(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         w: Which,
         f: &Fact,
         _held: &dyn Fn(&Fact) -> bool,
@@ -388,7 +639,7 @@ impl Program for Closure {
     fn prove(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         f: &Fact,
         held: &dyn Fn(&Fact) -> bool,
     ) -> Result<Option<Id>> {
@@ -407,11 +658,11 @@ impl Program for Closure {
     fn broken(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         recorded: &dyn Fn(&Fact) -> Option<Id>,
         out: &mut Sink<'_, Fact, Error>,
     ) -> Result<()> {
-        for (g, a, b, old, new) in self.edges(p)? {
+        for &(g, a, b, old, new) in self.edges(p)?.iter() {
             if !old || new {
                 continue;
             }
@@ -430,11 +681,11 @@ impl Program for Closure {
     fn added(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         held: &dyn Fn(&Fact) -> bool,
         out: &mut Sink<'_, (Fact, Id), Error>,
     ) -> Result<()> {
-        for (g, a, b, old, new) in self.edges(p)? {
+        for &(g, a, b, old, new) in self.edges(p)?.iter() {
             if old || !new {
                 continue;
             }
@@ -452,11 +703,11 @@ impl Program for Closure {
     fn moved(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         recorded: &dyn Fn(&Fact) -> Option<Id>,
         out: &mut Sink<'_, Fact, Error>,
     ) -> Result<()> {
-        for (g, a, b, old, new) in self.edges(p)? {
+        for &(g, a, b, old, new) in self.edges(p)?.iter() {
             if !(old && new) {
                 continue;
             }
@@ -478,7 +729,7 @@ impl Program for Closure {
     fn annotate(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         mode: Provenance,
         f: &Fact,
         r: &Id,
@@ -619,49 +870,78 @@ impl PathOp {
         }
     }
 
-    fn rows_of(&self, schema: &[u32], ends: &Ends, ch: Vec<Change<Fact>>) -> AChanges {
-        ch.into_iter()
-            .filter_map(|c| {
-                let r = self.fact_row(schema, ends, &c.fact)?;
-                let a = c.ann.unwrap_or(Ann::Count(c.weight));
-                Some((r, c.weight, a))
-            })
-            .collect()
+    fn rows_of(
+        &self,
+        p: &Pass,
+        schema: &[u32],
+        ends: &Ends,
+        ch: Vec<Change<Fact>>,
+        ann_bytes: &mut u64,
+        out_lease: &mut ScratchLease,
+    ) -> Result<AChanges> {
+        let mut out = AChanges::new();
+        for c in ch {
+            let Some(r) = self.fact_row(schema, ends, &c.fact) else {
+                continue;
+            };
+            let a = c.ann.unwrap_or(Ann::Count(c.weight));
+            p.preadmit_achanges_push(&out, schema.len(), ann_bytes, a.bytes(), out_lease)?;
+            out.push((r, c.weight, a));
+        }
+        Ok(out)
     }
 
     pub fn init(&mut self, p: &mut Pass, schema: &[u32]) -> Result<Changes> {
-        Ok(self
-            .init_a(p, schema)?
-            .into_iter()
-            .map(|(r, w, _)| (r, w))
-            .collect())
+        let mark = p.output_lease_mark();
+        let raw = self.init_a(p, schema)?;
+        let raw_leases = p.take_output_leases_since(mark);
+        let out: Changes = raw.into_iter().map(|(r, w, _)| (r, w)).collect();
+        for lease in raw_leases {
+            p.push_output_lease(lease);
+        }
+        Ok(out)
     }
 
     pub fn delta(&mut self, p: &mut Pass, schema: &[u32]) -> Result<Changes> {
-        Ok(self
-            .delta_a(p, schema)?
+        let mark = p.output_lease_mark();
+        let raw = self.delta_a(p, schema)?;
+        let raw_leases = p.take_output_leases_since(mark);
+        let out: Changes = raw
             .into_iter()
             .filter(|(_, w, _)| *w != 0)
             .map(|(r, w, _)| (r, w))
-            .collect())
+            .collect();
+        for lease in raw_leases {
+            p.push_output_lease(lease);
+        }
+        Ok(out)
     }
 
     pub fn init_a(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
         self.fixed.program.begin(p);
+        self.fixed.store_mut().attach_budget(p.budget_handle());
         let out = self.init_rows(p, schema);
+        self.fixed.store_mut().detach_budget();
         // the memos of the pass are released whether it succeeded or not
+        let cache_bytes = self.fixed.program.cache.bytes;
         self.fixed.program.end();
+        p.release_pass(cache_bytes);
         out
     }
 
     fn init_rows(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
         let ends = self.ends(p);
         let max = p.max_memory_bytes;
-        let ch = self.fixed.build(p, max)?;
-        let mut out = self.rows_of(schema, &ends, ch);
+        let (ch, ch_bytes) = self.fixed.build_charged(p, max)?;
+        let ch_lease = ScratchLease::from_reserved(p.budget_handle(), ch_bytes);
+        let mut out_lease = p.scratch_lease();
+        let mut ann_bytes = 0u64;
+        let mut out = self.rows_of(p, schema, &ends, ch, &mut ann_bytes, &mut out_lease)?;
+        drop(ch_lease);
         if self.zero {
-            out.extend(self.zero_build(p, schema, &ends)?);
+            self.zero_build(p, schema, &ends, &mut out, &mut ann_bytes, &mut out_lease)?;
         }
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
@@ -670,19 +950,28 @@ impl PathOp {
             return Ok(Vec::new());
         }
         self.fixed.program.begin(p);
+        self.fixed.store_mut().attach_budget(p.budget_handle());
         let out = self.delta_rows(p, schema);
+        self.fixed.store_mut().detach_budget();
+        let cache_bytes = self.fixed.program.cache.bytes;
         self.fixed.program.end();
+        p.release_pass(cache_bytes);
         out
     }
 
     fn delta_rows(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
         let ends = self.ends(p);
         let max = p.max_memory_bytes;
-        let ch = self.fixed.advance(p, max)?;
-        let mut out = self.rows_of(schema, &ends, ch);
+        let (ch, ch_bytes) = self.fixed.advance_charged(p, max)?;
+        let ch_lease = ScratchLease::from_reserved(p.budget_handle(), ch_bytes);
+        let mut out_lease = p.scratch_lease();
+        let mut ann_bytes = 0u64;
+        let mut out = self.rows_of(p, schema, &ends, ch, &mut ann_bytes, &mut out_lease)?;
+        drop(ch_lease);
         if self.zero {
-            out.extend(self.zero_delta(p, schema, &ends)?);
+            self.zero_delta(p, schema, &ends, &mut out, &mut ann_bytes, &mut out_lease)?;
         }
+        p.push_output_lease(out_lease);
         Ok(out)
     }
 
@@ -794,13 +1083,31 @@ impl PathOp {
         if matches!(mode, Provenance::Count | Provenance::None) {
             return Ok(Ann::one(mode));
         }
+        let mut quads_lease = p.scratch_lease();
         let mut quads: Vec<[Id; 4]> = Vec::new();
+        let quad_sz = std::mem::size_of::<[Id; 4]>();
+        let mut reserve_err: Option<Error> = None;
         self.node_quads(p, w, g, n, &mut |q| {
+            let next_cap =
+                sparkles_budget::sizes::vec_grown(quads.capacity(), quads.len(), 1, quad_sz);
+            let need = (next_cap as u64).saturating_mul(quad_sz as u64);
+            if need > quads_lease.bytes()
+                && let Err(e) = quads_lease.try_set(need)
+            {
+                reserve_err = Some(e);
+                return false;
+            }
             quads.push(q);
             true
         })?;
+        if let Some(e) = reserve_err {
+            drop(quads);
+            drop(quads_lease);
+            return Err(e);
+        }
         // in the union default graph, the named-graph quads that hold the triples
         let best = quads.into_iter().map(|q| (p.fact_key_of(&q), q)).min();
+        drop(quads_lease);
         let Some((_, q)) = best else {
             return Err(Error::Corrupt(
                 "a zero-length path row's node is in no quad".into(),
@@ -833,13 +1140,30 @@ impl PathOp {
         )
     }
 
-    fn zero_build(&self, p: &mut Pass, schema: &[u32], ends: &Ends) -> Result<AChanges> {
+    fn zero_build(
+        &self,
+        p: &mut Pass,
+        schema: &[u32],
+        ends: &Ends,
+        out: &mut AChanges,
+        ann_bytes: &mut u64,
+        out_lease: &mut ScratchLease,
+    ) -> Result<()> {
+        let key_sz = std::mem::size_of::<(Id, Id)>();
+        let mut keys_lease = p.scratch_lease();
         let mut keys: Vec<(Id, Id)> = Vec::new();
         if self.fixed.program.start.is_some() {
             for g in self.graphs(p)? {
+                let next_cap =
+                    sparkles_budget::sizes::vec_grown(keys.capacity(), keys.len(), 1, key_sz);
+                let need = (next_cap as u64).saturating_mul(key_sz as u64);
+                if need > keys_lease.bytes() {
+                    keys_lease.try_set(need)?;
+                }
                 keys.push((g, Id::UNDEF));
             }
         } else {
+            let mut seen_lease = p.scratch_lease();
             let mut seen: FxHashSet<(Id, Id)> = FxHashSet::default();
             let sel = match self.scope() {
                 Scope::Default if p.new.union_default_graph => Some(GraphSel::Named),
@@ -851,24 +1175,36 @@ impl PathOp {
                 let var = matches!(self.scope(), Scope::Var(_));
                 p.scan(Which::New, None, None, None, sel, &mut |q| {
                     let g = if var { q[3] } else { Id::UNDEF };
-                    seen.insert((g, q[0]));
-                    seen.insert((g, q[2]));
+                    for item in [(g, q[0]), (g, q[2])] {
+                        if !seen.contains(&item) {
+                            let next_cap =
+                                sparkles_budget::sizes::table_grown(seen.capacity(), seen.len(), 1);
+                            let need = sparkles_budget::sizes::table_bytes(next_cap, key_sz) as u64;
+                            if need > seen_lease.bytes() {
+                                seen_lease.try_set(need)?;
+                            }
+                            seen.insert(item);
+                        }
+                    }
                     Ok(true)
                 })?;
             }
+            keys_lease.try_reserve((seen.len() as u64).saturating_mul(key_sz as u64))?;
             keys = seen.into_iter().collect();
+            drop(seen_lease);
             keys.sort_unstable();
         }
-        let mut out = AChanges::new();
         for (g, n) in keys {
             p.tick()?;
             let Some(r) = self.zero_row(schema, ends, g, n) else {
                 continue;
             };
             let a = self.zero_ann(p, Which::New, g, n)?;
+            p.preadmit_achanges_push(out, schema.len(), ann_bytes, a.bytes(), out_lease)?;
             out.push((r, 1, a));
         }
-        Ok(out)
+        drop(keys_lease);
+        Ok(())
     }
 
     /// The active graphs with a quad at the new snapshot, for a constant end.
@@ -900,28 +1236,52 @@ impl PathOp {
         })
     }
 
-    fn zero_delta(&self, p: &mut Pass, schema: &[u32], ends: &Ends) -> Result<AChanges> {
+    fn zero_delta(
+        &self,
+        p: &mut Pass,
+        schema: &[u32],
+        ends: &Ends,
+        out: &mut AChanges,
+        ann_bytes: &mut u64,
+        out_lease: &mut ScratchLease,
+    ) -> Result<()> {
         let constant = self.fixed.program.start.is_some();
         // the default graph's existence changes only with the named graphs of the union
         if constant && matches!(self.scope(), Scope::Default) && !p.new.union_default_graph {
-            return Ok(AChanges::new());
+            return Ok(());
         }
-        let mut keys: FxHashSet<(Id, Id)> = FxHashSet::default();
+        let key_sz = std::mem::size_of::<(Id, Id)>();
+        let mut seen_lease = p.scratch_lease();
+        let mut seen: FxHashSet<(Id, Id)> = FxHashSet::default();
         for q in p.added.iter().chain(p.removed.iter()) {
             let Some(g) = self.in_scope(p, q) else {
                 continue;
             };
+            let mut insert_key = |item: (Id, Id)| -> Result<()> {
+                if !seen.contains(&item) {
+                    let next_cap =
+                        sparkles_budget::sizes::table_grown(seen.capacity(), seen.len(), 1);
+                    let need = sparkles_budget::sizes::table_bytes(next_cap, key_sz) as u64;
+                    if need > seen_lease.bytes() {
+                        seen_lease.try_set(need)?;
+                    }
+                    seen.insert(item);
+                }
+                Ok(())
+            };
             if constant {
-                keys.insert((g, Id::UNDEF));
+                insert_key((g, Id::UNDEF))?;
             } else {
-                keys.insert((g, q[0]));
-                keys.insert((g, q[2]));
+                insert_key((g, q[0]))?;
+                insert_key((g, q[2]))?;
             }
         }
-        let mut keys: Vec<(Id, Id)> = keys.into_iter().collect();
+        let mut keys_lease = p.scratch_lease();
+        keys_lease.try_reserve((seen.len() as u64).saturating_mul(key_sz as u64))?;
+        let mut keys: Vec<(Id, Id)> = seen.into_iter().collect();
+        drop(seen_lease);
         keys.sort_unstable();
         let annotated = !p.prov.is_none();
-        let mut out = AChanges::new();
         for (g, n) in keys {
             p.tick()?;
             let (old, new) = if constant {
@@ -941,27 +1301,44 @@ impl PathOp {
             match (old, new) {
                 (false, true) => {
                     let a = self.zero_ann(p, Which::New, g, n)?;
+                    p.preadmit_achanges_push(out, schema.len(), ann_bytes, a.bytes(), out_lease)?;
                     out.push((r, 1, a));
                 }
                 (true, false) => {
-                    let a = self.zero_ann(p, Which::Old, g, n)?;
-                    out.push((r, -1, a.scaled(-1)));
+                    let a = self.zero_ann(p, Which::Old, g, n)?.scaled(-1);
+                    p.preadmit_achanges_push(out, schema.len(), ann_bytes, a.bytes(), out_lease)?;
+                    out.push((r, -1, a));
                 }
                 (true, true) if annotated && !constant => {
                     let a = self.zero_ann(p, Which::Old, g, n)?;
                     let b = self.zero_ann(p, Which::New, g, n)?;
                     if a != b {
-                        out.push((r, 0, b.sub(&a)));
+                        let d = b.sub(&a);
+                        p.preadmit_achanges_push(
+                            out,
+                            schema.len(),
+                            ann_bytes,
+                            d.bytes(),
+                            out_lease,
+                        )?;
+                        out.push((r, 0, d));
                     }
                 }
                 _ => {}
             }
         }
-        Ok(out)
+        drop(keys_lease);
+        Ok(())
     }
 
     pub fn bytes(&self) -> u64 {
         self.fixed.bytes()
+    }
+
+    pub fn clear(&mut self) {
+        self.fixed.clear_state();
+        *self.fixed.store_mut() = PathStore::new();
+        self.fixed.program.end();
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {
@@ -969,7 +1346,10 @@ impl PathOp {
     }
 
     pub fn load(&mut self, r: &mut Reader) -> Result<()> {
-        self.fixed.load(r)
+        self.fixed.store_mut().attach_budget(r.budget_handle());
+        let res = self.fixed.load(r);
+        self.fixed.store_mut().detach_budget();
+        res
     }
 
     pub fn describe(&self) -> String {

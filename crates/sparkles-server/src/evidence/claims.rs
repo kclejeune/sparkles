@@ -129,6 +129,7 @@ struct RevisionJson {
     upstream_revisions: Vec<RefJson>,
     #[serde(default)]
     families: Vec<String>,
+    was_revision_of: Option<RefJson>,
 }
 
 #[derive(Deserialize)]
@@ -604,6 +605,11 @@ fn input_of(r: ClaimsRequest) -> ApiResult<(EvidenceInput, Request)> {
                 upstream_revisions: upstream,
                 families,
             },
+            was_revision_of: v
+                .was_revision_of
+                .as_ref()
+                .map(|w| reference(&format!("{at}.wasRevisionOf"), w))
+                .transpose()?,
         });
     }
     for (i, v) in r.renditions.iter().enumerate() {
@@ -849,17 +855,48 @@ pub(crate) fn principal_iri(p: &Principal) -> NamedNode {
     NamedNode::new_unchecked(out)
 }
 
-/// The caller's authority, checked under the authority registry's shared fence right
-/// before the commit publishes and held until it is published: the access generation
-/// the request was authenticated under is unchanged, and its session or token has not
-/// expired or been revoked.
+/// The caller's authority and declared-settings consistency, checked right before the
+/// commit publishes and held until it is published: the access generation the request
+/// was authenticated under is unchanged, its session or token has not expired or been
+/// revoked, and no settings reload has introduced evidence-settings drift.
 pub(super) struct CallerFence {
     pub(super) st: Arc<AppState>,
     pub(super) p: Principal,
+    pub(super) drift: crate::settings::evidence::DriftFence,
+}
+
+impl CallerFence {
+    /// Previews, replays and no-op writes can return without publishing.
+    pub(super) fn check_uncommitted(&self, committed: bool) -> sparkles::Result<()> {
+        if !committed {
+            let _declared = self.st.settings.hold_evidence_declarations();
+            self.drift.check(&self.st)?;
+        }
+        Ok(())
+    }
 }
 
 impl sparkles::evidence::AuthorityFence for CallerFence {
+    fn enter_source_holds(
+        &self,
+        targets: &[&sparkles::Dataset],
+    ) -> sparkles::Result<Box<dyn std::any::Any>> {
+        let guard = self.enter()?;
+        if targets
+            .iter()
+            .any(|ds| !ds.name().is_some_and(|name| self.p.admin_everywhere(name)))
+        {
+            return Err(sparkles::Error::NotPermitted(
+                "foreign source holds need admin on every branch and graph of the referenced dataset"
+                    .into(),
+            ));
+        }
+        Ok(guard)
+    }
+
     fn enter(&self) -> sparkles::Result<Box<dyn std::any::Any>> {
+        let declared = self.st.settings.hold_evidence_declarations();
+        self.drift.check(&self.st)?;
         #[cfg(feature = "auth")]
         if let (Some(auth), Some(epoch)) = (&self.st.auth, self.p.access_epoch()) {
             let hold = auth.authority_registry().begin_hold();
@@ -872,10 +909,10 @@ impl sparkles::evidence::AuthorityFence for CallerFence {
                     "authorization changed before the proposal published; nothing was written",
                 ));
             }
-            return Ok(Box::new(hold));
+            return Ok(Box::new((hold, declared)));
         }
         let _ = (&self.st, &self.p);
-        Ok(Box::new(()))
+        Ok(Box::new(declared))
     }
 }
 
@@ -890,17 +927,21 @@ pub(crate) fn record_json(r: &sparkles::evidence::ProposedRecord) -> J {
     })
 }
 
-/// The caller's authority fence, for a proposal made outside `POST /{ds}/claims`.
+/// The caller's authority and drift fence, for a proposal made outside `POST /{ds}/claims`.
+#[cfg(feature = "mcp")]
 pub(crate) fn caller_fence(
     st: Arc<AppState>,
+    main: &crate::state::Dataset,
     p: Principal,
-) -> Arc<dyn sparkles::evidence::AuthorityFence> {
-    Arc::new(CallerFence { st, p })
+) -> sparkles::Result<Arc<dyn sparkles::evidence::AuthorityFence>> {
+    let drift = crate::settings::evidence::DriftFence::capture(&st, main)?;
+    Ok(Arc::new(CallerFence { st, p, drift }))
 }
 
 /// Propose `input` on `logical`, a branch of `main` or `main` itself, as `p`, reading
 /// references with `p`'s query view as `POST /{ds}/claims` does. A claims ingestion
 /// publishes its batch and its source registration this way.
+#[cfg(feature = "mcp")]
 pub(crate) fn propose_ingested(
     st: &Arc<AppState>,
     (main, logical): (&Arc<crate::state::Dataset>, &Arc<crate::state::Dataset>),
@@ -909,6 +950,7 @@ pub(crate) fn propose_ingested(
     options: &ProposeOptions,
     control: &sparkles::task::Control,
 ) -> ApiResult<sparkles::evidence::Proposed> {
+    crate::settings::evidence::require_reconciled(st, main)?;
     type Policy = Option<Arc<sparkles::access::GraphAccess>>;
     let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =
         std::collections::HashMap::new();
@@ -992,10 +1034,15 @@ pub(super) fn propose_now(
     options.message = request.message.map(Arc::from);
     options.author = crate::http::author(&p);
     options.write = opts.graphs.clone();
-    options.authority = Some(Arc::new(CallerFence {
+    let drift = crate::settings::evidence::DriftFence::capture(&st, &main)?;
+    #[cfg(test)]
+    main.store.failpoint("evidence-admitted");
+    let fence = Arc::new(CallerFence {
         st: st.clone(),
         p: p.clone(),
-    }));
+        drift,
+    });
+    options.authority = Some(fence.clone());
     type Policy = Option<Arc<sparkles::access::GraphAccess>>;
     let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =
         std::collections::HashMap::new();
@@ -1041,5 +1088,6 @@ pub(super) fn propose_now(
             "error": preview.error(),
         });
     }
+    fence.check_uncommitted(proposed.committed)?;
     Ok(out)
 }

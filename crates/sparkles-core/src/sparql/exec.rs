@@ -12,7 +12,7 @@ use super::plan::{
 };
 use super::sortkey::{Entry, Screen, SortKey, TopK};
 use super::table::{InputCredit, Materialized, Table, VarId};
-use super::value::{NumOp, Value, arith, order_cmp};
+use super::value::{Value, order_cmp};
 use crate::access::Reservation;
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -61,7 +61,7 @@ pub(super) fn map_rows<T: Send>(
             .saturating_mul(2)
             .saturating_add(rayon::current_num_threads() as u64 * 1024);
         if let Ok(_scratch) = ctx.charge(bytes) {
-            return (0..n)
+            let out: Vec<T> = (0..n)
                 .into_par_iter()
                 .with_min_len(MAP_POLL_ROWS)
                 .map(|i| {
@@ -70,7 +70,9 @@ pub(super) fn map_rows<T: Send>(
                     }
                     Ok(f(i))
                 })
-                .collect();
+                .collect::<Result<Vec<T>>>()?;
+            ctx.check()?;
+            return Ok(out);
         }
     }
     // Without the collector's charge, a parallel map runs in pieces that each collect
@@ -88,6 +90,7 @@ pub(super) fn map_rows<T: Send>(
         }
         start = end;
     }
+    ctx.check()?;
     Ok(out)
 }
 
@@ -212,32 +215,6 @@ pub(super) fn map_batch_split<T: Send>(
     par: bool,
     f: impl Fn(usize) -> T + Sync + Send,
 ) -> Result<(Vec<T>, Option<Split>)> {
-    map_batch_with_split(ctx, n, par, || (), |_, i| f(i))
-}
-
-/// [`map_batch`] with a state for each thread that maps rows, made by `init`: one for the
-/// calling thread and one for each parallel task, as [`rayon`]'s `map_init` gives, such as
-/// a map of the query's floor cache in [`string_order_mask`].
-pub(super) fn map_batch_with<S, T: Send>(
-    ctx: &Ctx,
-    n: usize,
-    par: bool,
-    init: impl Fn() -> S + Sync + Send,
-    f: impl Fn(&mut S, usize) -> T + Sync + Send,
-) -> Result<Vec<T>> {
-    map_batch_with_split(ctx, n, par, init, f).map(|(out, _)| out)
-}
-
-/// [`map_batch_with`], also returning the times of a batch whose rest it mapped on the
-/// pool.
-fn map_batch_with_split<S, T: Send>(
-    ctx: &Ctx,
-    n: usize,
-    par: bool,
-    init: impl Fn() -> S + Sync + Send,
-    f: impl Fn(&mut S, usize) -> T + Sync + Send,
-) -> Result<(Vec<T>, Option<Split>)> {
-    let mut state = init();
     let sample = n.min(BATCH_SAMPLE_ROWS);
     let rest = n - sample;
     let mut out = Vec::with_capacity(n);
@@ -246,8 +223,9 @@ fn map_batch_with_split<S, T: Send>(
     // rows of an aggregate's BIND, would pay a clock read for nothing.
     let may_split = par && batch_may_split(n) && rayon::current_num_threads() > 1;
     let t0 = may_split.then(Instant::now);
-    out.extend((0..sample).map(|i| f(&mut state, i)));
+    out.extend((0..sample).map(&f));
     let sampled = t0.map(|t0| t0.elapsed().as_nanos());
+    ctx.check()?;
     if let Some(sample_nanos) = sampled
         && sample_nanos * rest as u128 >= BATCH_PAR_NANOS * sample as u128
     {
@@ -265,17 +243,16 @@ fn map_batch_with_split<S, T: Send>(
             // an indexed collect writes each piece's slot in place
             let pieces: Vec<Result<Vec<T>>> = starts
                 .into_par_iter()
-                .map_init(&init, |state, start| {
+                .map(|start| {
                     ctx.check()?;
-                    Ok((start..(start + BATCH_PAR_PIECE).min(n))
-                        .map(|i| f(state, i))
-                        .collect())
+                    Ok((start..(start + BATCH_PAR_PIECE).min(n)).map(&f).collect())
                 })
                 .collect();
             let rest_nanos = t1.elapsed().as_nanos();
             for piece in pieces {
                 out.extend(piece?);
             }
+            ctx.check()?;
             let split = Split {
                 sample_rows: sample,
                 sample_nanos,
@@ -289,10 +266,59 @@ fn map_batch_with_split<S, T: Send>(
     while start < n {
         ctx.check()?;
         let end = (start + 1024).min(n);
-        out.extend((start..end).map(|i| f(&mut state, i)));
+        out.extend((start..end).map(&f));
         start = end;
     }
+    ctx.check()?;
     Ok((out, None))
+}
+
+/// [`map_batch`] writing directly into an already-allocated output slice `out` for
+/// rows `base..base + out.len()`, avoiding intermediate piece vectors and copies.
+fn fill_batch_with<S, T: Send>(
+    ctx: &Ctx,
+    out: &mut [T],
+    base: usize,
+    init: impl Fn() -> S + Sync + Send,
+    f: impl Fn(&mut S, usize) -> T + Sync + Send,
+) -> Result<()> {
+    let n = out.len();
+    let mut state = init();
+    let sample = n.min(BATCH_SAMPLE_ROWS);
+    let rest = n - sample;
+    ctx.check()?;
+    let may_split = batch_may_split(n) && rayon::current_num_threads() > 1;
+    let t0 = may_split.then(Instant::now);
+    for (offset, slot) in out[..sample].iter_mut().enumerate() {
+        *slot = f(&mut state, base + offset);
+    }
+    if let Some(t0) = t0
+        && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
+    {
+        drop(state);
+        out[sample..]
+            .par_chunks_mut(BATCH_PAR_PIECE)
+            .enumerate()
+            .try_for_each_init(&init, |state, (chunk_idx, chunk)| -> Result<()> {
+                ctx.check()?;
+                let start = base + sample + chunk_idx * BATCH_PAR_PIECE;
+                for (offset, slot) in chunk.iter_mut().enumerate() {
+                    *slot = f(state, start + offset);
+                }
+                Ok(())
+            })?;
+        return ctx.check();
+    }
+    let mut start = sample;
+    while start < n {
+        ctx.check()?;
+        let end = (start + 1024).min(n);
+        for (offset, slot) in out[start..end].iter_mut().enumerate() {
+            *slot = f(&mut state, base + start + offset);
+        }
+        start = end;
+    }
+    ctx.check()
 }
 
 /// Executed operator tree with runtime information (QLever `RuntimeInformation`).
@@ -1895,7 +1921,20 @@ fn run_node<'ctx>(
             output_lease = t.lease;
             t.table
         }
-        Kind::ViewRead(spec) => super::viewsvc::run(ctx, spec, &n.vars)?,
+        Kind::ViewRead(spec) => {
+            if let Some(shared) = ctx.shared()
+                && ctx
+                    .views
+                    .as_ref()
+                    .is_some_and(|source| source.streams_views())
+            {
+                let table = super::cursor::eager_view(&shared, n, &held)?;
+                output_lease = Some(held.output_lease(super::algosvc::table_capacity(&table)?)?);
+                table
+            } else {
+                super::viewsvc::run(ctx, spec, &n.vars)?
+            }
+        }
         Kind::HistoryChanges(spec) => {
             let input = match n.children.len() {
                 0 => None,
@@ -2086,7 +2125,11 @@ fn merge_counters(
 pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
     /// scans of more blocks than this are left to their own read-ahead
     const FEW_BLOCKS: usize = 64;
-    if !ctx.opt.prefetch_first_scan || !crate::index::io_hints() {
+    #[cfg(test)]
+    if !ctx.opt.prefetch_first_scan {
+        return;
+    }
+    if !crate::index::io_hints() {
         return;
     }
     /// The columns the reader decodes of block `b` of the range `[lo, hi]`: the scan's own
@@ -3291,7 +3334,7 @@ impl NumAtom {
     /// generic evaluator answers it. For two numbers, `compare` and `equals` are
     /// `num_cmp`, and an incomparable pair (NaN) is false.
     #[inline]
-    fn holds(&self, x: Id, v: super::value::Num) -> bool {
+    fn holds(&self, x: Id, v: super::value::Num<'_>) -> bool {
         use super::plan::RangeOp;
         use Ordering::*;
         if self.op == RangeOp::Eq && self.id == Some(x) {
@@ -3347,10 +3390,19 @@ pub(super) fn apply_range_filter(
         t.col_of(var),
         num_atoms(ctx, var, exprs),
     ) else {
+        let _scratch = ctx.charge((t.len() as u64).saturating_add(
+            (ctx.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
+        ))?;
         apply_filter(ctx, t, exprs)?;
         return Ok(());
     };
     let col = &t.cols[c];
+    let n = col.len();
+    let vocab_count = col.iter().filter(|x| x.tag() == Tag::Vocab).count();
+    let decided_bytes = n.saturating_mul(size_of::<Option<bool>>()) as u64;
+    let vocab_bytes = (vocab_count as u64)
+        .saturating_mul((size_of::<u64>() + size_of::<(u8, u64)>() + size_of::<Numeric>()) as u64);
+    let scratch = ctx.charge(decided_bytes.saturating_add(vocab_bytes))?;
     use super::value::Num;
     let test = |x: Id, v: Num| atoms.iter().all(|a| a.holds(x, v));
     // `Some(passes)`, or `None` for the generic filter
@@ -3366,29 +3418,37 @@ pub(super) fn apply_range_filter(
             },
             (Tag::Int | Tag::Double | Tag::Decimal, _) => ctx
                 .value(x)
-                .and_then(|v| Num::of(&v).ok())
-                .map(|v| test(x, v)),
+                .and_then(|v| Num::of(&v).ok().map(|n| test(x, n))),
             _ => None,
         }
     };
     // the distinct vocabulary ids of a run of rows read from the column at once, and
-    // runs of one id (the scan's sorted column) decided once
-    let chunk = |ids: &[Id]| -> Vec<Option<bool>> {
-        let mut vocab: Vec<u64> = ids
-            .iter()
-            .filter(|x| x.tag() == Tag::Vocab)
-            .map(|x| x.payload())
-            .collect();
-        // already sorted when the column is the scan's sorted column
-        if !vocab.is_sorted() {
-            vocab.sort_unstable();
+    // runs of one id (the scan's sorted column) decided once, written directly into
+    // disjoint slices of the pre-admitted `decided` buffer
+    let fill_chunk = |ids: &[Id], out: &mut [Option<bool>]| {
+        let vocab_len = ids.iter().filter(|x| x.tag() == Tag::Vocab).count();
+        let mut vocab = Vec::with_capacity(vocab_len);
+        if vocab_len > 0 {
+            vocab.extend(
+                ids.iter()
+                    .filter(|x| x.tag() == Tag::Vocab)
+                    .map(|x| x.payload()),
+            );
+            // already sorted when the column is the scan's sorted column
+            if !vocab.is_sorted() {
+                vocab.sort_unstable();
+            }
+            vocab.dedup();
         }
-        vocab.dedup();
-        let found = num.get_many(&vocab);
+        let found = if vocab.is_empty() {
+            Vec::new()
+        } else {
+            num.get_many(&vocab)
+        };
         let mut at = 0;
         let mut last: Option<(Id, Option<bool>)> = None;
-        ids.iter()
-            .map(|&x| match last {
+        for (&x, slot) in ids.iter().zip(out.iter_mut()) {
+            *slot = match last {
                 Some((l, d)) if l == x => d,
                 _ => {
                     let n = if x.tag() == Tag::Vocab {
@@ -3408,44 +3468,78 @@ pub(super) fn apply_range_filter(
                     last = Some((x, d));
                     d
                 }
-            })
-            .collect()
+            };
+        }
     };
-    let decided: Vec<Option<bool>> = if col.len() > PAR_THRESHOLD {
-        col.par_chunks(PAR_MIN_LEN.max(4096))
-            .flat_map_iter(chunk)
-            .collect()
+    let mut decided = vec![None; n];
+    if col.len() > PAR_THRESHOLD {
+        let step = PAR_MIN_LEN.max(4096);
+        col.par_chunks(step)
+            .zip(decided.par_chunks_mut(step))
+            .for_each(|(ids, out)| fill_chunk(ids, out));
     } else {
-        chunk(col)
-    };
-    let rest: Vec<usize> = (0..decided.len())
-        .filter(|&i| decided[i].is_none())
-        .collect();
-    let mut keep: Vec<bool> = decided.iter().map(|d| d.unwrap_or(false)).collect();
+        fill_chunk(col, &mut decided);
+    }
+    let rest_len = decided.iter().filter(|d| d.is_none()).count();
+    let keep_bytes = n.saturating_mul(size_of::<bool>()) as u64;
+    let rest_bytes = rest_len.saturating_mul(size_of::<usize>()) as u64;
+    scratch.resize(
+        decided_bytes
+            .saturating_add(keep_bytes)
+            .saturating_add(rest_bytes),
+    )?;
+    let mut rest = Vec::with_capacity(rest_len);
+    let mut keep = Vec::with_capacity(n);
+    for (i, d) in decided.into_iter().enumerate() {
+        match d {
+            Some(k) => keep.push(k),
+            None => {
+                keep.push(false);
+                rest.push(i);
+            }
+        }
+    }
+    scratch.resize(keep_bytes.saturating_add(rest_bytes))?;
     if !rest.is_empty() {
+        let sub_bytes = topk_table_bytes(rest.len(), t.width());
+        let mask_bytes =
+            rest.len()
+                .saturating_mul(size_of::<bool>())
+                .saturating_add(ctx.nvars().saturating_mul(size_of::<Option<usize>>()))
+                .saturating_add(exprs.len().saturating_mul(size_of::<&Expr>())) as u64;
+        scratch.resize(
+            keep_bytes
+                .saturating_add(rest_bytes)
+                .saturating_add(sub_bytes)
+                .saturating_add(mask_bytes),
+        )?;
         let sub = t.take_rows(&rest);
         let mask = filter_mask(ctx, &sub, exprs)?;
         for (&i, k) in rest.iter().zip(mask) {
             keep[i] = k;
         }
     }
-    let sorted = t.sorted.clone();
+    drop(rest);
+    scratch.resize(keep_bytes)?;
+    let sorted = std::mem::take(&mut t.sorted);
     t.filter_rows(&keep);
     t.sorted = sorted;
+    drop(keep);
+    drop(scratch);
     Ok(())
 }
 
 // ---------------------------------------------------------- ordered top-k ------
 
 /// The unread part `[lo, hi]` of a monotone piece of an [`OrderedTopK`] scan.
-struct TopKRun {
+struct TopKRun<'ctx> {
     lo: u64,
     hi: u64,
     exact: bool,
     /// the best values are at the high end of the id range
     best_high: bool,
     /// the rows read so far that can still be among the first k
-    kept: Table,
+    kept: Materialized<'ctx>,
     /// base rows to read in the next step (grows geometrically)
     want: usize,
     /// no unread row of the piece can be among the first k
@@ -3490,7 +3584,7 @@ const LEXICAL_PREFIX_BYTES: usize = 256;
 fn lexical_check(
     ctx: &Ctx,
     spec: &OrderedTopK,
-    run: &TopKRun,
+    run: &TopKRun<'_>,
     kth: Option<&Value>,
 ) -> Result<Lexical> {
     let s = match kth {
@@ -3501,21 +3595,39 @@ fn lexical_check(
     };
     let vocab = &ctx.snap.generation.vocab;
     let last = run.lo - 1;
-    let Some(key) = vocab.get(Id(last).payload()) else {
-        return Ok(Lexical::Step);
-    };
-    let lex = match key.split_first() {
-        Some((b'"', rest)) => match rest.iter().position(|&b| b == crate::id::KEY_SEP) {
-            Some(end) => &rest[..end],
-            None => return Ok(Lexical::Step),
-        },
-        _ => return Ok(Lexical::Step),
-    };
-    if s.as_bytes() > lex {
-        return Ok(Lexical::Step);
-    }
-    let Ok(lex) = std::str::from_utf8(lex) else {
-        return Ok(Lexical::Step);
+    // Reconstruct the last key with controlled scratch admission and live controls,
+    // copying only the bounded prefix needed for prefix lookups.
+    let prefix = match ctx.with_controlled_vocab_key(Id(last).payload(), |key| {
+        let lex = match key.split_first() {
+            Some((b'"', rest)) => match rest.iter().position(|&b| b == crate::id::KEY_SEP) {
+                Some(end) => &rest[..end],
+                None => return Ok(Err(Lexical::Step)),
+            },
+            _ => return Ok(Err(Lexical::Step)),
+        };
+        if s.as_bytes() > lex {
+            return Ok(Err(Lexical::Step));
+        }
+        let Ok(lex_str) = std::str::from_utf8(lex) else {
+            return Ok(Err(Lexical::Step));
+        };
+        // Retain only the characters needed to enumerate the eligible prefixes.
+        let mut take = 0usize;
+        for (end, c) in lex_str.char_indices() {
+            let p = &lex_str[..end];
+            if p > &**s {
+                break;
+            }
+            if end > LEXICAL_PREFIX_BYTES {
+                return Ok(Err(Lexical::Generic));
+            }
+            take = end + c.len_utf8();
+        }
+        Ok(Ok(lex_str[..take].to_owned()))
+    })? {
+        Some(Ok(prefix)) => prefix,
+        Some(Err(verdict)) => return Ok(verdict),
+        None => return Ok(Lexical::Step),
     };
     let scan = &spec.scan;
     let bound = |v: u64, fill: u64| {
@@ -3528,19 +3640,12 @@ fn lexical_check(
     let mut probe = vec![b'"'];
     // the proper prefixes, shortest first: once one is greater than the k-th
     // candidate, so are the longer ones
-    for (n, (end, c)) in lex.char_indices().enumerate() {
-        let p = &lex[..end];
-        if p > &**s {
-            break;
-        }
-        if end > LEXICAL_PREFIX_BYTES {
-            return Ok(Lexical::Generic);
-        }
+    for (n, c) in prefix.chars().enumerate() {
         if n % 32 == 31 {
             ctx.check()?;
         }
         probe.push(crate::id::KEY_SEP);
-        let found = vocab.find(&probe);
+        let found = vocab.find_exact_controlled(&probe, |_| ctx.check())?;
         probe.pop();
         let mut utf8 = [0; 4];
         probe.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
@@ -3566,16 +3671,104 @@ fn lexical_check(
     })
 }
 
+#[cfg(test)]
+#[test]
+fn ordered_lexical_check_refuses_oversized_probe_after_candidate_decode() {
+    use crate::io::{RdfFormat, Source};
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{Literal, NamedNode, Term};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let oversized = format!("ab{}", "x".repeat(32 * 1024));
+    let data = format!("<urn:s> <urn:p> \"a\", \"abc\", \"{oversized}\" .");
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    store.compact().unwrap();
+    let snap = store.snapshot();
+    let literal = |s| {
+        snap.lookup_term(&Term::Literal(Literal::new_simple_literal(s)))
+            .unwrap()
+    };
+    let candidate = literal("a");
+    let short = literal("abc");
+    let long = literal(oversized.as_str());
+    let pred = snap
+        .lookup_term(&Term::NamedNode(NamedNode::new_unchecked("urn:p")))
+        .unwrap();
+    let scan = super::plan::ScanSpec {
+        perm: crate::index::Perm::Pos,
+        prefix: vec![pred.0],
+        cols: vec![(1, 0)],
+        eqs: Vec::new(),
+        graph: super::plan::GraphFilter::Default,
+        graph_col: 3,
+        dedup: false,
+        src: None,
+    };
+    let spec = OrderedTopK {
+        fallback: Box::new(Node::empty(vec![0])),
+        scan,
+        var: 0,
+        asc: true,
+        k: 1,
+        pieces: Vec::new(),
+        filter: Vec::new(),
+        range_filter: Vec::new(),
+        tie_order: vec![0],
+    };
+    fn make_run<'ctx>(ctx: &'ctx Ctx, last: Id, candidate: Id) -> TopKRun<'ctx> {
+        TopKRun {
+            lo: last.0 + 1,
+            hi: candidate.0,
+            exact: true,
+            best_high: false,
+            kept: Materialized::empty_fast(ctx, &[0], &[]).unwrap(),
+            want: 1,
+            done: false,
+            lexical: true,
+            extra: Vec::new(),
+            hold: false,
+        }
+    }
+
+    let control = Ctx::new(snap.clone());
+    let kth = control.value(candidate).expect("short candidate decodes");
+    assert!(matches!(
+        lexical_check(&control, &spec, &make_run(&control, short, candidate), Some(&kth)).unwrap(),
+        Lexical::Read(ids) if ids == [candidate.0]
+    ));
+    assert!(matches!(
+        lexical_check(&control, &spec, &make_run(&control, long, candidate), Some(&kth)).unwrap(),
+        Lexical::Read(ids) if ids == [candidate.0]
+    ));
+
+    let mut target = Ctx::new(snap);
+    target.mem_limit = 24 * 1024;
+    let kth = target
+        .value(candidate)
+        .expect("candidate fits tight budget");
+    target.check().unwrap();
+    assert!(matches!(
+        lexical_check(&target, &spec, &make_run(&target, long, candidate), Some(&kth)),
+        Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+    ));
+}
+
 /// Rows of an [`OrderedTopK`] scan whose order-column ids lie in `[lo, hi]`, in key order,
 /// with the filters applied; also returns how many rows were scanned.
-fn topk_read(
-    ctx: &Ctx,
+fn topk_read<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     lo: u64,
     hi: u64,
     exact: bool,
     vars: &[VarId],
-) -> Result<(Table, usize)> {
+) -> Result<(Materialized<'ctx>, usize)> {
     let scan = &spec.scan;
     let bound = |v: u64, fill: u64| {
         let mut k = pad(&scan.prefix, fill);
@@ -3586,38 +3779,47 @@ fn topk_read(
 }
 
 /// [`topk_read`] of the keys `[lo, hi]` of the scan.
-fn topk_read_keys(
-    ctx: &Ctx,
+fn topk_read_keys<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     lo: crate::index::Key,
     hi: crate::index::Key,
     exact: bool,
     vars: &[VarId],
-) -> Result<(Table, usize)> {
+) -> Result<(Materialized<'ctx>, usize)> {
     topk_read_keys_last(ctx, spec, lo, hi, exact, vars).map(|(t, n, _)| (t, n))
 }
 
 /// [`topk_read_keys`], with the last row the scan produced before any filter when the
 /// scan drops duplicate rows of a union default graph: the next read of the same piece
 /// must drop that row again if it starts with it.
-fn topk_read_keys_last(
-    ctx: &Ctx,
+fn topk_read_keys_last<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     lo: crate::index::Key,
     hi: crate::index::Key,
     exact: bool,
     vars: &[VarId],
-) -> Result<(Table, usize, Option<Vec<Id>>)> {
-    let mut t = Table::new(vars.to_vec());
+) -> Result<MorselBest<'ctx>> {
+    let mut t = Materialized::empty_fast(ctx, vars, &[])?;
     scan_into(ctx, &spec.scan, lo, hi, None, &mut t)?;
-    let scanned = t.len();
-    let last =
-        (spec.scan.dedup && scanned > 0).then(|| t.cols.iter().map(|c| c[scanned - 1]).collect());
-    if !exact && !spec.range_filter.is_empty() && !t.is_empty() {
-        apply_range_filter(ctx, &mut t, spec.var, &spec.range_filter)?;
+    let table = &mut t.table;
+    let scanned = table.len();
+    let last = (spec.scan.dedup && scanned > 0).then(|| {
+        let mut last = [Id::UNDEF; 4];
+        for (dst, col) in last.iter_mut().zip(&table.cols) {
+            *dst = col[scanned - 1];
+        }
+        last
+    });
+    if !exact && !spec.range_filter.is_empty() && !table.is_empty() {
+        apply_range_filter(ctx, table, spec.var, &spec.range_filter)?;
     }
-    if !spec.filter.is_empty() && !t.is_empty() {
-        apply_filter(ctx, &mut t, &spec.filter)?;
+    if !spec.filter.is_empty() && !table.is_empty() {
+        let _filter_scratch = ctx.charge((table.len() as u64).saturating_add(
+            (ctx.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
+        ))?;
+        apply_filter(ctx, table, &spec.filter)?;
     }
     Ok((t, scanned, last))
 }
@@ -3677,7 +3879,37 @@ fn topk_boundary(
 
 /// Read the next rows of a monotone piece from its best end, keeping those that can
 /// still be among the first k; returns the rows scanned.
-fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -> Result<usize> {
+fn topk_table_bytes(rows: usize, width: usize) -> u64 {
+    128 + width as u64 * (size_of::<VarId>() * 2 + size_of::<Vec<Id>>()) as u64
+        + super::ctx::table_bytes(rows, width)
+}
+
+fn topk_append(ctx: &Ctx, dst: &mut Materialized<'_>, src: Materialized<'_>) -> Result<()> {
+    dst.reserve_rows(ctx, dst.table.len().saturating_add(src.table.len()))?;
+    dst.table.append(src.table);
+    Ok(())
+}
+
+fn topk_take_rows<'ctx>(
+    ctx: &'ctx Ctx,
+    source: &Table,
+    rows: &[usize],
+) -> Result<Materialized<'ctx>> {
+    let mut out = Materialized::empty_fast(ctx, &source.vars, &[])?;
+    out.reserve_rows(ctx, rows.len())?;
+    for (dst, src) in out.table.cols.iter_mut().zip(&source.cols) {
+        dst.extend(rows.iter().map(|&r| src[r]));
+    }
+    out.table.len = rows.len();
+    Ok(out)
+}
+
+fn topk_step(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    run: &mut TopKRun<'_>,
+    vars: &[VarId],
+) -> Result<usize> {
     // base rows only: delta rows in between are merged by the scan
     let edge = topk_boundary(ctx, spec, run.lo, run.hi, run.best_high, run.want)?;
     let (a, b) = if run.best_high {
@@ -3693,13 +3925,14 @@ fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -
         run.lo = b.saturating_add(1);
         run.want = run.want.saturating_mul(4);
         if !run.extra.is_empty() {
-            let keep: Vec<bool> = part.cols[0]
+            let _mask = ctx.charge(part.table.len() as u64)?;
+            let keep: Vec<bool> = part.table.cols[0]
                 .iter()
                 .map(|id| !run.extra.contains(&id.0))
                 .collect();
-            part.filter_rows(&keep);
+            part.table.filter_rows(&keep);
         }
-        run.kept.append(part);
+        topk_append(ctx, &mut run.kept, part)?;
         return Ok(scanned);
     }
     if run.best_high {
@@ -3714,33 +3947,39 @@ fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -
     // best row of this step and its ties complete the piece's best k, and every other
     // row of the piece has k rows with strictly better values ahead of it (distinct ids
     // of a monotone piece are distinct numbers)
-    let need = spec.k - run.kept.len();
-    if part.len() >= need {
-        let col = &part.cols[0];
-        let keep: Vec<bool> = if run.best_high {
-            let cut = col[part.len() - need];
-            col.iter().map(|&id| id >= cut).collect()
+    let need = spec.k - run.kept.table.len();
+    if part.table.len() >= need {
+        let col = &part.table.cols[0];
+        let (first, end) = if run.best_high {
+            let cut = col[part.table.len() - need];
+            (col.partition_point(|&id| id < cut), col.len())
         } else {
             let cut = col[need - 1];
-            col.iter().map(|&id| id <= cut).collect()
+            (0, col.partition_point(|&id| id <= cut))
         };
-        part.filter_rows(&keep);
+        for col in &mut part.table.cols {
+            col.copy_within(first..end, 0);
+            col.truncate(end - first);
+        }
+        part.table.len = end - first;
         run.done = true;
     }
-    run.kept.append(part);
+    topk_append(ctx, &mut run.kept, part)?;
     Ok(scanned)
 }
 
 /// Whether ORDER BY's comparison of `id` with other values is a total order (it is not
 /// for NaN, which compares with numbers by its lexical form, nor for partially ordered
 /// dates, times and durations).
-fn totally_ordered(ctx: &Ctx, id: Id) -> bool {
+fn totally_ordered(ctx: &Ctx, id: Id) -> Result<bool> {
     use crate::id::Tag;
     match id.tag() {
-        Tag::Double => !id.as_f64().is_nan(),
-        Tag::DateTime | Tag::Date => false,
-        Tag::Vocab | Tag::Delta => value_totally_ordered(ctx.value(id).as_ref()),
-        _ => true,
+        Tag::Double => Ok(!id.as_f64().is_nan()),
+        Tag::DateTime | Tag::Date => Ok(false),
+        Tag::Vocab | Tag::Delta | Tag::Local => {
+            Ok(value_totally_ordered(ctx.value_checked(id)?.as_ref()))
+        }
+        _ => Ok(true),
     }
 }
 
@@ -3765,36 +4004,62 @@ fn value_totally_ordered(value: Option<&Value>) -> bool {
 /// The best k rows of the pieces of an [`OrderedTopK`] scan without value order, which
 /// are read whole, in no particular order; `None` when one of their values is not
 /// totally ordered. Adds the rows read to `scanned`.
-fn topk_rest(
-    ctx: &Ctx,
+fn topk_rest<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     vars: &[VarId],
     pieces: &[&super::plan::TopKPiece],
     scanned: &mut usize,
-) -> Result<Option<Table>> {
-    let mut rest = Table::new(vars.to_vec());
+) -> Result<Option<Materialized<'ctx>>> {
+    let mut rest = Materialized::empty_fast(ctx, vars, &[])?;
     for p in pieces {
         let (t, n) = topk_read(ctx, spec, p.lo, p.hi, p.exact, vars)?;
         *scanned += n;
-        rest.append(t);
-        ctx.check_output(rest.len(), rest.width())?;
+        topk_append(ctx, &mut rest, t)?;
+        ctx.check_output(rest.table.len(), rest.table.width())?;
     }
     // Up to `PAR_THRESHOLD` rows, decode the dictionary ORDER values once each in key
     // order, in one charged, operation-local pass, for the checks and the prefilter
     // below. A larger input reads them through the value cache in parallel.
-    let decoded = if rest.len() <= PAR_THRESHOLD {
-        super::exprcache::dictionary_values(ctx, &rest, &Expr::Var(spec.var))?
+    let decoded = if rest.table.len() <= PAR_THRESHOLD {
+        super::exprcache::dictionary_values(ctx, &rest.table, &Expr::Var(spec.var))?
     } else {
         None
     };
     let total = match &decoded {
-        Some(values) => rest_total(ctx, &rest, values)?,
+        Some(values) => rest_total(ctx, &rest.table, values)?,
         None => {
-            let total = |id: &Id| totally_ordered(ctx, *id);
-            if rest.len() > PAR_THRESHOLD / 4 {
-                rest.cols[0].par_iter().all(total)
+            if rest.table.len() > PAR_THRESHOLD / 4 {
+                let not_total = std::sync::atomic::AtomicBool::new(false);
+                rest.table.cols[0].par_iter().enumerate().try_for_each(
+                    |(i, &id)| -> Result<()> {
+                        if not_total.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                        if i.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        if !totally_ordered(ctx, id)? {
+                            not_total.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok(())
+                    },
+                )?;
+                ctx.check()?;
+                !not_total.load(std::sync::atomic::Ordering::Relaxed)
             } else {
-                rest.cols[0].iter().all(total)
+                let mut ok = true;
+                for (i, &id) in rest.table.cols[0].iter().enumerate() {
+                    if i.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    if !totally_ordered(ctx, id)? {
+                        ok = false;
+                        break;
+                    }
+                }
+                ctx.check()?;
+                ok
             }
         }
     };
@@ -3806,19 +4071,23 @@ fn topk_rest(
     // values again in the prefilter of `order_by`.
     if let Some(values) = &decoded
         && ctx.opt.topk_prefilter
-        && rest.len() > spec.k
-        && let Some((rows, charge)) = topk_candidates(ctx, &rest, &keys, spec.k, Some(values))?
-        && rows.len() < rest.len()
+        && rest.table.len() > spec.k
+        && let Some((rows, charge)) =
+            topk_candidates(ctx, &rest.table, &keys, spec.k, Some(values))?
+        && rows.len() < rest.table.len()
     {
-        ctx.check_output(rows.len(), rest.width())?;
-        rest = rest.take_rows(&rows);
+        ctx.check_output(rows.len(), rest.table.width())?;
+        rest = topk_take_rows(ctx, &rest.table, &rows)?;
         drop(charge);
     }
     drop(decoded);
     // only their first k can be among the first k of all rows (the order of two rows
     // does not depend on the others)
-    if rest.len() > spec.k {
-        rest = order_by(ctx, rest, &keys, Some(spec.k), &mut ExprReport::default())?.0;
+    if rest.table.len() > spec.k {
+        let (input, _input_charge) = rest.into_fast_parts()?;
+        let credit = ctx.charge(topk_table_bytes(spec.k, vars.len()))?;
+        let sorted = order_by(ctx, input, &keys, Some(spec.k), &mut ExprReport::default())?.0;
+        rest = Materialized::with_fast(sorted, credit)?;
     }
     Ok(Some(rest))
 }
@@ -3845,7 +4114,7 @@ fn rest_total(
         if !matches!(
             id.tag(),
             crate::id::Tag::Vocab | crate::id::Tag::Delta | crate::id::Tag::Local
-        ) && !totally_ordered(ctx, id)
+        ) && !totally_ordered(ctx, id)?
         {
             return Ok(false);
         }
@@ -3869,6 +4138,10 @@ struct RestOffer<'a> {
 }
 
 impl HeapRows<u32> for RestOffer<'_> {
+    fn reserve_key_slots(&mut self, _bytes: u64) -> Result<()> {
+        unreachable!("ordered top-k only offers a single key")
+    }
+
     fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<u32> {
         let s = &mut *self.slots;
         let slot = match s.free.pop() {
@@ -3905,7 +4178,7 @@ const TOPK_MORSEL_ROWS: usize = crate::index::BLOCK_ROWS;
 
 /// The rows a morsel of [`topk_rest_morsels`] keeps, the rows its scan produced and, when
 /// the scan drops union-graph duplicates, the last of those rows.
-type MorselBest = (Table, usize, Option<Vec<Id>>);
+type MorselBest<'ctx> = (Materialized<'ctx>, usize, Option<[Id; 4]>);
 
 /// The keys `[first, last]` of one morsel of [`topk_rest_morsels`], the piece it belongs
 /// to and the rows of its blocks.
@@ -3914,7 +4187,6 @@ struct Morsel {
     last: Key,
     exact: bool,
     piece: usize,
-    rows: usize,
 }
 
 /// [`topk_rest`] with a heap. The pieces are split into morsels of whole index blocks,
@@ -3926,13 +4198,13 @@ struct Morsel {
 /// per worker thread and the rows they keep, instead of every row of the pieces. A morsel
 /// is checked for values that are not totally ordered before it ranks its rows, and one
 /// such value sends the whole query to the generic plan, as it does eagerly.
-fn topk_rest_morsels(
-    ctx: &Ctx,
+fn topk_rest_morsels<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     vars: &[VarId],
     pieces: &[&super::plan::TopKPiece],
     scanned: &mut usize,
-) -> Result<Option<Table>> {
+) -> Result<Option<Materialized<'ctx>>> {
     let keys = [(Expr::Var(spec.var), spec.asc)];
     let scan = &spec.scan;
     let perm = ctx.snap.perm(scan.perm);
@@ -3945,6 +4217,7 @@ fn topk_rest_morsels(
     // the one before the gap, so each morsel but a piece's last ends just before the next
     // one's first block, and a piece with no base block is one morsel.
     let mut morsels: Vec<Morsel> = Vec::new();
+    let mut morsel_list = ctx.retained_charge(0)?;
     for (piece, p) in pieces.iter().enumerate() {
         let (lo, hi) = (bound(p.lo, 0), bound(p.hi, u64::MAX));
         let (b0, b1) = perm.key_block_range(&lo, &hi);
@@ -3975,12 +4248,17 @@ fn topk_rest_morsels(
                 }
                 next.min(hi)
             };
+            if morsels.len() == morsels.capacity() {
+                let next_cap = morsels.capacity().saturating_mul(2).max(8);
+                if let Some(h) = &mut morsel_list {
+                    h.resize((next_cap * std::mem::size_of::<Morsel>()) as u64)?;
+                }
+            }
             morsels.push(Morsel {
                 first,
                 last,
                 exact: p.exact,
                 piece,
-                rows,
             });
             if e >= b1 {
                 break;
@@ -3989,7 +4267,9 @@ fn topk_rest_morsels(
         }
     }
     ctx.check()?;
-    let _list = ctx.charge((morsels.capacity() * std::mem::size_of::<Morsel>()) as u64)?;
+    if let Some(h) = &mut morsel_list {
+        h.resize((morsels.capacity() * std::mem::size_of::<Morsel>()) as u64)?;
+    }
     let mut heap: TopK<u32> = TopK::new(spec.k, vec![spec.asc]);
     let mut slots = RestSlots {
         width: vars.len(),
@@ -4005,7 +4285,7 @@ fn topk_rest_morsels(
     // scan drops duplicate rows of a union default graph. The copies of a triple are
     // adjacent in key order, and the scan of one morsel drops them within the morsel,
     // so a morsel can only repeat the previous one's last row, as its first row.
-    let mut carried: Option<(usize, Vec<Id>)> = None;
+    let mut carried: Option<(usize, [Id; 4])> = None;
     // A wave of one morsel per worker at a time: a worker that waits inside a morsel's
     // own parallel work could otherwise steal and start every other morsel.
     for wave in morsels.chunks(rayon::current_num_threads().max(1)) {
@@ -4019,22 +4299,23 @@ fn topk_rest_morsels(
         for (m, (mut t, mut n, last)) in wave.iter().zip(parts) {
             if let Some((piece, row)) = &carried
                 && *piece == m.piece
-                && !t.is_empty()
-                && t.cols.iter().zip(row).all(|(c, &id)| c[0] == id)
+                && !t.table.is_empty()
+                && t.table.cols.iter().zip(row).all(|(c, &id)| c[0] == id)
             {
                 // a read of the whole piece drops this copy, as eager execution does
-                let rows: Vec<usize> = (1..t.len()).collect();
-                t = t.take_rows(&rows);
+                let _rows = ctx.charge(t.table.len() as u64 * size_of::<usize>() as u64)?;
+                let rows: Vec<usize> = (1..t.table.len()).collect();
+                t = topk_take_rows(ctx, &t.table, &rows)?;
                 n -= 1;
             }
             if let Some(last) = last {
                 carried = Some((m.piece, last));
             }
             *scanned += n;
-            if t.is_empty() {
+            if t.table.is_empty() {
                 continue;
             }
-            let room = heap.k().saturating_add(1).min(t.len()) as u64;
+            let room = heap.k().saturating_add(1).min(t.table.len()) as u64;
             if let Some(held) = &mut held {
                 held.resize(
                     1024 + (heap.kept() as u64 + room) * entry_bytes
@@ -4044,12 +4325,12 @@ fn topk_rest_morsels(
             }
             let mut offer = RestOffer {
                 slots: &mut slots,
-                table: &t,
+                table: &t.table,
             };
             offer_rows(
                 ctx,
                 &mut heap,
-                &t,
+                &t.table,
                 &keys,
                 &mut ExprReport::default(),
                 &mut offer,
@@ -4060,69 +4341,81 @@ fn topk_rest_morsels(
     let width = slots.width;
     let entries = heap.into_sorted();
     ctx.check_output(entries.len(), width)?;
-    let mut rest = Table::new(vars.to_vec());
-    for (j, col) in rest.cols.iter_mut().enumerate() {
+    let mut rest = Materialized::empty_fast(ctx, vars, &[])?;
+    rest.reserve_rows(ctx, entries.len())?;
+    for (j, col) in rest.table.cols.iter_mut().enumerate() {
         col.extend(
             entries
                 .iter()
                 .map(|e| slots.ids[e.payload as usize * width + j]),
         );
     }
-    rest.len = entries.len();
+    rest.table.len = entries.len();
     Ok(Some(rest))
 }
 
 /// The rows of one morsel of [`topk_rest_morsels`] that have fewer than k rows of the
 /// morsel ahead of them, in arrival order, and the rows the morsel read; `None` when one
 /// of its values is not totally ordered.
-fn morsel_best(
-    ctx: &Ctx,
+fn morsel_best<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     vars: &[VarId],
     keys: &[(Expr, bool)],
     m: &Morsel,
-) -> Result<Option<MorselBest>> {
-    // the morsel's rows, charged from its blocks before they are read and then at their
-    // real size
-    let estimate = (m.rows as u64).saturating_mul(vars.len() as u64 * 8);
-    let rows = ctx.charge(estimate)?;
+) -> Result<Option<MorselBest<'ctx>>> {
     let (mut t, n, last) = topk_read_keys_last(ctx, spec, m.first, m.last, m.exact, vars)?;
-    if t.is_empty() {
+    if t.table.is_empty() {
         return Ok(Some((t, n, last)));
     }
-    rows.add(t.mem_bytes().saturating_sub(estimate))?;
-    let decoded = super::exprcache::dictionary_values(ctx, &t, &Expr::Var(spec.var))?;
+    let decoded = super::exprcache::dictionary_values(ctx, &t.table, &Expr::Var(spec.var))?;
     let total = match &decoded {
-        Some(values) => rest_total(ctx, &t, values)?,
+        Some(values) => rest_total(ctx, &t.table, values)?,
         // without a decoded column, values are read one at a time, as eager execution
         // reads them
-        None => t.cols[0].iter().all(|&id| totally_ordered(ctx, id)),
+        None => {
+            let mut ok = true;
+            for (i, &id) in t.table.cols[0].iter().enumerate() {
+                if i.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                if !totally_ordered(ctx, id)? {
+                    ok = false;
+                    break;
+                }
+            }
+            ctx.check()?;
+            ok
+        }
     };
     if !total {
         return Ok(None);
     }
     if ctx.opt.topk_prefilter
-        && t.len() > spec.k
-        && let Some((rows, charge)) = topk_candidates(ctx, &t, keys, spec.k, decoded.as_ref())?
-        && rows.len() < t.len()
+        && t.table.len() > spec.k
+        && let Some((rows, charge)) =
+            topk_candidates(ctx, &t.table, keys, spec.k, decoded.as_ref())?
+        && rows.len() < t.table.len()
     {
-        t = t.take_rows(&rows);
+        t = topk_take_rows(ctx, &t.table, &rows)?;
         drop(charge);
     }
     drop(decoded);
-    if t.len() > spec.k {
+    if t.table.len() > spec.k {
+        let mut heap_rows = EagerHeapRows::new(ctx)?;
         let mut heap: TopK<usize> = TopK::new(spec.k, vec![spec.asc]);
         offer_rows(
             ctx,
             &mut heap,
-            &t,
+            &t.table,
             keys,
             &mut ExprReport::default(),
-            &mut RowIndex,
+            &mut heap_rows,
         )?;
         let mut rows: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        drop(heap_rows);
         rows.sort_unstable();
-        t = t.take_rows(&rows);
+        t = topk_take_rows(ctx, &t.table, &rows)?;
     }
     ctx.check()?;
     Ok(Some((t, n, last)))
@@ -4136,6 +4429,69 @@ pub(super) fn ordered_topk(
     spec: &OrderedTopK,
     out: &[VarId],
 ) -> Result<Option<(Table, usize)>> {
+    ordered_topk_inner(ctx, spec, out, heap_eligible(ctx))
+}
+
+/// [`ordered_topk`] using morsel-wise heap selection for non-monotone pieces regardless
+/// of `ctx.opt.topk_heap`, transferring the projected result directly into a pre-admitted
+/// cursor [`OwnedCharge`](super::ctx::OwnedCharge) before releasing working charges.
+pub(super) fn ordered_topk_morsels_charged(
+    ctx: &std::sync::Arc<Ctx>,
+    spec: &OrderedTopK,
+    out: &[VarId],
+) -> Result<Option<(Table, super::ctx::OwnedCharge, usize)>> {
+    ordered_topk_inner_charged(ctx, spec, out, true)
+}
+
+fn ordered_topk_inner(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    out: &[VarId],
+    morsels: bool,
+) -> Result<Option<(Table, usize)>> {
+    let mut table_out = None;
+    let scanned = ordered_topk_run(ctx, spec, out, morsels, &mut |top| {
+        table_out = Some(top.project(out));
+        Ok(())
+    })?;
+    Ok(table_out.map(|t| (t, scanned)))
+}
+
+fn ordered_topk_inner_charged(
+    ctx: &std::sync::Arc<Ctx>,
+    spec: &OrderedTopK,
+    out: &[VarId],
+    morsels: bool,
+) -> Result<Option<(Table, super::ctx::OwnedCharge, usize)>> {
+    let mut result: Option<(Table, super::ctx::OwnedCharge)> = None;
+    let scanned = ordered_topk_run(ctx, spec, out, morsels, &mut |top| {
+        let len = top.len();
+        let width = out.len();
+        let mut charge = super::ctx::OwnedCharge::new(ctx, topk_table_bytes(len, width))?;
+        let mut projected = Table::new(out.to_vec());
+        for (col, &var) in projected.cols.iter_mut().zip(out) {
+            col.reserve_exact(len);
+            if let Some(src) = top.col_of(var) {
+                col.extend_from_slice(&top.cols[src]);
+            } else {
+                col.resize(len, Id::UNDEF);
+            }
+        }
+        projected.len = len;
+        charge.resize(super::algosvc::table_capacity(&projected)?)?;
+        result = Some((projected, charge));
+        Ok(())
+    })?;
+    Ok(result.map(|(t, c)| (t, c, scanned)))
+}
+
+fn ordered_topk_run(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    _out: &[VarId],
+    morsels: bool,
+    finish: &mut dyn FnMut(Table) -> Result<()>,
+) -> Result<usize> {
     let vars: Vec<VarId> = spec.scan.cols.iter().map(|c| c.1).collect();
     debug_assert_eq!(vars.first(), Some(&spec.var));
     let mut scanned = 0;
@@ -4150,7 +4506,7 @@ pub(super) fn ordered_topk(
                 hi: p.hi,
                 exact: p.exact,
                 best_high: mono.is_some_and(|up| up != spec.asc),
-                kept: Table::new(vars.clone()),
+                kept: Materialized::empty_fast(ctx, &vars, &[])?,
                 want: spec.k.max(16).saturating_mul(2),
                 done: false,
                 lexical: mono.is_none(),
@@ -4159,16 +4515,15 @@ pub(super) fn ordered_topk(
             }),
         }
     }
-    let rest = if heap_eligible(ctx) {
+    let rest = if morsels {
         topk_rest_morsels(ctx, spec, &vars, &whole, &mut scanned)?
     } else {
         topk_rest(ctx, spec, &vars, &whole, &mut scanned)?
     };
     let Some(rest) = rest else {
-        return Ok(None);
+        return Ok(scanned);
     };
     let keys = [(Expr::Var(spec.var), spec.asc)];
-    let held = ctx.charge(rest.mem_bytes())?;
     let better = if spec.asc {
         Ordering::Less
     } else {
@@ -4183,19 +4538,39 @@ pub(super) fn ordered_topk(
             scanned += topk_step(ctx, spec, run, &vars)?;
         }
         // the candidates in the generic plan's row order, ranked by the generic ORDER BY
-        let n = rest.len() + runs.iter().map(|r| r.kept.len()).sum::<usize>();
+        let n = rest.table.len() + runs.iter().map(|r| r.kept.table.len()).sum::<usize>();
         ctx.check_output(n, vars.len())?;
-        let mut cand = rest.clone();
+        let cand_est = topk_table_bytes(n, vars.len());
+        let cand_charge = ctx.charge(cand_est)?;
+        let mut cand = Table::new(vars.clone());
+        for col in &mut cand.cols {
+            col.reserve_exact(n);
+        }
+        for (dst, src) in cand.cols.iter_mut().zip(&rest.table.cols) {
+            dst.extend_from_slice(src);
+        }
+        cand.len = rest.table.len();
         for run in &runs {
-            cand.append(run.kept.clone());
+            for (dst, src) in cand.cols.iter_mut().zip(&run.kept.table.cols) {
+                dst.extend_from_slice(src);
+            }
+            cand.len += run.kept.table.len();
         }
         cand.sorted.clear();
-        cand.sort_by_vars(&spec.tie_order);
+        {
+            let sort_cols = spec.tie_order.len() as u64 * size_of::<usize>() as u64;
+            let sort_rows = n as u64 * size_of::<usize>() as u64;
+            let _ties = ctx.charge(cand_est.saturating_add(sort_cols).saturating_add(sort_rows))?;
+            cand.sort_by_vars(&spec.tie_order);
+        }
+        let top_charge = ctx.charge(topk_table_bytes(n.min(spec.k), vars.len()))?;
         let (top, _) = order_by(ctx, cand, &keys, Some(spec.k), &mut ExprReport::default())?;
+        drop(cand_charge);
         if top.len() == spec.k {
             // a piece is finished once the k-th row is strictly better than its best
             // unread value, and so than every unread value
-            let kth = ctx.value(top.cols[0][spec.k - 1]);
+            let kth_credit = ctx.charge(0)?;
+            let kth = ctx.value_checked_into(top.cols[0][spec.k - 1], &kth_credit)?;
             for run in runs.iter_mut().filter(|r| !r.done) {
                 if run.lexical {
                     match lexical_check(ctx, spec, run, kth.as_ref())? {
@@ -4205,81 +4580,50 @@ pub(super) fn ordered_topk(
                             for id in ids {
                                 let (t, n) = topk_read(ctx, spec, id, id, run.exact, &vars)?;
                                 scanned += n;
-                                run.kept.append(t);
+                                topk_append(ctx, &mut run.kept, t)?;
                                 run.extra.push(id);
                             }
                             run.hold = true;
                         }
-                        Lexical::Generic => return Ok(None),
+                        Lexical::Generic => return Ok(scanned),
                     }
                     continue;
                 }
                 let best = Id(if run.best_high { run.hi } else { run.lo });
-                if order_cmp(kth.as_ref(), ctx.value(best).as_ref()) == better {
+                let best_credit = ctx.charge(0)?;
+                let best_v = ctx.value_checked_into(best, &best_credit)?;
+                if order_cmp(kth.as_ref(), best_v.as_ref()) == better {
                     run.done = true;
                 }
+                drop(best_v);
+                drop(best_credit);
             }
+            drop(kth);
+            drop(kth_credit);
         }
         if runs.iter().all(|r| r.done) {
-            drop(held);
-            return Ok(Some((top.project(out), scanned)));
+            finish(top)?;
+            drop(top_charge);
+            return Ok(scanned);
         }
-    }
-}
-
-// The paid sink keeps its actual guard around every physical growth. Raw-table
-// callers remain explicit legacy internal paths until their producer migration.
-trait ScanSink {
-    fn table(&self) -> &Table;
-    fn table_mut(&mut self) -> &mut Table;
-    fn prepare(&mut self, ctx: &Ctx, rows: usize) -> Result<()>;
-    fn check_output(&self, ctx: &Ctx) -> Result<()>;
-}
-impl ScanSink for Table {
-    fn table(&self) -> &Table {
-        self
-    }
-    fn table_mut(&mut self) -> &mut Table {
-        self
-    }
-    fn prepare(&mut self, _ctx: &Ctx, _rows: usize) -> Result<()> {
-        Ok(())
-    }
-    fn check_output(&self, ctx: &Ctx) -> Result<()> {
-        ctx.check_output(self.len(), self.width())
-    }
-}
-impl ScanSink for Materialized<'_> {
-    fn table(&self) -> &Table {
-        &self.table
-    }
-    fn table_mut(&mut self) -> &mut Table {
-        &mut self.table
-    }
-    fn prepare(&mut self, ctx: &Ctx, rows: usize) -> Result<()> {
-        ctx.check_output_rows(rows)?;
-        self.reserve_rows(ctx, rows)
-    }
-    fn check_output(&self, ctx: &Ctx) -> Result<()> {
-        ctx.check_output_rows(self.table.len())
     }
 }
 
 /// Append the scan's rows with keys in `[lo, hi]`, stopping at the row limit.
-fn scan_into<T: ScanSink>(
+fn scan_into(
     ctx: &Ctx,
     spec: &ScanSpec,
     lo: crate::index::Key,
     hi: crate::index::Key,
     limit: Option<usize>,
-    t: &mut T,
+    t: &mut Materialized<'_>,
 ) -> Result<bool> {
     let limit = limit.unwrap_or(usize::MAX);
     let mut truncated = false;
     let mut last: Option<[u64; 4]> = None;
     let mut n = 0usize;
-    let mut row = |k: &[u64; 4], t: &mut T| -> Result<()> {
-        if t.table().len >= limit || !spec.graph.accepts(k[spec.graph_col]) {
+    let mut row = |k: &[u64; 4], t: &mut Materialized<'_>| -> Result<()> {
+        if t.table.len >= limit || !spec.graph.accepts(k[spec.graph_col]) {
             return Ok(());
         }
         if spec.eqs.iter().any(|&(a, b)| k[a] != k[b]) {
@@ -4296,12 +4640,13 @@ fn scan_into<T: ScanSink>(
             last = Some(proj);
         }
         let rows = t
-            .table()
+            .table
             .len
             .checked_add(1)
             .ok_or_else(|| Error::invalid("scan output rows overflow"))?;
-        t.prepare(ctx, rows)?;
-        let table = t.table_mut();
+        ctx.check_output_rows(rows)?;
+        t.reserve_rows(ctx, rows)?;
+        let table = &mut t.table;
         for (c, &(kc, _)) in spec.cols.iter().enumerate() {
             table.cols[c].push(Id(k[kc]));
         }
@@ -4310,20 +4655,21 @@ fn scan_into<T: ScanSink>(
     };
     ctx.snap
         .scan_between_cols(spec.perm, lo, hi, scan_mask(spec), |chunk| {
-            if t.table().len >= limit {
+            if t.table.len >= limit {
                 truncated = true;
                 return Ok(false);
             }
             match chunk {
                 Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
-                    let e = e.min(s.saturating_add(limit - t.table().len));
+                    let e = e.min(s.saturating_add(limit - t.table.len));
                     let rows = t
-                        .table()
+                        .table
                         .len
                         .checked_add(e - s)
                         .ok_or_else(|| Error::invalid("scan output rows overflow"))?;
-                    t.prepare(ctx, rows)?;
-                    let table = t.table_mut();
+                    ctx.check_output_rows(rows)?;
+                    t.reserve_rows(ctx, rows)?;
+                    let table = &mut t.table;
                     for (c, &(kc, _)) in spec.cols.iter().enumerate() {
                         table.cols[c].extend(b.cols[kc][s..e].iter().map(|&x| Id(x)));
                     }
@@ -4344,9 +4690,9 @@ fn scan_into<T: ScanSink>(
             if n > 1 << 16 {
                 n = 0;
                 ctx.check()?;
-                t.check_output(ctx)?;
+                ctx.check_output_rows(t.table.len())?;
             }
-            if t.table().len >= limit {
+            if t.table.len >= limit {
                 truncated = true;
                 return Ok(false);
             }
@@ -4866,7 +5212,9 @@ fn unpack(
             ctx.check()?;
         }
         let Some(tc) = tc else { break };
-        let Some(oxrdf::Term::Triple(tr)) = ctx.term(input.cols[tc][i]) else {
+        let decode = ctx.charge(0)?;
+        let Some(oxrdf::Term::Triple(tr)) = ctx.term_checked_into(input.cols[tc][i], &decode)?
+        else {
             continue;
         };
         let comps = [
@@ -4874,6 +5222,9 @@ fn unpack(
             ctx.intern_term(&oxrdf::Term::NamedNode(tr.predicate.clone())),
             ctx.intern_term(&tr.object),
         ];
+        drop(tr);
+        drop(decode);
+        ctx.check()?;
         for (j, m) in map.iter().enumerate() {
             row[j] = m.map_or(Id::UNDEF, |c| input.cols[c][i]);
         }
@@ -4898,6 +5249,7 @@ fn unpack(
             out.push_row(&row);
         }
     }
+    ctx.check()?;
     Ok(out)
 }
 
@@ -5129,11 +5481,7 @@ fn string_cross(
         if j.is_multiple_of(1024) {
             ctx.check()?;
         }
-        let key = with_string_lexical(ctx, id, |s| {
-            index_charge.add(s.len() as u64)?;
-            Ok(Box::<str>::from(s))
-        })?
-        .expect("proved string domain");
+        let key = string_lexical_boxed(ctx, id, &index_charge)?.expect("proved string domain");
         index.push((key, j));
     }
     // One array, no extra sort scratch. Including row numbers in the key keeps
@@ -5152,12 +5500,10 @@ fn string_cross(
         if i.is_multiple_of(1024) {
             ctx.check()?;
         }
-        with_string_lexical(ctx, id, |s| {
-            let (begin, end) = range(s);
-            rows = rows.saturating_add(end - begin);
-            ctx.check_output_rows(rows)
-        })?
-        .expect("proved string domain");
+        let (begin, end) =
+            with_string_lexical(ctx, id, |s| Ok(range(s)))?.expect("proved string domain");
+        rows = rows.saturating_add(end - begin);
+        ctx.check_output_rows(rows)?;
     }
     // Includes the pair array while the matching table is materialized, with all
     // lexical index payloads and the input tables still charged and alive.
@@ -5171,17 +5517,14 @@ fn string_cross(
         if i.is_multiple_of(1024) {
             ctx.check()?;
         }
-        with_string_lexical(ctx, id, |s| {
-            let (begin, end) = range(s);
-            for (_, j) in &index[begin..end] {
-                if pairs.len().is_multiple_of(1024) {
-                    ctx.check()?;
-                }
-                pairs.push((i as u32, *j as u32));
+        let (begin, end) =
+            with_string_lexical(ctx, id, |s| Ok(range(s)))?.expect("proved string domain");
+        for (_, j) in &index[begin..end] {
+            if pairs.len().is_multiple_of(1024) {
+                ctx.check()?;
             }
-            Ok(())
-        })?
-        .expect("proved string domain");
+            pairs.push((i as u32, *j as u32));
+        }
     }
     ctx.check()?;
     // Pair capacity is already live; admit only the output columns here.
@@ -5206,28 +5549,49 @@ fn string_lexical_key(key: &[u8]) -> Option<&str> {
     std::str::from_utf8(&key[1..sep]).ok()
 }
 
-/// Read a borrowed lexical key with the existing charged vocabulary scratch.
-/// Unlike Ctx::value this does not populate the eager decoded-value cache.
+/// Read a borrowed lexical key with controlled vocabulary scratch and live request
+/// controls. `f` must only inspect the borrowed string without calling `ctx.charge()`.
+/// Unlike `Ctx::value` this does not populate the eager decoded-value cache.
 fn with_string_lexical<T>(
     ctx: &Ctx,
     id: Id,
     mut f: impl FnMut(&str) -> Result<T>,
 ) -> Result<Option<T>> {
-    use crate::id::Tag;
-    let mut read = |key: &[u8]| match string_lexical_key(key) {
+    ctx.with_controlled_key(id, |key| match string_lexical_key(key) {
         Some(s) => f(s).map(Some),
         None => Ok(None),
-    };
+    })
+    .map(Option::flatten)
+}
+
+/// Copy one string lexical form into a boxed string, admitting its bytes onto `credit`
+/// before allocating and never calling `credit.add` while holding a delta or local lock.
+fn string_lexical_boxed(
+    ctx: &Ctx,
+    id: Id,
+    credit: &super::ctx::Charge<'_>,
+) -> Result<Option<Box<str>>> {
+    use crate::id::Tag;
+    ctx.check()?;
     match id.tag() {
         Tag::Vocab => ctx
-            .with_cursor_vocab_key(id.payload(), &mut read)?
-            .unwrap_or(Ok(None)),
-        Tag::Delta => ctx
-            .snap
-            .generation
-            .dvocab
-            .with(|v| v.get(id.payload()).map(&mut read).unwrap_or(Ok(None))),
-        Tag::Local => ctx.with_local_key(id.payload(), read).unwrap_or(Ok(None)),
+            .with_controlled_vocab_key(id.payload(), |key| {
+                let Some(s) = string_lexical_key(key) else {
+                    return Ok(None);
+                };
+                credit.add(s.len() as u64)?;
+                ctx.check()?;
+                Ok(Some(Box::<str>::from(s)))
+            })
+            .map(Option::flatten),
+        Tag::Delta | Tag::Local => {
+            let Some(len) = with_string_lexical(ctx, id, |s| Ok(s.len()))? else {
+                return Ok(None);
+            };
+            credit.add(len as u64)?;
+            ctx.check()?;
+            with_string_lexical(ctx, id, |s| Ok(Box::<str>::from(s)))
+        }
         _ => Ok(None),
     }
 }
@@ -5506,11 +5870,15 @@ fn assign(ctx: &Ctx, t: &mut Table, v: VarId, col: Vec<Id>) -> Result<()> {
             t.cols[c][i] = new;
             continue;
         }
-        keep[i] = match (ctx.term(old), ctx.term(new)) {
+        let decode = ctx.charge(0)?;
+        let a = ctx.term_checked_into(old, &decode)?;
+        let b = ctx.term_checked_into(new, &decode)?;
+        keep[i] = match (a, b) {
             (Some(a), Some(b)) => super::cdt::same_value(&a, &b).unwrap_or(false),
             _ => false,
         };
     }
+    ctx.check()?;
     if keep.iter().any(|k| !k) {
         let sorted = t.sorted.clone();
         t.filter_rows(&keep);
@@ -5539,23 +5907,44 @@ fn unfold(
     let mut out = Table::new(vars);
     let mut row: Vec<Id> = Vec::with_capacity(out.width());
     // the elements of each distinct literal, interned once
+    let seen_charge = ctx.charge(0)?;
     let mut seen: FxHashMap<Id, Option<Vec<(Id, Id)>>> = FxHashMap::default();
     for (i, id) in col.into_iter().enumerate() {
         if i % 4096 == 0 {
             ctx.check()?;
             ctx.check_output(out.len(), out.width())?;
         }
-        let elems = seen.entry(id).or_insert_with(|| {
-            let t = ctx.term(id)?;
-            let parts = super::cdt::unfold(&t)?;
-            let intern = |x: Option<oxrdf::Term>| x.map_or(Id::UNDEF, |x| ctx.intern_term(&x));
-            Some(
-                parts
-                    .into_iter()
-                    .map(|(a, b)| (intern(a), intern(b)))
-                    .collect(),
-            )
-        });
+        if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(id) {
+            let decode = ctx.charge(0)?;
+            let entry = match ctx.term_checked_into(id, &decode)? {
+                Some(t) => match super::cdt::unfold(&t) {
+                    Some(parts) => {
+                        let entry_bytes =
+                            (parts.len() as u64).saturating_mul(16).saturating_add(64);
+                        seen_charge.add(entry_bytes)?;
+                        let mut pairs = Vec::with_capacity(parts.len());
+                        for (a, b) in parts {
+                            let ia = a.map_or(Id::UNDEF, |x| ctx.intern_term(&x));
+                            let ib = b.map_or(Id::UNDEF, |x| ctx.intern_term(&x));
+                            ctx.check()?;
+                            pairs.push((ia, ib));
+                        }
+                        Some(pairs)
+                    }
+                    None => {
+                        seen_charge.add(64)?;
+                        None
+                    }
+                },
+                None => {
+                    seen_charge.add(64)?;
+                    None
+                }
+            };
+            e.insert(entry);
+            drop(decode);
+        }
+        let elems = &seen[&id];
         row.clear();
         row.extend(t.cols.iter().map(|c| c[i]));
         match elems {
@@ -5578,6 +5967,10 @@ fn unfold(
             }
         }
     }
+    ctx.check()?;
+    ctx.check_output(out.len(), out.width())?;
+    drop(seen);
+    drop(seen_charge);
     Ok(out)
 }
 
@@ -5703,7 +6096,11 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> 
         // The rows are evaluated one at a time, each reading the terms it needs. On a
         // cold vocabulary every term is a page fault that waits for the one before it.
         // Ask for all their blocks first, so that the reads overlap.
-        if ctx.opt.prefetch_terms && crate::index::io_hints() {
+        #[cfg(not(test))]
+        let prefetch_terms = true;
+        #[cfg(test)]
+        let prefetch_terms = ctx.opt.prefetch_terms;
+        if prefetch_terms && crate::index::io_hints() {
             prefetch_column_terms(ctx, t, &vars);
         }
         return Ok(None);
@@ -5793,21 +6190,81 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> 
     }))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Count of admitted `prefetch_column_terms` ID-vector allocations on this thread
+    /// (for tests that verify budget-checked admission and scalar fallback).
+    static PREFETCH_COLUMN_TERMS_ALLOCATED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Count of admitted `prefetch_column_terms` mapped block-index resizes on this thread.
+    static PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
-/// (see [`decode_for`]).
+/// (see [`decode_for`]). Skips without charging or allocating when neither the base
+/// vocabulary nor its numeric column has unhinted mapped pages for these ids. In cursor
+/// mode, transient prefetch scratch reuses the paid decoding envelope and admits any
+/// extra optional headroom as reclaimable ledger bytes so repeated batches take no
+/// per-batch ledger locks while required charges can reclaim idle headroom before
+/// failing; in eager mode, it is charged and released directly on the fast account. If
+/// the remaining budget cannot hold the scratch, prefetching is skipped cleanly.
 fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
-    let mut ids: Vec<u64> = vars
+    let vocab = &ctx.snap.generation.vocab;
+    let ids_iter = || {
+        vars.iter()
+            .filter_map(|&v| t.col_of(v))
+            .flat_map(|c| t.cols[c].iter())
+            .filter(|id| id.tag() == crate::id::Tag::Vocab)
+            .map(|id| id.payload())
+    };
+    if !vocab.has_unhinted_value_pages(ids_iter()) {
+        return;
+    }
+    let count: usize = vars
         .iter()
         .filter_map(|&v| t.col_of(v))
-        .flat_map(|c| t.cols[c].iter())
-        .filter(|id| id.tag() == crate::id::Tag::Vocab)
-        .map(|id| id.payload())
-        .collect();
+        .map(|c| {
+            t.cols[c]
+                .iter()
+                .filter(|id| id.tag() == crate::id::Tag::Vocab)
+                .count()
+        })
+        .sum();
+    if count < 2 {
+        return;
+    }
+    let Some(ids_bytes) = count
+        .checked_mul(size_of::<u64>())
+        .and_then(|b| u64::try_from(b).ok())
+    else {
+        return;
+    };
+    let max_blocks = count
+        .checked_mul(size_of::<usize>())
+        .and_then(|b| u64::try_from(b).ok())
+        .unwrap_or(0);
+    let Ok(mut scratch) =
+        ctx.admit_prefetch_scratch(ids_bytes, ids_bytes.saturating_add(max_blocks))
+    else {
+        return;
+    };
+    #[cfg(test)]
+    PREFETCH_COLUMN_TERMS_ALLOCATED.with(|n| n.set(n.get() + 1));
+    let mut ids = Vec::with_capacity(count);
+    ids.extend(ids_iter());
     ids.sort_unstable();
     ids.dedup();
     if ids.len() >= 2 {
-        ctx.snap.generation.vocab.prefetch_value_pages(&ids);
+        let _ = vocab.prefetch_value_pages_checked(&ids, |block_bytes| {
+            scratch.grow(ids_bytes.saturating_add(block_bytes as u64))?;
+            #[cfg(test)]
+            PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|n| n.set(n.get() + 1));
+            Ok(())
+        });
     }
+    drop(ids);
+    drop(scratch);
 }
 
 /// Keep the rows that pass every conjunct: EXISTS conjuncts answered from a key set
@@ -5924,15 +6381,432 @@ static STRING_ORDER_MASKS: AtomicUsize = AtomicUsize::new(0);
 /// The rows whose values the first test of [`string_order_mask`] reads.
 const STRING_ORDER_SAMPLE: usize = 64;
 
+/// Stratified sample rows used to size the first shared floor table without heap allocation.
+const FLOOR_ESTIMATE_SAMPLE: usize = 1024;
+
+/// Distinct count and frequency counts `(distinct, singletons, doubletons)` of a sorted
+/// non-empty slice of raw ids.
+fn sorted_id_freq(sorted: &[u64]) -> (usize, usize, usize) {
+    let (mut d, mut f1, mut f2) = (0, 0, 0);
+    let mut i = 0;
+    while i < sorted.len() {
+        let v = sorted[i];
+        let start = i;
+        while i < sorted.len() && sorted[i] == v {
+            i += 1;
+        }
+        d += 1;
+        match i - start {
+            1 => f1 += 1,
+            2 => f2 += 1,
+            _ => {}
+        }
+    }
+    (d, f1, f2)
+}
+
+/// Combined `(distinct, singletons, doubletons, cross_overlap)` across two sorted slices
+/// of raw ids in one linear merge without allocation.
+fn merged_id_freq(a: &[u64], b: &[u64]) -> (usize, usize, usize, usize) {
+    let (mut d, mut f1, mut f2, mut cross) = (0, 0, 0, 0);
+    let (mut ia, mut ib) = (0, 0);
+    while ia < a.len() || ib < b.len() {
+        let v = match (a.get(ia), b.get(ib)) {
+            (Some(&va), Some(&vb)) => va.min(vb),
+            (Some(&va), None) => va,
+            (None, Some(&vb)) => vb,
+            (None, None) => break,
+        };
+        let mut ca = 0;
+        while ia < a.len() && a[ia] == v {
+            ca += 1;
+            ia += 1;
+        }
+        let mut cb = 0;
+        while ib < b.len() && b[ib] == v {
+            cb += 1;
+            ib += 1;
+        }
+        d += 1;
+        if ca > 0 && cb > 0 {
+            cross += 1;
+        }
+        match ca + cb {
+            1 => f1 += 1,
+            2 => f2 += 1,
+            _ => {}
+        }
+    }
+    (d, f1, f2, cross)
+}
+
+/// Estimate `(distinct, has_repeats)` for one column of `n` rows from a stratified sample
+/// of `s` rows with adjacent-repeat count `adj`.
+fn col_distinct_estimate(
+    n: usize,
+    s: usize,
+    d: usize,
+    f1: usize,
+    f2: usize,
+    adj: usize,
+) -> (usize, bool) {
+    if f1 == d && adj == 0 {
+        return (n, false);
+    }
+    let run_est = if adj > 0 {
+        let est = ((n as u128) * (s.saturating_sub(adj) as u128))
+            .checked_div(s as u128)
+            .unwrap_or(1);
+        usize::try_from(est).unwrap_or(n).max(1)
+    } else {
+        n
+    };
+    let chao = if f1 < d {
+        d.saturating_add(f1.saturating_mul(f1.saturating_sub(1)) / (2 * (f2 + 1)))
+    } else {
+        run_est
+    };
+    (chao.min(run_est).min(n).max(d), true)
+}
+
+/// Inclusive-exclusive row range `[lo, hi)` for stratum `k` of `s` across `n` rows.
+#[inline]
+fn stratum_bounds(k: usize, n: usize, s: usize) -> (usize, usize) {
+    let n128 = n as u128;
+    let s128 = s as u128;
+    let lo = ((k as u128) * n128 / s128) as usize;
+    let hi = (((k + 1) as u128) * n128 / s128) as usize;
+    (lo, hi)
+}
+
+struct FloorEstimate {
+    slots: usize,
+    /// Whether the sampled rows repeat enough strings for the floor table to pay off
+    /// over direct key comparison on this mask.
+    worth_caching: bool,
+}
+
+/// Estimate the initial slot count and repetition payoff of the shared floor table from a
+/// stack-allocated stratified sample of `(xs, ys)`.
+///
+/// Inputs whose strings are few or never repeat stay compact so small queries avoid
+/// over-allocating. Inputs with one non-repeating column and one small repeating column
+/// (such as a unique person name compared against a handful of cities) size a compact table
+/// wide enough that non-repeating writes do not trigger spurious growth. Large inputs with
+/// many repeating strings pre-size directly to avoid growth migrations and recomputations.
+fn estimate_floor_slots(xs: &[Id], ys: &[Id]) -> FloorEstimate {
+    use super::ctx::{FLOOR_BYPASS_HIT_DENOM, FLOOR_TABLE_FEWEST, FLOOR_TABLE_FIRST};
+    let n = xs.len().min(ys.len());
+    let s = FLOOR_ESTIMATE_SAMPLE.min(n);
+    if s == 0 {
+        return FloorEstimate {
+            slots: FLOOR_TABLE_FEWEST,
+            worth_caching: false,
+        };
+    }
+    let mut bx = [0u64; FLOOR_ESTIMATE_SAMPLE];
+    let mut by = [0u64; FLOOR_ESTIMATE_SAMPLE];
+    let (mut adj_x, mut adj_y) = (0usize, 0usize);
+    for k in 0..s {
+        let (lo, hi) = stratum_bounds(k, n, s);
+        let r = (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11;
+        let i = lo + (r % (hi - lo) as u64) as usize;
+        let (x, y) = (xs[i], ys[i]);
+        bx[k] = x.0;
+        by[k] = y.0;
+        if i + 1 < n {
+            adj_x += usize::from(xs[i + 1] == x);
+            adj_y += usize::from(ys[i + 1] == y);
+        }
+    }
+    let sx = &mut bx[..s];
+    let sy = &mut by[..s];
+    sx.sort_unstable();
+    sy.sort_unstable();
+    let (dx, f1x, f2x) = sorted_id_freq(sx);
+    let (dy, f1y, f2y) = sorted_id_freq(sy);
+    let (d_all, f1_all, f2_all, cross) = merged_id_freq(sx, sy);
+    let (est_x, rep_x) = col_distinct_estimate(n, s, dx, f1x, f2x, adj_x);
+    let (est_y, rep_y) = col_distinct_estimate(n, s, dy, f1y, f2y, adj_y);
+    let max_pow2 = 1usize << (usize::BITS - 1);
+    let round_slots = |target: usize| {
+        target
+            .max(FLOOR_TABLE_FEWEST)
+            .checked_next_power_of_two()
+            .unwrap_or(max_pow2)
+    };
+    if !rep_x && !rep_y && cross == 0 {
+        return FloorEstimate {
+            slots: FLOOR_TABLE_FEWEST,
+            worth_caching: false,
+        };
+    }
+    if cross == 0 && (rep_x ^ rep_y) {
+        let r = if rep_x { est_x } else { est_y };
+        let writes = n.max(FLOOR_TABLE_FIRST);
+        // Keep expected read-again evictions `writes * r / M` below `M / 32`.
+        let guard = usize::try_from(
+            (32u128)
+                .saturating_mul(writes as u128)
+                .saturating_mul(r as u128)
+                .isqrt(),
+        )
+        .unwrap_or(usize::MAX)
+        .saturating_mul(2);
+        let expected_hits = (n as u128).saturating_sub(r as u128);
+        let worth_caching = expected_hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM as u128)
+            >= (n as u128).saturating_mul(2);
+        return FloorEstimate {
+            slots: round_slots(r.saturating_mul(4).max(guard.min(FLOOR_TABLE_FIRST))),
+            worth_caching,
+        };
+    }
+    let u = if f1_all < d_all {
+        d_all.saturating_add(f1_all.saturating_mul(f1_all.saturating_sub(1)) / (2 * (f2_all + 1)))
+    } else {
+        est_x.saturating_add(est_y)
+    };
+    let cells = n.saturating_mul(2);
+    let u_f = u.max(1) as f64;
+    let lambda = cells as f64 / u_f;
+    let neg_exp = (-lambda).exp();
+    let distinct = ((u_f * (1.0 - neg_exp)).round() as usize)
+        .clamp(d_all, est_x.saturating_add(est_y).min(cells));
+    let poisson_rep = (u_f * (1.0 - neg_exp * (1.0 + lambda))).round() as usize;
+    let local_rep = if adj_x > 0 {
+        est_x.min(n.saturating_sub(est_x))
+    } else {
+        0
+    }
+    .saturating_add(if adj_y > 0 {
+        est_y.min(n.saturating_sub(est_y))
+    } else {
+        0
+    });
+    let repeating = poisson_rep.max(local_rep).min(distinct).min(n);
+    let target = repeating
+        .saturating_mul(4)
+        .max(distinct.saturating_mul(5).min(FLOOR_TABLE_FIRST));
+    let expected_hits = (cells as u128).saturating_sub(distinct as u128);
+    let worth_caching =
+        expected_hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM as u128) >= cells as u128;
+    FloorEstimate {
+        slots: round_slots(target),
+        worth_caching,
+    }
+}
+
+struct InitialFloorSample {
+    rows: [(u64, u64, bool, bool); STRING_ORDER_SAMPLE],
+    keep: [bool; STRING_ORDER_SAMPLE],
+    has_floors: bool,
+}
+
+/// Probe the initial sample of [`string_order_mask`] before the shared floor cache is
+/// initialized, confirming in left-to-right order that every sampled row holds two
+/// base-vocabulary simple literals without running [`estimate_floor_slots`], installing
+/// a floor table, setting `initialized` or allocating the mask buffer on fallback.
+/// Floor-only decoding-envelope refusals fall back to direct key comparison without
+/// recording a sticky failure unless a required operand decode itself refuses.
+fn probe_initial_floor_sample(
+    ctx: &Ctx,
+    xs: &[Id],
+    ys: &[Id],
+    sample: usize,
+    order: impl Fn(Id, Id, u64, u64) -> bool,
+    cmp_op: impl Fn(Ordering) -> bool,
+) -> Result<Option<InitialFloorSample>> {
+    enum ProbeFloor {
+        Floor(u64, bool),
+        NotSimple,
+        Refused,
+    }
+    let mut scratch = super::ctx::FloorScratch::default();
+    let mut keep = [false; STRING_ORDER_SAMPLE];
+    let finish_direct = |start: usize,
+                         keep: &mut [bool; STRING_ORDER_SAMPLE],
+                         scratch: &mut super::ctx::FloorScratch|
+     -> Result<Option<InitialFloorSample>> {
+        ctx.check_memory_failure()?;
+        for i in start..sample {
+            let Some(ord) = ctx.simple_literal_cmp_in(xs[i], ys[i], scratch) else {
+                ctx.check_memory_failure()?;
+                return Ok(None);
+            };
+            keep[i] = cmp_op(ord);
+        }
+        Ok(Some(InitialFloorSample {
+            rows: [(0u64, 0u64, false, false); STRING_ORDER_SAMPLE],
+            keep: *keep,
+            has_floors: false,
+        }))
+    };
+    // Check row 0 before touching the 256-slot stack table so immediately-ineligible masks
+    // pay no stack initialization cost.
+    let fa0 = match ctx.try_string_floor_in(xs[0], &mut scratch) {
+        Ok(Some(floor)) => floor,
+        Ok(None) => return Ok(None),
+        Err(_) => return finish_direct(0, &mut keep, &mut scratch),
+    };
+    let y0_new = ys[0] != xs[0];
+    let fb0 = if y0_new {
+        match ctx.try_string_floor_in(ys[0], &mut scratch) {
+            Ok(Some(floor)) => floor,
+            Ok(None) => return Ok(None),
+            Err(_) => return finish_direct(0, &mut keep, &mut scratch),
+        }
+    } else {
+        fa0
+    };
+
+    const SEEN_SLOTS: usize = 256;
+    const _: () = assert!(SEEN_SLOTS >= 2 * STRING_ORDER_SAMPLE);
+    // Open-addressed stack table keyed by raw `Id`. `Id::UNDEF.0` marks an empty slot;
+    // every key checked or inserted passes `may_be_base_literal` and is never `Id::UNDEF`.
+    let mut seen = [(Id::UNDEF.0, 0u64); SEEN_SLOTS];
+    let insert_known = |seen: &mut [(u64, u64); SEEN_SLOTS], id: Id, floor: u64| {
+        let mut slot = (id.payload() as usize) & (SEEN_SLOTS - 1);
+        while seen[slot].0 != Id::UNDEF.0 && seen[slot].0 != id.0 {
+            slot = (slot + 1) & (SEEN_SLOTS - 1);
+        }
+        seen[slot] = (id.0, floor);
+    };
+    insert_known(&mut seen, xs[0], fa0);
+    if y0_new {
+        insert_known(&mut seen, ys[0], fb0);
+    }
+    let mut lookup_or_compute = |seen: &mut [(u64, u64); SEEN_SLOTS], id: Id| -> ProbeFloor {
+        if !ctx.may_be_base_literal(id) {
+            return ProbeFloor::NotSimple;
+        }
+        let mut slot = (id.payload() as usize) & (SEEN_SLOTS - 1);
+        loop {
+            let (k, v) = seen[slot];
+            if k == id.0 {
+                return ProbeFloor::Floor(v, false);
+            }
+            if k == Id::UNDEF.0 {
+                return match ctx.try_string_floor_in(id, &mut scratch) {
+                    Ok(Some(floor)) => {
+                        seen[slot] = (id.0, floor);
+                        ProbeFloor::Floor(floor, true)
+                    }
+                    Ok(None) => ProbeFloor::NotSimple,
+                    Err(_) => ProbeFloor::Refused,
+                };
+            }
+            slot = (slot + 1) & (SEEN_SLOTS - 1);
+        }
+    };
+
+    let mut rows = [(0u64, 0u64, false, false); STRING_ORDER_SAMPLE];
+    rows[0] = (fa0, fb0, true, y0_new);
+    keep[0] = order(xs[0], ys[0], fa0, fb0);
+
+    for i in 1..sample {
+        let (a, b) = (xs[i], ys[i]);
+        let (fa, a_new) = match lookup_or_compute(&mut seen, a) {
+            ProbeFloor::Floor(floor, is_new) => (floor, is_new),
+            ProbeFloor::NotSimple => return Ok(None),
+            ProbeFloor::Refused => return finish_direct(i, &mut keep, &mut scratch),
+        };
+        let (fb, b_new) = match lookup_or_compute(&mut seen, b) {
+            ProbeFloor::Floor(floor, is_new) => (floor, is_new),
+            ProbeFloor::NotSimple => return Ok(None),
+            ProbeFloor::Refused => return finish_direct(i, &mut keep, &mut scratch),
+        };
+        rows[i] = (fa, fb, a_new, b_new);
+        keep[i] = order(a, b, fa, fb);
+    }
+    Ok(Some(InitialFloorSample {
+        rows,
+        keep,
+        has_floors: true,
+    }))
+}
+
+/// Trial-compute string floors for a sample already validated by direct key comparison,
+/// without recording a sticky memory failure on decoding-envelope refusal. Returns
+/// `Ok(true)` when every sampled operand's floor was admitted (populating `sample_rows`),
+/// `Ok(false)` when floor-only decoding refused admission, or `Err` if a sticky memory
+/// failure was already recorded on `ctx`.
+fn try_sample_floors(
+    ctx: &Ctx,
+    table_ref: Option<&super::ctx::FloorTable>,
+    xs: &[Id],
+    ys: &[Id],
+    sample: usize,
+    scratch: &mut super::ctx::FloorScratch,
+    sample_rows: &mut [(u64, u64, bool, bool); STRING_ORDER_SAMPLE],
+) -> Result<bool> {
+    const SEEN_SLOTS: usize = 256;
+    const _: () = assert!(SEEN_SLOTS >= 2 * STRING_ORDER_SAMPLE);
+    let mut seen: Option<[(u64, u64); SEEN_SLOTS]> = None;
+    let mut lookup = |id: Id| -> Result<Option<(u64, bool)>> {
+        if let Some(cur) = table_ref
+            && let Some(cached) = cur.get_cached(id.payload())
+        {
+            return Ok(cached.map(|floor| (floor, false)));
+        }
+        if let Some(seen_table) = seen.as_mut() {
+            let mut slot = (id.payload() as usize) & (SEEN_SLOTS - 1);
+            loop {
+                let (k, v) = seen_table[slot];
+                if k == id.0 {
+                    return Ok(Some((v, false)));
+                }
+                if k == Id::UNDEF.0 {
+                    let Some(floor) = ctx.try_string_floor_in(id, scratch)? else {
+                        return Ok(None);
+                    };
+                    seen_table[slot] = (id.0, floor);
+                    return Ok(Some((floor, true)));
+                }
+                slot = (slot + 1) & (SEEN_SLOTS - 1);
+            }
+        }
+        let Some(floor) = ctx.try_string_floor_in(id, scratch)? else {
+            return Ok(None);
+        };
+        let mut seen_table = [(Id::UNDEF.0, 0u64); SEEN_SLOTS];
+        seen_table[(id.payload() as usize) & (SEEN_SLOTS - 1)] = (id.0, floor);
+        seen = Some(seen_table);
+        Ok(Some((floor, true)))
+    };
+    for i in 0..sample {
+        let fa = match lookup(xs[i]) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(false),
+            Err(_) => {
+                ctx.check_memory_failure()?;
+                return Ok(false);
+            }
+        };
+        let fb = match lookup(ys[i]) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(false),
+            Err(_) => {
+                ctx.check_memory_failure()?;
+                return Ok(false);
+            }
+        };
+        sample_rows[i] = (fa.0, fb.0, fa.1, fb.1);
+    }
+    Ok(true)
+}
+
 /// `FILTER(?x < ?y)`, or `<=`, `>` or `>=`, over a table whose values of both variables
 /// are stored simple literals. Their order is read from their base-vocabulary ids and
 /// each string's floor ([`Ctx::string_floor`]), which the query's floor cache keeps for
 /// each distinct id across tables and the batches of a cursor (see
-/// [`super::ctx::FloorCache`]), so neither column is decoded. A row with another kind of
-/// value is evaluated as the generic filter would. `None` when the table is small or its
-/// first rows hold other values, so that the generic filter decodes the columns instead.
-/// The floors decode inside the envelope, and a refused floor fails the mask with the
-/// refusal it recorded.
+/// [`super::ctx::FloorCache`]), so neither column is decoded. When the floor table's hit
+/// rate stays low, a mask bypasses the table and compares the two vocabulary keys
+/// directly with worker-local reusable scratch buffers, probing periodically so inputs
+/// that repeat across later batches re-enable floors. A row with another kind of value is
+/// evaluated as the generic filter would. `None` when the table is small or its first
+/// rows hold other values, so that the generic filter decodes the columns instead. The
+/// floors and direct comparisons decode inside the envelope, and a refused decode fails
+/// the mask with the refusal it recorded.
 fn string_order_mask(
     ctx: &Ctx,
     t: &Table,
@@ -5940,6 +6814,7 @@ fn string_order_mask(
     op: super::expr::CmpOp,
     expr: &Expr,
 ) -> Result<Option<Vec<bool>>> {
+    use super::ctx::{DirectCommitPlan, FloorLookup, FloorMaskPlan, FloorScratch};
     use super::expr::CmpOp;
     let n = t.len();
     let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
@@ -5949,49 +6824,216 @@ fn string_order_mask(
         return Ok(None);
     }
     let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
+    if !ctx.may_be_base_literal(xs[0]) {
+        return Ok(None);
+    }
     let sample = n.min(STRING_ORDER_SAMPLE);
-    ctx.grow_floor_cache();
+    let cmp_op = |ord: Ordering| match op {
+        CmpOp::Lt => ord == Ordering::Less,
+        CmpOp::Le => ord != Ordering::Greater,
+        CmpOp::Gt => ord == Ordering::Greater,
+        CmpOp::Ge => ord != Ordering::Less,
+    };
     let order = |a: Id, b: Id, fa: u64, fb: u64| -> bool {
         let (pa, pb) = (a.payload(), b.payload());
-        let order = match pa.cmp(&pb) {
+        let ord = match pa.cmp(&pb) {
             Ordering::Equal => Ordering::Equal,
             Ordering::Less if pa < fb => Ordering::Less,
             Ordering::Less => Ordering::Greater,
             Ordering::Greater if pb < fa => Ordering::Greater,
             Ordering::Greater => Ordering::Less,
         };
-        match op {
-            CmpOp::Lt => order == Ordering::Less,
-            CmpOp::Le => order != Ordering::Greater,
-            CmpOp::Gt => order == Ordering::Greater,
-            CmpOp::Ge => order != Ordering::Less,
+        cmp_op(ord)
+    };
+    let first_triple = ctx.first_triple();
+    // The sample's rows keep the order their floors or direct comparisons give, so that
+    // no row is looked up twice, which would mark floors as read again without a repeat
+    // and grow the cache for strings that do not recur.
+    let (sample_keep, plan, refused_floor_trial) = if ctx.floor_cache_needs_init() {
+        let Some(probed) = probe_initial_floor_sample(ctx, xs, ys, sample, order, cmp_op)? else {
+            return Ok(None);
+        };
+        let est = estimate_floor_slots(xs, ys);
+        if probed.has_floors {
+            let plan = ctx.init_floor_cache(est.slots, est.worth_caching);
+            if let FloorMaskPlan::Floors(ref table) = plan {
+                let mut floors = ctx.floor_map_borrowed(table.as_deref(), first_triple);
+                for (i, &(fa, fb, a_new, b_new)) in probed.rows[..sample].iter().enumerate() {
+                    floors.record_floor(xs[i], fa, a_new);
+                    floors.record_floor(ys[i], fb, b_new);
+                }
+            }
+            (probed.keep, plan, false)
+        } else {
+            let plan = ctx.init_floor_cache_after_refused_floor_trial(est.slots);
+            (probed.keep, plan, true)
         }
+    } else {
+        if !ctx.may_be_base_literal(ys[0]) {
+            // Check `xs[0]` first so a refused left-operand decode still reports its failure,
+            // without taking the floor-table lock, decoding an optional floor predecessor, or
+            // allocating a mask buffer.
+            let _ = ctx.simple_literal_cmp(xs[0], ys[0]);
+            ctx.check_memory_failure()?;
+            return Ok(None);
+        }
+        let peek = ctx.peek_floor_plan();
+        let mut sample_keep = [false; STRING_ORDER_SAMPLE];
+        let mut sample_rows = [(0u64, 0u64, false, false); STRING_ORDER_SAMPLE];
+        let mut scratch = FloorScratch::default();
+        let mut has_floors = false;
+        let mut refused_floor_trial = false;
+        let strings = match &peek {
+            FloorMaskPlan::Floors(table) => {
+                enum SampleFloor {
+                    Floor(u64, bool),
+                    NotSimple,
+                    Refused,
+                }
+                has_floors = true;
+                let table_ref = table.as_deref();
+                const SEEN_SLOTS: usize = 256;
+                const _: () = assert!(SEEN_SLOTS >= 2 * STRING_ORDER_SAMPLE);
+                let mut seen: Option<[(u64, u64); SEEN_SLOTS]> = None;
+                let mut lookup = |id: Id| -> SampleFloor {
+                    if !ctx.may_be_base_literal(id) {
+                        return SampleFloor::NotSimple;
+                    }
+                    if let Some(cur) = table_ref
+                        && let Some(cached) = cur.get_cached(id.payload())
+                    {
+                        return match cached {
+                            Some(floor) => SampleFloor::Floor(floor, false),
+                            None => SampleFloor::NotSimple,
+                        };
+                    }
+                    if let Some(seen_table) = seen.as_mut() {
+                        let mut slot = (id.payload() as usize) & (SEEN_SLOTS - 1);
+                        loop {
+                            let (k, v) = seen_table[slot];
+                            if k == id.0 {
+                                return SampleFloor::Floor(v, false);
+                            }
+                            if k == Id::UNDEF.0 {
+                                return match ctx.try_string_floor_in(id, &mut scratch) {
+                                    Ok(Some(floor)) => {
+                                        seen_table[slot] = (id.0, floor);
+                                        SampleFloor::Floor(floor, true)
+                                    }
+                                    Ok(None) => SampleFloor::NotSimple,
+                                    Err(_) => SampleFloor::Refused,
+                                };
+                            }
+                            slot = (slot + 1) & (SEEN_SLOTS - 1);
+                        }
+                    }
+                    match ctx.try_string_floor_in(id, &mut scratch) {
+                        Ok(Some(floor)) => {
+                            let mut seen_table = [(Id::UNDEF.0, 0u64); SEEN_SLOTS];
+                            seen_table[(id.payload() as usize) & (SEEN_SLOTS - 1)] = (id.0, floor);
+                            seen = Some(seen_table);
+                            SampleFloor::Floor(floor, true)
+                        }
+                        Ok(None) => SampleFloor::NotSimple,
+                        Err(_) => SampleFloor::Refused,
+                    }
+                };
+                let mut ok = true;
+                let mut direct_from = None;
+                for i in 0..sample {
+                    let (a, b) = (xs[i], ys[i]);
+                    // the second floor is read only when the first is a string's, as the generic
+                    // comparison reads the second value only when the first has one
+                    let (fa, a_new) = match lookup(a) {
+                        SampleFloor::Floor(floor, is_new) => (floor, is_new),
+                        SampleFloor::NotSimple => {
+                            ok = false;
+                            break;
+                        }
+                        SampleFloor::Refused => {
+                            direct_from = Some(i);
+                            break;
+                        }
+                    };
+                    let (fb, b_new) = match lookup(b) {
+                        SampleFloor::Floor(floor, is_new) => (floor, is_new),
+                        SampleFloor::NotSimple => {
+                            ok = false;
+                            break;
+                        }
+                        SampleFloor::Refused => {
+                            direct_from = Some(i);
+                            break;
+                        }
+                    };
+                    sample_rows[i] = (fa, fb, a_new, b_new);
+                    sample_keep[i] = order(a, b, fa, fb);
+                }
+                if let Some(start) = direct_from {
+                    ctx.check_memory_failure()?;
+                    has_floors = false;
+                    refused_floor_trial = true;
+                    ok = (start..sample).all(|i| {
+                        let Some(ord) = ctx.simple_literal_cmp_in(xs[i], ys[i], &mut scratch)
+                        else {
+                            return false;
+                        };
+                        sample_keep[i] = cmp_op(ord);
+                        true
+                    });
+                }
+                ok
+            }
+            FloorMaskPlan::Direct => (0..sample).all(|i| {
+                let Some(ord) = ctx.simple_literal_cmp_in(xs[i], ys[i], &mut scratch) else {
+                    return false;
+                };
+                sample_keep[i] = cmp_op(ord);
+                true
+            }),
+        };
+        if !strings {
+            // a refused decode is not another kind of value
+            ctx.check_memory_failure()?;
+            return Ok(None);
+        }
+        let plan = if refused_floor_trial {
+            ctx.begin_floor_mask_after_refused_floor_trial()
+        } else if has_floors {
+            ctx.begin_floor_mask()
+        } else {
+            match ctx.begin_floor_mask_after_direct() {
+                DirectCommitPlan::Direct => FloorMaskPlan::Direct,
+                DirectCommitPlan::NeedsFloorTrial(trial_table) => {
+                    if try_sample_floors(
+                        ctx,
+                        trial_table.as_deref(),
+                        xs,
+                        ys,
+                        sample,
+                        &mut scratch,
+                        &mut sample_rows,
+                    )? {
+                        has_floors = true;
+                        ctx.begin_floor_mask()
+                    } else {
+                        refused_floor_trial = true;
+                        ctx.begin_floor_mask_after_refused_floor_trial()
+                    }
+                }
+            }
+        };
+        if has_floors && let FloorMaskPlan::Floors(ref table) = plan {
+            let mut floors = ctx.floor_map_borrowed(table.as_deref(), first_triple);
+            for (i, &(fa, fb, a_new, b_new)) in sample_rows[..sample].iter().enumerate() {
+                floors.record_floor(xs[i], fa, a_new);
+                floors.record_floor(ys[i], fb, b_new);
+            }
+        }
+        (sample_keep, plan, refused_floor_trial)
     };
-    // The sample's rows keep the order their floors give, so that no row's floors are
-    // looked up twice, which would mark them as read again without a repeat and grow the
-    // cache for strings that do not recur.
-    let mut keep = Vec::with_capacity(n);
-    let strings = {
-        let mut floors = ctx.floor_map();
-        (0..sample).all(|i| {
-            let (a, b) = (xs[i], ys[i]);
-            // the second floor is read only when the first is a string's, as the generic
-            // comparison reads the second value only when the first has one
-            let Some(fa) = floors.floor(a) else {
-                return false;
-            };
-            let Some(fb) = floors.floor(b) else {
-                return false;
-            };
-            keep.push(order(a, b, fa, fb));
-            true
-        })
-    };
-    if !strings {
-        // a refused floor is not another kind of value
-        ctx.check_memory_failure()?;
-        return Ok(None);
-    }
+    let mut keep = vec![false; n];
+    keep[..sample].copy_from_slice(&sample_keep[..sample]);
     let threads = rayon::current_num_threads().max(1);
     let map = t.var_map(ctx.nvars());
     let generic = |i: usize| {
@@ -6004,61 +7046,141 @@ fn string_order_mask(
         };
         ebv(expr, &row, ctx).unwrap_or(false)
     };
+    let direct_of = |scratch: &mut FloorScratch, i: usize| -> bool {
+        match ctx.simple_literal_cmp_in(xs[i], ys[i], scratch) {
+            Some(ord) => cmp_op(ord),
+            None => generic(i),
+        }
+    };
     let order_of = |floors: &mut super::ctx::FloorMap<'_>, i: usize| -> bool {
         let (a, b) = (xs[i], ys[i]);
-        let (Some(fa), Some(fb)) = (floors.floor(a), floors.floor(b)) else {
-            return generic(i);
+        let fa = match floors.try_floor(a) {
+            FloorLookup::Floor(fa) => fa,
+            FloorLookup::NotSimple => return generic(i),
+            FloorLookup::Refused => return direct_of(floors.scratch_mut(), i),
+        };
+        let fb = match floors.try_floor(b) {
+            FloorLookup::Floor(fb) => fb,
+            FloorLookup::NotSimple => return generic(i),
+            FloorLookup::Refused => return direct_of(floors.scratch_mut(), i),
         };
         order(a, b, fa, fb)
     };
-    let test = |floors: &mut super::ctx::FloorMap<'_>, i: usize| -> Result<bool> {
-        if i.is_multiple_of(1024) {
+    let fill_direct = |out: &mut [bool], lo: usize| -> Result<()> {
+        if threads > 1 {
+            let chunk_len = out.len().div_ceil(threads).max(1);
+            out.par_chunks_mut(chunk_len).enumerate().try_for_each_init(
+                FloorScratch::default,
+                |scratch, (chunk_idx, chunk)| {
+                    ctx.check()?;
+                    let start = lo + chunk_idx * chunk_len;
+                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                        let i = start + offset;
+                        if offset > 0 && i.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        *slot = direct_of(scratch, i);
+                    }
+                    Ok(())
+                },
+            )
+        } else {
             ctx.check()?;
+            let mut scratch = FloorScratch::default();
+            for (offset, slot) in out.iter_mut().enumerate() {
+                let i = lo + offset;
+                if offset > 0 && i.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                *slot = direct_of(&mut scratch, i);
+            }
+            Ok(())
         }
-        Ok(order_of(floors, i))
     };
     if n <= PAR_THRESHOLD && threads > 1 {
         // A table of at most `PAR_THRESHOLD` rows, such as a cursor's batch, spreads over
         // the pool as the generic filter's batch does, so that a cursor's comparison is
         // not left on one thread where the generic filter would use them all. The batch
-        // checks the deadline itself and collects the rows' booleans.
-        let rest = map_batch_with(
-            ctx,
-            n - sample,
-            true,
-            || ctx.floor_map(),
-            |floors, i| order_of(floors, sample + i),
-        )?;
-        keep.extend_from_slice(&rest);
+        // checks the deadline itself and writes directly into `keep`.
+        match plan {
+            FloorMaskPlan::Floors(table) => {
+                let table_ref = table.as_deref();
+                fill_batch_with(
+                    ctx,
+                    &mut keep[sample..],
+                    sample,
+                    || ctx.floor_map_borrowed(table_ref, first_triple),
+                    order_of,
+                )?;
+            }
+            FloorMaskPlan::Direct => {
+                fill_batch_with(
+                    ctx,
+                    &mut keep[sample..],
+                    sample,
+                    FloorScratch::default,
+                    direct_of,
+                )?;
+            }
+        }
     } else {
-        // A larger table is compared in parts of `PAR_THRESHOLD` rows and then of the
-        // rows before them, so that the floor cache can grow after the first parts as it
+        // A larger table (or a single-threaded mask) is compared in parts of
+        // `PAR_THRESHOLD` rows and then of the rows before them, so that the floor cache
+        // can grow, bypass low-hit-rate parts, and probe periodically between parts as it
         // does between a cursor's batches.
+        let mut plan = plan;
         let mut lo = sample;
         while lo < n {
-            if lo > sample {
-                ctx.grow_floor_cache();
+            if lo > sample && !refused_floor_trial {
+                plan = ctx.begin_floor_mask();
             }
             let hi = n.min(lo + lo.max(PAR_THRESHOLD));
-            if threads > 1 {
-                let part = (lo..hi)
-                    .into_par_iter()
-                    .with_min_len((hi - lo).div_ceil(threads))
-                    .map_init(|| ctx.floor_map(), |floors, i| test(floors, i))
-                    .collect::<Result<Vec<bool>>>()?;
-                keep.extend_from_slice(&part);
-            } else {
-                let mut floors = ctx.floor_map();
-                for i in lo..hi {
-                    keep.push(test(&mut floors, i)?);
+            match &plan {
+                FloorMaskPlan::Direct => {
+                    fill_direct(&mut keep[lo..hi], lo)?;
+                }
+                FloorMaskPlan::Floors(table) => {
+                    let table_ref = table.as_deref();
+                    if threads > 1 {
+                        let chunk_len = (hi - lo).div_ceil(threads).max(1);
+                        keep[lo..hi]
+                            .par_chunks_mut(chunk_len)
+                            .enumerate()
+                            .try_for_each_init(
+                                || ctx.floor_map_borrowed(table_ref, first_triple),
+                                |floors, (chunk_idx, chunk)| -> Result<()> {
+                                    ctx.check()?;
+                                    let start = lo + chunk_idx * chunk_len;
+                                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                                        let i = start + offset;
+                                        if offset > 0 && i.is_multiple_of(1024) {
+                                            ctx.check()?;
+                                        }
+                                        *slot = order_of(floors, i);
+                                    }
+                                    Ok(())
+                                },
+                            )?;
+                    } else {
+                        ctx.check()?;
+                        let mut floors = ctx.floor_map_borrowed(table_ref, first_triple);
+                        for (offset, slot) in keep[lo..hi].iter_mut().enumerate() {
+                            let i = lo + offset;
+                            if offset > 0 && i.is_multiple_of(1024) {
+                                ctx.check()?;
+                            }
+                            *slot = order_of(&mut floors, i);
+                        }
+                    }
                 }
             }
             lo = hi;
         }
     }
     debug_assert_eq!(keep.len(), n);
-    // A refused floor took its row to the generic test, so the mask must not stand.
-    ctx.check_memory_failure()?;
+    // Catch any refused decode (which fell back to generic) or late-chunk cancellation
+    // before returning the completed mask.
+    ctx.check()?;
     #[cfg(test)]
     STRING_ORDER_MASKS.fetch_add(1, AtomicOrdering::Relaxed);
     Ok(Some(keep))
@@ -6088,6 +7210,23 @@ pub(super) fn compute_column(
     e: &Expr,
     report: &mut ExprReport,
 ) -> Result<Vec<Id>> {
+    if let Expr::Var(v) = e {
+        // Like var_map, use the last column if the variable occurs more than once.
+        let column = t.vars.iter().rposition(|var| var == v).map(|c| &t.cols[c]);
+        let mut out = Vec::with_capacity(t.len());
+        loop {
+            ctx.check()?;
+            let start = out.len();
+            let end = (start + MAP_POLL_ROWS).min(t.len());
+            match column {
+                Some(ids) => out.extend_from_slice(&ids[start..end]),
+                None => out.resize(end, Id::UNDEF),
+            }
+            if end == t.len() {
+                return Ok(out);
+            }
+        }
+    }
     // `EXISTS { P }` from the key set of P when the rows have enough distinct keys
     if let Some(col) = super::exists::column(ctx, t, e)? {
         return Ok(col);
@@ -6110,6 +7249,10 @@ pub(super) fn compute_column_controlled(
     allow_parallel: impl Fn(usize) -> bool,
     time_eval: impl Fn(usize) -> bool,
 ) -> Result<(Vec<Id>, ColumnEval)> {
+    // A variable copies its column, as in [`compute_column`], and evaluates nothing.
+    if matches!(e, Expr::Var(_)) {
+        return Ok((compute_column(ctx, t, e, report)?, ColumnEval::default()));
+    }
     if let Some(col) = super::exists::column(ctx, t, e)? {
         return Ok((col, ColumnEval::default()));
     }
@@ -6172,6 +7315,69 @@ pub(super) fn column_rows_split(
         return map_batch_split(ctx, t.len(), batch_may_split(t.len()) && par, f);
     }
     Ok((map_rows(ctx, t.len(), par, f)?, None))
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+
+    #[test]
+    fn row_map_starts_at_an_aligned_address() {
+        assert!(std::mem::align_of::<Row<'_>>() >= 16);
+        assert_eq!(std::mem::offset_of!(Row<'_>, map), 0);
+    }
+
+    #[test]
+    fn variable_column_preserves_ids_and_unbound_rows() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Ctx::new(store.snapshot());
+        let bound = ctx.var("bound");
+        let unbound = ctx.var("unbound");
+        let mut report = ExprReport::default();
+        let mut table = Table::new(vec![bound]);
+        assert!(
+            compute_column(&ctx, &table, &Expr::Var(bound), &mut report)
+                .unwrap()
+                .is_empty()
+        );
+
+        let ids = [Id::from_i64(42).unwrap(), Id::UNDEF, Id::from_bool(false)];
+        for id in ids {
+            table.push_row(&[id]);
+        }
+        assert_eq!(
+            compute_column(&ctx, &table, &Expr::Var(bound), &mut report).unwrap(),
+            ids
+        );
+        assert_eq!(
+            compute_column(&ctx, &table, &Expr::Var(unbound), &mut report).unwrap(),
+            [Id::UNDEF; 3]
+        );
+
+        table.vars.insert(0, bound);
+        table.cols.insert(0, vec![Id::UNDEF; table.len()]);
+        assert_eq!(
+            compute_column(&ctx, &table, &Expr::Var(bound), &mut report).unwrap(),
+            ids
+        );
+    }
+
+    #[test]
+    fn variable_column_checks_cancellation_on_empty_input() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Ctx::new(store.snapshot());
+        let var = ctx.var("v");
+        ctx.cancel.store(true, AtomicOrdering::Relaxed);
+        assert!(matches!(
+            compute_column(
+                &ctx,
+                &Table::new(vec![var]),
+                &Expr::Var(var),
+                &mut ExprReport::default(),
+            ),
+            Err(Error::Cancelled)
+        ));
+    }
 }
 
 type Candidates = (Vec<usize>, Option<super::ctx::RetainedCharge>);
@@ -6251,13 +7457,21 @@ fn topk_candidates(
     } else {
         map_rows(ctx, t.len(), false, approximate)?
     };
+    ctx.check()?;
     let Some(numbers) = approximate.into_iter().collect::<Option<Vec<f64>>>() else {
         return Ok(None);
     };
-    ctx.check()?;
     let mut sorted = numbers.clone();
     let (_, kth, _) = sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-    let threshold = *kth;
+    // The other numeric conversions are correctly rounded. Fixed decimals round
+    // once converting the mantissa and again dividing by an exactly representable
+    // power of ten. The two rounding errors on either side can reverse the exact
+    // order by up to four representable steps. Keep these rows for exact comparison.
+    let threshold = if kth.is_finite() {
+        kth.next_down().next_down().next_down().next_down()
+    } else {
+        *kth
+    };
     let mut selected = Vec::new();
     for (i, number) in numbers.into_iter().enumerate() {
         if i.is_multiple_of(1024) {
@@ -6341,10 +7555,13 @@ fn order_by(
         && heap_eligible(ctx)
     {
         let n = t.len();
+        // Declare heap credit BEFORE `heap` so entries drop before their credit on unwind.
+        let mut rows = EagerHeapRows::new(ctx)?;
         let mut heap = TopK::new(k, keys.iter().map(|(_, asc)| *asc).collect());
-        let ranked = offer_rows(ctx, &mut heap, &t, keys, report, &mut RowIndex)?;
+        let ranked = offer_rows(ctx, &mut heap, &t, keys, report, &mut rows)?;
         ctx.check()?;
         let idx: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        drop(rows);
         ctx.check_output(idx.len(), t.width())?;
         notes.push(format!(
             "[top-k heap kept {} of {n} rows, {ranked} ranked on every key]",
@@ -6373,28 +7590,80 @@ enum HeapKey<'a> {
     Expr(&'a Expr),
 }
 
-/// The key of a variable's id. Inline numbers need no decoding.
+/// The key of a variable's id, propagating any latched decode refusal.
 #[inline]
-fn id_key(ctx: &Ctx, id: Id) -> SortKey {
-    SortKey::new(ctx.value(id))
+fn id_key(ctx: &Ctx, id: Id) -> Result<SortKey> {
+    let v = ctx.value(id);
+    if v.is_none() && ctx.has_memory_failure() {
+        ctx.check()?;
+    }
+    Ok(SortKey::new(v))
 }
 
 /// Where [`offer_rows`] keeps the rows that may enter a [`TopK`].
 pub(super) trait HeapRows<P> {
+    /// Make room for the candidate's key vector before allocating it.
+    fn reserve_key_slots(&mut self, bytes: u64) -> Result<()>;
     /// Keep row `i` of the input for an entry with these keys.
     fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<P>;
     /// An entry left the heap, or an offered row did not enter.
     fn release(&mut self, entry: Entry<P>) -> Result<()>;
 }
 
-/// Eager execution keeps the input table, so an entry is a row index.
-struct RowIndex;
+/// Eager execution keeps the input table, so an entry is a row index plus live credit
+/// for the `SortKey` payloads retained inside the heap until eviction or drop.
+struct EagerHeapRows<'a> {
+    charge: super::ctx::Charge<'a>,
+    bytes: u64,
+    step: u64,
+}
 
-impl HeapRows<usize> for RowIndex {
-    fn keep(&mut self, i: usize, _: &[SortKey]) -> Result<usize> {
+impl<'a> EagerHeapRows<'a> {
+    fn new(ctx: &'a Ctx) -> Result<Self> {
+        Ok(Self {
+            charge: ctx.charge(0)?,
+            bytes: 0,
+            step: ctx.reservation_step(),
+        })
+    }
+
+    fn entry_bytes(keys: &[SortKey]) -> u64 {
+        (std::mem::size_of::<Entry<usize>>() as u64)
+            .saturating_add(
+                (keys.len() as u64).saturating_mul(std::mem::size_of::<SortKey>() as u64),
+            )
+            .saturating_add(keys.iter().map(SortKey::payload_bytes).sum::<u64>())
+    }
+}
+
+impl HeapRows<usize> for EagerHeapRows<'_> {
+    fn reserve_key_slots(&mut self, bytes: u64) -> Result<()> {
+        // The vector moves into the heap. Cover its slots here on the same
+        // charge that keep() uses for the complete entry.
+        let need = self.bytes.saturating_add(bytes);
+        if need > self.charge.bytes() {
+            self.charge.resize(need)?;
+        }
+        Ok(())
+    }
+
+    fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<usize> {
+        let added = Self::entry_bytes(keys);
+        let next = self.bytes.saturating_add(added);
+        self.charge.cover(next, self.step.min(next / 4))?;
+        self.bytes = next;
         Ok(i)
     }
-    fn release(&mut self, _: Entry<usize>) -> Result<()> {
+
+    fn release(&mut self, entry: Entry<usize>) -> Result<()> {
+        let freed = Self::entry_bytes(&entry.keys);
+        // Drop the evicted entry's payloads before releasing their credit.
+        drop(entry);
+        self.bytes = self.bytes.saturating_sub(freed);
+        let slack = self.step.min(self.bytes / 4).max(256);
+        if self.charge.bytes() > self.bytes.saturating_add(slack) {
+            self.charge.resize(self.bytes)?;
+        }
         Ok(())
     }
 }
@@ -6416,30 +7685,6 @@ pub(super) fn offer_rows<P>(
     let mut sources = Vec::with_capacity(keys.len());
     for (i, (e, _)) in keys.iter().enumerate() {
         sources.push(match e {
-            // A large first key is decoded in parallel through the value cache. A smaller
-            // one decodes each dictionary value once, in key order.
-            Expr::Var(v) if i == 0 && t.len() > PAR_THRESHOLD => match t.col_of(*v) {
-                Some(c) => {
-                    let col = &t.cols[c];
-                    let vals: Vec<SortKey> = col
-                        .par_iter()
-                        .with_min_len(PAR_MIN_LEN)
-                        .map(|&id| id_key(ctx, id))
-                        .collect();
-                    // The keys' decoded payloads stay with the column until the heap
-                    // is done, whatever the value cache keeps.
-                    let payload: u64 = vals
-                        .par_iter()
-                        .with_min_len(PAR_MIN_LEN)
-                        .map(SortKey::payload_bytes)
-                        .sum();
-                    HeapKey::Column(super::exprcache::Column::Rows {
-                        vals,
-                        _charge: ctx.retained_charge(payload)?,
-                    })
-                }
-                None => HeapKey::Var(None),
-            },
             Expr::Var(v) if i > 0 => HeapKey::Var(t.col_of(*v).map(|c| t.cols[c].as_slice())),
             _ if i == 0 => HeapKey::Column(key_column(ctx, t, e, report)?.map(SortKey::new)),
             _ => HeapKey::Expr(e),
@@ -6449,13 +7694,13 @@ pub(super) fn offer_rows<P>(
     let nested = super::exists::nested(ctx, t, &later)?;
     let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
-    let key_of = |i: usize, k: usize| -> SortKey {
+    let key_of = |i: usize, k: usize| -> Result<SortKey> {
         match &sources[k] {
             HeapKey::Var(Some(col)) => id_key(ctx, col[i]),
-            HeapKey::Var(None) => SortKey::NULL,
-            HeapKey::Column(c) => c.get(i).clone(),
-            HeapKey::Expr(e) => SortKey::new(
-                eval(
+            HeapKey::Var(None) => Ok(SortKey::NULL),
+            HeapKey::Column(c) => Ok(c.get(i).clone()),
+            HeapKey::Expr(e) => {
+                let val = match eval(
                     e,
                     &Row {
                         table: t,
@@ -6465,13 +7710,24 @@ pub(super) fn offer_rows<P>(
                         exists,
                     },
                     ctx,
-                )
-                .ok()
-                .and_then(|v| match v {
-                    Val::Id(id) => ctx.value(id),
-                    Val::V(v) | Val::Dec(_, v) => Some(v),
-                }),
-            ),
+                ) {
+                    Ok(Val::Id(id)) => {
+                        let v = ctx.value(id);
+                        if v.is_none() && ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
+                        v
+                    }
+                    Ok(Val::V(v) | Val::Dec(_, v)) => Some(v),
+                    Err(_) => {
+                        if ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
+                        None
+                    }
+                };
+                Ok(SortKey::new(val))
+            }
         }
     };
     let mut ranked = 0;
@@ -6490,6 +7746,14 @@ pub(super) fn offer_rows<P>(
         }
         _ => Vec::new(),
     };
+    let secondary_iris = match sources.as_slice() {
+        [_, HeapKey::Var(Some(col))] => {
+            let vocab = &ctx.snap.generation.vocab;
+            Some((*col, vocab.first_iri()..vocab.len()))
+        }
+        _ => None,
+    };
+    let key_slots = keys.len() as u64 * std::mem::size_of::<SortKey>() as u64;
     for i in 0..t.len() {
         if i.is_multiple_of(4096) {
             ctx.check()?;
@@ -6517,7 +7781,7 @@ pub(super) fn offer_rows<P>(
                 c.get(i).clone()
             }
             _ => {
-                let first = key_of(i, 0);
+                let first = key_of(i, 0)?;
                 if heap.screen(&first) == Screen::Reject {
                     heap.skip();
                     continue;
@@ -6525,18 +7789,316 @@ pub(super) fn offer_rows<P>(
                 first
             }
         };
+        if keys.len() == 1 {
+            // The heap can admit a single key from the stack before allocating
+            // its vector, without a separate scratch reservation for the slot.
+            let row = [first];
+            let payload = rows.keep(i, &row)?;
+            if let Some(out) = heap.offer(Vec::from(row), payload) {
+                rows.release(out)?;
+            }
+            ranked += 1;
+            continue;
+        }
+        // Compact-vocabulary IRIs are in SPARQL lexical order, as in the indexed
+        // top-k scan. Screen ties on their IDs before reconstructing front-coded
+        // keys. Mixed vocabularies compare decoded values through the ordinary heap.
+        let base_iri = secondary_iris.as_ref().and_then(|(col, range)| {
+            let id = col[i];
+            (id.tag() == crate::id::Tag::Vocab && range.contains(&id.payload()))
+                .then(|| id.payload())
+        });
+        if let Some(id) = base_iri
+            && heap.rejects_base_iri_tie(&first, id)
+        {
+            ctx.check()?;
+            heap.skip();
+            continue;
+        }
+        rows.reserve_key_slots(key_slots)?;
+        let row_decode = ctx.charge(0)?;
         let mut row = Vec::with_capacity(keys.len());
         row.push(first);
-        for k in 1..keys.len() {
-            row.push(key_of(i, k));
+        for (k, source) in sources.iter().enumerate().skip(1) {
+            let sk = match source {
+                HeapKey::Var(Some(col)) => {
+                    let key = SortKey::new(ctx.value_checked_into(col[i], &row_decode)?);
+                    match base_iri {
+                        Some(id) => key.with_base_iri(id),
+                        None => key,
+                    }
+                }
+                _ => {
+                    let sk = key_of(i, k)?;
+                    let p = sk.payload_bytes();
+                    if p > 0 {
+                        row_decode.add(p)?;
+                    }
+                    sk
+                }
+            };
+            row.push(sk);
         }
         ranked += 1;
         let payload = rows.keep(i, &row)?;
-        if let Some(out) = heap.offer(row, payload) {
+        let evicted = heap.offer(row, payload);
+        drop(row_decode);
+        if let Some(out) = evicted {
             rows.release(out)?;
         }
     }
+    ctx.check()?;
     Ok(ranked)
+}
+
+#[cfg(test)]
+#[test]
+fn topk_eager_admits_key_slots_once() {
+    use std::mem::size_of;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    // The first key's one-row sort column and its retained value column.
+    let first_keys = size_of::<SortKey>() as u64 + size_of::<Option<Value>>() as u64 + 256;
+    let key_count = 16;
+    let key_slots = (key_count * size_of::<SortKey>()) as u64;
+    let entry = size_of::<Entry<usize>>() as u64 + key_slots;
+    for (cap, fits) in [
+        (first_keys + entry, true),
+        (first_keys + key_slots - 1, false),
+    ] {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = cap;
+        let ctx = ctx.into_shared();
+        let var = ctx.var("v");
+        let mut table = Table::new(vec![var]);
+        table.push_row(&[Id::from_i64(32).unwrap()]);
+        let keys = vec![(Expr::Var(var), true); key_count];
+        let mut rows = EagerHeapRows::new(&ctx).unwrap();
+        let mut heap = TopK::new(1, vec![true; keys.len()]);
+
+        let result = offer_rows(
+            &ctx,
+            &mut heap,
+            &table,
+            &keys,
+            &mut ExprReport::default(),
+            &mut rows,
+        );
+        if fits {
+            assert_eq!(result.unwrap(), 1);
+            assert_eq!(ctx.mem_peak(), cap);
+            assert_eq!(ctx.live_bytes(), entry);
+            assert_eq!(heap.kept(), 1);
+        } else {
+            assert!(
+                matches!(result, Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory)
+            );
+            assert_eq!(ctx.live_bytes(), 0);
+            assert_eq!(heap.kept(), 0);
+        }
+        drop(heap);
+        drop(rows);
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn topk_screens_tied_base_iris_across_batches() {
+    use crate::sparql::opt_tests::{load, update};
+    use oxrdf::{NamedNode, Term};
+
+    let store = crate::store::Store::in_memory(Default::default());
+    load(
+        &store,
+        "<http://ex.org/a> <http://ex.org/age> 18 .\n\
+         <http://ex.org/a/> <http://ex.org/age> 18 .\n\
+         <http://ex.org/é> <http://ex.org/age> 18 .",
+        crate::io::RdfFormat::Turtle,
+    );
+    store.compact().unwrap();
+    update(&store, "INSERT DATA { ex:A ex:age 18 . ex:日本 ex:age 18 }");
+    let ctx = Ctx::new(store.snapshot());
+    let p = ctx.var("p");
+    let lookup = |suffix: &str| {
+        ctx.snap
+            .lookup_term(&Term::NamedNode(NamedNode::new_unchecked(format!(
+                "http://ex.org/{suffix}"
+            ))))
+            .unwrap()
+    };
+    let [a, slash, accented, upper, japanese] = ["a", "a/", "é", "A", "日本"].map(lookup);
+    assert_eq!(a.tag(), crate::id::Tag::Vocab);
+    assert_eq!(upper.tag(), crate::id::Tag::Delta);
+
+    for (asc, best, worse, delta) in [(true, a, accented, upper), (false, accented, a, japanese)] {
+        let keys = [
+            (Expr::Const(Id::from_i64(32).unwrap()), false),
+            (Expr::Var(p), asc),
+        ];
+        let mut rows = EagerHeapRows::new(&ctx).unwrap();
+        let mut heap = TopK::new(1, vec![false, asc]);
+        let mut report = ExprReport::default();
+        let mut batch = Table::new(vec![p]);
+        for id in [best, slash, worse, best] {
+            batch.push_row(&[id]);
+        }
+        assert_eq!(
+            offer_rows(&ctx, &mut heap, &batch, &keys, &mut report, &mut rows).unwrap(),
+            1
+        );
+
+        let mut next = Table::new(vec![p]);
+        // The first row is screened using a base IRI retained from the prior batch.
+        // The delta IRI enters via checked decode, and the last row is compared to
+        // it using lexical order even though its base ID is eligible for screening.
+        for id in [worse, delta, best] {
+            next.push_row(&[id]);
+        }
+        assert_eq!(
+            offer_rows(&ctx, &mut heap, &next, &keys, &mut report, &mut rows).unwrap(),
+            2
+        );
+        let winner = heap.into_sorted().pop().unwrap();
+        assert_eq!(winner.payload, 1);
+        assert_eq!(winner.seq, 5);
+    }
+}
+
+#[cfg(test)]
+fn topk_compacted_keys() -> (crate::store::Store, [Id; 4]) {
+    use crate::sparql::opt_tests::load;
+    use oxrdf::{Literal, NamedNode, Term};
+
+    let store = crate::store::Store::in_memory(Default::default());
+    load(
+        &store,
+        "<urn:a> <urn:p> <urn:b> . <urn:c> <urn:p> \"text\" .",
+        crate::io::RdfFormat::Turtle,
+    );
+    store.compact().unwrap();
+    let snap = store.snapshot();
+    let keys = [
+        NamedNode::new_unchecked("urn:a").into(),
+        NamedNode::new_unchecked("urn:b").into(),
+        NamedNode::new_unchecked("urn:c").into(),
+        Term::Literal(Literal::new_simple_literal("text")),
+    ]
+    .map(|term| snap.lookup_term(&term).unwrap());
+    assert!(keys.iter().all(|id| id.tag() == crate::id::Tag::Vocab));
+    (store, keys)
+}
+
+#[cfg(test)]
+#[test]
+fn topk_orders_base_iris_with_other_keys() {
+    let (store, [a, b, c, text]) = topk_compacted_keys();
+    let ctx = Ctx::new(store.snapshot());
+    let primary = ctx.var("primary");
+    let secondary = ctx.var("secondary");
+    let first = Id::from_i64(2).unwrap();
+    let better = Id::from_i64(1).unwrap();
+    let run = |input: &[[Id; 2]], asc: bool, k| {
+        let keys = [(Expr::Var(primary), true), (Expr::Var(secondary), asc)];
+        let mut table = Table::new(vec![primary, secondary]);
+        for row in input {
+            table.push_row(row);
+        }
+        let mut rows = EagerHeapRows::new(&ctx).unwrap();
+        let mut heap = TopK::new(k, vec![true, asc]);
+        let ranked = offer_rows(
+            &ctx,
+            &mut heap,
+            &table,
+            &keys,
+            &mut ExprReport::default(),
+            &mut rows,
+        )
+        .unwrap();
+        let kept: Vec<_> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        (ranked, kept)
+    };
+
+    for (asc, best, worst) in [(true, a, c), (false, c, a)] {
+        assert_eq!(run(&[[first, best], [better, worst]], asc, 1), (2, vec![1]));
+
+        // The third entry ties the worst base IRI and sifts up. The next two
+        // offers replace the worst and sift down against other base IRIs.
+        let sifting = [best, worst, worst, b, best, worst].map(|id| [first, id]);
+        assert_eq!(run(&sifting, asc, 3), (5, vec![0, 4, 3]));
+
+        for term in [Id::UNDEF, Id::bnode(1)] {
+            let winner = if asc { 1 } else { 0 };
+            assert_eq!(
+                run(&[[first, best], [first, term]], asc, 1),
+                (2, vec![winner])
+            );
+        }
+        for term in [text, Id::from_i64(32).unwrap()] {
+            let winner = if asc { 0 } else { 1 };
+            assert_eq!(
+                run(&[[first, best], [first, term]], asc, 1),
+                (2, vec![winner])
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn topk_polls_cancellation_before_skipping_a_base_iri_tie() {
+    struct CancelOnKeep<'a, 'b> {
+        inner: &'a mut EagerHeapRows<'b>,
+        cancel: &'a std::sync::atomic::AtomicBool,
+    }
+    impl HeapRows<usize> for CancelOnKeep<'_, '_> {
+        fn reserve_key_slots(&mut self, bytes: u64) -> Result<()> {
+            self.inner.reserve_key_slots(bytes)
+        }
+
+        fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<usize> {
+            let kept = self.inner.keep(i, keys)?;
+            self.cancel.store(true, AtomicOrdering::Relaxed);
+            Ok(kept)
+        }
+
+        fn release(&mut self, entry: Entry<usize>) -> Result<()> {
+            self.inner.release(entry)
+        }
+    }
+
+    let (store, [best, worse, ..]) = topk_compacted_keys();
+    let ctx = Ctx::new(store.snapshot());
+    let secondary = ctx.var("secondary");
+    let keys = [
+        (Expr::Const(Id::from_i64(32).unwrap()), true),
+        (Expr::Var(secondary), true),
+    ];
+    let mut table = Table::new(vec![secondary]);
+    table.push_row(&[best]);
+    table.push_row(&[worse]);
+    let mut rows = EagerHeapRows::new(&ctx).unwrap();
+    let mut heap = TopK::new(1, vec![true, true]);
+    let mut cancelling = CancelOnKeep {
+        inner: &mut rows,
+        cancel: &ctx.cancel,
+    };
+    assert!(matches!(
+        offer_rows(
+            &ctx,
+            &mut heap,
+            &table,
+            &keys,
+            &mut ExprReport::default(),
+            &mut cancelling
+        ),
+        Err(Error::Cancelled),
+    ));
+
+    // A poll only at the end of the batch would also return Cancelled, but
+    // would already have advanced the sequence past the rejected row.
+    assert!(heap.offer(vec![SortKey::NULL; 2], 0).is_some());
+    assert_eq!(heap.into_sorted()[0].seq, 1);
 }
 
 /// Candidates for `ORDER BY k1 k2 … LIMIT k`: a row whose first key is worse than the
@@ -6594,40 +8156,61 @@ fn first_key_candidates(
     Ok((cand.len() < t.len()).then_some(cand))
 }
 
-/// The value of an ORDER BY key on each row of `t`, for a merge that compares rows
-/// read back from disk. Values the key computes are not interned.
-pub(super) fn key_values(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Option<Value>>> {
-    key_rows(ctx, t, e, None)
-}
-
-fn key_rows(
+/// Evaluate a column with one variable map and one set of EXISTS answers.
+fn with_key_evaluator<T>(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
     dec: Option<&super::expr::DecodedCols>,
-) -> Result<Vec<Option<Value>>> {
+    run: impl FnOnce(&(dyn Fn(usize) -> Result<Option<Value>> + Sync)) -> Result<T>,
+) -> Result<T> {
+    let _map_charge = ctx.charge(ctx.nvars() as u64 * 16 + 128)?;
     let nested = super::exists::nested(ctx, t, &[e])?;
     let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
-    let f = |i: usize| {
-        eval(
-            e,
-            &Row {
-                table: t,
-                i,
-                map: &map,
-                dec,
-                exists,
-            },
-            ctx,
-        )
-        .ok()
-        .and_then(|v| match v {
-            Val::Id(id) => ctx.value(id),
-            Val::V(v) | Val::Dec(_, v) => Some(v),
-        })
-    };
-    map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && e.parallel(), f)
+    let result = run(&|i| match eval(
+        e,
+        &Row {
+            table: t,
+            i,
+            map: &map,
+            dec,
+            exists,
+        },
+        ctx,
+    ) {
+        Ok(Val::Id(id)) => ctx.cursor_value_checked(id),
+        Ok(Val::V(v) | Val::Dec(_, v)) => Ok(Some(v)),
+        Err(_) => {
+            if ctx.has_memory_failure() {
+                ctx.check()?;
+            }
+            Ok(None)
+        }
+    })?;
+    ctx.check()?;
+    Ok(result)
+}
+
+/// Classify each spill merge key after admitting its owned payload.
+pub(super) fn spill_order_keys(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    mut admit: impl FnMut(u64) -> Result<()>,
+) -> Result<Vec<super::sortkey::SortKey>> {
+    with_key_evaluator(ctx, t, e, None, |eval| {
+        let mut values = Vec::with_capacity(t.len());
+        for i in 0..t.len() {
+            if i.is_multiple_of(MAP_POLL_ROWS) {
+                ctx.check()?;
+            }
+            let value = eval(i)?;
+            admit(key_payload(&value))?;
+            values.push(super::sortkey::SortKey::new(value));
+        }
+        Ok(values)
+    })
 }
 
 /// The bytes an ORDER key's value holds beyond its slot.
@@ -6638,92 +8221,243 @@ fn key_payload(value: &Option<Value>) -> u64 {
             (s.len() + lang.len()) as u64 + 128
         }
         Some(Value::Other { lex, dt }) => (lex.len() + dt.len()) as u64 + 128,
+        Some(Value::BigInteger(i)) => i.heap_bytes() + 32,
+        Some(Value::BigDecimal(d)) => d.heap_bytes() + 32,
         Some(Value::Triple(triple)) => super::graph_triple_bytes(triple),
         _ => 0,
     }
 }
 
-/// The value of an ORDER key on every row, charged until the sort releases it. An input
-/// of at most [`PAR_THRESHOLD`] rows is evaluated on this thread, each value admitted
-/// before the column keeps it. A larger input is evaluated in parallel, with `dec`'s
-/// decoded columns, after its slots are charged, and its values' payload is charged
-/// once they are made, so a query over its budget fails after one column's payload.
+/// Own decoded ORDER keys until the sort releases them. Admit a value's payload
+/// before keeping it in the key column.
 fn key_column_charged(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
     dec: Option<&super::expr::DecodedCols>,
 ) -> Result<super::exprcache::Column<Option<Value>>> {
-    if t.len() <= PAR_THRESHOLD {
-        return key_rows_charged(ctx, t, e);
-    }
-    let slots = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
-    let mut charge = ctx.retained_charge(slots)?;
-    let vals = key_rows(ctx, t, e, dec)?;
-    let payload: u64 = vals
-        .par_iter()
-        .with_min_len(PAR_MIN_LEN)
-        .map(key_payload)
-        .sum();
-    if let Some(charge) = &mut charge {
-        charge.resize(slots.saturating_add(payload))?;
-    }
+    let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
+    let mut charge = ctx.retained_charge(bytes)?;
+    let vals = key_rows_retained(ctx, t, e, dec, &mut charge, &mut bytes)?;
     Ok(super::exprcache::Column::Rows {
         vals,
         _charge: charge,
     })
 }
 
-/// Own decoded ORDER keys until the sort releases them. The current evaluated
-/// value is transient expression memory; admit its payload before retaining it
-/// in the column, rather than retaining an uncharged whole-answer value array.
-fn key_rows_charged(
+fn key_rows_retained(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
-) -> Result<super::exprcache::Column<Option<Value>>> {
-    let _map_charge = ctx.charge(ctx.nvars() as u64 * 16 + 128)?;
-    let nested = super::exists::nested(ctx, t, &[e])?;
-    let exists = nested.as_ref().map(|n| &n.answers);
-    let map = t.var_map(ctx.nvars());
-    let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
-    let mut charge = ctx.retained_charge(bytes)?;
-    // Each payload is admitted before the column keeps it, with the charge a step ahead,
-    // so that short strings take a charge once per step rather than once per row.
-    let step = ctx.reservation_step();
-    let mut values = Vec::with_capacity(t.len());
-    for i in 0..t.len() {
-        if i.is_multiple_of(1024) {
-            ctx.check()?;
-        }
-        let value = match eval(
-            e,
-            &Row {
-                table: t,
-                i,
-                map: &map,
-                dec: None,
-                exists,
-            },
-            ctx,
-        )
-        .ok()
-        {
-            Some(Val::Id(id)) => ctx.cursor_value_checked(id)?,
-            Some(Val::V(v) | Val::Dec(_, v)) => Some(v),
-            None => None,
+    dec: Option<&super::expr::DecodedCols>,
+    charge: &mut Option<super::ctx::RetainedCharge>,
+    bytes: &mut u64,
+) -> Result<Vec<Option<Value>>> {
+    with_key_evaluator(ctx, t, e, dec, |eval| {
+        let may_split = t.len() > PAR_THRESHOLD;
+        let parallel_key = (may_split || cfg!(feature = "geo")) && e.parallel_order_key();
+        let step = if cfg!(feature = "geo") && !parallel_key {
+            // A later key evaluation may need credit to serialize a geometry.
+            // Keep only the payload we already evaluated.
+            0
+        } else {
+            ctx.reservation_step()
         };
-        bytes = bytes.saturating_add(key_payload(&value));
-        if let Some(charge) = &mut charge {
-            charge.cover(bytes, step)?;
+        let eval_retained =
+            |i: usize, charge: &mut Option<super::ctx::RetainedCharge>, bytes: &mut u64| {
+                if i.is_multiple_of(MAP_POLL_ROWS) {
+                    ctx.check()?;
+                }
+                let value = eval(i)?;
+                *bytes = bytes.saturating_add(key_payload(&value));
+                if let Some(charge) = charge {
+                    charge.cover(*bytes, step)?;
+                }
+                Ok::<_, Error>(value)
+            };
+        // Fill the final slots directly. Bound the number of pieces so each can
+        // keep one transient result if its retained charge runs out of room.
+        const TRANSIENT: u64 = super::bignum::AGG_SUM_PAYLOAD_BYTES;
+        const PIECE_BYTES: u64 = 128;
+        // Resume offsets fit on the stack so the heap piece records can be
+        // freed before the serial suffixes need their memory.
+        const MAX_PIECES: usize = 64;
+        let piece_rows = if may_split && parallel_key {
+            t.len()
+                .div_ceil(rayon::current_num_threads().min(MAX_PIECES))
+                .max(PAR_MIN_LEN)
+        } else {
+            t.len().max(1)
+        };
+        let pieces = t.len().div_ceil(piece_rows) as u64;
+        let piece_bytes = pieces * PIECE_BYTES;
+        let reserve_scratch = || {
+            let bytes = piece_bytes + pieces * TRANSIENT;
+            let Some(owner) = charge.as_ref() else {
+                return ctx.charge(bytes);
+            };
+            let scratch = owner.part(ctx);
+            scratch.add(bytes)?;
+            Ok(scratch)
+        };
+        if pieces > 1
+            && let Ok(scratch) = reserve_scratch()
+        {
+            let mut values = vec![None; t.len()];
+            let part_owner = charge.as_ref();
+            let mut parts: Vec<_> = values
+                .par_chunks_mut(piece_rows)
+                .enumerate()
+                .map(|(piece, slots)| {
+                    let start = piece * piece_rows;
+                    let part = part_owner.map(|owner| owner.part(ctx));
+                    let mut payload = 0u64;
+                    let progress = (|| {
+                        for (offset, slot) in slots.iter_mut().enumerate() {
+                            if offset.is_multiple_of(MAP_POLL_ROWS) {
+                                ctx.check()?;
+                            }
+                            let value = eval(start + offset)?;
+                            let key_bytes = key_payload(&value);
+                            let needed = payload.saturating_add(key_bytes);
+                            if let Some(part) = &part
+                                && needed > part.bytes()
+                                && part.resize(needed.saturating_add(step)).is_err()
+                            {
+                                match part.resize(needed) {
+                                    Ok(()) => {}
+                                    Err(Error::BudgetExceeded(_)) if key_bytes <= TRANSIENT => {
+                                        *slot = value;
+                                        return Ok((offset + 1, key_bytes));
+                                    }
+                                    // A wider result cannot stay in scratch.
+                                    // Retry this row only if evaluation is repeatable.
+                                    Err(Error::BudgetExceeded(_))
+                                        if super::exprcache::repeatable(e) =>
+                                    {
+                                        return Ok((offset, 0));
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            payload = needed;
+                            *slot = value;
+                        }
+                        Ok((slots.len(), 0))
+                    })();
+                    if let Some(part) = &part {
+                        part.resize(payload).expect("shrinking a piece's charge");
+                    }
+                    (progress, payload, part)
+                })
+                .collect();
+            for (_, payload, part) in &mut parts {
+                if let (Some(charge), Some(part)) = (charge.as_mut(), part.take()) {
+                    charge.absorb(part);
+                }
+                *bytes = bytes.saturating_add(*payload);
+            }
+            let mut resume = [0; MAX_PIECES];
+            let mut pending = 0;
+            let mut has_suffix = false;
+            for (((progress, _, _), slots), offset) in parts
+                .into_iter()
+                .zip(values.chunks(piece_rows))
+                .zip(&mut resume)
+            {
+                let (done, saved) = progress?;
+                *offset = done;
+                pending += saved;
+                has_suffix |= done < slots.len();
+            }
+            // The collection is gone. Release its charge and the unused
+            // transient allowance before admitting any more key payload.
+            scratch.resize(pending)?;
+            if pending > 0 {
+                charge.as_mut().expect("retained pieces").absorb(scratch);
+                *bytes = bytes.saturating_add(pending);
+            }
+            if has_suffix {
+                ctx.check()?;
+                for (piece, (slots, &done)) in
+                    values.chunks_mut(piece_rows).zip(&resume).enumerate()
+                {
+                    let start = piece * piece_rows;
+                    for (offset, slot) in slots.iter_mut().enumerate().skip(done) {
+                        *slot = eval_retained(start + offset, charge, bytes)?;
+                    }
+                }
+                charge.as_mut().expect("retained pieces").resize(*bytes)?;
+            }
+            return Ok(values);
         }
-        values.push(value);
-    }
-    ctx.check()?;
-    Ok(super::exprcache::Column::Rows {
-        vals: values,
-        _charge: charge,
+        let mut values = Vec::with_capacity(t.len());
+        for i in 0..t.len() {
+            values.push(eval_retained(i, charge, bytes)?);
+        }
+        if let Some(charge) = charge {
+            charge.resize(*bytes)?;
+        }
+        Ok(values)
     })
+}
+
+#[cfg(test)]
+#[test]
+fn order_keys_refuse_before_accumulating_an_oversized_payload() {
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{Literal, Term};
+    use spargebra::algebra::Function;
+
+    let store = Store::in_memory(StoreOptions::default());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        // An allocation probe on this worker observes the parallel chunks, too.
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 4 << 20;
+        let ctx = ctx.into_shared();
+        let a = ctx.var("a");
+        let b = ctx.var("b");
+        let x = ctx.intern_term(&Term::Literal(Literal::new_simple_literal("a".repeat(512))));
+        let y = ctx.intern_term(&Term::Literal(Literal::new_simple_literal("b".repeat(512))));
+        let n = PAR_THRESHOLD + 1;
+        let mut table = Table::new(vec![a, b]);
+        table.cols = vec![vec![x; n], vec![y; n]];
+        table.len = n;
+        let expr = Expr::Call(
+            super::expr::Func::Builtin(Function::Concat),
+            (0..4).flat_map(|_| [Expr::Var(a), Expr::Var(b)]).collect(),
+        );
+
+        let peak = crate::test_alloc::record_peak_live(|| {
+            let error = key_column_charged(&ctx, &table, &expr, None).err();
+            assert!(
+                matches!(error, Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory),
+                "large ORDER expression column returned {error:?}"
+            );
+        });
+        assert!(peak < 8 << 20, "sort allocated {peak} bytes before refusing");
+
+        let keys = [(Expr::Const(Id::from_bool(true)), true), (expr, true)];
+        let peak = crate::test_alloc::record_peak_live(|| {
+            let error = order_by(
+                &ctx,
+                table,
+                &keys,
+                Some(3_000),
+                &mut ExprReport::default(),
+            )
+            .err();
+            assert!(
+                matches!(error, Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory),
+                "eager top-k returned {error:?}"
+            );
+        });
+        assert!(peak < 8 << 20, "heap allocated {peak} bytes before refusing");
+    });
 }
 
 /// The value of an ORDER BY key once per distinct input value, where the key is pure
@@ -6734,42 +8468,28 @@ fn key_per_value(
     e: &Expr,
     report: &mut ExprReport,
 ) -> Result<Option<super::exprcache::PerValue<Option<Value>>>> {
-    // Numeric keys reuse their input ids, from a dense range of integers at any size and
-    // from a sort up to `PAR_THRESHOLD` rows. A variable's values are decoded once each
-    // in key order at any size, so that the sort holds one value per distinct term, and
-    // another key of a larger input evaluates each distinct value once, in parallel.
-    // None of them takes fewer than `MIN_ROWS` rows, which return here.
+    // Numeric keys over inline ids and variable keys have specialized reuse.
+    // The general cache is useful only when enough rows can evaluate in parallel.
     if t.len() < super::exprcache::MIN_ROWS {
         return Ok(None);
     }
     if let Some(values) =
-        super::exprcache::cursor_numeric_values(ctx, t, e, report, |v| key_rows(ctx, v, e, None))?
+        super::exprcache::cursor_numeric_values(ctx, t, e, report, |v, charge, bytes| {
+            key_rows_retained(ctx, v, e, None, charge, bytes)
+        })?
     {
         return Ok(Some(values));
-    }
-    if t.len() <= PAR_THRESHOLD {
-        return super::exprcache::cursor_variable_values(ctx, t, e);
     }
     if let Some(values) = super::exprcache::cursor_variable_values(ctx, t, e)? {
         return Ok(Some(values));
     }
-    if t.len() < super::exprcache::MIN_ROWS {
+    if t.len() <= PAR_THRESHOLD {
         return Ok(None);
     }
-    let mut values = super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
-        key_rows(ctx, v, e, Decoded::cols(&decode_for(ctx, v, &[e])?))
-    })?;
-    // The distinct keys' payloads stay with them until the sort is done.
-    if let Some(values) = &mut values {
-        let payload: u64 = values
-            .vals
-            .par_iter()
-            .with_min_len(PAR_MIN_LEN)
-            .map(key_payload)
-            .sum();
-        values.retain(ctx, payload)?;
-    }
-    Ok(values)
+    super::exprcache::per_value_retained(ctx, t, &[e], false, report, |v, charge, bytes| {
+        let dec = decode_for(ctx, v, &[e])?;
+        key_rows_retained(ctx, v, e, Decoded::cols(&dec), charge, bytes)
+    })
 }
 
 /// The value of an ORDER BY key on every row, per distinct value where it can be.
@@ -6853,13 +8573,13 @@ fn order_by_rows(
         _ => idx.par_sort_by(cmp),
     }
     ctx.check()?;
-    ctx.check_output(idx.len(), t.width())?;
-    let sorted = t.take_rows(&idx);
-    // A large key column's decoded values are freed on the pool, not on this thread.
+    // Sorting has used the last key. Free the key columns on the pool before
+    // checking room for the output table.
     key_vals
         .into_iter()
         .for_each(super::exprcache::Column::drop_in_parallel);
-    Ok(sorted)
+    ctx.check_output(idx.len(), t.width())?;
+    Ok(t.take_rows(&idx))
 }
 
 /// The rows of `t` that DISTINCT keeps, each value's first, in input order.
@@ -6926,7 +8646,7 @@ fn group_or_spill(
     report: &mut ExprReport,
     note: &mut Option<String>,
 ) -> Result<Table> {
-    let charged = ctx.spill.is_some();
+    let charged = ctx.spill.is_some() || ctx.mem_limit < u64::MAX || ctx.grant().is_some();
     match super::group::whole(ctx, &t, keys, aggs, charged, true, report) {
         Err(error) if hash::spills(ctx, &error) && super::group::hashable(ctx, aggs) => {
             let Some(shared) = ctx.shared() else {
@@ -6961,31 +8681,495 @@ pub(super) fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::
     }
 }
 
+/// How a caller admits transient big-number scratch (directly on `ctx` or by reclaiming
+/// speculative headroom from [`super::group::op::GroupMemory`] under budget pressure).
+pub(crate) trait ScratchAdmit {
+    fn charge_scratch<'a>(&mut self, ctx: &'a Ctx, bytes: u64) -> Result<super::ctx::Charge<'a>> {
+        ctx.charge(bytes)
+    }
+}
+
+pub(super) struct DirectScratch;
+
+impl ScratchAdmit for DirectScratch {}
+
+/// Scratch and retained-subtotal admission for [`AggState::add_admitted`].
+pub(super) trait SumAdmit: ScratchAdmit {
+    fn admit(&mut self, old: u64, new: u64) -> Result<bool>;
+}
+
+struct CallbackAdmit<'a>(&'a mut dyn FnMut(u64) -> Result<()>);
+
+impl ScratchAdmit for CallbackAdmit<'_> {}
+
+impl SumAdmit for CallbackAdmit<'_> {
+    fn admit(&mut self, _old: u64, new: u64) -> Result<bool> {
+        (self.0)(new)?;
+        Ok(true)
+    }
+}
+
+/// Upper bound on bytes [`Ctx::try_intern_value`] can charge to `ctx.retain_bytes()`
+/// for a `Value::Double(x)`. Rust's `f64` `Display` writes fixed-point decimal text
+/// (up to 327 bytes for negative subnormals / `~1e-308`, up to 310 bytes near `f64::MAX`),
+/// plus typed-literal key framing (`"` + `KEY_SEP` + `^` + `xsd:double`, 43 bytes) and
+/// the interner's 96-byte local-vocabulary overhead.
+pub(super) fn double_intern_bytes(x: f64) -> u64 {
+    if Id::from_f64(x).is_some() {
+        return 0;
+    }
+    const OVERHEAD: u64 = 144;
+    if !x.is_finite() {
+        return 4 + OVERHEAD;
+    }
+    let biased = (x.to_bits() >> 52) & 0x7ff;
+    let lex_bound = if biased >= 1023 {
+        let e2 = biased - 1023;
+        ((e2 + 1) * 30_103) / 100_000 + 20
+    } else {
+        let e2_neg = if biased == 0 { 1074 } else { 1023 - biased };
+        (e2_neg * 30_103) / 100_000 + 21
+    };
+    lex_bound + OVERHEAD
+}
+
+/// Heap bytes owned by a `SumAcc::Decimal(Box<DecimalSum>)` allocation.
+pub(super) const DECIMAL_SUM_BYTES: u64 = size_of::<DecimalSum>() as u64;
+/// Heap bytes owned by a `SumAcc::Int128(Box<Int128Sum>)` allocation.
+pub(super) const INT128_SUM_BYTES: u64 = size_of::<Int128Sum>() as u64;
+
+/// Value-space hazard flags tracked on `AggState::Best` so `can_merge` only combines
+/// slice winners when `order_cmp` is guaranteed to be a transitive total preorder
+/// across every value seen in the merged group.
+const BEST_EXACT_NUM: u8 = 1 << 0;
+const BEST_FLOAT: u8 = 1 << 1;
+const BEST_INCOMPARABLE: u8 = 1 << 2;
+
+#[inline]
+fn best_value_flag(v: Option<&Value>) -> u8 {
+    match v {
+        None => BEST_INCOMPARABLE,
+        Some(
+            Value::Integer(_) | Value::Decimal(_) | Value::BigInteger(_) | Value::BigDecimal(_),
+        ) => BEST_EXACT_NUM,
+        Some(Value::Float(f)) => {
+            if f32::from(*f).is_nan() {
+                BEST_INCOMPARABLE
+            } else {
+                BEST_FLOAT
+            }
+        }
+        Some(Value::Double(d)) => {
+            if f64::from(*d).is_nan() {
+                BEST_INCOMPARABLE
+            } else {
+                BEST_FLOAT
+            }
+        }
+        Some(
+            Value::BNode(_)
+            | Value::Iri(_)
+            | Value::Str(_)
+            | Value::Lang(..)
+            | Value::LangDir(..)
+            | Value::Bool(_),
+        ) => 0,
+        Some(
+            Value::DateTime(_)
+            | Value::Date(_)
+            | Value::Time(_)
+            | Value::Duration(_)
+            | Value::YearMonth(_)
+            | Value::DayTime(_)
+            | Value::Triple(_)
+            | Value::Other { .. },
+        ) => BEST_INCOMPARABLE,
+    }
+}
+
+/// Decimal accumulator state with exact prefix bounds so merging two exact sums matches
+/// a single sequential pass on every intermediate overflow boundary.
+#[derive(Clone)]
+pub(super) struct DecimalSum {
+    /// Current scaled decimal sum (`value × 10^18`).
+    val: i128,
+    /// Minimum scaled decimal value across all decimal steps in this partition.
+    min: i128,
+    /// Maximum scaled decimal value across all decimal steps in this partition.
+    max: i128,
+    /// Unscaled integer sum just before the first decimal arrived.
+    int_before: i128,
+    /// Minimum unscaled integer prefix sum before the first decimal arrived (including 0).
+    int_min: i128,
+    /// Maximum unscaled integer prefix sum before the first decimal arrived (including 0).
+    int_max: i128,
+    /// Whether `int_min`/`int_max` are exact (false only after `retract`).
+    exact_int_prefix: bool,
+}
+
+/// Boxed 128-bit integer accumulator with exact prefix bounds, used only when an integer
+/// sum overflows `i64` so ordinary `i64` sums keep [`SumAcc`] and [`AggState`] compact.
+#[derive(Clone)]
+pub(super) struct Int128Sum {
+    sum: i128,
+    min: i128,
+    max: i128,
+}
+
+/// Running numeric state of `SUM` / `AVG`.
+///
+/// Big-number variants keep bounded headroom ([`super::bignum::AGG_MAX_INT_DIGITS`] /
+/// [`super::bignum::AGG_MAX_DEC_DIGITS`]) so cancellation and averaging at the digit cap
+/// stay independent of row order, while enforcing the final value limits in
+/// [`AggState::finish_with`].
+#[derive(Clone)]
+pub(super) enum SumAcc {
+    /// Pure exact integer sum in `i64`, with exact prefix bounds `[min, max]` (including 0).
+    Int {
+        sum: i64,
+        min: i64,
+        max: i64,
+    },
+    /// Pure exact integer sum in `i128`, with exact prefix bounds `[min, max]` (including 0).
+    Int128(Box<Int128Sum>),
+    /// Pure integer sum after a retraction, whose historical prefix bounds are unknown.
+    IntRetracted(i128),
+    /// Exact fixed-width decimal sum with prefix bounds for merge verification.
+    Decimal(Box<DecimalSum>),
+    /// Arbitrary-precision integer sum.
+    BigInt(Box<super::bignum::BigInt>),
+    /// Arbitrary-precision decimal sum.
+    BigDec(Box<super::bignum::BigDec>),
+    Float(oxsdatatypes::Float),
+    Double(oxsdatatypes::Double),
+    /// Failed on `Id::UNDEF` or a non-numeric value: guaranteed to fail any single pass.
+    HardError,
+    /// Failed on exceeding big-number digit limits: may succeed if preceded by a non-empty
+    /// left partition that cancels or promotes to float/double.
+    Overflow,
+}
+
+impl SumAcc {
+    #[inline]
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            SumAcc::Int128(_) => INT128_SUM_BYTES,
+            SumAcc::Decimal(_) => DECIMAL_SUM_BYTES,
+            SumAcc::BigInt(i) => i.heap_bytes() + 32,
+            SumAcc::BigDec(d) => d.heap_bytes() + 32,
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    fn int_bounds(&self) -> Option<(i128, i128, i128)> {
+        match self {
+            SumAcc::Int { sum, min, max } => Some(((*sum).into(), (*min).into(), (*max).into())),
+            SumAcc::Int128(b) => Some((b.sum, b.min, b.max)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn int_sum(&self) -> Option<i128> {
+        match self {
+            SumAcc::Int { sum, .. } => Some((*sum).into()),
+            SumAcc::Int128(b) => Some(b.sum),
+            SumAcc::IntRetracted(s) => Some(*s),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn is_retracted_int(&self) -> bool {
+        matches!(self, SumAcc::IntRetracted(_))
+    }
+
+    /// Compute the next `SumAcc` for any transition or arbitrary-precision operation that
+    /// could not update `self` in place. Returns any transient scratch charge alongside
+    /// the candidate so it stays covered until retained admission completes and the old
+    /// subtotal drops (or refusal drops the candidate).
+    fn add_value_slow<'a>(
+        &self,
+        ctx: &'a Ctx,
+        rhs: &Value,
+        admit: &mut dyn ScratchAdmit,
+    ) -> Result<(Self, Option<super::ctx::Charge<'a>>)> {
+        use super::bignum::{
+            AGG_MAX_DEC_DIGITS, AGG_MAX_INT_DIGITS, AGG_SUM_SCRATCH_BYTES, BigDec, BigInt,
+            TO_F32_SCRATCH_BYTES, TO_F64_SCRATCH_BYTES,
+        };
+        use super::value::Num;
+        use oxsdatatypes::{Double, Float};
+        let Ok(n) = Num::of(rhs) else {
+            return Ok((SumAcc::HardError, None));
+        };
+        Ok(match (self, n) {
+            (SumAcc::Int { sum, min, max }, Num::Integer(b)) => {
+                let s = i128::from(*sum) + i128::from(i64::from(b));
+                let lo = i128::from(*min).min(s);
+                let hi = i128::from(*max).max(s);
+                let scratch = admit.charge_scratch(ctx, INT128_SUM_BYTES)?;
+                (
+                    SumAcc::Int128(Box::new(Int128Sum {
+                        sum: s,
+                        min: lo,
+                        max: hi,
+                    })),
+                    Some(scratch),
+                )
+            }
+            (SumAcc::Int { .. } | SumAcc::Int128(_), Num::Decimal(b)) => {
+                let (int_before, int_min, int_max) = self.int_bounds().expect("int variant");
+                if let Some(v) = int_before
+                    .checked_mul(super::value::DECIMAL_SCALE)
+                    .and_then(|s| s.checked_add(super::value::decimal_raw(b)))
+                {
+                    let scratch = admit.charge_scratch(ctx, DECIMAL_SUM_BYTES)?;
+                    return Ok((
+                        SumAcc::Decimal(Box::new(DecimalSum {
+                            val: v,
+                            min: v,
+                            max: v,
+                            int_before,
+                            int_min,
+                            int_max,
+                            exact_int_prefix: true,
+                        })),
+                        Some(scratch),
+                    ));
+                }
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = BigDec::from_bigint(BigInt::from_i128(int_before))
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::IntRetracted(sum), Num::Decimal(b)) => {
+                let int_before = *sum;
+                if let Some(v) = int_before
+                    .checked_mul(super::value::DECIMAL_SCALE)
+                    .and_then(|s| s.checked_add(super::value::decimal_raw(b)))
+                {
+                    let scratch = admit.charge_scratch(ctx, DECIMAL_SUM_BYTES)?;
+                    return Ok((
+                        SumAcc::Decimal(Box::new(DecimalSum {
+                            val: v,
+                            min: v,
+                            max: v,
+                            int_before,
+                            int_min: 0,
+                            int_max: 0,
+                            exact_int_prefix: false,
+                        })),
+                        Some(scratch),
+                    ));
+                }
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = BigDec::from_bigint(BigInt::from_i128(int_before))
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::Int128(_) | SumAcc::IntRetracted(_), Num::Integer(b)) => {
+                let sum = self.int_sum().expect("int variant");
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = BigInt::from_i128(sum)
+                    .checked_add_with_limit(&BigInt::from_i64(b.into()), AGG_MAX_INT_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigInt(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (
+                SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_),
+                Num::BigInteger(b),
+            ) => {
+                let sum = self.int_sum().expect("int variant");
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = BigInt::from_i128(sum)
+                    .checked_add_with_limit(b, AGG_MAX_INT_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigInt(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (
+                SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_),
+                Num::BigDecimal(b),
+            ) => {
+                let sum = self.int_sum().expect("int variant");
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = BigDec::from_bigint(BigInt::from_i128(sum))
+                    .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_), Num::Float(b)) => {
+                let sum = self.int_sum().expect("int variant");
+                (SumAcc::Float(Float::from(sum as f32) + b), None)
+            }
+            (SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_), Num::Double(b)) => {
+                let sum = self.int_sum().expect("int variant");
+                (SumAcc::Double(Double::from(sum as f64) + b), None)
+            }
+            (SumAcc::Decimal(ds), Num::Integer(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let a = super::value::decimal_from_raw(ds.val);
+                let next = BigDec::from_oxs_decimal(a)
+                    .checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::Decimal(ds), Num::Decimal(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let a = super::value::decimal_from_raw(ds.val);
+                let next = BigDec::from_oxs_decimal(a)
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::Decimal(ds), Num::BigInteger(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let a = super::value::decimal_from_raw(ds.val);
+                let next = BigDec::from_oxs_decimal(a)
+                    .checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::Decimal(ds), Num::BigDecimal(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let a = super::value::decimal_from_raw(ds.val);
+                let next = BigDec::from_oxs_decimal(a)
+                    .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::Decimal(ds), Num::Float(b)) => {
+                let a = super::value::decimal_from_raw(ds.val);
+                (SumAcc::Float(Float::from(a) + b), None)
+            }
+            (SumAcc::Decimal(ds), Num::Double(b)) => {
+                let a = super::value::decimal_from_raw(ds.val);
+                (SumAcc::Double(Double::from(a) + b), None)
+            }
+            (SumAcc::BigInt(a), Num::Integer(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = a
+                    .checked_add_with_limit(&BigInt::from_i64(b.into()), AGG_MAX_INT_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigInt(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigInt(a), Num::BigInteger(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = a
+                    .checked_add_with_limit(b, AGG_MAX_INT_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigInt(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigInt(a), Num::Decimal(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = BigDec::from_bigint((**a).clone())
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigInt(a), Num::BigDecimal(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = BigDec::from_bigint((**a).clone())
+                    .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigInt(a), Num::Float(b)) => {
+                let _scratch = admit.charge_scratch(ctx, TO_F32_SCRATCH_BYTES)?;
+                (SumAcc::Float(Float::from(a.to_f32()) + b), None)
+            }
+            (SumAcc::BigInt(a), Num::Double(b)) => {
+                let _scratch = admit.charge_scratch(ctx, TO_F64_SCRATCH_BYTES)?;
+                (SumAcc::Double(Double::from(a.to_f64()) + b), None)
+            }
+            (SumAcc::BigDec(a), Num::Integer(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = a
+                    .checked_add_with_limit(&BigDec::from_i64(b.into()), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigDec(a), Num::BigInteger(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = a
+                    .checked_add_with_limit(&BigDec::from_bigint(b.clone()), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigDec(a), Num::Decimal(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = a
+                    .checked_add_with_limit(&BigDec::from_oxs_decimal(b), AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigDec(a), Num::BigDecimal(b)) => {
+                let scratch = admit.charge_scratch(ctx, AGG_SUM_SCRATCH_BYTES)?;
+                let next = a
+                    .checked_add_with_limit(b, AGG_MAX_DEC_DIGITS)
+                    .map_or(SumAcc::Overflow, |s| SumAcc::BigDec(Box::new(s)));
+                (next, Some(scratch))
+            }
+            (SumAcc::BigDec(a), Num::Float(b)) => {
+                let _scratch = admit.charge_scratch(ctx, TO_F32_SCRATCH_BYTES)?;
+                (SumAcc::Float(Float::from(a.to_f32()) + b), None)
+            }
+            (SumAcc::BigDec(a), Num::Double(b)) => {
+                let _scratch = admit.charge_scratch(ctx, TO_F64_SCRATCH_BYTES)?;
+                (SumAcc::Double(Double::from(a.to_f64()) + b), None)
+            }
+            (SumAcc::Float(a), Num::Double(b)) => (SumAcc::Double(Double::from(*a) + b), None),
+            (SumAcc::Float(a), Num::BigInteger(b)) => {
+                let _scratch = admit.charge_scratch(ctx, TO_F32_SCRATCH_BYTES)?;
+                (SumAcc::Float(*a + Float::from(b.to_f32())), None)
+            }
+            (SumAcc::Float(a), Num::BigDecimal(b)) => {
+                let _scratch = admit.charge_scratch(ctx, TO_F32_SCRATCH_BYTES)?;
+                (SumAcc::Float(*a + Float::from(b.to_f32())), None)
+            }
+            (SumAcc::Float(a), other) => (SumAcc::Float(*a + other.to_float()), None),
+            (SumAcc::Double(a), Num::BigInteger(b)) => {
+                let _scratch = admit.charge_scratch(ctx, TO_F64_SCRATCH_BYTES)?;
+                (SumAcc::Double(*a + Double::from(b.to_f64())), None)
+            }
+            (SumAcc::Double(a), Num::BigDecimal(b)) => {
+                let _scratch = admit.charge_scratch(ctx, TO_F64_SCRATCH_BYTES)?;
+                (SumAcc::Double(*a + Double::from(b.to_f64())), None)
+            }
+            (SumAcc::Double(a), other) => (SumAcc::Double(*a + other.to_double()), None),
+            (SumAcc::HardError | SumAcc::Overflow, _) => unreachable!(),
+        })
+    }
+}
+
 /// Running state of one aggregate of one group (same results as [`aggregate`]).
+#[derive(Clone)]
 pub(super) enum AggState {
     /// COUNT(*) / COUNT(?v): rows / bound values
     Count(u64),
-    /// SUM / AVG: an exact integer sum while every value is an inline integer, then the
-    /// generic numeric sum; `ok` is false once a value was unbound or not numeric. The
-    /// integer sum is held in an `i128`, so that a sum whose result fits an
-    /// `xsd:integer` is found whatever the order of its rows, and only the result is
-    /// checked. `errs` counts the rows whose argument was an error, apart from values
-    /// that are not numbers, for the reading in which AVG over only errors is zero.
+    /// SUM / AVG: an exact integer sum while every value is an integer, then decimal,
+    /// arbitrary-precision integer/decimal, float or double, or a recorded failure. `errs`
+    /// counts rows whose argument was `Id::UNDEF`, for the reading in which AVG over only
+    /// errors is zero.
     Sum {
-        int: i128,
-        generic: Option<Value>,
-        ok: bool,
+        acc: SumAcc,
         rows: u64,
         errs: u64,
+        deferred: bool,
     },
-    /// MIN / MAX: the best id and its value, and the count of arguments that were
-    /// errors, which some readings make the result unbound (see
-    /// [`super::AggregateErrors`])
-    Best(Option<Id>, Option<Value>, u64),
+    /// MIN / MAX: the best id and its value, the count of arguments that were errors
+    /// (which some readings make the result unbound, see [`super::AggregateErrors`]),
+    /// and a value-space hazard bitmask for exact merge validation.
+    Best(Option<Id>, Option<Value>, u64, u8),
     Sample(Option<Id>),
     /// ARQ's variance and deviation aggregates
     Stat(super::aggext::Arq, super::aggext::StatAcc),
 }
+
+const _: () = assert!(size_of::<AggState>() == 80);
 
 impl AggState {
     pub(super) fn new(agg: &Agg) -> AggState {
@@ -6994,70 +9178,180 @@ impl AggState {
         }
         match agg.func {
             AggregateFunction::Sum | AggregateFunction::Avg => AggState::Sum {
-                int: 0,
-                generic: None,
-                ok: true,
+                acc: SumAcc::Int {
+                    sum: 0,
+                    min: 0,
+                    max: 0,
+                },
                 rows: 0,
                 errs: 0,
+                deferred: false,
             },
-            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0),
+            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0, 0),
             AggregateFunction::Sample => AggState::Sample(None),
             _ => AggState::Count(0),
         }
     }
 
-    /// Add one row; `id` is the aggregated column's value (`None` for COUNT(*)).
-    #[inline(always)]
-    pub(super) fn add(&mut self, ctx: &Ctx, agg: &Agg, id: Option<Id>) {
+    /// Owned heap bytes held by a `SUM`/`AVG` subtotal (`Box<DecimalSum>`, `Box<BigInt>`,
+    /// or `Box<BigDec>`).
+    #[inline]
+    pub(super) fn sum_heap_bytes(&self) -> u64 {
         match self {
-            AggState::Count(n) => *n += id.is_none_or(|id| !id.is_undef()) as u64,
+            AggState::Sum { acc, .. } => acc.heap_bytes(),
+            _ => 0,
+        }
+    }
+
+    /// Upper bounds on result term retention and transient finalization scratch.
+    pub(super) fn finish_memory(&self, agg: &Agg) -> super::group::acc::FinishMemory {
+        use super::bignum::{AGG_SUM_SCRATCH_BYTES, FIXED_AVG_SCRATCH_BYTES, intern_scratch_bytes};
+        use super::group::acc::FinishMemory;
+        use super::value::{avg_fixed_integer, avg_fixed_raw};
+
+        let mut scratch = 0;
+        let retained = match self {
+            AggState::Count(_) | AggState::Best(..) | AggState::Sample(_) => 0,
             AggState::Sum {
-                int,
-                generic,
-                ok,
-                rows,
-                errs,
+                acc, rows, errs, ..
             } => {
-                *rows += 1;
-                let id = id.unwrap_or(Id::UNDEF);
-                *errs += u64::from(id.is_undef());
-                if !*ok {
-                    return;
+                let is_avg = matches!(agg.func, AggregateFunction::Avg);
+                if is_avg && *errs == *rows {
+                    return FinishMemory::default();
                 }
-                if generic.is_none()
-                    && id.tag() == crate::id::Tag::Int
-                    && let Some(s) = int.checked_add(id.as_i64().into())
-                {
-                    *int = s;
-                    return;
-                }
-                let value = (!id.is_undef()).then(|| ctx.value(id)).flatten();
-                // An integer too large to be inlined joins the exact sum as well.
-                if generic.is_none()
-                    && let Some(Value::Integer(i)) = &value
-                    && let Some(s) = int.checked_add(i64::from(*i).into())
-                {
-                    *int = s;
-                    return;
-                }
-                let Some(acc) = generic.take().or_else(|| super::value::exact_sum(*int)) else {
-                    *ok = false;
-                    return;
-                };
-                match value {
-                    Some(v) => match arith(NumOp::Add, &acc, &v) {
-                        Ok(v) => *generic = Some(v),
-                        Err(_) => *ok = false,
-                    },
-                    None => *ok = false,
+                match acc {
+                    SumAcc::HardError | SumAcc::Overflow => 0,
+                    SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_) => {
+                        let sum = acc.int_sum().expect("int variant");
+                        if is_avg {
+                            if avg_fixed_integer(sum, *rows).is_none() {
+                                scratch = FIXED_AVG_SCRATCH_BYTES;
+                            }
+                            256
+                        } else {
+                            match i64::try_from(sum) {
+                                Ok(sum) if Id::from_i64(sum).is_some() => 0,
+                                Ok(_) => 256,
+                                Err(_) => {
+                                    // `exact_sum` produces a BigInteger, whose decimal
+                                    // lexical form includes the sign for negative sums.
+                                    let digits = sum.unsigned_abs().ilog10() as usize + 1;
+                                    scratch = intern_scratch_bytes(digits + usize::from(sum < 0));
+                                    256
+                                }
+                            }
+                        }
+                    }
+                    SumAcc::Decimal(ds) => {
+                        if is_avg && avg_fixed_raw(ds.val, *rows).is_none() {
+                            scratch = FIXED_AVG_SCRATCH_BYTES;
+                        }
+                        256
+                    }
+                    SumAcc::BigInt(bi) => {
+                        if is_avg {
+                            scratch = AGG_SUM_SCRATCH_BYTES;
+                            4500
+                        } else {
+                            let len = bi.lexical_len();
+                            scratch = intern_scratch_bytes(len);
+                            len as u64 + 144
+                        }
+                    }
+                    SumAcc::BigDec(bd) => {
+                        if is_avg {
+                            scratch = AGG_SUM_SCRATCH_BYTES;
+                            4500
+                        } else {
+                            let len = bd.lexical_len();
+                            scratch = intern_scratch_bytes(len);
+                            len as u64 + 144
+                        }
+                    }
+                    SumAcc::Float(_) => 256,
+                    SumAcc::Double(d) => {
+                        let x = if is_avg {
+                            f64::from(*d) / (*rows as f64)
+                        } else {
+                            f64::from(*d)
+                        };
+                        double_intern_bytes(x)
+                    }
                 }
             }
-            AggState::Best(best, best_v, errs) => {
+            AggState::Stat(arq, acc) => acc.finish_value(*arq).map_or(0, double_intern_bytes),
+        };
+        FinishMemory { retained, scratch }
+    }
+
+    /// Add one row; `id` is the aggregated column's value (`None` for COUNT(*)).
+    /// `on_payload` admits any retained `MIN`/`MAX` or `SUM`/`AVG` payload before
+    /// replacing the state.
+    #[inline(always)]
+    pub(super) fn add(
+        &mut self,
+        ctx: &Ctx,
+        agg: &Agg,
+        id: Option<Id>,
+        on_payload: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        let mut admit = CallbackAdmit(on_payload);
+        let _ = self.add_admitted(ctx, agg, id, &mut admit)?;
+        Ok(())
+    }
+
+    /// Whether later arguments of this subtotal must be replayed from disk.
+    pub(super) fn sum_deferred(&self) -> bool {
+        matches!(self, Self::Sum { deferred: true, .. })
+    }
+
+    pub(super) fn defer_sum(&mut self) {
+        if let Self::Sum { deferred, .. } = self {
+            *deferred = true;
+        }
+    }
+
+    /// Try one row. If a subtotal's new heap capacity is refused, preserve its
+    /// prefix so the caller can replay this argument and the rest of the group.
+    #[inline(always)]
+    pub(super) fn add_admitted(
+        &mut self,
+        ctx: &Ctx,
+        agg: &Agg,
+        id: Option<Id>,
+        admit: &mut dyn SumAdmit,
+    ) -> Result<bool> {
+        match self {
+            AggState::Count(n) => *n += id.is_none_or(|id| !id.is_undef()) as u64,
+            AggState::Sum { acc, rows, .. } => {
+                *rows += 1;
+                let id = id.unwrap_or(Id::UNDEF);
+                if let SumAcc::Int { sum, min, max } = acc
+                    && id.tag() == crate::id::Tag::Int
+                {
+                    let x = id.as_i64();
+                    if let Some(s) = sum.checked_add(x) {
+                        *sum = s;
+                        if x >= 0 {
+                            if s > *max {
+                                *max = s;
+                            }
+                        } else if s < *min {
+                            *min = s;
+                        }
+                        return Ok(true);
+                    }
+                }
+                return self.add_sum_slow(ctx, id, admit);
+            }
+            AggState::Best(best, best_v, errs, flags) => {
                 let Some(id) = id.filter(|id| !id.is_undef()) else {
                     *errs += 1;
-                    return;
+                    return Ok(true);
                 };
-                let v = ctx.value(id);
+                let decode = ctx.charge(0)?;
+                let v = ctx.value_checked_into(id, &decode)?;
+                *flags |= best_value_flag(v.as_ref());
                 let better = match best_v {
                     None => best.is_none(),
                     Some(b) => {
@@ -7070,71 +9364,707 @@ impl AggState {
                     }
                 };
                 if better {
+                    let _ = admit.admit(0, key_payload(&v))?;
                     *best = Some(id);
                     *best_v = v;
+                } else {
+                    drop(v);
                 }
+                drop(decode);
             }
             AggState::Sample(x) => {
                 if x.is_none() {
                     *x = id.filter(|id| !id.is_undef());
                 }
             }
-            AggState::Stat(_, acc) => acc.add(ctx, id),
+            AggState::Stat(_, acc) => acc.add(ctx, id)?,
+        }
+        Ok(true)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn add_sum_slow(&mut self, ctx: &Ctx, id: Id, admit: &mut dyn SumAdmit) -> Result<bool> {
+        let AggState::Sum {
+            acc, rows, errs, ..
+        } = self
+        else {
+            unreachable!()
+        };
+        let err = u64::from(id.is_undef());
+        *errs += err;
+        if matches!(acc, SumAcc::HardError | SumAcc::Overflow) {
+            return Ok(true);
+        }
+        if id.is_undef() {
+            let old_bytes = acc.heap_bytes();
+            if old_bytes != 0 {
+                let _ = admit.admit(old_bytes, 0)?;
+            }
+            *acc = SumAcc::HardError;
+            return Ok(true);
+        }
+        match (&mut *acc, id.tag()) {
+            (SumAcc::Int { sum, min, max }, crate::id::Tag::Int) => {
+                let x = id.as_i64();
+                if let Some(s) = sum.checked_add(x) {
+                    *sum = s;
+                    if x >= 0 {
+                        if s > *max {
+                            *max = s;
+                        }
+                    } else if s < *min {
+                        *min = s;
+                    }
+                    return Ok(true);
+                }
+                let s = i128::from(*sum) + i128::from(x);
+                let lo = i128::from(*min).min(s);
+                let hi = i128::from(*max).max(s);
+                match admit.admit(0, INT128_SUM_BYTES) {
+                    Ok(true) => {
+                        *acc = SumAcc::Int128(Box::new(Int128Sum {
+                            sum: s,
+                            min: lo,
+                            max: hi,
+                        }));
+                        return Ok(true);
+                    }
+                    Ok(false) => {
+                        *rows -= 1;
+                        *errs -= err;
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        *rows -= 1;
+                        *errs -= err;
+                        return Err(error);
+                    }
+                }
+            }
+            (SumAcc::Int128(b), crate::id::Tag::Int) => {
+                let x = id.as_i64();
+                if let Some(s) = b.sum.checked_add(x.into()) {
+                    b.sum = s;
+                    if x >= 0 {
+                        if s > b.max {
+                            b.max = s;
+                        }
+                    } else if s < b.min {
+                        b.min = s;
+                    }
+                    return Ok(true);
+                }
+            }
+            (SumAcc::IntRetracted(sum), crate::id::Tag::Int) => {
+                if let Some(s) = sum.checked_add(id.as_i64().into()) {
+                    *sum = s;
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Decimal(ds), crate::id::Tag::Int) => {
+                let raw = i128::from(id.as_i64()) * super::value::DECIMAL_SCALE;
+                if let Some(v) = ds.val.checked_add(raw) {
+                    ds.val = v;
+                    ds.min = ds.min.min(v);
+                    ds.max = ds.max.max(v);
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Float(f), crate::id::Tag::Int) => {
+                *f = *f + oxsdatatypes::Float::from(oxsdatatypes::Integer::from(id.as_i64()));
+                return Ok(true);
+            }
+            (SumAcc::Float(f), crate::id::Tag::Double) => {
+                *acc = SumAcc::Double(
+                    oxsdatatypes::Double::from(*f) + oxsdatatypes::Double::from(id.as_f64()),
+                );
+                return Ok(true);
+            }
+            (SumAcc::Double(d), crate::id::Tag::Int) => {
+                *d = *d + oxsdatatypes::Double::from(oxsdatatypes::Integer::from(id.as_i64()));
+                return Ok(true);
+            }
+            (SumAcc::Double(d), crate::id::Tag::Double) => {
+                *d = *d + oxsdatatypes::Double::from(id.as_f64());
+                return Ok(true);
+            }
+            _ => {}
+        }
+        let value = match ctx.value_checked(id) {
+            Ok(v) => v,
+            Err(error) => {
+                *rows -= 1;
+                *errs -= err;
+                return Err(error);
+            }
+        };
+        let Some(value) = value else {
+            let old_bytes = acc.heap_bytes();
+            if old_bytes != 0 {
+                let _ = admit.admit(old_bytes, 0)?;
+            }
+            *acc = SumAcc::HardError;
+            return Ok(true);
+        };
+        // Fast in-place updates that never change heap ownership or need big-number scratch,
+        // plus fixed-size boxed transitions admitted strictly before allocation so spilling
+        // refusal preserves the admitted prefix without allocating.
+        match (&mut *acc, &value) {
+            (SumAcc::Int { sum, min, max }, Value::Integer(i)) => {
+                let x = i64::from(*i);
+                if let Some(s) = sum.checked_add(x) {
+                    *sum = s;
+                    if x >= 0 {
+                        if s > *max {
+                            *max = s;
+                        }
+                    } else if s < *min {
+                        *min = s;
+                    }
+                    return Ok(true);
+                }
+                let s = i128::from(*sum) + i128::from(x);
+                let lo = i128::from(*min).min(s);
+                let hi = i128::from(*max).max(s);
+                match admit.admit(0, INT128_SUM_BYTES) {
+                    Ok(true) => {
+                        *acc = SumAcc::Int128(Box::new(Int128Sum {
+                            sum: s,
+                            min: lo,
+                            max: hi,
+                        }));
+                        return Ok(true);
+                    }
+                    Ok(false) => {
+                        *rows -= 1;
+                        *errs -= err;
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        *rows -= 1;
+                        *errs -= err;
+                        return Err(error);
+                    }
+                }
+            }
+            (
+                SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_),
+                Value::Decimal(d),
+            ) => {
+                let (int_before, int_min, int_max, exact_int_prefix) = match &*acc {
+                    SumAcc::Int { sum, min, max } => {
+                        (i128::from(*sum), i128::from(*min), i128::from(*max), true)
+                    }
+                    SumAcc::Int128(b) => (b.sum, b.min, b.max, true),
+                    SumAcc::IntRetracted(sum) => (*sum, 0, 0, false),
+                    _ => unreachable!(),
+                };
+                if let Some(v) = int_before
+                    .checked_mul(super::value::DECIMAL_SCALE)
+                    .and_then(|s| s.checked_add(super::value::decimal_raw(*d)))
+                {
+                    let old_bytes = acc.heap_bytes();
+                    match admit.admit(old_bytes, DECIMAL_SUM_BYTES) {
+                        Ok(true) => {
+                            *acc = SumAcc::HardError;
+                            *acc = SumAcc::Decimal(Box::new(DecimalSum {
+                                val: v,
+                                min: v,
+                                max: v,
+                                int_before,
+                                int_min,
+                                int_max,
+                                exact_int_prefix,
+                            }));
+                            return Ok(true);
+                        }
+                        Ok(false) => {
+                            *rows -= 1;
+                            *errs -= err;
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            *rows -= 1;
+                            *errs -= err;
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            (SumAcc::Int128(b), Value::Integer(i)) => {
+                let x = i64::from(*i);
+                if let Some(s) = b.sum.checked_add(x.into()) {
+                    b.sum = s;
+                    if x >= 0 {
+                        if s > b.max {
+                            b.max = s;
+                        }
+                    } else if s < b.min {
+                        b.min = s;
+                    }
+                    return Ok(true);
+                }
+            }
+            (SumAcc::IntRetracted(sum), Value::Integer(i)) => {
+                if let Some(s) = sum.checked_add(i64::from(*i).into()) {
+                    *sum = s;
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Decimal(ds), Value::Integer(i)) => {
+                let raw = i128::from(i64::from(*i)) * super::value::DECIMAL_SCALE;
+                if let Some(v) = ds.val.checked_add(raw) {
+                    ds.val = v;
+                    ds.min = ds.min.min(v);
+                    ds.max = ds.max.max(v);
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Decimal(ds), Value::Decimal(d)) => {
+                if let Some(v) = ds.val.checked_add(super::value::decimal_raw(*d)) {
+                    ds.val = v;
+                    ds.min = ds.min.min(v);
+                    ds.max = ds.max.max(v);
+                    return Ok(true);
+                }
+            }
+            (SumAcc::Float(f), Value::Integer(i)) => {
+                *f = *f + oxsdatatypes::Float::from(*i);
+                return Ok(true);
+            }
+            (SumAcc::Float(f), Value::Decimal(d)) => {
+                *f = *f + oxsdatatypes::Float::from(*d);
+                return Ok(true);
+            }
+            (SumAcc::Float(f), Value::Float(g)) => {
+                *f = *f + *g;
+                return Ok(true);
+            }
+            (SumAcc::Float(f), Value::Double(d)) => {
+                *acc = SumAcc::Double(oxsdatatypes::Double::from(*f) + *d);
+                return Ok(true);
+            }
+            (SumAcc::Double(d), Value::Integer(i)) => {
+                *d = *d + oxsdatatypes::Double::from(*i);
+                return Ok(true);
+            }
+            (SumAcc::Double(d), Value::Decimal(x)) => {
+                *d = *d + oxsdatatypes::Double::from(*x);
+                return Ok(true);
+            }
+            (SumAcc::Double(d), Value::Float(f)) => {
+                *d = *d + oxsdatatypes::Double::from(*f);
+                return Ok(true);
+            }
+            (SumAcc::Double(d), Value::Double(x)) => {
+                *d = *d + *x;
+                return Ok(true);
+            }
+            _ => {}
+        }
+
+        let (next, scratch) = match acc.add_value_slow(ctx, &value, admit) {
+            Ok(pair) => pair,
+            Err(error) => {
+                *rows -= 1;
+                *errs -= err;
+                return Err(error);
+            }
+        };
+        let old_bytes = acc.heap_bytes();
+        let new_bytes = next.heap_bytes();
+        // All arithmetic temporaries have been dropped; narrow the scratch guard to cover
+        // the live candidate until retained admission completes and the old subtotal drops,
+        // or until refusal drops the candidate.
+        if let Some(guard) = &scratch
+            && let Err(error) = guard.resize(new_bytes)
+        {
+            drop(next);
+            drop(scratch);
+            *rows -= 1;
+            *errs -= err;
+            return Err(error);
+        }
+        if old_bytes != new_bytes {
+            match admit.admit(old_bytes, new_bytes) {
+                Ok(true) => {}
+                Ok(false) => {
+                    drop(next);
+                    drop(scratch);
+                    *rows -= 1;
+                    *errs -= err;
+                    return Ok(false);
+                }
+                Err(error) => {
+                    drop(next);
+                    drop(scratch);
+                    *rows -= 1;
+                    *errs -= err;
+                    return Err(error);
+                }
+            }
+        }
+        let old = std::mem::replace(acc, next);
+        drop(old);
+        drop(scratch);
+        Ok(true)
+    }
+
+    /// Whether [`AggState::merge`] of `other` into `self` is guaranteed to match a single
+    /// sequential pass bit-for-bit without mutating either state.
+    pub(super) fn can_merge(&self, other: &AggState) -> bool {
+        match (self, other) {
+            (AggState::Count(_), AggState::Count(_))
+            | (AggState::Sample(_), AggState::Sample(_)) => true,
+            (AggState::Best(lb, _, _, lf), AggState::Best(rb, _, _, rf)) => {
+                if lb.is_none() || rb.is_none() {
+                    return true;
+                }
+                let combined = lf | rf;
+                (combined & BEST_INCOMPARABLE) == 0
+                    && (combined & (BEST_EXACT_NUM | BEST_FLOAT)) != (BEST_EXACT_NUM | BEST_FLOAT)
+            }
+            (
+                AggState::Sum {
+                    acc: la,
+                    rows: lr,
+                    deferred: ld,
+                    ..
+                },
+                AggState::Sum {
+                    acc: ra,
+                    rows: rr,
+                    errs: re,
+                    deferred: rd,
+                },
+            ) => {
+                if *ld || *rd {
+                    return false;
+                }
+                if *lr == 0 || *rr == 0 {
+                    return true;
+                }
+                if matches!(la, SumAcc::HardError | SumAcc::Overflow) {
+                    return true;
+                }
+                if matches!(ra, SumAcc::HardError) {
+                    return true;
+                }
+                if matches!(ra, SumAcc::Overflow) {
+                    return *re > 0;
+                }
+                match (la, ra) {
+                    (l, r) if l.int_bounds().is_some() && r.int_bounds().is_some() => {
+                        let (ls, _, _) = l.int_bounds().expect("checked above");
+                        let (rs, rmin, rmax) = r.int_bounds().expect("checked above");
+                        ls.checked_add(rs).is_some()
+                            && ls.checked_add(rmin).is_some()
+                            && ls.checked_add(rmax).is_some()
+                    }
+                    (l, r) if l.int_sum().is_some() && r.int_sum().is_some() => {
+                        let ls = l.int_sum().expect("checked above");
+                        let rs = r.int_sum().expect("checked above");
+                        ls.checked_add(rs).is_some()
+                    }
+                    (SumAcc::Decimal(l), r) if r.int_bounds().is_some() => {
+                        let (osum, omin, omax) = r.int_bounds().expect("checked above");
+                        super::value::add_scaled_int(l.val, omin).is_some()
+                            && super::value::add_scaled_int(l.val, omax).is_some()
+                            && super::value::add_scaled_int(l.val, osum).is_some()
+                    }
+                    (l, SumAcc::Decimal(r)) if l.int_bounds().is_some() => {
+                        let (ls, _, _) = l.int_bounds().expect("checked above");
+                        r.exact_int_prefix
+                            && ls
+                                .checked_add(r.int_before)
+                                .and_then(|t| t.checked_mul(super::value::DECIMAL_SCALE))
+                                .is_some()
+                            && ls.checked_add(r.int_min).is_some()
+                            && ls.checked_add(r.int_max).is_some()
+                            && super::value::add_scaled_int(r.min, ls).is_some()
+                            && super::value::add_scaled_int(r.max, ls).is_some()
+                            && super::value::add_scaled_int(r.val, ls).is_some()
+                    }
+                    (SumAcc::Decimal(l), SumAcc::Decimal(r)) => {
+                        r.exact_int_prefix
+                            && super::value::add_scaled_int(l.val, r.int_min).is_some()
+                            && super::value::add_scaled_int(l.val, r.int_max).is_some()
+                            && l.val.checked_add(r.min).is_some()
+                            && l.val.checked_add(r.max).is_some()
+                            && l.val.checked_add(r.val).is_some()
+                    }
+                    (SumAcc::Decimal(_), r) if r.is_retracted_int() => false,
+                    (l, SumAcc::Decimal(_)) if l.is_retracted_int() => false,
+                    (SumAcc::BigInt(_) | SumAcc::BigDec(_), _)
+                    | (_, SumAcc::BigInt(_) | SumAcc::BigDec(_)) => false,
+                    (SumAcc::Float(_) | SumAcc::Double(_), r) if r.is_retracted_int() => false,
+                    (
+                        SumAcc::Float(_) | SumAcc::Double(_),
+                        SumAcc::Int { .. }
+                        | SumAcc::Int128(_)
+                        | SumAcc::Decimal(_)
+                        | SumAcc::Float(_)
+                        | SumAcc::Double(_),
+                    )
+                    | (
+                        SumAcc::Int { .. }
+                        | SumAcc::Int128(_)
+                        | SumAcc::IntRetracted(_)
+                        | SumAcc::Decimal(_),
+                        SumAcc::Float(_) | SumAcc::Double(_),
+                    ) => *rr == 1,
+                    (SumAcc::HardError | SumAcc::Overflow, _)
+                    | (_, SumAcc::HardError | SumAcc::Overflow) => unreachable!(),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Exact heap bytes that `self` will own after [`AggState::merge`] folds `other` into
+    /// `self`, assuming `self.can_merge(other)` is true. Allocates nothing.
+    pub(super) fn merged_sum_heap_bytes(&self, other: &AggState) -> u64 {
+        let (
+            AggState::Sum {
+                acc: la, rows: lr, ..
+            },
+            AggState::Sum {
+                acc: ra,
+                rows: rr,
+                errs: re,
+                ..
+            },
+        ) = (self, other)
+        else {
+            return 0;
+        };
+        if *rr == 0 {
+            return la.heap_bytes();
+        }
+        if *lr == 0 {
+            return ra.heap_bytes();
+        }
+        if matches!(la, SumAcc::HardError | SumAcc::Overflow) {
+            return la.heap_bytes();
+        }
+        if matches!(ra, SumAcc::HardError) || (matches!(ra, SumAcc::Overflow) && *re > 0) {
+            return 0;
+        }
+        match (la, ra) {
+            (l, r) if l.int_bounds().is_some() && r.int_bounds().is_some() => {
+                let (base, lmin, lmax) = l.int_bounds().expect("checked above");
+                let (osum, omin, omax) = r.int_bounds().expect("checked above");
+                let new_sum = base + osum;
+                let new_min = lmin.min(base + omin);
+                let new_max = lmax.max(base + omax);
+                if i64::try_from(new_sum).is_ok()
+                    && i64::try_from(new_min).is_ok()
+                    && i64::try_from(new_max).is_ok()
+                {
+                    0
+                } else {
+                    INT128_SUM_BYTES
+                }
+            }
+            (l, r) if l.int_sum().is_some() && r.int_sum().is_some() => 0,
+            (SumAcc::Decimal(_), r) if r.int_bounds().is_some() => DECIMAL_SUM_BYTES,
+            (l, SumAcc::Decimal(_)) if l.int_bounds().is_some() => DECIMAL_SUM_BYTES,
+            (SumAcc::Decimal(_), SumAcc::Decimal(_)) => DECIMAL_SUM_BYTES,
+            _ => 0,
         }
     }
 
     /// Fold `other`, the state of the same aggregate over rows that come after this
     /// state's rows, into this one, so that the result is what one state over all the
     /// rows in that order gives. `false`, with this state unchanged, for a state that
-    /// cannot be combined exactly, such as ARQ's shifted sums.
-    #[allow(dead_code, reason = "the parallel split and item 418's view operator")]
+    /// cannot be combined exactly, such as ARQ's shifted sums, multi-row float/double
+    /// subtotals, big-number arithmetic merges, or a right-side numeric overflow that a
+    /// single pass might have avoided.
     pub(super) fn merge(&mut self, ctx: &Ctx, agg: &Agg, other: AggState) -> bool {
+        if !self.can_merge(&other) {
+            let _ = ctx;
+            return false;
+        }
         match (&mut *self, other) {
             (AggState::Count(a), AggState::Count(b)) => *a += b,
             (
                 AggState::Sum {
-                    int,
-                    generic,
-                    ok,
-                    rows,
-                    errs,
+                    acc, rows, errs, ..
                 },
                 AggState::Sum {
-                    int: oint,
-                    generic: ogeneric,
-                    ok: ook,
+                    acc: oacc,
                     rows: orows,
                     errs: oerrs,
+                    ..
                 },
             ) => {
+                if orows == 0 {
+                    return true;
+                }
+                if *rows == 0 {
+                    *acc = oacc;
+                    *rows = orows;
+                    *errs = oerrs;
+                    return true;
+                }
                 *rows += orows;
                 *errs += oerrs;
-                if !*ok {
+                if matches!(acc, SumAcc::HardError | SumAcc::Overflow) {
                     return true;
                 }
-                if !ook {
-                    *ok = false;
-                    return true;
-                }
-                if generic.is_none()
-                    && ogeneric.is_none()
-                    && let Some(s) = int.checked_add(oint)
+                if matches!(oacc, SumAcc::HardError)
+                    || (matches!(oacc, SumAcc::Overflow) && oerrs > 0)
                 {
-                    *int = s;
+                    *acc = SumAcc::HardError;
                     return true;
                 }
-                let left = generic.take().or_else(|| super::value::exact_sum(*int));
-                let right = ogeneric.or_else(|| super::value::exact_sum(oint));
-                match (left, right) {
-                    (Some(l), Some(r)) => match arith(NumOp::Add, &l, &r) {
-                        Ok(v) => *generic = Some(v),
-                        Err(_) => *ok = false,
-                    },
-                    _ => *ok = false,
+                match (&mut *acc, oacc) {
+                    (l, r) if l.int_bounds().is_some() && r.int_bounds().is_some() => {
+                        let (base, lmin, lmax) = l.int_bounds().expect("checked above");
+                        let (osum, omin, omax) = r.int_bounds().expect("checked above");
+                        let new_sum = base + osum;
+                        let new_min = lmin.min(base + omin);
+                        let new_max = lmax.max(base + omax);
+                        if let (Ok(s), Ok(lo), Ok(hi)) = (
+                            i64::try_from(new_sum),
+                            i64::try_from(new_min),
+                            i64::try_from(new_max),
+                        ) {
+                            *l = SumAcc::Int {
+                                sum: s,
+                                min: lo,
+                                max: hi,
+                            };
+                        } else if let SumAcc::Int128(b) = l {
+                            b.sum = new_sum;
+                            b.min = new_min;
+                            b.max = new_max;
+                        } else if let SumAcc::Int128(mut b) = r {
+                            b.sum = new_sum;
+                            b.min = new_min;
+                            b.max = new_max;
+                            *l = SumAcc::Int128(b);
+                        } else {
+                            *l = SumAcc::Int128(Box::new(Int128Sum {
+                                sum: new_sum,
+                                min: new_min,
+                                max: new_max,
+                            }));
+                        }
+                    }
+                    (l, r) if l.int_sum().is_some() && r.int_sum().is_some() => {
+                        let sum = l.int_sum().expect("checked above")
+                            + r.int_sum().expect("checked above");
+                        *l = SumAcc::IntRetracted(sum);
+                    }
+                    (SumAcc::Decimal(l), r) if r.int_bounds().is_some() => {
+                        let (osum, omin, omax) = r.int_bounds().expect("checked above");
+                        let smin = super::value::add_scaled_int(l.val, omin)
+                            .expect("validated by can_merge");
+                        let smax = super::value::add_scaled_int(l.val, omax)
+                            .expect("validated by can_merge");
+                        let val = super::value::add_scaled_int(l.val, osum)
+                            .expect("validated by can_merge");
+                        l.val = val;
+                        l.min = l.min.min(smin);
+                        l.max = l.max.max(smax);
+                    }
+                    (l, SumAcc::Decimal(mut r)) if l.int_bounds().is_some() => {
+                        let (base, lmin, lmax) = l.int_bounds().expect("checked above");
+                        let trans_int = base + r.int_before;
+                        let smin = super::value::add_scaled_int(r.min, base)
+                            .expect("validated by can_merge");
+                        let smax = super::value::add_scaled_int(r.max, base)
+                            .expect("validated by can_merge");
+                        let val = super::value::add_scaled_int(r.val, base)
+                            .expect("validated by can_merge");
+                        r.val = val;
+                        r.min = smin;
+                        r.max = smax;
+                        r.int_before = trans_int;
+                        debug_assert!(r.exact_int_prefix);
+                        r.int_min = lmin.min(base + r.int_min);
+                        r.int_max = lmax.max(base + r.int_max);
+                        *l = SumAcc::Decimal(r);
+                    }
+                    (SumAcc::Decimal(l), SumAcc::Decimal(r)) => {
+                        let imin = super::value::add_scaled_int(l.val, r.int_min)
+                            .expect("validated by can_merge");
+                        let imax = super::value::add_scaled_int(l.val, r.int_max)
+                            .expect("validated by can_merge");
+                        let dmin = l.val.checked_add(r.min).expect("validated by can_merge");
+                        let dmax = l.val.checked_add(r.max).expect("validated by can_merge");
+                        let val = l.val.checked_add(r.val).expect("validated by can_merge");
+                        l.val = val;
+                        l.min = l.min.min(imin).min(dmin);
+                        l.max = l.max.max(imax).max(dmax);
+                    }
+                    // Single-row right partition with Float or Double on either side.
+                    (left_acc, right_acc) => {
+                        debug_assert_eq!(orows, 1);
+                        use oxsdatatypes::{Double, Float};
+                        match (&*left_acc, right_acc) {
+                            (l, SumAcc::Float(f)) if l.int_sum().is_some() => {
+                                let sum = l.int_sum().expect("checked above");
+                                *left_acc = SumAcc::Float(Float::from(sum as f32) + f);
+                            }
+                            (l, SumAcc::Double(d)) if l.int_sum().is_some() => {
+                                let sum = l.int_sum().expect("checked above");
+                                *left_acc = SumAcc::Double(Double::from(sum as f64) + d);
+                            }
+                            (SumAcc::Decimal(ds), SumAcc::Float(f)) => {
+                                *left_acc = SumAcc::Float(
+                                    Float::from(super::value::decimal_from_raw(ds.val)) + f,
+                                );
+                            }
+                            (SumAcc::Decimal(ds), SumAcc::Double(d)) => {
+                                *left_acc = SumAcc::Double(
+                                    Double::from(super::value::decimal_from_raw(ds.val)) + d,
+                                );
+                            }
+                            (SumAcc::Float(f), r) if r.int_sum().is_some() => {
+                                let sum = r.int_sum().expect("checked above");
+                                *left_acc = SumAcc::Float(*f + Float::from(sum as f32));
+                            }
+                            (SumAcc::Float(f), SumAcc::Decimal(ds)) => {
+                                *left_acc = SumAcc::Float(
+                                    *f + Float::from(super::value::decimal_from_raw(ds.val)),
+                                );
+                            }
+                            (SumAcc::Float(f), SumAcc::Float(g)) => {
+                                *left_acc = SumAcc::Float(*f + g);
+                            }
+                            (SumAcc::Float(f), SumAcc::Double(d)) => {
+                                *left_acc = SumAcc::Double(Double::from(*f) + d);
+                            }
+                            (SumAcc::Double(d), r) if r.int_sum().is_some() => {
+                                let sum = r.int_sum().expect("checked above");
+                                *left_acc = SumAcc::Double(*d + Double::from(sum as f64));
+                            }
+                            (SumAcc::Double(d), SumAcc::Decimal(ds)) => {
+                                *left_acc = SumAcc::Double(
+                                    *d + Double::from(super::value::decimal_from_raw(ds.val)),
+                                );
+                            }
+                            (SumAcc::Double(d), SumAcc::Float(f)) => {
+                                *left_acc = SumAcc::Double(*d + Double::from(f));
+                            }
+                            (SumAcc::Double(d), SumAcc::Double(x)) => {
+                                *left_acc = SumAcc::Double(*d + x);
+                            }
+                            _ => unreachable!("validated by can_merge"),
+                        }
+                    }
                 }
             }
-            (AggState::Best(best, best_v, errs), AggState::Best(Some(id), v, oerrs)) => {
+            (
+                AggState::Best(best, best_v, errs, flags),
+                AggState::Best(Some(id), v, oerrs, oflags),
+            ) => {
                 *errs += oerrs;
+                *flags |= oflags;
                 let better = match best_v.as_ref() {
                     None => best.is_none(),
                     Some(b) => {
@@ -7151,63 +10081,196 @@ impl AggState {
                     *best_v = v;
                 }
             }
-            (AggState::Best(_, _, errs), AggState::Best(None, _, oerrs)) => *errs += oerrs,
+            (AggState::Best(_, _, errs, flags), AggState::Best(None, _, oerrs, oflags)) => {
+                *errs += oerrs;
+                *flags |= oflags;
+            }
             (AggState::Sample(x), AggState::Sample(y)) => {
                 if x.is_none() {
                     *x = y;
                 }
             }
-            _ => {
-                let _ = ctx;
-                return false;
-            }
+            _ => unreachable!("validated by can_merge"),
         }
         true
     }
 
-    /// Take back one row that [`AggState::add`] counted, for a state that can: a count,
-    /// and an exact sum of inline integers. `false`, with this state unchanged, for any
-    /// other, since a minimum, a sample or a sum that left the exact integers keeps no
-    /// record of the rows it would have to give up.
-    #[allow(dead_code, reason = "the parallel split and item 418's view operator")]
-    pub(super) fn retract(&mut self, id: Option<Id>) -> bool {
+    /// Add `weight` copies of one row; `id` is the aggregated column's value (`None` for COUNT(*)).
+    pub(super) fn add_weighted(
+        &mut self,
+        ctx: &Ctx,
+        agg: &Agg,
+        id: Option<Id>,
+        weight: u64,
+        admit: &mut dyn SumAdmit,
+    ) -> Result<()> {
+        if weight == 0 {
+            return Ok(());
+        }
         match self {
             AggState::Count(n) => {
                 if id.is_none_or(|id| !id.is_undef()) {
-                    *n = n.saturating_sub(1);
+                    *n += weight;
+                }
+            }
+            AggState::Best(_, _, errs, _) => {
+                if id.is_none_or(|id| id.is_undef()) {
+                    *errs += weight;
+                } else {
+                    let _ = self.add_admitted(ctx, agg, id, admit)?;
+                }
+            }
+            AggState::Sample(_) => {
+                let _ = self.add_admitted(ctx, agg, id, admit)?;
+            }
+            AggState::Sum {
+                acc: SumAcc::HardError | SumAcc::Overflow,
+                rows,
+                errs,
+                ..
+            } => {
+                *rows += weight;
+                if id.is_none_or(|id| id.is_undef()) {
+                    *errs += weight;
+                }
+            }
+            AggState::Sum {
+                acc, rows, errs, ..
+            } if id.is_none_or(|id| id.is_undef()) => {
+                *rows += weight;
+                *errs += weight;
+                *acc = SumAcc::HardError;
+            }
+            AggState::Sum {
+                acc: SumAcc::Int { sum, min, max },
+                rows,
+                ..
+            } if id.is_some_and(|id| id.tag() == crate::id::Tag::Int) => {
+                let id = id.expect("checked above");
+                let x = id.as_i64();
+                if let Ok(w) = i64::try_from(weight)
+                    && let Some(delta) = x.checked_mul(w)
+                    && let Some(s) = sum.checked_add(delta)
+                {
+                    *sum = s;
+                    if x >= 0 {
+                        if s > *max {
+                            *max = s;
+                        }
+                    } else if s < *min {
+                        *min = s;
+                    }
+                    *rows += weight;
+                    return Ok(());
+                }
+                for i in 0..weight {
+                    if i.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    let _ = self.add_admitted(ctx, agg, Some(id), admit)?;
+                    if let AggState::Sum {
+                        acc: SumAcc::HardError | SumAcc::Overflow,
+                        rows,
+                        ..
+                    } = self
+                    {
+                        *rows += weight - 1 - i;
+                        break;
+                    }
+                }
+            }
+            _ => {
+                for i in 0..weight {
+                    if i.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    let _ = self.add_admitted(ctx, agg, id, admit)?;
+                    if let AggState::Sum {
+                        acc: SumAcc::HardError | SumAcc::Overflow,
+                        rows,
+                        errs,
+                        ..
+                    } = self
+                    {
+                        let rem = weight - 1 - i;
+                        *rows += rem;
+                        if id.is_none_or(|id| id.is_undef()) {
+                            *errs += rem;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Take back `weight` copies of one row that [`AggState::add`] counted, for a state
+    /// that can: a count, and an exact sum of inline integers. `false`, with this state
+    /// unchanged, for any other, since a minimum, a sample or a sum that left the exact
+    /// integers keeps no record of the rows it would have to give up.
+    pub(super) fn retract(&mut self, id: Option<Id>, weight: u64) -> bool {
+        if weight == 0 {
+            return true;
+        }
+        match self {
+            AggState::Count(n) => {
+                if id.is_none_or(|id| !id.is_undef()) {
+                    *n = n.saturating_sub(weight);
                 }
                 true
             }
-            AggState::Sum {
-                int,
-                generic: None,
-                ok: true,
-                rows,
-                ..
-            } => {
+            AggState::Sum { acc, rows, .. } => {
+                let Some(sum) = acc.int_sum() else {
+                    return false;
+                };
                 let Some(id) = id.filter(|id| id.tag() == crate::id::Tag::Int) else {
                     return false;
                 };
-                let Some(s) = int.checked_sub(id.as_i64().into()) else {
+                let Some(delta) = i128::from(id.as_i64()).checked_mul(i128::from(weight)) else {
                     return false;
                 };
-                *int = s;
-                *rows = rows.saturating_sub(1);
+                let Some(s) = sum.checked_sub(delta) else {
+                    return false;
+                };
+                *acc = SumAcc::IntRetracted(s);
+                *rows = rows.saturating_sub(weight);
                 true
             }
             _ => false,
         }
     }
 
-    pub(super) fn finish(self, ctx: &Ctx, agg: &Agg) -> Id {
+    /// Read the aggregate's current value without consuming this state.
+    pub(super) fn read(&self, ctx: &Ctx, agg: &Agg) -> Result<Id> {
         match self {
-            AggState::Count(n) => Id::from_i64(n as i64).unwrap_or(Id::UNDEF),
+            AggState::Count(n) => Ok(Id::from_i64(*n as i64).unwrap_or(Id::UNDEF)),
+            AggState::Sum { .. } => self.clone().finish(ctx, agg),
+            AggState::Best(best, _, errs, _) => Ok(super::group::acc::finish_best(
+                ctx,
+                matches!(agg.func, AggregateFunction::Min),
+                *errs,
+                *best,
+            )),
+            AggState::Sample(x) => Ok(x.unwrap_or(Id::UNDEF)),
+            AggState::Stat(arq, acc) => acc.try_finish(ctx, *arq),
+        }
+    }
+
+    pub(super) fn finish(self, ctx: &Ctx, agg: &Agg) -> Result<Id> {
+        self.finish_with(ctx, agg, &mut DirectScratch)
+    }
+
+    pub(super) fn finish_with(
+        self,
+        ctx: &Ctx,
+        agg: &Agg,
+        scratch_admit: &mut dyn ScratchAdmit,
+    ) -> Result<Id> {
+        match self {
+            AggState::Count(n) => Ok(Id::from_i64(n as i64).unwrap_or(Id::UNDEF)),
             AggState::Sum {
-                int,
-                generic,
-                ok,
-                rows,
-                errs,
+                acc, rows, errs, ..
             } => {
                 // AVG is Sum over Count, and Count leaves the errors out
                 if rows > 0
@@ -7215,39 +10278,116 @@ impl AggState {
                     && matches!(agg.func, AggregateFunction::Avg)
                     && ctx.aggregate_errors.avg_of_errors_zero()
                 {
-                    return ctx.intern_value(&Value::Integer(0.into()));
+                    return ctx.try_intern_value(&Value::Integer(0.into()));
                 }
-                if !ok {
-                    return Id::UNDEF;
+                if matches!(acc, SumAcc::HardError | SumAcc::Overflow) {
+                    return Ok(Id::UNDEF);
                 }
-                let sum = match generic {
-                    Some(sum) => sum,
-                    None => match i64::try_from(int) {
-                        Ok(int) => Value::Integer(int.into()),
-                        Err(_) => return Id::UNDEF,
-                    },
+                let is_avg = matches!(agg.func, AggregateFunction::Avg);
+                if is_avg && rows == 0 {
+                    return ctx.try_intern_value(&Value::Integer(0.into()));
+                }
+                use super::bignum::{BigDec, BigInt, FIXED_AVG_SCRATCH_BYTES};
+                use super::value::{
+                    avg_big_decimal, avg_fixed_integer, avg_fixed_raw, decimal_from_raw,
                 };
-                let v = if matches!(agg.func, AggregateFunction::Avg) {
-                    if rows == 0 {
-                        Some(Value::Integer(0.into()))
-                    } else {
-                        arith(NumOp::Div, &sum, &Value::Integer((rows as i64).into())).ok()
+                let (v, scratch) = match acc {
+                    SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_) => {
+                        let int = acc.int_sum().expect("int variant");
+                        if !is_avg {
+                            (Some(super::value::exact_sum(int)), None)
+                        } else if let Some(avg) = avg_fixed_integer(int, rows) {
+                            (Some(Value::Decimal(avg)), None)
+                        } else {
+                            let scratch =
+                                scratch_admit.charge_scratch(ctx, FIXED_AVG_SCRATCH_BYTES)?;
+                            let sum = BigDec::from_bigint(BigInt::from_i128(int));
+                            (avg_big_decimal(&sum, rows), Some(scratch))
+                        }
+                    }
+                    SumAcc::Decimal(ds) => {
+                        if !is_avg {
+                            (Some(Value::Decimal(decimal_from_raw(ds.val))), None)
+                        } else if let Some(avg) = avg_fixed_raw(ds.val, rows) {
+                            (Some(Value::Decimal(avg)), None)
+                        } else {
+                            let scratch =
+                                scratch_admit.charge_scratch(ctx, FIXED_AVG_SCRATCH_BYTES)?;
+                            let sum = BigDec::from_oxs_decimal(decimal_from_raw(ds.val));
+                            (avg_big_decimal(&sum, rows), Some(scratch))
+                        }
+                    }
+                    SumAcc::Float(f) => {
+                        let v = if is_avg {
+                            Some(Value::Float(f / oxsdatatypes::Float::from(rows as f32)))
+                        } else {
+                            Some(Value::Float(f))
+                        };
+                        (v, None)
+                    }
+                    SumAcc::Double(d) => {
+                        let v = if is_avg {
+                            Some(Value::Double(d / oxsdatatypes::Double::from(rows as f64)))
+                        } else {
+                            Some(Value::Double(d))
+                        };
+                        (v, None)
+                    }
+                    SumAcc::BigInt(bi) => {
+                        if is_avg {
+                            let scratch = scratch_admit
+                                .charge_scratch(ctx, super::bignum::AGG_SUM_SCRATCH_BYTES)?;
+                            let v = avg_big_decimal(&BigDec::from_bigint(*bi), rows);
+                            (v, Some(scratch))
+                        } else {
+                            (bi.fits_limits().then(|| Value::from_bigint(*bi)), None)
+                        }
+                    }
+                    SumAcc::BigDec(bd) => {
+                        if is_avg {
+                            let scratch = scratch_admit
+                                .charge_scratch(ctx, super::bignum::AGG_SUM_SCRATCH_BYTES)?;
+                            let v = super::value::avg_big_decimal(&bd, rows);
+                            drop(bd);
+                            (v, Some(scratch))
+                        } else {
+                            (bd.fits_limits().then(|| Value::from_bigdec(*bd)), None)
+                        }
+                    }
+                    SumAcc::HardError | SumAcc::Overflow => unreachable!(),
+                };
+                let intern_scratch = if scratch.is_none() {
+                    match v.as_ref() {
+                        Some(Value::BigInteger(i)) => Some(scratch_admit.charge_scratch(
+                            ctx,
+                            super::bignum::intern_scratch_bytes(i.lexical_len()),
+                        )?),
+                        Some(Value::BigDecimal(d)) => Some(scratch_admit.charge_scratch(
+                            ctx,
+                            super::bignum::intern_scratch_bytes(d.lexical_len()),
+                        )?),
+                        _ => None,
                     }
                 } else {
-                    Some(sum)
+                    None
                 };
-                v.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
+                let id = match v.as_ref() {
+                    Some(v) => ctx.try_intern_value(v)?,
+                    None => Id::UNDEF,
+                };
+                drop(v);
+                drop(intern_scratch);
+                drop(scratch);
+                Ok(id)
             }
-            AggState::Best(best, _, errs) => {
-                let min = matches!(agg.func, AggregateFunction::Min);
-                if errs > 0 && ctx.aggregate_errors.best_errs(min) {
-                    Id::UNDEF
-                } else {
-                    best.unwrap_or(Id::UNDEF)
-                }
-            }
-            AggState::Sample(x) => x.unwrap_or(Id::UNDEF),
-            AggState::Stat(arq, acc) => acc.finish(ctx, arq),
+            AggState::Best(best, _, errs, _) => Ok(super::group::acc::finish_best(
+                ctx,
+                matches!(agg.func, AggregateFunction::Min),
+                errs,
+                best,
+            )),
+            AggState::Sample(x) => Ok(x.unwrap_or(Id::UNDEF)),
+            AggState::Stat(arq, acc) => acc.try_finish(ctx, arq),
         }
     }
 }
@@ -7262,30 +10402,46 @@ pub(super) fn aggregate(
     agg: &Agg,
     arg: Option<&[Id]>,
     exists: Option<&super::exists::Answers<'_>>,
-) -> Id {
+) -> Result<Id> {
     if let (Some(spec), Some(e)) = (&agg.fold, &agg.expr) {
         return fold(ctx, t, map, rows, (e, spec, agg.distinct), exists);
     }
     let Some(e) = &agg.expr else {
         // COUNT(*)
         let n = if agg.distinct {
-            rows.iter()
-                .map(|&i| t.row(i as usize))
-                .collect::<FxHashSet<_>>()
-                .len()
+            let _seen_charge = ctx.charge(
+                (rows.len() as u64)
+                    .saturating_mul((t.cols.len() as u64).saturating_mul(8).saturating_add(64))
+                    .saturating_add(64),
+            )?;
+            let mut seen = FxHashSet::default();
+            for (idx, &i) in rows.iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                seen.insert(t.row(i as usize));
+            }
+            seen.len()
         } else {
             rows.len()
         };
-        return Id::from_i64(n as i64).unwrap_or(Id::UNDEF);
+        return Ok(Id::from_i64(n as i64).unwrap_or(Id::UNDEF));
     };
-    let mut vals: Vec<Result<Id, ()>> = rows
-        .iter()
-        .map(|&i| {
-            if let Some(a) = arg {
-                let id = a[i as usize];
-                return if id.is_undef() { Err(()) } else { Ok(id) };
-            }
-            eval(
+    let _vals_charge = ctx.charge(
+        (rows.len() as u64)
+            .saturating_mul(std::mem::size_of::<std::result::Result<Id, ()>>() as u64)
+            .saturating_add(64),
+    )?;
+    let mut vals: Vec<std::result::Result<Id, ()>> = Vec::with_capacity(rows.len());
+    for (idx, &i) in rows.iter().enumerate() {
+        if idx.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        let item = if let Some(a) = arg {
+            let id = a[i as usize];
+            if id.is_undef() { Err(()) } else { Ok(id) }
+        } else {
+            match eval(
                 e,
                 &Row {
                     table: t,
@@ -7295,45 +10451,62 @@ pub(super) fn aggregate(
                     exists,
                 },
                 ctx,
-            )
-            .map(|v| v.into_id(ctx))
-            .map_err(|_| ())
-        })
-        .collect();
+            ) {
+                Ok(v) => {
+                    let id = v.into_id(ctx);
+                    ctx.check()?;
+                    Ok(id)
+                }
+                Err(_) => {
+                    if ctx.has_memory_failure() {
+                        ctx.check()?;
+                    }
+                    Err(())
+                }
+            }
+        };
+        vals.push(item);
+    }
+    ctx.check()?;
     if agg.distinct {
+        let _seen_charge = ctx.charge((vals.len() as u64).saturating_mul(32).saturating_add(64))?;
         let mut seen = FxHashSet::default();
         vals.retain(|v| match v {
             Ok(id) => seen.insert(*id),
             Err(_) => true,
         });
     }
-    let values = || {
-        vals.iter()
-            .filter_map(|v| v.ok())
-            .filter_map(|id| ctx.value(id))
-    };
-    let result: Option<Value> = match &agg.func {
+    match &agg.func {
         AggregateFunction::Count => {
-            return Id::from_i64(vals.iter().filter(|v| v.is_ok()).count() as i64)
-                .unwrap_or(Id::UNDEF);
+            Ok(Id::from_i64(vals.iter().filter(|v| v.is_ok()).count() as i64).unwrap_or(Id::UNDEF))
         }
         // The running sum finds an integer sum in every order of the rows.
         AggregateFunction::Sum | AggregateFunction::Avg => {
             let mut state = AggState::new(agg);
-            for v in &vals {
-                state.add(ctx, agg, Some(v.unwrap_or(Id::UNDEF)));
+            for (idx, v) in vals.iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                state.add(ctx, agg, Some(v.unwrap_or(Id::UNDEF)), &mut |_| Ok(()))?;
             }
-            return state.finish(ctx, agg);
+            let id = state.finish(ctx, agg)?;
+            ctx.check()?;
+            Ok(id)
         }
         AggregateFunction::Min | AggregateFunction::Max => {
             let is_min = matches!(agg.func, AggregateFunction::Min);
             if vals.iter().any(|v| v.is_err()) && ctx.aggregate_errors.best_errs(is_min) {
-                return Id::UNDEF;
+                return Ok(Id::UNDEF);
             }
+            let mut best_credit = ctx.charge(0)?;
             let mut best: Option<Id> = None;
             let mut best_v: Option<Value> = None;
-            for id in vals.iter().filter_map(|v| v.ok()) {
-                let v = ctx.value(id);
+            for (idx, id) in vals.iter().filter_map(|v| v.ok()).enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let decode = ctx.charge(0)?;
+                let v = ctx.value_checked_into(id, &decode)?;
                 let better = match &best_v {
                     None => best.is_none(),
                     Some(b) => {
@@ -7347,41 +10520,82 @@ pub(super) fn aggregate(
                 };
                 if better {
                     best = Some(id);
+                    // Drop the old decoded value while its old credit is still live,
+                    // then swap in the new credit before storing the new value.
+                    drop(best_v.take());
+                    best_credit = decode;
                     best_v = v;
+                } else {
+                    drop(v);
+                    drop(decode);
                 }
             }
-            return best.unwrap_or(Id::UNDEF);
+            drop(best_v);
+            drop(best_credit);
+            Ok(best.unwrap_or(Id::UNDEF))
         }
-        AggregateFunction::Sample => return vals.iter().find_map(|v| v.ok()).unwrap_or(Id::UNDEF),
+        AggregateFunction::Sample => Ok(vals.iter().find_map(|v| v.ok()).unwrap_or(Id::UNDEF)),
         AggregateFunction::GroupConcat { separator } => {
             if agg.distinct
                 && rows.is_empty()
                 && ctx.aggregate_errors.distinct_concat_of_nothing_unbound()
             {
-                return Id::UNDEF;
-            }
-            let sep = separator.as_deref().unwrap_or(" ");
-            let mut parts = Vec::new();
-            let strings = ctx.aggregate_errors.concat_strings_only();
-            for v in values() {
-                // CONCAT takes only strings
-                if strings && !v.is_string() {
-                    return Id::UNDEF;
-                }
-                let Ok(s) = v.lexical() else { return Id::UNDEF };
-                parts.push(s.to_string());
+                return Ok(Id::UNDEF);
             }
             if vals.iter().any(|v| v.is_err()) {
-                return Id::UNDEF;
+                return Ok(Id::UNDEF);
+            }
+            let sep = separator.as_deref().unwrap_or(" ");
+            let strings = ctx.aggregate_errors.concat_strings_only();
+            let out_charge = ctx.charge(0)?;
+            let mut out = String::new();
+            let mut first = true;
+            for (idx, id) in vals.iter().filter_map(|v| v.ok()).enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let decode = ctx.charge(0)?;
+                let Some(v) = ctx.value_checked_into(id, &decode)? else {
+                    continue;
+                };
+                // CONCAT takes only strings
+                if strings && !v.is_string() {
+                    return Ok(Id::UNDEF);
+                }
+                let Ok(s) = v.lexical() else {
+                    return Ok(Id::UNDEF);
+                };
+                let add_len = s.len().saturating_add(if first { 0 } else { sep.len() });
+                if out.len().saturating_add(add_len) > out.capacity() {
+                    let before = out.capacity();
+                    let needed = out.len().saturating_add(add_len);
+                    let next_cap = needed.max(before.saturating_mul(2));
+                    let delta = (next_cap.saturating_sub(before) as u64).saturating_mul(2);
+                    if out_charge.add(delta).is_err() {
+                        let exact = (needed.saturating_sub(before) as u64).saturating_mul(2);
+                        out_charge.add(exact)?;
+                        out.reserve_exact(add_len);
+                    } else {
+                        out.reserve(next_cap - out.len());
+                    }
+                }
+                if !first {
+                    out.push_str(sep);
+                }
+                out.push_str(&s);
+                first = false;
+                drop(s);
+                drop(v);
+                drop(decode);
             }
             // SPARQL 1.1: the result is a simple literal (language tags are dropped)
-            Some(Value::Str(parts.join(sep).into()))
+            let id = ctx.intern_value(&Value::Str(out.into()));
+            drop(out_charge);
+            ctx.check()?;
+            Ok(id)
         }
-        AggregateFunction::Custom(iri) => {
-            return super::aggext::aggregate(ctx, iri.as_str(), &vals);
-        }
-    };
-    result.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
+        AggregateFunction::Custom(iri) => super::aggext::aggregate(ctx, iri.as_str(), &vals),
+    }
 }
 
 /// ARQ's `FOLD` of one group (`AggFoldList`, `AggFoldMap`): the values of `e` in the
@@ -7397,7 +10611,7 @@ fn fold(
     rows: &[u32],
     (e, fold, distinct): (&Expr, &super::plan::Fold, bool),
     exists: Option<&super::exists::Answers<'_>>,
-) -> Id {
+) -> Result<Id> {
     use super::cdt::{Elem, Map, map_put};
     let row = |i: u32| Row {
         table: t,
@@ -7406,17 +10620,40 @@ fn fold(
         dec: None,
         exists,
     };
+    let fold_charge = ctx.charge((rows.len() as u64).saturating_mul(4).saturating_add(64))?;
     let mut order: Vec<u32> = rows.to_vec();
     if !fold.order.is_empty() {
-        let keys: Vec<Vec<Option<Value>>> = rows
-            .iter()
-            .map(|&i| {
-                fold.order
-                    .iter()
-                    .map(|(k, _)| eval(k, &row(i), ctx).ok().and_then(|v| v.value(ctx).ok()))
-                    .collect()
-            })
-            .collect();
+        let key_slots = (rows.len() as u64)
+            .saturating_mul(fold.order.len() as u64)
+            .saturating_mul(std::mem::size_of::<Option<Value>>() as u64)
+            .saturating_add((rows.len() as u64).saturating_mul(8))
+            .saturating_add(64);
+        fold_charge.add(key_slots)?;
+        let mut keys: Vec<Vec<Option<Value>>> = Vec::with_capacity(rows.len());
+        for (r_idx, &i) in rows.iter().enumerate() {
+            if r_idx.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let mut row_keys = Vec::with_capacity(fold.order.len());
+            for (k, _) in &fold.order {
+                let val = match eval(k, &row(i), ctx) {
+                    Ok(Val::Id(id)) => ctx.value_checked_into(id, &fold_charge)?,
+                    Ok(Val::V(v) | Val::Dec(_, v)) => {
+                        let opt = Some(v);
+                        fold_charge.add(key_payload(&opt))?;
+                        opt
+                    }
+                    Err(_) => {
+                        if ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
+                        None
+                    }
+                };
+                row_keys.push(val);
+            }
+            keys.push(row_keys);
+        }
         let mut idx: Vec<usize> = (0..rows.len()).collect();
         idx.sort_by(|&a, &b| {
             for (k, (_, asc)) in fold.order.iter().enumerate() {
@@ -7428,28 +10665,56 @@ fn fold(
             }
             Ordering::Equal
         });
+        drop(keys);
         order = idx.into_iter().map(|j| rows[j]).collect();
     }
-    let term = |x: &Expr, i: u32| {
-        eval(x, &row(i), ctx)
-            .ok()
-            .and_then(|v| ctx.term(v.into_id(ctx)))
+    let eval_term = |x: &Expr, i: u32| -> Result<Option<oxrdf::Term>> {
+        match eval(x, &row(i), ctx) {
+            Ok(v) => {
+                let id = v.into_id(ctx);
+                ctx.check()?;
+                ctx.term_checked_into(id, &fold_charge)
+            }
+            Err(_) => {
+                if ctx.has_memory_failure() {
+                    ctx.check()?;
+                }
+                Ok(None)
+            }
+        }
     };
     let value = match &fold.value {
         None => {
+            fold_charge.add(
+                (order.len() as u64)
+                    .saturating_mul(std::mem::size_of::<Elem>() as u64)
+                    .saturating_add(64),
+            )?;
             let mut list = Vec::with_capacity(order.len());
             let mut seen = FxHashSet::default();
             let mut null = false;
-            for i in order {
+            for (idx, i) in order.into_iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
                 match eval(e, &row(i), ctx) {
                     Ok(v) => {
                         let id = v.into_id(ctx);
-                        if distinct && !seen.insert(id) {
-                            continue;
+                        ctx.check()?;
+                        if distinct {
+                            if seen.contains(&id) {
+                                continue;
+                            }
+                            fold_charge.add(32)?;
+                            seen.insert(id);
                         }
-                        list.push(ctx.term(id).map_or(Elem::Null, Elem::Term));
+                        let term = ctx.term_checked_into(id, &fold_charge)?;
+                        list.push(term.map_or(Elem::Null, Elem::Term));
                     }
                     Err(_) => {
+                        if ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
                         if distinct && null {
                             continue;
                         }
@@ -7462,17 +10727,29 @@ fn fold(
         }
         Some(v) => {
             let mut m = Map::new();
-            for i in order {
-                let Some(k @ (oxrdf::Term::NamedNode(_) | oxrdf::Term::Literal(_))) = term(e, i)
+            for (idx, i) in order.into_iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let Some(k @ (oxrdf::Term::NamedNode(_) | oxrdf::Term::Literal(_))) =
+                    eval_term(e, i)?
                 else {
                     continue;
                 };
-                map_put(&mut m, k, term(v, i).map_or(Elem::Null, Elem::Term));
+                let val_elem = eval_term(v, i)?.map_or(Elem::Null, Elem::Term);
+                fold_charge.add(64)?;
+                map_put(&mut m, k, val_elem);
             }
             super::cdt::map_value(&m)
         }
     };
-    ctx.intern_value(&value)
+    let opt = Some(value);
+    fold_charge.add(key_payload(&opt))?;
+    let id = ctx.intern_value(opt.as_ref().expect("folded value"));
+    drop(opt);
+    drop(fold_charge);
+    ctx.check()?;
+    Ok(id)
 }
 
 // ------------------------------------------------------------------ paths ------
@@ -8747,7 +12024,7 @@ fn spatial_relate(
 }
 
 /// The vector of entity `e` under `pred` in the active graph (`None`: it has none).
-fn entity_vector(
+pub(super) fn entity_vector(
     ctx: &Ctx,
     spec: &super::plan::VectorSpec,
     pred: Id,
@@ -8762,14 +12039,13 @@ fn entity_vector(
     match found.as_slice() {
         [] => Ok(None),
         [o] => ctx
-            .snap
-            .key(*o)
-            .and_then(|k| crate::vector::from_key(&k))
+            .with_controlled_key(*o, |k| Ok(crate::vector::from_key(k)))?
+            .flatten()
             .map(Some)
             .ok_or_else(|| Error::invalid("the entity's vector is not a valid spk:vector")),
         many => Err(Error::invalid(format!(
             "entity {} has {} vectors for the predicate; pass a vector literal",
-            ctx.term(e).map_or("?".into(), |t| t.to_string()),
+            ctx.plan_term(e).map_or("?".into(), |t| t.to_string()),
             many.len()
         ))),
     }
@@ -8779,29 +12055,30 @@ fn entity_vector(
 pub(super) const MAX_QUERY_VECTORS: usize = 1000;
 
 /// The IRI of a search's predicate.
-fn pred_iri(ctx: &Ctx, pred: Id) -> Option<String> {
-    match ctx.snap.term(pred) {
+fn pred_iri(ctx: &Ctx, pred: Id) -> Result<Option<String>> {
+    let decode = ctx.charge(0)?;
+    Ok(match ctx.term_checked_into(pred, &decode)? {
         Some(oxrdf::Term::NamedNode(n)) => Some(n.into_string()),
         _ => None,
-    }
+    })
 }
 
 /// Whether the index of `pred` embeds query text.
-fn text_queries(ctx: &Ctx, pred: Id) -> bool {
-    pred_iri(ctx, pred).is_some_and(|iri| {
+fn text_queries(ctx: &Ctx, pred: Id) -> Result<bool> {
+    Ok(pred_iri(ctx, pred)?.is_some_and(|iri| {
         ctx.snap
             .generation
             .vectors
             .configured()
             .values()
             .any(|c| c.predicate == iri && c.embedding.as_ref().is_some_and(|e| e.query_text))
-    })
+    }))
 }
 
 /// The vector of a search's text, from the provider of the predicate's index.
 fn text_vector(ctx: &Ctx, pred: Id, text: &str) -> Result<std::sync::Arc<[f32]>> {
     ctx.check()?;
-    let iri = pred_iri(ctx, pred)
+    let iri = pred_iri(ctx, pred)?
         .ok_or_else(|| Error::invalid("spk:vectorSearch: the predicate is not an IRI"))?;
     crate::store::embed_query_text(&ctx.snap, &iri, text)
 }
@@ -8948,7 +12225,8 @@ fn text_bound(
     let (mut searches, mut restricted) = (0u64, 0u64);
     for id in order {
         ctx.check()?;
-        let Some(oxrdf::Term::Literal(l)) = ctx.term(id) else {
+        let decode = ctx.charge(0)?;
+        let Some(oxrdf::Term::Literal(l)) = ctx.term_checked_into(id, &decode)? else {
             continue;
         };
         let lang = match l.language() {
@@ -8956,8 +12234,10 @@ fn text_bound(
             None if l.datatype() == oxrdf::vocab::xsd::STRING => None,
             None => continue,
         };
+        decode.add(l.value().len() as u64)?;
         let mut one = spec.clone();
         one.query = l.value().to_string();
+        drop(l);
         one.query_var = None;
         one.lang = spec.lang.clone().or(lang);
         let subjects = subject_col.and_then(|c| {
@@ -8966,6 +12246,8 @@ fn text_bound(
         });
         restricted += subjects.is_some() as u64;
         let mut t = crate::text::search_in(ctx, &one, &svars, subjects.as_deref(), true)?;
+        drop(one);
+        drop(decode);
         searches += 1;
         t.vars.push(qv);
         t.cols.push(vec![id; t.len()]);
@@ -9070,24 +12352,36 @@ pub(super) fn vector_search(
             }
             for id in order {
                 ctx.check()?;
-                let v = match ctx.term(id) {
+                let decode = ctx.charge(0)?;
+                let v = match ctx.term_checked_into(id, &decode)? {
                     Some(oxrdf::Term::Literal(l))
                         if (l.datatype() == oxrdf::vocab::xsd::STRING
                             || l.datatype() == oxrdf::vocab::rdf::LANG_STRING)
-                            && text_queries(ctx, pred) =>
+                            && text_queries(ctx, pred)? =>
                     {
-                        Some(text_vector(ctx, pred, l.value())?.to_vec())
+                        let vec = text_vector(ctx, pred, l.value())?.to_vec();
+                        drop(l);
+                        drop(decode);
+                        Some(vec)
                     }
                     Some(oxrdf::Term::Literal(l)) => {
                         match vector::parse_typed(l.value(), l.datatype().as_str())
                             .and_then(|v| v.ok())
                         {
-                            Some(v) => Some(v),
+                            Some(v) => {
+                                drop(l);
+                                drop(decode);
+                                Some(v)
+                            }
                             // a literal that is not a vector matches nothing
                             None => continue,
                         }
                     }
-                    _ => entity_vector(ctx, spec, pred, id)?,
+                    other => {
+                        drop(other);
+                        drop(decode);
+                        entity_vector(ctx, spec, pred, id)?
+                    }
                 };
                 runs.push((v, by_value.remove(&id).unwrap_or_default()));
             }
@@ -9150,7 +12444,13 @@ pub(super) fn vector_search(
             subjects: subjects.as_deref(),
             mode: spec.mode,
         };
-        let (hits, info) = vector::search(&ctx.snap, &q, &|| ctx.check())?;
+        let mut search_charge = ctx.retained_charge(0)?;
+        let (hits, info) = vector::search_with_admit(&ctx.snap, &q, &|| ctx.check(), &mut |b| {
+            if let Some(h) = &mut search_charge {
+                h.resize(b)?;
+            }
+            Ok(())
+        })?;
         searches += 1;
         match &mut info_all {
             None => info_all = Some(info),
@@ -9239,6 +12539,137 @@ pub(super) fn vector_search(
     Ok((t, counters))
 }
 
+pub(super) type ChargedVectorOrder = (Table, super::ctx::OwnedCharge, Counters);
+
+/// Cursor entry for [`Kind::VectorSearch`] with `order_fallback`: pre-admits search
+/// scratch and builds the projected output table directly under an [`OwnedCharge`]
+/// before returning so the caller never holds an uncharged table or marks the generic
+/// child skipped before admission succeeds.
+pub(super) fn vector_search_order_charged(
+    ctx: &std::sync::Arc<Ctx>,
+    spec: &super::plan::VectorSpec,
+    node_vars: &[VarId],
+    out_vars: &[VarId],
+) -> Result<Option<ChargedVectorOrder>> {
+    use super::plan::VectorQuery;
+    use crate::vector;
+    let mut counters = serde_json::Map::new();
+    let Some(pred) = spec.pred else {
+        return Ok(None);
+    };
+    let query = match &spec.query {
+        VectorQuery::Vector(v) => v.to_vec(),
+        VectorQuery::Text(s) => text_vector(ctx, pred, s)?.to_vec(),
+        VectorQuery::Entity(e) => match entity_vector(ctx, spec, pred, *e)? {
+            Some(v) => v,
+            None => return Ok(None),
+        },
+        VectorQuery::Var(_) => {
+            return Err(Error::invalid(
+                "spk:vectorSearch: the query variable is not bound by the rest of the group",
+            ));
+        }
+    };
+    let graph = |g: u64| spec.graph.accepts(g);
+    let q = vector::Search {
+        pred: pred.0,
+        query: &query,
+        k: spec.k,
+        metric: spec.metric,
+        graph: &graph,
+        dedup: spec.dedup,
+        distinct_subject: spec.distinct_subject,
+        subjects: None,
+        mode: spec.mode,
+    };
+    let mut scratch = super::ctx::OwnedCharge::new(ctx, 0)?;
+    let (hits, info) =
+        vector::search_with_admit(&ctx.snap, &q, &|| ctx.check(), &mut |b| scratch.resize(b))?;
+    let col = |v: Option<VarId>| v.and_then(|v| node_vars.iter().position(|x| *x == v));
+    let cs = match spec.subject {
+        PathEnd::Var(v) => col(Some(v)),
+        _ => None,
+    };
+    let (cscore, cvec, cg) = (col(spec.score), col(spec.vector), col(spec.graph_var));
+    let est = (hits.len() as u64)
+        .saturating_mul(node_vars.len() as u64 * 8)
+        .max(hits.len() as u64 * 8 * u64::from(node_vars.is_empty()))
+        .saturating_add(node_vars.len() as u64 * 4);
+    ctx.check_output(hits.len(), node_vars.len())?;
+    let mut out_charge = super::ctx::OwnedCharge::new(ctx, est)?;
+    let mut t = Table::new(node_vars.to_vec());
+    for col in &mut t.cols {
+        col.reserve_exact(hits.len());
+    }
+    let mut row = vec![Id::UNDEF; node_vars.len()];
+    let fill = |row: &mut Vec<Id>, h: &vector::Hit| -> bool {
+        let mut set = |c: Option<usize>, id: Id| -> bool {
+            match c {
+                Some(c) if row[c] != Id::UNDEF && row[c] != id => false,
+                Some(c) => {
+                    row[c] = id;
+                    true
+                }
+                None => true,
+            }
+        };
+        let score = Id::from_f64(h.score as f64)
+            .unwrap_or_else(|| ctx.intern_value(&Value::Double((h.score as f64).into())));
+        set(cs, Id(h.s)) && set(cscore, score) && set(cvec, Id(h.o)) && set(cg, Id(h.g))
+    };
+    for h in &hits {
+        if let PathEnd::Const(s) = spec.subject
+            && s.0 != h.s
+        {
+            continue;
+        }
+        row.fill(Id::UNDEF);
+        if fill(&mut row, h) {
+            t.push_row(&row);
+        }
+    }
+    drop(hits);
+    drop(scratch);
+    if t.len() < spec.k {
+        return Ok(None);
+    }
+    let t = if node_vars == out_vars {
+        t
+    } else {
+        let proj_est = (t.len() as u64)
+            .saturating_mul(out_vars.len() as u64 * 8)
+            .max(t.len() as u64 * 8 * u64::from(out_vars.is_empty()))
+            .saturating_add(out_vars.len() as u64 * 4);
+        out_charge.resize(est.saturating_add(proj_est))?;
+        t.project(out_vars)
+    };
+    let actual: u64 = t
+        .cols
+        .iter()
+        .map(|c| c.capacity() as u64 * 8)
+        .sum::<u64>()
+        .max(t.len as u64 * 8 * u64::from(t.width() == 0))
+        .saturating_add(t.vars.capacity() as u64 * 4)
+        .saturating_add(t.sorted.capacity() as u64 * 4);
+    out_charge.resize(actual)?;
+    counters.insert("method".into(), info.method.into());
+    if let Some(r) = info.reason {
+        counters.insert("exactBecause".into(), r.into());
+    }
+    if let Some(n) = info.index {
+        counters.insert("index".into(), n.into());
+    }
+    if info.ef > 0 {
+        counters.insert("ef".into(), info.ef.into());
+    }
+    counters.insert("rows".into(), info.rows.into());
+    counters.insert("scored".into(), info.scored.into());
+    counters.insert("overlayInserts".into(), info.inserted.into());
+    counters.insert("overlayPending".into(), info.pending.into());
+    counters.insert("overlayDeletes".into(), info.deleted.into());
+    Ok(Some((t, out_charge, counters)))
+}
+
 // ---------------------------------------------------------------- service ------
 
 fn service(
@@ -9253,7 +12684,8 @@ fn service(
     let PathEnd::Const(id) = endpoint else {
         return Err(Error::unsupported("SERVICE with a variable endpoint"));
     };
-    let Some(oxrdf::Term::NamedNode(url)) = ctx.term(*id) else {
+    let endpoint_credit = ctx.charge(0)?;
+    let Some(oxrdf::Term::NamedNode(url)) = ctx.term_checked_into(*id, &endpoint_credit)? else {
         return Err(Error::Service("invalid SERVICE endpoint".into()));
     };
     let store = &ctx.snap.results.service;
@@ -9264,7 +12696,15 @@ fn service(
         && !is_local(ctx, url.as_str())
     {
         // the whole result under one key: a SERVICE without `loop` has one input
-        let key = super::svccache::key(&ctx.service_scope, url.as_str(), query, &[]);
+        let key_credit = ctx.charge(0)?;
+        let mut key_reserved = 0usize;
+        let key = super::svccache::try_key(&ctx.service_scope, url.as_str(), query, &[], |need| {
+            if need > key_reserved {
+                key_credit.add((need - key_reserved) as u64)?;
+                key_reserved = need;
+            }
+            Ok::<_, Error>(())
+        })?;
         let hit = if cache == CacheMode::Default {
             store.get(&key)
         } else {
@@ -9272,10 +12712,15 @@ fn service(
             None
         };
         let rows = match hit {
-            Some(rows) => rows,
+            Some(rows) => {
+                drop(key);
+                drop(key_credit);
+                rows
+            }
             None => {
                 let rows = std::sync::Arc::new(super::enhancer::fetch_rows(ctx, &url, query)?);
                 store.put(key, rows.clone());
+                drop(key_credit);
                 rows
             }
         };
@@ -9296,6 +12741,7 @@ fn service(
                         .map_or(Id::UNDEF, |term| ctx.intern_remote_term(term, &mut bnodes))
                 })
                 .collect();
+            ctx.check()?;
             t.push_row(&row);
         }
         return Ok(t);
@@ -9311,9 +12757,11 @@ fn service(
                     .map_or(Id::UNDEF, |term| ctx.intern_remote_term(term, &mut bnodes))
             })
             .collect();
+        ctx.check()?;
         t.push_row(&row);
         Ok(())
     })?;
+    ctx.check()?;
     Ok(t)
 }
 
@@ -9358,6 +12806,63 @@ impl ServiceSolution<'_> {
     }
 }
 
+/// An in-process SERVICE call: the dataset it reads, the options it runs under and
+/// the callee's hold, which lasts as long as the call.
+pub(super) struct LocalCall {
+    pub(super) snap: std::sync::Arc<crate::store::Snapshot>,
+    pub(super) options: super::QueryOptions,
+    pub(super) hold: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl LocalCall {
+    /// The call to `target`, as the caller. It keeps the caller's cancellation, grant,
+    /// row count and outbound budget, and `deadline`, so it can neither wait for
+    /// admission behind its caller nor outlive it.
+    pub(super) fn new(
+        ctx: &Ctx,
+        target: Result<super::LocalTarget>,
+        deadline: Option<Instant>,
+    ) -> Result<Self> {
+        if ctx.service_depth >= super::MAX_SERVICE_DEPTH {
+            return Err(Error::Service(format!(
+                "SERVICE calls to this server nest more than {} deep",
+                super::MAX_SERVICE_DEPTH
+            )));
+        }
+        let super::LocalTarget {
+            snap,
+            options: mut opts,
+            hold,
+        } = target?;
+        // the call can never be given more than its caller has
+        opts.max_rows = Some(opts.max_rows.map_or(ctx.max_rows, |m| m.min(ctx.max_rows)));
+        opts.max_memory_bytes = Some(
+            opts.max_memory_bytes
+                .map_or(ctx.mem_limit, |m| m.min(ctx.mem_limit)),
+        );
+        opts.max_rows_produced = Some(
+            opts.max_rows_produced
+                .map_or(ctx.max_rows_produced, |m| m.min(ctx.max_rows_produced)),
+        );
+        opts.timeout = None;
+        opts.deadline = deadline;
+        opts.cancel = Some(ctx.cancel.clone());
+        opts.cancellation = ctx.cancellation.clone();
+        opts.grant = ctx.grant().cloned();
+        opts.pool = None;
+        opts.work = Some(ctx.rows_produced.clone());
+        opts.outbound_budget = Some(ctx.outbound_budget.clone());
+        opts.service_depth = ctx.service_depth + 1;
+        // the call's plan is dropped below, so it names no patterns (item 180)
+        opts.no_plan_patterns = true;
+        Ok(Self {
+            snap,
+            options: opts,
+            hold,
+        })
+    }
+}
+
 /// Run `query` in process on the dataset `target` names, as the caller, and hand each
 /// solution to `on_solution`. The call keeps the caller's deadline, cancellation, grant,
 /// row count and outbound budget, so it can neither wait for admission behind its
@@ -9368,37 +12873,11 @@ fn fetch_local(
     query: &str,
     on_solution: &mut dyn FnMut(ServiceSolution<'_>) -> Result<()>,
 ) -> Result<()> {
-    if ctx.service_depth >= super::MAX_SERVICE_DEPTH {
-        return Err(Error::Service(format!(
-            "SERVICE calls to this server nest more than {} deep",
-            super::MAX_SERVICE_DEPTH
-        )));
-    }
-    let super::LocalTarget {
+    let LocalCall {
         snap,
-        options: mut opts,
+        options: opts,
         hold: _hold,
-    } = target?;
-    // the call can never be given more than its caller has
-    opts.max_rows = Some(opts.max_rows.map_or(ctx.max_rows, |m| m.min(ctx.max_rows)));
-    opts.max_memory_bytes = Some(
-        opts.max_memory_bytes
-            .map_or(ctx.mem_limit, |m| m.min(ctx.mem_limit)),
-    );
-    opts.max_rows_produced = Some(
-        opts.max_rows_produced
-            .map_or(ctx.max_rows_produced, |m| m.min(ctx.max_rows_produced)),
-    );
-    opts.timeout = None;
-    opts.deadline = ctx.current_deadline();
-    opts.cancel = Some(ctx.cancel.clone());
-    opts.cancellation = ctx.cancellation.clone();
-    opts.grant = ctx.grant().cloned();
-    opts.work = Some(ctx.rows_produced.clone());
-    opts.outbound_budget = Some(ctx.outbound_budget.clone());
-    opts.service_depth = ctx.service_depth + 1;
-    // the call's plan is dropped below, so it names no patterns (item 180)
-    opts.no_plan_patterns = true;
+    } = LocalCall::new(ctx, target, ctx.current_deadline())?;
     ctx.check()?;
     let r = super::query(snap, query, &opts)?;
     for i in 0..r.table().len() {
@@ -9430,95 +12909,295 @@ pub(super) fn fetch(
     {
         return fetch_local(ctx, target, query, on_solution);
     }
-    // the host of the endpoint (no user info, no port)
-    let host = oxiri::Iri::parse(url.as_str())
-        .ok()
-        .and_then(|i| {
-            let a = i.authority()?;
-            let a = a.rsplit('@').next().unwrap_or(a);
-            Some(match a.strip_prefix('[') {
-                Some(v6) => v6.split(']').next().unwrap_or(v6).to_string(),
-                None => a.split(':').next().unwrap_or(a).to_string(),
-            })
-        })
-        .unwrap_or_default();
-    // a client span: its context is what the outbound headers hook propagates
-    let span = tracing::info_span!(
-        target: "sparkles::sparql::exec",
-        "sparql.service",
-        otel.kind = "client",
-        http.request.method = "POST",
-        server.address = %host,
-        http.response.status_code = tracing::field::Empty,
-    );
-    let _entered = span.enter();
-    // within the query's deadline too
-    let timeout = ctx.current_deadline().map_or(ctx.outbound.timeout, |d| {
-        d.saturating_duration_since(Instant::now())
-    });
-    let resp = ctx
-        .outbound
-        .send(&ctx.outbound_budget, url.as_str(), timeout, |client, u| {
-            client
-                .post(u)
-                .header(
-                    "Accept",
-                    "application/sparql-results+json, application/sparql-results+xml;q=0.8",
-                )
-                .form(&[("query", query)])
-        })
-        .map_err(|f| {
-            f.into_error(&format!("SERVICE <{}>", url.as_str()), |m| {
-                Error::Service(format!("<{}>: {m}", url.as_str()))
-            })
-        })?;
-    span.record("http.response.status_code", i64::from(resp.status.as_u16()));
-    if !resp.status.is_success() {
-        return Err(Error::Service(format!(
-            "{} returned {}",
-            url.as_str(),
-            resp.status
-        )));
-    }
-    let (fmt, syntax) = if resp.content_type.contains("xml") {
-        (
-            sparesults::QueryResultsFormat::Xml,
-            crate::nesting::Syntax::Xml,
-        )
-    } else {
-        (
-            sparesults::QueryResultsFormat::Json,
-            crate::nesting::Syntax::Json,
-        )
-    };
-    // the results parsers read a nested triple term by recursion
-    let body = crate::nesting::Guarded::new(
-        resp.body,
-        syntax,
-        crate::nesting::MAX_ELEMENTS,
-        &format!("<{}>", url.as_str()),
-        Error::Service,
-    );
-    // parsed as it streams in, under the policy's byte ceiling and deadline
-    let parser = sparesults::QueryResultsParser::from_format(fmt);
-    let failed = |e: sparesults::QueryResultsParseError| match e {
-        // a spent budget, or the body's own words (timeout, size, connection)
-        sparesults::QueryResultsParseError::Io(e) => match crate::codec::io_error(e) {
-            Error::Io(e) => Error::Service(format!("<{}>: {e}", url.as_str())),
-            e => e,
-        },
-        e => Error::Service(format!("<{}>: {e}", url.as_str())),
-    };
-    match parser.for_reader(body).map_err(failed)? {
-        sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => {
-            for sol in sols {
-                let solution = sol.map_err(failed)?;
-                on_solution(ServiceSolution::Remote(&solution))?;
-            }
-        }
-        sparesults::ReaderQueryResultsParserOutput::Boolean(_) => {}
+    let mut answer = RemoteAnswer::open(ctx, url, query, None)?;
+    let _entered = answer.span.clone().entered();
+    while let Some(solution) = answer.next_solution() {
+        on_solution(ServiceSolution::Remote(&solution?))?;
     }
     Ok(())
+}
+
+/// The response of a remote endpoint to one SERVICE request, whose solutions are parsed
+/// as they are read. Dropping it closes the response, and the request's time charge in
+/// the outbound budget ends then.
+pub(super) struct RemoteAnswer {
+    /// The client span of the request, which each read enters.
+    pub(super) span: tracing::Span,
+    url: String,
+    solutions: Option<sparesults::ReaderSolutionsParser<Box<dyn std::io::Read + Send>>>,
+    /// what the reader under the parser charges by, for a streamed answer
+    window: Option<std::sync::Arc<super::svcread::Window>>,
+    /// whether the metered JSON route had to buffer the solution sequence before output
+    buffered_before_output: bool,
+}
+
+/// How a streamed SERVICE answer is charged to its query (see [`super::svcread`]). An
+/// eager call reads without one.
+pub(super) struct Meter<'a> {
+    pub(super) ctx: &'a std::sync::Arc<Ctx>,
+    /// whether a response that sparesults would buffer whole is refused
+    pub(super) strict: bool,
+}
+
+impl RemoteAnswer {
+    /// Send `query` to `url` through the outbound policy and read the head of its
+    /// response. The transfer's timeout is the outbound policy's, cut to the query's
+    /// deadline as it stands now, and it counts from the start of the request.
+    pub(super) fn open(
+        ctx: &Ctx,
+        url: &oxrdf::NamedNode,
+        query: &str,
+        meter: Option<Meter<'_>>,
+    ) -> Result<Self> {
+        // the host of the endpoint (no user info, no port)
+        let host = oxiri::Iri::parse(url.as_str())
+            .ok()
+            .and_then(|i| {
+                let a = i.authority()?;
+                let a = a.rsplit('@').next().unwrap_or(a);
+                Some(match a.strip_prefix('[') {
+                    Some(v6) => v6.split(']').next().unwrap_or(v6).to_string(),
+                    None => a.split(':').next().unwrap_or(a).to_string(),
+                })
+            })
+            .unwrap_or_default();
+        // a client span: its context is what the outbound headers hook propagates
+        let span = tracing::info_span!(
+            target: "sparkles::sparql::exec",
+            "sparql.service",
+            otel.kind = "client",
+            http.request.method = "POST",
+            server.address = %host,
+            http.response.status_code = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        // within the query's deadline too
+        let timeout = ctx.current_deadline().map_or(ctx.outbound.timeout, |d| {
+            d.saturating_duration_since(Instant::now())
+        });
+        let resp = ctx
+            .outbound
+            .send(&ctx.outbound_budget, url.as_str(), timeout, |client, u| {
+                client
+                    .post(u)
+                    .header(
+                        "Accept",
+                        "application/sparql-results+json, application/sparql-results+xml;q=0.8",
+                    )
+                    .form(&[("query", query)])
+            })
+            .map_err(|f| {
+                f.into_error(&format!("SERVICE <{}>", url.as_str()), |m| {
+                    Error::Service(format!("<{}>: {m}", url.as_str()))
+                })
+            })?;
+        span.record("http.response.status_code", i64::from(resp.status.as_u16()));
+        if !resp.status.is_success() {
+            return Err(Error::Service(format!(
+                "{} returned {}",
+                url.as_str(),
+                resp.status
+            )));
+        }
+        let (fmt, syntax) = if resp.content_type.contains("xml") {
+            (
+                sparesults::QueryResultsFormat::Xml,
+                crate::nesting::Syntax::Xml,
+            )
+        } else {
+            (
+                sparesults::QueryResultsFormat::Json,
+                crate::nesting::Syntax::Json,
+            )
+        };
+        // the results parsers read a nested triple term by recursion
+        let body = crate::nesting::Guarded::new(
+            resp.body,
+            syntax,
+            crate::nesting::MAX_ELEMENTS,
+            &format!("<{}>", url.as_str()),
+            Error::Service,
+        );
+        // A streamed answer reads the start of a JSON response first to see whether
+        // sparesults would buffer it, and charges what the parser holds as it reads.
+        // Late-head JSON responses are validated to EOF before sparesults reads them so
+        // trailing truncation or garbage after `"vars"` cannot look like clean EOF.
+        let mut buffered_before_output = false;
+        let (body, window): (Box<dyn std::io::Read + Send>, _) = match meter {
+            None => {
+                if syntax == crate::nesting::Syntax::Json {
+                    let mut body = body;
+                    let mut staging = super::svcread::eager_charge(ctx)?;
+                    let start = super::svcread::json_start(&mut body, &mut staging, ctx)
+                        .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                    let reader: Box<dyn std::io::Read + Send> = if start.late {
+                        let bytes =
+                            super::svcread::read_late_json(start, &mut body, &mut staging, ctx)
+                                .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                        let parser_reserve = (bytes.len() as u64)
+                            .saturating_mul(super::svcread::buffered_factor())
+                            .saturating_add(super::svcread::SLACK);
+                        Box::new(
+                            super::svcread::ChargedCursor::with_parser_reserve(
+                                bytes,
+                                staging,
+                                parser_reserve,
+                            )
+                            .map_err(|e| Self::failed(url.as_str(), e.into()))?,
+                        )
+                    } else {
+                        let parser_reserve = (start.decided as u64)
+                            .saturating_mul(super::svcread::head_factor())
+                            .saturating_add(super::svcread::SLACK);
+                        let head = super::svcread::ChargedCursor::with_parser_reserve(
+                            start.bytes,
+                            staging,
+                            parser_reserve,
+                        )
+                        .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                        Box::new(std::io::Read::chain(head, body))
+                    };
+                    (reader, None)
+                } else {
+                    (Box::new(body), None)
+                }
+            }
+            Some(meter) => {
+                let mut body = body;
+                let charge = super::svcread::charge(meter.ctx)?;
+                let window = std::sync::Arc::new(super::svcread::Window::default());
+                let reader: Box<dyn std::io::Read + Send> =
+                    if syntax == crate::nesting::Syntax::Json {
+                        let mut staging = super::svcread::StagingCharge::from_cursor(charge);
+                        let start = super::svcread::json_start(&mut body, &mut staging, meter.ctx)
+                            .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                        if start.late && meter.strict {
+                            return Err(Error::Service(format!(
+                                "{}<{}>",
+                                super::cursor::LATE_HEAD,
+                                url.as_str()
+                            )));
+                        }
+                        buffered_before_output = start.late;
+                        if start.late {
+                            let bytes = super::svcread::read_late_json(
+                                start,
+                                &mut body,
+                                &mut staging,
+                                meter.ctx,
+                            )
+                            .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                            Box::new(super::svcread::Metered::precharged(
+                                std::io::Cursor::new(bytes),
+                                staging.into_cursor(),
+                                window.clone(),
+                            ))
+                        } else {
+                            let base = (start.decided as u64)
+                                .saturating_mul(super::svcread::head_factor());
+                            let bytes = std::io::Cursor::new(start.bytes);
+                            Box::new(super::svcread::Metered::new(
+                                std::io::Read::chain(bytes, body),
+                                staging.into_cursor(),
+                                base,
+                                false,
+                                window.clone(),
+                            ))
+                        }
+                    } else {
+                        Box::new(super::svcread::Metered::new(
+                            body,
+                            charge,
+                            0,
+                            false,
+                            window.clone(),
+                        ))
+                    };
+                (reader, Some(window))
+            }
+        };
+        // parsed as it streams in, under the policy's byte ceiling and deadline
+        let parser = sparesults::QueryResultsParser::from_format(fmt);
+        let solutions = match parser
+            .for_reader(body)
+            .map_err(|e| Self::failed(url.as_str(), e))?
+        {
+            sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => Some(sols),
+            sparesults::ReaderQueryResultsParserOutput::Boolean(_) => None,
+        };
+        drop(_entered);
+        Ok(Self {
+            span,
+            url: url.as_str().to_string(),
+            solutions,
+            window,
+            buffered_before_output,
+        })
+    }
+
+    /// Whether the metered parser route buffers the solution sequence before yielding
+    /// its first solution (for example, JSON results preceding head variables).
+    pub(super) fn buffered_before_output(&self) -> bool {
+        self.buffered_before_output
+    }
+
+    /// Construct a `RemoteAnswer` directly over an arbitrary reader for unit tests of
+    /// `Service::fill`, using the ordinary `sparesults` parser with no network state.
+    #[cfg(test)]
+    pub(super) fn from_reader(
+        reader: Box<dyn std::io::Read + Send>,
+        format: sparesults::QueryResultsFormat,
+        url: &str,
+    ) -> Result<Self> {
+        let parser = sparesults::QueryResultsParser::from_format(format);
+        let solutions = match parser
+            .for_reader(reader)
+            .map_err(|e| Self::failed(url, e))?
+        {
+            sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => Some(sols),
+            sparesults::ReaderQueryResultsParserOutput::Boolean(_) => None,
+        };
+        Ok(Self {
+            span: tracing::Span::none(),
+            url: url.to_string(),
+            solutions,
+            window: None,
+            buffered_before_output: false,
+        })
+    }
+
+    /// The next solution of the response, or `None` once it has ended. A failure ends
+    /// the answer, and the response is closed then.
+    pub(super) fn next_solution(&mut self) -> Option<Result<sparesults::QuerySolution>> {
+        let next = self.solutions.as_mut()?.next();
+        match next {
+            Some(Ok(solution)) => {
+                if let Some(window) = &self.window {
+                    window.solution();
+                }
+                Some(Ok(solution))
+            }
+            Some(Err(e)) => {
+                self.solutions = None;
+                Some(Err(Self::failed(&self.url, e)))
+            }
+            None => {
+                self.solutions = None;
+                None
+            }
+        }
+    }
+
+    fn failed(url: &str, e: sparesults::QueryResultsParseError) -> Error {
+        match e {
+            // a spent budget, or the body's own words (timeout, size, connection)
+            sparesults::QueryResultsParseError::Io(e) => match crate::codec::io_error(e) {
+                Error::Io(e) => Error::Service(format!("<{url}>: {e}")),
+                e => e,
+            },
+            e => Error::Service(format!("<{url}>: {e}")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -9903,6 +13582,909 @@ mod path_lookup_tests {
 mod paid_eager_producer_tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn r2_topk_scan_refuses_numeric_ties_and_delta_before_the_full_read() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, update::update};
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..512)
+            .map(|i| format!("<urn:tie:{i}> <urn:p> 42 .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let data = (0..512)
+            .map(|i| format!("<urn:delta:{i}> <urn:p> \"value-{i}\" .\n"))
+            .collect::<String>();
+        update(
+            &store,
+            &format!("INSERT DATA {{ {data} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 512;
+        let pred = ctx.snap.lookup_iri("urn:p").unwrap();
+        let scan = ScanSpec {
+            perm: Perm::Pos,
+            prefix: vec![pred.0],
+            cols: vec![(1, 0), (2, 1)],
+            eqs: Vec::new(),
+            graph: GraphFilter::Default,
+            graph_col: 3,
+            dedup: false,
+            src: None,
+        };
+        let spec = OrderedTopK {
+            scan,
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: Vec::new(),
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+        let tied = ctx
+            .snap
+            .lookup_term(&oxrdf::Literal::from(42_i64).into())
+            .unwrap();
+        let delta = ctx
+            .snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal("value-0").into())
+            .unwrap();
+        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(delta.tag(), payload).0);
+        for (lower, upper) in [(tied.0, tied.0), (lo, hi)] {
+            let err = topk_read(&ctx, &spec, lower, upper, true, &[0, 1])
+                .err()
+                .unwrap();
+            assert!(matches!(
+                err,
+                Error::BudgetExceeded(b) if b.kind == crate::error::BudgetKind::Memory && b.requested > 512
+            ));
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn r3_topk_residual_range_filter_refuses_before_copying_delta_rows() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, expr::CmpOp, update::update};
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:base> <urn:p> \"9999.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                    .to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let data = (0..512)
+            .map(|i| {
+                format!(
+                    "<urn:delta:{i}> <urn:p> \"{i}.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                )
+            })
+            .collect::<String>();
+        update(
+            &store,
+            &format!("INSERT DATA {{ {data} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_some());
+        let probe = Ctx::new(snap.clone());
+        let pred = probe.snap.lookup_iri("urn:p").unwrap();
+        let delta = probe
+            .snap
+            .lookup_term(&oxrdf::Literal::from(0.5_f32).into())
+            .unwrap();
+        assert_eq!(delta.tag(), crate::id::Tag::Delta);
+        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(delta.tag(), payload).0);
+        let threshold = Id::from_i64(100).unwrap();
+        let spec = OrderedTopK {
+            scan: ScanSpec {
+                perm: Perm::Pos,
+                prefix: vec![pred.0],
+                cols: vec![(1, 0), (2, 1)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            },
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: vec![Expr::Cmp(
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(threshold)),
+                CmpOp::Ge,
+            )],
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+
+        // Measure the raw delta table's admitted charge with no residual copy.
+        let (raw, scanned) = topk_read(&probe, &spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, 512);
+        let raw_bytes = probe.live_bytes();
+        drop(raw);
+        assert_eq!(probe.live_bytes(), 0);
+
+        // Allow the raw table plus `decided`/`keep`/`rest`, but not the residual `sub` table copy.
+        let mut tight = Ctx::new(snap.clone());
+        let scratch_without_copy = 512u64 * (1 + 1 + size_of::<usize>() as u64);
+        tight.mem_limit = raw_bytes + scratch_without_copy + 256;
+        let err = topk_read(&tight, &spec, lo, hi, false, &[0, 1])
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory && b.requested > tight.mem_limit
+        ));
+        assert_eq!(tight.live_bytes(), 0);
+
+        // With room for the residual copy, the non-exact range filter keeps the 412 matching rows.
+        let ok_ctx = Ctx::new(snap);
+        let (filtered, scanned) = topk_read(&ok_ctx, &spec, lo, hi, false, &[0, 1]).unwrap();
+        assert_eq!(scanned, 512);
+        assert_eq!(filtered.table.len(), 412);
+        let before_drop = ok_ctx.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ok_ctx.live_bytes(), raw_bytes);
+    }
+
+    #[test]
+    fn r4_topk_parallel_range_filter_admits_disjoint_decisions() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, expr::CmpOp, update::update};
+        use oxrdfio::RdfFormat;
+
+        let n = PAR_THRESHOLD + 64;
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:base> <urn:p> \"999999.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                    .to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let data = (0..n)
+            .map(|i| {
+                format!(
+                    "<urn:delta:{i}> <urn:p> \"{i}.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                )
+            })
+            .collect::<String>();
+        update(
+            &store,
+            &format!("INSERT DATA {{ {data} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_some());
+        let probe = Ctx::new(snap.clone());
+        let pred = probe.snap.lookup_iri("urn:p").unwrap();
+        let delta = probe
+            .snap
+            .lookup_term(&oxrdf::Literal::from(0.5_f32).into())
+            .unwrap();
+        assert_eq!(delta.tag(), crate::id::Tag::Delta);
+        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(delta.tag(), payload).0);
+        let threshold = Id::from_i64(100).unwrap();
+        let spec = OrderedTopK {
+            scan: ScanSpec {
+                perm: Perm::Pos,
+                prefix: vec![pred.0],
+                cols: vec![(1, 0), (2, 1)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            },
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: vec![Expr::Cmp(
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(threshold)),
+                CmpOp::Ge,
+            )],
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+
+        let (raw, scanned) = topk_read(&probe, &spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        let raw_bytes = probe.live_bytes();
+
+        let decided_bytes = n as u64 * size_of::<Option<bool>>() as u64;
+        let keep_bytes = n as u64 * size_of::<bool>() as u64;
+        let rest_bytes = n as u64 * size_of::<usize>() as u64;
+        let sub_bytes = topk_table_bytes(n, 2);
+        let mask_bytes = (n * size_of::<bool>()
+            + probe.nvars() * size_of::<Option<usize>>()
+            + size_of::<&Expr>()) as u64;
+
+        // Direct Phase 1 & Phase 2 checks on the already-scanned table (so `scan_into`'s
+        // power-of-two doubling peak cannot mask the exact Phase 1/2 boundaries):
+        // 1 byte below Phase 1 (`decided` disjoint output slice) refuses cleanly.
+        let mut p1 = Ctx::new(snap.clone());
+        p1.mem_limit = raw_bytes + decided_bytes - 1;
+        let held = p1.charge(raw_bytes).unwrap();
+        let mut tbl = raw.table.clone();
+        let err = apply_range_filter(&p1, &mut tbl, 0, &spec.range_filter)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory
+                    && b.requested == raw_bytes + decided_bytes
+        ));
+        drop(held);
+        assert_eq!(p1.live_bytes(), 0);
+
+        // Room for a single `decided` copy passes Phase 1 (no extra Rayon collector copy)
+        // and refuses at Phase 2 (`decided + keep + rest`).
+        let mut p2 = Ctx::new(snap.clone());
+        p2.mem_limit = raw_bytes + decided_bytes + 512;
+        let held = p2.charge(raw_bytes).unwrap();
+        let mut tbl = raw.table.clone();
+        let err = apply_range_filter(&p2, &mut tbl, 0, &spec.range_filter)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory
+                    && b.requested == raw_bytes + decided_bytes + keep_bytes + rest_bytes
+        ));
+        drop(held);
+        assert_eq!(p2.live_bytes(), 0);
+        drop(raw);
+        assert_eq!(probe.live_bytes(), 0);
+
+        // End-to-end `topk_read` 1 byte below Phase 3 (`keep + rest + sub + mask`) passes
+        // `scan_into`, Phase 1 parallel slices, and Phase 2, then refuses before copying `sub`.
+        let mut p3 = Ctx::new(snap.clone());
+        let p3_peak = raw_bytes + keep_bytes + rest_bytes + sub_bytes + mask_bytes;
+        p3.mem_limit = p3_peak - 1;
+        let err = topk_read(&p3, &spec, lo, hi, false, &[0, 1]).err().unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory && b.requested == p3_peak
+        ));
+        assert_eq!(p3.live_bytes(), 0);
+
+        // With room for the residual copy, all `n - 100` matching rows survive.
+        let ok_ctx = Ctx::new(snap);
+        let (filtered, scanned) = topk_read(&ok_ctx, &spec, lo, hi, false, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.len(), n - 100);
+        let before_drop = ok_ctx.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ok_ctx.live_bytes(), raw_bytes);
+    }
+
+    #[test]
+    fn r4_filter_vocabulary_prefetch_admits_or_skips_under_tight_budget() {
+        use crate::io::Source;
+        use crate::sparql::expr::CmpOp;
+        use crate::vocab::numeric::Numeric;
+        use oxrdfio::RdfFormat;
+
+        let n = 2048usize;
+        let half = n / 2;
+        let dir = tempfile::tempdir().unwrap();
+        // Use a disk-backed store so the base vocabulary is file-mapped (`Bytes::Map`)
+        // and exercises `prefetch_sorted_checked`'s block-index admission callback.
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        // Include one packed float on an unrelated predicate so `vocab.num` is built, plus
+        // 2,048 21-digit decimals (half negative, half positive) that exceed both inline
+        // Tag::Decimal and vocab.num's 58-bit packed mantissa so they remain Tag::Vocab +
+        // Numeric::Unknown and reach the residual filter + prefetch path.
+        let mut data = String::from(
+            "<urn:base> <urn:other> \"999999.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n",
+        );
+        for i in 0..half {
+            data.push_str(&format!(
+                "<urn:dec:neg:{i}> <urn:p> \"-100000000000000000000.{i:04}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n"
+            ));
+        }
+        for i in 0..(n - half) {
+            data.push_str(&format!(
+                "<urn:dec:pos:{i}> <urn:p> \"100000000000000000000.{i:04}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n"
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let num = snap
+            .generation
+            .vocab
+            .numeric()
+            .expect("base vocab numeric column");
+        let decimal_dt =
+            oxrdf::NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#decimal");
+        let neg_sample = snap
+            .lookup_term(
+                &oxrdf::Literal::new_typed_literal(
+                    "-100000000000000000000.0000",
+                    decimal_dt.clone(),
+                )
+                .into(),
+            )
+            .unwrap();
+        let pos_sample = snap
+            .lookup_term(
+                &oxrdf::Literal::new_typed_literal("100000000000000000000.0000", decimal_dt).into(),
+            )
+            .unwrap();
+        assert_eq!(neg_sample.tag(), crate::id::Tag::Vocab);
+        assert_eq!(pos_sample.tag(), crate::id::Tag::Vocab);
+        assert_eq!(
+            num.get_many(&[neg_sample.payload(), pos_sample.payload()]),
+            vec![Numeric::Unknown, Numeric::Unknown]
+        );
+
+        let make_ctx = || {
+            let ctx = Ctx::new(snap.clone());
+            assert_eq!(ctx.var("v"), 0);
+            assert_eq!(ctx.var("s"), 1);
+            ctx
+        };
+        let probe = make_ctx();
+        let pred = probe.snap.lookup_iri("urn:p").unwrap();
+        let [lo, hi] =
+            [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(pos_sample.tag(), payload).0);
+        let threshold = Id::from_i64(0).unwrap();
+        let filter_expr = Expr::Cmp(
+            Box::new(Expr::Var(0)),
+            Box::new(Expr::Const(threshold)),
+            CmpOp::Ge,
+        );
+        let base_scan = || ScanSpec {
+            perm: Perm::Pos,
+            prefix: vec![pred.0],
+            cols: vec![(1, 0), (2, 1)],
+            eqs: Vec::new(),
+            graph: GraphFilter::Default,
+            graph_col: 3,
+            dedup: false,
+            src: None,
+        };
+        let raw_spec = OrderedTopK {
+            scan: base_scan(),
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: Vec::new(),
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+        let generic_spec = OrderedTopK {
+            scan: base_scan(),
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: vec![filter_expr.clone()],
+            range_filter: Vec::new(),
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+        let range_spec = OrderedTopK {
+            scan: base_scan(),
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: vec![filter_expr],
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+
+        let (raw, scanned) = topk_read(&probe, &raw_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        let raw_bytes = probe.live_bytes();
+        assert_eq!(probe.mem_peak(), raw_bytes);
+
+        // Compute the expected surviving rows once under an unconstrained budget.
+        let baseline_ctx = make_ctx();
+        let (baseline, scanned) =
+            topk_read(&baseline_ctx, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        let expected_kept = baseline.table.cols[0].clone();
+        assert_eq!(expected_kept.len(), n - half);
+        assert!(expected_kept.contains(&pos_sample));
+        assert!(!expected_kept.contains(&neg_sample));
+        drop(baseline);
+
+        let ids_count = || PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        let blocks_count = || PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|c| c.get());
+        let io_hints = crate::index::io_hints();
+        let ids_bytes = (n * size_of::<u64>()) as u64;
+        let blocks_bytes = (n * size_of::<usize>()) as u64;
+
+        // Direct check 1: 1 byte below `ids_bytes` skips the ID vector and block-index hint.
+        let mut tight_ids = make_ctx();
+        tight_ids.mem_limit = ids_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        prefetch_column_terms(&tight_ids, &raw.table, &[0]);
+        assert_eq!(ids_count(), before_ids);
+        assert_eq!(blocks_count(), before_blocks);
+        assert_eq!(tight_ids.mem_peak(), 0);
+        assert_eq!(tight_ids.live_bytes(), 0);
+
+        // Direct check 2: room for `ids_bytes` alone (1 byte below `ids_bytes + blocks_bytes`)
+        // admits the ID vector, refuses the mapped block-index vector, and releases cleanly.
+        let mut ids_only = make_ctx();
+        ids_only.mem_limit = ids_bytes + blocks_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        prefetch_column_terms(&ids_only, &raw.table, &[0]);
+        assert_eq!(ids_count(), before_ids + 1);
+        assert_eq!(blocks_count(), before_blocks);
+        assert_eq!(ids_only.mem_peak(), ids_bytes);
+        assert_eq!(ids_only.live_bytes(), 0);
+
+        // Direct check 3: exact room for both ID and mapped block-index vectors admits both
+        // (when I/O hints are enabled) and releases cleanly.
+        let mut both_direct = make_ctx();
+        both_direct.mem_limit = ids_bytes + blocks_bytes;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        prefetch_column_terms(&both_direct, &raw.table, &[0]);
+        assert_eq!(ids_count(), before_ids + 1);
+        if io_hints {
+            assert_eq!(blocks_count(), before_blocks + 1);
+            assert_eq!(both_direct.mem_peak(), ids_bytes + blocks_bytes);
+        } else {
+            assert_eq!(blocks_count(), before_blocks);
+            assert_eq!(both_direct.mem_peak(), ids_bytes);
+        }
+        assert_eq!(both_direct.live_bytes(), 0);
+
+        drop(raw);
+        assert_eq!(probe.live_bytes(), 0);
+
+        // Generic top-k filter entry point (`topk_read_keys_last` with non-empty `spec.filter`):
+        // verify exact scalar results on ID refusal, on block-index refusal, and when both
+        // prefetch vectors are admitted. Pre-admit the parallel decode envelope for the
+        // decimal keys so strict eager decode accounting fits regardless of host thread count
+        // while `mem_limit` pins the exact remaining headroom around prefetch scratch.
+        let filter_scratch = (n as u64).saturating_add(
+            (probe.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
+        );
+        let warm_decode = |ctx: &Ctx| -> u64 {
+            rayon::join(
+                || {
+                    let _ = ctx.value(neg_sample);
+                    let _ = ctx.value(pos_sample);
+                },
+                || (),
+            );
+            ctx.live_bytes()
+        };
+
+        // Generic top-k case 1: 1 byte below `ids_bytes` skips prefetch and keeps exact scalar
+        // results within budget.
+        let mut tight_ids_topk = make_ctx();
+        let decode_bytes = warm_decode(&tight_ids_topk);
+        tight_ids_topk.opt.prefetch_terms = true;
+        tight_ids_topk.mem_limit = decode_bytes + raw_bytes + filter_scratch + ids_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        let (filtered, scanned) =
+            topk_read(&tight_ids_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        assert_eq!(ids_count(), before_ids);
+        assert_eq!(blocks_count(), before_blocks);
+        assert!(tight_ids_topk.mem_peak() <= tight_ids_topk.mem_limit);
+        let before_drop = tight_ids_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - tight_ids_topk.live_bytes(), raw_bytes);
+
+        // Generic top-k case 2: room for `ids_bytes` alone admits IDs, refuses the mapped
+        // block-index resize, and still returns exact scalar results.
+        let mut ids_only_topk = make_ctx();
+        let decode_bytes = warm_decode(&ids_only_topk);
+        ids_only_topk.opt.prefetch_terms = true;
+        ids_only_topk.mem_limit =
+            decode_bytes + raw_bytes + filter_scratch + ids_bytes + blocks_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        let (filtered, scanned) =
+            topk_read(&ids_only_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        if io_hints {
+            assert_eq!(ids_count(), before_ids + 1);
+            assert_eq!(blocks_count(), before_blocks);
+            assert!(
+                ids_only_topk.mem_peak() >= decode_bytes + raw_bytes + filter_scratch + ids_bytes
+            );
+            assert!(ids_only_topk.mem_peak() <= ids_only_topk.mem_limit);
+        } else {
+            assert_eq!(ids_count(), before_ids);
+            assert_eq!(blocks_count(), before_blocks);
+        }
+        let before_drop = ids_only_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ids_only_topk.live_bytes(), raw_bytes);
+
+        // Generic top-k case 3: exact room for both ID and mapped block-index vectors admits
+        // both through `topk_read` -> `apply_filter` -> `decode_for` -> `prefetch_column_terms`.
+        let mut both_topk = make_ctx();
+        let decode_bytes = warm_decode(&both_topk);
+        both_topk.opt.prefetch_terms = true;
+        both_topk.mem_limit = decode_bytes + raw_bytes + filter_scratch + ids_bytes + blocks_bytes;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        let (filtered, scanned) =
+            topk_read(&both_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        if io_hints {
+            assert_eq!(ids_count(), before_ids + 1);
+            assert_eq!(blocks_count(), before_blocks + 1);
+            assert_eq!(
+                both_topk.mem_peak(),
+                decode_bytes + raw_bytes + filter_scratch + ids_bytes + blocks_bytes
+            );
+        } else {
+            assert_eq!(ids_count(), before_ids);
+            assert_eq!(blocks_count(), before_blocks);
+        }
+        let before_drop = both_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - both_topk.live_bytes(), raw_bytes);
+
+        // End-to-end `topk_read` (`exact = false`) over the 2,048 `Numeric::Unknown` base
+        // decimals keeps the exact positive half and releases the table charge cleanly.
+        let ok_topk = make_ctx();
+        let (filtered, scanned) = topk_read(&ok_topk, &range_spec, lo, hi, false, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        let before_drop = ok_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ok_topk.live_bytes(), raw_bytes);
+    }
+
+    #[test]
+    fn prefetch_column_terms_bounds_cursor_ledger_ops_and_skips_warm_batches() {
+        use crate::io::Source;
+        use oxrdfio::RdfFormat;
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..256 {
+            data.push_str(&format!("ex:s{i} ex:p \"word {i:04}\" .\n"));
+        }
+        disk.load(&[Source::from_bytes(
+            data.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let snap = disk.snapshot();
+        let make_batch = |range: std::ops::Range<usize>| {
+            let mut tbl = Table::new(vec![0]);
+            for i in range {
+                let id = snap
+                    .lookup_term(&oxrdf::Literal::new_simple_literal(format!("word {i:04}")).into())
+                    .unwrap();
+                tbl.push_row(&[id]);
+            }
+            tbl
+        };
+        let batch1 = make_batch(0..64);
+        let batch2 = make_batch(64..128);
+        let batch3 = make_batch(128..192);
+        let ids_bytes = (64 * size_of::<u64>()) as u64;
+
+        // Under a tight cursor budget below `ids_bytes`, repeated cold batches skip
+        // cleanly without allocating scratch, poisoning `ctx.check()`, or repeating
+        // failed ledger operations.
+        let mut tight = Ctx::new(snap.clone());
+        tight.mem_limit = ids_bytes - 1;
+        tight.enable_cursor_accounting().unwrap();
+        let before_tight = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        prefetch_column_terms(&tight, &batch1, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_tight
+        );
+        assert!(tight.check().is_ok());
+        assert_eq!(tight.live_bytes(), 0);
+
+        let before_tight2_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        let before_tight2_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        prefetch_column_terms(&tight, &batch1, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_tight2_allocs
+        );
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before_tight2_ops,
+            "second tight-budget cold call must not repeat failed ledger admissions"
+        );
+        assert!(tight.check().is_ok());
+        assert_eq!(tight.live_bytes(), 0);
+
+        // When only `ids_bytes` fits (below the upper bound `ids_bytes + max_blocks`),
+        // the first cold batch admits only `ids_bytes`, and a second cold batch reuses
+        // it without repeating failed upper-bound or block-vector ledger admissions.
+        let mut ids_only = Ctx::new(snap.clone());
+        ids_only.mem_limit = ids_bytes;
+        ids_only.enable_cursor_accounting().unwrap();
+        let before_ids1 = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        prefetch_column_terms(&ids_only, &batch1, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_ids1 + 1
+        );
+        assert_eq!(ids_only.live_bytes(), ids_bytes);
+
+        let before_ids2_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        let before_ids2_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        prefetch_column_terms(&ids_only, &batch3, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_ids2_allocs + 1
+        );
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before_ids2_ops,
+            "second ID-only tight-budget cold call must not repeat failed ledger growth"
+        );
+        ids_only.release_cursor_work();
+        assert_eq!(ids_only.live_bytes(), 0);
+
+        // Under a normal cursor budget, the first cold batch admits its scratch once on
+        // the decode envelope; subsequent cold batches of the same size take 0 ledger
+        // operations, warm batches skip allocation entirely, and `release_cursor_work`
+        // frees the envelope.
+        let mut ctx = Ctx::new(snap);
+        ctx.mem_limit = 1 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let before_cold1 = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        prefetch_column_terms(&ctx, &batch1, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_cold1 + 1
+        );
+        assert!(ctx.live_bytes() >= ids_bytes);
+
+        let before_cold2_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        let before_cold2_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        prefetch_column_terms(&ctx, &batch2, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_cold2_allocs + 1
+        );
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before_cold2_ops,
+            "second cold cursor batch reuses the decoding envelope with zero ledger ops"
+        );
+
+        if crate::index::io_hints() {
+            let before_warm_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+            let before_warm_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+            prefetch_column_terms(&ctx, &batch1, &[0]);
+            assert_eq!(
+                PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+                before_warm_allocs
+            );
+            assert_eq!(
+                super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+                before_warm_ops
+            );
+        }
+
+        ctx.release_cursor_work();
+        assert_eq!(ctx.live_bytes(), 0);
+        assert!(ctx.check().is_ok());
+    }
+
+    #[test]
+    fn prefetch_column_terms_optional_reservation_reclaimed_by_required_cursor_work() {
+        use crate::io::Source;
+        use oxrdfio::RdfFormat;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..16 {
+            data.push_str(&format!("ex:s{i} ex:p \"short {i:02}\" .\n"));
+        }
+        disk.load(&[Source::from_bytes(
+            data.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let snap = disk.snapshot();
+        let id0 = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 00").into())
+            .unwrap();
+        let id1 = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 01").into())
+            .unwrap();
+
+        // 1,024 cells containing two distinct short strings reserve an upper bound of
+        // `1024 * (size_of::<u64>() + size_of::<usize>())` bytes (16 KiB on 64-bit).
+        let mut big_batch = Table::new(vec![0]);
+        for i in 0..1024 {
+            big_batch.push_row(&[if i % 2 == 0 { id0 } else { id1 }]);
+        }
+        let ids_bytes = (1024 * size_of::<u64>()) as u64;
+        let max_blocks = (1024 * size_of::<usize>()) as u64;
+        let eager_total = ids_bytes + max_blocks;
+
+        // 1) Prefetch succeeds on a cold batch, filling the entire budget, and subsequent
+        // required cursor work (`ctx.charge` and `OwnedCharge::resize` as used for BIND
+        // column reservations) reclaims that idle optional reservation instead of failing
+        // with `BudgetExceeded`.
+        let mut ctx = Ctx::new(snap.clone());
+        ctx.mem_limit = eager_total;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        let before_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        prefetch_column_terms(&ctx, &big_batch, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_allocs + 1
+        );
+        assert_eq!(ctx.live_bytes(), eager_total);
+
+        let required = ctx
+            .charge(eager_total)
+            .expect("required ctx.charge must reclaim idle optional prefetch reservation");
+        assert_eq!(ctx.live_bytes(), eager_total);
+        drop(required);
+        assert_eq!(ctx.live_bytes(), 0);
+
+        // Fresh cold store so prefetch runs again before an `OwnedCharge::resize` (the
+        // cursor's fallible BIND column reservation path).
+        let dir2 = tempfile::tempdir().unwrap();
+        let disk2 = Store::open(dir2.path(), StoreOptions::default()).unwrap();
+        disk2
+            .load(&[Source::from_bytes(
+                data.as_bytes().to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap2 = disk2.snapshot();
+        let id2_0 = snap2
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 00").into())
+            .unwrap();
+        let id2_1 = snap2
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 01").into())
+            .unwrap();
+        let mut big_batch2 = Table::new(vec![0]);
+        for i in 0..1024 {
+            big_batch2.push_row(&[if i % 2 == 0 { id2_0 } else { id2_1 }]);
+        }
+        let mut small_batch2 = Table::new(vec![0]);
+        for i in 0..32 {
+            small_batch2.push_row(&[if i % 2 == 0 { id2_0 } else { id2_1 }]);
+        }
+
+        let mut ctx2 = Ctx::new(snap2);
+        ctx2.mem_limit = eager_total;
+        ctx2.enable_cursor_accounting().unwrap();
+        let ctx2 = Arc::new(ctx2);
+
+        // Pay a non-reclaimable decode envelope first by decoding one short term.
+        assert!(ctx2.term(id2_0).is_some());
+        let decode_peak = ctx2.live_bytes();
+        assert!(decode_peak > 0 && decode_peak < eager_total);
+
+        // A small cold batch that fits inside the paid decode envelope reuses it with
+        // zero ledger ops and zero extra bytes.
+        let before_reuse_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        prefetch_column_terms(&ctx2, &small_batch2, &[0]);
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before_reuse_ops,
+            "prefetch within paid decode envelope must take zero ledger ops"
+        );
+        assert_eq!(ctx2.live_bytes(), decode_peak);
+
+        // A larger cold batch grows the optional prefetch reservation above `decode_peak`.
+        let dir3 = tempfile::tempdir().unwrap();
+        let disk3 = Store::open(dir3.path(), StoreOptions::default()).unwrap();
+        disk3
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap3 = disk3.snapshot();
+        let id3_0 = snap3
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 00").into())
+            .unwrap();
+        let id3_1 = snap3
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 01").into())
+            .unwrap();
+        let mut big_batch3 = Table::new(vec![0]);
+        for i in 0..1024 {
+            big_batch3.push_row(&[if i % 2 == 0 { id3_0 } else { id3_1 }]);
+        }
+        let mut ctx3 = Ctx::new(snap3);
+        ctx3.mem_limit = eager_total;
+        ctx3.enable_cursor_accounting().unwrap();
+        let ctx3 = Arc::new(ctx3);
+        assert!(ctx3.term(id3_0).is_some());
+        let decode_peak3 = ctx3.live_bytes();
+        assert!(decode_peak3 > 0 && decode_peak3 < eager_total);
+
+        let before_grow_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        prefetch_column_terms(&ctx3, &big_batch3, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_grow_allocs + 1
+        );
+        assert_eq!(ctx3.live_bytes(), eager_total);
+
+        // Required `OwnedCharge::resize` (as in cursor BIND column reservation) reclaims
+        // the extra optional prefetch bytes above `decode_peak3`, while preserving the
+        // non-reclaimable `decode_peak3` envelope.
+        let mut bind_charge = super::super::ctx::OwnedCharge::new(&ctx3, 0).unwrap();
+        let headroom = eager_total - decode_peak3;
+        bind_charge
+            .resize(headroom)
+            .expect("OwnedCharge::resize must reclaim idle optional prefetch excess");
+        assert_eq!(ctx3.live_bytes(), eager_total);
+        assert!(
+            ctx3.charge(1).is_err(),
+            "non-reclaimable decode envelope must stay accounted"
+        );
+        drop(bind_charge);
+        assert_eq!(ctx3.live_bytes(), decode_peak3);
+        ctx3.release_cursor_work();
+        assert_eq!(ctx3.live_bytes(), 0);
+
+        // Unused bindings from the reuse check above.
+        drop(big_batch2);
+        ctx2.release_cursor_work();
+        assert_eq!(ctx2.live_bytes(), 0);
+    }
 
     #[test]
     fn eager_and_nested_limited_slice_keep_prepaid_columns_without_ledger() {
@@ -10296,6 +14878,7 @@ mod string_order_tests {
             "\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_string(),
             "\"ab\"@en".to_string(),
             "<urn:iri>".to_string(),
+            "\"a\"^^<urn:datatype>".to_string(),
             format!("\"{long}\""),
         ];
         for (k, v) in extra.iter().enumerate() {
@@ -10335,6 +14918,16 @@ mod string_order_tests {
                 .unwrap(),
         );
         ids.push(
+            snap.lookup_term(
+                &oxrdf::Literal::new_typed_literal(
+                    "a",
+                    oxrdf::NamedNode::new("urn:datatype").unwrap(),
+                )
+                .into(),
+            )
+            .unwrap(),
+        );
+        ids.push(
             snap.lookup_term(&oxrdf::Literal::new_simple_literal(long).into())
                 .unwrap(),
         );
@@ -10360,6 +14953,8 @@ mod string_order_tests {
             }
         }
         t.push_row(&[local, ids[1]]);
+        t.push_row(&[Id::UNDEF, ids[1]]);
+        t.push_row(&[ids[1], Id::UNDEF]);
         (t, x, y)
     }
 
@@ -10393,6 +14988,62 @@ mod string_order_tests {
             }
             assert_eq!(masks[0], masks[1], "{op:?}");
         }
+    }
+
+    #[test]
+    fn floor_masks_match_direct_comparison_at_low_reuse() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let (s, ids) = word_store(2 * rows);
+        for cursor in [false, true] {
+            for distinct_pairs in [rows - rows / 8, rows] {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 64 << 20;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                for i in 0..rows {
+                    let pair = i % distinct_pairs;
+                    t.push_row(&ids[2 * pair..2 * pair + 2]);
+                }
+                let e = cmp(x, y, CmpOp::Lt);
+                let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                let direct = evaluate_mask(&ctx, &t, &[e], None).unwrap();
+                assert_eq!(
+                    mask, direct,
+                    "cursor {cursor}, {distinct_pairs} distinct pairs"
+                );
+                assert!(ctx.check().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_floor_mask_polls_cancellation_after_decoding_starts() {
+        use super::super::expr::CmpOp;
+        let (s, ids) = store("long");
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 64 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let (t, x, y) = product(&ctx, &ids);
+        let e = cmp(x, y, CmpOp::Lt);
+        let cancel = ctx.cancel.clone();
+        crate::algo::set_projection_observer(Some(std::sync::Arc::new(move |event| {
+            if let crate::algo::ProjectionEvent::Materialized(
+                "checked-vocab-scratch-allocated",
+                _,
+            ) = event
+            {
+                cancel.store(true, AtomicOrdering::Relaxed);
+            }
+        })));
+        let result = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+        crate::algo::set_projection_observer(None);
+        assert!(matches!(result, Err(Error::Cancelled)));
     }
 
     /// The floor of every word is the first id whose key starts with its lexical form, in
@@ -10909,8 +15560,8 @@ mod string_order_tests {
         }
     }
 
-    /// A cursor reserves the keys its floors read, so a string longer than the budget
-    /// fails the mask with a memory refusal, while an eager table reads it unchecked.
+    /// Both accounting modes reserve the keys their floors read, so a string longer than
+    /// the budget fails the mask with a memory refusal in eager and cursor modes alike.
     #[test]
     fn a_refused_floor_fails_the_cursor_mask() {
         use super::super::expr::CmpOp;
@@ -10925,14 +15576,10 @@ mod string_order_tests {
             let (t, x, y) = product(&ctx, &ids);
             let e = cmp(x, y, CmpOp::Lt);
             let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
-            if cursor {
-                assert!(
-                    matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
-                    "{outcome:?}"
-                );
-            } else {
-                assert!(outcome.unwrap().is_some());
-            }
+            assert!(
+                matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "cursor={cursor}: {outcome:?}"
+            );
         }
     }
 
@@ -10999,6 +15646,55 @@ mod string_order_tests {
                 assert!(ctx.check().is_ok(), "{len} cursor {cursor}");
             }
         }
+    }
+
+    #[test]
+    fn a_short_floor_after_an_unrelated_long_key_fits_the_cursor_budget() {
+        use super::super::expr::CmpOp;
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            format!(
+                "<urn:s:0> <urn:p> \"a{}\" .\n<urn:s:1> <urn:p> \"b\" .\n<urn:s:2> <urn:p> \"c\" .\n",
+                "é".repeat(8192)
+            )
+            .into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let id = |word| {
+            snap.lookup_term(&oxrdf::Literal::new_simple_literal(word).into())
+                .unwrap()
+        };
+        let (b, c) = (id("b"), id("c"));
+        assert!(!(b.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+        let mut ctx = Ctx::new(snap);
+        ctx.mem_limit = 64 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let (x, y) = (ctx.var("x"), ctx.var("y"));
+        let mut t = Table::new(vec![x, y]);
+        for _ in 0..STRING_ORDER_ROWS {
+            t.push_row(&[b, c]);
+        }
+        // On one worker this admits short keys while refusing the long predecessor.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let _held = ctx
+            .charge(ctx.mem_limit - ctx.live_bytes() - (8 << 10))
+            .unwrap();
+        pool.install(|| {
+            let e = cmp(x, y, CmpOp::Lt);
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("the floors apply");
+            let direct = evaluate_mask(&ctx, &t, &[e], None).unwrap();
+            assert_eq!(mask, direct);
+            assert!(mask.iter().all(|&keep| keep));
+            assert!(ctx.check().is_ok());
+        });
     }
 
     /// The strings of the growth tests: `n` distinct words, each the object of one subject.
@@ -11220,6 +15916,2592 @@ mod string_order_tests {
             assert!(ctx.check().is_ok(), "cursor {cursor}");
         }
     }
+
+    /// A mask over few distinct strings in a large vocabulary starts at a compact floor
+    /// table instead of `FLOOR_TABLE_FIRST`, keeps its charge small, never grows and
+    /// matches direct comparison in both modes.
+    #[test]
+    fn small_distinct_floor_input_uses_compact_initial_table() {
+        use super::super::ctx::{FLOOR_TABLE_FEWEST, FLOOR_TABLE_FIRST, FloorTable};
+        use super::super::expr::CmpOp;
+        let (s, mut ids) = word_store(20_000);
+        // Contiguous vocabulary ids have no direct-mapped collisions in 1,024 slots,
+        // verifying both compact initial sizing and zero spurious growth over 20,000 rows.
+        ids.sort_by_key(|id| id.payload());
+        let small = &ids[..200];
+        let rows = 20_000usize;
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let mut t = Table::new(vec![x, y]);
+            for i in 0..rows {
+                t.push_row(&[small[i % small.len()], small[(i * 7 + 3) % small.len()]]);
+            }
+            let e = cmp(x, y, CmpOp::Lt);
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("the floors apply");
+            let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic, "cursor {cursor}");
+            let cache = ctx.floor_cache();
+            assert_eq!(
+                cache.slots(),
+                FLOOR_TABLE_FEWEST,
+                "cursor {cursor}: stayed compact below {FLOOR_TABLE_FIRST}"
+            );
+            assert_eq!(
+                cache.used(),
+                FloorTable::bytes(FLOOR_TABLE_FEWEST),
+                "cursor {cursor}: no growth allocations"
+            );
+            assert!(
+                cache.reserved() <= 64 << 10,
+                "cursor {cursor}: compact charge ({})",
+                cache.reserved()
+            );
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
+    }
+
+    /// Comparing one unique string column against a small repeating string column (like
+    /// `str-pair-lt`) allocates a compact table below `FLOOR_TABLE_FIRST`, never grows
+    /// across eager or batched execution and matches direct comparison.
+    #[test]
+    fn one_unique_and_one_small_column_stays_compact_without_growing() {
+        use super::super::ctx::{FLOOR_TABLE_FIRST, FloorTable};
+        use super::super::expr::CmpOp;
+        let unique_rows = 20_000usize;
+        let cities = 10usize;
+        let (s, ids) = word_store(unique_rows + cities);
+        let city_ids = &ids[..cities];
+        let name_ids = &ids[cities..];
+        for (cursor, batched) in [(false, false), (true, true)] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Lt);
+            let step = if batched {
+                STRING_ORDER_ROWS
+            } else {
+                unique_rows
+            };
+            let mut at = 0;
+            while at + STRING_ORDER_ROWS <= unique_rows {
+                let end = (at + step).min(unique_rows);
+                let mut t = Table::new(vec![x, y]);
+                for i in at..end {
+                    t.push_row(&[name_ids[i], city_ids[i % cities]]);
+                }
+                let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic, "cursor {cursor} batched {batched} at {at}");
+                at = end;
+            }
+            let cache = ctx.floor_cache();
+            assert!(
+                cache.slots() < FLOOR_TABLE_FIRST,
+                "cursor {cursor} batched {batched}: {} slots",
+                cache.slots()
+            );
+            assert_eq!(
+                cache.used(),
+                FloorTable::bytes(cache.slots()),
+                "cursor {cursor} batched {batched}: never grew"
+            );
+            assert!(ctx.check().is_ok(), "cursor {cursor} batched {batched}");
+        }
+    }
+
+    /// A large repeating input whose distinct strings exceed `FLOOR_TABLE_FIRST` pre-sizes
+    /// its initial table cleanly to the vocabulary clamp without growth reallocations or
+    /// repeated floor computations, in both modes and on one or several threads.
+    #[test]
+    fn large_distinct_repeating_input_presizes_without_growth() {
+        use super::super::ctx::{FLOOR_TABLE_FIRST, FloorTable};
+        use super::super::expr::CmpOp;
+        let distinct = 70_000usize;
+        let rows = 3 * distinct;
+        let (s, ids) = word_store(distinct);
+        let expected_slots = s
+            .snapshot()
+            .generation
+            .vocab
+            .first_triple()
+            .next_power_of_two() as usize;
+        assert!(expected_slots > FLOOR_TABLE_FIRST);
+        // Reference mask computed once to keep debug-mode runtime short.
+        let ref_ctx = Ctx::new(s.snapshot());
+        let (rx, ry) = (ref_ctx.var("x"), ref_ctx.var("y"));
+        let mut ref_t = Table::new(vec![rx, ry]);
+        for i in 0..rows {
+            ref_t.push_row(&[ids[i % distinct], ids[(i * 13 + 7) % distinct]]);
+        }
+        let ref_e = cmp(rx, ry, CmpOp::Lt);
+        let generic = evaluate_mask(&ref_ctx, &ref_t, std::slice::from_ref(&ref_e), None).unwrap();
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for cursor in [false, true] {
+                    let mut ctx = Ctx::new(s.snapshot());
+                    ctx.mem_limit = 256 << 20;
+                    if cursor {
+                        ctx.enable_cursor_accounting().unwrap();
+                    }
+                    let (x, y) = (ctx.var("x"), ctx.var("y"));
+                    let mut t = Table::new(vec![x, y]);
+                    t.cols[0].clone_from(&ref_t.cols[0]);
+                    t.cols[1].clone_from(&ref_t.cols[1]);
+                    t.len = ref_t.len;
+                    let e = cmp(x, y, CmpOp::Lt);
+                    let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                        .unwrap()
+                        .expect("the floors apply");
+                    assert_eq!(mask, generic, "threads {threads} cursor {cursor}");
+                    let cache = ctx.floor_cache();
+                    assert_eq!(
+                        cache.slots(),
+                        expected_slots,
+                        "threads {threads} cursor {cursor}: pre-sized directly"
+                    );
+                    assert_eq!(
+                        cache.used(),
+                        FloorTable::bytes(expected_slots),
+                        "threads {threads} cursor {cursor}: single allocation, no growth"
+                    );
+                    if threads == 1 {
+                        assert_eq!(
+                            cache.computed(),
+                            distinct,
+                            "cursor {cursor}: zero evicted recomputations"
+                        );
+                    }
+                    assert!(ctx.check().is_ok(), "threads {threads} cursor {cursor}");
+                }
+            });
+        }
+    }
+
+    /// Tight memory budgets refuse or clamp an oversized estimated initial table before
+    /// allocation without recording a query failure, preserving exact parity with direct
+    /// comparison in both eager and cursor modes.
+    #[test]
+    fn tight_memory_budget_refuses_or_clamps_oversized_initial_table() {
+        use super::super::ctx::{FLOOR_TABLE_FEWEST, FloorTable};
+        use super::super::expr::CmpOp;
+        let distinct = 70_000usize;
+        let rows = 3 * distinct;
+        let (s, ids) = word_store(distinct);
+        let ref_ctx = Ctx::new(s.snapshot());
+        let (rx, ry) = (ref_ctx.var("x"), ref_ctx.var("y"));
+        let mut ref_t = Table::new(vec![rx, ry]);
+        for i in 0..rows {
+            ref_t.push_row(&[ids[i % distinct], ids[(i * 13 + 7) % distinct]]);
+        }
+        let ref_e = cmp(rx, ry, CmpOp::Lt);
+        let generic = evaluate_mask(&ref_ctx, &ref_t, std::slice::from_ref(&ref_e), None).unwrap();
+        let full_slots = s
+            .snapshot()
+            .generation
+            .vocab
+            .first_triple()
+            .next_power_of_two() as usize;
+        assert!(estimate_floor_slots(&ref_t.cols[0], &ref_t.cols[1]).slots >= full_slots);
+
+        for cursor in [false, true] {
+            // (a) Small cache cap clamps initial table before allocation.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 4 << 20;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let cap = ctx.mem_limit / 16;
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                t.cols[0].clone_from(&ref_t.cols[0]);
+                t.cols[1].clone_from(&ref_t.cols[1]);
+                t.len = ref_t.len;
+                let e = cmp(x, y, CmpOp::Lt);
+                let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                assert_eq!(mask, generic, "cap clamp cursor {cursor}");
+                let cache = ctx.floor_cache();
+                assert!(cache.slots() >= FLOOR_TABLE_FEWEST && cache.slots() < full_slots);
+                assert!(cache.used() <= cap, "cursor {cursor}");
+                assert!(cache.reserved() <= cap, "cursor {cursor}");
+                assert!(ctx.check().is_ok(), "cursor {cursor}");
+            }
+
+            // (b) Remaining room smaller than one reservation step refuses allocation
+            // cleanly with zero reserved bytes and exact mask parity.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 64 << 20;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                t.cols[0].clone_from(&ref_t.cols[0]);
+                t.cols[1].clone_from(&ref_t.cols[1]);
+                t.len = ref_t.len;
+                let e = cmp(x, y, CmpOp::Lt);
+                // 32 KiB leaves headroom for decoding short keys, not for a 64 KiB step.
+                let room = 32 << 10;
+                let held = ctx.charge(ctx.mem_limit - ctx.live_bytes() - room).unwrap();
+                let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                assert_eq!(mask, generic, "refused initial cursor {cursor}");
+                let cache = ctx.floor_cache();
+                assert_eq!(cache.slots(), 0, "cursor {cursor}: refused before alloc");
+                assert_eq!(cache.used(), 0, "cursor {cursor}");
+                assert_eq!(cache.reserved(), 0, "cursor {cursor}");
+                assert!(ctx.check().is_ok(), "cursor {cursor}");
+                drop(held);
+            }
+
+            // (c) Remaining room smaller than the estimated 1 MiB table steps down to a
+            // smaller admitted table without allocating the oversized table.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 64 << 20;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                t.cols[0].clone_from(&ref_t.cols[0]);
+                t.cols[1].clone_from(&ref_t.cols[1]);
+                t.len = ref_t.len;
+                let e = cmp(x, y, CmpOp::Lt);
+                let room = 200 << 10;
+                let held = ctx.charge(ctx.mem_limit - ctx.live_bytes() - room).unwrap();
+                let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                assert_eq!(mask, generic, "stepped-down initial cursor {cursor}");
+                let cache = ctx.floor_cache();
+                assert!(
+                    cache.slots() >= FLOOR_TABLE_FEWEST && cache.slots() < full_slots,
+                    "cursor {cursor}: stepped down to {} slots",
+                    cache.slots()
+                );
+                assert!(
+                    FloorTable::bytes(cache.slots()) <= room,
+                    "cursor {cursor}: fits remaining room"
+                );
+                assert!(cache.reserved() <= room, "cursor {cursor}");
+                assert!(ctx.check().is_ok(), "cursor {cursor}");
+                drop(held);
+            }
+        }
+    }
+
+    /// Language-tagged and non-inline typed base-vocabulary literals (whether on row 0 or
+    /// later in the initial sample) fall back without sizing, allocating or initializing
+    /// the floor cache, leaving a later eligible simple-literal mask on the same context
+    /// free to choose its own compact initial table.
+    #[test]
+    fn ineligible_base_literals_leave_floor_cache_uninitialized_for_later_mask() {
+        use super::super::ctx::{FLOOR_TABLE_FEWEST, FLOOR_TABLE_FIRST, FloorTable};
+        use super::super::expr::CmpOp;
+        let lang_n = 20_000usize;
+        let typed_n = 5_000usize;
+        let simple_n = 200usize;
+        let mut nt = String::new();
+        for i in 0..lang_n {
+            nt.push_str(&format!("<urn:l:{i}> <urn:p> \"l{i:05}\"@en .\n"));
+        }
+        for i in 0..typed_n {
+            nt.push_str(&format!(
+                "<urn:t:{i}> <urn:p> \"t{i:05}\"^^<urn:custom> .\n"
+            ));
+        }
+        for i in 0..simple_n {
+            nt.push_str(&format!("<urn:s:{i}> <urn:p> \"s{i:04}\" .\n"));
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let lang_ids: Vec<Id> = (0..lang_n)
+            .map(|i| {
+                snap.lookup_term(
+                    &oxrdf::Literal::new_language_tagged_literal(format!("l{i:05}"), "en")
+                        .unwrap()
+                        .into(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let custom_dt = oxrdf::NamedNode::new_unchecked("urn:custom");
+        let typed_ids: Vec<Id> = (0..typed_n)
+            .map(|i| {
+                snap.lookup_term(
+                    &oxrdf::Literal::new_typed_literal(format!("t{i:05}"), custom_dt.clone())
+                        .into(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut simple_ids: Vec<Id> = (0..simple_n)
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(format!("s{i:04}")).into())
+                    .unwrap()
+            })
+            .collect();
+        simple_ids.sort_by_key(|id| id.payload());
+        drop(snap);
+
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            assert!(ctx.may_be_base_literal(lang_ids[0]));
+            assert!(ctx.may_be_base_literal(typed_ids[0]));
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Lt);
+
+            // (a) Large repeating language-tagged mask whose raw-id pattern would estimate
+            // >= FLOOR_TABLE_FIRST must fall back without initializing or reserving the cache.
+            let mut lang_t = Table::new(vec![x, y]);
+            for i in 0..(3 * lang_n) {
+                lang_t.push_row(&[lang_ids[i % lang_n], lang_ids[(i * 13 + 7) % lang_n]]);
+            }
+            assert!(
+                estimate_floor_slots(&lang_t.cols[0], &lang_t.cols[1]).slots >= FLOOR_TABLE_FIRST
+            );
+            let out = string_order_mask(&ctx, &lang_t, (x, y), CmpOp::Lt, &e).unwrap();
+            assert!(out.is_none(), "lang-tagged mask must fall back");
+            assert!(ctx.floor_cache_needs_init(), "cursor {cursor}");
+            assert_eq!(ctx.floor_cache().slots(), 0, "cursor {cursor}");
+            assert_eq!(ctx.floor_cache().used(), 0, "cursor {cursor}");
+            assert_eq!(ctx.floor_cache().reserved(), 0, "cursor {cursor}");
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+
+            // (b) Non-inline typed base-vocabulary literal mask also leaves cache uninitialized.
+            let mut typed_t = Table::new(vec![x, y]);
+            for i in 0..(3 * typed_n) {
+                typed_t.push_row(&[typed_ids[i % typed_n], typed_ids[(i * 7 + 3) % typed_n]]);
+            }
+            let out = string_order_mask(&ctx, &typed_t, (x, y), CmpOp::Lt, &e).unwrap();
+            assert!(out.is_none(), "typed mask must fall back");
+            assert!(ctx.floor_cache_needs_init(), "cursor {cursor}");
+            assert_eq!(ctx.floor_cache().slots(), 0, "cursor {cursor}");
+            assert_eq!(ctx.floor_cache().used(), 0, "cursor {cursor}");
+            assert_eq!(ctx.floor_cache().reserved(), 0, "cursor {cursor}");
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+
+            // (c) Mixed mask with simple literals on row 0 and a language-tagged literal
+            // later in the initial sample still leaves cache uninitialized.
+            let mut mixed_t = Table::new(vec![x, y]);
+            mixed_t.push_row(&[simple_ids[0], simple_ids[1]]);
+            for i in 1..STRING_ORDER_ROWS {
+                mixed_t.push_row(&[lang_ids[i % lang_n], lang_ids[(i + 1) % lang_n]]);
+            }
+            let out = string_order_mask(&ctx, &mixed_t, (x, y), CmpOp::Lt, &e).unwrap();
+            assert!(out.is_none(), "mixed sample must fall back");
+            assert!(ctx.floor_cache_needs_init(), "cursor {cursor}");
+            assert_eq!(ctx.floor_cache().slots(), 0, "cursor {cursor}");
+            assert_eq!(ctx.floor_cache().used(), 0, "cursor {cursor}");
+            assert_eq!(ctx.floor_cache().reserved(), 0, "cursor {cursor}");
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+
+            // (d) A subsequent eligible small-distinct simple-literal mask on the same
+            // context initializes a compact FLOOR_TABLE_FEWEST table.
+            let mut simple_t = Table::new(vec![x, y]);
+            for i in 0..20_000usize {
+                simple_t.push_row(&[
+                    simple_ids[i % simple_ids.len()],
+                    simple_ids[(i * 7 + 3) % simple_ids.len()],
+                ]);
+            }
+            let mask = string_order_mask(&ctx, &simple_t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("eligible simple-literal mask applies");
+            let generic = evaluate_mask(&ctx, &simple_t, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic, "cursor {cursor}");
+            assert!(!ctx.floor_cache_needs_init(), "cursor {cursor}");
+            assert_eq!(
+                ctx.floor_cache().slots(),
+                FLOOR_TABLE_FEWEST,
+                "cursor {cursor}: sized from eligible mask, not earlier ineligible masks"
+            );
+            assert_eq!(
+                ctx.floor_cache().used(),
+                FloorTable::bytes(FLOOR_TABLE_FEWEST),
+                "cursor {cursor}"
+            );
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
+    }
+
+    /// A refused cursor floor decode on `xs[0]` still surfaces its memory failure when
+    /// `ys[0]` is not a base-vocabulary literal, whether the floor cache is uninitialized
+    /// or already initialized.
+    #[test]
+    fn refused_left_decode_with_ineligible_right_still_fails() {
+        use super::super::expr::CmpOp;
+        let long = "a".repeat(1 << 20);
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            format!("<urn:s:0> <urn:p> \"{long}\" .\n<urn:s:1> <urn:p> <urn:iri> .\n").into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let x_id = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal(&long).into())
+            .unwrap();
+        let iri_id = snap
+            .lookup_term(&oxrdf::NamedNode::new_unchecked("urn:iri").into())
+            .unwrap();
+        drop(snap);
+
+        for pre_init in [false, true] {
+            for y_id in [Id::UNDEF, iri_id] {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 4 << 20;
+                ctx.enable_cursor_accounting().unwrap();
+                assert!(ctx.may_be_base_literal(x_id));
+                assert!(!ctx.may_be_base_literal(y_id));
+                if pre_init {
+                    let _ = ctx.floor_map();
+                    assert!(!ctx.floor_cache_needs_init());
+                }
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                for _ in 0..STRING_ORDER_ROWS {
+                    t.push_row(&[x_id, y_id]);
+                }
+                let held = ctx.charge(ctx.mem_limit - ctx.live_bytes() - 1024).unwrap();
+                let e = cmp(x, y, CmpOp::Lt);
+                let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+                assert!(
+                    outcome.is_err(),
+                    "pre_init {pre_init} y_id {y_id:?}: refused left decode must fail, got {outcome:?}"
+                );
+                assert!(
+                    ctx.check().is_err(),
+                    "pre_init {pre_init} y_id {y_id:?}: memory failure must be recorded"
+                );
+                if !pre_init {
+                    assert!(ctx.floor_cache_needs_init());
+                    assert_eq!(ctx.floor_cache().slots(), 0);
+                    assert_eq!(ctx.floor_cache().reserved(), 0);
+                }
+                drop(held);
+            }
+        }
+    }
+
+    /// Growing the shared floor cache via `grow_floor_cache` migrates live entries so
+    /// subsequent lookups return the exact floors without recomputing them.
+    #[test]
+    fn grow_floor_cache_preserves_entries_without_recomputing() {
+        let (s, ids) = word_store(512);
+        let mut by_slot: Vec<Vec<Id>> = vec![Vec::new(); 64];
+        for &id in &ids {
+            by_slot[(id.payload() as usize) & 63].push(id);
+        }
+        let preserved: Vec<Id> = by_slot[..32]
+            .iter()
+            .filter_map(|bucket| bucket.first().copied())
+            .collect();
+        let evictors: Vec<(Id, Id)> = by_slot[32..]
+            .iter()
+            .filter(|bucket| bucket.len() >= 2)
+            .map(|bucket| (bucket[0], bucket[1]))
+            .take(4)
+            .collect();
+        assert!(preserved.len() >= 16);
+        assert_eq!(evictors.len(), 4);
+
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            ctx.floor_cache().set_first_slots(64);
+            let expected: Vec<Option<u64>> =
+                preserved.iter().map(|&id| ctx.string_floor(id)).collect();
+            assert!(expected.iter().all(Option::is_some));
+
+            {
+                let mut map = ctx.floor_map();
+                for (&id, &exp) in preserved.iter().zip(&expected) {
+                    assert_eq!(map.floor(id), exp);
+                }
+                // Trigger >= 4 read-again evictions in slots 32..64 (threshold for 64 slots is 2).
+                for &(a, b) in &evictors {
+                    let _ = map.floor(a);
+                    let _ = map.floor(a);
+                    let _ = map.floor(b);
+                }
+            }
+            assert_eq!(ctx.floor_cache().slots(), 64, "cursor {cursor}");
+            let before_computed = ctx.floor_cache().computed();
+            ctx.grow_floor_cache();
+            assert!(
+                ctx.floor_cache().slots() > 64,
+                "cursor {cursor}: table must grow"
+            );
+
+            {
+                let mut map = ctx.floor_map();
+                for (&id, &exp) in preserved.iter().zip(&expected) {
+                    assert_eq!(map.floor(id), exp, "cursor {cursor}");
+                }
+            }
+            assert_eq!(
+                ctx.floor_cache().computed(),
+                before_computed,
+                "cursor {cursor}: preserved entries must not be recomputed after growth"
+            );
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
+    }
+
+    /// `col_distinct_estimate` and `stratum_bounds` compute large-`n` products without `usize`
+    /// overflow.
+    #[test]
+    fn col_distinct_estimate_handles_large_n_without_overflow() {
+        let s = FLOOR_ESTIMATE_SAMPLE;
+        let large_n = usize::MAX / 2;
+        let (est, has_repeats) = col_distinct_estimate(large_n, s, s, s, 0, s / 2);
+        assert!(has_repeats);
+        assert_eq!(est, large_n / 2);
+
+        // Last of 1,024 strata at n = 1 << 22: (k + 1) * n = 2^32 overflows 32-bit usize.
+        let n_32bit_overflow = 1usize << 22;
+        let (lo, hi) = stratum_bounds(s - 1, n_32bit_overflow, s);
+        assert_eq!(lo, n_32bit_overflow - n_32bit_overflow / s);
+        assert_eq!(hi, n_32bit_overflow);
+        assert!(hi > lo);
+
+        // Same boundary check at usize::MAX / 2 overflows both 32-bit and 64-bit usize products.
+        let (large_lo, large_hi) = stratum_bounds(s - 1, large_n, s);
+        assert_eq!(large_lo, large_n - large_n / s - 1);
+        assert_eq!(large_hi, large_n);
+        assert!(large_hi > large_lo);
+    }
+
+    /// A low-reuse stream (all distinct string pairs) defers floor table allocation on its
+    /// initial masks, compares keys directly, probes on every 4th mask without growing the
+    /// table, and matches `evaluate_mask` across modes and thread counts.
+    #[test]
+    fn low_reuse_stream_defers_table_bypasses_and_probes_without_growing() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let masks = 7;
+        let (s, ids) = word_store(masks * 2 * rows);
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for cursor in [false, true] {
+                    let mut ctx = Ctx::new(s.snapshot());
+                    ctx.mem_limit = 256 << 20;
+                    if cursor {
+                        ctx.enable_cursor_accounting().unwrap();
+                    }
+                    let (x, y) = (ctx.var("x"), ctx.var("y"));
+                    let e = cmp(x, y, CmpOp::Lt);
+                    for (idx, part) in ids.chunks(2 * rows).enumerate() {
+                        let mut t = Table::new(vec![x, y]);
+                        for pair in part.chunks(2) {
+                            t.push_row(pair);
+                        }
+                        let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                            .unwrap()
+                            .expect("string_order_mask handles low-reuse pairs");
+                        let generic =
+                            evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                        assert_eq!(
+                            mask, generic,
+                            "threads {threads} cursor {cursor} mask {idx}"
+                        );
+                        if idx < 3 {
+                            assert_eq!(
+                                ctx.floor_cache().slots(),
+                                0,
+                                "threads {threads} cursor {cursor} mask {idx}: table stays deferred"
+                            );
+                            assert_eq!(ctx.floor_cache().used(), 0);
+                            assert_eq!(ctx.floor_cache().bypassed(), idx + 1);
+                        } else if idx == 3 {
+                            assert!(
+                                ctx.floor_cache().slots() > 0,
+                                "threads {threads} cursor {cursor}: probe mask installs table"
+                            );
+                            assert_eq!(ctx.floor_cache().bypassed(), 3);
+                        }
+                    }
+                    let slots_after_probe = ctx.floor_cache().slots();
+                    assert_eq!(
+                        ctx.floor_cache().bypassed(),
+                        6,
+                        "threads {threads} cursor {cursor}: 6 of 7 low-reuse masks bypassed"
+                    );
+                    assert_eq!(ctx.floor_cache().slots(), slots_after_probe);
+                    assert!(ctx.check().is_ok(), "threads {threads} cursor {cursor}");
+                }
+            });
+        }
+    }
+
+    /// A shuffled stream whose first batch repeats too few strings to cache initially starts
+    /// in bypass mode, populates the table on periodic probe masks, and re-enables floors
+    /// once cross-batch reuse rises above the hit-rate threshold.
+    #[test]
+    fn shuffled_repeating_stream_reenables_floors_after_probing() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let distinct = 32_000usize;
+        let (s, ids) = word_store(distinct);
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 256 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let (x, y) = (ctx.var("x"), ctx.var("y"));
+        let e = cmp(x, y, CmpOp::Lt);
+
+        // Deterministic pseudo-random shuffle over 32,000 distinct strings.
+        let mut state: u64 = 0x517c_c1b7_2722_0a95;
+        let mut next_id = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ids[((state >> 32) as usize) % distinct]
+        };
+
+        let mut bypassed_by_batch = Vec::new();
+        for batch in 0..16 {
+            let mut t = Table::new(vec![x, y]);
+            for _ in 0..rows {
+                t.push_row(&[next_id(), next_id()]);
+            }
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("the mask applies");
+            if batch < 2 || batch == 15 {
+                let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic, "batch {batch}");
+            }
+            bypassed_by_batch.push(ctx.floor_cache().bypassed());
+        }
+        assert!(
+            bypassed_by_batch[0] == 1,
+            "first low-repeat batch starts bypassed: {bypassed_by_batch:?}"
+        );
+        assert!(
+            ctx.floor_cache().slots() > 0,
+            "probe installed the floor table"
+        );
+        // Once cross-batch hits exceed 1/8, bypass stops growing for the trailing batches.
+        let tail_start = bypassed_by_batch[11];
+        assert_eq!(
+            bypassed_by_batch[15], tail_start,
+            "floors stayed enabled once cross-batch reuse rose: {bypassed_by_batch:?}"
+        );
+        assert!(ctx.check().is_ok());
+    }
+
+    /// On the bypassed direct-compare path in cursor mode, a budget-exceeding literal after
+    /// the sample fails with `BudgetExceeded(Memory)` and cancellation returns `Cancelled`.
+    #[test]
+    fn bypassed_direct_mask_enforces_strict_memory_refusal_and_cancellation() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let long = format!("z{}", "y".repeat(1 << 19));
+        let mut nt = String::new();
+        for i in 0..(2 * rows) {
+            nt.push_str(&format!("<urn:s:{i}> <urn:p> \"w{i:06}\" .\n"));
+        }
+        nt.push_str(&format!("<urn:s:long> <urn:p> \"{long}\" .\n"));
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let ids: Vec<Id> = (0..(2 * rows))
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(format!("w{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        let long_id = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal(&long).into())
+            .unwrap();
+        drop(snap);
+
+        // (a) Strict memory refusal after the initial sample on a bypassed mask.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 4 << 20;
+            ctx.enable_cursor_accounting().unwrap();
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let mut t = Table::new(vec![x, y]);
+            for i in 0..rows {
+                let b = if i == STRING_ORDER_SAMPLE + 50 {
+                    long_id
+                } else {
+                    ids[2 * i + 1]
+                };
+                t.push_row(&[ids[2 * i], b]);
+            }
+            let e = cmp(x, y, CmpOp::Lt);
+            let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+            assert!(
+                matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "expected memory refusal on bypassed mask, got {outcome:?}"
+            );
+            assert_eq!(ctx.floor_cache().bypassed(), 1);
+            assert!(ctx.check().is_err());
+        }
+
+        // (b) Cancellation after decoding scratch allocation on a bypassed mask.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            ctx.enable_cursor_accounting().unwrap();
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let mut t = Table::new(vec![x, y]);
+            for i in 0..rows {
+                t.push_row(&[ids[2 * i], ids[2 * i + 1]]);
+            }
+            let e = cmp(x, y, CmpOp::Lt);
+            // Start the bypass before arming the observer, so it fires during the
+            // direct comparison's checked walk in the second mask.
+            assert!(
+                string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(ctx.floor_cache().bypassed(), 1);
+            let cancel = ctx.cancel.clone();
+            crate::algo::set_projection_observer(Some(std::sync::Arc::new(move |event| {
+                if let crate::algo::ProjectionEvent::Materialized(
+                    "checked-vocab-scratch-allocated",
+                    _,
+                ) = event
+                {
+                    cancel.store(true, AtomicOrdering::Relaxed);
+                }
+            })));
+            let result = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+            crate::algo::set_projection_observer(None);
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert_eq!(ctx.floor_cache().bypassed(), 2);
+        }
+    }
+
+    /// A bypassed direct-compare mask falls back to the generic row evaluator whenever a
+    /// row after the sample holds a non-simple-literal term, matching `evaluate_mask`.
+    #[test]
+    fn bypassed_direct_mask_falls_back_to_generic_on_mixed_rows() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let mut nt = String::new();
+        for i in 0..(2 * rows) {
+            nt.push_str(&format!("<urn:s:{i}> <urn:p> \"w{i:06}\" .\n"));
+        }
+        nt.push_str("<urn:s:lang> <urn:p> \"w000100\"@en .\n");
+        nt.push_str("<urn:s:typed> <urn:p> \"w000101\"^^<urn:dt> .\n");
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let ids: Vec<Id> = (0..(2 * rows))
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(format!("w{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        let lang = snap
+            .lookup_term(
+                &oxrdf::Literal::new_language_tagged_literal("w000100", "en")
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap();
+        let typed = snap
+            .lookup_term(
+                &oxrdf::Literal::new_typed_literal(
+                    "w000101",
+                    oxrdf::NamedNode::new_unchecked("urn:dt"),
+                )
+                .into(),
+            )
+            .unwrap();
+        let iri = snap
+            .lookup_term(&oxrdf::NamedNode::new_unchecked("urn:s:0").into())
+            .unwrap();
+        drop(snap);
+
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for cursor in [false, true] {
+                    for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+                        let mut ctx = Ctx::new(s.snapshot());
+                        ctx.mem_limit = 64 << 20;
+                        if cursor {
+                            ctx.enable_cursor_accounting().unwrap();
+                        }
+                        let local = ctx.intern_value(&Value::Str("w000200".into()));
+                        let (x, y) = (ctx.var("x"), ctx.var("y"));
+                        let mut t = Table::new(vec![x, y]);
+                        for i in 0..rows {
+                            let pair = match i {
+                                100 => [lang, ids[2 * i + 1]],
+                                101 => [ids[2 * i], lang],
+                                102 => [typed, ids[2 * i + 1]],
+                                103 => [iri, ids[2 * i + 1]],
+                                104 => [local, ids[2 * i + 1]],
+                                105 => [Id::UNDEF, ids[2 * i + 1]],
+                                106 => [ids[2 * i], Id::UNDEF],
+                                107 => [ids[2 * i], ids[2 * i]],
+                                _ => [ids[2 * i], ids[2 * i + 1]],
+                            };
+                            t.push_row(&pair);
+                        }
+                        let e = cmp(x, y, op);
+                        let mask = string_order_mask(&ctx, &t, (x, y), op, &e)
+                            .unwrap()
+                            .expect("the mask applies");
+                        let generic =
+                            evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                        assert_eq!(mask, generic, "threads {threads} cursor {cursor} {op:?}");
+                        assert_eq!(ctx.floor_cache().bypassed(), 1);
+                        assert!(ctx.check().is_ok());
+                    }
+                }
+            });
+        }
+    }
+
+    /// Cancellation raised after entering a direct-comparison partition—including inside a
+    /// final chunk shorter than 1,024 rows with no later modulo-1024 poll—must fail the
+    /// mask with `Error::Cancelled` on both cursor and eager paths.
+    #[test]
+    fn direct_mask_cancels_after_entering_partition_and_in_short_final_chunk() {
+        use super::super::expr::CmpOp;
+        let eager_rows = PAR_THRESHOLD + 500;
+        let medium = format!("z{}", "m".repeat(320));
+        let mut nt = String::new();
+        for i in 0..(2 * eager_rows) {
+            nt.push_str(&format!("<urn:s> <urn:p> \"w{i:06}\" .\n"));
+        }
+        nt.push_str(&format!("<urn:s> <urn:p> \"{medium}\" .\n"));
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let ids: Vec<Id> = (0..(2 * eager_rows))
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(format!("w{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        let medium_id = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal(&medium).into())
+            .unwrap();
+        drop(snap);
+
+        // Trigger cancellation only when a worker grows scratch past 256 bytes (i.e. when
+        // decoding `medium_id` inside the direct-comparison partition, never during the
+        // initial sample whose keys are short).
+        let run_case = |threads: usize, rows: usize, trigger_row: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 64 << 20;
+                ctx.enable_cursor_accounting().unwrap();
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                for i in 0..rows {
+                    let b = if i == trigger_row {
+                        medium_id
+                    } else {
+                        ids[2 * i + 1]
+                    };
+                    t.push_row(&[ids[2 * i], b]);
+                }
+                let e = cmp(x, y, CmpOp::Lt);
+                let cancel = ctx.cancel.clone();
+                let triggered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let seen = triggered.clone();
+                let observer = std::sync::Arc::new(move |event| {
+                    if let crate::algo::ProjectionEvent::Materialized(
+                        "checked-vocab-scratch-allocated",
+                        cap,
+                    ) = event
+                        && cap > 256
+                    {
+                        seen.store(true, AtomicOrdering::Relaxed);
+                        cancel.store(true, AtomicOrdering::Relaxed);
+                    }
+                });
+                pool.broadcast(|_| crate::algo::set_projection_observer(Some(observer.clone())));
+                let result = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+                pool.broadcast(|_| crate::algo::set_projection_observer(None));
+                assert!(
+                    triggered.load(AtomicOrdering::Relaxed),
+                    "threads {threads} rows {rows} trigger {trigger_row}: growth observer must fire"
+                );
+                assert!(
+                    matches!(result, Err(Error::Cancelled)),
+                    "threads {threads} rows {rows} trigger {trigger_row}: expected Cancelled, got {result:?}"
+                );
+            });
+        };
+
+        // Cursor-sized batch (n <= PAR_THRESHOLD): trigger past the final multiple of 1024
+        // (row 4090 in 0..4096 has no later modulo-1024 poll).
+        run_case(4, STRING_ORDER_ROWS, STRING_ORDER_ROWS - 6);
+        run_case(1, STRING_ORDER_ROWS, STRING_ORDER_ROWS - 6);
+        // Eager multi-part direct mask (Part 2 is 16448..16884, 436 rows containing zero
+        // multiples of 1024):
+        // (1) cancellation inside the short final part;
+        // (2) cancellation near the end of Part 1 before entering the short final part.
+        run_case(4, eager_rows, eager_rows - 4);
+        run_case(4, eager_rows, PAR_THRESHOLD + STRING_ORDER_SAMPLE - 8);
+        run_case(1, eager_rows, eager_rows - 4);
+    }
+
+    /// Multi-part eager masks apply low-hit-rate bypass and periodic probing at eager part
+    /// boundaries, matching `evaluate_mask`.
+    #[test]
+    fn eager_multi_part_mask_transitions_between_floors_and_direct() {
+        use super::super::expr::CmpOp;
+        let distinct_count = 132_000usize;
+        let mut nt = String::new();
+        for i in 0..distinct_count {
+            nt.push_str(&format!("<urn:s> <urn:p> \"w{i:06}\" .\n"));
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let ids: Vec<Id> = (0..distinct_count)
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(format!("w{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        drop(snap);
+
+        // (a) Floors -> Direct transition across eager parts when Part 1 observes low hits.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 256 << 20;
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Lt);
+            // Warm up with a small repeating mask so the cache starts on Floors with a
+            // compact table (<= FLOOR_TABLE_FIRST).
+            let mut warm = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                warm.push_row(&[ids[i % 16], ids[(i + 5) % 16]]);
+            }
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("warm mask applies");
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            // Multi-part eager mask (2 parts: 64..16448 on Floors with 0% hits, then
+            // 16448..20000 transitioning to Direct).
+            let rows = 20_000usize;
+            let mut t = Table::new(vec![x, y]);
+            for i in 0..rows {
+                t.push_row(&[ids[2 * i], ids[2 * i + 1]]);
+            }
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("eager mask applies");
+            let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic);
+            assert_eq!(
+                ctx.floor_cache().bypassed(),
+                1,
+                "Part 2 must switch to Direct after Part 1 low-hit-rate floor pass"
+            );
+            assert!(ctx.check().is_ok());
+        }
+
+        // (b) A lone eager mask started in bypass probes on Part 4 and installs its table.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 256 << 20;
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Lt);
+            let rows = 66_000usize;
+            let mut t = Table::new(vec![x, y]);
+            for i in 0..rows {
+                t.push_row(&[ids[2 * i], ids[2 * i + 1]]);
+            }
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("lone eager mask applies");
+            assert_eq!(
+                ctx.floor_cache().bypassed(),
+                3,
+                "Parts 1..3 bypass and Part 4 probes on Floors"
+            );
+            assert!(
+                ctx.floor_cache().slots() > 0,
+                "Part 4 probe must install the deferred floor table"
+            );
+            assert_eq!(mask.len(), rows);
+            assert!(ctx.check().is_ok());
+        }
+
+        // (c) An eager mask started in bypass that probes on a high-reuse part stays on
+        // Floors for subsequent parts.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 256 << 20;
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Lt);
+            let mut first = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                first.push_row(&[ids[2 * i], ids[2 * i + 1]]);
+            }
+            string_order_mask(&ctx, &first, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("first low-reuse mask applies");
+            assert_eq!(ctx.floor_cache().bypassed(), 1);
+            assert_eq!(ctx.floor_cache().slots(), 0);
+
+            // Parts 1 & 2 (64..32896) stay Direct (bypassed = 2, 3), Part 3 (32896..65792)
+            // probes on Floors with high reuse, Part 4 (65792..70000) stays on Floors.
+            let rows = 70_000usize;
+            let mut t = Table::new(vec![x, y]);
+            for i in 0..rows {
+                if i < 32_896 {
+                    t.push_row(&[ids[2 * i], ids[2 * i + 1]]);
+                } else {
+                    t.push_row(&[ids[i % 128], ids[(i * 7 + 3) % 128]]);
+                }
+            }
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("second eager mask applies");
+            let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic);
+            assert_eq!(
+                ctx.floor_cache().bypassed(),
+                3,
+                "Part 3 probe must re-enable Floors so Part 4 does not bypass"
+            );
+            assert!(ctx.floor_cache().slots() > 0);
+            assert!(ctx.check().is_ok());
+        }
+    }
+
+    /// An ineligible subsequent mask (holding base-vocabulary non-simple literals) must
+    /// not advance floor-cache bypass or probe state before sample validation succeeds.
+    #[test]
+    fn ineligible_subsequent_mask_does_not_advance_floor_bypass_state() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let mut nt = String::new();
+        for i in 0..(2 * rows) {
+            nt.push_str(&format!("<urn:s> <urn:p> \"w{i:06}\" .\n"));
+        }
+        nt.push_str("<urn:s> <urn:p> \"a\"@en .\n");
+        nt.push_str("<urn:s> <urn:p> \"b\"@en .\n");
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let ids: Vec<Id> = (0..(2 * rows))
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(format!("w{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        let lang_a = snap
+            .lookup_term(
+                &oxrdf::Literal::new_language_tagged_literal("a", "en")
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap();
+        let lang_b = snap
+            .lookup_term(
+                &oxrdf::Literal::new_language_tagged_literal("b", "en")
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap();
+        drop(snap);
+
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 64 << 20;
+        let (x, y) = (ctx.var("x"), ctx.var("y"));
+        let e = cmp(x, y, CmpOp::Lt);
+
+        // First mask enters bypass with deferred table allocation.
+        let mut t1 = Table::new(vec![x, y]);
+        for i in 0..rows {
+            t1.push_row(&[ids[2 * i], ids[2 * i + 1]]);
+        }
+        string_order_mask(&ctx, &t1, (x, y), CmpOp::Lt, &e)
+            .unwrap()
+            .expect("first mask applies");
+        assert_eq!(ctx.floor_cache().bypassed(), 1);
+        assert_eq!(ctx.floor_cache().slots(), 0);
+
+        // Repeated ineligible base-literal masks must not advance bypass_streak or install
+        // the deferred table.
+        let mut ineligible = Table::new(vec![x, y]);
+        for _ in 0..rows {
+            ineligible.push_row(&[lang_a, lang_b]);
+        }
+        for _ in 0..5 {
+            assert!(
+                string_order_mask(&ctx, &ineligible, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(ctx.floor_cache().bypassed(), 1);
+            assert_eq!(ctx.floor_cache().slots(), 0);
+        }
+        assert!(ctx.check().is_ok());
+    }
+
+    /// A cursor mask entering bypass on a pending `Floors -> Direct` transition must validate
+    /// its sample via direct key comparison so an uncached block-start literal does not
+    /// trigger an unnecessary floor predecessor decode under a tight cursor budget.
+    #[test]
+    fn floors_to_direct_transition_skips_predecessor_decode_under_cursor_budget() {
+        use super::super::expr::CmpOp;
+        use crate::builder::{BuildOptions, VocabCodec};
+        use oxrdf::Literal;
+
+        let mut nt = String::new();
+        // IDs 0..=14: 15 short simple literals sorting before "m".
+        let mut a_terms = Vec::with_capacity(15);
+        for i in 0..15usize {
+            let term: oxrdf::Term = Literal::new_simple_literal(format!("a{i:02}")).into();
+            nt.push_str(&format!("<urn:s> <urn:p> {term} .\n"));
+            a_terms.push(term);
+        }
+        // ID 15: a 1 MiB extension of "m" (`"mxxx...\xFF"` sorts immediately before `"m\xFF"`).
+        let huge_term: oxrdf::Term =
+            Literal::new_simple_literal(format!("m{}", "x".repeat(1 << 20))).into();
+        nt.push_str(&format!("<urn:s> <urn:p> {huge_term} .\n"));
+        // ID 16: short simple literal "m" at block start (`16 % FC_BLOCK == 0`).
+        let m_term: oxrdf::Term = Literal::new_simple_literal("m").into();
+        nt.push_str(&format!("<urn:s> <urn:p> {m_term} .\n"));
+        // Cheap distinct simple literals sorting after "m" to drive a low-hit Floors batch.
+        let distinct_count = 2 * STRING_ORDER_ROWS;
+        for i in 0..distinct_count {
+            nt.push_str(&format!("<urn:s> <urn:p> \"z{i:06}\" .\n"));
+        }
+
+        let s = Store::in_memory(StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Front),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.generation.vocab_codec(), VocabCodec::Front);
+        let a_ids: Vec<Id> = a_terms
+            .iter()
+            .map(|t| snap.lookup_term(t).unwrap())
+            .collect();
+        let huge_id = snap.lookup_term(&huge_term).unwrap();
+        let m_id = snap.lookup_term(&m_term).unwrap();
+        assert_eq!(huge_id.payload(), 15);
+        assert_eq!(m_id.payload(), 16);
+        assert!((m_id.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+        let z_ids: Vec<Id> = (0..distinct_count)
+            .map(|i| {
+                snap.lookup_term(&Literal::new_simple_literal(format!("z{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        drop(snap);
+
+        // Sanity check: computing `m`'s floor under a 4 MiB cursor budget fails because
+        // decoding its 1 MiB predecessor at ID 15 exceeds the decoding envelope.
+        {
+            let mut probe_ctx = Ctx::new(s.snapshot());
+            probe_ctx.mem_limit = 4 << 20;
+            probe_ctx.enable_cursor_accounting().unwrap();
+            assert_eq!(probe_ctx.string_floor(m_id), None);
+            assert!(
+                matches!(
+                    probe_ctx.check(),
+                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                ),
+                "computing m's floor must fail when decoding ID 15 under 4 MiB cursor budget"
+            );
+        }
+
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 4 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let (x, y) = (ctx.var("x"), ctx.var("y"));
+        let e = cmp(x, y, CmpOp::Gt);
+
+        // Batch 1: establish a compact floor table on `Floors` with a repeating batch.
+        let mut warm = Table::new(vec![x, y]);
+        for i in 0..STRING_ORDER_ROWS {
+            warm.push_row(&[a_ids[i % a_ids.len()], a_ids[(i + 5) % a_ids.len()]]);
+        }
+        string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+            .unwrap()
+            .expect("warm mask applies");
+        assert!(ctx.floor_cache().slots() > 0);
+        assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+        // Batch 2: distinct cheap literals drive misses past `FLOOR_BYPASS_MIN_LOOKUPS` with
+        // at most 15 read-again evictions (below the growth threshold), queuing `Floors -> Direct`.
+        let mut low_hit = Table::new(vec![x, y]);
+        for i in 0..STRING_ORDER_ROWS {
+            low_hit.push_row(&[z_ids[2 * i], z_ids[2 * i + 1]]);
+        }
+        string_order_mask(&ctx, &low_hit, (x, y), CmpOp::Gt, &e)
+            .unwrap()
+            .expect("low-hit mask applies");
+        assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+        // Batch 3: comparing uncached block-start ID 16 ("m") with short literal `a00` must
+        // preview the pending bypass, validate via `simple_literal_cmp_in`, and succeed.
+        let mut transition = Table::new(vec![x, y]);
+        for i in 0..STRING_ORDER_ROWS {
+            let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+            transition.push_row(&[m_id, rhs]);
+        }
+        let mask = string_order_mask(&ctx, &transition, (x, y), CmpOp::Gt, &e)
+            .unwrap()
+            .expect("transition mask applies on Direct");
+        let generic = evaluate_mask(&ctx, &transition, std::slice::from_ref(&e), None).unwrap();
+        assert_eq!(mask, generic);
+        assert_eq!(
+            ctx.floor_cache().bypassed(),
+            1,
+            "transition mask must enter Direct bypass"
+        );
+        assert!(ctx.check().is_ok());
+    }
+
+    /// A subsequent `Floors` mask must count its validated 64-row sample's lookups and hits
+    /// toward floor hit-rate feedback so boundary decisions do not drop the sampled rows.
+    #[test]
+    fn later_mask_sample_counts_toward_floor_hit_rate_feedback() {
+        use super::super::expr::CmpOp;
+        let (s, ids) = word_store(2_500);
+        let non_base_a = Id::from_i64(1).unwrap();
+        let non_base_b = Id::from_i64(2).unwrap();
+
+        // (a) Sample lookups count toward `FLOOR_BYPASS_MIN_LOOKUPS` (2,048):
+        // 64 sampled rows (128 lookups) + 960 tail rows (1,920 lookups) = 2,048 distinct
+        // base-literal lookups, followed by non-base rows. Without sample accounting only
+        // 1,920 lookups would be recorded and the next mask would stay on Floors.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Lt);
+
+            let mut warm = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                warm.push_row(&[ids[i % 16], ids[(i + 5) % 16]]);
+            }
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("warm mask applies");
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            let mut boundary = Table::new(vec![x, y]);
+            for i in 0..1_024usize {
+                boundary.push_row(&[ids[16 + 2 * i], ids[16 + 2 * i + 1]]);
+            }
+            for _ in 1_024..STRING_ORDER_ROWS {
+                boundary.push_row(&[non_base_a, non_base_b]);
+            }
+            let mask = string_order_mask(&ctx, &boundary, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("boundary mask applies");
+            let generic = evaluate_mask(&ctx, &boundary, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic);
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("next mask applies");
+            assert_eq!(
+                ctx.floor_cache().bypassed(),
+                1,
+                "64 sampled rows + 960 tail rows must reach 2,048 lookups and trigger bypass"
+            );
+            assert!(ctx.check().is_ok());
+        }
+
+        // (b) Sample hits count toward the 1/8 hit-rate threshold:
+        // 64 cached sampled rows (128 hits / 128 lookups) + 72 cached tail rows (144 hits) +
+        // 952 distinct uncached tail rows (1,904 misses) = 272 hits / 2,176 lookups (12.5%).
+        // Without sample hits, 144 / 2,048 (7.0%) would wrongly trigger bypass.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Lt);
+
+            let mut warm = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                warm.push_row(&[ids[i % 16], ids[(i + 5) % 16]]);
+            }
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("warm mask applies");
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            let mut boundary = Table::new(vec![x, y]);
+            // 64 sampled rows + 72 tail rows hitting the 16 cached ids.
+            for i in 0..(STRING_ORDER_SAMPLE + 72) {
+                boundary.push_row(&[ids[i % 16], ids[(i + 3) % 16]]);
+            }
+            // 952 distinct uncached tail rows (1,904 misses).
+            for i in 0..952usize {
+                boundary.push_row(&[ids[16 + 2 * i], ids[16 + 2 * i + 1]]);
+            }
+            for _ in (STRING_ORDER_SAMPLE + 1_024)..STRING_ORDER_ROWS {
+                boundary.push_row(&[non_base_a, non_base_b]);
+            }
+            let mask = string_order_mask(&ctx, &boundary, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("boundary mask applies");
+            let generic = evaluate_mask(&ctx, &boundary, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic);
+
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("next mask applies");
+            assert_eq!(
+                ctx.floor_cache().bypassed(),
+                0,
+                "sample hits must keep 272 / 2,176 (12.5%) at or above the cutoff on Floors"
+            );
+            assert!(ctx.check().is_ok());
+        }
+    }
+
+    /// When both floor-table growth (1,024 -> 8,192 slots) and low-hit bypass are pending,
+    /// sample decoding can enlarge the cursor decode envelope and shrink remaining room
+    /// below the half-room growth threshold. Sample validation must compare keys directly
+    /// so a later sampled block-start literal with an oversized predecessor does not poison
+    /// a mask that commits `Direct`, while still growing and counting the sample when room
+    /// stays above the threshold.
+    #[test]
+    fn pending_growth_and_bypass_sample_crossing_half_room_switches_to_direct() {
+        use super::super::ctx::FLOOR_TABLE_FEWEST;
+        use super::super::expr::CmpOp;
+        use crate::builder::{BuildOptions, VocabCodec};
+        use oxrdf::Literal;
+
+        let mut nt = String::new();
+        // IDs 0..=14: 15 short simple literals sorting before "m".
+        let mut a_terms = Vec::with_capacity(15);
+        for i in 0..15usize {
+            let term: oxrdf::Term = Literal::new_simple_literal(format!("a{i:02}")).into();
+            nt.push_str(&format!("<urn:s> <urn:p> {term} .\n"));
+            a_terms.push(term);
+        }
+        // ID 15: a 1 MiB extension of "m" (`"mxxx...\xFF"` sorts immediately before `"m\xFF"`).
+        let huge_term: oxrdf::Term =
+            Literal::new_simple_literal(format!("m{}", "x".repeat(1 << 20))).into();
+        nt.push_str(&format!("<urn:s> <urn:p> {huge_term} .\n"));
+        // ID 16: short simple literal "m" at block start (`16 % FC_BLOCK == 0`).
+        let m_term: oxrdf::Term = Literal::new_simple_literal("m").into();
+        nt.push_str(&format!("<urn:s> <urn:p> {m_term} .\n"));
+        // 64 short simple literals sorting after "m" so Batch 1 marks >= 64 read-again slots
+        // in the 1,024-slot table (well above the 1,024 / 32 = 32 eviction threshold).
+        let mut n_terms = Vec::with_capacity(64);
+        for i in 0..64usize {
+            let term: oxrdf::Term = Literal::new_simple_literal(format!("n{i:02}")).into();
+            nt.push_str(&format!("<urn:s> <urn:p> {term} .\n"));
+            n_terms.push(term);
+        }
+        // An uncached 1 KiB simple literal with no extension.
+        let medium_term: oxrdf::Term =
+            Literal::new_simple_literal(format!("y{}", "q".repeat(1023))).into();
+        nt.push_str(&format!("<urn:s> <urn:p> {medium_term} .\n"));
+        // Cheap distinct simple literals sorting after "y..." to drive low-hit evictions.
+        let distinct_count = 3 * STRING_ORDER_ROWS;
+        for i in 0..distinct_count {
+            nt.push_str(&format!("<urn:s> <urn:p> \"z{i:06}\" .\n"));
+        }
+
+        let s = Store::in_memory(StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Front),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.generation.vocab_codec(), VocabCodec::Front);
+        let a_ids: Vec<Id> = a_terms
+            .iter()
+            .map(|t| snap.lookup_term(t).unwrap())
+            .collect();
+        let huge_id = snap.lookup_term(&huge_term).unwrap();
+        let m_id = snap.lookup_term(&m_term).unwrap();
+        let n_ids: Vec<Id> = n_terms
+            .iter()
+            .map(|t| snap.lookup_term(t).unwrap())
+            .collect();
+        let medium_id = snap.lookup_term(&medium_term).unwrap();
+        assert_eq!(huge_id.payload(), 15);
+        assert_eq!(m_id.payload(), 16);
+        assert!((m_id.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+        let z_ids: Vec<Id> = (0..distinct_count)
+            .map(|i| {
+                snap.lookup_term(&Literal::new_simple_literal(format!("z{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        drop(snap);
+
+        // Sanity check: computing `m`'s floor under a 4 MiB cursor budget fails because
+        // decoding its 1 MiB predecessor at ID 15 exceeds the decoding envelope.
+        {
+            let mut probe_ctx = Ctx::new(s.snapshot());
+            probe_ctx.mem_limit = 4 << 20;
+            probe_ctx.enable_cursor_accounting().unwrap();
+            assert_eq!(probe_ctx.string_floor(m_id), None);
+            assert!(
+                matches!(
+                    probe_ctx.check(),
+                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                ),
+                "computing m's floor must fail when decoding ID 15 under 4 MiB cursor budget"
+            );
+        }
+
+        // Run in a single-thread pool so `decode_workers()` stays deterministic across hosts
+        // and the 1 KiB sample literal always enlarges the decode envelope past the 128 KiB
+        // (2 * 64 KiB step) growth threshold.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            // (a) Sample decoding enlarges the decode envelope across the half-room threshold,
+            // so table growth (1,024 -> 8,192) is declined and the mask must commit `Direct`
+            // without decoding `m`'s 1 MiB predecessor.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 4 << 20;
+                ctx.enable_cursor_accounting().unwrap();
+                ctx.floor_cache().set_first_slots(FLOOR_TABLE_FEWEST);
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let e = cmp(x, y, CmpOp::Gt);
+
+                // Batch 1: install a 1,024-slot table and mark 64 distinct slots as read-again.
+                let mut warm = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    warm.push_row(&[n_ids[i % n_ids.len()], n_ids[(i + 7) % n_ids.len()]]);
+                }
+                string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("warm mask applies");
+                assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+                assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+                // Batch 2: 2 * STRING_ORDER_ROWS distinct cheap literals wrap the 1,024-slot
+                // table multiple times, evicting all 64 read-again slots (>= 32 growth threshold)
+                // while producing 0% hits across 8,192 lookups (>= 2,048 bypass threshold).
+                let mut low_hit = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    low_hit.push_row(&[z_ids[2 * i], z_ids[2 * i + 1]]);
+                }
+                string_order_mask(&ctx, &low_hit, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("low-hit mask applies");
+                assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+                assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+                // Leave 132 KiB of room: next reservation step for 8,192 slots is 64 KiB,
+                // which initially fits `room / 2` (66 KiB).
+                let initial_room = 132 << 10;
+                let _hold = ctx.charge(ctx.memory_room() - initial_room).unwrap();
+                assert_eq!(ctx.memory_room(), initial_room);
+
+                // Batch 3: row 0 decodes the uncached 1 KiB literal, shrinking remaining room
+                // below 128 KiB; subsequent sampled pairs compare `m_id` (1 MiB predecessor).
+                let mut transition = Table::new(vec![x, y]);
+                transition.push_row(&[medium_id, a_ids[0]]);
+                for i in 1..STRING_ORDER_ROWS {
+                    let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+                    transition.push_row(&[m_id, rhs]);
+                }
+                let mask = string_order_mask(&ctx, &transition, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("transition mask applies on Direct");
+                let generic =
+                    evaluate_mask(&ctx, &transition, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic);
+                assert!(
+                    ctx.memory_room() < (128 << 10),
+                    "sample decode must shrink room below 2 * 64 KiB step: room={}",
+                    ctx.memory_room()
+                );
+                assert_eq!(
+                    ctx.floor_cache().slots(),
+                    FLOOR_TABLE_FEWEST,
+                    "growth to 8,192 slots must be declined once room drops below 128 KiB"
+                );
+                assert_eq!(
+                    ctx.floor_cache().bypassed(),
+                    1,
+                    "mask must transition cleanly to Direct without sticky memory failure"
+                );
+                assert!(ctx.check().is_ok());
+            }
+
+            // (b) When room stays above the half-room threshold, growth (1,024 -> 8,192) still
+            // commits `Floors` and the 64 sampled rows count toward the grown table's feedback.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 4 << 20;
+                ctx.enable_cursor_accounting().unwrap();
+                ctx.floor_cache().set_first_slots(FLOOR_TABLE_FEWEST);
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let e = cmp(x, y, CmpOp::Gt);
+
+                let mut warm = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    warm.push_row(&[n_ids[i % n_ids.len()], n_ids[(i + 7) % n_ids.len()]]);
+                }
+                string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("warm mask applies");
+
+                let mut low_hit = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    low_hit.push_row(&[z_ids[2 * i], z_ids[2 * i + 1]]);
+                }
+                string_order_mask(&ctx, &low_hit, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("low-hit mask applies");
+
+                // Hold 132 KiB of room; cheap short literals do not enlarge the envelope, so
+                // `begin_floor_mask` grows to 8,192 slots. Put 1,024 distinct base-literal rows
+                // (64 sampled + 960 tail = 2,048 lookups) followed by non-base rows so bypass on
+                // the next mask proves the 64 sampled rows were counted on the grown table.
+                let initial_room = 132 << 10;
+                let _hold = ctx.charge(ctx.memory_room() - initial_room).unwrap();
+                let non_base_a = Id::from_i64(1).unwrap();
+                let non_base_b = Id::from_i64(2).unwrap();
+                let mut grown = Table::new(vec![x, y]);
+                for i in 0..1_024usize {
+                    let base = 2 * STRING_ORDER_ROWS + 2 * i;
+                    grown.push_row(&[z_ids[base], z_ids[base + 1]]);
+                }
+                for _ in 1_024..STRING_ORDER_ROWS {
+                    grown.push_row(&[non_base_a, non_base_b]);
+                }
+                let mask = string_order_mask(&ctx, &grown, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("grown mask applies on Floors");
+                let generic = evaluate_mask(&ctx, &grown, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic);
+                assert_eq!(
+                    ctx.floor_cache().slots(),
+                    FLOOR_TABLE_FEWEST * 8,
+                    "table must grow to 8,192 slots when room stays sufficient"
+                );
+                assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+                // The next mask must enter Direct, proving all 64 sampled rows counted toward
+                // the 2,048-lookup threshold on the newly grown 8,192-slot table.
+                string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("next mask applies");
+                assert_eq!(
+                    ctx.floor_cache().bypassed(),
+                    1,
+                    "64 sampled rows + 960 tail rows on grown table must reach 2,048 lookups"
+                );
+                assert!(ctx.check().is_ok());
+            }
+
+            // (c) When room stays at 132 KiB after direct sample validation, a sampled
+            // block-start literal whose 1 MiB predecessor cannot fit even before growth
+            // must be refused non-stickily during the floor trial so growth is skipped
+            // and the mask finishes cleanly on Direct across all eager parts (including
+            // the 4th-part boundary at 65,792) and across later periodic probe masks
+            // (both when the refused literal appears in the probe's sample and when it
+            // appears only in the probe's tail).
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 4 << 20;
+                ctx.enable_cursor_accounting().unwrap();
+                ctx.floor_cache().set_first_slots(FLOOR_TABLE_FEWEST);
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let e = cmp(x, y, CmpOp::Gt);
+
+                let ref_ctx = Ctx::new(s.snapshot());
+                let (rx, ry) = (ref_ctx.var("x"), ref_ctx.var("y"));
+                assert_eq!((rx, ry), (x, y));
+                let ref_e = cmp(rx, ry, CmpOp::Gt);
+
+                let mut warm = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    warm.push_row(&[n_ids[i % n_ids.len()], n_ids[(i + 7) % n_ids.len()]]);
+                }
+                string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("warm mask applies");
+
+                let mut low_hit = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    low_hit.push_row(&[z_ids[2 * i], z_ids[2 * i + 1]]);
+                }
+                string_order_mask(&ctx, &low_hit, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("low-hit mask applies");
+
+                let initial_room = 132 << 10;
+                let _hold = ctx.charge(ctx.memory_room() - initial_room).unwrap();
+                assert_eq!(ctx.memory_room(), initial_room);
+
+                // Cross the 4th-part boundary (`64 -> 16,448 -> 32,896 -> 65,792 -> 65,793`)
+                // so a chunked loop that exited bypass on part 4 would retry `m_id` via
+                // the sticky floor path.
+                let mut transition = Table::new(vec![x, y]);
+                for i in 0..65_793usize {
+                    let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+                    transition.push_row(&[m_id, rhs]);
+                }
+                let mask = string_order_mask(&ctx, &transition, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("transition mask applies on Direct after refused floor trial");
+                let generic =
+                    evaluate_mask(&ref_ctx, &transition, std::slice::from_ref(&ref_e), None)
+                        .unwrap();
+                assert_eq!(mask, generic);
+                assert_eq!(
+                    ctx.floor_cache().slots(),
+                    FLOOR_TABLE_FEWEST,
+                    "growth to 8,192 slots must be skipped when sample floor trial refuses"
+                );
+                assert_eq!(
+                    ctx.floor_cache().bypassed(),
+                    1,
+                    "refused floor trial must keep Direct for every part without sticky failure"
+                );
+                assert!(ctx.check().is_ok());
+
+                // Advance through the remaining bypassed masks (`bypass_streak` 1 -> 2 -> 3)
+                // to reach the periodic probe boundary (`FLOOR_BYPASS_PROBE_INTERVAL == 4`).
+                let mut short_transition = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+                    short_transition.push_row(&[m_id, rhs]);
+                }
+                let short_generic = evaluate_mask(
+                    &ref_ctx,
+                    &short_transition,
+                    std::slice::from_ref(&ref_e),
+                    None,
+                )
+                .unwrap();
+                for expected_bypassed in [2usize, 3] {
+                    let mask = string_order_mask(&ctx, &short_transition, (x, y), CmpOp::Gt, &e)
+                        .unwrap()
+                        .expect("bypassed mask applies on Direct");
+                    assert_eq!(mask, short_generic);
+                    assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+                    assert_eq!(ctx.floor_cache().bypassed(), expected_bypassed);
+                    assert!(ctx.check().is_ok());
+                }
+
+                // Periodic probe 1: `m_id` appears in the probe's sample (and across 4 parts).
+                // The probe must decline the floor-only refusal non-stickily and stay Direct.
+                let probe_sample_mask = string_order_mask(&ctx, &transition, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("periodic probe with refused sample floor must succeed on Direct");
+                assert_eq!(probe_sample_mask, generic);
+                assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+                assert_eq!(
+                    ctx.floor_cache().bypassed(),
+                    4,
+                    "refused periodic probe must reset bypass streak and stay Direct"
+                );
+                assert!(ctx.check().is_ok());
+
+                // Advance `bypass_streak` 1 -> 2 -> 3 to reach a second periodic probe.
+                for expected_bypassed in [5usize, 6] {
+                    let mask = string_order_mask(&ctx, &short_transition, (x, y), CmpOp::Gt, &e)
+                        .unwrap()
+                        .expect("bypassed mask applies on Direct");
+                    assert_eq!(mask, short_generic);
+                    assert_eq!(ctx.floor_cache().bypassed(), expected_bypassed);
+                    assert!(ctx.check().is_ok());
+                }
+
+                // Periodic probe 2: sample rows are cheap literals so the probe enters Floors,
+                // while tail rows contain `m_id`. FloorMap must decline the floor-only refusal
+                // non-stickily and fall back to direct comparison per row.
+                let mut probe_tail = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    let lhs = if i < STRING_ORDER_SAMPLE {
+                        a_ids[i % a_ids.len()]
+                    } else {
+                        m_id
+                    };
+                    let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+                    probe_tail.push_row(&[lhs, rhs]);
+                }
+                let probe_tail_mask = string_order_mask(&ctx, &probe_tail, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("periodic probe entering Floors with refused tail floor must succeed");
+                let probe_tail_generic =
+                    evaluate_mask(&ref_ctx, &probe_tail, std::slice::from_ref(&ref_e), None)
+                        .unwrap();
+                assert_eq!(probe_tail_mask, probe_tail_generic);
+                assert_eq!(
+                    ctx.floor_cache().bypassed(),
+                    6,
+                    "periodic probe with cheap sample enters Floors and falls back per refused row"
+                );
+                assert!(ctx.check().is_ok());
+            }
+        });
+    }
+
+    /// When both floor-table growth (1,024 -> 8,192 slots) and low-hit bypass are pending,
+    /// direct sample validation does not decode a block-start operand's predecessor. Before
+    /// spending 64 KiB on optional table growth, the mask must account for the sample's
+    /// floor decode: if a 6 KiB predecessor fits in the 132 KiB pre-growth room but would
+    /// exceed the 68 KiB left after growth, reserving it first makes growth ineligible so
+    /// the mask enters `Direct` and succeeds without a sticky memory failure.
+    #[test]
+    fn pending_growth_and_bypass_accounts_for_sampled_floor_before_growth() {
+        use super::super::ctx::FLOOR_TABLE_FEWEST;
+        use super::super::expr::CmpOp;
+        use crate::builder::{BuildOptions, VocabCodec};
+        use oxrdf::Literal;
+
+        let mut nt = String::new();
+        // IDs 0..=14: 15 short simple literals sorting before "l..." and "m".
+        let mut a_terms = Vec::with_capacity(15);
+        for i in 0..15usize {
+            let term: oxrdf::Term = Literal::new_simple_literal(format!("a{i:02}")).into();
+            nt.push_str(&format!("<urn:s> <urn:p> {term} .\n"));
+            a_terms.push(term);
+        }
+        // ID 15: a 6 KiB simple literal starting with "l", immediately preceding block-start
+        // "m" at ID 16 without extending it.
+        let pred_term: oxrdf::Term =
+            Literal::new_simple_literal(format!("l{}", "x".repeat(6143))).into();
+        nt.push_str(&format!("<urn:s> <urn:p> {pred_term} .\n"));
+        // ID 16: short simple literal "m" at block start (`16 % FC_BLOCK == 0`).
+        let m_term: oxrdf::Term = Literal::new_simple_literal("m").into();
+        nt.push_str(&format!("<urn:s> <urn:p> {m_term} .\n"));
+        // 64 short simple literals sorting after "m" to mark >= 64 read-again slots.
+        let mut n_terms = Vec::with_capacity(64);
+        for i in 0..64usize {
+            let term: oxrdf::Term = Literal::new_simple_literal(format!("n{i:02}")).into();
+            nt.push_str(&format!("<urn:s> <urn:p> {term} .\n"));
+            n_terms.push(term);
+        }
+        // Cheap distinct simple literals sorting after "n..." to drive low-hit evictions.
+        let distinct_count = 3 * STRING_ORDER_ROWS;
+        for i in 0..distinct_count {
+            nt.push_str(&format!("<urn:s> <urn:p> \"z{i:06}\" .\n"));
+        }
+
+        let s = Store::in_memory(StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Front),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.generation.vocab_codec(), VocabCodec::Front);
+        let a_ids: Vec<Id> = a_terms
+            .iter()
+            .map(|t| snap.lookup_term(t).unwrap())
+            .collect();
+        let pred_id = snap.lookup_term(&pred_term).unwrap();
+        let m_id = snap.lookup_term(&m_term).unwrap();
+        let n_ids: Vec<Id> = n_terms
+            .iter()
+            .map(|t| snap.lookup_term(t).unwrap())
+            .collect();
+        assert_eq!(pred_id.payload(), 15);
+        assert_eq!(m_id.payload(), 16);
+        assert!((m_id.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+        let z_ids: Vec<Id> = (0..distinct_count)
+            .map(|i| {
+                snap.lookup_term(&Literal::new_simple_literal(format!("z{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        drop(snap);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let initial_room = 132 << 10;
+            let growth_step = 64 << 10;
+
+            // Sanity check 1: ID 16's 6 KiB predecessor fits within 132 KiB pre-growth room
+            // (under the two-worker allowance) and leaves less than 128 KiB remaining.
+            {
+                let mut probe = Ctx::new(s.snapshot());
+                probe.mem_limit = 4 << 20;
+                probe.enable_cursor_accounting().unwrap();
+                let _hold = probe.charge(probe.memory_room() - initial_room).unwrap();
+                assert_eq!(probe.string_floor(m_id), Some(m_id.payload()));
+                assert!(probe.check().is_ok());
+                assert!(
+                    probe.memory_room() < (2 * growth_step),
+                    "decoding 6 KiB predecessor must leave room below 2 * 64 KiB growth threshold: room={}",
+                    probe.memory_room()
+                );
+            }
+
+            // Sanity check 2: after spending 64 KiB on table growth (68 KiB left), decoding
+            // ID 16's 6 KiB predecessor exceeds the remaining room.
+            {
+                let mut probe = Ctx::new(s.snapshot());
+                probe.mem_limit = 4 << 20;
+                probe.enable_cursor_accounting().unwrap();
+                let _hold = probe
+                    .charge(probe.memory_room() - (initial_room - growth_step))
+                    .unwrap();
+                assert_eq!(probe.string_floor(m_id), None);
+                assert!(
+                    matches!(
+                        probe.check(),
+                        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                    ),
+                    "decoding 6 KiB predecessor must exceed the 68 KiB left after 64 KiB growth"
+                );
+            }
+
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 4 << 20;
+            ctx.enable_cursor_accounting().unwrap();
+            ctx.floor_cache().set_first_slots(FLOOR_TABLE_FEWEST);
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Gt);
+
+            // Batch 1: install a 1,024-slot table and mark 64 distinct slots as read-again.
+            let mut warm = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                warm.push_row(&[n_ids[i % n_ids.len()], n_ids[(i + 7) % n_ids.len()]]);
+            }
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+                .unwrap()
+                .expect("warm mask applies");
+            assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            // Batch 2: drive >= 32 read-again evictions and 0% hit rate over 8,192 lookups.
+            let mut low_hit = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                low_hit.push_row(&[z_ids[2 * i], z_ids[2 * i + 1]]);
+            }
+            string_order_mask(&ctx, &low_hit, (x, y), CmpOp::Gt, &e)
+                .unwrap()
+                .expect("low-hit mask applies");
+            assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            // Leave 132 KiB of room (64 KiB growth step <= 66 KiB half-room).
+            let _hold = ctx.charge(ctx.memory_room() - initial_room).unwrap();
+            assert_eq!(ctx.memory_room(), initial_room);
+
+            // Batch 3: compare short block-start "m" with short literals from row 0 (no 1 KiB
+            // operand). Direct validation fits in the existing short-key envelope, so the mask
+            // must account for "m"'s floor decode before spending 64 KiB on optional growth.
+            let mut transition = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+                transition.push_row(&[m_id, rhs]);
+            }
+            let mask = string_order_mask(&ctx, &transition, (x, y), CmpOp::Gt, &e)
+                .unwrap()
+                .expect("transition mask must succeed on Direct without sticky memory failure");
+            let generic =
+                evaluate_mask(&ctx, &transition, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic);
+            assert_eq!(
+                ctx.floor_cache().slots(),
+                FLOOR_TABLE_FEWEST,
+                "reserving 6 KiB predecessor before growth must make 64 KiB growth ineligible"
+            );
+            assert_eq!(
+                ctx.floor_cache().bypassed(),
+                1,
+                "mask must enter Direct cleanly without sticky memory failure"
+            );
+            assert!(ctx.check().is_ok());
+        });
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn cursor_big_numeric_sort_keys_are_admitted_as_they_are_evaluated() {
+    use super::expr::ArithOp;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.mem_limit = 360 * 1024;
+    let var = ctx.var("v");
+    let ctx = std::sync::Arc::new(ctx);
+    ctx.attach_owner();
+
+    let mut table = Table::new(vec![var]);
+    for i in 1..=512 {
+        let id = Id::from_i64(i).unwrap();
+        table.push_row(&[id]);
+        table.push_row(&[id]);
+    }
+    let factor = Id::from_i64(100_000_000_000_000_003).unwrap();
+    let expr = (0..96).fold(Expr::Var(var), |expr, _| {
+        Expr::Arith(Box::new(expr), Box::new(Expr::Const(factor)), ArithOp::Mul)
+    });
+    let mut report = ExprReport::default();
+    let result = key_per_value(&ctx, &table, &expr, &mut report);
+    assert!(matches!(result, Err(Error::BudgetExceeded(_))));
+    // The initial fixed reservation is about 260 KiB. A one-shot payload charge
+    // would fail there, before the ledger had admitted any of the big values.
+    assert!(ctx.mem_peak() >= 310 * 1024, "peak: {}", ctx.mem_peak());
+    assert_eq!(ctx.live_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn cursor_fixed_width_sort_reuses_keys_under_a_tight_budget() {
+    use super::expr::ArithOp;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.mem_limit = 260 * 1024;
+    let var = ctx.var("v");
+    let ctx = std::sync::Arc::new(ctx);
+    ctx.attach_owner();
+
+    let mut table = Table::new(vec![var]);
+    for i in 1..=512 {
+        let id = Id::from_i64(i).unwrap();
+        table.push_row(&[id]);
+        table.push_row(&[id]);
+    }
+    let expr = Expr::Arith(
+        Box::new(Expr::Var(var)),
+        Box::new(Expr::Const(Id::from_i64(1).unwrap())),
+        ArithOp::Add,
+    );
+    let mut report = ExprReport::default();
+    let keys = key_per_value(&ctx, &table, &expr, &mut report)
+        .unwrap()
+        .expect("fixed-width keys fit in the cache");
+    assert_eq!(keys.vals.len(), 512);
+    assert!(matches!(
+        keys.get(1023),
+        Some(Value::Integer(value)) if i64::from(*value) == 513
+    ));
+    drop(keys);
+    assert_eq!(ctx.live_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn cursor_large_sparse_and_uncached_sort_keys_admit_payload_incrementally() {
+    use super::expr::ArithOp;
+
+    for cached in [true, false] {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 5 << 20;
+        let var = ctx.var("v");
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
+
+        let mut table = Table::new(vec![var]);
+        for i in 1..=PAR_THRESHOLD as i64 {
+            let id = Id::from_i64(i * 16).unwrap();
+            table.push_row(&[id]);
+            table.push_row(&[id]);
+        }
+        let factor = Value::from_typed(&"9".repeat(1700), oxrdf::vocab::xsd::INTEGER.as_str());
+        let expr = Expr::Arith(
+            Box::new(Expr::Var(var)),
+            Box::new(Expr::Lit(Id::UNDEF, factor)),
+            ArithOp::Mul,
+        );
+        let mut report = ExprReport::default();
+        let err = if cached {
+            key_per_value(&ctx, &table, &expr, &mut report).err()
+        } else {
+            key_column_charged(&ctx, &table, &expr, None).err()
+        };
+        assert!(
+            matches!(err, Some(Error::BudgetExceeded(_))),
+            "cached {cached}"
+        );
+        assert!(
+            ctx.mem_peak() >= 4 << 20,
+            "cached {cached}, peak {}",
+            ctx.mem_peak()
+        );
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_full_sort_fits_without_a_second_key_column() {
+    use super::expr::ArithOp;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.opt.expr_cache = false;
+    let var = ctx.var("v");
+    let rows = 2 * PAR_THRESHOLD;
+    let mut table = Table::new(vec![var]);
+    for i in (1..=rows as i64).rev() {
+        table.push_row(&[Id::from_i64(i).unwrap()]);
+    }
+    let factor = Value::from_typed(&"9".repeat(1700), oxrdf::vocab::xsd::INTEGER.as_str());
+    let expr = Expr::Arith(
+        Box::new(Expr::Var(var)),
+        Box::new(Expr::Lit(Id::UNDEF, factor)),
+        ArithOp::Mul,
+    );
+    let payload = with_key_evaluator(&ctx, &table, &expr, None, |eval| {
+        (0..rows).try_fold(0, |bytes, i| Ok(bytes + key_payload(&eval(i)?)))
+    })
+    .unwrap();
+    let slots = (rows * size_of::<Option<Value>>()) as u64;
+    assert!(payload > slots);
+    let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+    let evaluator = ctx.nvars() as u64 * 16 + 128;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    // The complete sort has room for only half the old scratch column's slots.
+    ctx.mem_limit = sort + slots + 128 + evaluator + payload + slots / 2;
+    let ctx = ctx.into_shared();
+    let sorted = pool
+        .install(|| {
+            order_by_rows(
+                &ctx,
+                table.clone(),
+                &[(expr.clone(), true)],
+                None,
+                &mut ExprReport::default(),
+            )
+        })
+        .unwrap();
+    assert!(
+        sorted.cols[0]
+            .iter()
+            .map(|id| id.as_i64())
+            .eq(1..=rows as i64)
+    );
+    assert_eq!(ctx.live_bytes(), 0);
+
+    // The column alone has room for the keys and piece metadata. The workers
+    // must hand off when the transient allowance occupies the remaining room.
+    let mut tight = Ctx::new(store.snapshot());
+    assert_eq!(tight.var("v"), var);
+    tight.mem_limit = slots + 128 + evaluator + payload + 4 * 128;
+    let tight = tight.into_shared();
+    let keys = pool
+        .install(|| key_column_charged(&tight, &table, &expr, None))
+        .unwrap();
+    with_key_evaluator(&ctx, &table, &expr, None, |eval| {
+        for i in 0..rows {
+            assert_eq!(
+                order_cmp(keys.get(i).as_ref(), eval(i)?.as_ref()),
+                Ordering::Equal
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    drop(keys);
+    assert_eq!(tight.live_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_full_sort_hands_off_wide_string_keys() {
+    use super::expr::Func;
+    use spargebra::algebra::Function;
+
+    let (ctx, table) = parallel_full_sort_fixture(2 * PAR_THRESHOLD);
+    let var = table.vars[0];
+    let expr = Expr::Call(
+        Func::Builtin(Function::Concat),
+        vec![
+            Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(var)]),
+            Expr::Lit(Id::UNDEF, Value::Str("#".repeat(4096).into())),
+        ],
+    );
+    // The final column fits with room for the old piece metadata, but a
+    // worker that runs out of room cannot stash its string in the transient.
+    let mut expected: Vec<_> = (1..=table.len() as i64).collect();
+    expected.sort_by_cached_key(i64::to_string);
+    assert_parallel_full_sort_at_budget(ctx, table, expr, 4 * 128, expected);
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_full_sort_releases_piece_metadata_before_finishing_keys() {
+    use super::expr::{ArithOp, CmpOp};
+
+    let (ctx, table) = parallel_full_sort_fixture(2 * PAR_THRESHOLD);
+    let var = table.vars[0];
+    let wide_rows = 32;
+    let factor = Value::from_typed(&"9".repeat(1700), oxrdf::vocab::xsd::INTEGER.as_str());
+    let expr = Expr::If(
+        Box::new(Expr::Cmp(
+            Box::new(Expr::Var(var)),
+            Box::new(Expr::Const(Id::from_i64(wide_rows).unwrap())),
+            CmpOp::Le,
+        )),
+        Box::new(Expr::Arith(
+            Box::new(Expr::Var(var)),
+            Box::new(Expr::Lit(Id::UNDEF, factor)),
+            ArithOp::Mul,
+        )),
+        Box::new(Expr::Var(var)),
+    );
+    // The sparse wide keys leave room to start the parallel evaluation, but
+    // finishing the suffix needs every byte remaining after the handoff.
+    let expected = (wide_rows + 1..=table.len() as i64).chain(1..=wide_rows);
+    assert_parallel_full_sort_at_budget(ctx, table, expr, 0, expected);
+}
+
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn parallel_full_sort_preserves_wide_geometry_keys_geof() {
+    assert_full_sort_with_wide_geometry_key(format!("{}asWKT", crate::geo::vocab::GEOF), vec![]);
+}
+
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn parallel_full_sort_preserves_wide_geometry_keys_spatialf() {
+    let dt = crate::geo::WKT_LITERAL;
+    assert_full_sort_with_wide_geometry_key(
+        format!("{}transformDatatype", crate::geo::vocab::SPATIALF),
+        vec![Expr::Lit(Id::UNDEF, Value::Iri(dt.into()))],
+    );
+}
+
+#[cfg(all(test, feature = "geo"))]
+fn assert_full_sort_with_wide_geometry_key(iri: String, extra_args: Vec<Expr>) {
+    use super::expr::Func;
+    use crate::geo::{WKT_LITERAL, memo::GeoMemo};
+    use spargebra::algebra::Function;
+
+    const KEY_LEN: i64 = 20_000;
+    let coordinates: Vec<_> = ["0 0", "1 1"].into_iter().cycle().take(6000).collect();
+    let wkt = format!("LINESTRING({})", coordinates.join(", "));
+    let geometry = crate::geo::parse(&wkt, WKT_LITERAL).unwrap();
+    let geometry_bytes = crate::geo::to_wkt(&geometry).len() as u64 + 64;
+    let key_bytes = KEY_LEN as u64 + 64;
+    assert!(geometry_bytes > key_bytes);
+    let literal =
+        oxrdf::Literal::new_typed_literal(wkt, oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL));
+
+    for threads in [1, 4] {
+        let (mut ctx, table) = parallel_full_sort_fixture(2 * PAR_THRESHOLD);
+        ctx.geo = GeoMemo::with_budget(0);
+        let var = table.vars[0];
+        let unbound = ctx.var("unbound");
+        let geometry_id = ctx.intern_term(&oxrdf::Term::Literal(literal.clone()));
+        assert_ne!(geometry_id, Id::UNDEF);
+        let mut args = vec![Expr::Lit(geometry_id, Value::from_literal(&literal))];
+        args.extend(extra_args.iter().cloned());
+        let first = table.cols[0][0];
+        let key = Expr::If(
+            Box::new(Expr::SameTerm(
+                Box::new(Expr::Var(var)),
+                Box::new(Expr::Const(first)),
+            )),
+            Box::new(Expr::Call(
+                Func::Builtin(Function::SubStr),
+                vec![
+                    Expr::Call(
+                        Func::Builtin(Function::Str),
+                        vec![Expr::Call(Func::Ext(iri.clone()), args)],
+                    ),
+                    Expr::Const(Id::from_i64(1).unwrap()),
+                    Expr::Const(Id::from_i64(KEY_LEN).unwrap()),
+                ],
+            )),
+            Box::new(Expr::Var(unbound)),
+        );
+        let rows = table.len();
+        let slots = (rows * size_of::<Option<Value>>()) as u64 + 128;
+        let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+        let evaluator = ctx.nvars() as u64 * 16 + 128;
+        let setup = ctx.live_bytes();
+        // One serialization and one retained key fit together. Four workers'
+        // scratch fits under the key's allowance, but leaves too little room
+        // to keep the evaluated key in the column.
+        ctx.mem_limit = setup + sort + evaluator + slots + geometry_bytes + key_bytes;
+        let ctx = ctx.into_shared();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let sorted = pool
+            .install(|| {
+                order_by_rows(
+                    &ctx,
+                    table,
+                    &[(key, true)],
+                    None,
+                    &mut ExprReport::default(),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            sorted.cols[0].last().copied(),
+            Some(first),
+            "{threads} threads"
+        );
+        assert!(
+            sorted.cols[0][..rows - 1]
+                .iter()
+                .map(|id| id.as_i64())
+                .eq((1..rows as i64).rev()),
+            "{threads} threads"
+        );
+        assert_eq!(
+            ctx.live_bytes(),
+            setup + geometry_bytes,
+            "{threads} threads"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn parallel_full_sort_keeps_credit_for_later_geometry_keys() {
+    use super::expr::Func;
+    use crate::geo::{WKT_LITERAL, memo::GeoMemo};
+    use spargebra::algebra::Function;
+
+    const ROWS: usize = 8 * PAR_THRESHOLD;
+    const KEY_LEN: i64 = 20_000;
+    for threads in [1, 4] {
+        let (mut ctx, table) = parallel_full_sort_fixture(ROWS);
+        ctx.geo = GeoMemo::with_budget(0);
+        let var = table.vars[0];
+        let unbound = ctx.var("unbound");
+        let wkt_key = |points| {
+            let coordinates: Vec<_> = ["0 0", "1 1"].into_iter().cycle().take(points).collect();
+            let wkt = format!("LINESTRING({})", coordinates.join(", "));
+            let geometry = crate::geo::parse(&wkt, WKT_LITERAL).unwrap();
+            let bytes = crate::geo::to_wkt(&geometry).len() as u64 + 64;
+            let literal = oxrdf::Literal::new_typed_literal(
+                wkt,
+                oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL),
+            );
+            let id = ctx.intern_term(&oxrdf::Term::Literal(literal.clone()));
+            assert_ne!(id, Id::UNDEF);
+            let as_wkt = Expr::Call(
+                Func::Ext(format!("{}asWKT", crate::geo::vocab::GEOF)),
+                vec![Expr::Lit(id, Value::from_literal(&literal))],
+            );
+            (
+                Expr::Call(Func::Builtin(Function::Str), vec![as_wkt]),
+                bytes,
+            )
+        };
+        let (first_wkt, first_bytes) = wkt_key(6000);
+        let (second_wkt, second_bytes) = wkt_key(12000);
+        let first = table.cols[0][0];
+        let second = table.cols[0][1];
+        let is_row = |id| {
+            Box::new(Expr::SameTerm(
+                Box::new(Expr::Var(var)),
+                Box::new(Expr::Const(id)),
+            ))
+        };
+        let key = Expr::If(
+            is_row(first),
+            Box::new(Expr::Call(
+                Func::Builtin(Function::SubStr),
+                vec![
+                    first_wkt,
+                    Expr::Const(Id::from_i64(1).unwrap()),
+                    Expr::Const(Id::from_i64(KEY_LEN).unwrap()),
+                ],
+            )),
+            Box::new(Expr::If(
+                is_row(second),
+                Box::new(Expr::Call(
+                    Func::Builtin(Function::StrLen),
+                    vec![second_wkt],
+                )),
+                Box::new(Expr::Var(unbound)),
+            )),
+        );
+        let slots = (ROWS * size_of::<Option<Value>>()) as u64 + 128;
+        let sort = ROWS as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+        let evaluator = ctx.nvars() as u64 * 16 + 128;
+        let setup = ctx.live_bytes();
+        let geometry_bytes = first_bytes + second_bytes;
+        let key_bytes = KEY_LEN as u64 + 64;
+        // The first key can reserve a growth step, but its unused credit
+        // would leave too little for the second WKT serialization.
+        let headroom = 4 * (128 + super::bignum::AGG_SUM_PAYLOAD_BYTES);
+        ctx.mem_limit = setup + sort + evaluator + slots + geometry_bytes + key_bytes + headroom;
+        assert!(ctx.reservation_step() > headroom);
+        assert!(ctx.reservation_step() <= headroom + second_bytes);
+        let ctx = ctx.into_shared();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let sorted = pool
+            .install(|| {
+                order_by_rows(
+                    &ctx,
+                    table,
+                    &[(key, true)],
+                    None,
+                    &mut ExprReport::default(),
+                )
+            })
+            .unwrap();
+        let (unbound_rows, bound_rows) = sorted.cols[0].split_at(ROWS - 2);
+        assert_eq!(bound_rows, &[first, second], "{threads} threads");
+        assert!(
+            unbound_rows
+                .iter()
+                .map(|id| id.as_i64())
+                .eq((1..=ROWS as i64 - 2).rev()),
+            "{threads} threads"
+        );
+        assert_eq!(
+            ctx.live_bytes(),
+            setup + geometry_bytes,
+            "{threads} threads"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "geo")]
+#[test]
+fn full_sort_releases_serial_key_slack_before_geometry_column() {
+    use super::expr::Func;
+    use crate::geo::{WKT_LITERAL, memo::GeoMemo};
+    use spargebra::algebra::Function;
+
+    let wkt = format!("LINESTRING({}0 0)", "0 0, 1 1, ".repeat(7000));
+    let geometry = crate::geo::parse(&wkt, WKT_LITERAL).unwrap();
+    let geometry_bytes = crate::geo::to_wkt(&geometry).len() as u64 + 64;
+    let literal =
+        oxrdf::Literal::new_typed_literal(wkt, oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL));
+    let text = Value::Str("x".repeat(20_000).into());
+    let key_bytes = key_payload(&Some(text.clone()));
+    for (rows, threads) in [
+        (PAR_THRESHOLD, 1),
+        (PAR_THRESHOLD, 4),
+        (8 * PAR_THRESHOLD, 1),
+    ] {
+        let (mut ctx, table) = parallel_full_sort_fixture(rows);
+        ctx.geo = GeoMemo::with_budget(0);
+        let var = table.vars[0];
+        let unbound = ctx.var("unbound");
+        let id = ctx.intern_term(&oxrdf::Term::Literal(literal.clone()));
+        let [first, second, ..] = table.cols[0][..] else {
+            unreachable!("the fixture has at least two rows");
+        };
+        let key_for = |row, value| {
+            Expr::If(
+                Box::new(Expr::SameTerm(
+                    Box::new(Expr::Var(var)),
+                    Box::new(Expr::Const(row)),
+                )),
+                Box::new(value),
+                Box::new(Expr::Var(unbound)),
+            )
+        };
+        let as_wkt = Expr::Call(
+            Func::Ext(format!("{}asWKT", crate::geo::vocab::GEOF)),
+            vec![Expr::Lit(id, Value::from_literal(&literal))],
+        );
+        let length = Expr::Call(
+            Func::Builtin(Function::StrLen),
+            vec![Expr::Call(Func::Builtin(Function::Str), vec![as_wkt])],
+        );
+        let keys = [
+            (key_for(first, Expr::Lit(Id::UNDEF, text.clone())), true),
+            (key_for(second, length), true),
+        ];
+        let slots = (rows * size_of::<Option<Value>>()) as u64 + 128;
+        let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 2 * 128 + 1024;
+        let evaluator = ctx.nvars() as u64 * 16 + 128;
+        let setup = ctx.live_bytes();
+        ctx.mem_limit = setup + sort + evaluator + 2 * slots + key_bytes + geometry_bytes;
+        assert!(ctx.reservation_step() < geometry_bytes);
+        let ctx = ctx.into_shared();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let sorted = pool
+            .install(|| order_by_rows(&ctx, table, &keys, None, &mut ExprReport::default()))
+            .unwrap();
+        let (unbound_rows, bound_rows) = sorted.cols[0].split_at(rows - 2);
+        assert_eq!(
+            bound_rows,
+            &[second, first],
+            "{rows} rows, {threads} threads"
+        );
+        assert!(
+            unbound_rows
+                .iter()
+                .map(|id| id.as_i64())
+                .eq((1..=rows as i64 - 2).rev()),
+            "{rows} rows, {threads} threads"
+        );
+        assert_eq!(ctx.live_bytes(), setup + geometry_bytes);
+    }
+}
+
+#[cfg(test)]
+fn parallel_full_sort_fixture(rows: usize) -> (Ctx, Table) {
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.opt.expr_cache = false;
+    let var = ctx.var("v");
+    let mut table = Table::new(vec![var]);
+    for i in (1..=rows as i64).rev() {
+        table.push_row(&[Id::from_i64(i).unwrap()]);
+    }
+    (ctx, table)
+}
+
+#[cfg(test)]
+fn assert_parallel_full_sort_at_budget(
+    mut ctx: Ctx,
+    table: Table,
+    expr: Expr,
+    headroom: u64,
+    expected: impl IntoIterator<Item = i64>,
+) {
+    let rows = table.len();
+    let payload = with_key_evaluator(&ctx, &table, &expr, None, |eval| {
+        (0..rows).try_fold(0, |bytes, i| Ok(bytes + key_payload(&eval(i)?)))
+    })
+    .unwrap();
+    let slots = (rows * size_of::<Option<Value>>()) as u64;
+    let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+    let evaluator = ctx.nvars() as u64 * 16 + 128;
+    ctx.mem_limit = sort + slots + 128 + evaluator + payload + headroom;
+    let ctx = ctx.into_shared();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let sorted = pool
+        .install(|| {
+            order_by_rows(
+                &ctx,
+                table,
+                &[(expr, true)],
+                None,
+                &mut ExprReport::default(),
+            )
+        })
+        .unwrap();
+    assert!(sorted.cols[0].iter().map(|id| id.as_i64()).eq(expected));
+    assert_eq!(ctx.live_bytes(), 0);
 }
 
 #[cfg(test)]

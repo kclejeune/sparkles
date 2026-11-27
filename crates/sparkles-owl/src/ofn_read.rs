@@ -186,6 +186,14 @@ fn line_start(text: &str, at: usize) -> Option<usize> {
     None
 }
 
+/// Error returned by [`parse_axiom_bounded`] when parsing fails or resolved term bytes
+/// exceed the caller's budget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundedParseError {
+    Parse { error: ParseError, used: usize },
+    Budget { used: usize, attempted: usize },
+}
+
 /// Read one axiom, such as `SubClassOf(ex:A ex:B)`, with `prefixes` and the predefined
 /// ones (a prefix of `prefixes` wins over a predefined one of the same name).
 pub fn parse_axiom(text: &str, prefixes: &[(String, String)]) -> Result<Axiom, ParseError> {
@@ -193,6 +201,33 @@ pub fn parse_axiom(text: &str, prefixes: &[(String, String)]) -> Result<Axiom, P
     let ax = r.axiom()?;
     r.end("axiom")?;
     Ok(ax)
+}
+
+/// Read one axiom while charging every resolved IRI and prefixed-name expansion before
+/// allocating its owned string, returning `(axiom, resolved_bytes)` on success.
+pub fn parse_axiom_bounded(
+    text: &str,
+    prefixes: &[(String, String)],
+    max_bytes: usize,
+) -> Result<(Axiom, usize), BoundedParseError> {
+    let mut r = Reader::one(text, prefixes);
+    r.byte_budget = Some(max_bytes);
+    match r.axiom().and_then(|ax| r.end("axiom").map(|()| ax)) {
+        Ok(ax) => Ok((ax, r.bytes_used)),
+        Err(error) => {
+            if r.budget_exceeded {
+                Err(BoundedParseError::Budget {
+                    used: r.bytes_used,
+                    attempted: r.bytes_attempted,
+                })
+            } else {
+                Err(BoundedParseError::Parse {
+                    error,
+                    used: r.bytes_used,
+                })
+            }
+        }
+    }
 }
 
 /// Read one class expression, such as `ObjectSomeValuesFrom(ex:p ex:A)`, with
@@ -208,24 +243,26 @@ pub fn parse_class_expression(
 }
 
 impl<'a> Reader<'a> {
-    /// A reader of one value of `text` with `prefixes` and the predefined ones.
-    fn one(text: &'a str, prefixes: &[(String, String)]) -> Reader<'a> {
+    /// A reader of one value of `text` with `prefixes` and the predefined ones, borrowing
+    /// `prefixes` directly without cloning the map.
+    fn one(text: &'a str, prefixes: &'a [(String, String)]) -> Reader<'a> {
         Reader {
             text,
             pos: 0,
             peeked: None,
             last: 0,
-            names: crate::ofn::STANDARD_PREFIXES
-                .iter()
-                .map(|(p, n)| (p.to_string(), n.to_string()))
-                .chain(prefixes.iter().cloned())
-                .collect(),
+            borrowed_names: prefixes,
+            names: Vec::new(),
             prefixes: Vec::new(),
             header: Header::default(),
             depth: 0,
             done: false,
             options: Options::default(),
             rules: 0,
+            byte_budget: None,
+            bytes_used: 0,
+            bytes_attempted: 0,
+            budget_exceeded: false,
         }
     }
 
@@ -292,7 +329,9 @@ pub struct Reader<'a> {
     peeked: Option<(Tok<'a>, usize)>,
     /// the start of the last token taken
     last: usize,
-    /// every prefix that resolves, the predefined ones first
+    /// caller-supplied or parent-chunk prefixes borrowed without cloning
+    borrowed_names: &'a [(String, String)],
+    /// document-declared prefixes that take precedence over `borrowed_names` and standard ones
     names: Vec<(String, String)>,
     prefixes: Vec<(String, String)>,
     header: Header,
@@ -301,6 +340,11 @@ pub struct Reader<'a> {
     options: Options,
     /// the SWRL rules passed over
     rules: usize,
+    /// optional cumulative byte budget for resolved IRIs during single-axiom parsing
+    byte_budget: Option<usize>,
+    bytes_used: usize,
+    bytes_attempted: usize,
+    budget_exceeded: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -312,16 +356,18 @@ impl<'a> Reader<'a> {
             pos: 0,
             peeked: None,
             last: 0,
-            names: crate::ofn::STANDARD_PREFIXES
-                .iter()
-                .map(|(p, n)| (p.to_string(), n.to_string()))
-                .collect(),
+            borrowed_names: &[],
+            names: Vec::new(),
             prefixes: Vec::new(),
             header: Header::default(),
             depth: 0,
             done: false,
             options: Options::default(),
             rules: 0,
+            byte_budget: None,
+            bytes_used: 0,
+            bytes_attempted: 0,
+            budget_exceeded: false,
         };
         r.preamble()?;
         Ok(r)
@@ -342,13 +388,18 @@ impl<'a> Reader<'a> {
             pos: start,
             peeked: None,
             last: start,
-            names: self.names.clone(),
+            borrowed_names: &self.names,
+            names: Vec::new(),
             prefixes: Vec::new(),
             header: Header::default(),
             depth: 0,
             done: false,
             options: self.options,
             rules: 0,
+            byte_budget: None,
+            bytes_used: 0,
+            bytes_attempted: 0,
+            budget_exceeded: false,
         };
         let mut out = Vec::new();
         if last {
@@ -605,19 +656,52 @@ impl<'a> Reader<'a> {
 
     // ---- IRIs
 
-    fn full_iri(&self, s: &str) -> Result<Iri, ParseError> {
+    fn lookup_prefix(&self, prefix: &str) -> Option<&str> {
+        if let Some((_, ns)) = self.names.iter().rev().find(|(p, _)| p == prefix) {
+            return Some(ns.as_str());
+        }
+        if let Some((_, ns)) = self.borrowed_names.iter().rev().find(|(p, _)| p == prefix) {
+            return Some(ns.as_str());
+        }
+        crate::ofn::STANDARD_PREFIXES
+            .iter()
+            .rev()
+            .find(|(p, _)| *p == prefix)
+            .map(|(_, ns)| *ns)
+    }
+
+    fn charge_bytes(&mut self, bytes: usize) -> Result<(), ParseError> {
+        if let Some(limit) = self.byte_budget {
+            let next = self.bytes_used.saturating_add(bytes);
+            if next > limit {
+                self.budget_exceeded = true;
+                self.bytes_attempted = next;
+                return Err(self.error(format!(
+                    "resolved term bytes exceeded the {limit} byte budget"
+                )));
+            }
+            self.bytes_used = next;
+        }
+        Ok(())
+    }
+
+    fn full_iri(&mut self, s: &str) -> Result<Iri, ParseError> {
+        self.charge_bytes(s.len())?;
         parse_iri(s).map_err(|e| self.error(e.0))
     }
 
     /// The IRI of a prefixed name.
-    fn expand(&self, name: &str) -> Result<Iri, ParseError> {
+    fn expand(&mut self, name: &str) -> Result<Iri, ParseError> {
         let Some((prefix, local)) = name.split_once(':') else {
             return Err(self.error(format!("expected an IRI, found the keyword '{name}'")));
         };
-        let Some((_, ns)) = self.names.iter().rev().find(|(p, _)| p == prefix) else {
+        let Some(ns_len) = self.lookup_prefix(prefix).map(str::len) else {
             return Err(self.error(format!("the prefix '{prefix}:' is not declared")));
         };
-        let mut s = String::with_capacity(ns.len() + local.len());
+        let est_len = ns_len.saturating_add(local.len());
+        self.charge_bytes(est_len)?;
+        let ns = self.lookup_prefix(prefix).expect("checked");
+        let mut s = String::with_capacity(est_len);
         s.push_str(ns);
         // the escapes of a local name (PN_LOCAL_ESC) stand for the character
         let mut chars = local.chars();
@@ -788,6 +872,14 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    fn individual_multiset(&mut self) -> Result<Multiset<Individual>, ParseError> {
+        let mut out = Vec::new();
+        while !self.at_close()? {
+            out.push(self.individual()?);
+        }
+        Ok(out.into())
+    }
+
     fn ope(&mut self) -> Result<ObjectPropertyExpression, ParseError> {
         if self.at_keyword("ObjectInverseOf")? {
             self.take()?;
@@ -809,6 +901,14 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    fn ope_multiset(&mut self) -> Result<Multiset<ObjectPropertyExpression>, ParseError> {
+        let mut out = Vec::new();
+        while !self.at_close()? {
+            out.push(self.ope()?);
+        }
+        Ok(out.into())
+    }
+
     fn data_property(&mut self) -> Result<DataProperty, ParseError> {
         Ok(DataProperty(self.iri()?))
     }
@@ -819,6 +919,14 @@ impl<'a> Reader<'a> {
             out.insert(self.data_property()?);
         }
         Ok(out)
+    }
+
+    fn data_property_multiset(&mut self) -> Result<Multiset<DataProperty>, ParseError> {
+        let mut out = Vec::new();
+        while !self.at_close()? {
+            out.push(self.data_property()?);
+        }
+        Ok(out.into())
     }
 
     fn annotation_property(&mut self) -> Result<AnnotationProperty, ParseError> {
@@ -991,6 +1099,14 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    fn class_expression_multiset(&mut self) -> Result<Multiset<ClassExpression>, ParseError> {
+        let mut out = Vec::new();
+        while !self.at_close()? {
+            out.push(self.class_expression()?);
+        }
+        Ok(out.into())
+    }
+
     // ---- annotations and axioms
 
     fn annotation(&mut self) -> Result<Annotation, ParseError> {
@@ -1063,10 +1179,10 @@ impl<'a> Reader<'a> {
                 K::SubClassOf(a, self.class_expression()?)
             }
             "EquivalentClasses" => K::EquivalentClasses(self.class_expressions()?),
-            "DisjointClasses" => K::DisjointClasses(self.class_expressions()?),
+            "DisjointClasses" => K::DisjointClasses(self.class_expression_multiset()?),
             "DisjointUnion" => {
                 let c = Class(self.iri()?);
-                K::DisjointUnion(c, self.class_expressions()?)
+                K::DisjointUnion(c, self.class_expression_multiset()?)
             }
             "SubObjectPropertyOf" => {
                 let sub = if self.at_keyword("ObjectPropertyChain")? {
@@ -1084,7 +1200,7 @@ impl<'a> Reader<'a> {
                 K::SubObjectPropertyOf(sub, self.ope()?)
             }
             "EquivalentObjectProperties" => K::EquivalentObjectProperties(self.opes()?),
-            "DisjointObjectProperties" => K::DisjointObjectProperties(self.opes()?),
+            "DisjointObjectProperties" => K::DisjointObjectProperties(self.ope_multiset()?),
             "InverseObjectProperties" => {
                 let a = self.ope()?;
                 K::InverseObjectProperties(a, self.ope()?)
@@ -1109,7 +1225,7 @@ impl<'a> Reader<'a> {
                 K::SubDataPropertyOf(a, self.data_property()?)
             }
             "EquivalentDataProperties" => K::EquivalentDataProperties(self.data_properties()?),
-            "DisjointDataProperties" => K::DisjointDataProperties(self.data_properties()?),
+            "DisjointDataProperties" => K::DisjointDataProperties(self.data_property_multiset()?),
             "DataPropertyDomain" => {
                 let p = self.data_property()?;
                 K::DataPropertyDomain(p, self.class_expression()?)
@@ -1134,7 +1250,7 @@ impl<'a> Reader<'a> {
                 K::HasKey(c, ops, dps)
             }
             "SameIndividual" => K::SameIndividual(self.individuals()?),
-            "DifferentIndividuals" => K::DifferentIndividuals(self.individuals()?),
+            "DifferentIndividuals" => K::DifferentIndividuals(self.individual_multiset()?),
             "ClassAssertion" => {
                 let c = self.class_expression()?;
                 K::ClassAssertion(c, self.individual()?)

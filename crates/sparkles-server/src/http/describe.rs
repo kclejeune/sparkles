@@ -9,7 +9,7 @@ use super::*;
 use sparkles::sparql::describe::{DescribeMode, DescribeOptions};
 
 /// Response header: the DESCRIBE result stopped at its `maxTriples` limit.
-pub(super) const SPARKLES_DESCRIBE_TRUNCATED: &str = "sparkles-describe-truncated";
+pub(crate) const SPARKLES_DESCRIBE_TRUNCATED: &str = "sparkles-describe-truncated";
 
 /// The setting as `GET /$/describe/{ds}` reports it.
 pub(crate) fn status_json(ds: &Dataset) -> J {
@@ -69,11 +69,45 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
     )
 }
 
+/// Validate `describe`, `describe-labels`, `describe-reifiers`, `describe-max-triples`
+/// and `describe-max-depth` syntax without consulting a dataset, so callers get the same
+/// `400` regardless of whether a target resource exists or is readable.
+pub(crate) fn validate_params(params: &Params) -> ApiResult<()> {
+    let bad = |e: sparkles::Error| err(StatusCode::BAD_REQUEST, e.to_string());
+    let mut o = DescribeOptions::default();
+    if let Some(m) = params.get("describe") {
+        o.mode = DescribeMode::parse(m).map_err(bad)?;
+    }
+    for (param, key) in [
+        ("describe-labels", "labels"),
+        ("describe-reifiers", "reifiers"),
+    ] {
+        if let Some(v) = params.get(param) {
+            o.set(key, v).map_err(bad)?;
+        }
+    }
+    for (param, key) in [
+        ("describe-max-triples", "maxTriples"),
+        ("describe-max-depth", "maxDepth"),
+    ] {
+        if let Some(v) = params.get(param) {
+            if v.trim().parse::<u64>().ok().is_none_or(|n| n == 0) {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    format!("{param} must be a positive whole number"),
+                ));
+            }
+            o.set(key, v).map_err(bad)?;
+        }
+    }
+    Ok(())
+}
+
 /// The DESCRIBE options of a query request: the dataset's setting, with the request's
 /// `describe` (a mode), `describe-labels`, `describe-reifiers`, `describe-max-triples`
 /// and `describe-max-depth` over it. The limits of a request can only lower the
 /// dataset's. A malformed value is a `400`.
-pub(super) fn request_options(ds: &Dataset, params: &Params) -> ApiResult<DescribeOptions> {
+pub(crate) fn request_options(ds: &Dataset, params: &Params) -> ApiResult<DescribeOptions> {
     let mut o = ds.dataset.settings().describe().get();
     let bad = |e: sparkles::Error| err(StatusCode::BAD_REQUEST, e.to_string());
     if let Some(m) = params.get("describe") {

@@ -83,18 +83,95 @@ it to Horn ontologies without individuals, as [the Horn rules](#the-horn-rules)
 describe, and to ALCHI ontologies without individuals that need case analysis, as
 [the disjunctive rules](#the-disjunctive-rules) describe. The export of inferred axioms and the removal of redundant ones are delivered
 as the ROBOT-compatible commands of items 634, 635 and 637, and the existential
-superclasses as `materialize`, item 636. The other phases remain under
-[item 457](../../ROADMAP.md).
+superclasses as `materialize`, item 636. The other phases remain under [item 457](../../ROADMAP.md).
+
+Item 719 adds partial-classification controls and display to the Ontology Workbench. Both the explicit inferred-tree run and the class frame accept a partial-answer toggle, a microsecond-precision bounded deadline in seconds sent as the `timeout` query parameter (blank omits the override and uses the server default) and the `cautious` or `eager` expansion strategy on `POST /$/ontology/{ds}/classify`. When a partial answer returns, the Workbench displays the partial status with its tier, open-class count and any excluded-axiom or unmapped-triple gaps, marks classes in the `incomplete` set as open in the inferred class tree (including accessible row names) and marks the selected class from `entity.incomplete` or `frame.incomplete` in the class frame, while rendering `unknown` consistency distinctly from `consistent` and `inconsistent` verdicts. Partial tree responses keep only their first page with a single-page partial truncation notice distinct from the 50,000-node browser cap, and open-class list sample caps are reported on both partial and finished incomplete runs. Both the explicit tree and the class frame reject unrequested partial answers, and the class frame also rejects any partial projection that advertises shared retention.
 
 Integer, decimal and rational literals use exact arbitrary-precision canonical values,
 including values beyond 128 bits. Construction and copied storage obey the classifier's
 resource controls, and large values share immutable storage until their last owner
 releases it. XML namespace conformance is checked without canonicalizing XML values.
-Canonical XML values, ill-typed literal semantics, datatypes outside the supported map
-and chains through the top object property remain in item 663. Item 692 runs the Horn
+On the default classification path, two-link OWL 2 EL property chains ending in
+`owl:topObjectProperty` now derive their named-domain consequences when the ontology
+stays within OWL 2 EL without datatype-checker components, under a 4,096-row bound, the
+classifier's memory budget and shared-world teardown refund ordering under pooled paid
+admission. Explicit EL-only mode (`Limits::el_only`, `ClassifyRequest::el_only` and
+`--reasoner ELK`) and rooted runs are unchanged, and the chain axioms remain reported as
+used in part. General composition through the top object property, canonical XML values,
+ill-typed literal semantics and datatypes outside the supported map remain in item 663.
+Item 692 runs the Horn
 rules on ontologies with individuals, functional data properties and top properties, as
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
 shared hierarchical budget remains in item 675.
+
+Item 694 exposes EL-only (ELK) classification across the Rust API, HTTP routes, CLI and
+Python, Node.js and JVM bindings and keys the dataset's kept classification cache by
+`el_only`. `POST /$/ontology/{ds}/classify`,
+`GET /$/ontology/{ds}/classification`, `POST /$/ontology/{ds}/dl-query` and
+`sparkles::handles::ontology::wire::call` accept `elOnly`, `sparkles ontology classify`
+(both standalone and chained) accepts `--el-only`, Python's `Dataset.ontology.classify`,
+`kept_classification` and `dl_query` accept `el_only`, Node.js's `dataset.ontology.classify`,
+`keptClassification` and `dlQuery` accept `elOnly`, and JVM's `ClassifyQuery`,
+`KeptClassificationQuery` and `DlQuery` expose `elOnly`. DL queries with `elOnly` run the
+EL classifier in EL-only mode against the dataset's EL-only kept saturation, report
+`reasoning.elOnly`, and refuse `reasoning=rl` or query expressions outside OWL 2 EL.
+`KeptCache` stores default (`el_only = false`) and EL-only (`el_only = true`) entries in
+separate slots so neither mode clobbers or mis-serves the other across classifications,
+incremental updates, kept reads and DL queries, while evicting the other slot if combined
+retained bytes exceed the one-gigabyte retention cap.
+
+Item 867 enables at-least restrictions above one beside individuals in the Horn rules,
+using Kazakov's Lemma 2 unfolding into fresh, pairwise disjoint subclasses of the filler
+up to `MAX_AT_LEAST`. For Horn ontologies with individuals, nominals, at-most-one
+restrictions, keys, top properties and OWL 2 EL data axioms, the unfolding preserves
+satisfiability and all named-class subsumptions, including named-class unsatisfiability,
+by a direct-power argument over `I^κ` in which every tuple whose coordinates all satisfy
+`≥n r.C` in `I` has at least `2^κ` distinct successors to colour with the fresh classes.
+When a non-Horn finite data range enters through the datatype checker, the Horn saturation
+stays sound because the checker emits only valid Horn implications and reports unresolved
+data covers as used in part. All 50 `horn-sroiq` fixtures in the `dl603` suite now
+classify whole alongside the 50 `horn-shiq` fixtures with exact HermiT 1.4.5.519 taxonomy
+parity, together with new hand fixtures covering satisfiable and unsatisfiable
+restrictions, nominals, functionality, at-most restrictions, inverses, subproperties,
+keys, self restrictions, anonymous individuals, EL datatypes, `DifferentIndividuals`,
+asymmetric roles, non-Horn data covers and incremental updates.
+
+Item 972 is the second phase of [the datatype checker](#the-datatype-checker). A data
+property whose component has a universal restriction, a cardinality, an enumeration of
+several values, a facet, a union, a complement, a datatype outside OWL 2 EL or a
+`DisjointDataProperties` axiom has its restrictions, ranges, assertions and functional
+axioms taken as the checker's atoms, and the Horn tier decides them in each context by
+the theory rule, as [the EL and Horn tiers](#the-datatype-checker) paragraph describes.
+An ontology whose data stays within OWL 2 EL builds no atoms and runs the EL lattice as
+before. A value outside an `xsd:int` range, two values of a functional `xsd:double`
+property and a string in an `xsd:boolean` range now make an ontology inconsistent, as
+they do under HermiT. Three other answers change. In a run with a checker component, a
+`DatatypeDefinition` outside OWL 2 EL that the checker converts and a
+`DisjointDataProperties` axiom over checker properties are used and no longer reported as
+left out. A cover found in a context that the run finds unsatisfiable, or in a world whose
+class has no instance, is not reported. `Stats::tier` reads `Disjunctive` for a run whose
+only axioms outside the Horn rules are data unions, enumerations of several values,
+complements on the left or higher data cardinalities, which the Horn tier now decides. A
+cover over the values of a property that gives different classes and a key over a checker
+property are reported as used in part, while a universal or maximum data restriction on
+the left is reported as left out. Item 768 takes them in Tier D and the rooted run.
+On 26 of the wiring tests' ontologies HermiT 1.4.5
+gives 37 of the 38 answers that the tests pin, and it derives the subsumption whose cover
+a world reports as used in part. The other answer is a
+`NegativeDataPropertyAssertion` of `"3"^^xsd:integer` beside the assertion of
+`"3"^^xsd:int`, which HermiT finds consistent, while it finds the same negation written as
+a class assertion of a complement inconsistent, as the shared numeric value space of
+OWL 2 requires. Across the 222 non-held-out census files whose default run previously left
+out data axioms, phase 2 keeps every file on the same tier, leaves more axioms out on none
+and takes 43,014 more axioms across 195 files. Twenty of those files now leave no axiom
+out and report nothing as used in part, one file reports a cover over three axioms as used
+in part, and nine files move from consistent to inconsistent, all nine confirmed
+inconsistent by HermiT 1.4.5. On the thirteen Kepler16b OML probes, the functional
+`xsd:double` probe and the `xsd:boolean` range probe move from consistent to inconsistent
+as in HermiT, so the classifier now agrees with HermiT on eleven of the thirteen probes
+and misses only the SWRL rule and enumeration probes. Item 1303 records that one object
+axiom needing case analysis sends an otherwise eligible ontology whose data properties
+occur only outside OWL 2 EL to Tier D. Tier D leaves those data axioms out.
 
 Item 1256 changes the invalidation of a run kept by the EL rules. It recomputed what
 every kept context takes from the index and read every subsumer of every context with
@@ -109,9 +186,31 @@ before any context changes, and an unsatisfiable context keeps no map. On `wally
 threads, in alternating runs of 7885a660 against 3afa8c52 that each passed the check against
 a fresh run, the kept index stage of `ore_ont_13482` fell from 423.5 to 347.6 ms and its edit
 from 485.9 to 408.1 ms, 0.68 of a run that starts again, and the edit of `ore_ont_9499` fell
-from 146.6 to 138.6 ms. Items 590 and 664 wait for item 1254, since on `ore_ont_13482`
+from 146.6 to 138.6 ms. Item 590 still waits for item 1254, since on `ore_ont_13482`
 the index build and the checks before it are 0.47 of a run
-that starts again.
+that starts again, while item 664 shipped ahead of item 1254 over the index-comparison path.
+
+Item 664 extends incremental OWL 2 EL classification to edits involving individuals,
+nominals, assertions, keys, context merges, universal roles and conditional worlds. Plain
+EL terminologies without individuals continue to take the bitset invalidation path of
+item 1256, adding only an edit-signature check and an inactive modification-bit guard on
+the shared saturation path. Strictly EL runs that enter Phase 2 record an acyclic
+`real_parent` forest for `real` reachability, pre-broadcast grounded supports for derived
+global universal facts, per-merge causal context and real-reachability dependencies for
+`HasKey` merges and per-world context, expression, key, named-individual and
+datatype-checker dependencies for cached conditional worlds. Incremental invalidation
+compares the old and new indexes, propagates through backward existential edges, nominal
+members, real-context nominal merges, the `real_parent` forest and `HasKey` dependencies,
+re-seeds kept contexts that retain an alternative real predecessor and reuses unaffected
+cached conditional worlds while replaying sticky datatype-checker rows. A kept run
+restarts cleanly when a previously broadcast global universal fact loses all grounded
+supports, drops optional tracking to a fresh next run when a tight memory budget or
+shared pool refuses the dependency tables, and uses `Interner::met_individuals` to filter
+removed individuals out of live nominals and `Saturation::describe`. Targeted and
+randomized differential tests in `crates/sparkles-owl/tests/el_incremental_individuals.rs`,
+`tests/classify.rs` and `tests/incremental_sweep.rs` verify exact taxonomy, consistency
+and `describe` parity against fresh full runs and confirm that unaffected contexts and
+conditional worlds are not recomputed.
 
 Item 804 delivers the sixth phase's rooted run as the option `Limits::rooted`, off by
 default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) and
@@ -140,6 +239,69 @@ in 0.3 to 1 s against 16 ms without the option on a shared laptop. ore_ont_15803
 same in 1.7 s against 0.7 s on four threads, with the same taxonomy as before item 805.
 Item 1061 follows that cost.
 
+Item 1265 closes a crash of the keys that the rewriting declines. When an ontology's only
+individuals were in axioms outside OWL 2 EL, the disjunctive rules took the run, the
+normalization made it rooted, and a key left in the EL part marked the contexts real in
+rules that do not take those marks, so the run panicked. A run of Tier D is now rooted only
+when the EL part has no keys, as the check for individuals in the EL part already required,
+and such a run answers as a run without the option. Each reason the rewriting declines a
+key, its bound, data, the bottom property, a construct without a reduction and the reserved
+prefix, has a regression test. The rooted taxonomies and statistics of 198 fixture and
+generated ontologies, 62 of them with keys, are unchanged. A rooted run that completed
+before gives the same answers, except that some such runs now take axioms they used to
+leave out. In one case a retained key and an individual only in a key outside OWL 2 EL
+gave a rooted run with an empty root, which left out a minimum cardinality. The run is no
+longer rooted, takes the cardinality and derives the subsumption that the run without the
+option derives, which a regression test checks.
+
+Item 1304 keeps the disjointness of members that the rewriting merges. Two members such
+as `∃top.A` and `≥1 top.A`, or `owl:Thing` and `≥0 top.X`, have one image, and the set of
+images held one member, which the normaliser drops, so a rooted run lost the disjointness
+and could answer a class satisfiable or an inconsistent ontology consistent while it
+reported itself complete. The members are equivalent, so their disjointness makes the
+image empty. The rewriting now adds `D ⊑ ⊥` for each image `D` of more than one member,
+keeps the disjointness of the distinct images when two or more remain, and keeps the union
+of a `DisjointUnion` over the set of images. Intersections, unions and equivalences keep
+the set of images, since a repeated member does not change their meaning. A rewritten
+axiom can equal an axiom that the ontology states unchanged or the rewriting of another
+axiom, so the report of the axioms left out now names every original axiom that a left-out
+rewritten axiom stands for, and names each original once for each kind of gap.
+
+Item 1314 preserves repeated operands in disjointness and inequality axioms at parsing and
+model construction. `DisjointClasses`, `DisjointUnion`, `DisjointObjectProperties`,
+`DisjointDataProperties` and `DifferentIndividuals` now store their operands in a sorted
+`Multiset<T>` instead of a `BTreeSet<T>`, so structural equality, ordering, hashing and
+serialized output remain order-independent while duplicate occurrences are kept across the
+functional-style, RDF and JSON codecs, Manchester's four binary disjointness and inequality
+forms and public constructors. Manchester continues to render `None` for `DisjointUnion`
+and n-ary forms longer than two and carries no axiom annotation round-trip. Equivalences,
+unions, intersections, `SameIndividual` and `HasKey` keep `BTreeSet` deduplication.
+Classification forces repeated class operands empty in `DisjointClasses` and
+`DisjointUnion`, marks repeated properties empty in `DisjointObjectProperties` and
+`DisjointDataProperties`, and derives inconsistency for repeated individuals in
+`DifferentIndividuals` with rooted rules off and on, subject to each tier's existing role
+and datatype restrictions such as top and bottom data properties in the datatype checker
+and counting for `DisjointObjectProperties` in Tier D. `dl::clauses`, Horn normalization,
+Tier D normalization and `dl_reduce` reduce repeated class operands to emptiness
+constraints beside surviving distinct members so Horn ontologies do not escalate to Tier D,
+property disjointness emits each self-pair once over distinct roles under the run's memory
+and cancellation limits, retained-axiom estimates include repeated operand storage, and
+round-tripping, annotations and original-axiom diagnostics preserve the original operands.
+Item 1313 keeps eligible item-805 rewritten results when the rewriting turns every non-Horn
+axiom into Horn or OWL 2 EL axioms, such as a one-image `DisjointUnion` or two complemented
+disjointness members that merge to one image. Previously `Saturation::run` required Tier D to
+have taken the rewritten ontology and discarded the lower-tier answer, reporting the original
+axiom outside the supported fragment. The run now keeps the rewritten result whenever the
+rewritten ontology has no remaining disjunctive axioms and leaves out no axiom generated by
+the rewriting, restores any unchanged exclusions, computes the original axioms' outside-EL
+counts, chain range checks and tier from the original ontology, and keeps every internal
+fresh class and the hub individual out of the taxonomy, descriptions and reports. When Tier D
+does not take the rewritten ontology, runs that remain disjunctive or leave out a rewritten
+axiom, such as under a non-regular role hierarchy, a `DisjointUnion` over a
+non-simple self role or an at-least restriction above the Horn bound of 64, still start again on
+the original axioms. Direct parser regressions in `tests/dl_nominals.rs` cover each kept,
+chain-range statistics and rejected case without injecting unrelated disjunctions.
+
 Item 822 adds a fifth departure, [the constant of a restriction into a
 singleton](#item-822s-departure-the-constant-of-a-restriction-into-a-singleton), and item
 1070 makes the context of `owl:Thing` a query context. With both, 48 of the 50 `shoi`
@@ -156,6 +318,15 @@ default paths. All agree with
 HermiT but g2-150, whose answer holds one subsumption that HermiT 1.4.5 does not report,
 since HermiT does not apply a key over the universal property. HermiT derives that subsumption once the key's property is a named one with the
 same values. The gap of `owl:Thing` that item 805 found is closed.
+
+Item 1086 closes the taxonomy and class-description gap when a run places a class in the
+top node without also recording every class above it as a subsumer of `owl:Thing`.
+Taxonomy construction now closes the set of top-equivalent classes upward transitively
+over satisfiable subsumers, covering multi-hop chains, equivalence classes in any IRI
+order and paths through hidden internal classes from item 805's rewriting without leaking
+internal names, breaking parent and child links or altering inconsistent ontologies.
+`Saturation::describe` applies the same upward closure so direct descriptions agree with
+the taxonomy.
 
 Item 1220 first turned off the selection of ground body literals in rooted runs and
 narrowed the restriction on ground inferences in Join, since each could make a run that
@@ -186,7 +357,8 @@ fixtures are exact again, and two runs pass the bound that finished before, s2-g
 one thread and on four and a version of shoi-022 with its individuals merged on four
 threads, which are items 1227 and 1228. `SPARKLES_ROOTED_SELECT_GROUND=0`,
 `SPARKLES_ROOTED_SEL_PARTNERS_X=0` and `SPARKLES_ROOTED_JOIN_EXEMPT=0` turn each part off
-for measurement.
+for measurement, and reproducing the original uncut selection-off control after item 1250
+also sets `SPARKLES_ROOTED_GROUND_BODY_CUT=0`.
 
 Item 1229 records a loss of runs that count and of rooted runs. Pred takes each clause
 that a successor sends with the restrictions that reach the successor when it arrives, and
@@ -218,6 +390,193 @@ without counting or without the rooted rules, with the same taxonomy as before a
 bound, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` gives the earlier containment, in
 which a rooted run classifies again without counting or without the rooted rules when such
 a restriction or edge arrives, and `=0` turns both off, for measurement.
+
+Item 1231 records a loss of rooted runs. A fact that holds in a context only under the
+queried class and concerns an individual reached from another individual must reach the
+contexts registered for that individual, and its consequences there must come back to the
+context, and the departures above keep a context's conditional ground literals in that
+context.
+A rooted run therefore looks after its saturation for such a fact that cannot reach a
+registered context, and when it finds one it classifies again without the rooted rules and
+sets `Stats::dl_rooted_declined`. The check exempts four kinds of context without a proof,
+and it withdraws between 2 and 38 complete answers per generated corpus, so it is partial
+containment, and `Limits::rooted_decline` turns it off for measurement.
+
+`Limits::rooted_marker_repair`, off by default, repairs the delivery. A context that holds
+a ground literal as a condition tells the root, which sends the literal as a marker to the
+contexts registered for its individuals that the root reaches, also to a context that
+registers or becomes reachable later. The root returns its clauses whose bodies hold such
+literals to the contexts that hold them. Enabling `Limits::rooted_marker_repair` defaults
+to mode `129` (`MREPAIR_ON | MREPAIR_CF`), in which both return arrival paths exclude any
+holder premise whose body holds a literal mentioning neither `x` nor `y`, namely a constant
+literal or a constant-successor `f_e(u)` literal. On initial return arrival the holder
+records the returned clause under every literal of its body before filtering its candidate
+premises, and on late premise arrival the holder registers itself with the root before
+excluding an ineligible premise from replay. The sends and the returns count against the
+work bound. `SPARKLES_ROOTED_MARKER_REPAIR=1` selects the unfiltered return rule that
+resolves against all live non-marker holder premises on both arrival paths, `=0` turns the
+repair off, and an explicit environment value takes precedence over test overrides and
+`Limits::rooted_marker_repair`. With the diagnostic `SPARKLES_ROOTED_MARKER_DIAG=1`, a run
+reports in `Stats::dl_marker_deficits` the markers and returned products that its quiescent
+contexts still owe; when mode `129` is active, the second deficit measures only the
+eligible filtered return products, while mode `1` measures unfiltered products. In the
+initial unfiltered measurements (`SPARKLES_ROOTED_MARKER_REPAIR=1`) with the check off, the
+two generated corpora built around the loss give 1,168 and 262 runs that differ from HermiT
+without the repair and none with it. Twelve fixtures built for particular orders of arrival
+fail without it and pass with it, although no fixture isolates a returned clause that the
+root subsumes later or a return followed by a late premise that it misses. No run that
+finishes on the other generated corpora, with or without counting and on one and four
+threads, differs from HermiT apart from g2-150. With the repair off, every corpus gives the
+same answers and the same counts of derived conclusions as before, and every finished run
+on the corpora owes no deficit with the repair. Unfiltered repair derives 1.02 to 1.13
+times the conclusions on the larger generated corpora, up to 1.41 times on corpora of small
+files, up to 1.28 times with counting and 1.4 to 1.65 times on the two built around the
+loss, which now derive the missing entailments, so a few runs near the bound pass it and
+give their default answer.
+
+In the original uncut selection-off control (`SPARKLES_ROOTED_SELECT_GROUND=0` and
+`SPARKLES_ROOTED_GROUND_BODY_CUT=0`, the setting of item 1220's earlier measurements),
+unfiltered returns (`SPARKLES_ROOTED_MARKER_REPAIR=1`) derive more. On one purpose-built
+ontology they add 24% to the derived conclusions, and on the generated ontology
+g1-051_p0012 the run passes the work bound at 4 million conclusions and the memory budget
+of 1 GiB at 400 million, against 455,967 conclusions without the repair. Filtering returns
+alone with `SPARKLES_ROOTED_MARKER_REPAIR=129` on that uncut control loses no answer on the
+corpora, takes the purpose-built ontology's cost from 24% to 10.5% and finishes ten runs
+that unfiltered repair takes past the bound, but g1-051_p0012 still passes the bound of 4
+million and finishes only at 63.2 million conclusions under a bound of 400 million. Its
+growth is in Pred over successor terms of constants and in Join, and g1-051_p0121 derives
+1.42 million conclusions against 1.17 million with unfiltered repair alone.
+
+Item 1250 decouples the non-root ground-body cut from full ground-body selection and makes
+mode `129` the default when `Limits::rooted_marker_repair` is enabled. Each stored clause
+in a non-root context carries `Stored::gbody` alongside `Stored::sel`, while root clauses
+keep both flags false. A non-root clause whose body holds a literal mentioning neither `x`
+nor `y` sets `Stored::gbody` whenever either full selection or the decoupled cut is active
+and sets `Stored::sel` only when full selection is active. `Stored::gbody` cuts non-local
+ground Hyper, role-universal inferences with constant or `f_e(u)` fillers, head-side Join,
+and purely constant or `f_e(u)` binary Eq and Factor even when
+`SPARKLES_ROOTED_SELECT_GROUND=0`. Mixed non-local Eq and Factor, including query-form
+`x ≈ u` equalities, remain gated by `Stored::sel`, and Hyper over `x` and `f_e(u)` Pred
+partners remain gated by `Stored::sel` and `SPARKLES_ROOTED_SEL_PARTNERS_X`.
+`SPARKLES_ROOTED_GROUND_BODY_CUT` is on by default and `=0` disables the decoupled cut;
+reproducing the original uncut selection-off control therefore sets
+`SPARKLES_ROOTED_SELECT_GROUND=0`, `SPARKLES_ROOTED_GROUND_BODY_CUT=0` and
+`SPARKLES_ROOTED_SEL_PARTNERS_X=0`, together with `SPARKLES_ROOTED_MARKER_REPAIR=1` for
+unfiltered returns. With the decoupled cut active under `SPARKLES_ROOTED_SELECT_GROUND=0`
+and `SPARKLES_ROOTED_SEL_PARTNERS_X=0`, the full 19-axiom `g1-051_p0012` finishes complete
+within the default 524,288 rooted work bound with zero marker deficits and matches HermiT
+1.4.5's taxonomy (`C1` unsatisfiable and `C0` equivalent to `owl:Thing`) across repair off,
+default filtered mode `129` and unfiltered mode `1`: on one thread cautious with default
+mode `129` it takes 251,217 derived conclusions, 32,307 stored clauses and 10.9 MB peak
+estimated memory, and on four threads eager it takes 336,298 derived conclusions, 41,450
+stored clauses and 12.6 MB peak estimated memory, against 232,622 conclusions (10.2 MB)
+with repair off and 262,033 conclusions (10.9 MB) with mode `1` on one thread cautious. The
+repair's state costs 8 bytes per context with the repair off, which item 1247 removes, and
+a synthetic family whose conditions nest two or more deep grows with the repair's sends,
+which is item 1251. The repair's completeness is not proved, and the check stays on by
+default.
+
+The repair keeps the resource contract of the rest of Tier D, and the contract is
+cooperative. A run charges each conclusion that it derives to the work bound, and several
+of the repair's scans also charge one conclusion for every 16 entries that they read,
+while others do not. The preparation of an inference, such as the premise lists of a rule
+and their pruning, takes time and memory in proportion to the clauses that the context
+already holds and is not charged while it runs. The redundancy test of each derived
+conclusion against the stored clauses is not counted either, here as in the rest of Tier
+D. The run checks the work bound, the memory budget, the deadline and a cancellation at
+cooperative checkpoints, which come after every 256 choices of a product, after every 64
+sends of a loop and whenever a worker adds its counts of applied conclusions to the run's
+totals. Earlier builds added retained index growth to the memory estimate only after
+allocation, buffered rooted initialization into one uncharged `Found` collection per
+constant, and left non-ground product tables uncharged on the default path, so a counting
+allocator measured the heap 6 to 31% above the charged estimate on the three files named
+below and 1.04 GB above the 1 GiB budget on `ore_ont_8480`.
+
+Item 1291 closes those gaps across Tier D. Root initialization streams directly through
+`derive` with pre-admitted literal interning and store growth instead of buffering
+constants times `owl:Thing` in `Found`. `Store` tracks exact incremental owned bytes across
+its clause vector, literal slices, queue, predecessor list and index maps, pre-admitting
+clause construction copies, `maximal_rooted` scratch and reallocation or rehash overlap
+before mutating its containers. `DlSt`, `RootSt`, `MRep` and their index maps and vectors
+are pre-admitted before allocation, `MRep::regs` empties replayed slots in place to stay
+append-only and credits freed vectors after replay, and `Lits::lit_admitted` revalidates
+growth bounds under the interner mutex while keeping caller callbacks outside the lock.
+Committed Tier D growth stays inside the saturation's single memory counter so concurrent
+checks never double-count a transfer, and temporary reservations in root initialization,
+product enumeration and marker-repair handlers are guarded against callback unwinds.
+Non-ground `fold` and ground products pre-admit candidate buffers, retained union payloads,
+table rehashes, step-list growth and `prune` scratch, keep drained buffers charged until
+emitted when switching to streaming at 4,096 unions, and account for live union payloads
+when `slack_covered` pre-reserves table slack on M-return. The discretionary Horn and Tier
+D memory allowance now uses a deterministic `.len()`-based logical input size independent
+of thread count while `Limits::max_memory` and `Limits::charge` continue to observe full
+container capacities, and `Saturation::retained_bytes` includes `DlRun::lits`. Counting-allocator
+regression tests cover store mutations, backward subsumption, refusal without growth,
+concurrent literal and ledger boundaries, non-ground and ground products, marker replay,
+unwind cleanup and multi-chunk thread invariance. Remaining estimation boundaries outside
+item 1291 are the upfront 32-slot `Segs` directory, `Table::push` segment allocations,
+un-admitted `Lits::lit` calls outside root initialization, which remain post-counted in
+`DlRun::bytes`, and premise-list preparation and read metering, which remain in item 1280.
+
+Item 1075 delivers demand-driven binary case splitting over disjunctive constant
+equalities in rooted runs behind the default-off `Limits::rooted_eq_split` switch, as
+[item 1075](#item-1075-binary-splitting-over-disjunctive-equalities-of-constants)
+describes. When enabled on full classifications, branches that reach the probe threshold
+or derive a pure constant-equality disjunction at depth one and below fork into equality
+and disequality children, intersect their terminal leaves' closed subsumptions and public
+instances under one shared work bound and pre-admitted memory ledger, and retain a compact
+`SplitAnswer` for `describe` queries. On `shoi-042` it completes within the 524,288 bound
+across all thread, expansion and step configurations with zero taxonomy differences against
+the checked-in HermiT oracle and exact `describe` instances, and across all 50 `shoi`
+fixtures it completes within the bound with zero taxonomy differences against HermiT.
+Enabling the switch by default waits on benchmark-host qualification under item 823.
+
+A returned clause reserves memory before its products run, both on initial arrival and when a
+late premise replays saved returns. Before item 1291, the product of a clause that
+is not ground charged each union that it kept, as every rule did, but not the table that
+records its unions nor the spare capacity of each step's list. These grow with the number of
+unions a step makes. With the repair's wide products on g1-051_p0012, at a bound of 400
+million conclusions under a budget of 256 MiB, one product's table reached 504,475 unions
+and 51 MB, and the heap reached 286 MB. Initial arrivals therefore reserve a bound on those
+tables before draining their products and release it after them, and each late-replay batch
+reserves the checked sum of its held products and the largest product's table bound before
+draining. The table model runs in 128-bit arithmetic and saturates once at the end, and an
+unrepresentable bound or estimate overflow stops the run cleanly with a memory stop before
+enumeration rather than clamping the reservation or promising a hard allocation ceiling. A
+refused reservation rolls back any debit it added and stops the run as a refused charge does.
+The bound takes one union per choice of the product,
+which can exceed the unions a step keeps by more than a thousand times. That overcount is
+what makes it a bound. Its model of a step's tables, taken at the unions that the step
+actually keeps, is smaller than the growth of the heap past the estimate in the heaviest
+returns without the reservation, 18.7 MB against 23.3 MB under the budget of 256 MiB and
+24.6 MB against 173.6 MB under the default budget. In the initial-arrival measurements on
+those files, the return reservation stopped g1-051_p0012 earlier at a heap of 179 MB under
+256 MiB, caused no refusal on part022 p01, g1-051_p0121 and g1-051_p0012 at 4 million
+conclusions or on g1-051_p0012 with `SPARKLES_ROOTED_MARKER_REPAIR=129` at 400 million, and
+stopped the default-budget run of 1 GiB at a heap of 256 MB against 1.29 GB without the
+reservation, so that run did not finish under its own budget either way. Item 1291 now
+charges those product tables and step lists directly on both default and repair paths, while
+item 1280 replaces the loose upfront bound with a shared meter.
+
+Some steps of the repair and of the rooted rules read between two checks without counting
+what they read. The steps named here are the ones that were measured or reproduced, and
+other preparation falls under the rule above. The premise lists of a returned clause are
+prepared for one return, and for up to 64 returns when a late premise replays them,
+before the next check. On the three files where the returns derive most, part022 p01,
+g1-051_p0121 and g1-051_p0012 under the containment arm with the repair at 1 and at 129,
+a list read at most 548 premises and kept at most 378, one pruning of a list made at most
+38,226 comparisons, and the preparation of a batch of returns allocated at most 143 KB,
+at most 6.4% of the holder's store at the time. The index of a clause that the root
+offers to its holders is built for the whole body before the first check, so that step is
+bounded by one clause's body. With `SPARKLES_ROOTED_MARKER_DIAG=1`, the redundancy test
+of each of the diagnostic's products scans the context's stored clauses without a count.
+The marker pass that the diagnostic and the decline check run after a rooted run
+saturates checks no bound. The decline check runs it on every rooted run with the check
+on, with the repair on or off. When the last step of a wide product passes 4,096 unions,
+the product derives the 4,097 unions that it holds before its next check, also with the
+repair off. Item 1260 follows the stop latency of the marker pass and of the wide
+product, and item 1280 gives the repair and the store's premise lists one meter that
+counts these reads.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
@@ -458,7 +817,8 @@ million conclusions. The Horn rules then take 2.0 to 2.2 times the EL rules' tim
 thread, against 4.2 to 5.6 times before, and item 1025 follows that remainder. The Horn
 normalization also passes over an assertion about an anonymous individual before it
 opens a scope for it, which takes 136 to 251 ms off the index stage of the four files
-whose 243,972 to 457,662 such axioms the reader leaves out. GO, ChEBI lite, the 298 ORE
+whose 243,972 to 457,662 such axioms the reader leaves out. Item 1281 replaced that
+refusal, and those files now classify by the EL rules. GO, ChEBI lite, the 298 ORE
 2015 EL files and the files of the development set keep their taxonomies byte for byte
 on one and eight threads, as the
 [benchmark report](../../benchmarks/el-classification/RESULTS.md#conjunctions-with-an-individual)
@@ -558,11 +918,26 @@ without the reductions, which suggests that the attempt does the same work there
 `ore_ont_8737` takes 1.03 to 1.04 times the base's time on the build with and without
 the reductions, within the range of the base's own rounds. Item 1090 follows both, and
 the [benchmark report](../../benchmarks/el-classification/RESULTS.md#reduced-automata)
-holds every file. The reductions were also tried in the unfolding of the disjunctive
-rules and not kept, as [the experiments page](../../PERFORMANCE-EXPERIMENTS.md#reasoning)
-records. Item 693 keeps the remaining cost of the Horn rules on the two files, which
+holds every file. Item 712 applies the first two reductions in the unfolding of the
+disjunctive rules as well. Item 693 keeps the remaining cost of the Horn rules on the two files, which
 still derive 22.1 and 35.6 million conclusions against 16.5 and 10.8 million for the EL
 rules alone.
+
+Item 712 reduces the automata by which the disjunctive rules unfold their universal and
+negative existential restrictions, with the first two reductions of the Horn rules, as
+[reduced automata of the disjunctive rules](#reduced-automata-of-the-disjunctive-rules)
+describes. On BioTop, ore_ont_12141 of the ORE 2015 DL sample, the 22 unfoldings of its 11
+automata make 62 fresh classes and 77 transition axioms where they made 111 and 357, and
+the attempt's `Stats::dl_work` on one thread falls from 136,117 to 66,200, with 42,242
+stored clauses against 75,182. On `atlas`, twelve rounds in alternating order of one
+binary with `SPARKLES_DL_AUTOMATA` at 0 and at 2 took BioTop's classification from 56.2 to
+31.0 ms on one thread, a median paired ratio of 0.552 with every round between 0.550 and
+0.556, and from 23.7 to 14.3 ms on four threads, 0.599 with rounds from 0.550 to 0.657.
+The run's estimated bytes fall from 21.2 to 12.8 MB. Two other releases of BioTop among
+the final files of the ORE sample, ore_ont_16847 and ore_ont_9024, halve their work in the
+same way. Every taxonomy is equal at both levels on the 205 development files and the 183
+final files that both classify and on the 875 fixtures of items 603, 897 and 712. Item 712 stays open for
+its aim of three times Konclude's speed, which a comparison on one host decides.
 
 The rule for a new universal no longer searches the context's universals for the same
 role and filler. A context derives each universal once, since a role and a filler have
@@ -573,6 +948,22 @@ threads. A corpus sweep of the release builds with and without the search gave t
 results on the 1,010 pairs that both classified. On
 one thread on forge ore_ont_14817 and ore_ont_9663 classify 2.1% and 2.4% faster, and GO
 0.2% to 0.7% slower in each round, a median of 0.6 ms, which item 1234 follows.
+
+Item 693 leaves out the universal restriction on `owl:Thing` of a range of a property that
+chains reach when the told ranges of the links that end the property's paths already give
+it, as [the Horn rules](#the-horn-rules) argue. The rule leaves out all 6 such universals
+of ore_ont_14817 and 13 of the 16 of ore_ont_9663, which then derive 8.2% and 7.2% fewer
+conclusions and take 7.4% and 6.5% fewer instructions per classification on the laptop.
+On `atlas`, without their disjunctive attempt and against the same binary with every
+universal kept, they classify in a median over five paired rounds of 0.942 and 0.955 times
+the time on one thread and 0.927 and 0.960 times on four, with peak resident sets of 638 against 697 MiB and 910 against
+959 MiB on one thread. GO has no such universal and takes the same time. The taxonomies
+are equal on the 389 development and final-set files of the ORE 2015 DL sample that both
+sides classify, and on 3,537 generated Horn ontologies, of which the 853 that leave a
+universal out and that HermiT accepts give HermiT's taxonomy. `ore_ont_7646` now
+classifies within 8 GiB on one thread with the attempt bounded at 1, with 219.2 million conclusions against 398.7
+million. The [benchmark report](../../benchmarks/el-classification/RESULTS.md#range-universals-that-the-links-cover)
+holds the rounds and the sweeps.
 
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
@@ -791,7 +1182,9 @@ waiting messages while they run, and the subsumers they keep once they end. The 
 of a parallel normalization count their interners and axioms with room for what their
 merge adds, the merge counts what it adds past that room, and a run whose chunks pass
 the budget or a refused grant normalizes on one thread instead. The memory pool is
-charged for the growth of the peak, once, from the normalization on.
+charged for the growth of the peak, once, from the normalization on. A refused
+estimate can raise the reported peak. Only successful grants count toward the
+coverage that later phases reuse.
 Numeric parsing and reduction poll cancellation and deadlines and admit construction
 scratch before allocation. Large canonical values share immutable limbs whose live
 storage remains counted until the last alias drops. Index copies, functional-data
@@ -813,11 +1206,12 @@ inferred read is refused, since a classification reads the asserted axioms. The 
 keeps its last classification of an ontology for callers who read every graph, without
 assertions, keyed by the graphs, imports and mode. A compatible classification at the
 same commit answers from the retained result. At a later commit eligible EL additions
-and removals reuse affected contexts, as do edits of class axioms after a Horn run
-without individuals and a disjunctive run that does not count, while the other Horn and
-disjunctive runs rebuild after edits. Item 753 covers incremental native DL maintenance
-under item 603, and item 664
-covers the EL individual, merge, key and world invalidation gaps. One kept classification
+and removals, including edits involving individuals, nominals, keys, merges, universal
+roles and conditional worlds, reuse unaffected contexts and worlds, as do edits of class
+axioms after a Horn run without individuals and a disjunctive run that does not count,
+while the other Horn and disjunctive runs rebuild after edits. Item 753 covers incremental
+native DL maintenance under item 603, and item 664 delivered the EL individual, merge, key
+and world invalidation tracking. One kept classification
 runs at a time, and a second caller waits for it under
 its own deadline. The dataset keeps the saturation and the ontology it read, whose axioms
 the open ontology shares, and at the next commit it passes the saturation the axioms
@@ -1002,7 +1396,9 @@ report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the r
 each construct, the reports of excluded axioms, the bounds, incremental runs, a
 comparison with an independent naive completion procedure for EL++ on random ontologies
 of up to twenty axioms, incremental against full runs on random changes for both
-`Classifier` and `Saturation`, and in `tests/incremental_sweep.rs` incremental against
+`Classifier` and `Saturation`, in `tests/el_incremental_individuals.rs` targeted and
+randomized differential runs over edits of assertions, nominals, merges, keys, universal
+roles and conditional worlds, and in `tests/incremental_sweep.rs` incremental against
 full runs on edits of class axioms beside fixed self restrictions, reflexive roles,
 chains, ranges, individuals and the top and bottom properties, the same taxonomy on one, two and eight threads for an
 ontology of 3,000 classes, and an estimate that bounds a run with its taxonomy. Unit
@@ -1018,7 +1414,7 @@ taxonomy.
 **Roadmap follow-ups.** An MCP tool is item 586. Complete reasoning with
 individuals and datatypes was item 587, with item 605. The literals and datatypes the
 classifier cannot compare and chains through the top property are item 663, and
-incremental runs that follow merges, keys and worlds are item 664. Reads that
+incremental runs that follow merges, keys and worlds were item 664. Reads that
 answer from the classification are item 588. DL queries answer from the kept classifier
 through `Classifier::saturate` and `Classifier::describe`, as
 [U12's DL Query outcome](../U12-ontology-workbench/SPEC.md#dl-query) describes.
@@ -1326,12 +1722,10 @@ alone derive 16.5 and 10.8 million. The contexts of conjunctions hold 5.47 milli
 subsumers on ore_ont_14817 where they held 8.50 million. On the benchmark host the Horn
 rules alone then take 2.0 against 2.5 s and 2.7 against 3.7 s on one thread, with peak
 resident sets of 713 against 808 MiB and 951 against 1,215 MiB, as the Outcome records.
-The taxonomies are equal at every level on one and eight threads. Tier D's own unfolding in its bounded
-attempt is not reduced. The first two reductions were tried there and not kept. On the
-96 disjunctive files of the development set the taxonomies were equal, the same three
-attempts ended over their bound, and the times of the two Uberon files differed by no
-more than the spread of their runs, 52 to 125 s, as the
-[experiments log](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records.
+The taxonomies are equal at every level on one and eight threads. The disjunctive rules apply the first two
+reductions in their own unfolding and not the third, as
+[reduced automata of the disjunctive rules](#reduced-automata-of-the-disjunctive-rules)
+describes.
 
 A differential check generated small Horn ontologies with chains, transitive properties,
 inverses, ranges and property hierarchies over six properties, of which the class axioms
@@ -1343,6 +1737,64 @@ and the third one that of 2,658. GO, ChEBI lite, the ORE 2015 EL files and the D
 development set, 497 files that the laptop classifies within 8 GiB, give the same
 taxonomies with and without the reductions on one and eight threads, and 67 of them
 change their conclusion count.
+
+A range of a property that chains reach is the universal restriction `⊤ ⊑ ∀r.C`, which
+every context holds and unfolds into the states of the automaton of `r`. The run leaves
+it out when the told ranges already give `C` at the end of every path that implies `r`
+(item 693). Every word that the automaton accepts ends with the label of a transition
+into a final state. The universal is left out when the start state is not final and,
+for every such label `l`, `C` is a told range of `l` or of a property above `l`, with
+`r` itself among them. The told ranges include the domains, each a range of the inverse
+property, and the universal property is never such a label. On ore_ont_14817 the rule
+leaves out all 6 range universals and on ore_ont_9663 13 of 16. The property 207 of the
+second file keeps its universal, since its paths can end with links by properties 206,
+329, 355 and 356, which have no range `C`, and without that universal the taxonomy
+loses subsumptions.
+
+Leaving an entailed axiom out is sound. The argument for completeness changes the first
+of the three steps above and leaves the other two.
+
+1. **A told range holds on every link.** For each told range `C` of a property `p`, the
+   index gives `C` to the successor of each existential restriction on a property under
+   `p`, and to the source of each link by a property under `p⁻` through `∃p⁻.⊤ ⊑ C`. A
+   loop takes the ranges of its property and of the property's inverse, and the range of
+   a reflexive or universal property holds everywhere. R3 and the merges of R5 keep the
+   cores that carry the ranges, R6 gives a predecessor the core of the successor it is
+   identified with, and the rules of individuals copy links with their properties. This
+   is how the run treats the ranges of simple properties, which never have a universal.
+   The translation of the first step therefore keeps `⊤ ⊑ ∀p.C` on the links of the
+   chain-free model for every told range, whether `p` is simple or not.
+2. **The translation without the universal preserves named subsumption.** A model of the
+   ontology is a model of the translation without the states of the left-out universal.
+   Close a model of that translation under the chains. An edge that the closure adds by
+   `r` runs along a path whose properties spell a word that the automaton of `r`
+   accepts, by the construction of Horrocks, Kutz and Sattler. The last edge of the path
+   is an edge of the model by a property under the word's last label `l`. That label has
+   `C` as a told range of a property `l'` above it, and `⊤ ⊑ ∀l'.C` holds on the edges
+   of the model, so the end of the path is in `C`. The closure then satisfies
+   `⊤ ⊑ ∀r.C`, and every other axiom as the first step shows.
+3. **The rest is unchanged.** The calculus without composition is complete for this
+   translation, and chain selection derives what that calculus derives, as before.
+
+The argument holds for several universals left out at once, since each one's case reads
+only the told ranges on links and not another universal. Its first point needs every
+property that a link can have to count for the rule `∃p⁻.⊤ ⊑ C`. A context that derives
+a negative existential restriction made positive by its unfolding links to its
+successor, so the index gives those properties the same rule (item 693). Those rules
+add conclusions on 27 of 3,537 generated ontologies, on none of the 389 files of the ORE
+2015 sweep and on no file of the benchmark, and change no taxonomy. The
+automaton's reductions and pruning do not affect the test, which reads the labels into
+the final states of the closure over the ε-transitions before them. It finds them from
+the transitions between a state that the start reaches and one whose ε-transitions reach
+the end, without building the closure, in time linear in the automaton apart from the sort
+of the labels and with polls of the run's deadline and cancellation, and it refuses
+scratch whose upper bound passes the run's memory limit, as the property closure does. When the left-out universals were a run's only
+universal restrictions and no other Horn rule can fire, the run takes the EL rules, which
+compose every chain, as for any such run. A change to the axioms after a run with the
+Horn rules normalizes them again, so a removed range that covered a universal brings the
+universal back.
+Tier D makes its own range universals and keeps them all. `SPARKLES_HORN_RANGES=keep`
+keeps every range universal for a comparison.
 
 Item 693 also fixed a gap in completeness that phase 3 left. A chain
 `r_1 ∘ … ∘ r_n ⊑ s` entails its mirror image `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻`, and the rules of
@@ -1581,11 +2033,10 @@ changes nothing for them. `Limits::rooted` lifts the refusal of individuals for 
 disjunctive rules under the further conditions of its section, as it does today. When the
 disjunctive rules decline an ontology, the Horn rules take what they can of it, with its
 individuals, and leave out and report the axioms that need case analysis and the axioms
-they left out before, which are at-least restrictions above 64, data restrictions outside
-OWL 2 EL, and axioms over property hierarchies that are not regular or whose automata
-pass the bound. A run with individuals also leaves out at-least restrictions above one,
-for the reason the normalization paragraph gives, which item 867 follows, and chains
-through the top property stay partial, as item 663 records.
+they left out before, which are at-least restrictions above 64, data restrictions that
+neither OWL 2 EL nor the datatype checker accepts, and axioms over property hierarchies
+that are not regular or whose automata pass the bound. Chains through the top property
+stay partial, as item 663 records.
 
 **One saturation.** Kazakov's rules read a context as the set of instances of its
 conjunction, and every conclusion of a context holds of each of its instances. The EL
@@ -1605,17 +2056,86 @@ individuals in a positive position is not Horn and stays with the disjunctive ru
 normalization takes a class assertion `C(a)` as `{a} ⊑ C`, so that a Horn class
 expression in an assertion reaches the rules, and an object property assertion over an
 inverse property as the assertion over the property the other way round. The other
-assertions are EL axioms already. A run with individuals leaves out and reports an
-at-least restriction above one, where a run without them unfolds it as the paper's Lemma
-2 does into fresh, pairwise disjoint fillers. The lemma's argument expands a model of
-the ontology to one of the unfolding, and it colours each element's successors with the
-fresh fillers, which it can do because the paper's models are trees in which no two
-elements share a successor. A nominal is a shared successor, and the argument is not
-made here for models with them, though no Horn axiom bounds an element's successors to
-a finite set, so an expansion that adds fresh successors may exist. Leaving the
-restriction out is a sound weakening that the run reports, no file of the lane's gate
-has such a restriction beside individuals, and item 867 holds the argument or the
-rule that takes them. Lemma 2 stays for runs without individuals.
+assertions are EL axioms already. A run with individuals takes a positive at-least
+restriction above one, up to `MAX_AT_LEAST` over a simple role, by unfolding `≥n r.C`
+into `n` existential restrictions `∃r.B_1 ⊓ … ⊓ ∃r.B_n` with fresh, pairwise disjoint
+subclasses `B_i ⊑ C`, as Kazakov's Lemma 2 does without individuals.
+
+Every model of the unfolding is a model of the original ontology, because pairwise
+disjointness forces the `n` successors to be distinct. For the converse in the Horn
+fragment with individuals, take any model `I` of the original ontology and set
+`κ = max(ℵ_0, |Δ^I|)`. When `|Δ^I| = 1`, no element satisfies `≥n r.C` for `n ≥ 2`, so
+interpreting every `B_i` as empty suffices. When `|Δ^I| ≥ 2`, form the direct power `I^κ`
+with domain `(Δ^I)^κ`, coordinatewise atomic classes and object roles, and each named
+individual interpreted as its constant tuple `(a^I)_{α < κ}`, lifting a fixed satisfying
+valuation of the existentially quantified anonymous individuals in `I` to constant tuples
+as well. By structural induction after root-level dualization, every negative-position
+Horn expression `G` satisfies `G^{I^κ} ⊆ (G^I)^κ` and every positive-position Horn
+expression `H` satisfies `(H^I)^κ ⊆ H^{I^κ}`, because positive nominals are singletons,
+positive at-most restrictions have bound at most one, and no positive disjunctions occur.
+Role inclusions, chains, inverses, `ObjectHasSelf`, reflexivity, irreflexivity,
+asymmetry, disjointness, universal object roles, assertions, individual equalities and
+inequalities, and keys over named individuals all hold in `I^κ`.
+
+For OWL 2 EL data properties, resolve all EL `DatatypeDefinition` axioms first so that
+every EL data range reduces to empty, a singleton `{v}`, a proper EL datatype `T`, or
+`rdfs:Literal`. The OWL 2 EL datatypes form disjoint chains of finite height beneath
+`rdfs:Literal`, and every proper EL datatype `T` has an infinite top atomic cell
+`T^∘ = T \ ⋃_{T' ⊊ T} T'`. Distinguish the source data domain `Δ_D` from the target data
+domain `Δ_D'` of `I^κ`. Under the full OWL 2 datatype map, `rdfs:Literal` already
+contains values outside every proper EL chain, such as `xsd:boolean` values that do not
+occur in EL data axioms, so `Δ_D' = Δ_D`. Over the strict EL datatype map alone, where
+`Δ_D` has no value outside the proper EL chains, set `Δ_D' = Δ_D ∪ {u_⊤}` by adding one
+fresh value `u_⊤` to `rdfs:Literal` outside every proper EL datatype. Pick one fresh
+representative `u_T ∈ T^∘ ⊆ Δ_D'` avoiding all finitely many literal values in the
+ontology for each EL datatype `T`, using `u_⊤` for `rdfs:Literal` when `Δ_D'` is
+extended. Define `φ : (Δ_D)^κ → Δ_D'` by `φ(v⃗) = v` when `v⃗ = (v)_{α < κ}` is constant
+and `φ(v⃗) = u_{T(v⃗)}` otherwise, where `T(v⃗)` is the unique smallest EL datatype or
+`rdfs:Literal` containing `{v_α : α < κ}`. For every EL data property `d`, including
+`owl:topDataProperty` and any role forced universal by inclusions, set
+`d^{I^κ}(x) = Δ_D'` when `d^I(c) = Δ_D` and `d^{I^κ}(x) = d^I(c)` otherwise on each
+constant tuple `x = (c)_{α < κ}`, and set
+`d^{I^κ}(x) = {φ(v⃗) : v⃗ ∈ ∏_{α < κ} d^I(x_α)}` on each non-constant tuple `x`. On
+`owl:topDataProperty` and any universal superrole, every constant tuple receives `Δ_D'`,
+and every non-constant tuple's full product `(Δ_D)^κ` produces all values of `Δ_D` via
+constant vectors `(v)_{α < κ}` together with `u_⊤`, when `Δ_D'` is extended, via any
+non-constant vector combining values from two disjoint proper EL chains such as an
+`xsd:integer` and an `xsd:string`. Applying the same map `φ` to every data property
+preserves `SubDataPropertyOf` and preserves `FunctionalDataProperty` because
+`|d^I(x_α)| ≤ 1 < |Δ_D|` gives `|∏ d^I(x_α)| ≤ 1` and never makes a fiber equal to
+`Δ_D`. It preserves `DataPropertyRange`, `DataHasValue` in both polarities because no
+`u_T` equals an ontology literal, and `DataSomeValuesFrom` in both polarities because
+`u_{T(v⃗)} ∈ T^∘ ∩ T` forces `T(v⃗) ⊆ T` on the tree of disjoint EL chains. On constant
+tuples, `DataPropertyAssertion` and `NegativeDataPropertyAssertion` hold because `u_⊤` is
+distinct from every literal in `Δ_D`, and `HasKey` on named individuals holds without
+spurious collisions because dummy values never enter non-full diagonal fibers and any two
+diagonal fibers that share `u_⊤` were both equal to `Δ_D` in `I`, so those named
+individuals already shared an existing value of `Δ_D` in `I`.
+
+For each occurrence of `≥n r.C` processed bottom-up with already-unfolded filler `C'`,
+every tuple `x` in `((≥n r.C)^I)^κ` has at least `n^κ ≥ 2^κ` distinct `r`-successors in
+`(C^I)^κ ⊆ (C')^{I^κ}`, while `|Δ^{I^κ}| = |Δ^I|^κ = 2^κ`, so transfinite recursion
+assigns `n` distinct unassigned `r`-successors of each `x` to `B_1, …, B_n ⊆ (C')^{I^κ}`
+without reusing any element. Unfolding therefore preserves satisfiability and all
+named-class subsumptions `A ⊑ B`, including named-class unsatisfiability, because any
+counterexample `a ∈ A^I \ B^I` lifts to the constant tuple `(a)_{α < κ} ∈ A^{I^κ} \ B^{I^κ}`
+with named extensions left uncoloured. Arbitrary non-Horn subsumptions over the original
+signature need not be preserved, as `∀owl:topObjectProperty.{a, b, c} ⊑ owl:Nothing`
+beside `DifferentIndividuals(:a :b :c)`, `IrreflexiveObjectProperty(:r)` and
+`owl:Thing ⊑ ≥2 r.owl:Thing` illustrates.
+
+When an ontology also contains a non-Horn finite data range handled by the datatype
+checker, such as `DataOneOf` over three values alongside `≤1 r.(d = v)` restrictions, the
+unfolded ontology can be semantically stronger under full case analysis over data values.
+The Horn saturation still stays sound on such ontologies because the datatype checker
+emits only valid Horn implications `⋀ Γ ⊑ ψ`: `owl:Nothing` for incompatible local
+premises, a single entailed body atom, or a shared told positive consequence of a cover.
+Non-told uses such as at-most qualifiers cannot trigger a grouped told consequence, and
+any unresolved cover sets a diagnostic and is reported as used in part. Replacing each
+checker atom with a fresh atomic class interpreted coordinatewise as a unary predicate
+from `I` rather than from concrete OWL data values, and replacing the checker axioms with
+the finite set of emitted Horn implications, yields a pure Horn ontology satisfied by `I`
+whose unfolding `I^κ` models, so every Horn derivation stays sound.
 
 Three mechanisms of the EL rules of individuals have to reach the links and contexts of
 the Horn rules.
@@ -1941,9 +2461,10 @@ holds the judgements, the exclusions, the generator and the timings, which the
 discusses.
 
 **Out of scope.** Enumerations of several individuals in a positive position need case
-analysis and stay with the rooted run. At-least restrictions above one beside
-individuals are item 867, and chains through the top property stay in item 663. A cheaper
-witness criterion is not built. Anonymous individuals stay with the reader's rules. Data cardinalities
+analysis and stay with the rooted run. Chains through the top property stay in item 663. A cheaper
+witness criterion is not built. Item 1281 later took anonymous individuals, as
+[Anonymous individuals and top-property inclusions](#anonymous-individuals-and-top-property-inclusions)
+describes. Data cardinalities
 and keys over data properties beside the disjunctive rules stay with item 768, counting
 with item 728 and incremental runs after a change with item 753.
 
@@ -1957,7 +2478,9 @@ covers ALCHI, which adds unions, complements and universal restrictions in every
 to the EL classifier's language, with inverse properties and property hierarchies.
 Transitive properties and chains are taken through the automata of Horrocks, Kutz and
 Sattler, which unfold the universal restrictions, negative existential restrictions and
-ranges on the properties they reach. A run that does not count reads an at-least
+ranges on the properties they reach, after the reductions that
+[reduced automata of the disjunctive rules](#reduced-automata-of-the-disjunctive-rules)
+describes. A run that does not count reads an at-least
 restriction in a positive position and an at-most restriction in a negative one as the
 existential restriction they imply, which keeps ALCHI's models. The rules run when an
 axiom needs case analysis and the ontology has no individuals, data properties, self
@@ -1995,20 +2518,24 @@ holds of it for certain, with a context of that conjunction when it is more than
 successor's core. Both strategies give the same answers on the fixtures and the random
 tests.
 
-`Limits::partial` makes a run of the disjunctive rules that its deadline, its cancellation
-or its memory budget stops answer with what it proved instead of failing. The answer's
-`Classification::complete` is false, `incomplete` lists the classes whose subsumers it may
-miss, and `consistency` is `Consistent`, `Inconsistent` or `Unknown`. A stopped worker gives
-back the conclusions it did not apply and delivers the messages it holds, and an inference
-the stop cut off marks its context, so that every context with work left shows as open. A
-class is complete when every context it reaches is closed, none of its candidates is left
-untested and the ontology is consistent. Consistency is decided when `owl:Thing`'s context
+`Limits::partial` makes a classification that its deadline, its cancellation or its memory
+budget stops after saturation begins answer with what it proved instead of failing. The
+flag was introduced for the disjunctive rules and is now shared across the EL, Horn and
+disjunctive tiers (item 714; see the Outcome subsection below and
+[the reasoning guide](../../reasoning/README.md) for the EL and Horn phase-by-phase
+recording and memory-admission details). The answer's `Classification::complete` is false,
+`incomplete` lists the classes whose subsumers it may miss, and `consistency` is
+`Consistent`, `Inconsistent` or `Unknown`. A stopped worker gives back the conclusions it
+did not apply and delivers the messages it holds, and an inference the stop cut off marks
+its context, so that every context with work left shows as open. In the disjunctive rules,
+a class is complete when every context it reaches is closed, none of its candidates is left
+untested and the ontology is consistent; consistency is decided when `owl:Thing`'s context
 is unsatisfiable, or when it and every context it reaches are closed, and when it is unknown
 no class is complete. The taxonomy of a partial answer is built from its proved subsumptions
-closed transitively, after the clause stores are freed. A partial answer that passes the
-budget fails with the memory error, and the next run starts again. Runs of the other tiers
-ignore the flag and fail on a stop as before, item 714. A class whose context the stop came
-before is open too, and so is the consistency while `owl:Thing` has no context.
+closed transitively, after non-taxonomy saturation state is freed. A partial answer that
+still exceeds the memory budget fails with the memory error without downgrading to a weaker
+tier, and the next run starts again. A class whose context the stop came before is open too,
+and so is the consistency while `owl:Thing` has no context.
 
 Phase 7's surfaces give the partial answer to every caller of a classification.
 `ClassifyRequest::partial` and `ClassifyRequest::expansion` carry the flag and the
@@ -2025,8 +2552,9 @@ the flag, since none of them can say that a taxonomy is partial. The command lin
 otherwise clean. Each surface's tests classify a generated ALCHI ontology under deadlines
 from a fiftieth of a full run's time upwards, and check that a partial answer is never
 complete, that it lists its open classes and that its consistency agrees with the full run
-or is unknown, which an inconsistent ontology gives when stopped early. The Workbench does
-not ask for partial answers, item 719.
+or is unknown, which an inconsistent ontology gives when stopped early. Item 719 extends
+the Workbench with deadline, partial-answer and expansion controls and displays partial
+hierarchies, open classes and unknown consistency, as [Outcome](#outcome) records.
 
 A run of the disjunctive rules has the Horn rules' memory budget, 64 times the estimated
 bytes of its index and axioms, at least 1 GiB, and no more than the caller's. The clause
@@ -3819,6 +4347,459 @@ thread the fallback of ore_ont_6485 takes 55 ms longer, and that of ore_ont_1481
 10 s against 132 s without steps. The times above are from one host under load, and
 none is from the benchmark host.
 
+### The datatype checker
+
+Items 768 and 972 add a datatype checker that every tier of the classifier shares. This
+subsection is their design, and its outcome follows as the phases land. The checker
+decides, for one context, the data restrictions, data ranges, data cardinalities,
+functional data properties and data-property keys that apply there, over the whole OWL 2
+datatype map with its facets. The EL and Horn tiers call it for the meets and inclusions
+of their data lattice and for the covers that would need a case analysis, Tier D and the
+rooted run call it through a theory rule over the data atoms of each context, and the
+worlds of the Horn rules with individuals call it for the values of keys and
+functional properties. It is written from the OWL 2 Structural Specification §4, §5.7,
+§9.3.6, §9.4 and §11.2, the Direct Semantics §2.2 and §2.3, and XML Schema 1.1 Part 2,
+and the Hyper rule of the clause calculus. No other reasoner's source is read.
+
+**Why it is needed.** On the ORE 2015 DL development files that the census of item 1272
+found leaving axioms out for data, the datatypes in use are `xsd:int`, `xsd:string`,
+`xsd:anyURI`, `xsd:double`, `xsd:integer`, `xsd:float`, `xsd:boolean`, `xsd:dateTime`,
+`xsd:nonNegativeInteger`, `xsd:decimal`, `owl:real` and `xsd:positiveInteger`, in that
+order of use. Only two files restrict a datatype with facets, and both use the four
+bounds. No file uses `pattern` or a length facet, data unions or complements, keys or
+`DisjointDataProperties`. Functional data properties appear in 21 files, exact data
+cardinalities in 21 and maximum data cardinalities in 9. Item 972 is mostly `xsd:int`,
+which is outside OWL 2 EL because its value space is finite, and the floating-point and
+Boolean datatypes. The checker covers the whole map so that the remaining gaps are named
+and small, and its first phases favour these datatypes.
+
+**Values and identity.** A data value is compared by identity, as §9.3.6 requires of
+cardinality restrictions and functional data properties, and a facet is compared by the
+datatype's equality and order. The two differ in three places. The values `+0` and `-0`
+of `xsd:float` or `xsd:double` are equal and not identical, so a functional property
+with both values is inconsistent, while `minInclusive 0` admits both. NaN is identical to
+itself and is excluded by every bound facet, since it is incomparable with every value.
+Two date-times that denote the same instant with different offsets are equal and not
+identical (§4.7). The checker therefore computes an exact value of each literal as its
+identity key, with rationals of any size and date-times with years of any length and
+seconds of any precision, and keeps the order that the facets use beside it.
+
+**Families and value spaces.** The checker reads the map as disjoint families. Within a
+family the datatypes nest or are intervals, and between families the value spaces are
+disjoint. §4.2 states that `xsd:double`, `xsd:float` and `owl:real` are pairwise
+disjoint, §4.5 and §4.6 state it of the two binary datatypes and of `xsd:anyURI` and
+`xsd:string`, and the families of `xsd:boolean`, `xsd:dateTime` and `rdf:XMLLiteral` are
+disjoint from the others, the first two as primitive datatypes of XML Schema. The
+disjointness of `rdf:XMLLiteral` rests on its definition in RDF and is verified in phase 1. The families are these.
+
+| Family | Datatypes | Representation |
+|---|---|---|
+| Real | `owl:real`, `owl:rational`, `xsd:decimal`, `xsd:integer` and its twelve subtypes | Four strata, the integers, the decimals that are not integers, the rationals that are not decimals and the reals that are not rationals. Each stratum holds a finite union of intervals with exact rational ends, each end open or closed. |
+| Double, Float | `xsd:double`, `xsd:float` | A finite union of intervals over the values in their total order, with `-0` below `+0` and NaN as a separate point. |
+| Plain | `rdf:PlainLiteral`, `xsd:string`, `normalizedString`, `token`, `NMTOKEN`, `Name`, `NCName`, `language` | Untagged strings by a set of lengths for each cell of the string chain. Tagged strings by a set of lengths for each tag, given by the longest basic language range of a finite map that matches the tag or by a default, so that a range minus a narrower range is represented. `rdf:langString` is the tagged strings alone. |
+| URI | `xsd:anyURI` | Strings with a set of lengths and finite included and excluded values. |
+| Hex, Base64 | `xsd:hexBinary`, `xsd:base64Binary` | Octet sequences with a set of lengths and finite included and excluded values. |
+| Boolean | `xsd:boolean` | A subset of the two values. |
+| Time | `xsd:dateTime`, `xsd:dateTimeStamp` | Values with an offset by intervals of instants, values without one by intervals of local times, and finite included and excluded identities. |
+| XML | `rdf:XMLLiteral` | Opaque values, as today. |
+
+The integer subtypes are intervals of the integer stratum with the bounds of XML Schema
+1.1 §3.4, so `xsd:int` is the integers from -2147483648 to 2147483647. The string
+datatypes form one chain, `xsd:string ⊃ normalizedString ⊃ token ⊃ NMTOKEN ⊃ Name ⊃
+NCName ⊃ language`, since every language tag starts with a letter and holds only
+letters, digits and hyphens. A cell of the chain is the strings at one level and not at
+the next. A range in normal form is a union over the families of these pieces, with finite sets of
+values included beyond them and excluded from them, which is closed under intersection,
+union and complement. `rdfs:Literal` is the whole data domain, which the Direct
+Semantics §2.2 requires only to contain the value spaces of the map. The normal form
+therefore has one more region, the values outside every datatype of the map, which no
+literal denotes and which is infinite for the checker, since an interpretation can
+always add values there. A complement is taken within the data domain, as Table 3 of the
+Direct Semantics defines `DataComplementOf`, so `DataComplementOf(xsd:int)` holds every
+string, and the complement of the union of every datatype of the map is not empty.
+A datatype definition is replaced by its range, which §11.2 keeps acyclic. Normal forms
+are interned, and the meet, inclusion and emptiness of two ids are computed once and
+cached. The values that a family's base holds as points are never held among the
+included or excluded values. These are the numbers, the floating-point and Boolean
+values, the date-times without an offset and the members of the classes of at most
+three values, which are the empty string, the space, `:`, the tab, line feed and carriage
+return, and the empty values of `xsd:anyURI`, `xsd:hexBinary` and `xsd:base64Binary`.
+The tests check that equal ranges of these families have one id. A larger finite class,
+such as `xsd:hexBinary` of length 1, can be held whole in the base by one form and value
+by value by another, so equal ranges can have two ids. Ids are therefore cache keys, and
+whether a range lies within another is decided through sizes, never by comparing ids.
+
+**Facets.** The bound facets of the real, floating-point and time families cut their
+intervals. A bound of the time family on a value without an offset follows the partial order of
+§4.7, under which a local time and an instant are never equal, a local time is below an
+instant only when it is below it with the offset `-14:00`, the latest instant it can
+denote, and above it only when it is above it with `+14:00`, the earliest. A bound with
+an offset therefore narrows the local times by fourteen hours on that side and becomes
+strict there, and a bound without an offset does the same to the instants. Under the
+§4.7 example, `minInclusive "1956-01-01T04:00:00-05:00"` holds `1956-01-01T10:00:00Z`
+and not `1956-01-01T10:00:00`. The length facets
+of the string, URI and binary families cut their sets of lengths, counted in characters
+for strings and in octets for binary data, and `rdf:langRange` keeps the tags that a
+basic language range matches. The tags are the well-formed language tags of BCP 47, which
+RDF requires, so the range `a` matches no tag and keeps nothing, while `en-a` matches
+`en-a-bb`. The `pattern` facet needs an automaton for an XML Schema
+regular expression, which the first phases do not build. Until a later item builds it, a
+range with a pattern, like an unknown datatype, is not passed to the checker, and its
+axiom is left out and reported as used in part.
+
+**Sizes.** Every range has a size, the number of its values saturating at 2^63, given as
+a lower and an upper bound. The model's cardinalities are 32-bit numbers, so their sums
+stay far below the saturation, and the checker declines a problem whose counts reach it.
+A size also says whether the range is infinite, which only an unbounded source sets, so a
+finite count that saturates stays a lower bound that removing values lowers. A
+bounded interval of the integer stratum, every range of the floating-point and Boolean
+families and every finite set of values have finite sizes. An interval of a dense stratum of the reals is empty when it holds no value of
+the stratum, one value when it is a point of the stratum, such as `xsd:decimal[≥0.5,
+≤0.5]`, and infinite otherwise, so `owl:real[≥1/3, ≤1/3]` without `owl:rational` is
+empty. The seconds of a date-time are a decimal of unbounded precision, so an interval
+of instants is infinite unless it is one instant, which has one value for each of the
+1,681 offsets from `-14:00` to `+14:00`. A length of `xsd:anyURI` holds at least the strings of ASCII letters of that
+length, which are relative IRIs, and at most every string of it, since XML Schema 1.1
+makes every string a value and OWL 2 §4.6 calls the value space the set of IRIs. The cells of the string chain are small at short lengths. The empty string is
+the only string of length 0, `normalizedString` without `token` holds only the space at
+length 1, `string` without `normalizedString` holds three strings of length 1, and
+`language` holds 52 of length 1 and caps each subtag at 8 characters. The checker counts
+the cells of bounded length exactly up to a small length and reports an axiom as used in
+part when it would compare a cardinality with a string or binary cell it has not
+counted. The tagged strings are counted by tag. Each irregular grandfathered tag, such
+as `i-klingon`, is a whole tag that nothing extends, so `rdf:PlainLiteral[rdf:langRange
+"i-klingon", length 0]` has one value. A range that matches any other tag matches
+infinitely many. The other strata, unbounded lengths and the reals are infinite. An
+underestimate of a size would be unsound and an overestimate incomplete, so each
+family's size function has its own tests at the boundaries.
+
+**Literals.** A literal of a datatype in the map has the value of its lexical form,
+which `datatypes::lexical` checks. Date-times are checked by the checker's own parser,
+since `datatypes::lexical` refuses fractions of a second past eighteen digits, which
+XML Schema 1.1 allows, and item 1289 corrects it for the other readers. The bound facets
+of the time family are checked by the same parser. A language-tagged literal has a value
+when its string is of XML characters and its tag is well-formed under BCP 47, in either
+of its forms, and item 1290 brings the other readers to the same rule. A number or
+date-time whose lexical form is longer than 4,096 characters is not passed to the
+checker, which bounds the cost of its exact arithmetic, and its axioms are left out and
+reported as used in part. A literal whose lexical form is outside the
+lexical space of its datatype violates §5.7, so the ontology is not in OWL 2 DL and the
+Direct Semantics gives the literal no value. Reading it as the empty range would draw
+entailments from an input the semantics does not define, since its complement would hold
+every value and a negative assertion with it would say nothing. Such a literal is
+therefore never passed to the checker, nor is an XML literal or a literal of a
+datatype outside the map, since the checker cannot tell which of them denote the same
+value. Their axioms are left out and reported as used in part.
+
+**Data restrictions are atoms.** Every data restriction of the ontology,
+`DataSomeValuesFrom`, `DataAllValuesFrom`, `DataHasValue`, `DataMinCardinality` and
+`DataMaxCardinality`, is an atom over x in every tier, and `DataExactCardinality` is the
+conjunction of its minimum and maximum, since its complement is no atom. A minimum of
+zero holds of every element and is replaced by `owl:Thing` before the atoms are formed,
+and its complement by `owl:Nothing`, as the object cardinalities already are. A functional
+data property is the restriction `≤1 d` on `owl:Thing`. A data value has no successors,
+and the data property hierarchy, disjointness, ranges and functionality all apply to one
+element, so the data successors of an element exist only inside the checker. The top
+data property, which OWL 2 DL allows only as a superproperty, relates every element to
+every value and adds no constraint between elements. A restriction over it is never an
+atom, since `∃U.R` with R not empty holds of every element and would need a valid clause
+with an empty body, so its axiom is left out and reported. A negative data assertion
+`NegativeDataPropertyAssertion(d a v)` in a component of the checker is the atom
+`∀d.¬{v}` on the constant a, a positive atom. With it, a constant whose values of d are
+all ruled out is a conflict and needs no cover, and the negative assertions add no body
+atoms. A component that stays with the EL lattice keeps the EL index's form `{a} ⊓
+∃d.{v} ⊑ ⊥`. The complement of a data atom is a
+data atom, `∀d.¬R` for `∃d.R` and `≤(n-1) d.R` for `≥n d.R`. The normalization keeps
+one invariant that the theory rule needs. Every data atom in the body of a clause is of
+the at-least kind, an existential, a value or a minimum, since a universal or a maximum
+in a negative position becomes its dual in the head, as `∀d.R ⊑ A` becomes `⊤ ⊑ A ⊔
+∃d.¬R`. No disjunction of at-least atoms is valid on its own, because an element without
+data values satisfies none of them, so no valid clause with an empty body is needed.
+
+**The local problem.** The checker decides whether a set of data atoms can hold of one
+element together with the negations of another set. It counts values by type. A type is
+a cell of the ranges involved, a nonempty intersection of each range or its complement,
+together with an upward-closed set of the data properties involved, which are the
+properties that relate the element to a value of the type. The unknowns are one
+nonnegative integer for each type, the number of distinct values of that type. A minimum
+`≥n d.R` says that the types whose cell is within `R` and whose property set holds `d`
+sum to at least n, an existential is a minimum of one, and a maximum is the same sum
+bounded above. A universal `∀d.R` and a range of `d` set to zero every type with `d`
+whose cell is outside `R`, and `DisjointDataProperties` sets to zero every type whose
+property set holds two of its properties. The types of one cell sum to at most the
+cell's size. Each cell records, for every range involved, whether it lies within the
+range or its complement, which its construction decides, so no test of inclusion rests on
+comparing ids. The answer is whether this small integer program has a solution, which
+the checker finds exactly by a bounded search over the types that some bound mentions.
+The search bounds each count by what the other counts leave to each minimum and maximum,
+and prunes a minimum whose counts all lie under a maximum with a smaller bound.
+The counts make no assumption about which witnesses are the same value, so two
+existentials under a functional property are satisfiable with one value in the meet of
+their ranges, and large minimums need no enumeration of witnesses. A search past its
+bound answers that the bound was passed, which the callers treat as their work bounds.
+
+**The theory rule.** A context's clauses hold data atoms like any other atoms over x, and
+the context's units held in the EL index count as clauses with an empty body. The rule
+fires when a processed clause's maximal literal is a data atom P and when the context
+gains a data atom P as a unit, whichever rule derived it. It takes P with the data atoms
+that are maximal in the context's other clauses or are its units, and with the body
+atoms. The body atoms are the data atoms with a negative occurrence anywhere in the
+index. Such an occurrence is in the body of an ontology clause, on the left of a told
+subsumer such as the `∃d.rdfs:Literal` of a domain, an operand of a conjunction, the
+filler of a negative existential restriction, the qualifier of an at-most restriction, a
+member of a disjointness axiom or a key clause. The index registers them where it
+registers every negative occurrence, so that no position is missed. The atoms it takes are those
+of P's component, the data properties connected by the hierarchy and by disjointness. It
+asks the checker for the pairs of a set of maximal atoms containing P and a set of body
+atoms whose negations make them unsatisfiable, minimal in both sets at once, so that a
+pair with a smaller head set and a larger body set is kept beside one with a smaller
+body set and a larger head set. For each pair and each choice of one clause for each
+maximal atom, it derives the union of those clauses' other literals and the pair's body
+atoms under the union of their bodies. A pair without body atoms is a conflict, such
+as a minimum above the size of its range, one body atom is an entailment such as
+`≥2 d.xsd:boolean ⊑ ∃d.{true}`, and two or more are a cover, such as `∃d.xsd:boolean
+⊑ ∃d.{true} ⊔ ∃d.{false}`. Every body atom of a minimal cover is consistent with the
+pair's set of maximal atoms and not entailed by it, so for a set of maximal atoms the
+rule asks for covers only when two or more body atoms of the component pass both tests.
+The tests are made against that set and not against every atom of the context. With
+`Γ1 → ∃d.xsd:boolean` and `Γ2 → ∀d.{true}`, the atom `∃d.{false}` is inconsistent with
+the context's atoms taken together, and the cover `Γ1 → ∃d.{true} ⊔ ∃d.{false}` is still
+needed, since the universal holds only under Γ2. No filter compares the ranges of the
+atoms, since a cover can hold an atom whose range contains the others, as `∃d.xsd:int[1,
+2] ⊓ ∃d.xsd:int[2, 3] ⊑ ≥2 d.xsd:integer ⊔ ∃d.{2}` does. In a rooted run, after an
+equality rewrites a term, the rule reads the atoms of the term that remains.
+
+**Completeness.** The rule is Hyper over the clauses `P_1(x) ∧ … ∧ P_k(x) → Q_1(x) ∨ … ∨
+Q_m(x)` that are valid in the datatype map, with the `P_i` among the ontology's finitely
+many data atoms and the `Q_j` among its body atoms. Added to the ontology they give it
+the same models, since an element whose data atoms are true cannot be given values with
+its other body atoms false only when one of these clauses is violated, and a data atom
+that occurs in no body triggers no ontology clause. The calculus with them is complete
+by its own theorem, since they are ordinary ontology clauses over x, and the invariant
+above, with the replacement of zero minimums and no atoms over the top data property,
+makes the clauses with an empty body unnecessary. The theorem needs the run with the rule
+to be the calculus on the larger ontology in its other rules too. The valid clauses are
+over x alone, so they add no atom over y, no role atom and no qualifier of an at-most
+restriction, which are what Pred and the at-most rule read from the ontology, and Succ
+sends a successor the marker of every atom over its term whatever the ontology's bodies
+hold. A data atom is an atom of the index like a named class, in the cores of
+successors, in markers, in the conjunctions of the Horn rules, under the equality rules
+and as a qualifier. A data atom over a successor or predecessor term therefore reaches
+the context whose x it is, and the rule fires there. The tests take `A ⊑ ∃r.B`, `A ⊑
+∀r.∃d.{1}` and `B ⊑ ∃d.{2}` with d functional, which entail `A ⊑ ⊥`, and two successors
+of a functional property, one with `∃d.xsd:int[1, 2]` and the other with
+`∀d.xsd:int[2, 3]`, whose merged successor has the value 2. The rule computes them lazily
+and fires on exactly the premises that Hyper would take with them, since a valid clause
+whose body atoms are not all maximal in the context cannot fire there. This makes the
+unrooted run complete in the sense of the existing tiers. The rooted run takes the same
+rule, and its completeness rests on the rooted calculus, which item 1231 records as not
+proved. A search or a set of minimal pairs past its bound passes the work bound as the
+case analysis of an inference does. An earlier design kept the data successors as terms
+of the clauses, with data function symbols, equalities between data terms and a data
+at-most rule over every set of n + 1 neighbours. It needs new rules and an argument that
+theory literals entailed by later ones do not break the model construction, and it buys
+nothing that the atoms do not, since no data term is shared between contexts.
+
+**The EL and Horn tiers.** The data properties fall into components connected by the
+hierarchy and by disjointness. A component whose ranges are all in the OWL 2 EL map and
+that has no universal restriction, cardinality, enumeration of several values, facet or
+`DisjointDataProperties` axiom stays with the EL lattice of `classify/data.rs`, which is convex
+there, since every value space of the profile is infinite and no union of its ranges
+covers another, and the lattice already meets the ranges under a functional data
+property. An ontology whose data is within OWL 2 EL therefore runs the code it runs
+today. Every other component is all data atoms. A lattice over the whole map
+would not be convex, since `∃d.xsd:boolean` entails a class that both `∃d.{true}` and
+`∃d.{false}` imply, and `∃d.xsd:integer` one that `∃d.xsd:integer[≤0]` and
+`∃d.xsd:positiveInteger` imply. The Horn tier applies the theory rule to the data atoms
+of its contexts. A context of the Horn rules holds only units, so its data atoms in a
+component are one set S and the rule needs no minimal pairs. A conflict of S gives
+`owl:Nothing`, and each body atom of the component that S entails is given as a unit,
+which the Horn rules can take. A remaining body atom, one that the context does not
+hold, is free when its only negative occurrences are told subsumptions whose subsumers
+the context holds, since its truth then changes no conclusion. A class C is given when S
+with the negations of the remaining atoms whose only negative occurrences are told
+subsumptions by C or by units of the context is unsatisfiable, as for a Boolean property
+whose two values both give C, and those atoms become free. A cover remains when S with
+the negations of the remaining atoms that are not free is unsatisfiable. It needs a case
+analysis, so the Horn tier reports its axioms as used in part and a run that Tier D takes
+decides them there. With these rules the Horn tier is complete when it reports nothing.
+Kazakov's canonical model has an element for each context, whose atoms are the
+context's units. When no cover remains, each element can be given data values that
+satisfy S and falsify every remaining atom that is not free. A data atom in a negative
+position of an axiom is then true of the element only when the context holds it or the
+subsumers it gives are units already, so the model satisfies the data axioms and has
+the subsumers that the rules derived. Several successors and pigeonholes come out as
+entailments of one body atom. A data restriction in a negative position whose negation is not Horn, a universal
+restriction or a maximum on the left, stays with Tier D. On the 67 ORE 2015 DL files
+that the census found leaving axioms out for 768 or 972, all 27 files with data
+restrictions outside OWL 2 EL have them only in positive positions, so no negative
+universal or cardinality keeps them from the Horn tier. Covers can still arise from
+values on the left, such as a Boolean property whose two values define different
+classes, and the Horn tier reports such a cover as used in part. A context that the run
+finds unsatisfiable reports no cover, since it has every subsumer. A functional object
+property joins the atoms of its successors in the context of their conjunction, so a
+conflict, an entailment or a cover between atoms that different classes give is found
+there. The worlds of the Horn rules with individuals apply the same rule to the copies of
+the contexts they change. A world reads the last evaluation of each copy once it reaches
+its fixpoint, and it skips unsatisfiable copies and every copy when its class has no
+instance, so that what it reports does not depend on the order of its derivations. A
+`DisjointDataProperties` axiom over properties of a checker component is a pair of
+disjoint properties of the local problem. In a run with a checker component, a
+`DatatypeDefinition` outside OWL 2 EL is taken when the checker converts its range,
+since every property its datatype is used on is then in a checker component and reads the
+definition through its atoms. `Stats::tier` still counts a data union, an enumeration of
+several values, a complement on the left or a higher data cardinality as disjunctive, so
+it reads `Disjunctive` for a run whose only such axioms are data restrictions, while Tier
+D, which refuses every data restriction, takes no axiom of the run and the Horn tier
+decides it.
+
+**Tier D.** Tier D's eligibility drops its refusal of data roles and keeps its refusal of
+the top data property. Data atoms are atoms of the index like named classes, ordered
+above them by id, and the theory rule runs beside Hyper in every context that holds a
+data atom.
+
+**Keys.** A key constrains only named individuals (Direct Semantics Table 9), so it adds
+nothing to a run without individuals, and Tier D without individuals ignores keys. In a
+rooted run, a key `HasKey(K (p…) (d…))` relates two constants u and v of K with one
+clause for the pair, `K(u) ∧ K(v) → u ≈ v ∨ D`, where D holds, for each key property,
+the literal that u and v share no value of it. For an object property that literal is
+the difference of their named fillers. For a data property the first phases take only
+keys whose properties, and the subproperties of those, have no positive restriction
+other than a single value, so that a shared value is the same value on both sides, as
+the worlds take today. A hash of the constants by their key values finds the pairs.
+Every other key is reported as used in part, since a range such as `xsd:int[5, 6]` on
+one side could need the cover `∃d.{5} ⊔ ∃d.{6}` to decide the pair. The worlds of
+the Horn rules with individuals report every key over a property of a checker component
+as used in part, and the singleton case waits for the rooted run of item 768.
+
+**The rooted run.** A data assertion `DataPropertyAssertion(d a v)` is the atom
+`∃d.{v}` on the constant a, and its negative form is the atom `∀d.¬{v}` on a, as the
+atoms paragraph gives it. Hyper binds x to a constant, and the theory rule does the same, so each context
+decides the ground data atoms of each constant as it decides those over x.
+
+**Representation and incremental checking.** A run builds the data tables only when its
+index has a data atom. A context then keeps its processed clauses with a maximal data
+atom by the component of the atom's property, with the cached answers of the checker for
+the sets it has asked about, and the run keeps the cells of each component's ranges. A
+new maximal data atom is checked only with the atoms of its component, and the answers
+for the same sets of atoms are shared by every context through a run-level cache. The
+checks and the minimal pairs count toward the run's work bound and memory budget as the
+case analysis of an inference does.
+
+**Cost without data.** An ontology without data atoms builds no data tables, interns no
+ranges and adds no rule. The run chooses its clause loop once, before saturation, so a
+run without data atoms executes no added test per processed clause. Phase 3 compares instruction counts of the
+disjunctive fixtures with and without the change, and its timing A/B runs on a quiet
+Intel host.
+
+**Cost with data.** Item 768's experiment took the EL data restrictions as atoms in Tier
+D, which is this design without the checker, and found that sending these files to Tier
+D costs far more than leaving their data axioms out, 442 ms against 6 ms on
+ore_ont_3231. It also found that ore_ont_8273 did not finish in 120 s and that
+ore_ont_13306 left more axioms out, because Tier D leaves out Horn axioms that the Horn
+rules took. Where that cost goes is not measured, so phase 3 first profiles `2f8080e5`
+on these files with `dl_contexts`, `dl_tests` and `dl_testing`. Phase 2's Horn tier
+takes the files whose only case analysis would be in their data. For the rest, phase 3
+weighs a hybrid in which the Horn tier records the contexts where a reported cover or
+other left-out axiom fired. A class whose Horn saturation reaches no such context would
+be complete, and Tier D would test only the classes that reach one, with the union of
+the two tiers' subsumptions as the answer, since both are sound. The proof that a class
+reaching no such context is complete is that phase's obligation before it is kept.
+
+**What stays out.** The `pattern` facet until its automaton is built, ill-typed literals,
+XML literals and datatypes outside the map stay out of the checker and are reported as used in part,
+and so do cardinalities compared with string cells the checker has not counted. The top data
+property stays with the EL index and declines Tier D, as the top object property does.
+Keys outside the forced singleton case are reported as used in part.
+
+**Phases and tests.** Phase 1 builds the checker as a module with unit tests from the
+W3C OWL 2 test cases that involve datatypes, among them `Datatype-Float-Discrete-001`,
+`Plus and Minus Zero Integer`, `Minus Infinity is not in owl:real`,
+`Qualified-cardinality-boolean`, `inconsistent-integer-filler`,
+`Contradicting-dateTime-restrictions`, `New-Feature-DataQCR-001`, the
+`New-Feature-DisjointDataProperties` and `New-Feature-Keys` cases and
+`string-integer-clash`, with tests of the zeros, such as `minExclusive "-0"` excluding
+`+0`. A differential test compares the checker's answers on random small sets of atoms
+with a brute-force model finder over small finite stand-ins for the value spaces, and a
+second one does the same for the theory rule's clauses. Phase 2 is item 972 with the
+Horn tier's data atoms, checked against HermiT on the thirteen OML probes and compared
+before and after on the 222 non-held-out census files whose default run left out data
+axioms, with HermiT checking the consistency changes, as the Outcome above records. Phase 3 is item 768, data atoms in Tier D and the rooted run, with the census
+tool run on the 61 files before and after.
+
+#### Reduced automata of the disjunctive rules
+
+The disjunctive rules unfold a universal restriction `∀r.C` on a property that chains or
+transitivity reach by the automaton of `r` without its ε-transitions, and a negative
+existential restriction `∃r.F ⊑ G` as `F ⊑ ∀r⁻.G`. Each state `s` becomes a fresh class
+`X_s`, the holder of the restriction gets `X_start`, each transition by `l` from `p` to `q`
+gives `X_p ⊑ ∀l.X_q`, and each final state gives `X_s ⊑ C`. The restriction itself stays,
+which is sound on the direct links. Item 712 reduces each automaton before the unfolding
+with the first two reductions of [the Horn rules](#the-horn-rules), and
+`Limits::dl_automata` or `SPARKLES_DL_AUTOMATA` set to 0 or 1 turns off both or the second
+for a comparison. The default is 2, which applies both.
+
+`X_s` stands for the universal restriction over every word that `s` accepts, in which a
+link meets a letter `l` when its property is under `l`. The rules read universals in that
+way. A universal on `l` reaches each successor whose property is under `l`, through the
+existential restrictions and the stored clauses whose maximal literal is a role under `l`,
+each predecessor whose link is under the inverse of `l`, through the propagations over the
+backward links, and in a rooted run each constant that a link under `l` reaches. Every one
+of these tests reads the index's property hierarchy, which closes the same property
+inclusions as the automata, closed under inverses, and in which every property that an
+automaton names has its inverse. The tables that let a role reach a successor or a
+predecessor at all hold every superproperty of a role they hold. A test that holds under
+`l` therefore holds under every superproperty of `l`.
+
+1. **States that accept the same words become one.** The coarsest partition of the states
+   whose blocks are final alike and have transitions by the same properties into the same
+   blocks puts states with the same language together. Each block accepts what each of its
+   states accepted, so every class of the quotient stands for the universal that the class
+   of any of its states stood for, and the quotient's axioms have the consequences of the
+   axioms they replace. A merge that ignored which states are final would make the start
+   final and put the holder under the filler.
+2. **A transition that another covers by a superproperty goes.** When a state has
+   transitions by `l` and by `l'` into the same state and `l` is under `l'`, the transition
+   by `l` goes, and of two transitions by equivalent properties the one with the lower id
+   stays. The state accepts fewer words, but each word it no longer accepts differs from
+   one it accepts only in letters that are subproperties of the accepted word's letters,
+   so the universal it stands for is the same. `X_p ⊑ ∀l.X_q` follows from
+   `X_p ⊑ ∀l'.X_q` and `l ⊑ l'`, and the rules derive each of its instances from the kept
+   axiom, since they apply the kept universal over every link under `l'` in both
+   directions. Dropping the transition by `l'` instead would lose the paths whose link is
+   only under `l'`.
+3. **Transitions by properties that no link can have stay.** The Horn rules' third
+   reduction rests on the list of properties that their links and loops can have, argued
+   for their rules R3 and R4. The disjunctive rules make links from the heads of clauses
+   and from hypothetical successors as well, and the list is not argued for them, so their
+   automata keep these transitions.
+
+The two reductions alternate until neither applies, within the Horn rules' bound of steps.
+They read only the property axioms, so the positions of an unfolding's fresh classes, which
+a kept run reuses, depend on the property axioms and the level alone, and the level is one
+of the options that a kept run must share with the last one.
+
+`tests/dl_automata.rs` checks the reductions. Eight hand-written cases combine transitive
+properties under transitive properties, inverses, negative existential restrictions, a
+chain, equivalent properties, a nominal and a qualified maximum with unions. In the
+counting case two links of a simple subproperty merge under the maximum, and the merged
+successor needs the universal that the reduced automaton carries over them. Each is taken whole by the
+disjunctive rules at every level on one and four threads with the answer of the reference
+reasoners, HermiT 1.4.5 and Konclude 0.7.0, whose union is the reference because each
+misses subsumptions that the other finds. The reduced automata derive fewer conclusions on
+each case. A merge that ignores which states are final and a covered transition dropped
+by the superproperty each fail all eight, the backward cases through a holder that only a
+union gives, so that the EL rules cannot answer them. 200 generated cases with transitive
+properties, chains and inclusions between properties and between their inverses are taken
+whole at levels 0 and 2 on one thread with the reference answer, and the reduction changes
+the conclusions of 107 of them. The wrong merge fails 172 of them and the wrong drop none,
+so the hand-written cases alone guard the second reduction. Levels 0 and 2 give one answer on every fixture of items
+603, 897 and 712 on which neither run falls back, and none of the fixtures of items 603
+and 897 has an automaton that the reduction changes. A classifier kept across runs answers
+as a fresh one at every level while a universal is added and removed, reuses its contexts
+between runs at one level and starts afresh when the level changes, since the fresh
+classes of an unfolding are numbered by its automaton's states.
+
 ### Nominals in the disjunctive rules
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
@@ -3975,9 +4956,12 @@ disjointness or an irreflexivity, and the run either leaves such an axiom out an
 it or gives the default answer. A larger minimum, a maximum, an exact cardinality, a
 self restriction, functionality, asymmetry, irreflexivity or disjointness of the universal
 property itself has no replacement, and the ontology is then not rewritten. Neither is an
-ontology that names an entity with the prefix `urn:sparkles:internal:` of the fresh names,
-and a rewritten run that does not take the disjunctive rules starts again on the original
-axioms. Both cases give the default answer. The classes and individuals of an axiom that
+ontology that names an entity with the prefix `urn:sparkles:internal:` of the fresh names. A
+rewritten run that turns the ontology Horn or OWL 2 EL and takes every rewritten axiom keeps
+its lower-tier answer with the original axioms' statistics and fresh-name hiding, while a
+rewritten run that does not take the disjunctive rules and either remains disjunctive or
+leaves out any rewritten axiom starts again on the original axioms. Both declined cases give the default
+answer. The classes and individuals of an axiom that
 the rewriting drops stay in the signature, and the statistics count the original axioms
 outside OWL 2 EL. The universal property links every context
 to h, and on the generated ontologies above every run that passed the bound had the
@@ -4375,6 +5359,171 @@ clauses that hold x, about 380,000 of 866,000 conclusions in four seconds. With 
 200 million it finishes after 4.7 million conclusions in 4.4 s on four threads of a build
 without link-time optimization. Item 1075 follows these equalities.
 
+#### Item 1075: binary splitting over disjunctive equalities of constants
+
+When a rooted non-counting classification enables `Limits::rooted_eq_split` or sets
+`SPARKLES_ROOTED_EQ_SPLIT=1`, the classifier resolves explosive root disjunctive
+equalities between named constants by binary semantic case splitting outside the
+consequence-based calculus. The switch is off by default, and the alternative block-order
+restriction on the rooted literal order remains deferred because its global transitivity
+and completeness transfer across mixed contexts are unproved.
+
+The soundness and completeness argument rests on two properties. First, for any ontology
+`O` and any two distinct named individuals `u` and `v` from the original input signature,
+every model of `O` satisfies either `u = v` or `u ≠ v`. Consequently `O` is consistent if
+and only if at least one of the two branches `O ∪ {u = v}` and `O ∪ {u ≠ v}` is
+consistent, and a class subsumption or individual class assertion holds in `O` if and only
+if it holds in every consistent leaf of the binary split tree. Second, before projecting
+any consistent leaf into the split accumulator, the classifier closes subsumptions over
+all met classes including internal reduction classes and verifies that no real nominal in
+the leaf, including anonymous witnesses and any active universal-property hub, reaches an
+unsatisfiable class. It then projects subsumptions and public instances onto the original
+visible signature, treating unconstrained declared-only individuals as instances of every
+class subsuming `owl:Thing`, and intersects the projected relations across all consistent
+leaves. If every leaf is inconsistent, the ontology is inconsistent and every visible
+class is unsatisfiable.
+
+Candidate discovery inspects empty-body root clauses that contain at least one positive
+equality between two distinct original named individuals not already decided in the
+current branch partition or disequality set. Pure equality disjunctions take priority over
+mixed disjunctions, with deterministic tie-breaking by clause head length and original
+individual rank. At depth zero, the root populates the best candidate while saturation
+runs, and a branch forks once total rooted work crosses the probe threshold of 16,384
+conclusions, or immediately on a pure equality disjunction at depth one and below. The
+equality child merges `u` and `v` in its branch partition, remaps all inherited branch
+disequalities and closes immediately as inconsistent on a self-disequality collision, and
+the disequality child adds `DifferentIndividuals(u, v)`. All prefix work before forks and
+restarts is charged in `Stats::dl_rooted_spent` disjointly from terminal leaf work in
+`Stats::dl_work`, so the combined total stays within one frozen `attempt_bound` across
+every branch, bounded by default depth and leaf caps of 8 and 32. If no fork occurs, the
+run preserves its ordinary context index and incremental state. If a fork occurs, the
+classifier retains a compact `SplitAnswer` holding the intersected taxonomy and public
+instances so `Classifier::describe` and `Saturation::describe` answer without keeping a
+branch index, and clears that answer on any edit or strict `Error::Incomplete` refusal.
+Every branch partition, disequality list, clause and dynamic conjunction insertion,
+leaf closure, taxonomy construction and retained answer is pre-admitted against the
+single memory ledger and caller pool before allocation.
+
+On the `shoi-042` fixture, enabling `Limits::rooted_eq_split` with `Limits::rooted_merge`
+completes across one and four threads under both cautious and eager expansion and both
+stepped and unstepped drivers, with two splits, three consistent leaves, two merge
+restarts, 18,103 prefix conclusions and 21,144 leaf conclusions for a total of 39,247
+derived conclusions against the 524,288 bound. With `Limits::rooted_merge` off it
+completes across all configurations with 18,032 prefix conclusions and 30,595 leaf
+conclusions for a total of 48,627 conclusions. Every configuration matches the checked-in
+HermiT taxonomy oracle and the exact individual instances of `shoi-042` with zero excluded
+axioms and no fallback. Across all 50 `shoi` fixtures with both switches on, all 50
+complete within the 524,288 bound with zero taxonomy differences against the checked-in
+HermiT oracles. Benchmark-host timings remain for default-on qualification under item 823.
+
+### Anonymous individuals and top-property inclusions
+
+Items 1281 and 1282 close the two cheapest gaps of item 1272's census of what
+classification leaves out. On the ORE 2015 DL development set, 55 files left out
+2,827,410 axioms with anonymous individuals, most of them `oboInOwl` reifications such as
+`ClassAssertion(oboInOwl:DbXref _:x)`, and for 31 files nothing else. In six files an inclusion
+`SubObjectPropertyOf(r owl:topObjectProperty)` was one of the things that kept the
+disjunctive rules closed.
+
+**Anonymous individuals.** OWL 2's Direct Semantics satisfies an ontology when some
+mapping of its anonymous individuals to elements satisfies every axiom, so each anonymous
+individual stands for an element that the whole ontology quantifies existentially. A
+fresh constant in its place keeps the ontology's consistency and every entailment that
+does not name it, which is how standard reasoners classify such ontologies. The
+classifier now interns each anonymous individual as a nominal named `_:label`, which no
+IRI can be since the scheme of an IRI starts with a letter. The EL, Horn and disjunctive
+normalizations take it in class and property assertions, negative assertions,
+`SameIndividual`, `DifferentIndividuals`, `ObjectOneOf` and `ObjectHasValue`, where they
+left out the whole axiom before and dropped anonymous members of equalities without a
+report. A label names one individual wherever it occurs among a run's axioms, as the
+axiom model makes equal axioms one. A key binds named individuals alone, as
+`HasKey`'s semantics requires, so the EL rules' key matching skips anonymous nominals as
+members and as values, and item 805's rewriting of keys already enumerated named
+individuals only. A description never lists an anonymous individual among the
+instances of a class, and a change to an axiom with one runs in full. The detection of
+individuals that makes a disjunctive run rooted, and that selects the Horn rules with
+individuals, counts anonymous ones too.
+
+An anonymous individual is an individual for the choice of tier. The disjunctive rules
+without the rooted run take no individuals, so an ontology whose only individuals are
+anonymous, and which has axioms that need case analysis, now leaves those axioms out
+instead of its assertions. No file of the census is such an ontology, and the rooted run
+takes it, which item 823 follows.
+
+A class assertion of a named class whose anonymous individual occurs in no other
+logical axiom, and only once in it, says that the class has an instance and no more. Two
+of them over one class are interchangeable, so the one whose individual has the least
+label stands for the others, which the run does not read. A class assertion of a named
+class is an OWL 2 EL axiom that every run takes in full, so the run reports nothing for
+the assertions it does not read. Before the run, a scan counts the labels of these
+assertions in every logical axiom. Its scratch of 96 bytes for each assertion and a
+pointer for each axiom, which holds the list the run reads, is admitted against
+`Limits::max_memory` beside the caller's axioms and against the pool before it is
+allocated. A refusal leaves every assertion its own individual. The run draws first on
+what the pool granted for the scan and counts it in its peak, every pass of the scan
+polls the deadline and cancellation, and a stopped scan leaves the next run to start
+again in full, as a stopped run does. Every merged assertion in the census is of a named class.
+On `ore_ont_5857`, with 723,805 such assertions, the merge keeps the rooted run within
+its bound, which a constant for each assertion passed.
+
+**Top-property inclusions.** `SubObjectPropertyOf(X owl:topObjectProperty)`, for a
+property, an inverse or a chain `X`, and `SubDataPropertyOf(d owl:topDataProperty)` hold
+of every ontology, and the role table already puts every role below a top property that
+another axiom names. The classifier takes them as OWL 2 EL axioms whose normalization
+adds nothing and interns no top property, so they no longer close
+`Saturation::disj_allowed` or the rooted run's gate. A chain among them meets no range
+restriction of OWL 2 EL, and item 805's rewriting neither starts for them alone nor
+lets a data property among them keep it from an ontology. The run reports them neither
+as left out nor as taken.
+
+**Gate.** The census tool of item 1272, built on the base 0779d666 and on the lane tip,
+reran the 59 files that hold anonymous individuals or top-property inclusions on two
+threads, in the default and the rooted run. Their left-out axioms fall from 5,659,868 to
+5,048 across both runs. Thirty files leave nothing out in the default run and 31 in the
+rooted run, where all 59 left something out before, and no file leaves out an axiom
+without an anonymous individual that the base took. The anonymous-only files move from
+the Horn rules to the EL rules or stay with the Horn rules, and every file keeps its
+consistency. The six files with top-property inclusions leave out what they left out
+before, since their data properties, datatypes and, in the default run, individuals keep
+the disjunctive rules closed too, which items 768, 972 and 823 follow. Item 1272's
+ablation without those axioms showed that the inclusions then no longer close the gate
+and the files reach the rooted run's bound, which item 1284 follows. The peak
+resident memory of a census process, which reads the file and runs both, falls from 752
+to 196 MiB on `ore_ont_10073` and `ore_ont_5481`, from 1,674 to 501 MiB on
+`ore_ont_5857` and by a sixth to two thirds on the other files above 400 MiB. It rises
+by 6 to 7% on `ore_ont_4510` and `ore_ont_9654`, whose anonymous individuals occur in
+other axioms and become individuals of the run, and by 4 to 5 MiB on six files of about
+22 MiB. On `atlas`
+with four threads, in three alternating rounds of three classifications a side of
+3c7d0eb0 against 0779d666, 34 of the 118 file and run cells are faster in every
+classification and 7 slower. The tip classifies `ore_ont_10073` and `ore_ont_5481` in 105
+to 107 ms against 761 to 775 ms, `ore_ont_5857` in 312 against 1,388 ms by default and in
+2,045 against 3,398 ms rooted, and the other files above 100 ms in 0.17 to 0.80 times the
+base's time. `ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375` and `ore_ont_9654` take 1.21
+to 1.27 times as long while they take the 479 to 3,981 axioms that the base left out,
+since their anonymous individuals occur in several axioms, which item 1293 follows. The
+same rounds at 781da4c8, before the review fixes, classified `ore_ont_10073` and
+`ore_ont_5481` in 88 to 90 ms and `ore_ont_5857` in 242 ms by default, so the review fixes
+cost 16 to 18 ms and 70 ms there, and item 1293 also follows that cost. HermiT
+1.4.5.519 references exist for 29 of the 31 files that anonymous individuals alone kept
+from a full answer, and the tip's taxonomy equals HermiT's on all 29 in both runs on four
+threads, with the same consistency. The hand cases of `tests/anonymous_individuals.rs`
+cover each position of an anonymous individual in each tier, keys with anonymous members
+and values, the hiding in descriptions, edits, the shared individual and its budget, and
+the reports and counts of a run that starts again. `dl_tier_d` and `dl_nominals` cover
+the inclusions in each form, a chain beside a range of the top property and item 805's
+rewriting beside a data inclusion. The census and the HermiT comparison above are those
+of 781da4c8, and a rerun with the build of 3c7d0eb0, after the review fixes, gives the
+same left-out axioms, tiers and consistency in all 118 cells and HermiT's taxonomy in all
+58 runs, as its
+[record](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-laptop-3c7d0eb0/record.json)
+shows. The
+[record of 3c7d0eb0's timings](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-atlas-3c7d0eb0/record.json)
+and the
+[record of 781da4c8](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-atlas-781da4c8/record.json),
+which holds the earlier timings, the census and the judgements, are discussed in the
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#anonymous-individuals-and-top-property-inclusions).
+
 ### ROBOT-compatible commands
 
 **The commands.** `sparkles ontology reason`, `reduce` and `relax` (items 634 and 635)
@@ -4389,8 +5538,9 @@ ROBOT's error messages and its exit status 1 are kept. The transformations live 
 the classification passed in as a function, so they use the classifier without changing
 it. `sparkles::handles::ontology::transform::WorkingOntology` reads a file through
 `OntologyFile` or a database with `--loc`, runs the classifier with the caller's
-threads, deadline and budgets, and writes functional-style syntax, RDF/XML, Turtle and
-N-Triples, gzipped when the name ends in `.gz`.
+threads, deadline and budgets, and writes functional-style syntax, OWL/XML, Manchester
+OWL syntax, OBO 1.4, OBO Graphs JSON, RDF/XML, Turtle and N-Triples, gzipped when the
+name ends in `.gz`.
 
 **What each command does.** `reason` validates as ROBOT's `ReasonerHelper.validate` does.
 An inconsistent ontology, an unsatisfiable class or an unsatisfiable object property
@@ -4480,8 +5630,44 @@ and 30.63 s, and the chain took 3.87 s and 10.27 s. The run record of the
 [ROBOT comparison](../../benchmarks/el-classification/RESULTS.md#robot) keeps the
 comparison and the timings.
 
-**Limits.** The commands read no dataset on a server (item 685), write no OWL/XML,
-Manchester, OBO or OBO Graphs JSON (item 686), and refuse
+**Output formats.** `sparkles_owl::owx`, `sparkles_owl::manchester`, `sparkles_owl::obo`
+and `sparkles_owl::obographs` write OWL/XML (`.owx`), Manchester OWL syntax (`.omn`),
+OBO 1.4 (`.obo`) and OBO Graphs JSON (`.json`) documents with proper escaping, W3C
+`PN_PREFIX` prefix validation and bounded nesting (item 686). OBO 1.4 and OBO Graphs JSON
+sort axioms canonically for order-independent output, while OWL/XML streams in input order
+and Manchester groups axioms into sorted entity frames while preserving input order within
+frame sections and miscellaneous frames (repeatable for a given input order). OWL/XML
+covers all 37 OWL 2 axiom kinds losslessly, encodes non-`NCName` blank-node labels
+injectively and duplicates single-operand equivalences to satisfy XSD `minOccurs="2"`. The
+Manchester writer retains standard `rdf`, `rdfs`, `xsd` and `owl` prefix bindings, emits
+W3C-standard `HasKey:`, parenthesized nested complements aligned with the parser's depth
+budget, standard quoted and typed boolean literals, and `BLANK_NODE_LABEL`-validated
+anonymous individuals, synthesizes `DataProperty:`/`Datatype:` and colliding entity frames
+for referenced undeclared entities, and refuses or reports ambiguous punned object/data
+property constructs. OBO 1.4 follows OBO 1.4 URL-as-ID (`http://` and `https://`) and
+`idspace` rules, enforces unique stanza IDs across `[Term]`, `[Typedef]` and `[Instance]`
+and single-cardinality stanza tags including `[Typedef]` `domain:` and `range:` (routing
+eligible extra or boundary-whitespace annotations to `property_value:` and skipping extra
+`instance_of:`, `domain:`, `range:` or unrepresentable values), emits `is_asymmetric: true`
+and `subsetdef:`/`synonymtypedef:` headers, preserves reserved header metadata without
+conflation, and skips or refuses `DataProperty` declarations, `DataPropertyAssertion`
+axioms and non-string qualifiers. OBO Graphs JSON emits and reads `propertyType`
+(`OBJECT`, `DATA`, `ANNOTATION`), rejects cross-axiom and same-axiom entity-kind punning
+collisions, restricts generic `basicPropertyValues` to plain `xsd:string` values, and
+reserves `owl:imports` in graph header `basicPropertyValues` for imports. The Manchester,
+OBO 1.4 and OBO Graphs JSON writers accept `WriteOptions` so callers can either refuse the
+first unrepresentable axiom or header annotation in strict mode or skip it and receive a
+bounded `WriteReport` capping each sample list (`skipped` and `skipped_header`) at
+`MAX_REPORTED_SKIPPED` entries. File outputs stage beside the resolved destination
+(following symlinks, preserving existing file permissions and applying standard umask mode
+to new files) and replace it atomically only after serialization and gzip completion
+succeed. `sparkles ontology reason`, `reduce`, `relax`, `materialize` and chains select
+these writers from the output file extension, including `.gz` variants, and log a concise
+warning to stderr whenever a lossy format skips axioms or header annotations. `sparkles
+ontology axioms` and `sparkles ontology classify` also accept `--format owx`, `omn`, `obo`
+and `obographs`.
+
+**Limits.** The commands read no dataset on a server (item 685) and refuse
 `--prevent-invalid-references true` (item 687). `reason --reasoner emr` asserts
 named superclasses only, as ELK does, not the class expressions that ROBOT's expression
 materializing reasoner adds, which item 691 follows.
@@ -4537,19 +5723,20 @@ With the requests that `owl-load`, `owl-query` and `owl-shacl` send, made with `
 stores the ontologies and HermiT's entailment graphs, answers the five queries as the
 reference does over them and answers the SHACL request.
 
-Thirteen probes each added one violation to the sample. The classifier agrees with
-HermiT on the eight that need disjointness from the closure, keys, asymmetry, universal
-restrictions, the closure's differences, functional properties and a functional string
-property. It misses a reflexive fact that a SWRL rule derives, an individual of an
-enumeration that differs from its members, two values of a functional `xsd:double`
-property and a string in an `xsd:boolean` range, and it has no closed-world cardinality
-check. The rooted run creates no contexts on the sample, because it refuses keys and
-functional data properties, and the sample's base vocabulary and the metrology library
-declare both. Item 768 takes the keys and functional data properties, and items 970 to
-977 record the other gaps, the SWRL reader, the
-lenient read that drops an `AllDisjointClasses` axiom with an undeclared member, the
-`all-disjoint-classes` check that passes its row limit on the sample, owl-reason's
-entailment outputs and an OML importer.
+Thirteen probes each added one violation to the sample. After item 972's datatype checker
+in the Horn tier, the classifier agrees with HermiT on eleven of the thirteen probes,
+covering disjointness from the closure, keys, asymmetry, universal restrictions, the
+closure's differences, functional object properties, a functional string property, two
+values of a functional `xsd:double` property and a string in an `xsd:boolean` range, as
+well as the two closed-world probes that HermiT finds consistent. It misses a reflexive
+fact that a SWRL rule derives and an individual of an enumeration that differs from its
+members, and it has no closed-world cardinality check. The rooted run creates no contexts
+on the sample, because it refuses keys and functional data properties, and the sample's
+base vocabulary and the metrology library declare both. Item 768 takes the keys and
+functional data properties, and items 970, 971 and 973 to 977 record the other gaps, the
+SWRL reader, the lenient read that drops an `AllDisjointClasses` axiom with an undeclared
+member, the `all-disjoint-classes` check that passes its row limit on the sample,
+owl-reason's entailment outputs and an OML importer.
 
 A later run checked these stand-ins against openCAESAR's own pipeline. The sample's
 Gradle build ran with oml2owl 2.13.1, owl-reason 2.15.0 with Openllet 2.6.5 and
@@ -4576,10 +5763,11 @@ On the adapter's closure Sparkles gives the survey's results. The classifier's t
 equals Openllet's with or without counting and the rooted option. `ontology reason`
 gives Openllet's 307 types and the 21 `swrl:Variable` types, OWL RL materialization
 gives the same types and misses the same 34 object property values, and the five queries
-give the same answers. On the probes the classifier again finds the seven
-inconsistencies that need no rule, enumeration or OWL 2 DL datatype. It agrees with
-HermiT, and with Openllet's consistency check alone, that the two closed-world probes
-are consistent, and it misses the same four. The `all-disjoint-classes` check still
+give the same answers. On the probes the classifier finds the nine inconsistencies that
+need no rule or enumeration, including the two OWL 2 DL datatype probes after item 972.
+It agrees with HermiT, and with Openllet's consistency check alone, that the two
+closed-world probes are consistent, and it misses only the rule and enumeration probes.
+The `all-disjoint-classes` check still
 passes its row limit. The rules file that the adapter writes with `generateRules` holds
 the adapter's four default rules and the six bundle rules of the survey's file, but it
 gives its prefixes as `@prefix oml: http://opencaesar.io/oml#` without angle brackets
@@ -4588,6 +5776,127 @@ that it derived from the survey's file came from the translation's extra sub-pro
 statements. Sparkles' rule parser refuses the adapter's file at its first line, and with
 the brackets added it derives exactly Jena's 321 facts. Item 1020 takes the bare
 namespace IRIs.
+
+### Completeness for the whole ontology
+
+Item 1271 aligns `complete` with complete OWL reasoners. HermiT, Pellet, FaCT++ and
+Konclude either answer for the whole ontology or refuse it, and the OWL API's reasoner
+interface has no completeness flag, so its callers read every answer as complete. A
+profile reasoner such as ELK ignores the axioms outside its fragment and warns. Before
+this item `complete` was ELK's weaker statement, true while `outside` listed axioms the run
+left out. It now means that every subsumption between named classes and every
+unsatisfiable class that the whole input ontology entails is in the taxonomy. It is false
+when the run left out or used only in part an axiom, which `excluded` lists, and for the
+partial answer of a stopped run. `completeForTaken` in the wire answers and
+`Classification::complete_for_taken` in Rust keep the old meaning, false only for a
+partial answer. `partial` is its negation, and the dataset retains a run by it.
+
+A class outside `incomplete` keeps its exact answer when axioms are left out. The
+classifier extracts the syntactic bottom-locality module of the class, after Cuenca Grau,
+Horrocks, Kazakov and Sattler, and the class is complete when the module holds no axiom
+the run left out. Let `O` be the ontology, `L` the axioms left out and `T = O \ L`. A model
+of the module `M_C` of `{C}` in `O` extends to a model of `O` that agrees with it on the
+module's signature and makes every other class empty, so the named superclasses of `C`
+that `O` entails are those that `M_C` entails. When `L` misses `M_C`, `M_C` is inside `T`,
+and the run, which is complete for `T`, finds them all. Equivalent classes and
+unsatisfiability follow. A satisfiable class equivalent to such a class is in its module's
+signature, so its own module is inside `M_C`. Every unsatisfiable class shares the node of
+`owl:Nothing`, which a missed unsatisfiable class leaves short, so when any class is
+incomplete every unsatisfiable class is listed too. The answer is exact for the superclasses,
+equivalents and satisfiability of a class outside `incomplete`, and not for its
+subclasses. A class can be complete while a subclass of it is missed, since the subclass's
+module can hold a left-out axiom. On item 1271's `irl1`, which a plain run classifies
+without `K ⊑ Ans`, `Ans` is complete and its children are not.
+
+The consistency verdict needs its own condition, since an inconsistent ontology makes
+every class unsatisfiable. A verdict of inconsistent is sound for `O`. When the run finds
+`T` consistent, `O` is consistent if `L` misses the bottom module of the empty signature in
+`O` or its top module, whose models extend to models of `O` with every class outside the
+signature empty or the whole domain. Otherwise `consistency` is `unknown` and every class is
+incomplete. A third layer decides more classes. Without nominals or `ObjectHasValue`
+outside the assertions and keys, and without the universal object property, a model of
+the terminology's module joins a model of `O` in a disjoint union, so the module of a class
+in `O` without its assertions and keys is enough. The module documentation of
+`transform/module.rs` gives the three arguments in full, and a rule unsure of an axiom's
+locality calls it non-local, which only makes a module larger. The test is syntactic and
+over-approximates, so it can list a class whose answer is exact, such as `S` in `irl1`, and
+never omits a class whose answer can be missed. `dl_fixtures` checks every complete class
+against HermiT on the 640 cases of item 603 with and without the EL-only rules. In 1009
+runs that left axioms out, the consistency stayed known in 379 and 1486 of 5914 classes
+were complete, with no mismatch.
+
+A classification of the terminology alone, which is the default of `ontology classify`,
+HTTP and the bindings without `assertions`, does not read the file's assertions, which are
+part of its ontology. Any assertion with logical content among them counts as left out,
+whether or not it could change an answer. The run reads the assertions up to the first
+such one and reports it in `excluded` under the rule `assertion-not-read`, with one entry
+for all of them. The answer is then not complete, every class of the taxonomy is
+incomplete, and a consistency the run found becomes `unknown`, while an inconsistency
+stays, since it holds for the whole ontology too. A class that only an unread assertion
+names is in no taxonomy, so `incomplete` cannot list it, and it shows through `complete`
+and the `assertion-not-read` entry, and as a class that is not found. An earlier design
+let assertions that the module layers proved harmless leave the run complete. Three
+review rounds each found a case it missed, all of the kind of a class that only an
+assertion names, so it was removed, and roadmap item 1301 records a sound replacement.
+`assertions` true gives the complete answer, and roadmap item 1279 makes it the default.
+
+A triple that maps to no axiom, such as an assertion that a strict read cannot map or
+the domain of a property that is not declared, may carry any logical
+content. Every classification counts such triples, of the terminology and of the
+assertions, in `Stats::unmapped`, and with any of them the answer is not complete, every
+class is incomplete and a consistency found is `unknown`. No `excluded` entry names them,
+since an entry names an axiom, so the wire answers report the count as `stats.unmapped`
+and list the first 100 triples in `unmappedTriples`, in the order the input gave them, as
+N-Triples terms, with `unmappedTruncated` when there are more. The CLI lists the first
+ten, ROBOT's warning the first five and a strict run's refusal the first three. The OWL
+API calls such triples unparsed and reports them through its RDF parser's metadata.
+Sparkles calls them unmapped, since a read of the store maps stored triples and parses
+nothing. A run of the terminology alone reads the assertions only up to the first that
+has logical content or maps to no axiom, so it counts and lists at most one unmapped
+assertion triple. A file in functional-style syntax
+whose entities are all declared reads without the store and has no unmapped triples. One
+with an undeclared entity takes the store's reading, in which a domain or range of an
+undeclared property is such a triple. A class assertion whose class is a blank node that
+no triple of the terminology describes, such as `:x a _:c` alone, is one too. A
+classification later in a ROBOT chain, such as `relax` followed by `classify`, counts the
+unmapped triples of the input that the chain read, while a `check` there checks the
+mapped document, which has lost them, as roadmap item 1311 records. A classification with
+unmapped triples still runs the modules' pass for its left-out axioms, whose answer the
+unmapped triples then override, and roadmap item 1309 records skipping it. A typing as `rdf:Property` alone, as RDFS
+vocabularies type their properties, carries no logical content, so a classification does
+not count it, while the read and the profile checks still report it as unmapped. The GO and ChEBI lite releases in RDF/XML, and stores of
+OWL2Bench and of LUBM with their assertions, count no unmapped triple. The triples of a SWRL rule are not unmapped, since
+the RDF reader maps a rule and its atoms to assertions about anonymous individuals, so a
+classification with `assertions` reads them as assertions and can answer complete while
+it ignores the rule. Roadmap item 1302 records this.
+
+The pass costs nothing when nothing is left out and nothing is dropped. A classification of
+the terminology alone reads the assertions only up to the first with logical content, and
+takes no extraction for them. The pass's extractions share one bound on the
+axioms they examine, 1024 for each axiom of the input and at least about a million, past
+which the classes not yet decided are incomplete, so an answer depends on the input
+alone. `Limits::coverage_work` sets the bound and `Stats::coverage_over` reports it. A
+deadline or cancellation during the pass leaves every class incomplete and the
+consistency unknown with `coverageStopped` set, rather than discard the saturation, and the
+dataset retains the saturation but publishes no such answer. On a loaded laptop with four
+threads the pass took about 0.4 s on GO and 0.8 s and 107 MiB on ChEBI lite with the
+EL-only rules, which leave axioms of both out. These are single approximate runs. `Limits::coverage` false skips it, which the ROBOT-compatible commands
+do since they read only the taxonomy.
+
+`strict` on the request, `--strict` on `ontology classify` and `--strict true` on ROBOT's
+`reason`, `reduce` and `materialize` refuse a run that is not complete for the whole
+ontology. The refusal is the component error `classification-incomplete`, HTTP 422, which
+names the axioms and the rule each breaks, `UnsupportedError` in Python and Node.js, an
+unsupported error in the JVM and the FFI, and ROBOT's `INCOMPLETE REASONING ERROR`. The
+default stays non-strict, except that ROBOT's commands are strict when they name HermiT
+or JFact as the reasoner, since a caller who asks for those expects a complete answer or
+an error. `--strict false` turns that off, and ELK and the other names keep the warning.
+`reduce` classifies ROBOT's subset of the subclass axioms and the property
+characteristics, so its refusal concerns the axioms of that subset. The JVM binding has
+no OWL API reasoner adapter and its `ClassifyQuery` names no reasoner, so its `strict`
+stays off by default as the opt-in. The content fingerprint of a retained classification is
+version 2, since it now covers both flags. The server computes it in memory and stores it
+nowhere, so only a client that kept an older fingerprint sees a new value.
 
 ### Roadmap follow-ups
 
@@ -4736,8 +6045,8 @@ peak of a kept run on four threads is 1.3 to 1.45 times that of the first run, 2
 against 147 MB for the Gene Ontology and 863 against 651 MB for ChEBI lite, since the
 run holds the last index and the chunks of the parallel normalization at once.
 
-Item 590 owns assertion retention and item 664 owns EL individual, merge, key and world
-invalidation. Coordinate their dependency records before making those changes eligible
+Item 590 owns assertion retention, and item 664 delivered EL individual, merge, key and
+world invalidation. Coordinate their dependency records before making those changes eligible
 for native DL reuse. Terminology-only maintenance can ship with a safe full fallback
 before those items finish. Item 589 owns durable automatic scheduling after item 339.
 
@@ -4763,3 +6072,22 @@ invalidation and taxonomy costs, fallback edits, retained bytes and peak memory.
 Acceptance requires a measured benefit for localized edits and a documented memory
 tradeoff. Existing full-classification gates still apply, and accepted slowdowns get a
 roadmap follow-up. This does not promise cheap updates for arbitrary OWL 2 DL.
+
+### Partial answers from every tier (item 714)
+
+`Limits::partial` and `ClassifyRequest::partial` now apply to EL (`Plain` and `Full`)
+and Horn (`Horn` and `HornFull`) classifications alongside Tier D across the library,
+HTTP, CLI and language bindings, while `Saturation::saturate`, DL queries and ROBOT
+commands remain non-partial. When a deadline, cancellation or memory budget stops an EL
+or Horn run after saturation begins, the classifier records interrupted activations on
+`State::interrupted` inside `Run::process`'s existing partial epilogue without adding
+branches to the non-partial hot loops, bounds `Run::flush_links` uniformly and stops
+`horn_rules::flush` promptly on `sends.stop`. A unified two-pass flat-CSR and compact
+bitset dependency recorder (`classify::partial::record`) handles EL, Horn and Tier D
+stops with strict pre-allocation admission against `max_memory` and `charge`, a
+zero-allocation inconsistency pass over `owl:Thing`, individuals and real contexts, exact
+Phase 1 and Phase 2 backward reachability, Phase 3 partial world retention and a
+zero-scratch conservative fallback when admission fails. Before admitting retained state
+and building a partial EL or Horn taxonomy, the classifier frees conjunction contexts,
+pending to-do buffers and non-subsumer tables and sets `partial_over` on memory refusal
+so a Horn run preserves its tier rather than silently downgrading to EL.

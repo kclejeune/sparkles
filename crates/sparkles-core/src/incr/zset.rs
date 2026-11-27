@@ -60,6 +60,19 @@ impl ZSet {
         }
     }
 
+    /// Add a borrowed row, copying its ids only if it becomes a new key.
+    pub(crate) fn add_borrowed(&mut self, row: &Row, w: i64) {
+        if let Some(old) = self.map.get_mut(row) {
+            self.total += w;
+            *old += w;
+            if *old == 0 {
+                self.map.remove(row);
+            }
+        } else if w != 0 {
+            self.add(row.clone(), w);
+        }
+    }
+
     pub fn get(&self, row: &[Id]) -> i64 {
         self.map.get(row).copied().unwrap_or(0)
     }

@@ -358,9 +358,8 @@ impl Dl {
         use AxiomKind as K;
         match ax {
             K::SubClassOf(a, b) => vec![a, b],
-            K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
-                cs.iter().collect()
-            }
+            K::EquivalentClasses(cs) => cs.iter().collect(),
+            K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().collect(),
             K::ObjectPropertyDomain(_, c)
             | K::ObjectPropertyRange(_, c)
             | K::DataPropertyDomain(_, c)

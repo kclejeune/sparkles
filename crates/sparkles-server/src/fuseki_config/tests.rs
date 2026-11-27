@@ -747,8 +747,11 @@ fn shacl_rules_reasoner() {
         r.profile.as_deref(),
         Some("shacl-af?shapes=urn:x:shapes&mode=one-pass")
     );
-    let parsed: sparkles_reasoner::Profile = r.profile.as_deref().unwrap().parse().unwrap();
-    assert_eq!(parsed.name(), "shacl-af");
+    #[cfg(feature = "reasoning")]
+    {
+        let parsed: sparkles_reasoner::Profile = r.profile.as_deref().unwrap().parse().unwrap();
+        assert_eq!(parsed.name(), "shacl-af");
+    }
     assert!(has(&p, Kind::Converted, "sh:Rules"), "{}", p.report.text());
     assert!(
         has(&p, Kind::Manual, "sh:entailment"),
@@ -783,12 +786,19 @@ fn shacl_rules_reasoner() {
     .unwrap();
     let p = plan_for(&[f], &UserSource::default(), Mode::Files).unwrap();
     let r = p.datasets[0].reasoning.as_ref().unwrap();
-    let parsed: sparkles_reasoner::Profile = r.profile.as_deref().unwrap().parse().unwrap();
-    let sparkles_reasoner::Profile::ShaclAf(c) = parsed else {
-        panic!("{:?}", r.profile)
-    };
-    assert_eq!(c.shapes, vec![g.to_string()]);
-    assert!(c.one_pass);
+    assert_eq!(
+        r.profile.as_deref(),
+        Some("shacl-af?shapes=http://example.org/shapes?a=1%26b=50%2525&mode=one-pass")
+    );
+    #[cfg(feature = "reasoning")]
+    {
+        let parsed: sparkles_reasoner::Profile = r.profile.as_deref().unwrap().parse().unwrap();
+        let sparkles_reasoner::Profile::ShaclAf(c) = parsed else {
+            panic!("{:?}", r.profile)
+        };
+        assert_eq!(c.shapes, vec![g.to_string()]);
+        assert!(c.one_pass);
+    }
 }
 
 /// The GenericRuleReasoner's `jr:ruleMode`, read from the `ja:InfModel` as Jena's

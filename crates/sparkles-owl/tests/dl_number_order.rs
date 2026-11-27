@@ -597,7 +597,7 @@ fn a_stopped_run_leaves_the_class_of_a_waiting_minimum_open() {
         else {
             continue;
         };
-        if out.complete {
+        if out.complete_for_taken {
             continue;
         }
         stopped += 1;
@@ -736,7 +736,7 @@ fn the_fixtures_with_minimums_keep_their_answers_with_the_order() {
                     }
                 }
             }
-            let fell = out.stats.dl_over_budget || !out.complete;
+            let fell = out.stats.dl_over_budget || !out.complete_for_taken;
             (got, k.excluded().is_empty(), fell)
         };
         let (_, _, fell_off) = answer(false, 1, Expansion::Cautious);
@@ -779,5 +779,395 @@ fn the_fixtures_with_minimums_keep_their_answers_with_the_order() {
         (within_on, within_off),
         (205, 204),
         "the cases within the bound with the order and without it"
+    );
+}
+
+/// Checks an ontology on one and eight threads under both Cautious and Eager strategies
+/// with counting and `number_order` enabled, verifies zero excluded axioms and parity
+/// against `number_order = false` when it finishes, and checks required/forbidden pairs.
+fn check_strategies(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) -> Classification {
+    let ax = axioms(body);
+    let cs = classes(&ax);
+    let mut base: Option<Classification> = None;
+    for threads in [1, 8] {
+        for expansion in [Expansion::Cautious, Expansion::Eager] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    counting: true,
+                    number_order: true,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(
+                !out.stats.dl_over_budget && out.complete && k.excluded().is_empty(),
+                "counting+order failed on threads={threads}, expansion={expansion:?}, excluded={:?}",
+                k.excluded()
+            );
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
+            if let Some(first) = &base {
+                assert_eq!(
+                    pairs(first, &cs),
+                    pairs(&out, &cs),
+                    "answer differs on threads={threads}, expansion={expansion:?}"
+                );
+            } else {
+                base = Some(out);
+            }
+        }
+    }
+    let on = base.unwrap();
+    let off = run(&ax, false, 1, None);
+    if !off.stats.dl_over_budget {
+        assert_eq!(
+            pairs(&on, &cs),
+            pairs(&off, &cs),
+            "number_order changed the answer"
+        );
+    }
+    for (a, b) in yes {
+        assert!(
+            on.taxonomy.is_subclass(&c(a), &c(b)),
+            "{a} ⊑ {b} is missing"
+        );
+    }
+    for (a, b) in no {
+        assert!(
+            !on.taxonomy.is_subclass(&c(a), &c(b)),
+            "{a} ⊑ {b} is not entailed"
+        );
+    }
+    on
+}
+
+/// Astra's §1 two-element countermodel (both transitive superrole `r` and simple `r`):
+/// `s ⊑ r`, `X ⊑ ≥2 s.X`, `X ⊑ ∃r.A`, `∃r.A ⊑ A`, with an independent counting axiom
+/// `Z ⊑ ≤1 u.⊤` to activate counting through the public classifier. The ontology entails
+/// `X ⊑ A`; keeping R1c disabled and certifying filler inclusions preserves `X ⊑ A`.
+#[test]
+fn astra_two_element_countermodel_preserves_x_subsumes_a() {
+    assert!(
+        !Limits::default().counting,
+        "counting must remain opt-in in Phase 1"
+    );
+    for transitive in [true, false] {
+        let tr = if transitive {
+            "TransitiveObjectProperty(:r)"
+        } else {
+            ""
+        };
+        check_strategies(
+            &format!(
+                "{tr}
+                 SubObjectPropertyOf(:s :r)
+                 SubClassOf(:X ObjectMinCardinality(2 :s :X))
+                 SubClassOf(:X ObjectSomeValuesFrom(:r :A))
+                 SubClassOf(ObjectSomeValuesFrom(:r :A) :A)
+                 SubClassOf(:Z ObjectMaxCardinality(1 :u owl:Thing))
+                 {UNION}"
+            ),
+            &[("X", "A")],
+            &[("X", "Nothing"), ("A", "X"), ("A", "Nothing")],
+        );
+    }
+}
+
+/// The §4.1 9-axiom (6-group) counterexample with an independent counting trigger
+/// `Z ⊑ ≤1 u.⊤` so the public classifier activates counting and `number_order`:
+/// `X ⊑ A ⊔ B`, `A ⊑ ∃r.F`, `B ⊑ ∃r.F`, `X ⊑ U1 ⊔ U2`, `U1 ⊑ ∀r.D1`, `U2 ⊑ ∀r.D2`,
+/// `Disjoint(F, D1)`, `Disjoint(F, D2)`, `∃r.F ⊑ C`. Must entail `X ⊑ ⊥` on 1 and 8
+/// threads under both Cautious and Eager strategies (naive unit shadow blocking failed).
+#[test]
+fn section_4_1_counterexample_with_counting_trigger_entails_x_unsatisfiable() {
+    check_strategies(
+        "SubClassOf(:X ObjectUnionOf(:A :B))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :F))
+         SubClassOf(:B ObjectSomeValuesFrom(:r :F))
+         SubClassOf(:X ObjectUnionOf(:U1 :U2))
+         SubClassOf(:U1 ObjectAllValuesFrom(:r :D1))
+         SubClassOf(:U2 ObjectAllValuesFrom(:r :D2))
+         DisjointClasses(:F :D1)
+         DisjointClasses(:F :D2)
+         SubClassOf(ObjectSomeValuesFrom(:r :F) :C)
+         SubClassOf(:Z ObjectMaxCardinality(1 :u owl:Thing))",
+        &[("X", "Nothing")],
+        &[
+            ("A", "Nothing"),
+            ("B", "Nothing"),
+            ("F", "Nothing"),
+            ("Z", "Nothing"),
+        ],
+    );
+}
+
+/// R1a + R1b: conditional stronger minimums block weaker minimums in clauses without
+/// losing mandatory large-to-small return edges between equivalent representatives.
+#[test]
+fn conditional_minimum_blocking_and_equivalent_rep_return_in_clauses() {
+    check_strategies(
+        &format!(
+            "EquivalentObjectProperties(:r :t)
+             SubObjectPropertyOf(:r :s)
+             SubClassOf(:F :G)
+             SubClassOf(:P ObjectUnionOf(:Keep ObjectMinCardinality(3 :r :F)))
+             SubClassOf(:P ObjectUnionOf(:Keep ObjectMinCardinality(2 :s :G)))
+             SubClassOf(:P ObjectMaxCardinality(2 :s :G))
+             SubClassOf(:X ObjectMinCardinality(2 :r :Bad))
+             SubClassOf(:Q ObjectUnionOf(:Survive ObjectMinCardinality(2 :t :Bad)))
+             SubClassOf(:Bad ObjectIntersectionOf(:B1 :B2))
+             DisjointClasses(:B1 :B2)
+             {UNION}"
+        ),
+        &[("P", "Keep"), ("Q", "Survive"), ("X", "Nothing")],
+        &[("P", "Nothing"), ("Q", "Nothing"), ("Keep", "Nothing")],
+    );
+}
+
+/// R2: symmetric bond roles with negative existentials, nested negative `∃t.(∃s.A)` over
+/// transitive `t` and simple `s`, disjoint negative existentials, compound qualifiers,
+/// and domain/range backward propagation.
+#[test]
+fn r2_shadow_names_nested_nonsimple_and_range_back_propagation() {
+    check_strategies(
+        &format!(
+            "SymmetricObjectProperty(:b)
+             TransitiveObjectProperty(:t)
+             SubObjectPropertyOf(:s :s)
+             ObjectPropertyDomain(:b :Dom)
+             ObjectPropertyRange(:b :Ran)
+             ObjectPropertyRange(:t :TRan)
+             SubClassOf(:Atom ObjectIntersectionOf(:F ObjectSomeValuesFrom(:b :Other)
+               ObjectMaxCardinality(1 :b :F)))
+             SubClassOf(:Other ObjectSomeValuesFrom(:b :Atom))
+             SubClassOf(ObjectSomeValuesFrom(:b :F) :HasF)
+             DisjointClasses(ObjectSomeValuesFrom(:b :BadF) :Good)
+             SubClassOf(:CheckDisj ObjectIntersectionOf(:Good ObjectSomeValuesFrom(:b :BadF)))
+             SubClassOf(:ChainStart ObjectSomeValuesFrom(:t ObjectSomeValuesFrom(:t
+               ObjectSomeValuesFrom(:s :Leaf))))
+             SubClassOf(ObjectSomeValuesFrom(:t ObjectSomeValuesFrom(:s :Leaf)) :Reached)
+             SubClassOf(:QCheck ObjectIntersectionOf(
+               ObjectMaxCardinality(1 :q ObjectSomeValuesFrom(:s :Leaf))
+               ObjectSomeValuesFrom(:q ObjectIntersectionOf(:K1 ObjectSomeValuesFrom(:s :Leaf)))
+               ObjectSomeValuesFrom(:q ObjectIntersectionOf(:K2 ObjectSomeValuesFrom(:s :Leaf)))))
+             DisjointClasses(:K1 :K2)
+             {UNION}"
+        ),
+        &[
+            ("Other", "HasF"),
+            ("Other", "Dom"),
+            ("Other", "Ran"),
+            ("CheckDisj", "Nothing"),
+            ("ChainStart", "Reached"),
+            ("QCheck", "Nothing"),
+        ],
+        &[
+            ("Atom", "Nothing"),
+            ("Other", "Nothing"),
+            ("ChainStart", "Nothing"),
+        ],
+    );
+}
+
+/// R4: chemical-group pattern (`ore_ont_6485` shape) with pairwise disjoint atoms over
+/// symmetric bond roles. Guarded exact-cardinality splitting keeps disjoint atom contexts
+/// from firing the `Carbon`-guarded definition.
+#[test]
+fn r4_chemical_group_guarded_exact_cardinality_pattern() {
+    let body = format!(
+        "SymmetricObjectProperty(:s)
+         SymmetricObjectProperty(:d)
+         DisjointClasses(:Carbon :Oxygen :Hydrogen :Halogen :Sulfur :Nitrogen)
+         SubClassOf(:Bromine :Halogen)
+         SubClassOf(:Organic :Carbon)
+         EquivalentClasses(:Acyl ObjectIntersectionOf(:Carbon
+           ObjectExactCardinality(1 :d :Oxygen)
+           ObjectExactCardinality(2 :s :Organic)))
+         SubClassOf(:CarbonSample ObjectIntersectionOf(:Carbon
+           ObjectExactCardinality(1 :d :Oxygen)
+           ObjectExactCardinality(2 :s :Organic)))
+         SubClassOf(:OxygenSample ObjectIntersectionOf(:Oxygen
+           ObjectSomeValuesFrom(:d :Oxygen)
+           ObjectSomeValuesFrom(:s :Organic)
+           ObjectSomeValuesFrom(:s :Organic)))
+         SubClassOf(:SulfurSample ObjectIntersectionOf(:Sulfur
+           ObjectSomeValuesFrom(:d :Oxygen)
+           ObjectSomeValuesFrom(:s :Halogen)))
+         {UNION}"
+    );
+    let on = check_strategies(
+        &body,
+        &[("CarbonSample", "Acyl")],
+        &[
+            ("CarbonSample", "Nothing"),
+            ("OxygenSample", "Acyl"),
+            ("OxygenSample", "Nothing"),
+            ("SulfurSample", "Acyl"),
+            ("SulfurSample", "Nothing"),
+        ],
+    );
+    let off = run(&axioms(&body), false, 1, None);
+    if !off.stats.dl_over_budget {
+        assert!(
+            on.stats.dl_work < off.stats.dl_work,
+            "guarded R4 should save work: {} vs {}",
+            on.stats.dl_work,
+            off.stats.dl_work
+        );
+    }
+}
+
+/// Astra R4 condition: an ontology where ONLY a lazy equality (no positive at-most
+/// restriction anywhere in the ontology!) can merge a successor with the predecessor `y`,
+/// and that merge sends `s⁻(y, x)` over `Pred` to `Root`, where `Root ⊑ ∀s⁻.Hit` and
+/// `Hit ⊑ ∀r⁻.RootSawSInv` strictly require the `s⁻` carry bit from `DlIx::carried`'s
+/// inverse-carry fixed point over lazy roles.
+#[test]
+fn r4_lazy_only_predecessor_merge_exposes_inverse_role() {
+    check_strategies(
+        &format!(
+            "SubObjectPropertyOf(:p ObjectInverseOf(:r))
+             SubObjectPropertyOf(:p :s)
+             SubClassOf(:Root ObjectSomeValuesFrom(:r :Mid))
+             SubClassOf(:Mid ObjectSomeValuesFrom(:p :Extra))
+             SubClassOf(:Mid :Guard)
+             SubClassOf(ObjectIntersectionOf(:Guard
+               ObjectMinCardinality(2 ObjectInverseOf(:r) owl:Thing)) owl:Nothing)
+             SubClassOf(:Root ObjectAllValuesFrom(ObjectInverseOf(:s) :Hit))
+             SubClassOf(:Hit ObjectAllValuesFrom(ObjectInverseOf(:r) :RootSawSInv))
+             {UNION}"
+        ),
+        &[("Root", "Extra"), ("Root", "RootSawSInv")],
+        &[
+            ("Root", "Nothing"),
+            ("Mid", "Nothing"),
+            ("Extra", "Nothing"),
+            ("Hit", "Nothing"),
+            ("Root", "Hit"),
+            ("Mid", "RootSawSInv"),
+        ],
+    );
+}
+
+/// Astra R4 conditions: mixed conditional guard derived AFTER role premises (exercising
+/// both `Holder::Prem` in `process()` and `Holder::Unit` in `sub()`), compound positive
+/// heads over a transitive role (`∀t.B` and `(C0 ⊓ C2) ⊔ ∃r2.C4`), two distinct fillers on
+/// the same base role (verifying two `r`-neighbours outside `F1` never fire
+/// `P ⊓ ≥2 r.F1 ⊑ H`), exact-zero, bottom filler, empty head, empty body, and nested `=n`
+/// under `neg()` (`DisjointClasses` and union on LHS).
+#[test]
+fn r4_astra_edge_cases_arrival_orders_fillers_and_compound_heads() {
+    check_strategies(
+        &format!(
+            "TransitiveObjectProperty(:t)
+             DisjointClasses(:F1 :F2 :Other)
+             SubClassOf(:HasTwoF1 ObjectIntersectionOf(
+               ObjectSomeValuesFrom(:r ObjectIntersectionOf(:F1 :K1))
+               ObjectSomeValuesFrom(:r ObjectIntersectionOf(:F1 :K2))))
+             DisjointClasses(:K1 :K2)
+             SubClassOf(:HasTwoF2 ObjectIntersectionOf(
+               ObjectSomeValuesFrom(:r ObjectIntersectionOf(:F2 :K1))
+               ObjectSomeValuesFrom(:r ObjectIntersectionOf(:F2 :K2))))
+             SubClassOf(:HasTwoOther ObjectIntersectionOf(
+               ObjectSomeValuesFrom(:r ObjectIntersectionOf(:Other :K1))
+               ObjectSomeValuesFrom(:r ObjectIntersectionOf(:Other :K2))))
+             SubClassOf(:CondTrigger ObjectIntersectionOf(:HasTwoF1 ObjectUnionOf(:G1 :G2)))
+             SubClassOf(ObjectIntersectionOf(:G1 ObjectMinCardinality(2 :r :F1)) :CondOut)
+             SubClassOf(ObjectIntersectionOf(:G2 ObjectMinCardinality(2 :r :F1)) :CondOut)
+             SubClassOf(:Trigger1 ObjectIntersectionOf(:HasTwoF1 ObjectUnionOf(:G :Fallback)))
+             SubClassOf(:Fallback :G)
+             SubClassOf(ObjectIntersectionOf(:G ObjectMinCardinality(2 :r :F1))
+               ObjectAllValuesFrom(:t :TransHit))
+             SubClassOf(:Trigger1 ObjectSomeValuesFrom(:t ObjectSomeValuesFrom(:t :Probe)))
+             SubClassOf(:Probe ObjectAllValuesFrom(ObjectInverseOf(:t)
+               ObjectAllValuesFrom(ObjectInverseOf(:t) :BackCheck)))
+             SubClassOf(:TransHit ObjectAllValuesFrom(ObjectInverseOf(:t)
+               ObjectAllValuesFrom(ObjectInverseOf(:t) :TransSawRoot)))
+             SubClassOf(:Outside ObjectIntersectionOf(:G :HasTwoOther))
+             SubClassOf(ObjectIntersectionOf(:G ObjectMinCardinality(2 :r :F1)
+               ObjectMinCardinality(2 :r :F2))
+               ObjectUnionOf(ObjectIntersectionOf(:C0 :C2) ObjectSomeValuesFrom(:r2 :C4)))
+             SubClassOf(:BothFillers ObjectIntersectionOf(:G :HasTwoF1 :HasTwoF2))
+             SubClassOf(:C0 :UnionDone)
+             SubClassOf(ObjectSomeValuesFrom(:r2 :C4) :UnionDone)
+             SubClassOf(ObjectIntersectionOf(:EmptyHeadGuard ObjectMinCardinality(2 :r :F1))
+               owl:Nothing)
+             SubClassOf(:EmptyHeadHit ObjectIntersectionOf(:EmptyHeadGuard :HasTwoF1))
+             SubClassOf(ObjectIntersectionOf(:ExactZeroGuard ObjectExactCardinality(0 :r :F1))
+               :ZeroOut)
+             SubClassOf(:ZeroHit ObjectIntersectionOf(:ExactZeroGuard
+               ObjectAllValuesFrom(:r :Other)))
+             SubClassOf(ObjectIntersectionOf(:BotGuard ObjectExactCardinality(2 :r owl:Nothing))
+               :NeverHit)
+             SubClassOf(ObjectExactCardinality(64 :r owl:Nothing) :NeverHit64)
+             DisjointClasses(ObjectIntersectionOf(:NestGuard ObjectExactCardinality(2 :r :F1))
+               :NestPeer)
+             SubClassOf(:NestHit ObjectIntersectionOf(:NestGuard :NestPeer
+               ObjectExactCardinality(2 :r :F1)))
+             SubClassOf(ObjectUnionOf(
+               ObjectIntersectionOf(:UnionLhsGuard ObjectExactCardinality(2 :r :F1))
+               :UnionAlt) :UnionOut)
+             SubClassOf(:UnionLhsHit ObjectIntersectionOf(:UnionLhsGuard
+               ObjectExactCardinality(2 :r :F1)))
+             {UNION}"
+        ),
+        &[
+            ("CondTrigger", "CondOut"),
+            ("Trigger1", "TransSawRoot"),
+            ("BothFillers", "UnionDone"),
+            ("EmptyHeadHit", "Nothing"),
+            ("ZeroHit", "ZeroOut"),
+            ("NestHit", "Nothing"),
+            ("UnionLhsHit", "UnionOut"),
+        ],
+        &[
+            ("CondTrigger", "Nothing"),
+            ("Outside", "TransSawRoot"),
+            ("Outside", "Nothing"),
+            ("Trigger1", "Nothing"),
+            ("BothFillers", "Nothing"),
+            ("ZeroHit", "Nothing"),
+            ("BotGuard", "NeverHit"),
+            ("UnionLhsHit", "Nothing"),
+        ],
+    );
+}
+
+/// Memory-budget and cancellation compliance on an ontology exercising R1a, R1b, R2, and R4.
+#[test]
+fn counting_refinements_respect_memory_budget_and_cancellation() {
+    let ax = axioms(&format!(
+        "SymmetricObjectProperty(:s)
+         DisjointClasses(:Carbon :Oxygen :Organic)
+         EquivalentClasses(:Acyl ObjectIntersectionOf(:Carbon
+           ObjectExactCardinality(1 :d :Oxygen)
+           ObjectExactCardinality(2 :s :Organic)))
+         SubClassOf(:Sample ObjectIntersectionOf(:Carbon
+           ObjectExactCardinality(1 :d :Oxygen)
+           ObjectExactCardinality(2 :s :Organic)))
+         {UNION}"
+    ));
+    let cancelled = Classifier::of(&ax).classify(&Limits {
+        threads: 1,
+        counting: true,
+        number_order: true,
+        cancelled: Some(Arc::new(|| true)),
+        ..Limits::default()
+    });
+    assert!(
+        matches!(cancelled, Err(sparkles_owl::classify::Error::Cancelled)),
+        "expected Error::Cancelled, got {cancelled:?}"
+    );
+    let tight_mem = Classifier::of(&ax).classify(&Limits {
+        threads: 1,
+        counting: true,
+        number_order: true,
+        max_memory: Some(128),
+        ..Limits::default()
+    });
+    assert!(
+        matches!(tight_mem, Err(sparkles_owl::classify::Error::Memory { .. })),
+        "expected Error::Memory under 128B cap, got {tight_mem:?}"
     );
 }

@@ -545,6 +545,13 @@ impl LiveCredit {
     }
 
     pub fn remove(&mut self, bytes: u64) -> Result<(), ParentRefused> {
+        drop(self.remove_detached(bytes)?);
+        Ok(())
+    }
+
+    /// Lower live bytes and split any excess reserved credit above [`LIVE_SLACK`]
+    /// into a detached [`MemoryLease`] so the caller can drop it outside locks.
+    pub fn remove_detached(&mut self, bytes: u64) -> Result<Option<MemoryLease>, ParentRefused> {
         let next = self
             .live
             .checked_sub(bytes)
@@ -554,9 +561,28 @@ impl LiveCredit {
             })?;
         self.live = next;
         if self.reserved() - next > LIVE_SLACK {
-            self.lease.shrink(self.reserved() - rounded(next))?;
+            let target = rounded(next).min(self.reserved());
+            let excess = self.reserved() - target;
+            if excess > 0 {
+                return Ok(Some(self.lease.split(excess)?));
+            }
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// Split all excess reserved credit above the rounded live total (including
+    /// down to zero when `live() == 0`) into a detached [`MemoryLease`].
+    pub fn trim_detached(&mut self) -> Option<MemoryLease> {
+        let target = rounded(self.live).min(self.reserved());
+        let excess = self.reserved() - target;
+        if excess == 0 {
+            return None;
+        }
+        Some(
+            self.lease
+                .split(excess)
+                .expect("excess cannot exceed reserved credit"),
+        )
     }
 
     pub fn split_live(&mut self, bytes: u64) -> Result<Self, ParentRefused> {
@@ -581,6 +607,12 @@ impl LiveCredit {
         self.live = live;
         other.live = 0;
         Ok(())
+    }
+
+    /// Absorb a detached [`MemoryLease`] into this account's reserved headroom without
+    /// any parent operation, preserving `live()` unchanged.
+    pub fn try_absorb_lease(&mut self, other: &mut MemoryLease) -> Result<(), ParentRefused> {
+        self.lease.try_merge(other)
     }
 
     pub fn try_move_to(&mut self, parent: ParentHandle) -> Result<(), ParentRefused> {

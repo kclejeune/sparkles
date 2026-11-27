@@ -17,36 +17,51 @@ pub struct Distinct {
 }
 
 impl Distinct {
-    fn apply(&mut self, c: Changes) -> Changes {
+    fn apply(&mut self, p: &mut Pass, c: Changes) -> Result<Changes> {
         let mut out = Changes::new();
-        for (r, w) in c {
+        let mut tracked = self.bytes();
+        for (i, (r, w)) in c.into_iter().enumerate() {
             let (old, new) = self.weights.add(r.clone(), w);
             match (old > 0, new > 0) {
                 (false, true) => out.push((r, 1)),
                 (true, false) => out.push((r, -1)),
                 _ => {}
             }
+            if i % 1024 == 1023 {
+                p.tick()?;
+                p.sync_op_state(&mut tracked, self.bytes())?;
+            }
         }
-        out
+        p.sync_op_state(&mut tracked, self.bytes())?;
+        Ok(out)
     }
 
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
         self.weights = ZSet::new();
+        let mark = p.output_lease_mark();
         let c = self.inner.init(p)?;
-        Ok(self.apply(c))
+        let c_leases = p.take_output_leases_since(mark);
+        let out = self.apply(p, c)?;
+        drop(c_leases);
+        Ok(out)
     }
 
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
+        let mark = p.output_lease_mark();
         let c = self.inner.delta(p)?;
-        Ok(self.apply(c))
+        let c_leases = p.take_output_leases_since(mark);
+        let out = self.apply(p, c)?;
+        drop(c_leases);
+        Ok(out)
     }
 
     /// [`apply`](Self::apply) with annotations: a row's annotation is the sum of its
     /// input rows' annotations, so every annotation change passes, with the weight's
     /// crossing when there is one.
-    fn apply_a(&mut self, c: AChanges) -> AChanges {
+    fn apply_a(&mut self, p: &mut Pass, c: AChanges) -> Result<AChanges> {
         let mut out = AChanges::new();
-        for (r, w, a) in c {
+        let mut tracked = self.bytes();
+        for (i, (r, w, a)) in c.into_iter().enumerate() {
             let (old, new) = self.weights.add(r.clone(), w);
             let d = match (old > 0, new > 0) {
                 (false, true) => 1,
@@ -56,23 +71,32 @@ impl Distinct {
             if d != 0 || !a.is_zero() {
                 out.push((r, d, a));
             }
+            if i % 1024 == 1023 {
+                p.tick()?;
+                p.sync_op_state(&mut tracked, self.bytes())?;
+            }
         }
-        out
+        p.sync_op_state(&mut tracked, self.bytes())?;
+        Ok(out)
     }
 
     pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
         self.weights = ZSet::new();
         let c = self.inner.init_a(p)?;
-        Ok(self.apply_a(c))
+        self.apply_a(p, c)
     }
 
     pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
         let c = self.inner.delta_a(p)?;
-        Ok(self.apply_a(c))
+        self.apply_a(p, c)
     }
 
     pub fn bytes(&self) -> u64 {
         self.weights.bytes(self.inner.schema.len())
+    }
+
+    pub fn clear(&mut self) {
+        self.weights = ZSet::new();
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {

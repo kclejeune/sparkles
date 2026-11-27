@@ -34,7 +34,7 @@ enum Test {
         needle: Arc<str>,
         /// substring search for `CONTAINS`, built once for the needle
         finder: Box<memchr::memmem::Finder<'static>>,
-        lang: Option<Arc<str>>,
+        lang: Option<(Arc<str>, Option<oxrdf::BaseDirection>)>,
     },
     Regex {
         arg: Arg,
@@ -106,7 +106,9 @@ enum Key<'a> {
         lex: &'a [u8],
         /// language tag without the base direction
         lang: Option<&'a [u8]>,
-        /// datatype other than `xsd:string` / `rdf:langString`
+        /// RDF 1.2 base direction (`--ltr` / `--rtl`), present only with `lang`
+        dir: Option<oxrdf::BaseDirection>,
+        /// datatype other than `xsd:string` / `rdf:langString` / `rdf:dirLangString`
         typed: bool,
     },
     /// blank node or triple term
@@ -125,23 +127,31 @@ fn split(key: &[u8]) -> Key<'_> {
                 None => Key::Literal {
                     lex,
                     lang: None,
+                    dir: None,
                     typed: false,
                 },
                 Some(b'@') => {
                     let tag = &suffix[1..];
-                    let lang = match tag.len().checked_sub(5) {
-                        Some(i) if tag[i..] == *b"--ltr" || tag[i..] == *b"--rtl" => &tag[..i],
-                        _ => tag,
+                    let (lang, dir) = match tag.len().checked_sub(5) {
+                        Some(i) if tag[i..] == *b"--ltr" => {
+                            (&tag[..i], Some(oxrdf::BaseDirection::Ltr))
+                        }
+                        Some(i) if tag[i..] == *b"--rtl" => {
+                            (&tag[..i], Some(oxrdf::BaseDirection::Rtl))
+                        }
+                        _ => (tag, None),
                     };
                     Key::Literal {
                         lex,
                         lang: Some(lang),
+                        dir,
                         typed: false,
                     }
                 }
                 Some(_) => Key::Literal {
                     lex,
                     lang: None,
+                    dir: None,
                     typed: true,
                 },
             }
@@ -176,6 +186,9 @@ impl Key<'_> {
     }
 }
 
+/// Language tag bytes and optional RDF 1.2 base direction read from a key.
+type KeyLang<'a> = (&'a [u8], Option<oxrdf::BaseDirection>);
+
 impl Arg {
     fn of(e: &Expr, v: VarId) -> Option<Arg> {
         match e {
@@ -187,17 +200,18 @@ impl Arg {
         }
     }
 
-    /// The string and language tag the function sees; `None` on a type error.
-    fn read<'a>(self, key: &Key<'a>) -> Option<(&'a [u8], Option<&'a [u8]>)> {
+    /// The string, language tag and base direction the function sees; `None` on a type error.
+    fn read<'a>(self, key: &Key<'a>) -> Option<(&'a [u8], Option<KeyLang<'a>>)> {
         match (self, key) {
             (
                 Arg::Term,
                 Key::Literal {
                     lex,
                     lang,
+                    dir,
                     typed: false,
                 },
-            ) => Some((lex, *lang)),
+            ) => Some((lex, lang.map(|l| (l, *dir)))),
             (Arg::Str, Key::Iri(i)) => Some((i, None)),
             (Arg::Str, Key::Literal { lex, .. }) => Some((lex, None)),
             _ => None,
@@ -231,7 +245,10 @@ impl KeyFilter {
 
     /// [`KeyFilter::key_prefixes`] of the filter [`KeyFilter::new_for`] would compile,
     /// without compiling its regular expressions, for the planner's estimates.
-    pub(super) fn plan_prefixes(exprs: &[Expr], v: VarId) -> Option<Vec<Vec<u8>>> {
+    pub(super) fn plan_prefixes<'a>(
+        exprs: impl IntoIterator<Item = &'a Expr>,
+        v: VarId,
+    ) -> Option<Vec<Vec<u8>>> {
         Self::compile(Programs::None, exprs, v)?.key_prefixes()
     }
 
@@ -348,7 +365,11 @@ impl KeyFilter {
         Self::compile(Programs::Own, exprs, v)
     }
 
-    fn compile(ctx: Programs<'_>, exprs: &[Expr], v: VarId) -> Option<KeyFilter> {
+    fn compile<'a>(
+        ctx: Programs<'_>,
+        exprs: impl IntoIterator<Item = &'a Expr>,
+        v: VarId,
+    ) -> Option<KeyFilter> {
         fn add(ctx: Programs<'_>, e: &Expr, v: VarId, out: &mut Vec<Test>) -> Option<()> {
             if let Some(test) = length_test(e, v) {
                 out.push(test);
@@ -366,8 +387,9 @@ impl KeyFilter {
                 (Function::Contains | Function::StrStarts | Function::StrEnds, [a, n]) => {
                     let (needle, lang) = match n {
                         Expr::Lit(_, Value::Str(s)) => (s.clone(), None),
-                        Expr::Lit(_, Value::Lang(s, l) | Value::LangDir(s, l, _)) => {
-                            (s.clone(), Some(l.clone()))
+                        Expr::Lit(_, Value::Lang(s, l)) => (s.clone(), Some((l.clone(), None))),
+                        Expr::Lit(_, Value::LangDir(s, l, d)) => {
+                            (s.clone(), Some((l.clone(), Some(*d))))
                         }
                         _ => return None,
                     };
@@ -507,7 +529,7 @@ impl KeyFilter {
                 finder,
                 lang,
             } => arg.read(&key).is_some_and(|(s, l)| {
-                compatible_bytes(l, lang.as_deref())
+                compatible_bytes(l, lang.as_ref().map(|(tag, dir)| (tag.as_ref(), *dir)))
                     && match f {
                         Function::Contains => finder.find(s).is_some(),
                         Function::StrStarts => s.starts_with(needle.as_bytes()),
@@ -581,12 +603,13 @@ fn regex_prefix(pattern: &str, flags: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// [`super::expr::compatible`] on the bytes of a language tag: the needle's tag, if it
-/// has one, must equal the string's ignoring ASCII case.
-fn compatible_bytes(a: Option<&[u8]>, b: Option<&str>) -> bool {
+/// [`super::expr::compatible`] on the bytes of a language tag and optional base
+/// direction: the needle's tag and base direction, if it has a tag, must equal the
+/// string's (ignoring ASCII case on the language tag).
+fn compatible_bytes(a: Option<KeyLang<'_>>, b: super::value::StringLang<'_>) -> bool {
     match (a, b) {
         (_, None) => true,
-        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y.as_bytes()),
+        (Some((x, dx)), Some((y, dy))) => x.eq_ignore_ascii_case(y.as_bytes()) && dx == dy,
         (None, Some(_)) => false,
     }
 }
@@ -715,13 +738,153 @@ mod tests {
             Literal::new_typed_literal("Ada", NamedNode::new_unchecked("http://x/dt")).into()
         )));
 
-        // a language-tagged needle requires a compatible tag
+        // a language-tagged needle requires a compatible tag and matching base direction
         let en = Expr::Lit(crate::id::Id::UNDEF, Value::Lang("A".into(), "en".into()));
-        let f = KeyFilter::new(&[call(Function::StrStarts, vec![Expr::Var(v), en])], v).unwrap();
-        assert!(f.test(&key(
-            Literal::new_language_tagged_literal_unchecked("Ada", "EN").into()
-        )));
-        assert!(!f.test(&key(Literal::new_simple_literal("Ada").into())));
+        let en_ltr = Expr::Lit(
+            crate::id::Id::UNDEF,
+            Value::LangDir("A".into(), "EN".into(), oxrdf::BaseDirection::Ltr),
+        );
+        let en_rtl = Expr::Lit(
+            crate::id::Id::UNDEF,
+            Value::LangDir("A".into(), "en".into(), oxrdf::BaseDirection::Rtl),
+        );
+        let plain_key = key(Literal::new_simple_literal("Ada").into());
+        let lang_key = key(Literal::new_language_tagged_literal_unchecked("Ada", "EN").into());
+        let ltr_key = key(Literal::new_directional_language_tagged_literal_unchecked(
+            "Ada",
+            "en",
+            oxrdf::BaseDirection::Ltr,
+        )
+        .into());
+        let rtl_key = key(Literal::new_directional_language_tagged_literal_unchecked(
+            "Ada",
+            "en",
+            oxrdf::BaseDirection::Rtl,
+        )
+        .into());
+
+        let f_plain = KeyFilter::new(
+            &[call(Function::StrStarts, vec![Expr::Var(v), lit("A")])],
+            v,
+        )
+        .unwrap();
+        assert!(f_plain.test(&plain_key));
+        assert!(f_plain.test(&lang_key));
+        assert!(f_plain.test(&ltr_key));
+        assert!(f_plain.test(&rtl_key));
+
+        let f_en = KeyFilter::new(&[call(Function::StrStarts, vec![Expr::Var(v), en])], v).unwrap();
+        assert!(!f_en.test(&plain_key));
+        assert!(f_en.test(&lang_key));
+        assert!(!f_en.test(&ltr_key));
+        assert!(!f_en.test(&rtl_key));
+
+        for func in [Function::StrStarts, Function::StrEnds, Function::Contains] {
+            let needle_ltr = Expr::Lit(
+                crate::id::Id::UNDEF,
+                Value::LangDir("a".into(), "EN".into(), oxrdf::BaseDirection::Ltr),
+            );
+            let f_ltr =
+                KeyFilter::new(&[call(func.clone(), vec![Expr::Var(v), needle_ltr])], v).unwrap();
+            let sample_plain = key(Literal::new_simple_literal("aba").into());
+            let sample_lang =
+                key(Literal::new_language_tagged_literal_unchecked("aba", "en").into());
+            let sample_ltr = key(Literal::new_directional_language_tagged_literal_unchecked(
+                "aba",
+                "en",
+                oxrdf::BaseDirection::Ltr,
+            )
+            .into());
+            let sample_rtl = key(Literal::new_directional_language_tagged_literal_unchecked(
+                "aba",
+                "en",
+                oxrdf::BaseDirection::Rtl,
+            )
+            .into());
+            assert!(!f_ltr.test(&sample_plain), "{func:?} plain vs ltr");
+            assert!(!f_ltr.test(&sample_lang), "{func:?} lang vs ltr");
+            assert!(f_ltr.test(&sample_ltr), "{func:?} ltr vs ltr");
+            assert!(!f_ltr.test(&sample_rtl), "{func:?} rtl vs ltr");
+        }
+
+        let f_ltr = KeyFilter::new(
+            &[call(
+                Function::StrStarts,
+                vec![Expr::Var(v), en_ltr.clone()],
+            )],
+            v,
+        )
+        .unwrap();
+        assert!(!f_ltr.test(&plain_key));
+        assert!(!f_ltr.test(&lang_key));
+        assert!(f_ltr.test(&ltr_key));
+        assert!(!f_ltr.test(&rtl_key));
+
+        let f_rtl =
+            KeyFilter::new(&[call(Function::StrStarts, vec![Expr::Var(v), en_rtl])], v).unwrap();
+        assert!(!f_rtl.test(&plain_key));
+        assert!(!f_rtl.test(&lang_key));
+        assert!(!f_rtl.test(&ltr_key));
+        assert!(f_rtl.test(&rtl_key));
+
+        // STR(?v) yields a simple string, so any directional needle is incompatible
+        let str_v = call(Function::Str, vec![Expr::Var(v)]);
+        let f_str_ltr =
+            KeyFilter::new(&[call(Function::StrStarts, vec![str_v, en_ltr.clone()])], v).unwrap();
+        assert!(!f_str_ltr.test(&ltr_key));
+
+        // Malformed or uppercase direction suffixes stay part of the language tag with no
+        // base direction, matching Value::from_key and id::lang_literal.
+        let raw_lang =
+            |lex: &[u8], tag: &[u8]| [b"\"".as_slice(), lex, &[KEY_SEP], b"@", tag].concat();
+        let f_en_only = KeyFilter::new(
+            &[call(
+                Function::StrStarts,
+                vec![
+                    Expr::Var(v),
+                    Expr::Lit(crate::id::Id::UNDEF, Value::Lang("A".into(), "en".into())),
+                ],
+            )],
+            v,
+        )
+        .unwrap();
+        let f_en_ltr =
+            KeyFilter::new(&[call(Function::StrStarts, vec![Expr::Var(v), en_ltr])], v).unwrap();
+        for tag in [
+            b"en--LTR".as_slice(),
+            b"en--RTL",
+            b"en--foo",
+            b"en-us--RTL",
+            b"a",
+        ] {
+            let raw = raw_lang(b"Ada", tag);
+            let tag_str = std::str::from_utf8(tag).unwrap();
+            assert!(
+                matches!(Value::from_key(&raw), Value::Lang(ref l, ref t) if &**l == "Ada" && &**t == tag_str),
+                "from_key should keep {tag_str:?} as an undirected language tag"
+            );
+            assert!(
+                matches!(
+                    split(&raw),
+                    Key::Literal {
+                        lex: b"Ada",
+                        lang: Some(l),
+                        dir: None,
+                        typed: false,
+                    } if l == tag
+                ),
+                "split should match from_key for {tag_str:?}"
+            );
+            assert!(f_plain.test(&raw), "plain needle should match {tag_str:?}");
+            assert!(
+                !f_en_only.test(&raw),
+                "@en needle should reject {tag_str:?}"
+            );
+            assert!(
+                !f_en_ltr.test(&raw),
+                "@en--ltr needle should reject {tag_str:?}"
+            );
+        }
     }
 
     /// A bound filter takes each regular expression's own program after earlier tests
@@ -1011,5 +1174,39 @@ mod tests {
             assert!(f.test(&good) && bound.test(&good), "case {i} on {good:?}");
             assert!(!f.test(&bad) && !bound.test(&bad), "case {i} on {bad:?}");
         }
+    }
+
+    #[test]
+    fn regex_dot_excludes_carriage_return_unless_s_flag_is_set() {
+        let v = 0;
+        let cr = key(Literal::new_simple_literal("a\rb").into());
+        let lf = key(Literal::new_simple_literal("a\nb").into());
+        let ok = key(Literal::new_simple_literal("axb").into());
+        let dot = key(Literal::new_simple_literal("a.b").into());
+
+        let f = KeyFilter::new(
+            &[call(Function::Regex, vec![Expr::Var(v), lit("^a.b$")])],
+            v,
+        )
+        .unwrap();
+        assert!(f.test(&ok) && f.test(&dot));
+        assert!(!f.test(&cr) && !f.test(&lf));
+
+        let fs = KeyFilter::new(
+            &[call(
+                Function::Regex,
+                vec![Expr::Var(v), lit("^a.b$"), lit("s")],
+            )],
+            v,
+        )
+        .unwrap();
+        assert!(fs.test(&ok) && fs.test(&dot) && fs.test(&cr) && fs.test(&lf));
+
+        let fcls = KeyFilter::new(
+            &[call(Function::Regex, vec![Expr::Var(v), lit("^a[.]b$")])],
+            v,
+        )
+        .unwrap();
+        assert!(fcls.test(&dot) && !fcls.test(&ok) && !fcls.test(&cr));
     }
 }

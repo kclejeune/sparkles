@@ -1,0 +1,1 @@
+{"queryType":"DESCRIBE","triples":[],"quads":[[{"type":"uri","value":"urn:ex:o"},{"type":"uri","value":"urn:ex:q"},{"type":"literal","value":"after\no"},null]],"meta":{"describeTruncated":false,"memory":"<n>","plan":"<n>","rowsProduced":"<n>","sentRows":1,"status":"complete","timing":"<n>","totalRows":1}}

@@ -11,7 +11,7 @@
 //! to the run's commit and rules by `reasoning-generalized.json`.
 
 mod diagnostic_summary;
-pub use diagnostic_summary::literal_typings_controlled;
+pub use diagnostic_summary::{literal_typings_controlled, literal_typings_controlled_guarded};
 
 use crate::INFERRED_GRAPH;
 use crate::budget::{Budget, BudgetFailure, Held, table_bytes, table_capacity};
@@ -35,6 +35,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+struct CacheSlot {
+    kept: Option<Kept>,
+    generation: u64,
+}
+
 /// The closure of a dataset's last materialization, kept in memory for the next run.
 ///
 /// The closure keeps its derived facts in memory and reads the explicit facts from the
@@ -42,21 +47,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// one back after its commit. Only closures of at most `max_triples` derived facts are
 /// kept.
 pub struct Cache {
-    kept: Mutex<Option<Kept>>,
+    kept: Mutex<CacheSlot>,
     max_triples: AtomicUsize,
+    retained_parent: Option<crate::ParentHandle>,
+    #[cfg(test)]
+    on_take_detached: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Default of [`Cache::new`]'s limit.
 pub const DEFAULT_CACHE_TRIPLES: usize = 10_000_000;
-
-impl Kept {
-    /// The heap of the closure, its witnesses and the generalized facts.
-    fn heap_bytes(&self) -> usize {
-        self.closure.heap_bytes()
-            + set_bytes(&self.generalized)
-            + self.witnesses.as_ref().map_or(0, Witnesses::heap_bytes)
-    }
-}
 
 /// The witnesses of one fact of a kept closure (spec F18 §7.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,9 +78,44 @@ impl Cache {
     /// none).
     pub fn new(max_triples: usize) -> Cache {
         Cache {
-            kept: Mutex::new(None),
+            kept: Mutex::new(CacheSlot {
+                kept: None,
+                generation: 0,
+            }),
             max_triples: AtomicUsize::new(max_triples),
+            retained_parent: None,
+            #[cfg(test)]
+            on_take_detached: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn on_take_detached(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.on_take_detached.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_locked(&self) -> bool {
+        self.kept.is_locked()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kept_snap_strong_count(&self) -> Option<usize> {
+        self.kept
+            .lock()
+            .kept
+            .as_ref()
+            .map(|k| Arc::strong_count(&k.closure.terms.snap))
+    }
+
+    /// Charge closures kept in this cache to `parent` instead of holding no retained pool credit.
+    pub fn with_retained_parent(mut self, parent: Option<crate::ParentHandle>) -> Cache {
+        self.retained_parent = parent;
+        self
+    }
+
+    pub(crate) fn retained_parent(&self) -> Option<crate::ParentHandle> {
+        self.retained_parent.clone()
     }
 
     /// Change the limit (a kept closure over it is dropped at the next run).
@@ -96,15 +130,20 @@ impl Cache {
 
     /// Drop the kept closure.
     pub fn clear(&self) {
-        *self.kept.lock() = None;
+        let old = {
+            let mut slot = self.kept.lock();
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.kept.take()
+        };
+        drop(old);
     }
 
     /// The witnesses of `t` in the kept closure: `None` when no closure with witnesses
     /// is kept (see [`crate::ReasonOptions::witnesses`]) or `t` is not one of its facts.
     /// An asserted fact that no rule derives has its own quad as its witness.
     pub fn witnesses(&self, t: &oxrdf::Triple) -> Option<FactWitnesses> {
-        let k = self.kept.lock();
-        let k = k.as_ref()?;
+        let slot = self.kept.lock();
+        let k = slot.kept.as_ref()?;
         let w = k.witnesses.as_ref()?;
         let id = |x: &Term| {
             sparkles_core::id::inline_id(x)
@@ -130,8 +169,8 @@ impl Cache {
         &self,
         key: &sparkles_core::incr::FactKey,
     ) -> Option<(u64, Vec<oxrdf::Triple>)> {
-        let k = self.kept.lock();
-        let k = k.as_ref()?;
+        let slot = self.kept.lock();
+        let k = slot.kept.as_ref()?;
         let w = k.witnesses.as_ref()?;
         let terms = &k.closure.terms;
         let out = w
@@ -154,14 +193,19 @@ impl Cache {
 
     /// What the witnesses of the kept closure hold, when it has them.
     pub fn witness_report(&self) -> Option<crate::WitnessReport> {
-        let k = self.kept.lock();
-        k.as_ref()?.witnesses.as_ref().map(|w| w.report.clone())
+        let slot = self.kept.lock();
+        slot.kept
+            .as_ref()?
+            .witnesses
+            .as_ref()
+            .map(|w| w.report.clone())
     }
 
     /// Derived facts in the kept closure, and the commit it belongs to.
     pub fn kept(&self) -> Option<(usize, u64)> {
         self.kept
             .lock()
+            .kept
             .as_ref()
             .map(|k| (k.closure.graph.live(), k.commit))
     }
@@ -172,63 +216,83 @@ impl Cache {
     /// can use is taken only when its heap fits `budget`, and is charged there; one that
     /// does not fit stays for a later run, and the result is the error.
     fn take_for(&self, budget: &Arc<Budget>, want: &Want<'_>) -> Taken {
-        let mut k = self.kept.lock();
-        let Some(kept) = k.as_ref() else {
+        let (taken, taken_gen, mismatch) = {
+            let mut slot = self.kept.lock();
+            let Some(kept) = slot.kept.as_ref() else {
+                return Taken::None;
+            };
+            if kept.dataset_id != want.dataset_id
+                || kept.commit != want.since
+                || !Arc::ptr_eq(&kept.snap.generation, want.generation)
+            {
+                slot.generation = slot.generation.wrapping_add(1);
+                (slot.kept.take(), 0, Some(Taken::None))
+            } else if kept.digest != want.digest {
+                slot.generation = slot.generation.wrapping_add(1);
+                (slot.kept.take(), 0, Some(Taken::RulesChanged))
+            } else if kept.inputs != want.inputs {
+                slot.generation = slot.generation.wrapping_add(1);
+                (slot.kept.take(), 0, Some(Taken::InputsChanged))
+            } else {
+                let generation = slot.generation;
+                (slot.kept.take(), generation, None)
+            }
+        };
+        if let Some(outcome) = mismatch {
+            drop(taken);
+            return outcome;
+        }
+        let Some(mut kept) = taken else {
             return Taken::None;
         };
-        if kept.dataset_id != want.dataset_id
-            || kept.commit != want.since
-            || !Arc::ptr_eq(&kept.snap.generation, want.generation)
-        {
-            *k = None;
-            return Taken::None;
-        }
-        if kept.digest != want.digest {
-            *k = None;
-            return Taken::RulesChanged;
-        }
-        if kept.inputs != want.inputs {
-            *k = None;
-            return Taken::InputsChanged;
-        }
-        // witnesses the run will not update are dropped before the closure is charged, so
-        // that a run without them, or with another bound, is not refused for their memory
-        if kept.witnesses.as_ref().map(Witnesses::max) != want.witnesses
-            && let Some(kept) = k.as_mut()
-        {
-            kept.witnesses = None;
-        }
-        let Some(kept) = k.as_ref() else {
-            return Taken::None;
+        // Hold aside witnesses the run will not update so the transfer does not charge
+        // them, while preserving them if admission is refused and the entry is restored.
+        let excluded_witnesses = if kept.witnesses.as_ref().map(Witnesses::max) != want.witnesses {
+            kept.witnesses.take()
+        } else {
+            None
         };
-        let need = kept.heap_bytes();
-        if let Err(e) = budget.try_charge(need) {
+        #[cfg(test)]
+        if let Some(hook) = self.on_take_detached.lock().take() {
+            hook();
+        }
+        let restore = |this: &Self, kept: Kept, expected_gen: u64| {
+            let displaced = {
+                let mut slot = this.kept.lock();
+                if slot.generation == expected_gen && slot.kept.is_none() {
+                    slot.kept = Some(kept);
+                    None
+                } else {
+                    Some(kept)
+                }
+            };
+            drop(displaced);
+        };
+        if let Err(e) = kept.transfer_budget(budget) {
+            if let Some(w) = excluded_witnesses {
+                kept.witnesses = Some(w);
+            }
+            restore(self, kept, taken_gen);
             return Taken::Refused(
                 e.with_context(" (taking the closure kept in memory)".into())
                     .into(),
             );
         }
-        budget.release(need);
-        let Some(mut kept) = k.take() else {
-            return Taken::None;
-        };
-        if let Err(e) = kept.closure.set_budget(budget) {
-            *k = Some(kept);
-            return Taken::Refused(e.into());
-        }
-        if let Some(w) = kept.witnesses.as_mut()
-            && let Err(e) = w.set_budget(budget)
-        {
-            *k = Some(kept);
-            return Taken::Refused(e.into());
-        }
+        drop(excluded_witnesses);
         Taken::Kept(Box::new(kept))
     }
 
     fn put(&self, k: Kept) {
-        if k.closure.graph.live() <= self.max_triples.load(Ordering::Relaxed) {
-            *self.kept.lock() = Some(k);
+        if k.closure.graph.live() > self.max_triples.load(Ordering::Relaxed) {
+            drop(k);
+            return;
         }
+        let old = {
+            let mut slot = self.kept.lock();
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.kept.replace(k)
+        };
+        drop(old);
     }
 }
 
@@ -272,6 +336,54 @@ pub(crate) struct Kept {
     generalized: FxHashSet<Triple>,
     /// the generalized facts as saved with the dataset for `commit`
     saved: Option<SavedMeta>,
+    /// retained charge for `generalized`, declared after it so payload drops first
+    generalized_held: Held,
+}
+
+impl Kept {
+    /// Atomically validate, reserve once on `budget`, and commit credit for the closure,
+    /// its witnesses, and its generalized facts without dropping a probe reservation.
+    fn transfer_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
+        let closure_plan = self.closure.plan_budget_transfer(budget)?;
+        let witness_plan = match &self.witnesses {
+            Some(w) => w.plan_budget_transfer(budget)?,
+            None => None,
+        };
+        let gen_source = self.generalized_held.budget().clone();
+        let gen_plan = if Arc::ptr_eq(&gen_source, budget) {
+            None
+        } else {
+            let bytes = set_bytes(&self.generalized);
+            if bytes != 0
+                && gen_source.parent().is_some()
+                && budget.parent().is_some()
+                && gen_source.domain() != budget.domain()
+            {
+                return Err(BudgetFailure::parent(
+                    sparkles_budget::ParentRefused::ForeignDomain,
+                ));
+            }
+            Some(bytes)
+        };
+        let total = closure_plan
+            .total
+            .checked_add(witness_plan.unwrap_or(0))
+            .and_then(|n| n.checked_add(gen_plan.unwrap_or(0)))
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        let mut prepared = Held::try_new_exact(budget, total)?;
+        self.closure
+            .apply_budget_transfer(closure_plan, budget, &mut prepared);
+        if let Some(w) = self.witnesses.as_mut() {
+            w.apply_budget_transfer(witness_plan, &mut prepared);
+        }
+        if let Some(gen_bytes) = gen_plan {
+            let old_gen = std::mem::replace(&mut self.generalized_held, prepared.split(gen_bytes));
+            drop(old_gen);
+        }
+        debug_assert_eq!(prepared.bytes(), 0);
+        drop(prepared);
+        Ok(())
+    }
 }
 
 /// The changes of the union of the input graphs and of the inferred graph between two
@@ -342,8 +454,9 @@ pub(crate) fn kept_changes(
     inputs: &[GraphRef],
 ) -> Option<Result<RawChanges, String>> {
     let old = cache.and_then(|c| {
-        let k = c.kept.lock();
-        k.as_ref()
+        let slot = c.kept.lock();
+        slot.kept
+            .as_ref()
             .filter(|k| {
                 k.dataset_id == store.dataset_id()
                     && k.commit == since
@@ -417,11 +530,11 @@ pub(crate) fn previous(
             mut witnesses,
             mut generalized,
             saved,
+            generalized_held,
             ..
         } = k;
         let raw = raw.map_err(Fallback)?;
-        let mut held = Held::new(budget);
-        held.grow(set_bytes(&generalized))?;
+        let mut held = generalized_held;
         let moved = closure.terms.rebase(snap.clone())?;
         closure.remap(&moved)?;
         if let Some(w) = witnesses.as_mut() {
@@ -479,8 +592,7 @@ pub(crate) fn previous(
         }
     };
     let raw = raw.map_err(Fallback)?;
-    let terms = Terms::new(snap.clone());
-    terms.set_budget(budget)?;
+    let terms = Terms::new_in(snap.clone(), budget)?;
     let changes = raw.resolve(&terms, snap, &ids)?;
     let mut held = Held::new(budget);
     held.grow(changes.heap_bytes())?;
@@ -595,8 +707,7 @@ fn reconstruct(
         !then
     });
     drop((now, added, removed));
-    let mut graph =
-        Graph::with_base(base).try_like(derived.len() + generalized.len(), budget, true)?;
+    let mut graph = Graph::try_with_base_capacity(base, derived.len() + generalized.len(), budget)?;
     graph.try_add_batch(derived)?;
     graph.try_add_batch(generalized.iter().copied())?;
     drop(held);
@@ -617,16 +728,6 @@ pub(crate) enum RawChanges {
 }
 
 impl RawChanges {
-    /// Triples removed from the default graph.
-    pub(crate) fn base_removed(&self) -> usize {
-        match self {
-            RawChanges::Ids(c) => c.base_removed.len(),
-            RawChanges::Quads { base, .. } => {
-                base.iter().filter(|(op, _)| *op == DiffOp::Remove).count()
-            }
-        }
-    }
-
     /// The changes as ids of `terms`, whose snapshot is `snap`; `inputs` are the ids of
     /// the input graphs in it.
     fn resolve(self, terms: &Terms, snap: &Snapshot, inputs: &[Id]) -> anyhow::Result<Changes> {
@@ -949,6 +1050,54 @@ pub(crate) fn keep(
         .graph
         .try_reserve_rows((live / 64).max(1024), (live / 16).max(4096))?;
     budget.check_peak()?;
+    // Drop any obsolete kept entry before migrating onto the cache's retained budget so
+    // replacing a closure does not incur a 2x retained-pool peak or leave a stale entry
+    // pinned when the new closure does not fit.
+    cache.clear();
+    // Migrate off the run's transient work budget onto the cache's retained budget so
+    // finishing a materialization returns work-pool credit to exact 0 and the next
+    // incremental run does not double-charge the closure across two work budgets.
+    let kept_budget = Budget::with_parent(None, cache.retained_parent());
+    let closure_plan = match closure.plan_budget_transfer(&kept_budget) {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::warn!("kept closure did not fit retained budget: {e}");
+            return Ok(false);
+        }
+    };
+    let witness_plan = match &witnesses {
+        Some(w) => match w.plan_budget_transfer(&kept_budget) {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::warn!("kept closure witnesses did not fit retained budget: {e}");
+                return Ok(false);
+            }
+        },
+        None => None,
+    };
+    let gen_bytes = set_bytes(&generalized);
+    let Some(total) = closure_plan
+        .total
+        .checked_add(witness_plan.unwrap_or(0))
+        .and_then(|n| n.checked_add(gen_bytes))
+    else {
+        tracing::warn!("kept closure size overflowed retained budget");
+        return Ok(false);
+    };
+    let mut prepared = match Held::try_new_exact(&kept_budget, total) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("kept closure did not fit retained budget: {e}");
+            return Ok(false);
+        }
+    };
+    closure.apply_budget_transfer(closure_plan, &kept_budget, &mut prepared);
+    if let Some(w) = witnesses.as_mut() {
+        w.apply_budget_transfer(witness_plan, &mut prepared);
+    }
+    let generalized_held = prepared.split(gen_bytes);
+    debug_assert_eq!(prepared.bytes(), 0);
+    drop(prepared);
     cache.put(Kept {
         dataset_id: store.dataset_id(),
         commit: receipt.commit.seq,
@@ -959,6 +1108,7 @@ pub(crate) fn keep(
         witnesses,
         generalized,
         saved,
+        generalized_held,
     });
     Ok(true)
 }
@@ -1187,92 +1337,22 @@ fn read_saved(
 /// materialization were, so a caller that reports them checks that its rules are sound
 /// for OWL 2.
 ///
-/// The cache's lock is held only for a pass over the kept generalized facts that compares
-/// ids, which keeps the `rdf:type` facts with a literal subject and an object the check
-/// decides. Their subjects are decoded after the lock is released, so a run that waits
-/// for the cache, and the writers behind it, do not wait for the decoding. A typing whose
-/// subject is a term the rules made is decoded under the lock, since only the closure
-/// knows it. Nothing is kept between calls, and an in-memory dataset has no typings while
-/// a run has its closure out of the cache.
+/// The reader collects distinct datatype ids from the cache and copies rule-local
+/// datatype keys only for supported ranges. It resolves store vocabulary ids and
+/// decodes terms outside the lock. It copies candidate subjects and their rule-local
+/// keys only for supported ranges in the same cache generation. Literal value-space
+/// checks run outside the lock.
+/// Nothing is kept between calls, and an in-memory dataset has no typings while a run has
+/// its closure out of the cache.
 pub fn literal_typings(
     store: &Store,
     commit: u64,
     cache: Option<&Cache>,
 ) -> anyhow::Result<Option<LiteralTypings>> {
-    if let Some(c) = cache {
-        let ty_term = Term::NamedNode(rdf::TYPE.into_owned());
-        // under the lock: typings decided at once, the others as (subject, datatype)
-        let mut found = Vec::new();
-        let mut pending: Vec<(u64, u64)> = Vec::new();
-        let mut datatypes: FxHashMap<u64, Option<NamedNode>> = FxHashMap::default();
-        let snap = 'kept: {
-            let k = c.kept.lock();
-            let Some(k) = k
-                .as_ref()
-                .filter(|k| k.dataset_id == store.dataset_id() && k.commit == commit)
-            else {
-                break 'kept None;
-            };
-            let terms = &k.closure.terms;
-            let ty = terms.snap.lookup_iri(rdf::TYPE.as_str()).map(|i| i.0);
-            let mut predicates: FxHashMap<u64, bool> = FxHashMap::default();
-            for t in &k.generalized {
-                let is_type = match ty {
-                    Some(ty) => t[1] == ty,
-                    None => *predicates
-                        .entry(t[1])
-                        .or_insert_with(|| terms.term(t[1]).as_ref() == Some(&ty_term)),
-                };
-                if !is_type || terms.kind(t[0]) != crate::terms::Kind::Literal {
-                    continue;
-                }
-                let dt = datatypes
-                    .entry(t[2])
-                    .or_insert_with(|| match terms.term(t[2]) {
-                        Some(Term::NamedNode(n))
-                            if crate::diagnostics::decidable_range(n.as_str()) =>
-                        {
-                            Some(n)
-                        }
-                        _ => None,
-                    });
-                let Some(dt) = dt else {
-                    continue;
-                };
-                if Id(t[0]).tag() == sparkles_core::id::Tag::Local {
-                    let Some(s) = terms.term(t[0]) else {
-                        continue;
-                    };
-                    found.extend(LiteralTypings::violation(
-                        &s,
-                        &ty_term,
-                        &Term::NamedNode(dt.clone()),
-                    ));
-                } else {
-                    pending.push((t[0], t[2]));
-                }
-            }
-            Some(terms.snap.clone())
-        };
-        // the saved files are read without the lock
-        let Some(snap) = snap else {
-            return saved(store, commit);
-        };
-        pending.sort_unstable();
-        for (s, dt) in pending {
-            let (Some(s), Some(Some(dt))) = (snap.term(Id(s)), datatypes.get(&dt)) else {
-                continue;
-            };
-            found.extend(LiteralTypings::violation(
-                &s,
-                &ty_term,
-                &Term::NamedNode(dt.clone()),
-            ));
-        }
-        return Ok(Some(LiteralTypings {
-            commit,
-            facts: found,
-        }));
+    if let Some(cache) = cache
+        && let Some(typings) = diagnostic_summary::literal_typings_cached(store, commit, cache)?
+    {
+        return Ok(Some(typings));
     }
     saved(store, commit)
 }

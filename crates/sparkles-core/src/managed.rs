@@ -25,7 +25,9 @@
 //! it begins.
 //!
 //! Each owner keeps its settings in its own file, such as `evidence.json`, whose SHA-256
-//! digest `managed.json` records. A dataset with `managed.json` needs dataset reader 6
+//! digest `managed.json` records. An evidence entry can also carry a versioned sparse
+//! override, published with the entry and captured by the same backups. Older builds
+//! refuse the unknown entry member. A dataset with `managed.json` needs dataset reader 6
 //! ([`READER`]), so a release that does not enforce the registry refuses to open it.
 //!
 //! A `managed.json` of a format this build does not read, an owner it does not know, a
@@ -44,7 +46,7 @@
 use crate::error::{Error, Result};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// The registry file at the dataset root.
@@ -54,11 +56,13 @@ pub const FILE: &str = "managed.json";
 /// `dataset.json`).
 pub const READER: u32 = 6;
 
-/// The `managed.json` format this build writes. Format 2 adds each owner's
-/// `protections`. Format 1, which has none, is read as a registry whose graphs have no
-/// protection nonces, so they take no typed writes until their owner protects them
-/// again.
-pub const FORMAT: u32 = 3;
+/// The `managed.json` format this build writes when projection-only graphs are recorded.
+/// Format 1 has no `protections` (read as graphs without nonces until re-enabled).
+/// Format 2 adds `protections`. Format 3 adds `configurationHistory` for activated
+/// datasets without `projectionOnly` graphs. Format 4 records registries carrying at
+/// least one `projectionOnly` graph (with or without `configurationHistory`), fencing
+/// older writers that do not enforce the projection-only contract.
+pub const FORMAT: u32 = 4;
 
 /// Whether this build reads the `managed.json` format `f`.
 fn reads_format(f: u64) -> bool {
@@ -73,6 +77,24 @@ pub const MAX_IRI_BYTES: usize = 4096;
 
 /// The largest owner settings file, in bytes.
 pub const MAX_SETTINGS_BYTES: usize = 16 << 20;
+
+/// Whether any owner in `owners` marks at least one graph as projection-only.
+pub(crate) fn owners_have_projection_only(owners: &BTreeMap<OwnerKind, OwnerEntry>) -> bool {
+    owners
+        .values()
+        .any(|entry| !entry.projection_only.is_empty())
+}
+
+/// The canonical `managed.json` format version for `owners` and `has_history`.
+pub(crate) fn expected_format(owners: &BTreeMap<OwnerKind, OwnerEntry>, has_history: bool) -> u32 {
+    if owners_have_projection_only(owners) {
+        FORMAT
+    } else if has_history {
+        3
+    } else {
+        2
+    }
+}
 
 /// Who owns a set of managed graphs. Each owner has its own typed writer and settings
 /// file.
@@ -176,6 +198,10 @@ pub struct OwnerEntry {
     pub profile: u32,
     /// `sha256:` and the lowercase hex SHA-256 digest of the owner's settings file.
     pub settings_digest: String,
+    /// Sparse runtime overrides of declared evidence settings. This independently
+    /// versioned extension is stored only on the evidence entry and only when nonempty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_overrides: Option<EvidenceOverrides>,
     /// The absolute IRIs of the graphs the owner manages.
     pub graphs: Vec<String>,
     /// The protection nonce of each managed graph, chosen at random when the graph
@@ -185,6 +211,14 @@ pub struct OwnerEntry {
     /// and its graphs get one when the owner is enabled again.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub protections: BTreeMap<String, uuid::Uuid>,
+    /// Managed graphs of the evidence owner that are dedicated projection outputs
+    /// (never used as record-role graphs under their current protection nonce, or
+    /// verified free of genuinely published `ev:Operation` history across the dataset
+    /// family when upgraded from a pre-format-4 registry). Written only in
+    /// `managed.json` format 4 so older writers refuse the registry rather than
+    /// publishing records into a projection-only graph.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub projection_only: BTreeSet<String>,
     /// Who sees the graphs through the ordinary read surfaces: `public`, under the
     /// caller's grants. `hidden` is reserved for owners whose control graphs only
     /// their typed inspection renders (spec C26 §2.3), and this build refuses it.
@@ -195,6 +229,43 @@ pub struct OwnerEntry {
     /// it.
     #[serde(default)]
     pub merge: MergePolicy,
+}
+
+/// Versioned settings-layer data attached to the evidence entry at publication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceOverrides {
+    #[serde(deserialize_with = "read_overrides_format")]
+    overrides_format: u32,
+    patch: serde_json::Map<String, serde_json::Value>,
+}
+
+impl EvidenceOverrides {
+    /// An empty runtime patch has no representation in the registry.
+    pub fn new(patch: serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        (!patch.is_empty()).then_some(Self {
+            overrides_format: 1,
+            patch,
+        })
+    }
+
+    /// The sparse settings patch with its version envelope removed.
+    pub fn into_patch(self) -> serde_json::Map<String, serde_json::Value> {
+        self.patch
+    }
+}
+
+fn read_overrides_format<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u32, D::Error> {
+    let format = u32::deserialize(deserializer)?;
+    if format == 1 {
+        Ok(format)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "evidence overrides format {format} is unsupported; this build reads format 1"
+        )))
+    }
 }
 
 /// An owner's [`OwnerEntry::visibility`].
@@ -236,8 +307,10 @@ impl OwnerEntry {
         OwnerEntry {
             profile,
             settings_digest: settings_digest(settings),
+            evidence_overrides: None,
             graphs,
             protections: BTreeMap::new(),
+            projection_only: BTreeSet::new(),
             visibility: Visibility::Public,
             merge: MergePolicy::Refuse,
         }
@@ -355,11 +428,14 @@ pub enum ManagedErrorKind {
     /// The dataset was restored and its jobs recovery is pausing the restored work, so
     /// the transition was refused (spec C26 §7.3).
     JobsRecovering,
+    /// The server's declared evidence settings differ from the settings recorded on the
+    /// dataset, so typed evidence operations are refused until reconciled (spec C25, C19).
+    EvidenceSettingsDrift,
 }
 
 impl ManagedErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ManagedErrorKind; 27] = [
+    pub const ALL: [ManagedErrorKind; 28] = [
         ManagedErrorKind::Protected,
         ManagedErrorKind::Unavailable,
         ManagedErrorKind::UnsupportedProfile,
@@ -387,6 +463,7 @@ impl ManagedErrorKind {
         ManagedErrorKind::PublicationConflict,
         ManagedErrorKind::JobsOverloaded,
         ManagedErrorKind::JobsRecovering,
+        ManagedErrorKind::EvidenceSettingsDrift,
     ];
 
     /// The stable code of the kind.
@@ -419,6 +496,7 @@ impl ManagedErrorKind {
             ManagedErrorKind::PublicationConflict => "publication-conflict",
             ManagedErrorKind::JobsOverloaded => "jobs-overloaded",
             ManagedErrorKind::JobsRecovering => "jobs-recovering",
+            ManagedErrorKind::EvidenceSettingsDrift => "evidence-settings-drift",
         }
     }
 
@@ -494,7 +572,8 @@ impl ManagedError {
             | ManagedErrorKind::ConfigurationHistoryInactive
             | ManagedErrorKind::LeaseLost
             | ManagedErrorKind::PublicationConflict
-            | ManagedErrorKind::JobsRecovering => 409,
+            | ManagedErrorKind::JobsRecovering
+            | ManagedErrorKind::EvidenceSettingsDrift => 409,
             ManagedErrorKind::JobsOverloaded => 429,
             ManagedErrorKind::AuthorityChanged | ManagedErrorKind::ProjectionUnavailable => 503,
         }
@@ -547,6 +626,9 @@ pub(crate) struct Installed {
     /// Present only after a real configuration-history activation/publication.
     pub configuration_history: Option<crate::store::managed_history::Root>,
     pub history_memory: Option<Arc<crate::store::managed_history::MemoryHistory>>,
+    /// Review-policy configuration for support-aware projection visibility
+    /// (spec C25 §5, item 582), computed once when this registry revision is installed.
+    evidence_visibility: crate::access::triples::evidence::EvidenceConfig,
 }
 
 impl Installed {
@@ -556,6 +638,25 @@ impl Installed {
     ) -> Result<Installed> {
         let mut by_key = FxHashMap::default();
         for (owner, entry) in &graphs.owners {
+            if let Some(overrides) = &entry.evidence_overrides
+                && (*owner != OwnerKind::Evidence || overrides.patch.is_empty())
+            {
+                return Err(Error::invalid(
+                    "only an evidence entry can carry a nonempty evidence override",
+                ));
+            }
+            if *owner != OwnerKind::Evidence && !entry.projection_only.is_empty() {
+                return Err(Error::invalid(
+                    "only the evidence owner can carry projectionOnly graphs",
+                ));
+            }
+            for g in &entry.projection_only {
+                if !entry.graphs.contains(g) || !entry.protections.contains_key(g) {
+                    return Err(Error::invalid(format!(
+                        "projectionOnly graph <{g}> is not a protected graph of {owner}"
+                    )));
+                }
+            }
             for g in &entry.graphs {
                 let key = crate::id::iri_key(g).into_boxed_slice();
                 if let Some(other) = by_key.insert(key, *owner)
@@ -567,13 +668,33 @@ impl Installed {
                 }
             }
         }
+        let evidence_visibility =
+            crate::access::triples::evidence::ProjectionConfig::from_installed_parts(
+                &graphs, &settings,
+            );
         Ok(Installed {
             graphs,
             by_key,
             settings,
             configuration_history: None,
             history_memory: None,
+            evidence_visibility,
         })
+    }
+
+    /// Whether a raw history read may reach evidence writes. A pristine registry
+    /// can have configuration history, but installing any owner advances its
+    /// revision. Later revisions may have exported or removed evidence graphs.
+    pub(crate) fn may_have_evidence_history(&self) -> bool {
+        (self.configuration_history.is_some() && self.graphs.revision != 0)
+            || self.graphs.owners.contains_key(&OwnerKind::Evidence)
+            || self.settings.contains_key(&OwnerKind::Evidence)
+    }
+
+    /// Evidence review-policy configuration for support-aware projection visibility,
+    /// resolved once at registry installation.
+    pub(crate) fn evidence_visibility(&self) -> crate::access::triples::evidence::EvidenceConfig {
+        self.evidence_visibility.clone()
     }
 
     /// The owner of the graph whose vocabulary key is `key`.
@@ -612,9 +733,10 @@ fn managed_file<'a>(
     history: Option<&'a crate::store::managed_history::Root>,
 ) -> ManagedFile<'a> {
     ManagedFile {
-        // A legacy configuration change does not activate history or fabricate a
-        // coverage boundary. Only an anchored root writes the new primary form.
-        format: if history.is_some() { FORMAT } else { 2 },
+        // Legacy registries without projection-only graphs keep format 2 (plain) or
+        // format 3 (activated configuration history). Registries carrying any
+        // `projectionOnly` graph write format 4 so pre-581 writers refuse them.
+        format: expected_format(&graphs.owners, history.is_some()),
         revision: graphs.revision,
         owners: graphs.owners.iter().map(|(o, e)| (o.as_str(), e)).collect(),
         configuration_history: history,
@@ -694,6 +816,26 @@ impl ManagedWrite {
                 .and_then(|e| e.protections.get(graph).copied()),
             ManagedState::Unavailable { .. } => None,
         }
+    }
+
+    /// Whether `graph` is marked as a dedicated projection-only graph of this
+    /// capability's owner in the registry this capability is valid for.
+    pub fn is_projection_only(&self, graph: &str) -> bool {
+        match &*self.state {
+            ManagedState::Installed(i) => i.graphs.owners.get(&self.owner).is_some_and(|e| {
+                e.graphs.iter().any(|g| g == graph) && e.projection_only.contains(graph)
+            }),
+            ManagedState::Unavailable { .. } => false,
+        }
+    }
+
+    /// The protection nonce of `graph` for publishing profile records, or `None` when
+    /// `graph` is unmanaged, lacks a nonce, or is marked projection-only.
+    pub fn record_protection(&self, graph: &str) -> Option<uuid::Uuid> {
+        if self.is_projection_only(graph) {
+            return None;
+        }
+        self.protection(graph)
     }
 
     /// Whether any owner manages `graph` in the registry this capability is valid for.
@@ -843,7 +985,7 @@ fn decode_inner(
         Some(Some(f)) => {
             return Err((
                 format!(
-                    "{FILE} has format {f}; Sparkles {} reads formats 1, 2 and {FORMAT}. It was written by a newer release",
+                    "{FILE} has format {f}; Sparkles {} reads formats 1 to {FORMAT}. It was written by a newer release",
                     crate::formats::SPARKLES_VERSION
                 ),
                 false,
@@ -853,9 +995,15 @@ fn decode_inner(
     }
     let raw: RawFile = serde_json::from_value(v).map_err(|e| (format!("{FILE}: {e}"), false))?;
     debug_assert!(reads_format(raw.format));
-    if (raw.format == 3) != raw.configuration_history.is_some() {
+    if raw.format < 3 && raw.configuration_history.is_some() {
         return Err((
-            format!("{FILE}: configuration history requires format 3 and its complete root"),
+            format!("{FILE}: configuration history requires format 3 or {FORMAT}"),
+            false,
+        ));
+    }
+    if raw.format == 3 && raw.configuration_history.is_none() {
+        return Err((
+            format!("{FILE}: format 3 requires configuration history and its complete root"),
             false,
         ));
     }
@@ -864,7 +1012,6 @@ fn decode_inner(
             .map_err(|error| (error.to_string(), false))?;
     }
     let mut owners = BTreeMap::new();
-    let mut settings = BTreeMap::new();
     for (name, value) in raw.owners {
         let Some(owner) = OwnerKind::parse(&name) else {
             return Err((
@@ -892,12 +1039,57 @@ fn decode_inner(
                 false,
             ));
         }
+        if raw.format < 4 && !entry.projection_only.is_empty() {
+            return Err((
+                format!(
+                    "{FILE}: owner {name}: format {} does not support projectionOnly graphs",
+                    raw.format
+                ),
+                false,
+            ));
+        }
+        if entry
+            .protections
+            .iter()
+            .any(|(graph, nonce)| nonce.is_nil() || !entry.graphs.contains(graph))
+        {
+            return Err((
+                format!("{FILE}: owner {name} has an invalid graph protection"),
+                false,
+            ));
+        }
         check_graphs(&entry.graphs).map_err(|e| (format!("{FILE}: owner {name}: {e}"), false))?;
+        owners.insert(owner, entry);
+    }
+    if raw.format == 4 && !owners_have_projection_only(&owners) {
+        return Err((
+            format!("{FILE}: format 4 requires at least one projectionOnly graph"),
+            false,
+        ));
+    }
+    let mut installed = Installed::new(
+        ManagedGraphs {
+            revision: raw.revision,
+            owners,
+        },
+        BTreeMap::new(),
+    )
+    .map_err(|e| (e.to_string(), false))?;
+    installed.configuration_history = raw.configuration_history;
+    if installed.configuration_history.is_some() && installed.file_bytes() != bytes {
+        return Err((
+            format!("{FILE}: history registry is not its unique canonical encoding"),
+            false,
+        ));
+    }
+    // Repair may replace settings only after every owner and the complete
+    // registry have passed structural validation.
+    for (owner, entry) in &installed.graphs.owners {
         let file = owner.settings_file();
-        let found = read_settings(owner).map_err(|e| (format!("{file}: {e}"), false))?;
+        let found = read_settings(*owner).map_err(|e| (format!("{file}: {e}"), false))?;
         let Some(found) = found else {
             return Err((
-                format!("{file} of the managed owner {name} is missing"),
+                format!("{file} of the managed owner {owner} is missing"),
                 true,
             ));
         };
@@ -910,24 +1102,13 @@ fn decode_inner(
         if let Some(why) = owner.check_settings(&found, entry.profile) {
             return Err((why, false));
         }
-        settings.insert(owner, Arc::from(found));
-        owners.insert(owner, entry);
+        installed.settings.insert(*owner, Arc::from(found));
     }
-    let mut installed = Installed::new(
-        ManagedGraphs {
-            revision: raw.revision,
-            owners,
-        },
-        settings,
-    )
-    .map_err(|e| (e.to_string(), false))?;
-    installed.configuration_history = raw.configuration_history;
-    if raw.format == 3 && installed.file_bytes() != bytes {
-        return Err((
-            format!("{FILE}: history registry is not its unique canonical encoding"),
-            false,
-        ));
-    }
+    installed.evidence_visibility =
+        crate::access::triples::evidence::ProjectionConfig::from_installed_parts(
+            &installed.graphs,
+            &installed.settings,
+        );
     Ok(installed)
 }
 
@@ -945,7 +1126,10 @@ pub(crate) fn recorded_history(
     }
     let envelope: Envelope = serde_json::from_slice(bytes)
         .map_err(|_| Error::Corrupt("invalid managed history envelope".into()))?;
-    if !reads_format(envelope.format) || (envelope.format == 3) != envelope.history.is_some() {
+    if !reads_format(envelope.format)
+        || (envelope.format < 3 && envelope.history.is_some())
+        || (envelope.format == 3 && envelope.history.is_none())
+    {
         return Err(Error::Unsupported(
             "managed history envelope has an unsupported version or missing root".into(),
         ));
@@ -1109,6 +1293,12 @@ mod tests {
         v["format"] = 3.into();
         let newer = serde_json::to_vec(&v).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        v["format"] = 4.into();
+        let empty_v4 = serde_json::to_vec(&v).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        v["format"] = 5.into();
+        let unknown_future = serde_json::to_vec(&v).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
         v["owners"]["widgets"] = v["owners"]["evidence"].clone();
         let unknown_owner = serde_json::to_vec(&v).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
@@ -1125,6 +1315,10 @@ mod tests {
         let unknown_merge = serde_json::to_vec(&v).unwrap();
         for (bytes, repairable, settings) in [
             (&newer[..], false, Some(b"{}".to_vec())),
+            (&empty_v4, false, Some(b"{}".to_vec())),
+            (&empty_v4, false, None),
+            (&unknown_owner, false, None),
+            (&unknown_future, false, Some(b"{}".to_vec())),
             (&unknown_owner, false, Some(b"{}".to_vec())),
             (&unknown_profile, false, Some(b"{}".to_vec())),
             (&hidden, false, Some(b"{}".to_vec())),
@@ -1138,6 +1332,112 @@ mod tests {
                 ManagedState::Unavailable { repairable: r, .. } => assert_eq!(r, repairable),
                 s => panic!("{s:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn projection_only_graphs_write_format_4_and_fence_older_readers() {
+        let mut e = entry(&["http://e/rec", "http://e/proj"], b"{}");
+        let rec_nonce = uuid::Uuid::new_v4();
+        let proj_nonce = uuid::Uuid::new_v4();
+        e.protections = [
+            ("http://e/rec".to_string(), rec_nonce),
+            ("http://e/proj".to_string(), proj_nonce),
+        ]
+        .into();
+        e.projection_only = ["http://e/proj".to_string()].into();
+        let graphs = ManagedGraphs {
+            revision: 3,
+            owners: [(OwnerKind::Evidence, e)].into(),
+        };
+        let bytes = file_bytes(&graphs);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // A registry carrying a projectionOnly graph writes format 4, which a
+        // pre-581 reader (accepting formats 1..=3 only) must refuse.
+        let written_format = v["format"].as_u64().unwrap();
+        assert_eq!(written_format, 4);
+        assert!(
+            !(1..=3).contains(&written_format),
+            "older readers accepting 1..=3 must refuse a format-4 projectionOnly registry"
+        );
+        assert_eq!(
+            v["owners"]["evidence"]["projectionOnly"],
+            serde_json::json!(["http://e/proj"])
+        );
+        // Current reader decodes format 4 cleanly.
+        match decode(&bytes, |_| Ok(Some(b"{}".to_vec()))) {
+            ManagedState::Installed(i) => assert_eq!(i.graphs, graphs),
+            s => panic!("expected Installed for format 4, got {s:?}"),
+        }
+        // Downgrading the format marker to 2 or 3 while keeping projectionOnly is refused.
+        for downgraded in [2u64, 3u64] {
+            let mut bad = v.clone();
+            bad["format"] = downgraded.into();
+            assert!(matches!(
+                decode(&serde_json::to_vec(&bad).unwrap(), |_| Ok(Some(
+                    b"{}".to_vec()
+                ))),
+                ManagedState::Unavailable {
+                    repairable: false,
+                    ..
+                }
+            ));
+        }
+        // projectionOnly naming an unlisted or unprotected graph is refused.
+        let mut unlisted = v.clone();
+        unlisted["owners"]["evidence"]["projectionOnly"] = serde_json::json!(["http://e/missing"]);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&unlisted).unwrap(), |_| Ok(Some(
+                b"{}".to_vec()
+            ))),
+            ManagedState::Unavailable {
+                repairable: false,
+                ..
+            }
+        ));
+        let mut unprotected = v.clone();
+        unprotected["owners"]["evidence"]["protections"]
+            .as_object_mut()
+            .unwrap()
+            .remove("http://e/proj");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&unprotected).unwrap(), |_| Ok(Some(
+                b"{}".to_vec()
+            ))),
+            ManagedState::Unavailable {
+                repairable: false,
+                ..
+            }
+        ));
+        // Only the evidence owner may carry projectionOnly graphs.
+        let mut non_evidence = v.clone();
+        non_evidence["owners"]["test"] = non_evidence["owners"]["evidence"].clone();
+        non_evidence["owners"]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("projectionOnly");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&non_evidence).unwrap(), |_| Ok(Some(
+                b"{}".to_vec()
+            ))),
+            ManagedState::Unavailable {
+                repairable: false,
+                ..
+            }
+        ));
+        // Unknown higher versions are refused cleanly.
+        for higher in [5u64, 99u64] {
+            let mut future = v.clone();
+            future["format"] = higher.into();
+            assert!(matches!(
+                decode(&serde_json::to_vec(&future).unwrap(), |_| Ok(Some(
+                    b"{}".to_vec()
+                ))),
+                ManagedState::Unavailable {
+                    repairable: false,
+                    ..
+                }
+            ));
         }
     }
 

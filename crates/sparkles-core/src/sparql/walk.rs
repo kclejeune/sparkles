@@ -60,6 +60,13 @@ pub(super) fn visit_algebra<'a>(
     )
 }
 
+pub(super) fn visit_algebra_ordinary<'a, E>(
+    root: Algebra<'a>,
+    visit: impl FnMut(Algebra<'a>) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
+    walk(root, None, visit, |_| unreachable!("ordinary walk"))
+}
+
 fn walk<'a, E>(
     root: Algebra<'a>,
     preparation: Option<&Preparation>,

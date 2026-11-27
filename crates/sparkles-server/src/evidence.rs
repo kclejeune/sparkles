@@ -1,8 +1,10 @@
 //! Evidence-profile settings and source holds in the server (spec C25 §3 and §7):
 //! `GET` and `PUT /$/evidence/{ds}/settings` read and record a dataset's evidence
 //! settings, `POST /$/evidence/{ds}/detach` stops protecting one graph of their roles,
-//! and `GET` and `POST /$/evidence/{ds}/holds` and `DELETE
-//! /$/evidence/{ds}/holds/{id}` list, acquire and release durable source holds.
+//! `POST /$/evidence/{ds}/projections/reconcile` rebuilds a review policy's accepted
+//! projection after a changed protection, and `GET` and `POST /$/evidence/{ds}/holds`
+//! and `DELETE /$/evidence/{ds}/holds/{id}` list, acquire and release durable source
+//! holds.
 //! `POST /{ds}/claims/resolve` verifies evidence references at their exact retained
 //! views and records by their publication origin, and `POST /{ds}/claims` publishes
 //! authenticated claim proposals (see [`claims`]).
@@ -38,6 +40,15 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(get_settings).put(put_settings),
         )
         .route("/$/evidence/{ds}/detach", post(detach))
+        .route(
+            "/$/evidence/{ds}/identities/rebuild",
+            post(review::rebuild_identities),
+        )
+        .route("/$/evidence/{ds}/reauthenticate", post(reauthenticate))
+        .route(
+            "/$/evidence/{ds}/projections/reconcile",
+            post(review::reconcile_projection),
+        )
         .route("/$/evidence/{ds}/holds", get(list_holds).post(acquire_hold))
         .route("/$/evidence/{ds}/holds/{id}", delete(release_hold))
         .route("/{ds}/claims/resolve", post(resolve))
@@ -51,7 +62,9 @@ pub fn routes() -> Router<Arc<AppState>> {
 mod claims;
 mod review;
 
-pub(crate) use claims::{caller_fence, principal_iri, propose_ingested, record_json};
+pub(crate) use claims::principal_iri;
+#[cfg(feature = "mcp")]
+pub(crate) use claims::{caller_fence, propose_ingested, record_json};
 
 /// The response body: the canonical settings, their digest, the registry revision and
 /// the role graphs that are protected or detached.
@@ -73,8 +86,8 @@ async fn get_settings(State(st): St, Path(name): Path<String>) -> ApiResult<Json
 }
 
 /// `PUT /$/evidence/{ds}/settings`: record complete settings. A configuration that
-/// would stop protecting a graph, or that races with another registry change, is a
-/// `409` that writes nothing.
+/// would stop protecting a graph, change a field locked by `serve --settings`, or race
+/// with another registry change is a `409` that writes nothing.
 async fn put_settings(
     State(st): St,
     Path(name): Path<String>,
@@ -87,10 +100,11 @@ async fn put_settings(
     blocking(move || {
         let control = Control::none();
         let settings = sparkles::evidence::parse_settings(&bytes, &control)?;
-        body(sparkles::evidence::configure(
-            &ds.dataset,
-            &settings,
-            &control,
+        let lock = st.settings.write_lock(&ds.name, &crate::settings::EVIDENCE);
+        let _g = lock.lock();
+        let _declared = st.settings.hold_evidence_declarations();
+        body(crate::settings::evidence::configure_complete(
+            &st, &ds, &settings, &control,
         )?)
     })
     .await
@@ -103,7 +117,8 @@ struct Detach {
 }
 
 /// `POST /$/evidence/{ds}/detach` with `{"graph": IRI}`: ordinary writes can change the
-/// graph until the settings are recorded again.
+/// graph until the settings are recorded again. Refused with `409 locked-by-config` when
+/// `serve --settings` locks evidence enabled and locks a role or policy requiring `graph`.
 async fn detach(
     State(st): St,
     Path(name): Path<String>,
@@ -119,7 +134,203 @@ async fn detach(
         )
     })?;
     let ds = dataset(&st, &name)?;
-    blocking(move || body(sparkles::evidence::detach(&ds.dataset, &request.graph)?)).await
+    blocking(move || {
+        let lock = st.settings.write_lock(&ds.name, &crate::settings::EVIDENCE);
+        let _g = lock.lock();
+        let _declared = st.settings.hold_evidence_declarations();
+        crate::settings::evidence::check_detach_locks(&st, &ds, &request.graph)?;
+        body(sparkles::evidence::detach(&ds.dataset, &request.graph)?)
+    })
+    .await
+}
+
+const MAX_REAUTHENTICATE_BYTES: usize = 4 << 20;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReauthenticateRequest {
+    graph: String,
+    branch: Option<String>,
+    records: Option<Vec<ReauthenticateRecordJson>>,
+    if_head: Option<u64>,
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReauthenticateRecordJson {
+    iri: String,
+    record_digest: Option<String>,
+}
+
+/// `POST /$/evidence/{ds}/reauthenticate`: verify records written under an earlier
+/// protection nonce in a protected evidence record graph against their retained
+/// configuration-bound publication views and recorded digests, and mark the vouched
+/// records under the graph's current protection nonce.
+async fn reauthenticate(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    body: axum::body::Body,
+) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let bytes = crate::http::read_admin_body_capped(
+        body,
+        &st.limits,
+        MAX_REAUTHENTICATE_BYTES as u64,
+        "re-authentication body limit",
+    )
+    .await?;
+    let request: ReauthenticateRequest = serde_json::from_slice(&bytes).map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid re-authentication request: {e}"),
+        )
+    })?;
+    let bad_req = |field: &str, why: &dyn std::fmt::Display| {
+        err(StatusCode::BAD_REQUEST, format!("{field}: {why}"))
+    };
+    let graph = oxrdf::NamedNode::new(&request.graph).map_err(|e| bad_req("graph", &e))?;
+    let records = match request.records {
+        None => None,
+        Some(list) => {
+            if list.is_empty() {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "records: records must not be empty when supplied; omit records to reconcile every record in the graph",
+                ));
+            }
+            if list.len() > sparkles::evidence::MAX_REAUTHENTICATE_RECORDS {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "records: at most {} records",
+                        sparkles::evidence::MAX_REAUTHENTICATE_RECORDS
+                    ),
+                ));
+            }
+            let mut parsed = Vec::with_capacity(list.len());
+            for (i, item) in list.into_iter().enumerate() {
+                let at = format!("records[{i}]");
+                let iri = oxrdf::NamedNode::new(&item.iri)
+                    .map_err(|e| bad_req(&format!("{at}.iri"), &e))?;
+                let expected_digest = item
+                    .record_digest
+                    .as_deref()
+                    .map(|d| {
+                        d.parse::<sparkles::evidence::Sha256Digest>()
+                            .map_err(|e| bad_req(&format!("{at}.recordDigest"), &e))
+                    })
+                    .transpose()?;
+                parsed.push(sparkles::evidence::ReauthenticateRecord {
+                    iri,
+                    expected_digest,
+                });
+            }
+            Some(parsed)
+        }
+    };
+    if let Some(k) = &request.idempotency_key
+        && (k.is_empty() || k.len() > 256)
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "idempotencyKey: a key has 1 to 256 bytes",
+        ));
+    }
+    let branch = request
+        .branch
+        .unwrap_or_else(|| sparkles::branch::MAIN.to_string());
+    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
+    let grant = crate::server_memory::current_grant();
+    let res = blocking(move || -> ApiResult<J> {
+        let _grant = grant;
+        let main = crate::http::main_dataset(&st, &name)?;
+        let here = crate::auth::on_branch(&main.name, &branch);
+        if !p.can(&here, crate::auth::Level::Admin) {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                format!("re-authentication needs admin on {here}"),
+            ));
+        }
+        let logical = if branch == sparkles::branch::MAIN {
+            main.clone()
+        } else {
+            st.branch_dataset(&main, &branch)?
+        };
+        crate::settings::evidence::require_reconciled(&st, &main)?;
+        let caller = crate::http::caller::CallerContext::for_caller(&st, &logical, &p);
+        let opts = caller.options_on(
+            &crate::http::Params::empty(),
+            &here,
+            crate::auth::Endpoint::Update,
+        );
+        let control = Control {
+            deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
+            ..Control::with_cancel(cancel)
+        };
+        let drift = crate::settings::evidence::DriftFence::capture(&st, &main)?;
+        let fence = Arc::new(claims::CallerFence {
+            st: st.clone(),
+            p: p.clone(),
+            drift,
+        });
+        let mut options = sparkles::evidence::ReauthenticateOptions::new(claims::principal_iri(&p));
+        options.records = records;
+        options.idempotency_key = request.idempotency_key;
+        options.if_head = request.if_head;
+        options.dry_run = request.dry_run;
+        options.message = request.message.map(Arc::from);
+        options.author = crate::http::author(&p);
+        options.write = opts.graphs.clone();
+        options.authority = Some(fence.clone());
+        let outcome = sparkles::evidence::reauthenticate(
+            &main.dataset,
+            &logical.dataset,
+            &graph,
+            &options,
+            &control,
+        )?;
+        let mut out = json!({
+            "operation": outcome.operation.as_str(),
+            "graph": outcome.graph.as_str(),
+            "committed": outcome.committed,
+            "replayed": outcome.replayed,
+            "commit": outcome.commit,
+            "branchId": outcome.branch,
+            "records": outcome.records.iter().map(|r| json!({
+                "iri": r.iri.as_str(),
+                "kind": kind_name(r.kind),
+                "recordDigest": r.digest.to_string(),
+                "receipt": r.receipt.as_str(),
+                "alreadyAuthenticated": r.already_authenticated,
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(preview) = &outcome.preview {
+            let commit = preview.receipt_commit();
+            out["dryRun"] = json!({
+                "wouldCommit": matches!(preview.outcome(), sparkles::preview::Outcome::Commit),
+                "inserted": commit.inserted,
+                "deleted": commit.deleted,
+                "error": preview.error(),
+            });
+        }
+        fence.check_uncommitted(outcome.committed)?;
+        Ok(out)
+    })
+    .await;
+    match res {
+        Ok(value) => Ok(Json(value).into_response()),
+        Err(error) if error.audit_code() == "authority-changed" => {
+            Ok(crate::auth::routes::authority_changed_response())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 // ------------------------------------------------------------------ holds ------
@@ -156,8 +367,9 @@ fn branch_names(
 fn hold_json(
     h: &sparkles::evidence::SourceHold,
     names: &std::collections::HashMap<uuid::Uuid, String>,
+    for_dataset: Option<uuid::Uuid>,
 ) -> J {
-    json!({
+    let mut out = json!({
         "id": h.id,
         "owner": h.owner.as_str(),
         "created": sparkles::commit::rfc3339_ms(h.created_ms),
@@ -166,7 +378,11 @@ fn hold_json(
             "branchId": c.branch_id,
             "commit": c.seq,
         })).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(ds) = for_dataset {
+        out["forDatasetId"] = json!(ds);
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -203,19 +419,19 @@ async fn list_holds(
             None => None,
             Some(b) => Some(branch_id(store, b)?),
         };
-        let all = sparkles::evidence::holds(&ds.dataset)?;
-        let held: usize = all.iter().map(|h| h.commits.len()).sum();
+        let all = sparkles::evidence::hold_details(&ds.dataset)?;
+        let held: usize = all.iter().map(|h| h.hold.commits.len()).sum();
         let mut page: Vec<J> = Vec::new();
         let mut next = None;
         for h in all.iter().filter(|h| {
-            q.after.is_none_or(|a| h.id > a)
-                && branch.is_none_or(|b| h.commits.iter().any(|c| c.branch_id == b))
+            q.after.is_none_or(|a| h.hold.id > a)
+                && branch.is_none_or(|b| h.hold.commits.iter().any(|c| c.branch_id == b))
         }) {
             if page.len() == limit {
                 next = page.last().map(|p: &J| p["id"].clone());
                 break;
             }
-            page.push(hold_json(h, &names));
+            page.push(hold_json(&h.hold, &names, h.for_dataset));
         }
         Ok(Json(json!({
             "holds": page,
@@ -313,7 +529,7 @@ async fn acquire_hold(
         } else {
             StatusCode::OK
         };
-        Ok((status, Json(hold_json(&acquired.hold, &names))).into_response())
+        Ok((status, Json(hold_json(&acquired.hold, &names, None))).into_response())
     })
     .await
 }
@@ -684,7 +900,7 @@ fn resolve_now(
 
 /// What `p` may read on branch `branch` of `ds` through the query endpoint, by their
 /// current names: `None` when it may read nothing there.
-fn policy(
+pub(crate) fn policy(
     st: &AppState,
     p: &Principal,
     ds: &sparkles::Dataset,
@@ -744,6 +960,8 @@ impl Execution {
 
 /// One typed operation shared by HTTP and MCP. Both transports perform their endpoint
 /// check; record access and protected writes are checked here by the existing writer.
+/// Refuses with `409 evidence-settings-drift` while the declared and recorded evidence
+/// settings differ.
 pub(crate) fn execute(
     operation: &str,
     st: Arc<AppState>,
@@ -754,15 +972,40 @@ pub(crate) fn execute(
 ) -> ApiResult<J> {
     // Keep admission ownership even when the caller drops its transport future.
     let _grant = execution.grant.clone();
-    match operation {
-        "propose" => claims::propose_now(st, name, principal, bytes, execution),
-        "review" => review::review_now(st, name, principal, bytes, execution),
-        "withdraw" => review::withdraw_now(st, name, principal, bytes, execution),
-        "resolve" => resolve_now(st, name, principal, bytes, execution),
-        "identities" => review::identities_now(st, name, principal, bytes, execution),
-        "dependents" => review::dependents_now(st, name, principal, bytes, execution),
-        _ => unreachable!("unregistered evidence operation"),
+    if st.read_only
+        && matches!(
+            operation,
+            "propose" | "review" | "withdraw" | "rebuild-identities"
+        )
+    {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
+    let main = crate::http::main_dataset(&st, &name)?;
+    if matches!(
+        operation,
+        "propose" | "review" | "withdraw" | "rebuild-identities"
+    ) {
+        crate::settings::evidence::require_reconciled(&st, &main)?;
+        return match operation {
+            "propose" => claims::propose_now(st, name, principal, bytes, execution),
+            "review" => review::review_now(st, name, principal, bytes, execution),
+            "withdraw" => review::withdraw_now(st, name, principal, bytes, execution),
+            "rebuild-identities" => {
+                review::rebuild_identities_now(st, name, principal, bytes, execution)
+            }
+            _ => unreachable!("unregistered evidence write"),
+        };
+    }
+    let fence = crate::settings::evidence::DriftFence::capture(&st, &main)?;
+    let result = match operation {
+        "resolve" => resolve_now(st.clone(), name, principal, bytes, execution),
+        "identities" => review::identities_now(st.clone(), name, principal, bytes, execution),
+        "dependents" => review::dependents_now(st.clone(), name, principal, bytes, execution),
+        _ => unreachable!("unregistered evidence read"),
+    };
+    let _declared = st.settings.hold_evidence_declarations();
+    fence.check(&st)?;
+    result
 }
 
 async fn run_http(

@@ -1,7 +1,7 @@
 //! A recursive-descent reader of the Manchester syntax over the tokens of [`super::lex`].
 
 use super::lex::{self, Name, Tok};
-use super::{Error, ErrorKind, Found, Span, Vocabulary};
+use super::{BoundedError, ByteBudget, Error, ErrorKind, Found, Span, Vocabulary};
 use crate::model::*;
 use crate::vocab;
 use std::collections::BTreeSet;
@@ -12,6 +12,9 @@ type K = EntityKind;
 
 /// How deeply expressions may nest, as the RDF reader allows.
 const MAX_DEPTH: usize = crate::read::MAX_NESTING;
+/// Syntax-level cap on nested grouping parentheses so pathological `((...))` inputs are
+/// bounded without penalizing semantic depth for parenthesized complements or sub-expressions.
+const MAX_SYNTAX_DEPTH: usize = MAX_DEPTH * 2;
 
 /// The words that are part of the grammar of class expressions and data ranges.
 pub const KEYWORDS: [&str; 14] = [
@@ -57,6 +60,11 @@ struct Prop {
     span: Span,
 }
 
+/// Maximum diagnostic message length built when the parser runs in bounded mode.
+const BOUNDED_DIAGNOSTIC_MAX_BYTES: usize = 512;
+/// Maximum bytes copied from a single name, IRI, or ontology label in bounded diagnostics.
+const BOUNDED_SNIPPET_BYTES: usize = 64;
+
 pub struct Parser<'v> {
     toks: Vec<(Tok, Span)>,
     pos: usize,
@@ -65,19 +73,35 @@ pub struct Parser<'v> {
     len: usize,
     v: &'v Vocabulary,
     depth: usize,
+    paren_depth: usize,
+    budget: Option<ByteBudget>,
+    max_error_bytes: Option<usize>,
 }
 
 impl<'v> Parser<'v> {
     pub fn new(text: &str, v: &'v Vocabulary) -> Result<Parser<'v>, Error> {
         let toks = lex::tokens(text)?;
-        Ok(Parser {
+        Ok(Self::from_tokens(toks, text.len(), v))
+    }
+
+    pub(super) fn from_tokens(toks: Vec<(Tok, Span)>, len: usize, v: &'v Vocabulary) -> Parser<'v> {
+        Parser {
             end: toks.len(),
             toks,
             pos: 0,
-            len: text.len(),
+            len,
             v,
             depth: 0,
-        })
+            paren_depth: 0,
+            budget: None,
+            max_error_bytes: None,
+        }
+    }
+
+    pub fn with_budget(mut self, max_bytes: usize) -> Self {
+        self.budget = Some(ByteBudget::new(max_bytes));
+        self.max_error_bytes = Some(BOUNDED_DIAGNOSTIC_MAX_BYTES);
+        self
     }
 
     /// Reads with `f` and checks that nothing is left.
@@ -90,9 +114,47 @@ impl<'v> Parser<'v> {
         Ok(out)
     }
 
+    pub fn whole_bounded<T>(
+        mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<(T, usize), BoundedError> {
+        if self.end == 0 {
+            return Err(BoundedError::Parse {
+                error: Error::syntax(Span::new(0, self.len), "the text is empty"),
+                used: 0,
+            });
+        }
+        match f(&mut self).and_then(|out| self.done().map(|()| out)) {
+            Ok(out) => Ok((out, self.budget.map_or(0, |b| b.used))),
+            Err(error) => {
+                let used = self.budget.map_or(0, |b| b.used);
+                if let Some(b) = self.budget
+                    && b.exceeded
+                {
+                    Err(BoundedError::Budget {
+                        used,
+                        attempted: b.attempted,
+                    })
+                } else {
+                    Err(BoundedError::Parse { error, used })
+                }
+            }
+        }
+    }
+
     fn done(&self) -> Result<(), Error> {
         if self.pos < self.end {
             let (t, s) = &self.toks[self.pos];
+            if let Some(max_bytes) = self.max_error_bytes {
+                let mut msg = String::with_capacity(max_bytes.min(160));
+                push_tok_described_bounded(&mut msg, t, BOUNDED_SNIPPET_BYTES, max_bytes);
+                push_capped(
+                    &mut msg,
+                    " does not continue the expression; join expressions with and, or or parentheses",
+                    max_bytes,
+                );
+                return Err(Error::syntax(*s, msg));
+            }
             let what = match t.word() {
                 Some(w) if KEYWORDS.contains(&w) => format!("the keyword '{w}'"),
                 _ => format!("'{}'", t.shown()),
@@ -156,6 +218,21 @@ impl<'v> Parser<'v> {
     }
 
     fn expected(&self, what: &str) -> Error {
+        if let Some(max_bytes) = self.max_error_bytes {
+            let mut msg = String::with_capacity(max_bytes.min(160));
+            push_capped(&mut msg, "expected ", max_bytes);
+            push_capped(&mut msg, what, max_bytes);
+            match self.peek() {
+                None => {
+                    push_capped(&mut msg, ", but the expression ends", max_bytes);
+                }
+                Some(t) => {
+                    push_capped(&mut msg, ", found ", max_bytes);
+                    push_tok_described_bounded(&mut msg, t, BOUNDED_SNIPPET_BYTES, max_bytes);
+                }
+            }
+            return Error::syntax(self.here(), msg);
+        }
         match self.peek() {
             None => Error::syntax(
                 self.here(),
@@ -168,6 +245,49 @@ impl<'v> Parser<'v> {
                 };
                 Error::syntax(self.here(), format!("expected {what}, found {found}"))
             }
+        }
+    }
+
+    fn parse_iri_checked(&self, span: Span, iri: &str) -> Result<Iri, Error> {
+        if let Some(max_bytes) = self.max_error_bytes {
+            oxrdf::NamedNode::new(iri).map_err(|e| {
+                use std::fmt::Write as _;
+                let mut msg = String::with_capacity(max_bytes.min(160));
+                push_capped(&mut msg, "invalid IRI <", max_bytes);
+                push_snippet(&mut msg, iri, BOUNDED_SNIPPET_BYTES, max_bytes);
+                push_capped(&mut msg, ">: ", max_bytes);
+                let mut reason = String::new();
+                let _ = write!(&mut reason, "{e}");
+                push_capped(&mut msg, &reason, max_bytes);
+                Error::syntax(span, msg)
+            })
+        } else {
+            crate::model::parse_iri(iri).map_err(|e| Error::syntax(span, e.0))
+        }
+    }
+
+    fn parse_lang_literal_checked(
+        &self,
+        span: Span,
+        value: String,
+        lang: &str,
+    ) -> Result<Literal, Error> {
+        if let Some(max_bytes) = self.max_error_bytes {
+            oxrdf::Literal::new_language_tagged_literal(value, lang)
+                .map(Literal)
+                .map_err(|e| {
+                    use std::fmt::Write as _;
+                    let mut msg = String::with_capacity(max_bytes.min(160));
+                    push_capped(&mut msg, "invalid language tag '", max_bytes);
+                    push_snippet(&mut msg, lang, BOUNDED_SNIPPET_BYTES, max_bytes);
+                    push_capped(&mut msg, "': ", max_bytes);
+                    let mut reason = String::new();
+                    let _ = write!(&mut reason, "{e}");
+                    push_capped(&mut msg, &reason, max_bytes);
+                    Error::syntax(span, msg)
+                })
+        } else {
+            Literal::lang(value, lang).map_err(|e| Error::syntax(span, e.0))
         }
     }
 
@@ -185,6 +305,17 @@ impl<'v> Parser<'v> {
             return Err(Error::syntax(
                 self.here(),
                 format!("the expression nests more than {MAX_DEPTH} deep"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn nest_paren(&mut self) -> Result<(), Error> {
+        self.paren_depth += 1;
+        if self.paren_depth > MAX_SYNTAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_SYNTAX_DEPTH} parentheses deep"),
             ));
         }
         Ok(())
@@ -216,11 +347,36 @@ impl<'v> Parser<'v> {
 
     /// The entities of the kinds `want` that `n` names, all with one IRI, in the order
     /// of `want`. An IRI the vocabulary does not know is taken as the first kind.
-    fn resolve(&self, n: &Name, span: Span, want: &[K], what: &str) -> Result<Vec<Entity>, Error> {
-        match self.v.lookup(n, want) {
+    fn resolve(
+        &mut self,
+        n: &Name,
+        span: Span,
+        want: &[K],
+        what: &str,
+    ) -> Result<Vec<Entity>, Error> {
+        let found = match self.v.lookup_bounded(n, want, &mut self.budget) {
+            Ok(f) => f,
+            Err(()) => {
+                return Err(Error::syntax(
+                    span,
+                    "resolved term bytes exceeded the expression budget",
+                ));
+            }
+        };
+        match found {
             Found::Entities(es) => {
                 let iris: BTreeSet<&str> = es.iter().map(|e| e.iri().as_str()).collect();
                 if iris.len() > 1 {
+                    if let Some(max_bytes) = self.max_error_bytes {
+                        let message =
+                            format_ambiguous_bounded(n, &es, iris.len(), self.v, max_bytes);
+                        return Err(Error {
+                            kind: ErrorKind::Ambiguous,
+                            message,
+                            span,
+                            candidates: Vec::new(),
+                        });
+                    }
                     let mut cands = es.clone();
                     cands.dedup_by(|a, b| a.iri() == b.iri());
                     let r = crate::ofn::Renderer::new(self.v.prefixes().iter().cloned());
@@ -252,6 +408,31 @@ impl<'v> Parser<'v> {
             }
             Found::Unknown { iri, others } => {
                 if !others.is_empty() {
+                    if let Some(max_bytes) = self.max_error_bytes {
+                        let mut kinds: Vec<&str> = Vec::new();
+                        for e in &others {
+                            let kw = kind_word(e.kind());
+                            if !kinds.contains(&kw) {
+                                kinds.push(kw);
+                            }
+                        }
+                        let mut msg = String::with_capacity(max_bytes.min(160));
+                        push_capped(&mut msg, "'", max_bytes);
+                        push_name_bounded(&mut msg, n, BOUNDED_SNIPPET_BYTES, max_bytes);
+                        push_capped(&mut msg, "' is ", max_bytes);
+                        push_capped(&mut msg, article(kinds[0]), max_bytes);
+                        push_capped(&mut msg, " ", max_bytes);
+                        push_capped(&mut msg, &join_or(&kinds), max_bytes);
+                        push_capped(&mut msg, ", but ", max_bytes);
+                        push_capped(&mut msg, what, max_bytes);
+                        push_capped(&mut msg, " belongs here", max_bytes);
+                        return Err(Error {
+                            kind: ErrorKind::Kind,
+                            message: msg,
+                            span,
+                            candidates: Vec::new(),
+                        });
+                    }
                     let kinds: Vec<&str> = others.iter().map(|e| kind_word(e.kind())).collect();
                     return Err(Error {
                         kind: ErrorKind::Kind,
@@ -266,40 +447,56 @@ impl<'v> Parser<'v> {
                     });
                 }
                 match iri {
-                    Some(iri) => match crate::model::parse_iri(&iri) {
-                        Ok(i) => Ok(vec![Entity::of_kind(want[0], i)]),
-                        Err(e) => Err(Error::syntax(span, e.0)),
-                    },
-                    None => Err(Error {
-                        kind: ErrorKind::Unknown,
-                        message: format!(
-                            "no {} is named '{}'",
-                            join_or(&want.iter().map(|k| kind_word(*k)).collect::<Vec<_>>()),
-                            name_text(n)
-                        ),
-                        span,
-                        candidates: Vec::new(),
-                    }),
+                    Some(iri) => self
+                        .parse_iri_checked(span, &iri)
+                        .map(|i| vec![Entity::of_kind(want[0], i)]),
+                    None => {
+                        let message = if let Some(max_bytes) = self.max_error_bytes {
+                            let mut msg = String::with_capacity(max_bytes.min(160));
+                            push_capped(&mut msg, "no ", max_bytes);
+                            push_capped(
+                                &mut msg,
+                                &join_or(&want.iter().map(|k| kind_word(*k)).collect::<Vec<_>>()),
+                                max_bytes,
+                            );
+                            push_capped(&mut msg, " is named '", max_bytes);
+                            push_name_bounded(&mut msg, n, BOUNDED_SNIPPET_BYTES, max_bytes);
+                            push_capped(&mut msg, "'", max_bytes);
+                            msg
+                        } else {
+                            format!(
+                                "no {} is named '{}'",
+                                join_or(&want.iter().map(|k| kind_word(*k)).collect::<Vec<_>>()),
+                                name_text(n)
+                            )
+                        };
+                        Err(Error {
+                            kind: ErrorKind::Unknown,
+                            message,
+                            span,
+                            candidates: Vec::new(),
+                        })
+                    }
                 }
             }
         }
     }
 
-    fn class(&mut self) -> Result<Class, Error> {
+    pub(super) fn class(&mut self) -> Result<Class, Error> {
         match self.entity(&[K::Class], "a class")? {
             (Entity::Class(c), _) => Ok(c),
             _ => unreachable!("asked for a class"),
         }
     }
 
-    fn datatype(&mut self) -> Result<Datatype, Error> {
+    pub(super) fn datatype(&mut self) -> Result<Datatype, Error> {
         match self.entity(&[K::Datatype], "a datatype")? {
             (Entity::Datatype(d), _) => Ok(d),
             _ => unreachable!("asked for a datatype"),
         }
     }
 
-    fn object_property(&mut self) -> Result<ObjectProperty, Error> {
+    pub(super) fn object_property(&mut self) -> Result<ObjectProperty, Error> {
         match self.entity(&[K::ObjectProperty], "an object property")? {
             (Entity::ObjectProperty(p), _) => Ok(p),
             _ => unreachable!("asked for an object property"),
@@ -307,7 +504,7 @@ impl<'v> Parser<'v> {
     }
 
     /// An object property expression: a property, `inverse p` or `inverse (p)`.
-    fn ope(&mut self) -> Result<Ope, Error> {
+    pub(super) fn ope(&mut self) -> Result<Ope, Error> {
         if self.eat_word("inverse") {
             let paren = self.peek() == Some(&Tok::LParen);
             if paren {
@@ -376,45 +573,82 @@ impl<'v> Parser<'v> {
 
     /// `conjunction or conjunction …`
     pub fn description(&mut self) -> Result<Ce, Error> {
-        self.nest()?;
-        let first = self.conjunction()?;
-        let mut all = vec![first];
-        while self.eat_word("or") {
-            all.push(self.conjunction()?);
+        self.description_depth().map(|(ce, _)| ce)
+    }
+
+    fn description_depth(&mut self) -> Result<(Ce, usize), Error> {
+        let (first, first_h) = self.conjunction_depth()?;
+        if !self.eat_word("or") {
+            return Ok((first, first_h));
         }
-        self.depth -= 1;
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), Ce::ObjectUnionOf)
-        })
+        // Do not charge `self.depth` provisionally for booleans: recursion back into
+        // nested booleans is already bounded early by `nest_paren` (`MAX_SYNTAX_DEPTH`)
+        // and non-collapsing primaries (`nest` at `MAX_DEPTH`), while the exact semantic
+        // limit is enforced below after deduplication so `E or E` at height `MAX_DEPTH`
+        // still collapses cleanly.
+        let mut all = vec![first];
+        let mut max_h = first_h;
+        loop {
+            let (next, h) = self.conjunction_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !self.eat_word("or") {
+                break;
+            }
+        }
+        let set: BTreeSet<Ce> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let ce = collapse(set, Ce::ObjectUnionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
+        if self.depth + h > MAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_DEPTH} deep"),
+            ));
+        }
+        Ok((ce, h))
     }
 
     /// `primary and primary …`, with `that` read as `and`.
-    fn conjunction(&mut self) -> Result<Ce, Error> {
-        let first = self.primary()?;
-        let mut all = vec![first];
-        while self.eat_word("and") || self.eat_word("that") {
-            all.push(self.primary()?);
+    fn conjunction_depth(&mut self) -> Result<(Ce, usize), Error> {
+        let (first, first_h) = self.primary_depth()?;
+        if !(self.eat_word("and") || self.eat_word("that")) {
+            return Ok((first, first_h));
         }
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), Ce::ObjectIntersectionOf)
-        })
+        let mut all = vec![first];
+        let mut max_h = first_h;
+        loop {
+            let (next, h) = self.primary_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !(self.eat_word("and") || self.eat_word("that")) {
+                break;
+            }
+        }
+        let set: BTreeSet<Ce> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let ce = collapse(set, Ce::ObjectIntersectionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
+        if self.depth + h > MAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_DEPTH} deep"),
+            ));
+        }
+        Ok((ce, h))
     }
 
-    /// Whether a restriction starts at the next token: a property, then a restriction
+    /// Whether a restriction starts at token `pos`: a property, then a restriction
     /// keyword.
-    fn restriction_ahead(&self) -> bool {
-        let k = if self.is_word(self.pos, "inverse") {
-            if self.tok(self.pos + 1) == Some(&Tok::LParen) {
-                self.pos + 4
+    fn restriction_ahead_at(&self, pos: usize) -> bool {
+        let k = if self.is_word(pos, "inverse") {
+            if self.tok(pos + 1) == Some(&Tok::LParen) {
+                pos + 4
             } else {
-                self.pos + 2
+                pos + 2
             }
-        } else if self.is_name(self.pos) {
-            self.pos + 1
+        } else if self.is_name(pos) {
+            pos + 1
         } else {
             return false;
         };
@@ -423,37 +657,51 @@ impl<'v> Parser<'v> {
             .is_some_and(|w| RESTRICTIONS.contains(&w))
     }
 
-    fn primary(&mut self) -> Result<Ce, Error> {
+    /// Whether a restriction starts at the next token: a property, then a restriction
+    /// keyword.
+    fn restriction_ahead(&self) -> bool {
+        self.restriction_ahead_at(self.pos)
+    }
+
+    fn primary_depth(&mut self) -> Result<(Ce, usize), Error> {
+        if self.peek() == Some(&Tok::LParen) {
+            self.nest_paren()?;
+            self.bump();
+            let res = self.description_depth().and_then(|d| {
+                self.expect(Tok::RParen, "')' to close the parenthesis")?;
+                Ok(d)
+            });
+            self.paren_depth -= 1;
+            return res;
+        }
         self.nest()?;
-        let out = if self.eat_word("not") {
-            Ce::ObjectComplementOf(Box::new(self.primary()?))
-        } else if self.peek() == Some(&Tok::LParen) {
-            self.bump();
-            let d = self.description()?;
-            self.expect(Tok::RParen, "')' to close the parenthesis")?;
-            d
-        } else if self.peek() == Some(&Tok::LBrace) {
-            self.bump();
-            let mut is = BTreeSet::new();
-            loop {
-                is.insert(self.individual()?);
-                if self.peek() == Some(&Tok::Comma) {
-                    self.bump();
-                    continue;
+        let res = (|| {
+            if self.eat_word("not") {
+                let (inner, h) = self.primary_depth()?;
+                Ok((Ce::ObjectComplementOf(Box::new(inner)), h + 1))
+            } else if self.peek() == Some(&Tok::LBrace) {
+                self.bump();
+                let mut is = BTreeSet::new();
+                loop {
+                    is.insert(self.individual()?);
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                        continue;
+                    }
+                    self.expect(Tok::RBrace, "',' or '}'")?;
+                    break;
                 }
-                self.expect(Tok::RBrace, "',' or '}'")?;
-                break;
+                Ok((Ce::ObjectOneOf(is), 1))
+            } else if self.restriction_ahead() {
+                self.restriction_depth()
+            } else if self.is_name(self.pos) {
+                Ok((Ce::Class(self.class()?), 1))
+            } else {
+                Err(self.expected("a class, a restriction, 'not', '(' or '{'"))
             }
-            Ce::ObjectOneOf(is)
-        } else if self.restriction_ahead() {
-            self.restriction()?
-        } else if self.is_name(self.pos) {
-            Ce::Class(self.class()?)
-        } else {
-            return Err(self.expected("a class, a restriction, 'not', '(' or '{'"));
-        };
+        })();
         self.depth -= 1;
-        Ok(out)
+        res
     }
 
     /// Whether a data range rather than a class expression starts at token `k`.
@@ -467,14 +715,17 @@ impl<'v> Parser<'v> {
                 _ => break,
             }
         }
+        if self.restriction_ahead_at(k) {
+            return false;
+        }
         match self.tok(k) {
             Some(Tok::Str { .. } | Tok::Number(_)) => true,
             Some(Tok::Name(Name::Word(w))) if w == "true" || w == "false" => true,
             Some(Tok::LBrace) => self.literal_ahead(k + 1),
             Some(Tok::Name(n)) => {
                 self.tok(k + 1) == Some(&Tok::LBracket)
-                    || matches!(self.v.lookup(n, &[K::Datatype]), Found::Entities(_))
-                        && !matches!(self.v.lookup(n, &[K::Class]), Found::Entities(_))
+                    || self.v.lookup_kinds(n, &[K::Datatype]).contains(K::Datatype)
+                        && !self.v.lookup_kinds(n, &[K::Class]).contains(K::Class)
             }
             _ => false,
         }
@@ -498,7 +749,7 @@ impl<'v> Parser<'v> {
         }
     }
 
-    fn restriction(&mut self) -> Result<Ce, Error> {
+    fn restriction_depth(&mut self) -> Result<(Ce, usize), Error> {
         let p = self.prop()?;
         let (Tok::Name(Name::Word(kw)), kw_span) = self.bump().expect("a restriction keyword")
         else {
@@ -526,9 +777,15 @@ impl<'v> Parser<'v> {
         if data_filler {
             let d = p.data.clone().expect("a data property");
             return Ok(match kw.as_str() {
-                "some" => Ce::DataSomeValuesFrom(vec![d], self.data_primary()?),
-                "only" => Ce::DataAllValuesFrom(vec![d], self.data_primary()?),
-                "value" => Ce::DataHasValue(d, self.literal()?),
+                "some" => {
+                    let (r, rh) = self.data_primary_depth()?;
+                    (Ce::DataSomeValuesFrom(vec![d], r), rh + 1)
+                }
+                "only" => {
+                    let (r, rh) = self.data_primary_depth()?;
+                    (Ce::DataAllValuesFrom(vec![d], r), rh + 1)
+                }
+                "value" => (Ce::DataHasValue(d, self.literal()?), 1),
                 "Self" => {
                     return Err(Error {
                         kind: ErrorKind::Kind,
@@ -540,37 +797,47 @@ impl<'v> Parser<'v> {
                 }
                 _ => {
                     let n = self.cardinality()?;
-                    let f = if self.filler_ahead(self.pos) {
-                        Some(self.data_primary()?)
+                    let (f, h) = if self.filler_ahead(self.pos) {
+                        let (r, rh) = self.data_primary_depth()?;
+                        (Some(r), rh + 1)
                     } else {
-                        None
+                        (None, 1)
                     };
-                    match kw.as_str() {
+                    let ce = match kw.as_str() {
                         "min" => Ce::DataMinCardinality(n, d, f),
                         "max" => Ce::DataMaxCardinality(n, d, f),
                         _ => Ce::DataExactCardinality(n, d, f),
-                    }
+                    };
+                    (ce, h)
                 }
             });
         }
         let o = need_object(&p)?;
         Ok(match kw.as_str() {
-            "some" => Ce::ObjectSomeValuesFrom(o, Box::new(self.primary()?)),
-            "only" => Ce::ObjectAllValuesFrom(o, Box::new(self.primary()?)),
-            "value" => Ce::ObjectHasValue(o, self.individual()?),
-            "Self" => Ce::ObjectHasSelf(o),
+            "some" => {
+                let (f, fh) = self.primary_depth()?;
+                (Ce::ObjectSomeValuesFrom(o, Box::new(f)), fh + 1)
+            }
+            "only" => {
+                let (f, fh) = self.primary_depth()?;
+                (Ce::ObjectAllValuesFrom(o, Box::new(f)), fh + 1)
+            }
+            "value" => (Ce::ObjectHasValue(o, self.individual()?), 1),
+            "Self" => (Ce::ObjectHasSelf(o), 1),
             _ => {
                 let n = self.cardinality()?;
-                let f = if self.filler_ahead(self.pos) {
-                    Some(Box::new(self.primary()?))
+                let (f, h) = if self.filler_ahead(self.pos) {
+                    let (ce, fh) = self.primary_depth()?;
+                    (Some(Box::new(ce)), fh + 1)
                 } else {
-                    None
+                    (None, 1)
                 };
-                match kw.as_str() {
+                let ce = match kw.as_str() {
                     "min" => Ce::ObjectMinCardinality(n, o, f),
                     "max" => Ce::ObjectMaxCardinality(n, o, f),
                     _ => Ce::ObjectExactCardinality(n, o, f),
-                }
+                };
+                (ce, h)
             }
         })
     }
@@ -592,76 +859,118 @@ impl<'v> Parser<'v> {
 
     /// `dataConjunction or dataConjunction …`
     pub fn data_range(&mut self) -> Result<DataRange, Error> {
-        self.nest()?;
-        let mut all = vec![self.data_conjunction()?];
-        while self.eat_word("or") {
-            all.push(self.data_conjunction()?);
-        }
-        self.depth -= 1;
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), DataRange::UnionOf)
-        })
+        self.data_range_depth().map(|(dr, _)| dr)
     }
 
-    fn data_conjunction(&mut self) -> Result<DataRange, Error> {
-        let mut all = vec![self.data_primary()?];
-        while self.eat_word("and") {
-            all.push(self.data_primary()?);
+    fn data_range_depth(&mut self) -> Result<(DataRange, usize), Error> {
+        let (first, first_h) = self.data_conjunction_depth()?;
+        if !self.eat_word("or") {
+            return Ok((first, first_h));
         }
-        Ok(if all.len() == 1 {
-            all.pop().expect("one")
-        } else {
-            collapse(all.into_iter().collect(), DataRange::IntersectionOf)
-        })
-    }
-
-    fn data_primary(&mut self) -> Result<DataRange, Error> {
-        self.nest()?;
-        let out = if self.eat_word("not") {
-            DataRange::ComplementOf(Box::new(self.data_primary()?))
-        } else if self.peek() == Some(&Tok::LParen) {
-            self.bump();
-            let r = self.data_range()?;
-            self.expect(Tok::RParen, "')' to close the parenthesis")?;
-            r
-        } else if self.peek() == Some(&Tok::LBrace) {
-            self.bump();
-            let mut ls = BTreeSet::new();
-            loop {
-                ls.insert(self.literal()?);
-                if self.peek() == Some(&Tok::Comma) {
-                    self.bump();
-                    continue;
-                }
-                self.expect(Tok::RBrace, "',' or '}'")?;
+        let mut all = vec![first];
+        let mut max_h = first_h;
+        loop {
+            let (next, h) = self.data_conjunction_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !self.eat_word("or") {
                 break;
             }
-            DataRange::OneOf(ls)
-        } else if self.is_name(self.pos) {
-            let d = self.datatype()?;
-            if self.peek() == Some(&Tok::LBracket) {
+        }
+        let set: BTreeSet<DataRange> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let dr = collapse(set, DataRange::UnionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
+        if self.depth + h > MAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_DEPTH} deep"),
+            ));
+        }
+        Ok((dr, h))
+    }
+
+    fn data_conjunction_depth(&mut self) -> Result<(DataRange, usize), Error> {
+        let (first, first_h) = self.data_primary_depth()?;
+        if !self.eat_word("and") {
+            return Ok((first, first_h));
+        }
+        let mut all = vec![first];
+        let mut max_h = first_h;
+        loop {
+            let (next, h) = self.data_primary_depth()?;
+            max_h = max_h.max(h);
+            all.push(next);
+            if !self.eat_word("and") {
+                break;
+            }
+        }
+        let set: BTreeSet<DataRange> = all.into_iter().collect();
+        let collapsed = set.len() == 1;
+        let dr = collapse(set, DataRange::IntersectionOf);
+        let h = if collapsed { max_h } else { max_h + 1 };
+        if self.depth + h > MAX_DEPTH {
+            return Err(Error::syntax(
+                self.here(),
+                format!("the expression nests more than {MAX_DEPTH} deep"),
+            ));
+        }
+        Ok((dr, h))
+    }
+
+    fn data_primary_depth(&mut self) -> Result<(DataRange, usize), Error> {
+        if self.peek() == Some(&Tok::LParen) {
+            self.nest_paren()?;
+            self.bump();
+            let res = self.data_range_depth().and_then(|r| {
+                self.expect(Tok::RParen, "')' to close the parenthesis")?;
+                Ok(r)
+            });
+            self.paren_depth -= 1;
+            return res;
+        }
+        self.nest()?;
+        let res = (|| {
+            if self.eat_word("not") {
+                let (inner, h) = self.data_primary_depth()?;
+                Ok((DataRange::ComplementOf(Box::new(inner)), h + 1))
+            } else if self.peek() == Some(&Tok::LBrace) {
                 self.bump();
-                let mut fs = BTreeSet::new();
+                let mut ls = BTreeSet::new();
                 loop {
-                    fs.insert(self.facet()?);
+                    ls.insert(self.literal()?);
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                         continue;
                     }
-                    self.expect(Tok::RBracket, "',' or ']'")?;
+                    self.expect(Tok::RBrace, "',' or '}'")?;
                     break;
                 }
-                DataRange::DatatypeRestriction(d, fs)
+                Ok((DataRange::OneOf(ls), 1))
+            } else if self.is_name(self.pos) {
+                let d = self.datatype()?;
+                if self.peek() == Some(&Tok::LBracket) {
+                    self.bump();
+                    let mut fs = BTreeSet::new();
+                    loop {
+                        fs.insert(self.facet()?);
+                        if self.peek() == Some(&Tok::Comma) {
+                            self.bump();
+                            continue;
+                        }
+                        self.expect(Tok::RBracket, "',' or ']'")?;
+                        break;
+                    }
+                    Ok((DataRange::DatatypeRestriction(d, fs), 1))
+                } else {
+                    Ok((DataRange::Datatype(d), 1))
+                }
             } else {
-                DataRange::Datatype(d)
+                Err(self.expected("a datatype, 'not', '(' or '{'"))
             }
-        } else {
-            return Err(self.expected("a datatype, 'not', '(' or '{'"));
-        };
+        })();
         self.depth -= 1;
-        Ok(out)
+        res
     }
 
     fn facet(&mut self) -> Result<FacetRestriction, Error> {
@@ -681,9 +990,16 @@ impl<'v> Parser<'v> {
                     .find(|f| super::local_name(f) == w.as_str())
                     .map(|f| f.to_string())
                     .or_else(|| {
-                        self.v
-                            .expand(w)
-                            .filter(|i| vocab::FACETS.contains(&i.as_str()))
+                        self.v.expand_parts(w).and_then(|(ns, local)| {
+                            vocab::FACETS
+                                .iter()
+                                .find(|f| {
+                                    f.len() == ns.len().saturating_add(local.len())
+                                        && f.starts_with(ns)
+                                        && &f[ns.len()..] == local
+                                })
+                                .map(|f| (*f).to_string())
+                        })
                     });
                 match found {
                     Some(f) => f,
@@ -732,7 +1048,7 @@ impl<'v> Parser<'v> {
             }) => {
                 self.bump();
                 if let Some(lang) = lang {
-                    return Literal::lang(value, &lang).map_err(|e| Error::syntax(span, e.0));
+                    return self.parse_lang_literal_checked(span, value, &lang);
                 }
                 if let Some((n, dspan)) = datatype {
                     let d = self.resolve(&n, dspan, &[K::Datatype], "a datatype")?;
@@ -743,10 +1059,22 @@ impl<'v> Parser<'v> {
             Some(Tok::Number(n)) => {
                 self.bump();
                 number(&n).ok_or_else(|| {
-                    Error::syntax(
-                        span,
-                        format!("'{n}' is not an integer, a decimal or a floating-point number with an f suffix"),
-                    )
+                    if let Some(max_bytes) = self.max_error_bytes {
+                        let mut msg = String::with_capacity(max_bytes.min(160));
+                        push_capped(&mut msg, "'", max_bytes);
+                        push_snippet(&mut msg, &n, BOUNDED_SNIPPET_BYTES, max_bytes);
+                        push_capped(
+                            &mut msg,
+                            "' is not an integer, a decimal or a floating-point number with an f suffix",
+                            max_bytes,
+                        );
+                        Error::syntax(span, msg)
+                    } else {
+                        Error::syntax(
+                            span,
+                            format!("'{n}' is not an integer, a decimal or a floating-point number with an f suffix"),
+                        )
+                    }
                 })
             }
             Some(Tok::Name(Name::Word(w))) if w == "true" || w == "false" => {
@@ -961,28 +1289,26 @@ impl<'v> Parser<'v> {
                 return Left::of(e.clone());
             }
         }
-        if let Some(Tok::Name(n)) = self.tok(self.pos)
-            && let Found::Entities(right) = self.v.lookup(
+        if let Some(Tok::Name(n)) = self.tok(self.pos) {
+            let right_kinds = self.v.lookup_kinds(
                 n,
                 &[K::ObjectProperty, K::DataProperty, K::AnnotationProperty],
-            )
-            && let Some(e) = es
-                .iter()
-                .find(|e| right.iter().any(|r| r.kind() == e.kind()))
-        {
-            return Left::of(e.clone());
+            );
+            if let Some(e) = es.iter().find(|e| right_kinds.contains(e.kind())) {
+                return Left::of(e.clone());
+            }
         }
         Left::of(es[0].clone())
     }
 
-    fn data_property(&mut self) -> Result<DataProperty, Error> {
+    pub(super) fn data_property(&mut self) -> Result<DataProperty, Error> {
         match self.entity(&[K::DataProperty], "a data property")? {
             (Entity::DataProperty(p), _) => Ok(p),
             _ => unreachable!("asked for a data property"),
         }
     }
 
-    fn annotation_property(&mut self) -> Result<AnnotationProperty, Error> {
+    pub(super) fn annotation_property(&mut self) -> Result<AnnotationProperty, Error> {
         match self.entity(&[K::AnnotationProperty], "an annotation property")? {
             (Entity::AnnotationProperty(p), _) => Ok(p),
             _ => unreachable!("asked for an annotation property"),
@@ -993,9 +1319,31 @@ impl<'v> Parser<'v> {
     fn iri(&mut self) -> Result<Iri, Error> {
         let span = self.here();
         let iri = match self.peek() {
-            Some(Tok::Name(Name::Iri(i))) => i.clone(),
-            Some(Tok::Name(Name::Word(w))) if self.v.expand(w).is_some() => {
-                self.v.expand(w).expect("checked")
+            Some(Tok::Name(Name::Iri(i))) => {
+                let len = i.len();
+                let owned = i.clone();
+                if let Some(b) = self.budget.as_mut()
+                    && b.charge(len).is_err()
+                {
+                    return Err(Error::syntax(
+                        span,
+                        "resolved term bytes exceeded the expression budget",
+                    ));
+                }
+                owned
+            }
+            Some(Tok::Name(Name::Word(w))) if self.v.expanded_len(w).is_some() => {
+                let exp_len = self.v.expanded_len(w).expect("checked");
+                let w = w.clone();
+                if let Some(b) = self.budget.as_mut()
+                    && b.charge(exp_len).is_err()
+                {
+                    return Err(Error::syntax(
+                        span,
+                        "resolved term bytes exceeded the expression budget",
+                    ));
+                }
+                self.v.expand(&w).expect("checked")
             }
             Some(Tok::Name(n)) => {
                 let n = n.clone();
@@ -1005,7 +1353,7 @@ impl<'v> Parser<'v> {
             _ => return Err(self.expected("an IRI")),
         };
         self.bump();
-        crate::model::parse_iri(&iri).map_err(|e| Error::syntax(span, e.0))
+        self.parse_iri_checked(span, &iri)
     }
 
     /// An axiom without a keyword between its sides: a characteristic such as
@@ -1188,4 +1536,217 @@ fn name_text(n: &Name) -> String {
         Name::Word(w) => w.clone(),
         Name::Quoted(q) => q.clone(),
     }
+}
+
+fn push_capped(out: &mut String, s: &str, max_bytes: usize) -> bool {
+    if out.len() >= max_bytes {
+        return false;
+    }
+    let avail = max_bytes - out.len();
+    if s.len() <= avail {
+        out.push_str(s);
+        true
+    } else {
+        let mut end = avail;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&s[..end]);
+        false
+    }
+}
+
+fn push_snippet(out: &mut String, s: &str, snippet_cap: usize, max_bytes: usize) {
+    if s.len() <= snippet_cap {
+        push_capped(out, s, max_bytes);
+        return;
+    }
+    let ellipsis = "...";
+    let body_cap = snippet_cap.saturating_sub(ellipsis.len());
+    let mut end = body_cap.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    push_capped(out, &s[..end], max_bytes);
+    push_capped(out, ellipsis, max_bytes);
+}
+
+fn push_name_bounded(out: &mut String, n: &Name, snippet_cap: usize, max_bytes: usize) {
+    match n {
+        Name::Iri(i) => {
+            push_capped(out, "<", max_bytes);
+            push_snippet(out, i, snippet_cap, max_bytes);
+            push_capped(out, ">", max_bytes);
+        }
+        Name::Word(w) => push_snippet(out, w, snippet_cap, max_bytes),
+        Name::Quoted(q) => push_snippet(out, q, snippet_cap, max_bytes),
+    }
+}
+
+fn push_debug_snippet(out: &mut String, s: &str, snippet_cap: usize, max_bytes: usize) {
+    let ellipsis = "...";
+    let body_cap = snippet_cap.saturating_sub(ellipsis.len());
+    let mut escaped_bytes = 0usize;
+    let mut cut_len = out.len();
+    for c in s.chars() {
+        let mut buf = [0u8; 16];
+        let mut n = 0usize;
+        for ec in c.escape_debug() {
+            n += ec.encode_utf8(&mut buf[n..]).len();
+        }
+        let piece = std::str::from_utf8(&buf[..n]).expect("valid utf8");
+        let next_bytes = escaped_bytes.saturating_add(piece.len());
+        if next_bytes > snippet_cap {
+            out.truncate(cut_len);
+            push_capped(out, ellipsis, max_bytes);
+            return;
+        }
+        if !push_capped(out, piece, max_bytes) {
+            return;
+        }
+        escaped_bytes = next_bytes;
+        if escaped_bytes <= body_cap {
+            cut_len = out.len();
+        }
+    }
+}
+
+fn push_tok_described_bounded(out: &mut String, t: &Tok, snippet_cap: usize, max_bytes: usize) {
+    if let Some(w) = t.word()
+        && KEYWORDS.contains(&w)
+    {
+        push_capped(out, "the keyword '", max_bytes);
+        push_capped(out, w, max_bytes);
+        push_capped(out, "'", max_bytes);
+        return;
+    }
+    push_capped(out, "'", max_bytes);
+    match t {
+        Tok::LParen => {
+            push_capped(out, "(", max_bytes);
+        }
+        Tok::RParen => {
+            push_capped(out, ")", max_bytes);
+        }
+        Tok::LBrace => {
+            push_capped(out, "{", max_bytes);
+        }
+        Tok::RBrace => {
+            push_capped(out, "}", max_bytes);
+        }
+        Tok::LBracket => {
+            push_capped(out, "[", max_bytes);
+        }
+        Tok::RBracket => {
+            push_capped(out, "]", max_bytes);
+        }
+        Tok::Comma => {
+            push_capped(out, ",", max_bytes);
+        }
+        Tok::Op(o) => {
+            push_capped(out, o, max_bytes);
+        }
+        Tok::Name(Name::Iri(i)) => {
+            push_capped(out, "<", max_bytes);
+            push_snippet(out, i, snippet_cap, max_bytes);
+            push_capped(out, ">", max_bytes);
+        }
+        Tok::Name(Name::Word(w)) => push_snippet(out, w, snippet_cap, max_bytes),
+        Tok::Name(Name::Quoted(q)) => {
+            push_capped(out, "'", max_bytes);
+            push_snippet(out, q, snippet_cap, max_bytes);
+            push_capped(out, "'", max_bytes);
+        }
+        Tok::Str { value, .. } => {
+            push_capped(out, "\"", max_bytes);
+            push_debug_snippet(out, value, snippet_cap, max_bytes);
+            push_capped(out, "\"", max_bytes);
+        }
+        Tok::Number(n) => push_snippet(out, n, snippet_cap, max_bytes),
+    }
+    push_capped(out, "'", max_bytes);
+}
+
+fn push_short_iri_bounded(
+    out: &mut String,
+    iri: &str,
+    prefixes: &[(String, String)],
+    snippet_cap: usize,
+    max_bytes: usize,
+) {
+    if let Some((prefix, local)) = prefixes
+        .iter()
+        .filter_map(|(p, ns)| iri.strip_prefix(ns.as_str()).map(|local| (p, ns, local)))
+        .max_by_key(|(_, ns, _)| ns.len())
+        .map(|(p, _, local)| (p.as_str(), local))
+        && !local.is_empty()
+        && !local.contains([' ', '<', '>', '\'', '"', '(', ')'])
+    {
+        push_snippet(out, prefix, 24, max_bytes);
+        push_capped(out, ":", max_bytes);
+        push_snippet(out, local, snippet_cap, max_bytes);
+    } else {
+        push_capped(out, "<", max_bytes);
+        push_snippet(out, iri, snippet_cap, max_bytes);
+        push_capped(out, ">", max_bytes);
+    }
+}
+
+/// Format an ambiguous-name diagnostic strictly within `max_bytes` without cloning the
+/// prefix table, candidate list, or full ontology labels.
+fn format_ambiguous_bounded(
+    n: &Name,
+    es: &[Entity],
+    unique_count: usize,
+    v: &Vocabulary,
+    max_bytes: usize,
+) -> String {
+    use std::fmt::Write as _;
+
+    let suffix = "; write a prefixed name or an IRI";
+    let list_budget = max_bytes.saturating_sub(suffix.len() + 6);
+    let mut msg = String::with_capacity(max_bytes.min(256));
+    push_capped(&mut msg, "'", max_bytes);
+    push_name_bounded(&mut msg, n, BOUNDED_SNIPPET_BYTES, list_budget);
+    let mut header = String::new();
+    let _ = write!(&mut header, "' names {unique_count} entities: ");
+    push_capped(&mut msg, &header, list_budget);
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut written = 0usize;
+    let mut omitted = false;
+    for e in es {
+        let iri = e.iri().as_str();
+        if !seen.insert(iri) {
+            continue;
+        }
+        if written > 0 && msg.len().saturating_add(24) >= list_budget {
+            omitted = true;
+            break;
+        }
+        if written > 0 {
+            push_capped(&mut msg, ", ", list_budget);
+        }
+        push_short_iri_bounded(
+            &mut msg,
+            iri,
+            v.prefixes(),
+            BOUNDED_SNIPPET_BYTES,
+            list_budget,
+        );
+        push_capped(&mut msg, " (", list_budget);
+        push_capped(&mut msg, kind_word(e.kind()), list_budget);
+        if let Some(label) = v.label(iri) {
+            push_capped(&mut msg, ", labelled '", list_budget);
+            push_snippet(&mut msg, label, BOUNDED_SNIPPET_BYTES, list_budget);
+            push_capped(&mut msg, "'", list_budget);
+        }
+        push_capped(&mut msg, ")", list_budget);
+        written += 1;
+    }
+    if omitted {
+        push_capped(&mut msg, ", ...", max_bytes);
+    }
+    push_capped(&mut msg, suffix, max_bytes);
+    msg
 }

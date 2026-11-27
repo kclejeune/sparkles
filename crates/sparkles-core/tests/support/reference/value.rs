@@ -93,6 +93,69 @@ pub fn is_float_lexical(lex: &str) -> bool {
     mantissa_ok && exponent_ok
 }
 
+/// The datatype that supplied a computed spelling, before a lexical constructor
+/// discarded or replaced the datatype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum NumericKind {
+    Integer,
+    Decimal,
+    Float,
+    Double,
+}
+
+impl NumericKind {
+    pub(super) fn of(t: &Term) -> Option<Self> {
+        let Term::Literal(l) = t else {
+            return None;
+        };
+        Some(match l.datatype() {
+            xsd::INTEGER => Self::Integer,
+            xsd::DECIMAL => Self::Decimal,
+            xsd::FLOAT => Self::Float,
+            xsd::DOUBLE => Self::Double,
+            _ => return None,
+        })
+    }
+
+    pub(super) fn lexical_key(self, lex: &str) -> Option<String> {
+        match self {
+            Self::Integer | Self::Decimal => self.exact_key(lex),
+            Self::Float | Self::Double if !is_float_lexical(lex) => None,
+            Self::Float => Float::from_str(lex)
+                .ok()
+                .map(|f| Num::Flt(f32::from(f)).canonical_lexical()),
+            Self::Double => Double::from_str(lex)
+                .ok()
+                .map(|f| Num::Dbl(f64::from(f)).canonical_lexical()),
+        }
+    }
+
+    /// Compare an integer or decimal without rounding or bounding the digit count.
+    fn exact_key(self, lex: &str) -> Option<String> {
+        let body = lex.strip_prefix(['+', '-']).unwrap_or(lex);
+        let (whole, fraction) = match body.split_once('.') {
+            Some(parts) if self == Self::Decimal => parts,
+            _ => (body, ""),
+        };
+        if (whole.is_empty() && fraction.is_empty())
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let whole = whole.trim_start_matches('0');
+        let fraction = fraction.trim_end_matches('0');
+        let sign = if lex.starts_with('-') && !(whole.is_empty() && fraction.is_empty()) {
+            "-"
+        } else {
+            ""
+        };
+        Some(format!("{sign}{whole}.{fraction}"))
+    }
+}
+
 /// Whether [`numeric`] read an integer or decimal with more than 16 digits since the last
 /// call, which XSD 1.1 section 5.4 lets an implementation limit. The call resets it.
 pub fn take_beyond_minimum_precision() -> bool {
@@ -382,6 +445,59 @@ impl Num {
         }
     }
 
+    /// Average an exact subtotal by long division on its integer coefficient.
+    /// ARQ keeps terminating quotients exact and otherwise rounds at scale 24.
+    pub fn average_term(self, rows: usize) -> Option<Term> {
+        let (raw, unit) = match self {
+            Num::Int(i) => (i, 1),
+            Num::Dec(d) => (i128::from_be_bytes(d.to_be_bytes()), 10_u128.pow(18)),
+            Num::Flt(_) | Num::Dbl(_) => {
+                return self
+                    .arith(Arith::Div, Num::Int(rows as i128))
+                    .map(Num::to_term);
+            }
+        };
+        let denominator = u128::from(u64::try_from(rows).ok()?) * unit;
+        if denominator == 0 {
+            return None;
+        }
+        let magnitude = raw.unsigned_abs();
+        let mut whole = magnitude / denominator;
+        let mut remainder = magnitude % denominator;
+        let mut other_factors = denominator >> denominator.trailing_zeros();
+        while other_factors.is_multiple_of(5) {
+            other_factors /= 5;
+        }
+        let exact = magnitude.is_multiple_of(other_factors);
+        let mut fraction = String::new();
+        while remainder != 0 && (exact || fraction.len() < 24) {
+            remainder *= 10;
+            fraction.push(char::from(b'0' + (remainder / denominator) as u8));
+            remainder %= denominator;
+        }
+        if !exact {
+            let coefficient = fraction.parse::<u128>().ok()?;
+            let half = (remainder * 2).cmp(&denominator);
+            if half.is_gt() || (half.is_eq() && !coefficient.is_multiple_of(2)) {
+                let rounded = coefficient + 1;
+                whole += rounded / 10_u128.pow(24);
+                fraction = format!("{:024}", rounded % 10_u128.pow(24));
+            }
+        }
+        let fraction = fraction.trim_end_matches('0');
+        let sign = if raw < 0 && (whole != 0 || !fraction.is_empty()) {
+            "-"
+        } else {
+            ""
+        };
+        let lexical = if fraction.is_empty() {
+            format!("{sign}{whole}")
+        } else {
+            format!("{sign}{whole}.{fraction}")
+        };
+        Some(Literal::new_typed_literal(lexical, xsd::DECIMAL).into())
+    }
+
     pub fn neg(self) -> Option<Num> {
         match self {
             Num::Int(i) => i.checked_neg().map(Num::Int),
@@ -497,6 +613,15 @@ pub fn string_term(s: impl Into<String>) -> Term {
     Term::Literal(Literal::new_simple_literal(s))
 }
 
+/// The simple literal that STR reads from an IRI or literal.
+pub(super) fn lexical_string(term: &Term) -> Option<Term> {
+    match term {
+        Term::NamedNode(n) => Some(string_term(n.as_str())),
+        Term::Literal(l) => Some(string_term(l.value())),
+        _ => None,
+    }
+}
+
 pub fn int_term(i: i128) -> Term {
     Num::Int(i).to_term()
 }
@@ -530,6 +655,11 @@ fn class(t: Option<&Term>) -> u8 {
         Some(Term::Literal(_)) => 3,
         Some(Term::Triple(_)) => 4,
     }
+}
+
+/// The ORDER BY term class of a bound RDF term.
+pub(crate) fn term_class(t: &Term) -> u8 {
+    class(Some(t))
 }
 
 /// The order of two decimal numerals, such as `-12.50`, by their values.

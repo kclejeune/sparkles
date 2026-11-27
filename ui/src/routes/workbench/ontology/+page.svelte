@@ -20,6 +20,7 @@
   import ClassificationFrame from '$components/ClassificationFrame.svelte';
   import InferredTreeView from '$components/InferredTree.svelte';
   import MaterializedFrame from '$components/MaterializedFrame.svelte';
+  import { ExplicitClassification } from '$lib/explicit-classification.svelte';
   import { InferredPins } from '$lib/inferred-read';
   import type { InferredKind } from '$lib/inferred-tree.svelte';
   import { app, toasts } from '$lib/app.svelte';
@@ -40,7 +41,6 @@
     describeAxiom,
     annotationAssertion,
     buildTree,
-    classifyOntology,
     dlQuery,
     DL_ANSWERS,
     declaration,
@@ -57,8 +57,12 @@
     ontologyAxioms,
     ontologyEntities,
     ontologyKindLabels,
+    classificationNote,
+    consistencyInfo,
+    inferredNodeStatus,
     ontologyLabelsFor,
     ontologyEntity,
+    ontologyHead,
     ontologySummary,
     RDFS_LABEL,
     renameUpdate,
@@ -74,7 +78,6 @@
     type AxiomInput,
     type AxiomJson,
     type AxiomItem,
-    type Classification,
     type DlAnswer,
     type DlQueryResult,
     type DlReasoning,
@@ -84,6 +87,7 @@
     type IriPolicy,
     type Lit,
     type Op,
+    type OntologyHead,
     type OntologySummary,
     type Selection,
   } from '$lib/ontology';
@@ -101,6 +105,8 @@
   import Discussions from '$components/Discussions.svelte';
   import WatchButton from '$components/WatchButton.svelte';
   import BulkEdit from '$components/BulkEdit.svelte';
+  import OntoPatterns from '$components/OntoPatterns.svelte';
+  import { PatternCommitCoordinator, patternCommitToast } from '$lib/ontology-patterns';
   import OntoImports from '$components/OntoImports.svelte';
   import { isDiscussionGraph } from '$lib/discussions';
   import TreeCrumbs from '$components/TreeCrumbs.svelte';
@@ -114,6 +120,7 @@
     ['history', 'History'],
     ['discussions', 'Discussions'],
     ['bulk', 'Bulk edits'],
+    ['patterns', 'Patterns'],
     ['imports', 'Imports'],
   ];
 
@@ -185,7 +192,18 @@
   });
 
   // --- what the page read -------------------------------------------------------------
-  let summary = $state<OntologySummary | null>(null);
+  // the head of the ontology, read from the index without mapping it (ROADMAP item 735): its
+  // header, entity counts, graphs and imports head the page and feed the views
+  let summary = $state<OntologyHead | null>(null);
+  // the full summary, whose axiom counts and diagnostics map the whole ontology, read only for
+  // the Header tab or when asked
+  // the full summary and the last failure, each with the key of the head they belong to: its
+  // target, graph, imports switch, import map revision and commit, and the scope of the read in
+  // flight, which holds through the head's next read whatever commit that read lands on
+  let full = $state<{ key: string; summary: OntologySummary } | null>(null);
+  let fullLoadingScope = $state<string | null>(null);
+  let fullError = $state<{ key: string; error: Error } | null>(null);
+  let fullSeq = 0;
   const inferredPins = $derived(
     new InferredPins(JSON.stringify([target, graph, sel.imports, summary?.commit])),
   );
@@ -232,7 +250,6 @@
    */
   let loadSeq = 0;
   let frameSeq = 0;
-  let classifySeq = 0;
 
   const langs = $derived(iriForm.languages);
   /** The name of `iri` as a tree draws it: the tree's own levels carry the labels. */
@@ -269,8 +286,8 @@
     const my = ++loadSeq;
     loading = true;
     try {
-      // the summary alone: its counts head the page, and the tree reads its own levels
-      const r = await ontologySummary(t, s);
+      // the head alone: its counts head the page, and the tree reads its own levels
+      const r = await ontologyHead(t, s);
       if (my !== loadSeq) return;
       // what was read for the commit before is read again when a view needs it, and what the
       // first summary of a scope arrives beside, such as the labels of the tree, is kept
@@ -287,6 +304,66 @@
       if (my === loadSeq) loading = false;
     }
   }
+
+  /**
+   * Read the full summary of the head on screen. A summary of a newer commit reads the head
+   * again, so the page never shows the counts of two commits.
+   */
+  async function loadFull() {
+    const key = headKey;
+    const head = summary;
+    if (!name || !head || !key) return;
+    const t = target;
+    const s = { ...sel };
+    const scope = scopeKey();
+    const my = ++fullSeq;
+    fullLoadingScope = scope;
+    fullError = null;
+    try {
+      const r = await ontologySummary(t, s);
+      if (my !== fullSeq) return;
+      full = { key: JSON.stringify([scope, r.summary.commit]), summary: r.summary };
+      if (r.summary.commit !== head.commit) {
+        // a newer commit: the head is read again, and the read stays pending until it lands
+        await loadAll();
+        if (my !== fullSeq) return;
+        // a head that failed or moved on is not paired with this summary, and the failure
+        // waits for Count the axioms instead of reading again by itself
+        if (headKey && full?.key !== headKey)
+          fullError = {
+            key: headKey,
+            error: new Error('The ontology changed while its axioms were counted.'),
+          };
+      }
+    } catch (e) {
+      if (my === fullSeq) fullError = { key, error: e as Error };
+    } finally {
+      if (my === fullSeq) fullLoadingScope = null;
+    }
+  }
+  /** Forget the full summary, which belongs to a scope the page left. */
+  function forgetFull() {
+    full = null;
+    fullError = null;
+    fullLoadingScope = null;
+    fullSeq++;
+  }
+  /** The scope the page reads: target, graph, imports switch and import map revision. */
+  const scopeKey = () => JSON.stringify([target, sel.graph ?? null, sel.imports, importsRev]);
+  /** The key of the head on screen, or `null` while a new scope's head is read. */
+  const headKey = $derived(
+    summary && !summaryStale ? JSON.stringify([scopeKey(), summary.commit]) : null,
+  );
+  /** The full summary when it was read for the head on screen. */
+  const fullShown = $derived(full && headKey && full.key === headKey ? full.summary : null);
+  const fullLoading = $derived(headKey != null && fullLoadingScope === scopeKey());
+  const fullFailed = $derived(fullError && fullError.key === headKey ? fullError.error : null);
+  $effect(() => {
+    if (tab !== 'header' || !headKey) return;
+    // a read of this scope in flight, its head's next read included, records its own outcome
+    if (fullShown || fullLoadingScope === scopeKey() || fullError?.key === headKey) return;
+    untrack(() => void loadFull());
+  });
 
   /** Forget the lists and labels read, which belong to a commit or graph the page left. */
   function resetLazy() {
@@ -368,6 +445,7 @@
     untrack(() => {
       // a preview belongs to the target and graph it ran on
       summary = null;
+      forgetFull();
       shown = 0;
       loadedTarget = null;
       // the names, lists and levels of the scope before are another scope's, and a read of a
@@ -375,7 +453,8 @@
       resetLazy();
       for (const lt of levelTrees.values()) lt.drop();
       individualLevel.drop();
-      classification = null;
+      explicit.clear();
+      explicit.resetOptions();
       session.reset(`sparkles.onto.undo.${target}|${graph ?? ''}`);
       void loadAll();
       void loadSide();
@@ -390,11 +469,12 @@
     // the summary stays on screen until its next read lands, so the Imports tab keeps its
     // form state; the reset below forgets what the views read
     summaryStale = true;
+    forgetFull();
     loadedTarget = null;
     resetLazy();
     for (const lt of levelTrees.values()) lt.drop();
     individualLevel.drop();
-    classification = null;
+    explicit.clear();
     void loadAll();
   }
   let importsShown: string | null = null;
@@ -717,83 +797,41 @@
     });
   });
   // --- the inferred tree ---------------------------------------------------------------
-  let classification = $state<Classification | null>(null);
-  let classifyError = $state<string | null>(null);
-  let classifying = $state(false);
-  let classifyAbort: AbortController | null = null;
-  let inferredScope: { target: string; selection: Selection; commit: number } | null = null;
-  const inferredLabels = new SvelteMap<string, Lit[]>();
-  const inferredBatch = new LabelBatch(
-    (iris) => {
-      const scope = inferredScope;
-      return scope
-        ? ontologyLabelsFor(
-            scope.target,
-            scope.selection,
-            iris,
-            undefined,
-            `commit:${scope.commit}`,
-          )
-        : Promise.resolve(new Map());
-    },
-    (more) => {
-      for (const [iri, labels] of more) inferredLabels.set(iri, labels);
-    },
-  );
-  function clearClassification() {
-    classifySeq++;
-    classifyAbort?.abort();
-    classifyAbort = null;
-    classification = null;
-    inferredScope = null;
-    inferredBatch.reset();
-    inferredLabels.clear();
-    classifying = false;
-    classifyError = null;
-  }
+  const explicit = new ExplicitClassification();
+  const classification = $derived(explicit.classification);
+  const classifyError = $derived(explicit.error);
+  const classifying = $derived(explicit.classifying);
+  const parsedDeadline = $derived(explicit.parsedDeadline);
+  const classifyOptions = $derived(explicit.options);
   async function classify() {
-    if (!summary || classifying) return;
-    const my = ++classifySeq;
-    const input = { target, selection: { ...sel }, commit: summary.commit };
-    classifyAbort?.abort();
-    const abort = new AbortController();
-    classifyAbort = abort;
-    classifying = true;
-    classifyError = null;
-    try {
-      const c = await classifyOntology(
-        input.target,
-        input.selection,
-        abort.signal,
-        `commit:${input.commit}`,
-      );
-      if (my !== classifySeq) return;
-      inferredScope = { ...input, commit: c.commit };
-      inferredBatch.reset();
-      inferredLabels.clear();
-      classification = c;
-    } catch (e) {
-      if (my === classifySeq) classifyError = api.errorMessage(e);
-    } finally {
-      if (my === classifySeq) {
-        classifying = false;
-        classifyAbort = null;
-      }
-    }
+    if (!summary) return;
+    await explicit.run(target, sel, summary.commit);
   }
   // Reading/toggling the tree, including inferred=1, never starts classification.
   $effect(() => {
     void target;
     void graph;
+    void withImports;
+    void importsRev;
     void summary?.commit;
-    untrack(clearClassification);
-    return () => classifyAbort?.abort();
+    untrack(() => explicit.clear());
+    return () => explicit.abort();
   });
   const inferred = $derived(classification ? taxonomyTree(classification) : null);
+  const inferredIncomplete = $derived(new Set(classification?.incomplete ?? []));
+  const inferredConsistency = $derived(
+    classification
+      ? consistencyInfo(
+          classification.consistency,
+          classification.consistent,
+          classification.partial,
+        )
+      : null,
+  );
   const inferredIriName = (iri: string) => {
     if (iriForm.mode !== 'label') return iri;
-    inferredBatch.want(iri);
-    return preferredLabel(inferredLabels.get(iri), langs) ?? iri;
+    explicit.wantLabel(iri);
+    return preferredLabel(explicit.labels.get(iri), langs) ?? iri;
   };
   const inferredName = (id: string) => {
     const cs = inferred?.classesOf.get(id) ?? [];
@@ -1122,6 +1160,27 @@
     if (seq != null) session.own.add(seq);
     void loadAll();
   };
+
+  let pageMounted = true;
+  onMount(() => () => {
+    pageMounted = false;
+  });
+  let patternPendingTargets = $state<ReadonlySet<string>>(new Set());
+  const patternCommit = new PatternCommitCoordinator({
+    onCommitted: (submittedTarget, seq, notice, res, handledInTab) => {
+      if (!pageMounted || submittedTarget !== target) return;
+      discussed(seq);
+      const toast = patternCommitToast(res, notice, handledInTab);
+      if (toast) toasts.push(toast.kind, toast.title, toast.detail);
+    },
+    onDetachedError: (submittedTarget, e) => {
+      if (!pageMounted || submittedTarget !== target) return;
+      toasts.push('error', 'Pattern apply failed', api.errorMessage(e));
+    },
+    onPendingChange: (pending) => {
+      if (pageMounted) patternPendingTargets = pending;
+    },
+  });
   /**
    * Preview `op`. `selection` is the graphs the edit reads and writes, the page's own unless
    * the edit was planned from another reading, as a bulk edit is from the graph alone.
@@ -1551,6 +1610,10 @@
             {target}
             {sel}
             {summary}
+            full={fullShown}
+            {fullLoading}
+            fullError={fullFailed}
+            onfull={loadFull}
             name={nameOf}
             {prefixes}
             {annotationProperties}
@@ -1575,6 +1638,20 @@
               onedit={(op, label) =>
                 // the plan was read without the imports, and its edit reads and writes the same
                 edit(op, label, undefined, null, { graph, imports: false })}
+            />{/key}
+        </div>
+      </section>
+    {:else if tab === 'patterns' && summary}
+      <section class="panel" aria-label="Pattern axiom generation">
+        <div class="panel-body">
+          {#key `${target}|${graph}`}<OntoPatterns
+              {target}
+              {sel}
+              {etag}
+              {readonly}
+              oncommitted={discussed}
+              commitCoordinator={patternCommit}
+              externalApplying={patternPendingTargets.has(target)}
             />{/key}
         </div>
       </section>
@@ -1797,30 +1874,117 @@
                   {#if kindTab === 'Class'}
                     <h2 class="col-title">
                       Inferred
-                      {#if classification}<span class="faint">
-                          {classification.complete
-                            ? `${classification.tier?.toUpperCase() ?? 'Classification'} · commit ${classification.commit}`
-                            : `${fmtInt(classification.excludedCount)} omitted or partly used axioms · commit ${classification.commit}`}</span
+                      {#if classification}<span class="faint"
+                          >{classificationNote(classification)}</span
                         >{/if}
                     </h2>
-                    <button
-                      class="btn sm ghost"
-                      disabled={classifying || !summary}
-                      onclick={() => void classify()}>Classify tree</button
-                    >
-                    <p class="faint">This explicit action reads the full taxonomy in POST pages.</p>
-                    {#if classification?.nodesTruncated}<p class="note">
-                        The browser's taxonomy display limit was reached.
+                    <div class="classify-controls">
+                      <label
+                        class="check"
+                        title="Ask the disjunctive classifier to return proved subsumptions if the deadline stops it"
+                      >
+                        <input type="checkbox" bind:checked={explicit.partial} />
+                        Allow partial
+                      </label>
+                      <label class="classify-field">
+                        <span>Deadline (s)</span>
+                        <input
+                          class="input sm"
+                          type="text"
+                          inputmode="decimal"
+                          size="12"
+                          placeholder="Server default"
+                          aria-label="Classification deadline in seconds"
+                          aria-invalid={!!parsedDeadline.error}
+                          bind:value={explicit.deadline}
+                        />
+                      </label>
+                      <label class="classify-field">
+                        <span>Expansion</span>
+                        <select
+                          class="select sm"
+                          aria-label="Expansion strategy"
+                          bind:value={explicit.expansion}
+                        >
+                          <option value="cautious">Cautious</option>
+                          <option value="eager">Eager</option>
+                        </select>
+                      </label>
+                      <button
+                        class="btn sm ghost"
+                        disabled={classifying || !summary || !!parsedDeadline.error}
+                        onclick={() => void classify()}>Classify tree</button
+                      >
+                    </div>
+                    {#if parsedDeadline.error}<p class="problem pad-x" role="alert">
+                        {parsedDeadline.error}
+                      </p>{/if}
+                    <p class="faint pad-x small">
+                      This explicit action reads the taxonomy in POST pages.
+                    </p>
+                    {#if classification?.nodesTruncated}<p class="note pad-x">
+                        {classification.partial
+                          ? 'This partial classification is not retained across pages, so only its first page of taxonomy nodes is shown.'
+                          : "The browser's taxonomy display limit was reached."}
                       </p>{/if}
                     <div class="tree-scroll">
-                      {#if classifying && !inferred}<p class="faint">
+                      {#if classifying}<p class="faint">
                           <span class="spinner"></span> Classifying…
                         </p>{/if}
                       {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
-                      {#if inferred}
-                        {#if classification && !classification.consistent}
+                      {#if inferred && classification}
+                        <div class="classify-status" role="status">
+                          {#if classification.tier}
+                            <span class="badge">{classification.tier.toUpperCase()}</span>
+                          {/if}
+                          {#if classification.partial}
+                            <span class="badge warn"
+                              >Partial · {fmtCount(
+                                classification.incompleteCount ?? inferredIncomplete.size,
+                                'open class',
+                                'open classes',
+                              )}</span
+                            >
+                          {/if}
+                          {#if inferredConsistency}
+                            <span
+                              class="badge"
+                              class:ok={inferredConsistency.tone === 'ok'}
+                              class:warn={inferredConsistency.tone === 'warn'}
+                              class:danger={inferredConsistency.tone === 'danger'}
+                              >{inferredConsistency.label}</span
+                            >
+                          {/if}
+                        </div>
+                        {#if classification.partial}
+                          <p class="warn-box" role="status">
+                            Partial hierarchy ({classification.tier?.toUpperCase() ??
+                              'classification'}). Proved subsumptions are shown;
+                            {fmtCount(
+                              classification.incompleteCount ?? inferredIncomplete.size,
+                              'class',
+                              'classes',
+                            )} marked open may miss inferred superclasses or equivalences.
+                            {#if (classification.incompleteCount ?? 0) > (classification.incomplete?.length ?? 0)}
+                              Showing markers for the first {fmtInt(
+                                classification.incomplete?.length ?? 0,
+                              )} of {fmtInt(classification.incompleteCount ?? 0)} open classes.
+                            {/if}
+                          </p>
+                        {:else if (classification.incompleteCount ?? 0) > (classification.incomplete?.length ?? 0)}
+                          <p class="warn-box" role="status">
+                            Showing open-class markers for the first {fmtInt(
+                              classification.incomplete?.length ?? 0,
+                            )} of {fmtInt(classification.incompleteCount ?? 0)} incomplete classes.
+                          </p>
+                        {/if}
+                        {#if inferredConsistency?.state === 'inconsistent'}
                           <p class="error-box" role="alert">
-                            The ontology is inconsistent, so every class is unsatisfiable.
+                            {inferredConsistency.detail}
+                          </p>
+                        {:else if inferredConsistency?.state === 'unknown'}
+                          <p class="warn-box" role="status">
+                            {inferredConsistency.detail}
                           </p>
                         {/if}
                         <OntoTree
@@ -1831,9 +1995,12 @@
                           onview={(ids) => {
                             for (const id of ids)
                               for (const c of inferred?.classesOf.get(id) ?? [])
-                                inferredBatch.want(c);
+                                explicit.wantLabel(c);
                           }}
-                          badge={(id) => (id === 'n:1' ? 'unsatisfiable' : null)}
+                          badge={(id) =>
+                            inferredNodeStatus(id, inferred.classesOf, inferredIncomplete).badge}
+                          badgeTone={(id) =>
+                            inferredNodeStatus(id, inferred.classesOf, inferredIncomplete).tone}
                           open={openSet('inferred')}
                           selected={selected ? (inferred.nodeOf.get(selected) ?? null) : null}
                           keep={inferredKeep}
@@ -1879,6 +2046,10 @@
                   {target}
                   {sel}
                   {summary}
+                  full={fullShown}
+                  {fullLoading}
+                  fullError={fullFailed}
+                  onfull={loadFull}
                   name={nameOf}
                   {prefixes}
                   {annotationProperties}
@@ -1939,6 +2110,20 @@
               {#if frameError}<p class="error-box" role="alert">{frameError}</p>{/if}
               {#if inferredOn && frameKind === 'Class' && inferred && selected}
                 {@const sup = inferredParents(selected)}
+                {#if inferredIncomplete.has(selected)}
+                  <p class="inferred-sup warn-box" role="status">
+                    <span class="badge warn">Open</span>
+                    {#if classification?.partial}
+                      This class was left open in the partial classification and may miss inferred
+                      superclasses.
+                    {:else if (classification?.excludedCount ?? 0) > 0 || (classification?.stats?.unmapped ?? 0) > 0}
+                      This class is incomplete because the classification excluded or could not map
+                      part of the input, and may miss inferred superclasses.
+                    {:else}
+                      This class is incomplete and may miss inferred superclasses.
+                    {/if}
+                  </p>
+                {/if}
                 {#if sup.length}
                   <p class="inferred-sup">
                     <span class="faint">Inferred direct superclasses:</span>
@@ -1981,6 +2166,7 @@
                         commit={frameCommit}
                         items={frameItems}
                         pins={frameCommit === summary?.commit ? inferredPins : undefined}
+                        classifyOptions={parsedDeadline.error ? undefined : classifyOptions}
                         onopen={(iri) => nav({ iri, view: null })}
                       />
                     {/key}
@@ -2532,6 +2718,43 @@
   .col-title .faint {
     font-weight: 400;
     font-size: var(--fs-xs);
+  }
+  .classify-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    padding: 0 10px 6px;
+    font-size: var(--fs-xs);
+  }
+  .classify-field {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--text-2);
+  }
+  .classify-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 4px 0 6px;
+  }
+  .badge.warn {
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+  }
+  .warn-box {
+    border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+    color: var(--warn);
+    border-radius: var(--r);
+    padding: 6px 8px;
+    font-size: var(--fs-xs);
+    margin: 4px 0 6px;
+  }
+  .pad-x {
+    padding: 0 10px;
   }
   .tree-scroll {
     flex: 1;

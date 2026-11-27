@@ -180,7 +180,8 @@ fn aggregate_inner(
             distinct_charge.add(32)?;
             seen.insert(id);
         }
-        let Some(term) = ctx.term(id) else {
+        let decode = ctx.charge(0)?;
+        let Some(term) = ctx.term_checked_into(id, &decode)? else {
             domain_error = true;
             continue;
         };
@@ -189,6 +190,7 @@ fn aggregate_inner(
             error.engine()
         })?;
         let _input = ctx.charge(bytes)?;
+        drop(decode);
         remember_blank_nodes(ctx, &term, &mut blanks, &blank_charge)?;
         let context = AggregateContext {
             scalar: ScalarContext { ctx },

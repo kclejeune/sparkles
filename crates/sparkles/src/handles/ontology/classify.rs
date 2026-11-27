@@ -47,18 +47,20 @@ use crate::error::{Error, Result};
 use crate::sparql::QueryOptions;
 use crate::store::Snapshot;
 use crate::{Budget, BudgetKind};
-use oxrdf::{Literal, NamedNode, Term};
+use oxrdf::{Literal, NamedNode, Term, Triple};
 use rustc_hash::FxHashSet;
 use sparkles_core::algo::Control;
 use sparkles_core::algo::pool::Par;
 use sparkles_owl::classify::{
-    Changes, Classification, Excluded, Expansion, Limits, Saturation, logical,
+    Changes, Classification, Excluded, Expansion, Limits, Saturation, Unmapped, logical,
 };
 use sparkles_owl::read::Mode;
+use sparkles_owl::transform::Dropped;
 use sparkles_owl::{
     AnnotationProperty, AnnotationValue, Axiom, AxiomKind, ClassExpression, Entity, vocab,
 };
 use sparkles_reasoner::inputs::{GraphRef, ImportMode};
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -87,18 +89,91 @@ pub struct ClassifyRequest {
     pub about: Option<String>,
     /// classify by the OWL 2 EL rules alone, as ELK does, with every axiom outside
     /// OWL 2 EL left out; the default also takes the Horn axioms outside OWL 2 EL
-    /// ([`sparkles_owl::classify::Limits::el_only`]). Such a run does not use the
-    /// dataset's kept classification.
+    /// ([`sparkles_owl::classify::Limits::el_only`]). The dataset keeps EL-only
+    /// classifications separately from default runs.
     pub el_only: bool,
-    /// a run with the disjunctive rules that its deadline, cancellation or memory budget
-    /// stops answers with what it proved, a [`Classification`] whose
-    /// [`complete`](Classification::complete) is false, instead of failing
-    /// ([`sparkles_owl::classify::Limits::partial`]). A run of the other tiers fails as
-    /// before. A classification that writes its taxonomy refuses it.
+    /// a classification run (EL, Horn, or disjunctive) that its deadline, cancellation or
+    /// memory budget stops after saturation begins answers with what it proved, a
+    /// [`Classification`] whose [`complete`](Classification::complete) is false, instead
+    /// of failing ([`sparkles_owl::classify::Limits::partial`]). A classification that
+    /// writes its taxonomy refuses it.
     pub partial: bool,
     /// the expansion strategy of the disjunctive rules, which gives the same answer
     /// either way ([`sparkles_owl::classify::Limits::expansion`])
     pub expansion: Expansion,
+    /// refuse the classification when it leaves an axiom out or uses one only in part,
+    /// or stopped part way, as a complete reasoner such as HermiT refuses what it does
+    /// not support, with [`STRICT_CODE`] and the axioms in the message. The check reads
+    /// the final answer, a kept one included, and comes before a taxonomy is written.
+    /// It does not change what the dataset keeps.
+    pub strict: bool,
+    /// skip the bottom-locality modules that decide, when axioms are left out, which
+    /// classes keep their complete answer, for a caller that reads only the taxonomy:
+    /// every class is then incomplete and the consistency unknown when something is left
+    /// out ([`sparkles_owl::classify::Limits::coverage`])
+    pub skip_coverage: bool,
+}
+
+/// The code of a strict classification's refusal ([`ClassifyRequest::strict`]), whose
+/// component is `classifier`.
+pub const STRICT_CODE: &str = "classification-incomplete";
+
+/// A strict request's answer to a run that is not complete for the whole ontology: the
+/// caller's own deadline or cancellation when it stopped the modules' pass, which is no
+/// refusal of the ontology, and otherwise [`strict_refusal`].
+pub(super) fn refuse_strict(
+    classification: &Classification,
+    excluded: &[Excluded],
+    opts: &QueryOptions,
+) -> Error {
+    if classification.stats.coverage_stopped
+        && let Err(e) = check(opts)
+    {
+        return e;
+    }
+    strict_refusal(classification, excluded)
+}
+
+/// The refusal of a strict classification whose answer is not complete for the whole
+/// ontology: the axioms left out, which the error's source holds as
+/// [`sparkles_owl::classify::Error::Incomplete`], or the run that stopped.
+pub fn strict_refusal(classification: &Classification, excluded: &[Excluded]) -> Error {
+    let unmapped = classification.stats.unmapped;
+    let mut message = if !excluded.is_empty() {
+        sparkles_owl::classify::refusal(excluded)
+    } else if unmapped > 0 {
+        String::from("the classification would not be complete")
+    } else {
+        format!(
+            "the classification would not be complete: the run stopped before it decided {} classes",
+            classification.incomplete.len()
+        )
+    };
+    if unmapped > 0 {
+        message.push_str(&format!(
+            "; {unmapped} triples of the input map to no axiom, such as the domain of a \
+             property that is not declared, and may carry anything: declare the property \
+             or remove the triples"
+        ));
+        let first: Vec<String> = classification
+            .unmapped
+            .triples
+            .iter()
+            .take(3)
+            .map(|t| format!("{t} ."))
+            .collect();
+        if !first.is_empty() {
+            message.push_str(&format!(", such as {}", first.join(" ")));
+        }
+    }
+    incomplete(message, excluded)
+}
+
+fn incomplete(message: String, excluded: &[Excluded]) -> Error {
+    Error::Component(Box::new(
+        crate::error::ComponentError::new("classifier", STRICT_CODE, message)
+            .with_source(sparkles_owl::classify::Error::Incomplete(excluded.to_vec())),
+    ))
 }
 
 /// The opening of the comment the classifier writes on a taxonomy graph's header, by
@@ -139,6 +214,17 @@ impl Classified {
 /// its immutable metadata/answer as the existing partial API requires. This
 /// changes only result-local options, never the shared flags, workers or cache.
 pub(super) fn result_options(opts: &QueryOptions, complete: bool) -> QueryOptions {
+    result_controls(opts, complete)
+}
+
+/// Whether a run acknowledged a stop of its caller: a partial answer, or a modules' pass
+/// that the deadline or a cancellation stopped. Its metadata and answer then finish
+/// without the stop controls ([`result_options`]).
+pub(super) fn acknowledged_stop(c: &Classification) -> bool {
+    !c.complete_for_taken || c.stats.coverage_stopped
+}
+
+fn result_controls(opts: &QueryOptions, complete: bool) -> QueryOptions {
     QueryOptions {
         graphs: opts.graphs.clone(),
         cancel: if complete { opts.cancel.clone() } else { None },
@@ -157,6 +243,8 @@ pub(super) fn result_options(opts: &QueryOptions, complete: bool) -> QueryOption
 /// copying them.
 pub struct CacheEntry {
     pub(super) key: InputKey,
+    pub(super) el_only: bool,
+    pub(super) retained_bytes: usize,
     pub(super) mutated: bool,
     ontology: Option<Arc<sparkles_owl::read::Ontology>>,
     /// the axioms beyond the ontology's that the saturation last read, such as a DL
@@ -169,9 +257,11 @@ pub struct CacheEntry {
 }
 
 impl CacheEntry {
-    pub(super) fn new(key: InputKey) -> Self {
+    pub(super) fn new(key: InputKey, el_only: bool) -> Self {
         Self {
             key,
+            el_only,
+            retained_bytes: 0,
             mutated: false,
             ontology: None,
             extra: Vec::new(),
@@ -292,22 +382,30 @@ impl Ontologies {
         // triples can be absent. Re-deciding there could widen the graph grant.
         opts.graphs = opts.graphs.as_ref().map(|access| access.bound(&snap));
         let o = self.open_at(&snap, req, &opts)?;
-        let keep = opts.graphs.is_none() && snap.cacheable && !c.assertions && !c.el_only;
+        // a run that skips the modules' pass answers differently, so it is not kept
+        let keep = opts.graphs.is_none() && snap.cacheable && !c.assertions && !c.skip_coverage;
         let (publication, reused) = if keep {
             self.classify_kept(&o, req, c, &opts)?
         } else {
             let mut assertions: Vec<Axiom> = Vec::new();
+            // the assertion triples that map to no axiom
+            let mut unread = Unmapped::default();
             if c.assertions {
-                o.assertions(&opts, |ax, _, _| {
-                    if let Some(ax) = ax {
-                        assertions.push(ax);
+                o.assertions(&opts, |ax, t, _| {
+                    match ax {
+                        Some(ax) => assertions.push(ax),
+                        None => unread.push(t),
                     }
                     Ok(true)
                 })?;
             }
             let mut axioms = logical_axioms(&o.ontology);
             axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
-            let (out, excluded) = classify_once(&axioms, c, &opts)?;
+            let seen = RefCell::new(None);
+            let mut dropped = dropped_assertions(&o, &opts, &seen);
+            let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
+            let unmapped = || unmapped_of(&o.ontology, &unread, &seen);
+            let (out, excluded) = classify_once(&axioms, c, &opts, dropped, &unmapped)?;
             (
                 KeptClassification::capture(
                     self,
@@ -321,6 +419,13 @@ impl Ontologies {
                 false,
             )
         };
+        if c.strict && !publication.classification.complete {
+            return Err(refuse_strict(
+                &publication.classification,
+                &publication.excluded,
+                &opts,
+            ));
+        }
         if let Some(about) = &c.about
             && publication
                 .classification
@@ -338,10 +443,11 @@ impl Ontologies {
                 .state()
                 .classify_cache
                 .lock()
+                .slot(c.el_only)
                 .publication
                 .as_ref()
                 .is_some_and(|p| p.id == publication.id);
-        let classified_complete = publication.classification.complete;
+        let classified_complete = !acknowledged_stop(&publication.classification);
         let mut classified = Classified {
             opened: o,
             classification: publication.classification.clone(),
@@ -379,47 +485,92 @@ impl Ontologies {
         let key = InputKey::of(self, req, &o.snapshot);
         let state = self.ds.state();
         if let Some(_idle) = state.classify_flight.try_lock() {
-            let cached = state.classify_cache.lock().publication.clone();
-            if let Some(p) =
-                cached.filter(|p| p.source.input == key && p.source.commit == o.snapshot.commit)
-            {
+            let cached = state
+                .classify_cache
+                .lock()
+                .slot(c.el_only)
+                .publication
+                .clone();
+            if let Some(p) = cached.filter(|p| {
+                p.source.input == key
+                    && p.source.commit == o.snapshot.commit
+                    && p.source.el_only == c.el_only
+            }) {
                 return Ok((p, true));
             }
         }
-        self.with_kept(o, req, opts, "classify", |e| {
+        self.with_kept(o, req, c.el_only, opts, "classify", |e| {
             if let Some(p) = &e.result
                 && p.source.commit == o.snapshot.commit
+                && p.source.el_only == c.el_only
             {
                 return Ok(((p.clone(), true), true));
             }
             // Admission precedes mutation, so a refused admission preserves a proven
             // old entry/publication. Later errors conservatively discard both.
             let par = admit(c.threads, opts)?;
-            let out = e.run_over(o, Vec::new(), |s, axioms, changes| {
-                run(s, axioms, changes, par, opts, c)
+            let seen = RefCell::new(None);
+            let mut dropped = dropped_assertions(o, opts, &seen);
+            let none = Unmapped::default();
+            let unmapped = || unmapped_of(&o.ontology, &none, &seen);
+            let (out, witness) = e.run_over(o, Vec::new(), |s, axioms, changes| {
+                run(
+                    s,
+                    axioms,
+                    changes,
+                    par,
+                    opts,
+                    c,
+                    Some(&mut dropped),
+                    &unmapped,
+                )
             })?;
             #[cfg(test)]
             let out = if FORCE_PARTIAL.with(|f| f.replace(false)) {
                 let mut partial = out;
                 partial.complete = false;
+                partial.complete_for_taken = false;
                 partial.consistency = sparkles_owl::classify::Consistency::Unknown;
                 partial.incomplete = partial.taxonomy.classes().cloned().collect();
                 partial
             } else {
                 out
             };
+            #[cfg(test)]
+            let out = if FORCE_COVERAGE_STOP.with(|f| f.replace(false)) {
+                // the caller's stop that the pass acknowledged
+                if let Some(c) = &opts.cancel {
+                    c.store(true, Ordering::Relaxed);
+                }
+                let mut stopped = out;
+                stopped.complete = false;
+                stopped.stats.coverage_stopped = true;
+                stopped.consistency = sparkles_owl::classify::Consistency::Unknown;
+                stopped.incomplete = stopped.taxonomy.classes().cloned().collect();
+                stopped
+            } else {
+                out
+            };
+            let mut excluded = e.saturation.excluded().to_vec();
+            excluded.extend(witness);
             let p = KeptClassification::capture(
                 self,
                 req,
                 c,
                 o,
                 Arc::new(out),
-                Arc::new(e.saturation.excluded().to_vec()),
+                Arc::new(excluded),
                 opts,
             )?;
-            let keep = p.classification.complete
-                && classification_retained_bytes(e, &p) <= retention_cap();
-            e.result = keep.then(|| p.clone());
+            let retained_bytes = classification_retained_bytes(e, &p);
+            let keep = p.classification.complete_for_taken && retained_bytes <= retention_cap();
+            // A modules' pass that the deadline stopped answers by timing, so the next
+            // request takes the pass again over the kept saturation.
+            let publish = keep && !p.classification.stats.coverage_stopped;
+            e.result = publish.then(|| p.clone());
+            if keep {
+                e.retained_bytes = retained_bytes;
+            }
             Ok(((p, false), keep))
         })
     }
@@ -431,6 +582,7 @@ impl Ontologies {
         &self,
         o: &Opened,
         req: &OntologyRequest,
+        el_only: bool,
         opts: &QueryOptions,
         kind: &'static str,
         f: impl FnOnce(&mut CacheEntry) -> Result<(T, bool)>,
@@ -454,7 +606,7 @@ impl Ontologies {
             check(opts)?;
         };
         check(opts)?;
-        let mut flight = KeptFlight::begin(state, lock, key, o.snapshot.commit, kind);
+        let mut flight = KeptFlight::begin(state, lock, key, el_only, o.snapshot.commit, kind);
         match f(flight.entry()) {
             Ok((out, keep)) => {
                 flight.finish(keep);
@@ -660,6 +812,9 @@ thread_local! {
     pub(super) static FORCE_PARTIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static FLIGHT_WAIT_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static REFUSE_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next kept classification on this thread answer as one whose modules'
+    /// pass the deadline stopped.
+    pub(super) static FORCE_COVERAGE_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The threads of a classification, from the algorithm pool. A caller takes them before
@@ -677,20 +832,83 @@ pub(super) fn admit(threads: usize, opts: &QueryOptions) -> Result<Par> {
 /// A classification of `axioms` by a saturation of its own, on the threads `c` asks the
 /// algorithm pool for and under the deadline, cancellation and memory budget of `opts`,
 /// with the axioms it left out or used in part.
+///
+/// `dropped` streams the axioms of the ontology that `axioms` leaves out, such as the
+/// assertions of a classification of the terminology alone, which count as left out
+/// when one has logical content ([`Classification::cover`]). `unmapped` answers, after
+/// that read, how many triples of the input map to no axiom, which count as left out
+/// too ([`Classification::leave_out_unmapped`]).
 pub(crate) fn classify_once(
     axioms: &[&AxiomKind],
     c: &ClassifyRequest,
     opts: &QueryOptions,
+    dropped: Option<&mut Dropped<'_>>,
+    unmapped: &dyn Fn() -> Unmapped,
 ) -> Result<(Classification, Vec<Excluded>)> {
     let mut s = Saturation::new();
     let par = admit(c.threads, opts)?;
-    let out = run(&mut s, axioms, None, par, opts, c)?;
-    Ok((out, s.excluded().to_vec()))
+    let (out, witness) = run(&mut s, axioms, None, par, opts, c, dropped, unmapped)?;
+    let mut excluded = s.excluded().to_vec();
+    excluded.extend(witness);
+    Ok((out, excluded))
+}
+
+/// The assertions of an open ontology, as the axioms a classification of its terminology
+/// alone drops ([`classify_once`]). A triple that maps to no axiom stops the read and
+/// sets `unmapped`.
+pub(super) fn dropped_assertions<'o>(
+    o: &'o Opened,
+    opts: &'o QueryOptions,
+    unmapped: &'o RefCell<Option<Triple>>,
+) -> impl FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + 'o {
+    move |f| {
+        o.assertions(opts, |ax, t, _| {
+            Ok(match ax {
+                Some(ax) => f(&ax.kind),
+                None => {
+                    *unmapped.borrow_mut() = Some(t.clone());
+                    false
+                }
+            })
+        })
+        .is_ok()
+    }
+}
+
+/// The triples that map to no axiom of a classification of `o`: the terminology's, then
+/// the assertion triples a run read (`unread`), then the one at which a stream of the
+/// assertions that the run did not read stopped (`seen`). A typing as `rdf:Property`
+/// that the read left unmapped, which no OWL type accompanies, as RDFS vocabularies type
+/// their properties, carries no logical content, so the classification does not count
+/// it; the read still reports it, as the profile checks do.
+pub(super) fn unmapped_of(
+    o: &sparkles_owl::read::Ontology,
+    unread: &Unmapped,
+    seen: &RefCell<Option<Triple>>,
+) -> Unmapped {
+    let rdfs_property = |t: &&Triple| {
+        t.predicate.as_str() == vocab::RDF_TYPE
+            && matches!(&t.object, Term::NamedNode(n) if n.as_str() == vocab::RDF_PROPERTY)
+    };
+    Unmapped::default()
+        .extend(
+            o.unmapped
+                .iter()
+                .map(|i| &o.triples[*i])
+                .filter(|t| !rdfs_property(t)),
+        )
+        .merge(unread)
+        .extend(seen.borrow().as_ref())
 }
 
 /// Runs a classification on the threads of `par` under the options' deadline,
 /// cancellation and memory budget, with the rules, the partial answer and the expansion
 /// strategy that `c` asks for.
+///
+/// The modules' pass ([`Classification::cover`]) runs after the saturation under the same
+/// bounds, with the `dropped` axioms, and answers the one of them it reports as left out.
+/// The triples that `unmapped` then counts are left out too.
+#[allow(clippy::too_many_arguments)]
 fn run(
     k: &mut Saturation,
     axioms: &[&AxiomKind],
@@ -698,15 +916,22 @@ fn run(
     par: Par,
     opts: &QueryOptions,
     c: &ClassifyRequest,
-) -> Result<Classification> {
+    dropped: Option<&mut Dropped<'_>>,
+    unmapped: &dyn Fn() -> Unmapped,
+) -> Result<(Classification, Option<Excluded>)> {
     bounded(par, opts, |limits| {
         let limits = Limits {
             el_only: c.el_only,
             partial: c.partial,
             expansion: c.expansion,
+            coverage: !c.skip_coverage,
+            cover_later: true,
             ..limits.clone()
         };
-        k.classify(axioms, changes, &limits)
+        let mut out = k.classify_admitted(axioms, changes, &limits)?;
+        let witness = out.cover(axioms, k.excluded(), dropped)?;
+        out.leave_out_unmapped(unmapped())?;
+        Ok((out.into_classification(), witness))
     })
 }
 
@@ -716,9 +941,16 @@ pub(super) fn saturate(
     axioms: &[&AxiomKind],
     changes: Option<Changes<'_>>,
     par: Par,
+    el_only: bool,
     opts: &QueryOptions,
 ) -> Result<sparkles_owl::classify::Saturated> {
-    bounded(par, opts, |limits| k.saturate(axioms, changes, limits))
+    bounded(par, opts, |limits| {
+        let limits = Limits {
+            el_only,
+            ..limits.clone()
+        };
+        k.saturate(axioms, changes, &limits)
+    })
 }
 
 /// Calls `f` on the threads of `par` with the limits of `opts`: its deadline,
@@ -753,6 +985,9 @@ fn bounded<T>(
     out.map_err(|e| match e {
         sparkles_owl::classify::Error::Cancelled => Error::Cancelled,
         sparkles_owl::classify::Error::Timeout => Error::Timeout,
+        sparkles_owl::classify::Error::Incomplete(excluded) => {
+            incomplete(sparkles_owl::classify::refusal(&excluded), &excluded)
+        }
         sparkles_owl::classify::Error::Memory { limit, used } => {
             let over_budget = opts.max_memory_bytes.is_some_and(|m| used as u64 > m);
             Error::BudgetExceeded(Budget {

@@ -18,10 +18,11 @@
 //! The options are IRIs with a scheme that is neither `http` nor `https`, so no query
 //! that could reach an endpoint before means something else now.
 
-use super::ctx::Ctx;
+use super::ctx::{Charge, Ctx, TermKind};
 use super::exec::{join_tables, left_join};
 use super::lateral::LateralSpec;
 use super::plan::{ActiveGraph, Kind, Node, Planner, collect_pattern_vars};
+use super::query_memory::QueryMemoryLease;
 use super::svccache::{self, Rows};
 use super::table::{Table, VarId};
 use crate::error::{Error, Result};
@@ -1035,16 +1036,21 @@ pub(super) fn plan_loop(
 }
 
 /// The substitutions of the planner's constants (initial bindings, the row of an
-/// enclosing `EXISTS` or `LATERAL`) into a SERVICE pattern.
-pub(super) fn planner_subst(p: &Planner<'_>, inner: &GraphPattern) -> Subst {
+/// enclosing `EXISTS` or `LATERAL`) into a SERVICE pattern, together with the decode
+/// credit that must stay alive until the returned map is dropped.
+pub(super) fn planner_subst<'a>(
+    p: &Planner<'a>,
+    inner: &GraphPattern,
+) -> Result<(Subst, Charge<'a>)> {
+    let decode = p.ctx.charge(0)?;
     let mut s = Subst::default();
     if p.subst.is_empty() {
-        return s;
+        return Ok((s, decode));
     }
     for n in all_vars(inner) {
         let v = p.ctx.var(&n);
         if let Some(id) = p.subst.get(&v)
-            && let Some(t) = p.ctx.term(*id)
+            && let Some(t) = p.ctx.term_checked_into(*id, &decode)?
         {
             if p.scoped.contains(&v) {
                 s.hidden.insert(n.clone());
@@ -1052,7 +1058,7 @@ pub(super) fn planner_subst(p: &Planner<'_>, inner: &GraphPattern) -> Subst {
             s.add(&n, t);
         }
     }
-    s
+    Ok((s, decode))
 }
 
 // ------------------------------------------------------------- execution ------
@@ -1170,7 +1176,7 @@ pub(super) fn run_remote(
     vars: &[VarId],
 ) -> Result<(Table, LoopStats)> {
     let mut run = RemoteRun::new(ctx, spec, rl)?;
-    run.add(ctx, spec, rl, l);
+    run.add(ctx, spec, rl, l)?;
     // The eager loop keeps its answers outside the memory charge until it joins them,
     // and admits the joined rows.
     run.send(ctx, spec, rl, true, &mut |_| Ok(()))?;
@@ -1199,9 +1205,13 @@ pub(super) struct RemoteRun {
     missing: Vec<usize>,
     /// the bytes of the answers the inputs hold, summed as they arrive
     held: u64,
-    /// the bytes of the keys and inputs the loop keeps, summed as they are added
-    kept: u64,
     pub stats: LoopStats,
+    /// retained credit for decoded outer constants and substituted pattern, dropped after
+    /// `outer` and `pattern`
+    _outer_lease: Option<QueryMemoryLease>,
+    /// retained credit for distinct keys, inputs and cache keys, reconciled continuously
+    /// from each row's decode charge and dropped after `inputs`, `by_values` and `by_key`
+    kept_lease: Option<QueryMemoryLease>,
 }
 
 /// The bytes one distinct key of `width` identifiers holds in `by_key`: the key, its
@@ -1229,13 +1239,14 @@ impl RemoteRun {
     pub(super) fn new(ctx: &Ctx, spec: &LateralSpec, rl: &RemoteLoop) -> Result<Self> {
         check_allowed(ctx)?;
         let names: Vec<String> = spec.keys.iter().map(|k| ctx.var_name(*k)).collect();
+        let decode = ctx.charge(0)?;
         let mut outer = Subst::default();
         for (v, id) in &spec.outer {
             if spec.keys.contains(v) {
                 continue;
             }
             let n = ctx.var_name(*v);
-            if let Some(t) = ctx.term(*id) {
+            if let Some(t) = ctx.term_checked_into(*id, &decode)? {
                 if spec.outer_scoped.contains(v) {
                     outer.hidden.insert(n.clone());
                 }
@@ -1243,6 +1254,11 @@ impl RemoteRun {
             }
         }
         let pattern = substitute(&spec.pattern, &outer);
+        let _outer_lease = if decode.bytes() > 0 {
+            Some(decode.output_lease(decode.bytes())?)
+        } else {
+            None
+        };
         let text = spec.pattern.to_string();
         let cache = &ctx.snap.results.service;
         let caching = rl.cache != CacheMode::None
@@ -1261,8 +1277,9 @@ impl RemoteRun {
             by_key: FxHashMap::default(),
             missing: Vec::new(),
             held: 0,
-            kept: 0,
             stats: LoopStats::default(),
+            _outer_lease,
+            kept_lease: None,
         })
     }
 
@@ -1275,40 +1292,68 @@ impl RemoteRun {
     }
 
     /// Take the left rows `l`: their new distinct inputs, answered from the cache where
-    /// it has them.
-    pub(super) fn add(&mut self, ctx: &Ctx, spec: &LateralSpec, rl: &RemoteLoop, l: &Table) {
-        let first = self.inputs.len();
+    /// it has them. Reconciles each row's transient decode charge continuously into
+    /// `kept_lease`, releasing credit for filtered or deduplicated terms immediately.
+    pub(super) fn add(
+        &mut self,
+        ctx: &Ctx,
+        spec: &LateralSpec,
+        rl: &RemoteLoop,
+        l: &Table,
+    ) -> Result<()> {
+        let cache = &ctx.snap.results.service;
         for i in 0..l.len() {
             let key = Self::key(spec, l, i);
             if self.by_key.contains_key(&key) {
                 continue;
             }
-            let values: Vec<Option<Term>> = key
-                .iter()
-                .map(|id| {
-                    (!id.is_undef())
-                        .then(|| ctx.term(*id))
-                        .flatten()
-                        .filter(|t| matches!(t, Term::NamedNode(_) | Term::Literal(_)))
-                })
-                .collect();
-            let n = self.inputs.len();
-            let input = *self.by_values.entry(values.clone()).or_insert_with(|| {
-                self.inputs.push(Input {
-                    values,
-                    key: None,
-                    rows: None,
-                });
-                n
-            });
-            self.kept = self.kept.saturating_add(key_bytes(key.len()));
-            self.by_key.insert(key, (input, false));
-        }
-        self.stats.inputs = self.inputs.len();
-        let cache = &ctx.snap.results.service;
-        for i in first..self.inputs.len() {
+            ctx.check()?;
+            let row_decode = ctx.charge(0)?;
+            let mut values = Vec::with_capacity(key.len());
+            for id in &key {
+                let term = if id.is_undef() {
+                    None
+                } else {
+                    ctx.check()?;
+                    match ctx.kind(*id) {
+                        TermKind::Iri | TermKind::Literal => {
+                            let prev = row_decode.bytes();
+                            match ctx.term_checked_into(*id, &row_decode)? {
+                                Some(t) if matches!(t, Term::NamedNode(_) | Term::Literal(_)) => {
+                                    Some(t)
+                                }
+                                discarded => {
+                                    drop(discarded);
+                                    row_decode.resize(prev)?;
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                values.push(term);
+            }
+            let key_cost = key_bytes(key.len());
+            if let Some(&existing) = self.by_values.get(&values) {
+                // Duplicate values (including filtered terms that collapsed to an existing
+                // entry): drop the decoded terms and settle credit down to the key alone.
+                drop(values);
+                let mut lease = Some(row_decode.output_lease(key_cost)?);
+                match &mut self.kept_lease {
+                    Some(held) => held.merge(&mut lease)?,
+                    None => self.kept_lease = lease,
+                }
+                self.by_key.insert(key, (existing, false));
+                continue;
+            }
+            let mut input = Input {
+                values,
+                key: None,
+                rows: None,
+            };
+            let base_kept = key_cost.saturating_add(input_bytes(&input));
             if self.caching {
-                let input = &mut self.inputs[i];
                 let mut kv: Vec<(&str, &Term)> = self
                     .outer
                     .map
@@ -1320,29 +1365,60 @@ impl RemoteRun {
                         kv.push((n.as_str(), t));
                     }
                 }
-                let k = svccache::key(&ctx.service_scope, rl.endpoint.as_str(), &self.text, &kv);
+                input.key = Some(svccache::try_key(
+                    &ctx.service_scope,
+                    rl.endpoint.as_str(),
+                    &self.text,
+                    &kv,
+                    |cap| -> Result<()> {
+                        let needed = base_kept.saturating_add(cap as u64);
+                        if needed > row_decode.bytes() {
+                            row_decode.add(needed - row_decode.bytes())?;
+                        }
+                        Ok(())
+                    },
+                )?);
+            }
+            let kept_cost =
+                base_kept.saturating_add(input.key.as_ref().map_or(0, |k| k.capacity() as u64));
+            // Admit any growth above the transient decode charge before cloning `values`
+            // into `by_values` or mutating state, then settle continuously into `kept_lease`.
+            if kept_cost > row_decode.bytes() {
+                row_decode.add(kept_cost - row_decode.bytes())?;
+            }
+            if let Some(k) = &input.key {
                 if rl.cache.reads() {
-                    input.rows = cache.get(&k);
+                    input.rows = cache.get(k);
                     if let Some(rows) = &input.rows {
                         self.stats.cache_hits += 1;
                         self.held = self.held.saturating_add(rows.bytes());
                     }
                 } else {
-                    cache.remove(&k);
+                    cache.remove(k);
                 }
-                input.key = Some(k);
             }
-            if self.inputs[i].rows.is_none() {
-                self.missing.push(i);
+            let n = self.inputs.len();
+            self.by_values.insert(input.values.clone(), n);
+            if input.rows.is_none() {
+                self.missing.push(n);
             }
-            self.kept = self.kept.saturating_add(input_bytes(&self.inputs[i]));
+            self.inputs.push(input);
+            self.by_key.insert(key, (n, false));
+            let mut lease = Some(row_decode.output_lease(kept_cost)?);
+            match &mut self.kept_lease {
+                Some(held) => held.merge(&mut lease)?,
+                None => self.kept_lease = lease,
+            }
         }
+        self.stats.inputs = self.inputs.len();
+        Ok(())
     }
 
     /// Send the requests for the unanswered inputs: the full bulk requests among them,
     /// and with `all` the last partial one too. After each request it passes `admit` the
-    /// bytes the loop then holds ([`RemoteRun::held_bytes`]), so a caller that charges
-    /// them refuses the loop before it sends the next request.
+    /// answer bytes the loop then holds ([`RemoteRun::answer_bytes`]), so a caller that
+    /// charges them refuses the loop before it sends the next request. Keys and inputs
+    /// are already covered by `self.kept_lease`.
     pub(super) fn send(
         &mut self,
         ctx: &Ctx,
@@ -1360,7 +1436,7 @@ impl RemoteRun {
             return Ok(());
         }
         let missing: Vec<usize> = self.missing.drain(..ready).collect();
-        let (mut held, kept) = (self.held, self.kept);
+        let mut held = self.held;
         let (names, outer, pattern) = (&self.names, &self.outer, &self.pattern);
         let (inputs, stats) = (&mut self.inputs, &mut self.stats);
         let unit = || {
@@ -1428,7 +1504,7 @@ impl RemoteRun {
                             let mut out = Vec::new();
                             let mut err = None;
                             // Each answer is held before the next request goes out.
-                            let mut retried = held.saturating_add(kept);
+                            let mut retried = held;
                             for i in chunk {
                                 match ctx
                                     .check()
@@ -1476,7 +1552,7 @@ impl RemoteRun {
                 .sum();
             held = held.saturating_add(answered);
             self.held = held;
-            admit(held.saturating_add(kept))?;
+            admit(held)?;
         }
         Ok(())
     }
@@ -1493,10 +1569,10 @@ impl RemoteRun {
             .unwrap_or(l.len())
     }
 
-    /// The bytes the loop holds: the answers of its inputs, and the distinct keys and
-    /// inputs it keeps to look them up.
-    pub(super) fn held_bytes(&self) -> u64 {
-        self.held.saturating_add(self.kept)
+    /// The bytes of the answers the loop holds (cached and fetched). Distinct keys and
+    /// inputs are charged separately on `self.kept_lease`.
+    pub(super) fn answer_bytes(&self) -> u64 {
+        self.held
     }
 
     /// Join the left rows `l`, whose inputs all have answers, with their solutions.
@@ -1526,7 +1602,7 @@ impl RemoteRun {
             .collect();
         rvars.dedup();
         let expr = match &spec.optional {
-            Some(Some(e)) => Some(Planner::new(ctx).compile(e, &spec.graph)),
+            Some(Some(e)) => Some(Planner::new(ctx).compile(e, &spec.graph)?),
             _ => None,
         };
         let mut out = Table::new(vars.to_vec());

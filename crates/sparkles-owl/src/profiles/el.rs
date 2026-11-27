@@ -67,6 +67,12 @@ pub(super) fn axiom(ax: &Axiom) -> Vec<Broken> {
 
 /// The rules of one axiom, without its annotations.
 pub(super) fn axiom_kind(kind: &AxiomKind) -> Vec<Broken> {
+    axiom_kind_with(kind, false)
+}
+
+/// The rules of one axiom, without its annotations, and without the rule against
+/// anonymous individuals when `anonymous` allows them.
+pub(super) fn axiom_kind_with(kind: &AxiomKind, anonymous: bool) -> Vec<Broken> {
     use AxiomKind as K;
     let mut out = Vec::new();
     match kind {
@@ -74,9 +80,8 @@ pub(super) fn axiom_kind(kind: &AxiomKind) -> Vec<Broken> {
             ce(a, &mut out);
             ce(b, &mut out);
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
-            cs.iter().for_each(|c| ce(c, &mut out))
-        }
+        K::EquivalentClasses(cs) => cs.iter().for_each(|c| ce(c, &mut out)),
+        K::DisjointClasses(cs) => cs.iter().for_each(|c| ce(c, &mut out)),
         K::SubObjectPropertyOf(sub, sup) => {
             match sub {
                 SubObjectPropertyExpression::Expression(p) => ope(p, &mut out),
@@ -122,9 +127,10 @@ pub(super) fn axiom_kind(kind: &AxiomKind) -> Vec<Broken> {
             ));
         }
     }
-    if individuals(kind)
-        .iter()
-        .any(|i| matches!(i, Individual::Anonymous(_)))
+    if !anonymous
+        && individuals(kind)
+            .iter()
+            .any(|i| matches!(i, Individual::Anonymous(_)))
     {
         out.push(broken(ENTITIES, "anonymous individuals are not allowed"));
     }
@@ -160,7 +166,8 @@ pub(super) fn certainly_el(kind: &AxiomKind) -> bool {
         // a declaration names a datatype without using it
         K::Declaration(_) => true,
         K::SubClassOf(a, b) => ce(a) && ce(b),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs.iter().all(ce),
+        K::EquivalentClasses(cs) => cs.iter().all(ce),
+        K::DisjointClasses(cs) => cs.iter().all(ce),
         K::SubObjectPropertyOf(sub, sup) => {
             plain(sup)
                 && match sub {
@@ -175,9 +182,188 @@ pub(super) fn certainly_el(kind: &AxiomKind) -> bool {
         K::ObjectPropertyAssertion(p, a, b) | K::NegativeObjectPropertyAssertion(p, a, b) => {
             plain(p) && named(a) && named(b)
         }
-        K::SameIndividual(is) | K::DifferentIndividuals(is) => is.iter().all(named),
+        K::SameIndividual(is) => is.iter().all(named),
+        K::DifferentIndividuals(is) => is.iter().all(named),
         // the remaining types are left to the full check
         _ => false,
+    }
+}
+
+/// Whether an axiom breaks any local rule of OWL 2 EL (without the global property-chain
+/// range restriction and allowing anonymous individuals, matching
+/// `!axiom_kind_with(kind, true).is_empty()`), decided without heap allocation and
+/// polling `poll` every `poll_step` AST nodes.
+pub(super) fn breaks_with_anonymous_polled<E>(
+    kind: &AxiomKind,
+    poll_step: usize,
+    poll: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    fn forbidden_dt(iri: &str) -> bool {
+        EL_QL_FORBIDDEN_DATATYPES.contains(&iri)
+    }
+    fn lit_breaks(l: &Literal) -> bool {
+        l.language().is_none() && forbidden_dt(l.datatype())
+    }
+    fn ope_breaks(p: &ObjectPropertyExpression) -> bool {
+        matches!(p, ObjectPropertyExpression::InverseOf(_))
+    }
+    fn tick<E>(
+        visited: &mut usize,
+        step: usize,
+        poll: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        *visited += 1;
+        if (*visited).is_multiple_of(step) {
+            poll()?;
+        }
+        Ok(())
+    }
+    fn dr_breaks<E>(
+        r: &DataRange,
+        step: usize,
+        visited: &mut usize,
+        poll: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        tick(visited, step, poll)?;
+        match r {
+            DataRange::Datatype(d) => Ok(forbidden_dt(d.as_str())),
+            DataRange::IntersectionOf(rs) => {
+                for r in rs {
+                    if dr_breaks(r, step, visited, poll)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            DataRange::OneOf(ls) => Ok(ls.len() != 1 || ls.iter().any(lit_breaks)),
+            DataRange::UnionOf(_)
+            | DataRange::ComplementOf(_)
+            | DataRange::DatatypeRestriction(..) => Ok(true),
+        }
+    }
+    fn ce_breaks<E>(
+        c: &ClassExpression,
+        step: usize,
+        visited: &mut usize,
+        poll: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        use ClassExpression as C;
+        tick(visited, step, poll)?;
+        match c {
+            C::Class(_) => Ok(false),
+            C::DataHasValue(_, l) => Ok(lit_breaks(l)),
+            C::ObjectIntersectionOf(cs) => {
+                for c in cs {
+                    if ce_breaks(c, step, visited, poll)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            C::ObjectOneOf(is) => Ok(is.len() != 1),
+            C::ObjectSomeValuesFrom(p, c) => {
+                if ope_breaks(p) {
+                    return Ok(true);
+                }
+                ce_breaks(c, step, visited, poll)
+            }
+            C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => Ok(ope_breaks(p)),
+            C::DataSomeValuesFrom(_, r) => dr_breaks(r, step, visited, poll),
+            _ => Ok(true),
+        }
+    }
+
+    use AxiomKind as K;
+    let step = poll_step.max(1);
+    let mut visited = 0usize;
+    tick(&mut visited, step, poll)?;
+    match kind {
+        // Declarations name a datatype without using it (`datatypes()` clears them).
+        K::Declaration(_) => Ok(false),
+        K::SubClassOf(a, b) => {
+            Ok(ce_breaks(a, step, &mut visited, poll)? || ce_breaks(b, step, &mut visited, poll)?)
+        }
+        K::EquivalentClasses(cs) => {
+            for c in cs {
+                if ce_breaks(c, step, &mut visited, poll)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        K::DisjointClasses(cs) => {
+            for c in cs {
+                if ce_breaks(c, step, &mut visited, poll)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        K::SubObjectPropertyOf(sub, sup) => {
+            if ope_breaks(sup) {
+                return Ok(true);
+            }
+            match sub {
+                SubObjectPropertyExpression::Expression(p) => Ok(ope_breaks(p)),
+                SubObjectPropertyExpression::Chain(ps) => {
+                    for p in ps {
+                        tick(&mut visited, step, poll)?;
+                        if ope_breaks(p) {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+            }
+        }
+        K::EquivalentObjectProperties(ps) => {
+            for p in ps {
+                tick(&mut visited, step, poll)?;
+                if ope_breaks(p) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
+            Ok(ope_breaks(p) || ce_breaks(c, step, &mut visited, poll)?)
+        }
+        K::ReflexiveObjectProperty(p) | K::TransitiveObjectProperty(p) => Ok(ope_breaks(p)),
+        K::DataPropertyDomain(_, c) => ce_breaks(c, step, &mut visited, poll),
+        K::DataPropertyRange(_, r) => dr_breaks(r, step, &mut visited, poll),
+        K::DatatypeDefinition(d, r) => {
+            Ok(forbidden_dt(d.as_str()) || dr_breaks(r, step, &mut visited, poll)?)
+        }
+        K::HasKey(c, ops, _) => {
+            if ce_breaks(c, step, &mut visited, poll)? {
+                return Ok(true);
+            }
+            for p in ops {
+                tick(&mut visited, step, poll)?;
+                if ope_breaks(p) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        K::ClassAssertion(c, _) => ce_breaks(c, step, &mut visited, poll),
+        K::ObjectPropertyAssertion(p, ..) | K::NegativeObjectPropertyAssertion(p, ..) => {
+            Ok(ope_breaks(p))
+        }
+        K::DataPropertyAssertion(_, _, l) | K::NegativeDataPropertyAssertion(_, _, l) => {
+            Ok(lit_breaks(l))
+        }
+        K::AnnotationAssertion(_, _, AnnotationValue::Literal(l)) => Ok(lit_breaks(l)),
+        K::DisjointUnion(..)
+        | K::DisjointObjectProperties(_)
+        | K::InverseObjectProperties(..)
+        | K::FunctionalObjectProperty(_)
+        | K::InverseFunctionalObjectProperty(_)
+        | K::IrreflexiveObjectProperty(_)
+        | K::SymmetricObjectProperty(_)
+        | K::AsymmetricObjectProperty(_)
+        | K::DisjointDataProperties(_) => Ok(true),
+        _ => Ok(false),
     }
 }
 

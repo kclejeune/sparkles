@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""make-record.py EVIDENCE OUT: writes the run record of item 712 from the lane's evidence."""
+import hashlib
+import json
+import os
+import statistics as st
+import sys
+
+E, OUT = sys.argv[1], sys.argv[2]
+T = os.path.join(E, "timing712")
+
+
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+timing = []
+for k in range(1, 13):
+    for t in (1, 4):
+        for lv in (0, 2):
+            j = json.load(open(f"{T}/r{k}.l{lv}.t{t}.json"))
+            timing.append({
+                "round": k, "level": lv, "threads": t,
+                "classifyMs": j["classifyMs"], "tier": j["tier"], "complete": j["complete"],
+                "dlWork": j["dlWork"], "dlStored": j["dlStored"], "conclusions": j["conclusions"],
+                "estimatedBytes": j["estimatedBytes"], "peakRssKib": j["peakRssKib"],
+            })
+summary = {}
+for t in (1, 4):
+    med = {lv: [st.median(x["classifyMs"]) for x in timing if x["threads"] == t and x["level"] == lv]
+           for lv in (0, 2)}
+    ratios = [b / a for a, b in zip(med[0], med[2])]
+    summary[f"{t} thread(s)"] = {
+        "level0_ms": round(st.median(med[0]), 2), "level2_ms": round(st.median(med[2]), 2),
+        "ratio_median": round(st.median(ratios), 3),
+        "ratio_range": [round(min(ratios), 3), round(max(ratios), 3)],
+        "rounds_below_1": sum(r < 1 for r in ratios),
+    }
+
+sweeps = {}
+for name in ("sweep712-dev", "sweep712-final"):
+    lines = open(os.path.join(E, name, "log.txt")).read().splitlines()
+    sweeps[name] = lines
+
+counts = {}
+for lv in (0, 2):
+    counts[f"level{lv}"] = {
+        l.split()[1]: int(l.split()[2])
+        for l in open(os.path.join(E, "counts", f"l{lv}.err")) if l.startswith("MEAS ")
+    }
+
+A = os.path.join(E, "automata712")
+automata = {}
+for lv in (0, 1, 2):
+    automata[f"level{lv}"] = [l.rstrip("\n") for l in open(os.path.join(A, f"l{lv}.r1.err"))
+                             if l.startswith("MEASURE dl-")]
+instructions = {
+    "binary": "the meas build of lane perf-stuck-measure, fd47b7ae with automata_patch, sha256 "
+              + open(os.path.join(A, "meas.sha256")).read().split()[0],
+    "method": "perf stat -e cpu_core/instructions/u of one whole el_classify process with --repeat 5 on BioTop, pinned to the laptop's P-cores, three runs per level in the order of the lines, with SPARKLES_DL_AUTOMATA at each level; each line gives the level, the run, the user instructions and the process's classification times in ms",
+    "runs": open(os.path.join(A, "insn.txt")).read().splitlines(),
+}
+
+record = {
+    "suite": "el-classification",
+    "kind": "measurement",
+    "scale": "ore_ont_12141 of the ORE 2015 DL sample, BioTop, on atlas, with the laptop's corpus sweep, counters and profile",
+    "host": {"name": "atlas", "cpu": "13th Gen Intel(R) Core(TM) i5-13500", "cpus": 20, "ram_mib": 15614},
+    "manifest": {
+        "sides": {
+            "level0": "SPARKLES_DL_AUTOMATA=0, the automata as the closure over their ε-transitions leaves them",
+            "level2": "SPARKLES_DL_AUTOMATA=2, merged states and dropped covered transitions, the item's default",
+        },
+        "build": "the dlauto measurement build of lane perf-stuck-measure, fd47b7ae with dlauto.patch, the same reduction call as the item's commit, release el_classify built on the laptop with mbx 1.29.1 and rustc 1.99.1 and copied to atlas",
+        "commits": {"base": "fd47b7ae", "item": "acf29e27"},
+        "binaries_sha256": {"dlauto": "c3a01adf791fb96bf958618268077992f8334c0960e1e6da087f772c846f55c3",
+                            "item el_classify (sweep)": sha(os.path.join(E, "el_classify-tip"))},
+        "data_sha256": {"ore_ont_12141.owl": "608315409b470595b1c6febfff51a88ca8041e4adaaa9560d6e71abf1ede5dd2"},
+    },
+    "settings": {
+        "threads": "one and four",
+        "repeat": 5,
+        "scope": "one process per level, round and thread count, with a 300 s timeout",
+        "lock": "the rounds ran under ~/lanes/.heavy.lock as the systemd user unit perf-stuck-measure-timing712 with no other job holding the lock, and the one-minute load average was 2.29 at the start, after earlier work whose five-minute average was 11.4",
+    },
+    "method": "timing712.sh ran twelve rounds on atlas in ABBA order of one binary with SPARKLES_DL_AUTOMATA at 0 and 2 on one and four threads. Each time is the median over the rounds of each process's median classification, each ratio the median of the rounds' paired ratios of those medians, and the range that of the rounds. The laptop's sweep ran the item's build on every development and final file of the ORE 2015 DL sample, none of the sealed third, once per level on one thread in an 8 GiB scope, and each log line gives the file, the level, the exit status, the first 16 hex digits of the SHA-256 of the sorted taxonomy and the tier, work, stored clauses, conclusions, attempt flag and classification time. The counters are a temporary patch of the item's build, meas.patch, run once per level on one thread, and the profile samples user instructions of the item's build at level 2 over 30 classifications.",
+    "timing": timing,
+    "timing_summary": summary,
+    "host_state": {"before": open(f"{T}/before.txt").read(), "after": open(f"{T}/after.txt").read()},
+    "laptop": {
+        "sweeps": sweeps,
+        "counters": counts,
+        "counter_patch": open(os.path.join(E, "counts", "meas.patch")).read(),
+        "profile_self": open(os.path.join(E, "counts", "perf.l2.self.txt")).read(),
+        "profile_children": open(os.path.join(E, "counts", "perf.l2.children.txt")).read(),
+        "automata": automata,
+        "automata_method": "one run per level on one thread of the same meas build, whose dl-auto lines give each automaton's states and transitions before and after the reduction and whose dl-unfold line gives the unfoldings, the fresh state classes and the transition axioms of the whole ontology",
+        "automata_patch": open(os.path.join(A, "meas.patch")).read(),
+        "instructions": instructions,
+    },
+}
+os.makedirs(OUT, exist_ok=True)
+with open(os.path.join(OUT, "record.json"), "w") as f:
+    json.dump(record, f, indent=1, ensure_ascii=False)
+    f.write("\n")

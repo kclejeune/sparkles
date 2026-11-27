@@ -450,41 +450,69 @@ fn incremental_runs_agree_with_fresh_ones_across_constructors() {
     }
 }
 
-/// A merge with an individual ties the contexts together, so the next edit starts again,
-/// and its answer is that of a fresh run.
+/// A merge with an individual tracks its exact context dependencies, so the next edit
+/// updates incrementally and matches a fresh run (roadmap item 664).
 #[test]
-fn an_edit_after_a_merge_with_an_individual_starts_again() {
+fn an_edit_after_a_merge_with_an_individual_updates_incrementally() {
     let one = ClassExpression::ObjectOneOf([ind("i")].into_iter().collect());
     let held = vec![
         Axiom::sub_class_of(ce("A"), one.clone()),
         Axiom::sub_class_of(ce("B"), one),
         Axiom::sub_class_of(ce("A"), ce("X")),
     ];
-    follows_with_restart(held, Axiom::sub_class_of(ce("X"), ce("Y")));
+    follows_incrementally(held, Axiom::sub_class_of(ce("X"), ce("Y")));
 }
 
-/// A fact of the universal role reaches every context, so the next edit starts again,
-/// and its answer is that of a fresh run.
+/// A fact of the universal role keeps its grounded witness across unrelated edits, so
+/// an edit that leaves the witness intact updates incrementally, while removing the
+/// witness restarts fresh (roadmap item 664).
 #[test]
-fn an_edit_after_a_fact_of_the_universal_role_starts_again() {
+fn an_edit_after_a_fact_of_the_universal_role_tracks_its_witness() {
+    let witness = ax(AxiomKind::ClassAssertion(ce("C"), ind("i")));
     let held = vec![
-        ax(AxiomKind::ClassAssertion(ce("C"), ind("i"))),
+        witness.clone(),
         Axiom::sub_class_of(
             ClassExpression::some(ObjectProperty::top(), ce("C")),
             ce("D"),
         ),
         Axiom::declaration(Entity::Class(c("A"))),
     ];
-    follows_with_restart(held, Axiom::sub_class_of(ce("D"), ce("E")));
+    // An unrelated edit leaves the witness intact and updates incrementally.
+    follows_incrementally(held.clone(), Axiom::sub_class_of(ce("A"), ce("E")));
+
+    // Editing the broadcast universal fact `D` itself reaches every context holding `D`
+    // and matches a fresh run.
+    let limits = Limits::default();
+    let mut kd = Classifier::of(&held);
+    kd.classify(&limits).unwrap();
+    let d_edit = Axiom::sub_class_of(ce("D"), ce("E"));
+    kd.add([&d_edit]);
+    let out_d = kd.classify(&limits).unwrap();
+    let mut with_d = held.clone();
+    with_d.push(d_edit);
+    let fresh_d = Classifier::of(&with_d).classify(&limits).unwrap();
+    assert_eq!(out_d.taxonomy, fresh_d.taxonomy);
+    assert_eq!(out_d.consistent, fresh_d.consistent);
+
+    // Removing the only grounded witness of the broadcast universal fact restarts fresh.
+    let mut k = Classifier::of(&held);
+    k.classify(&limits).unwrap();
+    k.remove([&witness]);
+    let out = k.classify(&limits).unwrap();
+    assert!(!out.stats.incremental, "{:?}", out.stats);
+    let remaining: Vec<Axiom> = held.into_iter().filter(|a| a != &witness).collect();
+    let fresh = Classifier::of(&remaining).classify(&limits).unwrap();
+    assert_eq!(out.taxonomy, fresh.taxonomy);
+    assert_eq!(out.consistent, fresh.consistent);
 }
 
-fn follows_with_restart(held: Vec<Axiom>, edit: Axiom) {
+fn follows_incrementally(held: Vec<Axiom>, edit: Axiom) {
     let limits = Limits::default();
     let mut k = Classifier::of(&held);
     k.classify(&limits).unwrap();
     k.add([&edit]);
     let out = k.classify(&limits).unwrap();
-    assert!(!out.stats.incremental, "{:?}", out.stats);
+    assert!(out.stats.incremental, "{:?}", out.stats);
     let mut all = held;
     all.push(edit);
     let fresh = Classifier::of(&all).classify(&limits).unwrap();

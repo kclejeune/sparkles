@@ -37,6 +37,7 @@ mod fmt;
 mod fuseki_config;
 mod geo;
 mod geo_index_cmd;
+mod git_cmd;
 #[cfg(feature = "graphql")]
 mod graphql;
 mod graphrag;
@@ -55,6 +56,7 @@ mod migrate_cmd;
 mod model_store;
 mod views_cmd;
 // the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
+mod linked_data;
 #[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
 mod models;
 mod models_cmd;
@@ -1187,7 +1189,7 @@ enum Cmd {
         #[arg(long)]
         no_metrics: bool,
         /// Datasets with their own metric labels; the others share `$other`
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = obs::DEFAULT_METRICS_MAX_DATASETS)]
         metrics_max_datasets: usize,
         /// Also expose Fuseki's metric names (fuseki_requests, fuseki_requests_good,
         /// fuseki_requests_bad, ...) on /$/metrics, for dashboards built for Fuseki
@@ -1916,6 +1918,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: branch_cmd::BranchCmd,
     },
+    /// Canonical git serialization and branch export
+    Git {
+        #[command(subcommand)]
+        cmd: git_cmd::GitCmd,
+    },
     /// Merge a branch into another (main by default); exits 2 when conflicts stopped it
     Merge(branch_cmd::MergeArgs),
     /// Undo a commit on the --branch branch (main by default) with a new commit; exits 2
@@ -2626,6 +2633,7 @@ fn rejected_exit(e: anyhow::Error) -> anyhow::Error {
 
 /// The input graphs that `sparkles infer` was given, or `None` when it was given none of
 /// the input options and the recorded inputs apply.
+#[cfg(feature = "reasoning")]
 fn cli_inputs(
     data_graphs: &[String],
     ontology_graphs: &[String],
@@ -2740,6 +2748,9 @@ fn run() -> Result<()> {
             | Cmd::Patch(_)
             | Cmd::Revert(_)
             | Cmd::CherryPick(_)
+            | Cmd::Git {
+                cmd: git_cmd::GitCmd::Export { .. } | git_cmd::GitCmd::WriteTree { .. },
+            }
     );
     #[cfg(feature = "backup")]
     let branch_capable = branch_capable
@@ -2771,12 +2782,14 @@ fn run() -> Result<()> {
             otel_query_text,
             otel_plan_spans,
             otel_logs,
+            metrics_max_datasets,
             ..
         } => otel::Settings {
             enabled: *otel,
             query_text: *otel_query_text,
             plan_spans: *otel_plan_spans,
             logs: *otel_logs,
+            metrics_max_datasets: *metrics_max_datasets,
         },
         _ => otel::Settings::default(),
     };
@@ -3480,7 +3493,11 @@ fn run() -> Result<()> {
             // and runs its request itself, instead of waking this thread to accept and
             // then another worker to serve it.
             let serve = async move {
-                let addr = format!("{host}:{port}");
+                let addr = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                };
                 let tcp = match &unix_socket {
                     None => Some(
                         tokio::net::TcpListener::bind(&addr)
@@ -3502,7 +3519,17 @@ fn run() -> Result<()> {
                     let l = tokio::net::TcpListener::bind(maddr)
                         .await
                         .with_context(|| format!("binding --metrics-addr {maddr}"))?;
-                    tracing::info!("metrics at http://{maddr}/$/metrics");
+                    let bound = if maddr
+                        .rsplit_once(':')
+                        .is_some_and(|(_, port)| port.parse::<u16>() == Ok(0))
+                    {
+                        l.local_addr()
+                            .context("reading the metrics listener address")?
+                            .to_string()
+                    } else {
+                        maddr.clone()
+                    };
+                    tracing::info!("metrics at http://{bound}/$/metrics");
                     let service = obs::metrics_router(st.clone())
                         .into_make_service_with_connect_info::<auth::Peer>();
                     tokio::spawn(async move {
@@ -3521,17 +3548,22 @@ fn run() -> Result<()> {
                     bail!("--unix-socket needs a Unix platform");
                 }
                 let scheme = if tls_cert.is_some() { "https" } else { "http" };
-                // the address and port the socket bound, which differ from a `--host`
-                // name or `--port 0`, for recognising SERVICE calls to this server
-                if let Some(addr) = tcp.as_ref().and_then(|l| l.local_addr().ok()) {
+                let addr = if let Some(listener) = &tcp {
+                    // Recognise SERVICE calls to the actual socket address.
+                    let bound = listener
+                        .local_addr()
+                        .context("reading the listener address")?;
                     let _ = st.listener.set(http::self_service::Listener {
                         scheme,
-                        ip: addr.ip(),
-                        port: addr.port(),
+                        ip: bound.ip(),
+                        port: bound.port(),
                     });
-                }
+                    if port == 0 { bound.to_string() } else { addr }
+                } else {
+                    addr
+                };
                 let listening = match &unix_socket {
-                    Some(p) => format!("unix:{}", p.display()),
+                    Some(path) => format!("unix:{}", path.display()),
                     None => format!("{scheme}://{addr}/"),
                 };
                 tracing::info!(
@@ -4507,6 +4539,7 @@ fn run() -> Result<()> {
         } => check_cmd::run(loc, data, &format, quick),
         Cmd::Migrate(a) => migrate_cmd::run(a),
         Cmd::Branch { cmd } => branch_cmd::run_branch(cmd, opts),
+        Cmd::Git { cmd } => git_cmd::run(cmd, opts),
         Cmd::Merge(a) => {
             let code = branch_cmd::run_merge(a, opts)?;
             if code != 0 {

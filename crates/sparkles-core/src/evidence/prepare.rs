@@ -201,6 +201,50 @@ pub fn prepare_input<'a>(input: &'a EvidenceInput, control: &Control) -> Result<
         for family in &source.lineage.families {
             preparation.node(family)?;
         }
+        // Framed only when present, under a tag no other field uses, so that a
+        // revision without a predecessor keeps the payload digest it had before.
+        if let Some(predecessor) = &source.was_revision_of {
+            preparation.frame.field(41, &[1])?;
+            preparation.reference(predecessor, &[RecordKind::SourceRevision])?;
+        }
+    }
+    if input.revisions.iter().any(|r| r.was_revision_of.is_some()) {
+        // 0 = unvisited, 1 = on current path, 2 = verified acyclic.
+        let mut state = vec![0u8; input.revisions.len()];
+        let mut path = Vec::new();
+        for start in 0..input.revisions.len() {
+            if state[start] != 0 {
+                continue;
+            }
+            path.clear();
+            let mut cur = start;
+            loop {
+                control.check()?;
+                state[cur] = 1;
+                path.push(cur);
+                let Some(RecordRef::Local(key)) = &input.revisions[cur].was_revision_of else {
+                    break;
+                };
+                let next = preparation.local_index(key);
+                if next == cur {
+                    return Err(Error::invalid(
+                        "revisions.wasRevisionOf: a source revision cannot revise itself",
+                    ));
+                }
+                if state[next] == 1 {
+                    return Err(Error::invalid(
+                        "revisions.wasRevisionOf: the batch's source revisions revise each other in a cycle",
+                    ));
+                }
+                if state[next] == 2 {
+                    break;
+                }
+                cur = next;
+            }
+            for &node in &path {
+                state[node] = 2;
+            }
+        }
     }
     for rendition in &input.renditions {
         preparation.start(RecordKind::Rendition, rendition.key.as_str())?;
@@ -867,7 +911,7 @@ fn verify_local_structured(
             unreachable!("only retained local revisions are grouped");
         };
         let json = std::str::from_utf8(bytes)
-            .map_err(|_| Error::invalid("JSON reference requires retained UTF-8"))?;
+            .map_err(|_| Error::invalid("span-mismatch: JSON reference requires retained UTF-8"))?;
         let pointers: Vec<_> = references
             .iter()
             .map(|index| {

@@ -1,0 +1,8 @@
+200 application/rdf+xml
+<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xsd="http://www.w3.org/2001/XMLSchema#" xmlns:its="http://www.w3.org/2005/11/its" xmlns:ex="urn:ex:">
+	<rdf:Description rdf:about="urn:ex:s1">
+		<ex:p rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">42</ex:p>
+		<ex:p rdf:nodeID="b0"/>
+	</rdf:Description>
+</rdf:RDF>

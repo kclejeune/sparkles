@@ -427,7 +427,7 @@ impl Tools<'_> {
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let deadline = self.call.arrived + timeout;
+        let deadline = self.deadline(timeout);
         let max_claims = match (&a.review_policy, a.max_claims) {
             (None, Some(_)) => {
                 return Err(ToolError::bad_argument("maxClaims needs reviewPolicy"));
@@ -444,13 +444,7 @@ impl Tools<'_> {
             None
         };
         let r = match &view {
-            Some(v) => self.reader_on(
-                &ds,
-                v.shared_snapshot().clone(),
-                a.reasoning,
-                deadline,
-                &ctx,
-            )?,
+            Some(v) => self.reader_on_evidence(&ds, v.clone(), a.reasoning, deadline, &ctx)?,
             None => self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?,
         };
         let eng = |e| ctx.engine(e);
@@ -516,7 +510,7 @@ impl Tools<'_> {
                 if let Term::NamedNode(n) = seed
                     && let Some(e) = doc.entities.get(n.as_str())
                 {
-                    for m in &e.members {
+                    for m in e.members.iter() {
                         if present.insert(Term::NamedNode(m.clone()).to_string()) {
                             joined.push((Term::NamedNode(m.clone()), None));
                             joined_ranks.push(rank);
@@ -689,14 +683,18 @@ impl Tools<'_> {
                     ));
                 }
             };
-            self.seed_communities(&ds, &r, &entities, level)
+            let community_filter = crate::graphrag::read::Filter {
+                reviewed_only: false,
+                review_policy_iri: claims.as_ref().map(|c| c.policy.iri.as_str()),
+            };
+            self.seed_communities(&ds, &r, &entities, level, community_filter)
                 .map_err(eng)?
         } else {
             Communities::default()
         };
         let doc = Doc {
             dataset: &ds.name,
-            commit: r.snap.commit,
+            commit: r.commit(),
             seeds: seeds.len(),
             entities: &entities,
             facts: &facts,
@@ -958,6 +956,7 @@ impl Tools<'_> {
         r: &Reader,
         entities: &[Entity],
         level: Option<u32>,
+        filter: crate::graphrag::read::Filter<'_>,
     ) -> Result<Communities, Error> {
         use crate::graphrag::read;
         let settings: crate::graphrag::settings::GraphragSettings =
@@ -970,7 +969,7 @@ impl Tools<'_> {
         }
         let graph = settings.reports_graph;
         let opts = r.timed()?;
-        if !read::readable(&r.snap, &opts, &graph) {
+        if !r.readable_graph(&opts, &graph)? {
             return Ok(Communities {
                 unavailable: Some("access"),
                 ..Default::default()
@@ -985,14 +984,7 @@ impl Tools<'_> {
             .collect();
         seeds.sort();
         let members: Vec<String> = seeds.iter().map(|(_, s)| s.clone()).collect();
-        let found = read::reports_of_members(
-            &r.snap,
-            &opts,
-            &graph,
-            &members,
-            level,
-            read::Filter::default(),
-        )?;
+        let found = r.reports_of_members(&opts, &graph, &members, level, filter)?;
         let mut reports: Vec<(read::ReportRef, Vec<usize>)> = Vec::new();
         for (m, rep) in found {
             let n = seeds.iter().find(|(_, s)| *s == m).map_or(0, |(n, _)| *n);
@@ -1280,14 +1272,12 @@ impl Tools<'_> {
             .call
             .principal
             .view(&ds.name, crate::auth::Endpoint::Info);
-        let layer = match ds.dataset.schema().constraints_at(
-            &r.snap,
-            &sparkles::handles::ShapesRequest::default(),
-            view.as_deref(),
-        ) {
+        let layer = match r.constraints(ds, view.as_deref()) {
             Ok(Some(l)) => l,
-            Ok(None) => return Ok(Vec::new()),
-            Err(Error::Unsupported(_)) | Err(Error::NotFound(_)) | Err(Error::Invalid(_)) => {
+            Ok(None)
+            | Err(Error::Unsupported(_))
+            | Err(Error::NotFound(_))
+            | Err(Error::Invalid(_)) => {
                 return Ok(Vec::new());
             }
             Err(e) => return Err(ctx.engine(e)),
@@ -2239,7 +2229,7 @@ const VIEW_BYTES: u64 = 64 << 20;
 impl Tools<'_> {
     /// The evidence view a call that names a policy reads, selected from its own
     /// selector: Head, `atCommit` or `at`, including a named snapshot.
-    fn evidence_view(
+    pub(super) fn evidence_view(
         &self,
         ds: &std::sync::Arc<crate::state::Dataset>,
         at_commit: Option<u64>,
@@ -2256,13 +2246,26 @@ impl Tools<'_> {
                 .ok_or_else(|| ToolError::new("unknown-dataset", 404, "the dataset is gone"))?,
             None => ds.clone(),
         };
+        let drift = crate::settings::evidence::DriftFence::capture(&self.server.state, &main)
+            .map_err(|e| ctx.engine(e))?;
         let control = sparkles::task::Control {
             deadline: Some(deadline),
             ..sparkles::task::Control::with_cancel(self.call.cancel.clone())
         };
-        let preparation =
-            sparkles::access::Preparation::new(control, VIEW_BYTES).map_err(|e| ctx.engine(e))?;
-        main.dataset
+        let query_limit = self.cfg().query_memory_bytes.unwrap_or(u64::MAX);
+        let grant = self.call.grant.clone().or_else(|| {
+            ds.dataset
+                .query_options()
+                .pool
+                .map(|pool| std::sync::Arc::new(pool.empty_grant()))
+        });
+        let preparation = match grant {
+            Some(grant) => sparkles::access::Preparation::with_grant(control, query_limit, grant),
+            None => sparkles::access::Preparation::new(control, query_limit),
+        }
+        .and_then(|prep| prep.with_selection_limit(VIEW_BYTES))
+        .map_err(|e| ctx.engine(e))?;
+        let view = main.dataset
             .store()
             .evidence_view_with_branch(ds.dataset.store(), &sel, &preparation)
             .map_err(|e| match &e {
@@ -2272,13 +2275,16 @@ impl Tools<'_> {
                     )
                 }
                 _ => ctx.engine(e),
-            })
+            });
+        let _declared = self.server.state.settings.hold_evidence_declarations();
+        drift.check(&self.server.state).map_err(|e| ctx.engine(e))?;
+        view
     }
 }
 
 /// A refusal of a policy argument: a policy the caller cannot use is a bad argument
 /// that names the argument and not the policy's graphs. Other errors keep their codes.
-fn policy_error(argument: &str, e: Error, ctx: &ErrorContext) -> ToolError {
+pub(super) fn policy_error(argument: &str, e: Error, ctx: &ErrorContext) -> ToolError {
     match e {
         Error::Invalid(m) => ToolError::bad_argument(match m.strip_prefix("policy: ") {
             Some(rest) => format!("{argument}: {rest}"),
@@ -2455,40 +2461,65 @@ impl ClaimsDoc {
     }
 }
 
+/// The most retained IRI bytes one [`ResolutionDoc`] holds across chunks.
+const MAX_RESOLUTION_BYTES: usize = 16 << 20;
+
 /// One entity of the resolution map.
-struct ResolvedDoc {
-    representative: NamedNode,
-    members: Vec<NamedNode>,
-    complete: bool,
+pub(super) struct ResolvedDoc {
+    pub(super) representative: NamedNode,
+    pub(super) members: std::sync::Arc<[NamedNode]>,
+    pub(super) complete: bool,
     /// whether the map names the entity, rather than resolving it to itself
-    named: bool,
+    pub(super) named: bool,
 }
 
 /// The resolution map of a call that names a matching policy.
-struct ResolutionDoc {
-    name: String,
-    version: u32,
-    revision: Option<NamedNode>,
-    number: u64,
-    entities: HashMap<String, ResolvedDoc>,
+pub(super) struct ResolutionDoc {
+    pub(super) name: String,
+    pub(super) version: u32,
+    pub(super) revision: Option<NamedNode>,
+    pub(super) number: u64,
+    pub(super) entities: HashMap<String, ResolvedDoc>,
+    /// Deduplicated cluster member slices keyed by representative IRI so many entities
+    /// in one large cluster share one allocation.
+    clusters: HashMap<String, std::sync::Arc<[NamedNode]>>,
+    /// Retained IRI bytes across `entities` keys/representatives and unique `clusters`
+    /// (keys and members).
+    retained_bytes: usize,
     /// whether the map's header has been read
     read: bool,
 }
 
 impl ResolutionDoc {
-    fn new(name: &str, version: u32) -> Self {
+    pub(super) fn new(name: &str, version: u32) -> Self {
         ResolutionDoc {
             name: name.to_string(),
             version,
             revision: None,
             number: 0,
             entities: HashMap::new(),
+            clusters: HashMap::new(),
+            retained_bytes: 0,
             read: false,
         }
     }
 
+    fn charge_retained(&mut self, bytes: usize) -> Result<(), Error> {
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        if self.retained_bytes > MAX_RESOLUTION_BYTES {
+            return Err(sparkles::managed::ManagedError::error(
+                sparkles::managed::ManagedErrorKind::IncompleteEvidence,
+                format!(
+                    "resolved identity clusters exceed {} MiB",
+                    MAX_RESOLUTION_BYTES >> 20
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolve the entities of `named` not resolved yet, at `view`.
-    fn read(
+    pub(super) fn read(
         &mut self,
         view: &sparkles::store::BoundEvidenceView,
         named: &[NamedNode],
@@ -2507,6 +2538,7 @@ impl ResolutionDoc {
         let chunks = wanted
             .chunks(sparkles::evidence::MAX_RESOLVE)
             .chain(header.as_deref());
+        let empty_members: std::sync::Arc<[NamedNode]> = std::sync::Arc::from([]);
         for chunk in chunks {
             self.read = true;
             let got = sparkles::evidence::resolve_entities_at(
@@ -2519,18 +2551,100 @@ impl ResolutionDoc {
             self.revision = got.revision;
             self.number = got.number;
             for e in got.entities {
-                let named = e.members.len() > 1 || e.representative != e.entity;
-                self.entities.insert(
-                    e.entity.as_str().to_string(),
-                    ResolvedDoc {
-                        representative: e.representative,
-                        members: e.members,
-                        complete: e.members_complete,
-                        named,
-                    },
-                );
+                self.record_resolved(e, &empty_members)?;
             }
         }
         Ok(())
+    }
+
+    fn record_resolved(
+        &mut self,
+        e: sparkles::evidence::ResolvedEntity,
+        empty_members: &std::sync::Arc<[NamedNode]>,
+    ) -> Result<(), Error> {
+        let named = e.members.len() > 1 || e.representative != e.entity;
+        let entry_bytes = e.entity.as_str().len() + e.representative.as_str().len();
+        self.charge_retained(entry_bytes)?;
+        let members = if named {
+            if let Some(existing) = self.clusters.get(e.representative.as_str()) {
+                std::sync::Arc::clone(existing)
+            } else {
+                let cluster_bytes = e.representative.as_str().len().saturating_add(
+                    e.members
+                        .iter()
+                        .fold(0usize, |acc, m| acc.saturating_add(m.as_str().len())),
+                );
+                self.charge_retained(cluster_bytes)?;
+                let shared: std::sync::Arc<[NamedNode]> = std::sync::Arc::from(e.members);
+                self.clusters.insert(
+                    e.representative.as_str().to_string(),
+                    std::sync::Arc::clone(&shared),
+                );
+                shared
+            }
+        } else {
+            std::sync::Arc::clone(empty_members)
+        };
+        self.entities.insert(
+            e.entity.as_str().to_string(),
+            ResolvedDoc {
+                representative: e.representative,
+                members,
+                complete: e.members_complete,
+                named,
+            },
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod resolution_doc_tests {
+    use super::*;
+
+    #[test]
+    fn cluster_interning_charges_cluster_map_key_once_per_representative() {
+        let rep = NamedNode::new_unchecked("http://example.org/rep/alpha");
+        let m1 = NamedNode::new_unchecked("http://example.org/ent/m1");
+        let m2 = NamedNode::new_unchecked("http://example.org/ent/m2");
+        let empty: std::sync::Arc<[NamedNode]> = std::sync::Arc::from([]);
+        let mut doc = ResolutionDoc::new("people", 1);
+
+        doc.record_resolved(
+            sparkles::evidence::ResolvedEntity {
+                entity: m1.clone(),
+                representative: rep.clone(),
+                members: vec![rep.clone(), m1.clone(), m2.clone()],
+                members_complete: true,
+                decisions: Vec::new(),
+            },
+            &empty,
+        )
+        .unwrap();
+        let expected_first = (m1.as_str().len() + rep.as_str().len())
+            + rep.as_str().len()
+            + rep.as_str().len()
+            + m1.as_str().len()
+            + m2.as_str().len();
+        assert_eq!(doc.retained_bytes, expected_first);
+
+        // Second entity in the same cluster reuses the interned slice and cluster key.
+        doc.record_resolved(
+            sparkles::evidence::ResolvedEntity {
+                entity: m2.clone(),
+                representative: rep.clone(),
+                members: vec![rep.clone(), m1.clone(), m2.clone()],
+                members_complete: true,
+                decisions: Vec::new(),
+            },
+            &empty,
+        )
+        .unwrap();
+        let expected_second = expected_first + m2.as_str().len() + rep.as_str().len();
+        assert_eq!(doc.retained_bytes, expected_second);
+        assert!(std::sync::Arc::ptr_eq(
+            &doc.entities[m1.as_str()].members,
+            &doc.entities[m2.as_str()].members
+        ));
     }
 }

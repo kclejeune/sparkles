@@ -653,12 +653,79 @@ fn unreadable_holds_keep_every_past_state() {
     assert_eq!(code(s.source_holds()), "holds-unavailable");
     drop(s);
     // a newer format refuses the open
-    let newer = format!(r#"{{"format":2,"datasetId":"{}"}}"#, id(5));
+    let newer = format!(r#"{{"format":3,"datasetId":"{}"}}"#, id(5));
     std::fs::write(root.join(crate::holds::FILE), newer).unwrap();
     assert!(matches!(
         Store::open(&root, StoreOptions::default()),
         Err(Error::Unsupported(_))
     ));
+}
+
+#[test]
+fn a_cross_dataset_hold_writes_format_2_reopens_and_checks_origin_conflicts() {
+    let (_dir, root, s) = setup();
+    let origin = id(99);
+    let other_origin = id(100);
+    // self dataset id is normalized to None and stays format 1
+    s.acquire_hold_for(EV, id(1), &[at(&s, 1)], Some(s.dataset_id()))
+        .unwrap();
+    assert_eq!(s.source_hold_details().unwrap()[0].for_dataset, None);
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(crate::holds::FILE)).unwrap()).unwrap();
+    assert_eq!(v["format"], 1);
+    // foreign dataset id writes format 2 with forDatasetId
+    let foreign = s
+        .acquire_hold_for(EV, id(2), &[at(&s, 2)], Some(origin))
+        .unwrap();
+    assert!(foreign.created);
+    assert_eq!(
+        s.source_hold_details().unwrap()[1].for_dataset,
+        Some(origin)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(crate::holds::FILE)).unwrap()).unwrap();
+    assert_eq!(v["format"], 2);
+    // idempotent repeat with same origin succeeds; different origin or local conflicts
+    let again = s
+        .acquire_hold_for(EV, id(2), &[at(&s, 2)], Some(origin))
+        .unwrap();
+    assert!(!again.created);
+    assert_eq!(
+        code(s.acquire_hold_for(EV, id(2), &[at(&s, 2)], Some(other_origin))),
+        "hold-conflict"
+    );
+    assert_eq!(
+        code(s.acquire_hold_for(EV, id(2), &[at(&s, 2)], None)),
+        "hold-conflict"
+    );
+    // hold_publication_for checks for_dataset as well
+    assert_eq!(
+        code(
+            s.hold_publication_for(EV, id(2), &[at(&s, 2)], None)
+                .map(drop)
+        ),
+        "hold-conflict"
+    );
+    assert!(
+        s.hold_publication_for(EV, id(2), &[at(&s, 2)], Some(origin))
+            .is_ok()
+    );
+    // survives compaction and reopen
+    s.compact().unwrap();
+    bump(&s, 2);
+    s.compact().unwrap();
+    drop(s);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let holds = s.source_hold_details().unwrap();
+    assert_eq!(holds.len(), 2);
+    assert_eq!(holds[0].for_dataset, None);
+    assert_eq!(holds[1].for_dataset, Some(origin));
+    assert!(readable(&s, 2));
+    // releasing the last foreign hold returns holds.json to format 1
+    assert_eq!(s.release_holds(EV, &[id(2)]).unwrap(), [id(2)]);
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(crate::holds::FILE)).unwrap()).unwrap();
+    assert_eq!(v["format"], 1);
 }
 
 #[test]
@@ -706,7 +773,7 @@ fn an_oversized_holds_file_opens_the_dataset_and_fails_closed() {
     // a newer format behind more padding than a holds file may have: the preflight
     // does not read it whole and the dataset opens with its holds unavailable
     let mut bytes = vec![b' '; crate::holds::MAX_FILE_BYTES as usize + 1];
-    bytes.extend_from_slice(br#"{"format":2}"#);
+    bytes.extend_from_slice(br#"{"format":3}"#);
     std::fs::write(root.join(crate::holds::FILE), bytes).unwrap();
     let s = Store::open(&root, StoreOptions::default()).unwrap();
     assert_eq!(code(s.source_holds()), "holds-unavailable");

@@ -80,17 +80,12 @@ impl AutoReasoner {
             return derive(why);
         }
         // a caller whose protections hide the inferences cannot read the graph (C12b)
-        if let Some(readable) = &req.readable {
-            let inferred = oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-                crate::reasoning::INFERRED_GRAPH,
-            ));
-            if req
-                .snap
-                .lookup_term(&inferred)
-                .is_some_and(|g| !readable(g))
-            {
-                return derive("the caller cannot read the inferred graph".to_string());
-            }
+        if let Some(readable) = &req.readable
+            && !readable
+                .read
+                .allows_named_iri(crate::reasoning::INFERRED_GRAPH)
+        {
+            return derive("the caller cannot read the inferred graph".to_string());
         }
         let f = freshness(&record, self.dataset.store(), req.snap.commit);
         match f.stale {
@@ -137,6 +132,10 @@ impl ReasoningProvider for AutoReasoner {
         .then_some(m)
     }
 
+    fn rewrites(&self) -> bool {
+        self.inner.rewrites()
+    }
+
     fn rewrite(
         &self,
         query: &spargebra::Query,
@@ -144,6 +143,15 @@ impl ReasoningProvider for AutoReasoner {
         req: &SessionRequest,
     ) -> Result<Option<sparkles_core::sparql::reasoning::Rewritten>> {
         self.inner.rewrite(query, bound, req)
+    }
+
+    fn rewrite_guarded(
+        &self,
+        query: &spargebra::Query,
+        bound: &[(String, oxrdf::Term)],
+        req: &SessionRequest,
+    ) -> Result<Option<sparkles_core::sparql::reasoning::GuardedRewritten>> {
+        self.inner.rewrite_guarded(query, bound, req)
     }
 
     fn start(&self, req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
@@ -247,6 +255,10 @@ impl ReasoningProvider for Limited {
         self.inner.reads_all(req)
     }
 
+    fn rewrites(&self) -> bool {
+        self.inner.rewrites()
+    }
+
     fn rewrite(
         &self,
         query: &spargebra::Query,
@@ -260,11 +272,31 @@ impl ReasoningProvider for Limited {
             readable: req.readable.clone(),
             stop: self.limit(req.stop.clone()),
             max_memory: req.max_memory,
+            memory_parent: req.memory_parent.clone(),
             no_cache: req.no_cache,
         };
         let rewritten = self.inner.rewrite(query, bound, &req)?;
         // the terminology's parsing has no checks of its own, so the allowance is checked
         // once more before the rewritten query is planned
+        (req.stop)()?;
+        Ok(rewritten)
+    }
+
+    fn rewrite_guarded(
+        &self,
+        query: &spargebra::Query,
+        bound: &[(String, oxrdf::Term)],
+        req: &SessionRequest,
+    ) -> Result<Option<sparkles_core::sparql::reasoning::GuardedRewritten>> {
+        let req = SessionRequest {
+            snap: req.snap.clone(),
+            readable: req.readable.clone(),
+            stop: self.limit(req.stop.clone()),
+            max_memory: req.max_memory,
+            memory_parent: req.memory_parent.clone(),
+            no_cache: req.no_cache,
+        };
+        let rewritten = self.inner.rewrite_guarded(query, bound, &req)?;
         (req.stop)()?;
         Ok(rewritten)
     }

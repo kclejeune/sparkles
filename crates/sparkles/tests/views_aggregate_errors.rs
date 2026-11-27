@@ -209,6 +209,30 @@ fn a_read_under_another_reading_evaluates_the_view_query() {
     assert_eq!(rows(r), jena);
 }
 
+#[test]
+fn cold_explain_uses_no_unpublished_view_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ds = Dataset::open(dir.path()).unwrap();
+        ds.settings()
+            .aggregate_errors()
+            .set(AggregateErrors::Sparkles)
+            .unwrap();
+        ds.views().put("aggs", ViewDef::table(AGGS)).unwrap();
+        ds.views().wait_built("aggs", WAIT).unwrap();
+    }
+
+    let ds = Dataset::open(dir.path()).unwrap();
+    assert_eq!(
+        ds.settings().aggregate_errors().get(),
+        AggregateErrors::Sparkles
+    );
+    let read = "PREFIX view: <urn:x-sparkles:view#> \
+        SELECT ?g WHERE { SERVICE view:read { [] view:name \"aggs\" ; view:bind ?g } }";
+    let (_, plan) = ds.explain(read, &QueryOptions::default()).unwrap();
+    assert!(plan.warnings.iter().all(|w| w.code != "view-evaluated"));
+}
+
 /// A view's checkpoint keeps the reading it was built under: reopened under another
 /// reading, the view is built again from the data instead of loading it.
 #[test]

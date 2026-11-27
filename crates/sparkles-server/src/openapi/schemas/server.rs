@@ -62,6 +62,36 @@ fn metrics(put: &mut dyn FnMut(&str, J)) {
             "rechecked": int(),
         }),
     );
+    let query_memory_peak = obj(
+        &["count", "sumBytes", "buckets"],
+        json!({
+            "count": int(),
+            "sumBytes": int(),
+            "buckets": { "type": "array", "items": int(), "description": "Cumulative counts for `queryMemoryPeakBucketBounds` plus +Inf. The last one equals `count`." },
+        }),
+    );
+    let rebuild_duration = obj(
+        &["count", "sumSeconds", "buckets"],
+        json!({
+            "count": int(),
+            "sumSeconds": num(),
+            "buckets": { "type": "array", "items": int(), "description": "Cumulative counts for `rebuildDurationBucketBounds` plus +Inf. The last one equals `count`." },
+        }),
+    );
+    let rebuild_reason = obj(
+        &["count", "duration"],
+        json!({
+            "count": int(),
+            "duration": or_null(rebuild_duration),
+        }),
+    );
+    let rebuilds = obj(
+        &["compact", "bulk"],
+        json!({
+            "compact": rebuild_reason.clone(),
+            "bulk": rebuild_reason,
+        }),
+    );
     put(
         "MetricsSnapshot",
         doc(
@@ -74,6 +104,8 @@ fn metrics(put: &mut dyn FnMut(&str, J)) {
                     "processResidentBytes",
                     "limits",
                     "bucketBounds",
+                    "queryMemoryPeakBucketBounds",
+                    "rebuildDurationBucketBounds",
                     "active",
                     "requests",
                     "datasets",
@@ -86,6 +118,8 @@ fn metrics(put: &mut dyn FnMut(&str, J)) {
                     "processResidentBytes": nullable("integer"),
                     "limits": sref("Limits"),
                     "bucketBounds": { "type": "array", "items": num(), "description": "Histogram upper bounds in seconds, without +Inf." },
+                    "queryMemoryPeakBucketBounds": { "type": "array", "items": int(), "description": "Upper bounds in bytes of `datasets[*].queryMemoryPeak.buckets`, without +Inf." },
+                    "rebuildDurationBucketBounds": { "type": "array", "items": num(), "description": "Upper bounds in seconds of `datasets[*].rebuilds.*.duration.buckets`, without +Inf." },
                     "active": counters("Requests in progress, by operation."),
                     "requests": array(obj(
                         &["dataset", "operation", "outcomes", "count", "sumSeconds", "buckets", "responseBytes"],
@@ -102,8 +136,9 @@ fn metrics(put: &mut dyn FnMut(&str, J)) {
                     "datasets": array(obj(
                         &[
                             "name", "quads", "deltaInserts", "deltaDeletes", "walBytes", "diskBytes",
-                            "quotaBytes", "resultRows", "budgetExceeded", "rateLimited", "blockCache",
-                            "resultCache", "geo", "groupCommit", "commits",
+                            "quotaBytes", "resultRows", "rowsProduced", "queryMemoryPeak", "rebuilds",
+                            "budgetExceeded", "rateLimited", "blockCache", "resultCache", "geo",
+                            "groupCommit", "commits",
                         ],
                         json!({
                             "name": string(),
@@ -123,6 +158,9 @@ fn metrics(put: &mut dyn FnMut(&str, J)) {
                             "diskBytes": int(),
                             "quotaBytes": { "type": "integer", "description": "0 means unlimited." },
                             "resultRows": int(),
+                            "rowsProduced": { "type": "integer", "description": "Rows produced by all operators of queries and updates." },
+                            "queryMemoryPeak": or_null(query_memory_peak),
+                            "rebuilds": rebuilds,
                             "budgetExceeded": or_null(counters("Requests over a budget, by budget.")),
                             "rateLimited": or_null(counters("Rate-limited requests, by class.")),
                             "blockCache": block_cache,
@@ -156,7 +194,7 @@ fn derived_table_cache(put: &mut dyn FnMut(&str, J)) {
                     "scope": string_enum(&["process"]),
                     "enabled": boolean(),
                     "capacityBytes": int(),
-                    "estimatedBytes": { "type": "integer", "description": "The retained-table estimate, counting shared chunks per cached table and excluding caller-held evictions. Neither allocator usage nor RSS." },
+                    "estimatedBytes": { "type": "integer", "description": "The calibrated retained-table estimate across cached tables, deduplicated shared chunks, cache keys, hash-table capacity, and allocator metadata, excluding tables kept alive only by callers. Neither allocator usage nor RSS." },
                     "tables": int(),
                     "hits": int(),
                     "misses": int(),

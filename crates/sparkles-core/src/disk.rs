@@ -28,7 +28,11 @@ pub fn free_bytes(dir: &Path) -> std::io::Result<u64> {
 
 /// Free space is not measured on this platform: never short.
 #[cfg(not(unix))]
-pub fn free_bytes(_: &Path) -> std::io::Result<u64> {
+pub fn free_bytes(_dir: &Path) -> std::io::Result<u64> {
+    #[cfg(test)]
+    if let Some(free) = fake::free(_dir) {
+        return Ok(free);
+    }
     Ok(u64::MAX)
 }
 
@@ -71,28 +75,64 @@ pub fn in_memory_file_system(name: &str) -> bool {
     matches!(name, "tmpfs" | "ramfs")
 }
 
+type FreeSpaceSamples = HashMap<PathBuf, (Instant, u64)>;
+
+struct FreeSpaceCache {
+    epoch: u64,
+    samples: Option<FreeSpaceSamples>,
+}
+
+static FREE_SPACE: parking_lot::Mutex<FreeSpaceCache> = parking_lot::Mutex::new(FreeSpaceCache {
+    epoch: 0,
+    samples: None,
+});
+
+/// Discard the observation made before a replay step allocated disk space.
+pub(crate) fn invalidate_free_bytes(dir: &Path) {
+    let mut cache = FREE_SPACE.lock();
+    cache.epoch = cache.epoch.wrapping_add(1);
+    if let Some(samples) = &mut cache.samples {
+        samples.remove(dir);
+    }
+}
+
 /// [`free_bytes`], measured at most once per `max_age` for each directory (small
 /// commits check it under the writer lock, many times a second).
 pub fn free_bytes_cached(dir: &Path, max_age: Duration) -> std::io::Result<u64> {
-    static CACHE: parking_lot::Mutex<Option<HashMap<PathBuf, (Instant, u64)>>> =
-        parking_lot::Mutex::new(None);
     #[cfg(test)]
-    if let Some(free) = fake::free(dir) {
-        return Ok(free);
-    }
+    let max_age = match fake::disk(dir) {
+        Some(disk) if disk.cached => Duration::MAX,
+        Some(disk) => return Ok(disk.free()),
+        None => max_age,
+    };
+    free_bytes_cached_with(dir, max_age, free_bytes)
+}
+
+fn free_bytes_cached_with(
+    dir: &Path,
+    max_age: Duration,
+    measure: impl FnOnce(&Path) -> std::io::Result<u64>,
+) -> std::io::Result<u64> {
     let now = Instant::now();
-    if let Some((at, free)) = CACHE.lock().as_ref().and_then(|c| c.get(dir).copied())
-        && now.duration_since(at) < max_age
+    let cache = FREE_SPACE.lock();
+    if let Some((at, free)) = cache.samples.as_ref().and_then(|samples| samples.get(dir))
+        && now.duration_since(*at) < max_age
     {
-        return Ok(free);
+        return Ok(*free);
     }
-    let free = free_bytes(dir)?;
-    let mut cache = CACHE.lock();
-    let cache = cache.get_or_insert_with(HashMap::new);
-    if cache.len() > 1024 {
-        cache.clear();
+    let epoch = cache.epoch;
+    drop(cache);
+
+    let free = measure(dir)?;
+    let mut cache = FREE_SPACE.lock();
+    // An invalidation fences off measurements already in flight.
+    if cache.epoch == epoch {
+        let samples = cache.samples.get_or_insert_with(HashMap::new);
+        if samples.len() > 1024 {
+            samples.clear();
+        }
+        samples.insert(dir.to_path_buf(), (now, free));
     }
-    cache.insert(dir.to_path_buf(), (now, free));
     Ok(free)
 }
 
@@ -275,6 +315,42 @@ impl std::io::Write for WritebackFile {
     }
 }
 
+#[cfg(test)]
+mod free_space_tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn invalidation_prevents_an_in_flight_sample_from_being_cached() {
+        const CAPACITY: u64 = 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let _disk = fake::install_cached(dir, CAPACITY);
+        let measured = Barrier::new(2);
+        let invalidated = Barrier::new(2);
+
+        let (old_free, write) = std::thread::scope(|scope| {
+            let check = scope.spawn(|| {
+                free_bytes_cached_with(dir, Duration::MAX, |dir| {
+                    let free = free_bytes(dir);
+                    measured.wait();
+                    invalidated.wait();
+                    free
+                })
+            });
+            measured.wait();
+            let write = std::fs::write(dir.join("growth"), b"x");
+            invalidate_free_bytes(dir);
+            invalidated.wait();
+            (check.join().unwrap().unwrap(), write)
+        });
+
+        write.unwrap();
+        assert_eq!(old_free, CAPACITY);
+        assert_eq!(free_bytes_cached(dir, Duration::MAX).unwrap(), CAPACITY - 1);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod open_file_tests {
     use super::*;
@@ -303,26 +379,63 @@ mod open_file_tests {
 pub(crate) mod fake {
     use std::path::{Path, PathBuf};
 
-    static DISKS: parking_lot::Mutex<Vec<(PathBuf, u64)>> = parking_lot::Mutex::new(Vec::new());
+    static DISKS: parking_lot::Mutex<Vec<FakeDisk>> = parking_lot::Mutex::new(Vec::new());
+
+    #[derive(Clone)]
+    pub(super) struct FakeDisk {
+        root: PathBuf,
+        capacity: u64,
+        pub(super) cached: bool,
+    }
+
+    impl FakeDisk {
+        pub(super) fn free(&self) -> u64 {
+            self.capacity
+                .saturating_sub(crate::store::dir_size(&self.root))
+        }
+    }
 
     /// Removes its disk when dropped.
-    pub(crate) struct Disk(PathBuf);
+    pub(crate) struct Disk(PathBuf, bool);
 
     impl Drop for Disk {
         fn drop(&mut self) {
-            DISKS.lock().retain(|(root, _)| root != &self.0);
+            DISKS.lock().retain(|disk| disk.root != self.0);
+            if self.1 {
+                super::invalidate_free_bytes(&self.0);
+            }
         }
     }
 
     /// Make `root` a disk of `capacity` bytes.
     pub(crate) fn install(root: &Path, capacity: u64) -> Disk {
-        DISKS.lock().push((root.to_path_buf(), capacity));
-        Disk(root.to_path_buf())
+        install_with_cache(root, capacity, false)
+    }
+
+    /// Make a sample stay warm until it is invalidated, regardless of test timing.
+    pub(crate) fn install_cached(root: &Path, capacity: u64) -> Disk {
+        super::invalidate_free_bytes(root);
+        install_with_cache(root, capacity, true)
+    }
+
+    fn install_with_cache(root: &Path, capacity: u64, cached: bool) -> Disk {
+        DISKS.lock().push(FakeDisk {
+            root: root.to_path_buf(),
+            capacity,
+            cached,
+        });
+        Disk(root.to_path_buf(), cached)
+    }
+
+    pub(super) fn disk(dir: &Path) -> Option<FakeDisk> {
+        DISKS
+            .lock()
+            .iter()
+            .find(|disk| dir.starts_with(&disk.root))
+            .cloned()
     }
 
     pub(super) fn free(dir: &Path) -> Option<u64> {
-        let disks = DISKS.lock();
-        let (root, capacity) = disks.iter().find(|(root, _)| dir.starts_with(root))?;
-        Some(capacity.saturating_sub(crate::store::dir_size(root)))
+        disk(dir).map(|disk| disk.free())
     }
 }

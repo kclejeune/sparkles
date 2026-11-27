@@ -1,5 +1,5 @@
 //! HTTP request draining around the catalog's restore publication.
-use crate::state::{AppState, Dataset, Reservation};
+use crate::state::{AppState, Dataset, DbType, Reservation};
 use sparkles_backup::{BackupError, Code};
 use std::path::Path;
 use std::sync::Arc;
@@ -11,10 +11,11 @@ pub fn publish_new(
     restored: &Path,
 ) -> Result<Arc<Dataset>, BackupError> {
     let name = reservation.name().to_string();
-    st.catalog
+    let dataset = st
+        .catalog
         .publish_restored(reservation, restored)
         .map_err(super::ops::library_error)?;
-    Ok(st.get(&name).expect("published"))
+    Ok(st.cache_published(&name, DbType::Persistent, dataset))
 }
 
 pub fn replace_in_place(
@@ -25,10 +26,14 @@ pub fn replace_in_place(
     keep: bool,
 ) -> Result<Arc<Dataset>, BackupError> {
     let r = st
-        .catalog
-        .reserve(name, sparkles::catalog::ReservationKind::Restore, task)
+        .reserve_restore(name, task)
         .map_err(|e| BackupError::new(Code::DatasetBusy, e.to_string()))?;
+    #[cfg(all(test, feature = "otel"))]
+    st.lifecycle_hooks
+        .run(crate::state::tests::HookPoint::SwapReserved, name);
     crate::compaction::cancel(st, name);
+    #[cfg(feature = "mcp")]
+    st.graphrag.cancel_auto_refresh(st, name);
     let start = Instant::now();
     loop {
         let busy = st.get(name).is_some_and(|ds| Arc::strong_count(&ds) > 2);
@@ -43,12 +48,19 @@ pub fn replace_in_place(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    st.forget_routing(name);
-    // the catalog lists the dataset again only once the swap or its rollback is done
-    let swapping = st.swapping();
-    let result = st
-        .catalog
-        .replace_restored_reserved(r, restored, task, keep);
+    // Keep the predecessor's `$other` counters pending until the catalog closes the
+    // opening or the swap refuses it.
+    let mut swapping = st.begin_swap(name);
+    #[cfg(feature = "mcp")]
+    st.graphrag.detach_circuit(name);
+    #[cfg(all(test, feature = "otel"))]
+    st.lifecycle_hooks
+        .run(crate::state::tests::HookPoint::SwapPending, name);
+    let result =
+        st.catalog
+            .replace_restored_reserved_observed(r, restored, task, keep, |id, store| {
+                swapping.observe_close(name, id, store)
+            });
     drop(swapping);
     // Recreate the HTTP observers on success and on rollback.
     let ds = st.get(name);

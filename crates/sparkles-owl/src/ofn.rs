@@ -22,6 +22,93 @@ impl Default for Renderer {
     }
 }
 
+const POLL_CHUNK_BYTES: usize = 1024;
+
+/// Poll-aware streaming sink for functional-style syntax formatting.
+pub(crate) trait PolledWrite<E> {
+    fn push_str(&mut self, s: &str) -> Result<(), E>;
+    fn tick(&mut self, work: usize) -> Result<(), E>;
+
+    fn write_str_polled(&mut self, mut s: &str) -> Result<(), E> {
+        if s.is_empty() {
+            return self.tick(1);
+        }
+        while !s.is_empty() {
+            let split = if s.len() <= POLL_CHUNK_BYTES {
+                s.len()
+            } else {
+                let mut i = POLL_CHUNK_BYTES;
+                while i > 0 && !s.is_char_boundary(i) {
+                    i -= 1;
+                }
+                if i == 0 {
+                    s.chars().next().map_or(s.len(), char::len_utf8)
+                } else {
+                    i
+                }
+            };
+            let (head, tail) = s.split_at(split);
+            self.tick(head.len())?;
+            self.push_str(head)?;
+            s = tail;
+        }
+        Ok(())
+    }
+
+    fn write_char_polled(&mut self, c: char) -> Result<(), E> {
+        let mut buf = [0u8; 4];
+        let s = c.encode_utf8(&mut buf);
+        self.tick(1)?;
+        self.push_str(s)
+    }
+
+    fn write_u32_polled(&mut self, mut n: u32) -> Result<(), E> {
+        let mut buf = [0u8; 10];
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        let s = std::str::from_utf8(&buf[i..]).expect("ASCII digits");
+        self.write_str_polled(s)
+    }
+}
+
+struct FmtSink<'a, W: fmt::Write + ?Sized>(&'a mut W);
+
+impl<W: fmt::Write + ?Sized> PolledWrite<fmt::Error> for FmtSink<'_, W> {
+    fn push_str(&mut self, s: &str) -> fmt::Result {
+        self.0.write_str(s)
+    }
+
+    fn tick(&mut self, _work: usize) -> fmt::Result {
+        Ok(())
+    }
+}
+
+struct BoundedSink {
+    buf: String,
+    limit: usize,
+}
+
+impl PolledWrite<()> for BoundedSink {
+    fn push_str(&mut self, s: &str) -> Result<(), ()> {
+        if self.buf.len().saturating_add(s.len()) > self.limit {
+            return Err(());
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
+
+    fn tick(&mut self, _work: usize) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
 /// The prefixes every rendering knows.
 pub const STANDARD_PREFIXES: [(&str, &str); 4] = [
     ("owl", vocab::OWL),
@@ -36,18 +123,21 @@ impl Renderer {
     pub fn new<P: Into<String>, N: Into<String>>(
         prefixes: impl IntoIterator<Item = (P, N)>,
     ) -> Renderer {
-        let mut v: Vec<(String, String)> = prefixes
-            .into_iter()
-            .map(|(p, n)| (p.into(), n.into()))
-            .collect();
-        for (p, n) in STANDARD_PREFIXES {
-            if !v.iter().any(|(q, _)| q == p) {
-                v.push((p.to_string(), n.to_string()));
+        let mut by_name: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (p, n) in prefixes {
+            let p = p.into();
+            let n = n.into();
+            if !n.is_empty() && (p.is_empty() || crate::write_common::is_pn_prefix(&p)) {
+                by_name.insert(p, n);
             }
         }
-        v.retain(|(p, n)| {
-            !n.is_empty() && p.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c))
-        });
+        for (p, n) in STANDARD_PREFIXES {
+            by_name
+                .entry(p.to_string())
+                .or_insert_with(|| n.to_string());
+        }
+        let mut v: Vec<(String, String)> = by_name.into_iter().collect();
         v.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
         Renderer { prefixes: v }
     }
@@ -61,6 +151,571 @@ impl Renderer {
             .collect();
         v.sort();
         v
+    }
+
+    /// Streams an IRI as a prefixed name or in angle brackets with cooperative polling.
+    pub(crate) fn write_iri_polled<E>(
+        &self,
+        iri: &str,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        for (p, ns) in &self.prefixes {
+            if let Some(local) = iri.strip_prefix(ns.as_str())
+                && is_local_name_polled(local, w)?
+            {
+                w.write_str_polled(p)?;
+                w.write_char_polled(':')?;
+                return w.write_str_polled(local);
+            }
+        }
+        w.write_char_polled('<')?;
+        w.write_str_polled(iri)?;
+        w.write_char_polled('>')
+    }
+
+    pub(crate) fn write_literal_polled<E>(
+        &self,
+        l: &Literal,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        w.write_char_polled('"')?;
+        for c in l.value().chars() {
+            match c {
+                '"' => w.write_str_polled("\\\"")?,
+                '\\' => w.write_str_polled("\\\\")?,
+                c => w.write_char_polled(c)?,
+            }
+        }
+        w.write_char_polled('"')?;
+        if let Some(lang) = l.language() {
+            w.write_char_polled('@')?;
+            w.write_str_polled(lang)?;
+        } else if l.datatype() != vocab::XSD_STRING {
+            w.write_str_polled("^^")?;
+            self.write_iri_polled(l.datatype(), w)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_individual_polled<E>(
+        &self,
+        i: &Individual,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        match i {
+            Individual::Named(n) => self.write_iri_polled(n.as_str(), w),
+            Individual::Anonymous(a) => {
+                w.write_str_polled("_:")?;
+                w.write_str_polled(a.label())
+            }
+        }
+    }
+
+    pub(crate) fn write_ope_polled<E>(
+        &self,
+        p: &ObjectPropertyExpression,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        match p {
+            ObjectPropertyExpression::Property(p) => self.write_iri_polled(p.as_str(), w),
+            ObjectPropertyExpression::InverseOf(p) => {
+                w.write_str_polled("ObjectInverseOf(")?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(')')
+            }
+        }
+    }
+
+    pub(crate) fn write_data_range_polled<E>(
+        &self,
+        r: &DataRange,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        match r {
+            DataRange::Datatype(d) => self.write_iri_polled(d.as_str(), w),
+            DataRange::IntersectionOf(rs) => {
+                w.write_str_polled("DataIntersectionOf(")?;
+                for (i, r) in rs.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char_polled(' ')?;
+                    }
+                    self.write_data_range_polled(r, w)?;
+                }
+                w.write_char_polled(')')
+            }
+            DataRange::UnionOf(rs) => {
+                w.write_str_polled("DataUnionOf(")?;
+                for (i, r) in rs.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char_polled(' ')?;
+                    }
+                    self.write_data_range_polled(r, w)?;
+                }
+                w.write_char_polled(')')
+            }
+            DataRange::ComplementOf(r) => {
+                w.write_str_polled("DataComplementOf(")?;
+                self.write_data_range_polled(r, w)?;
+                w.write_char_polled(')')
+            }
+            DataRange::OneOf(ls) => {
+                w.write_str_polled("DataOneOf(")?;
+                for (i, l) in ls.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char_polled(' ')?;
+                    }
+                    self.write_literal_polled(l, w)?;
+                }
+                w.write_char_polled(')')
+            }
+            DataRange::DatatypeRestriction(d, fs) => {
+                w.write_str_polled("DatatypeRestriction(")?;
+                self.write_iri_polled(d.as_str(), w)?;
+                for f in fs {
+                    w.write_char_polled(' ')?;
+                    self.write_iri_polled(f.facet.as_str(), w)?;
+                    w.write_char_polled(' ')?;
+                    self.write_literal_polled(&f.value, w)?;
+                }
+                w.write_char_polled(')')
+            }
+        }
+    }
+
+    /// Streams a class expression in functional-style syntax with cooperative polling
+    /// and zero intermediate allocations.
+    pub(crate) fn write_class_expression_polled<E>(
+        &self,
+        c: &ClassExpression,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        use ClassExpression as C;
+        match c {
+            C::Class(c) => self.write_iri_polled(c.as_str(), w),
+            C::ObjectIntersectionOf(cs) => {
+                w.write_str_polled("ObjectIntersectionOf(")?;
+                for (i, c) in cs.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char_polled(' ')?;
+                    }
+                    self.write_class_expression_polled(c, w)?;
+                }
+                w.write_char_polled(')')
+            }
+            C::ObjectUnionOf(cs) => {
+                w.write_str_polled("ObjectUnionOf(")?;
+                for (i, c) in cs.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char_polled(' ')?;
+                    }
+                    self.write_class_expression_polled(c, w)?;
+                }
+                w.write_char_polled(')')
+            }
+            C::ObjectComplementOf(c) => {
+                w.write_str_polled("ObjectComplementOf(")?;
+                self.write_class_expression_polled(c, w)?;
+                w.write_char_polled(')')
+            }
+            C::ObjectOneOf(is) => {
+                w.write_str_polled("ObjectOneOf(")?;
+                for (i, ind) in is.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char_polled(' ')?;
+                    }
+                    self.write_individual_polled(ind, w)?;
+                }
+                w.write_char_polled(')')
+            }
+            C::ObjectSomeValuesFrom(p, c) => {
+                w.write_str_polled("ObjectSomeValuesFrom(")?;
+                self.write_ope_polled(p, w)?;
+                w.write_char_polled(' ')?;
+                self.write_class_expression_polled(c, w)?;
+                w.write_char_polled(')')
+            }
+            C::ObjectAllValuesFrom(p, c) => {
+                w.write_str_polled("ObjectAllValuesFrom(")?;
+                self.write_ope_polled(p, w)?;
+                w.write_char_polled(' ')?;
+                self.write_class_expression_polled(c, w)?;
+                w.write_char_polled(')')
+            }
+            C::ObjectHasValue(p, i) => {
+                w.write_str_polled("ObjectHasValue(")?;
+                self.write_ope_polled(p, w)?;
+                w.write_char_polled(' ')?;
+                self.write_individual_polled(i, w)?;
+                w.write_char_polled(')')
+            }
+            C::ObjectHasSelf(p) => {
+                w.write_str_polled("ObjectHasSelf(")?;
+                self.write_ope_polled(p, w)?;
+                w.write_char_polled(')')
+            }
+            C::ObjectMinCardinality(n, p, f)
+            | C::ObjectMaxCardinality(n, p, f)
+            | C::ObjectExactCardinality(n, p, f) => {
+                let name = match c {
+                    C::ObjectMinCardinality(..) => "ObjectMinCardinality",
+                    C::ObjectMaxCardinality(..) => "ObjectMaxCardinality",
+                    C::ObjectExactCardinality(..) => "ObjectExactCardinality",
+                    _ => unreachable!(),
+                };
+                w.write_str_polled(name)?;
+                w.write_char_polled('(')?;
+                w.write_u32_polled(*n)?;
+                w.write_char_polled(' ')?;
+                self.write_ope_polled(p, w)?;
+                if let Some(f) = f {
+                    w.write_char_polled(' ')?;
+                    self.write_class_expression_polled(f, w)?;
+                }
+                w.write_char_polled(')')
+            }
+            C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => {
+                let name = match c {
+                    C::DataSomeValuesFrom(..) => "DataSomeValuesFrom",
+                    C::DataAllValuesFrom(..) => "DataAllValuesFrom",
+                    _ => unreachable!(),
+                };
+                w.write_str_polled(name)?;
+                w.write_char_polled('(')?;
+                for p in ps {
+                    self.write_iri_polled(p.as_str(), w)?;
+                    w.write_char_polled(' ')?;
+                }
+                self.write_data_range_polled(r, w)?;
+                w.write_char_polled(')')
+            }
+            C::DataHasValue(p, l) => {
+                w.write_str_polled("DataHasValue(")?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_literal_polled(l, w)?;
+                w.write_char_polled(')')
+            }
+            C::DataMinCardinality(n, p, r)
+            | C::DataMaxCardinality(n, p, r)
+            | C::DataExactCardinality(n, p, r) => {
+                let name = match c {
+                    C::DataMinCardinality(..) => "DataMinCardinality",
+                    C::DataMaxCardinality(..) => "DataMaxCardinality",
+                    C::DataExactCardinality(..) => "DataExactCardinality",
+                    _ => unreachable!(),
+                };
+                w.write_str_polled(name)?;
+                w.write_char_polled('(')?;
+                w.write_u32_polled(*n)?;
+                w.write_char_polled(' ')?;
+                self.write_iri_polled(p.as_str(), w)?;
+                if let Some(r) = r {
+                    w.write_char_polled(' ')?;
+                    self.write_data_range_polled(r, w)?;
+                }
+                w.write_char_polled(')')
+            }
+        }
+    }
+
+    /// Streams a class expression in functional-style syntax with zero intermediate allocations.
+    pub(crate) fn write_class_expression(
+        &self,
+        c: &ClassExpression,
+        w: &mut impl fmt::Write,
+    ) -> fmt::Result {
+        self.write_class_expression_polled(c, &mut FmtSink(w))
+    }
+
+    pub(crate) fn write_entity_polled<E>(
+        &self,
+        e: &Entity,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        w.write_str_polled(e.kind().name())?;
+        w.write_char_polled('(')?;
+        self.write_iri_polled(e.iri().as_str(), w)?;
+        w.write_char_polled(')')
+    }
+
+    pub(crate) fn write_annotation_value_polled<E>(
+        &self,
+        v: &AnnotationValue,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        match v {
+            AnnotationValue::Iri(i) => self.write_iri_polled(i.as_str(), w),
+            AnnotationValue::Literal(l) => self.write_literal_polled(l, w),
+            AnnotationValue::Anonymous(a) => {
+                w.write_str_polled("_:")?;
+                w.write_str_polled(a.label())
+            }
+        }
+    }
+
+    pub(crate) fn write_annotation_polled<E>(
+        &self,
+        a: &Annotation,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        w.write_str_polled("Annotation(")?;
+        for inner in &a.annotations {
+            self.write_annotation_polled(inner, w)?;
+            w.write_char_polled(' ')?;
+        }
+        self.write_iri_polled(a.property.as_str(), w)?;
+        w.write_char_polled(' ')?;
+        self.write_annotation_value_polled(&a.value, w)?;
+        w.write_char_polled(')')
+    }
+
+    pub(crate) fn write_axiom_polled<E>(
+        &self,
+        ax: &Axiom,
+        w: &mut impl PolledWrite<E>,
+    ) -> Result<(), E> {
+        use AxiomKind as K;
+        w.write_str_polled(ax.axiom_type().name())?;
+        w.write_char_polled('(')?;
+        let mut first = true;
+        let mut sep = |w: &mut dyn FnMut() -> Result<(), E>| -> Result<(), E> {
+            if first {
+                first = false;
+                Ok(())
+            } else {
+                w()
+            }
+        };
+        for a in &ax.annotations {
+            sep(&mut || w.write_char_polled(' '))?;
+            self.write_annotation_polled(a, w)?;
+        }
+        match &ax.kind {
+            K::Declaration(e) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_entity_polled(e, w)?;
+            }
+            K::SubClassOf(a, b) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_class_expression_polled(a, w)?;
+                w.write_char_polled(' ')?;
+                self.write_class_expression_polled(b, w)?;
+            }
+            K::EquivalentClasses(cs) => {
+                for c in cs {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_class_expression_polled(c, w)?;
+                }
+            }
+            K::DisjointClasses(cs) => {
+                for c in cs {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_class_expression_polled(c, w)?;
+                }
+            }
+            K::DisjointUnion(c, cs) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(c.as_str(), w)?;
+                for x in cs {
+                    w.write_char_polled(' ')?;
+                    self.write_class_expression_polled(x, w)?;
+                }
+            }
+            K::SubObjectPropertyOf(sub, sup) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                match sub {
+                    SubObjectPropertyExpression::Expression(p) => self.write_ope_polled(p, w)?,
+                    SubObjectPropertyExpression::Chain(ps) => {
+                        w.write_str_polled("ObjectPropertyChain(")?;
+                        for (i, p) in ps.iter().enumerate() {
+                            if i > 0 {
+                                w.write_char_polled(' ')?;
+                            }
+                            self.write_ope_polled(p, w)?;
+                        }
+                        w.write_char_polled(')')?;
+                    }
+                }
+                w.write_char_polled(' ')?;
+                self.write_ope_polled(sup, w)?;
+            }
+            K::EquivalentObjectProperties(ps) => {
+                for p in ps {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_ope_polled(p, w)?;
+                }
+            }
+            K::DisjointObjectProperties(ps) => {
+                for p in ps {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_ope_polled(p, w)?;
+                }
+            }
+            K::InverseObjectProperties(a, b) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_ope_polled(a, w)?;
+                w.write_char_polled(' ')?;
+                self.write_ope_polled(b, w)?;
+            }
+            K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_ope_polled(p, w)?;
+                w.write_char_polled(' ')?;
+                self.write_class_expression_polled(c, w)?;
+            }
+            K::FunctionalObjectProperty(p)
+            | K::InverseFunctionalObjectProperty(p)
+            | K::ReflexiveObjectProperty(p)
+            | K::IrreflexiveObjectProperty(p)
+            | K::SymmetricObjectProperty(p)
+            | K::AsymmetricObjectProperty(p)
+            | K::TransitiveObjectProperty(p) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_ope_polled(p, w)?;
+            }
+            K::SubDataPropertyOf(a, b) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(a.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_iri_polled(b.as_str(), w)?;
+            }
+            K::EquivalentDataProperties(ps) => {
+                for p in ps {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_iri_polled(p.as_str(), w)?;
+                }
+            }
+            K::DisjointDataProperties(ps) => {
+                for p in ps {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_iri_polled(p.as_str(), w)?;
+                }
+            }
+            K::DataPropertyDomain(p, c) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_class_expression_polled(c, w)?;
+            }
+            K::DataPropertyRange(p, r) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_data_range_polled(r, w)?;
+            }
+            K::FunctionalDataProperty(p) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+            }
+            K::DatatypeDefinition(d, r) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(d.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_data_range_polled(r, w)?;
+            }
+            K::HasKey(c, ops, dprops) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_class_expression_polled(c, w)?;
+                w.write_str_polled(" (")?;
+                for (i, p) in ops.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char_polled(' ')?;
+                    }
+                    self.write_ope_polled(p, w)?;
+                }
+                w.write_str_polled(") (")?;
+                for (i, p) in dprops.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char_polled(' ')?;
+                    }
+                    self.write_iri_polled(p.as_str(), w)?;
+                }
+                w.write_char_polled(')')?;
+            }
+            K::SameIndividual(is) => {
+                for i in is {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_individual_polled(i, w)?;
+                }
+            }
+            K::DifferentIndividuals(is) => {
+                for i in is {
+                    sep(&mut || w.write_char_polled(' '))?;
+                    self.write_individual_polled(i, w)?;
+                }
+            }
+            K::ClassAssertion(c, i) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_class_expression_polled(c, w)?;
+                w.write_char_polled(' ')?;
+                self.write_individual_polled(i, w)?;
+            }
+            K::ObjectPropertyAssertion(p, a, b) | K::NegativeObjectPropertyAssertion(p, a, b) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_ope_polled(p, w)?;
+                w.write_char_polled(' ')?;
+                self.write_individual_polled(a, w)?;
+                w.write_char_polled(' ')?;
+                self.write_individual_polled(b, w)?;
+            }
+            K::DataPropertyAssertion(p, a, l) | K::NegativeDataPropertyAssertion(p, a, l) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_individual_polled(a, w)?;
+                w.write_char_polled(' ')?;
+                self.write_literal_polled(l, w)?;
+            }
+            K::AnnotationAssertion(p, s, v) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                match s {
+                    AnnotationSubject::Iri(i) => self.write_iri_polled(i.as_str(), w)?,
+                    AnnotationSubject::Anonymous(a) => {
+                        w.write_str_polled("_:")?;
+                        w.write_str_polled(a.label())?;
+                    }
+                }
+                w.write_char_polled(' ')?;
+                self.write_annotation_value_polled(v, w)?;
+            }
+            K::SubAnnotationPropertyOf(a, b) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(a.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_iri_polled(b.as_str(), w)?;
+            }
+            K::AnnotationPropertyDomain(p, i) | K::AnnotationPropertyRange(p, i) => {
+                sep(&mut || w.write_char_polled(' '))?;
+                self.write_iri_polled(p.as_str(), w)?;
+                w.write_char_polled(' ')?;
+                self.write_iri_polled(i.as_str(), w)?;
+            }
+        }
+        w.write_char_polled(')')
+    }
+
+    /// Render `e` into functional-style syntax if it fits within `max_bytes`, returning
+    /// `None` immediately upon exceeding `max_bytes`.
+    pub fn entity_bounded(&self, e: &Entity, max_bytes: usize) -> Option<String> {
+        let mut sink = BoundedSink {
+            buf: String::new(),
+            limit: max_bytes,
+        };
+        self.write_entity_polled(e, &mut sink).ok()?;
+        Some(sink.buf)
+    }
+
+    /// Render `ax` into functional-style syntax if it fits within `max_bytes`, returning
+    /// `None` immediately upon exceeding `max_bytes`.
+    pub fn axiom_bounded(&self, ax: &Axiom, max_bytes: usize) -> Option<String> {
+        let mut sink = BoundedSink {
+            buf: String::new(),
+            limit: max_bytes,
+        };
+        self.write_axiom_polled(ax, &mut sink).ok()?;
+        Some(sink.buf)
     }
 
     /// An IRI as a prefixed name, or in angle brackets.
@@ -248,13 +903,25 @@ impl Renderer {
         let ces = |cs: &std::collections::BTreeSet<ClassExpression>| -> Vec<String> {
             cs.iter().map(|c| self.class_expression(c)).collect()
         };
+        let ces_bag = |cs: &Multiset<ClassExpression>| -> Vec<String> {
+            cs.iter().map(|c| self.class_expression(c)).collect()
+        };
         let opes = |ps: &std::collections::BTreeSet<ObjectPropertyExpression>| -> Vec<String> {
+            ps.iter().map(|p| self.ope(p)).collect()
+        };
+        let opes_bag = |ps: &Multiset<ObjectPropertyExpression>| -> Vec<String> {
             ps.iter().map(|p| self.ope(p)).collect()
         };
         let dps = |ps: &std::collections::BTreeSet<DataProperty>| -> Vec<String> {
             ps.iter().map(|p| self.iri(p.as_str())).collect()
         };
+        let dps_bag = |ps: &Multiset<DataProperty>| -> Vec<String> {
+            ps.iter().map(|p| self.iri(p.as_str())).collect()
+        };
         let inds = |is: &std::collections::BTreeSet<Individual>| -> Vec<String> {
+            is.iter().map(|i| self.individual(i)).collect()
+        };
+        let inds_bag = |is: &Multiset<Individual>| -> Vec<String> {
             is.iter().map(|i| self.individual(i)).collect()
         };
         match &ax.kind {
@@ -263,10 +930,11 @@ impl Renderer {
                 args.push(self.class_expression(a));
                 args.push(self.class_expression(b));
             }
-            K::EquivalentClasses(cs) | K::DisjointClasses(cs) => args.extend(ces(cs)),
+            K::EquivalentClasses(cs) => args.extend(ces(cs)),
+            K::DisjointClasses(cs) => args.extend(ces_bag(cs)),
             K::DisjointUnion(c, cs) => {
                 args.push(self.iri(c.as_str()));
-                args.extend(ces(cs));
+                args.extend(ces_bag(cs));
             }
             K::SubObjectPropertyOf(sub, sup) => {
                 args.push(match sub {
@@ -277,9 +945,8 @@ impl Renderer {
                 });
                 args.push(self.ope(sup));
             }
-            K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
-                args.extend(opes(ps))
-            }
+            K::EquivalentObjectProperties(ps) => args.extend(opes(ps)),
+            K::DisjointObjectProperties(ps) => args.extend(opes_bag(ps)),
             K::InverseObjectProperties(a, b) => {
                 args.push(self.ope(a));
                 args.push(self.ope(b));
@@ -299,7 +966,8 @@ impl Renderer {
                 args.push(self.iri(a.as_str()));
                 args.push(self.iri(b.as_str()));
             }
-            K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => args.extend(dps(ps)),
+            K::EquivalentDataProperties(ps) => args.extend(dps(ps)),
+            K::DisjointDataProperties(ps) => args.extend(dps_bag(ps)),
             K::DataPropertyDomain(p, c) => {
                 args.push(self.iri(p.as_str()));
                 args.push(self.class_expression(c));
@@ -318,7 +986,8 @@ impl Renderer {
                 args.push(format!("({})", opes(ops).join(" ")));
                 args.push(format!("({})", dps(dprops).join(" ")));
             }
-            K::SameIndividual(is) | K::DifferentIndividuals(is) => args.extend(inds(is)),
+            K::SameIndividual(is) => args.extend(inds(is)),
+            K::DifferentIndividuals(is) => args.extend(inds_bag(is)),
             K::ClassAssertion(c, i) => {
                 args.push(self.class_expression(c));
                 args.push(self.individual(i));
@@ -359,13 +1028,40 @@ impl Renderer {
     }
 }
 
-/// Whether `s` can follow a prefix in a prefixed name: a simplified PN_LOCAL that
-/// accepts letters, digits, `_` and `-`, and `.` inside.
+/// Whether `s` can follow a prefix in a prefixed name: a simplified `PN_LOCAL`
+/// matching W3C `PN_CHARS_U | [0-9]` followed by `PN_CHARS | '.'` not ending in `.`.
 fn is_local_name(s: &str) -> bool {
-    !s.is_empty()
-        && !s.ends_with('.')
-        && !s.starts_with(['-', '.'])
-        && s.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c))
+    crate::write_common::is_pn_local(s)
+}
+
+fn is_local_name_polled<E>(s: &str, w: &mut impl PolledWrite<E>) -> Result<bool, E> {
+    let mut cs = s.chars();
+    let Some(first) = cs.next() else {
+        return Ok(false);
+    };
+    if !(crate::write_common::is_pn_chars_u(first) || first.is_ascii_digit()) {
+        return Ok(false);
+    }
+    let mut last = first;
+    let mut batch = 1usize;
+    for c in cs {
+        batch += 1;
+        if batch == POLL_CHUNK_BYTES {
+            w.tick(batch)?;
+            batch = 0;
+        }
+        if !(crate::write_common::is_pn_chars(c) || c == '.') {
+            if batch > 0 {
+                w.tick(batch)?;
+            }
+            return Ok(false);
+        }
+        last = c;
+    }
+    if batch > 0 {
+        w.tick(batch)?;
+    }
+    Ok(last != '.')
 }
 
 /// An ontology document in functional-style syntax: the prefix declarations, the
@@ -406,6 +1102,13 @@ thread_local! {
     static DEFAULT: Renderer = Renderer::default();
 }
 
+pub(crate) fn write_default_class_expression_polled<E>(
+    c: &ClassExpression,
+    w: &mut impl PolledWrite<E>,
+) -> Result<(), E> {
+    DEFAULT.with(|r| r.write_class_expression_polled(c, w))
+}
+
 macro_rules! display {
     ($t:ty, $m:ident) => {
         impl fmt::Display for $t {
@@ -417,7 +1120,11 @@ macro_rules! display {
 }
 
 display!(Axiom, axiom);
-display!(ClassExpression, class_expression);
+impl fmt::Display for ClassExpression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        DEFAULT.with(|r| r.write_class_expression(self, f))
+    }
+}
 display!(DataRange, data_range);
 display!(ObjectPropertyExpression, ope);
 display!(Individual, individual);

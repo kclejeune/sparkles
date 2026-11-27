@@ -100,7 +100,12 @@ impl Opened {
         ))
     }
 
-    fn relative(&self, path: &str, directory: bool, preparation: &Preparation) -> Result<Self> {
+    pub(super) fn relative(
+        &self,
+        path: &str,
+        directory: bool,
+        preparation: &Preparation,
+    ) -> Result<Self> {
         if path.is_empty() {
             return Err(managed_history::unavailable("empty original metadata path"));
         }
@@ -128,6 +133,19 @@ impl Opened {
     ) -> Result<managed_history::Bytes> {
         let Self { file, _held } = self;
         let result = managed_history::read_opened(file, length, preparation);
+        drop(_held);
+        result
+    }
+
+    pub(super) fn into_pinned_file(
+        self,
+        expected: Sha256Digest,
+        preparation: &Preparation,
+        control: &crate::guard::WriteOptions,
+    ) -> Result<File> {
+        let Self { file, _held } = self;
+        let result =
+            managed_history::capture::pin_opened_file(file, expected, preparation, control);
         drop(_held);
         result
     }
@@ -333,6 +351,37 @@ pub(super) fn source_header(
                 Ok(())
             },
         )?;
+    } else if root_name == "main" && descriptor.files.contains_key(ROOT_FILE) {
+        let origin_bytes = read_member(directory, descriptor, ROOT_FILE, preparation)?;
+        let decoded = Origin::decode(&origin_bytes.value, preparation)?;
+        if decoded.value.format == 2
+            && let Some(publication) = &decoded.value.destination
+            && publication.creation_commit.is_some()
+        {
+            let commit_path = format!("{}/commit.json", root.generation);
+            if descriptor.files.contains_key(&commit_path) {
+                let commit_bytes = read_member(directory, descriptor, &commit_path, preparation)?;
+                let allowance = preparation.room();
+                let _loan = preparation.reserve(allowance)?;
+                let options = crate::history::HistoryOptions {
+                    cancel: Some(preparation.control().cancel.flag()),
+                    deadline: preparation.control().deadline,
+                };
+                let mut budget = crate::store::cold::ColdBudget::new(crate::history::ReadLimit {
+                    options: &options,
+                    memory: Some(allowance),
+                    held: 0,
+                })?;
+                let physical = crate::commit::decode_gen_commit_bytes_with(
+                    Path::new("original-primary/commit.json"),
+                    &commit_bytes.value,
+                    &mut budget,
+                )?;
+                let actual = physical.value;
+                drop(_loan);
+                origin = publication.creation_origin(&actual, preparation)?;
+            }
+        }
     }
     let header = primary::Header::from_coverage(
         descriptor.family_id,
@@ -464,7 +513,10 @@ pub(super) fn source_identities(
     preparation.check()
 }
 
-pub(super) fn dataset_id(bytes: &[u8], preparation: &Preparation) -> Result<Uuid> {
+pub(super) fn dataset_id_and_reader(
+    bytes: &[u8],
+    preparation: &Preparation,
+) -> Result<(Uuid, u32)> {
     let allowance = preparation.room();
     let _loan = preparation.reserve(allowance)?;
     let options = crate::history::HistoryOptions {
@@ -476,7 +528,11 @@ pub(super) fn dataset_id(bytes: &[u8], preparation: &Preparation) -> Result<Uuid
         memory: Some(allowance),
         held: 0,
     })?;
-    crate::commit::dataset_id_bytes_controlled(bytes, &mut budget)
+    crate::commit::dataset_identity_and_reader_bytes_with(bytes, &mut budget)
+}
+
+pub(super) fn dataset_id(bytes: &[u8], preparation: &Preparation) -> Result<Uuid> {
+    dataset_id_and_reader(bytes, preparation).map(|(id, _)| id)
 }
 
 pub(super) fn branch_identity(

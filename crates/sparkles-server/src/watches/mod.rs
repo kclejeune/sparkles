@@ -16,10 +16,12 @@
 pub mod deliver;
 pub mod follow;
 pub mod http;
-#[cfg(test)]
+#[cfg(all(test, feature = "auth"))]
 mod tests;
 
-use crate::auth::{EmailClaim, Identity, Kind, Principal};
+#[cfg(feature = "auth")]
+use crate::auth::EmailClaim;
+use crate::auth::{Identity, Kind, Principal};
 use crate::state::AppState;
 use chrono::{DateTime, Utc};
 use parking_lot::{Condvar, Mutex};
@@ -46,10 +48,12 @@ pub const MATCH_MEMBERS: usize = 20;
 const CURSOR_SAVE: Duration = Duration::from_secs(30);
 /// How long a provider's word on an owner that changed nothing but its time may wait
 /// before it is saved.
+#[cfg(feature = "auth")]
 const VOUCH_SAVE: Duration = Duration::from_secs(3600);
 /// The identities whose latest vouching is kept in memory before the ones already
 /// recorded on their watches, and the ones of identities without watches, are
 /// forgotten.
+#[cfg(feature = "auth")]
 const VOUCHED_MAX: usize = 10_000;
 
 /// What a watch covers.
@@ -130,6 +134,7 @@ impl Owner {
     /// the principal holds no groups, so the owner's groups are fresh only when it has
     /// none. A verified address replaces the owner's, and an unverified one removes
     /// it. `true` when the groups or the address changed.
+    #[cfg(feature = "auth")]
     fn vouch(&mut self, groups: Option<&[String]>, email: &EmailClaim, now: &str) -> bool {
         let mut changed = false;
         if let Some(g) = groups
@@ -167,10 +172,12 @@ impl Owner {
         self.kind == other.kind && self.name == other.name
     }
 
+    #[cfg(feature = "auth")]
     fn same_identity(&self, who: &Identity) -> bool {
         self.kind == who.kind && self.name == who.name
     }
 
+    #[cfg(feature = "auth")]
     pub fn identity(&self) -> Identity {
         Identity {
             kind: self.kind,
@@ -291,8 +298,10 @@ pub(crate) type Snapshot = (Vec<Watch>, BTreeMap<uuid::Uuid, u64>, u64);
 struct Vouch {
     owner: Owner,
     /// when it was last recorded on the owner's watches
+    #[cfg(feature = "auth")]
     written: Option<Instant>,
     /// it changed since, or recording it failed
+    #[cfg(feature = "auth")]
     pending: bool,
 }
 
@@ -475,6 +484,7 @@ impl Watches {
     /// [`VOUCH_SAVE`]. The word kept in memory decides matching and mail at once, saved
     /// or not (see [`Watches::vouched_owner`]). Changed groups make the follower
     /// authorize the owner again.
+    #[cfg(feature = "auth")]
     pub fn vouched(
         &self,
         st: &AppState,

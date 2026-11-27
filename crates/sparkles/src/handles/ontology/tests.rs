@@ -1518,6 +1518,81 @@ fn equalities_stream_once_and_fill_each_list_on_its_own() {
 }
 
 #[test]
+fn streamed_different_from_self_appears_in_equalities_and_entity_wire() {
+    let ds = dataset(":o a owl:Ontology . :a a owl:NamedIndividual ; owl:differentFrom :a .");
+    let o = ds
+        .ontology()
+        .graph("default")
+        .mode(Mode::Strict)
+        .open()
+        .unwrap();
+    let mut seen = Vec::new();
+    o.equalities(&Individual::named(ex("a")), &opts(), |ax, _| {
+        seen.push(ax.kind);
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(
+        seen,
+        vec![AxiomKind::DifferentIndividuals(
+            [Individual::named(ex("a")), Individual::named(ex("a"))].into()
+        )]
+    );
+
+    let body = wire::call(
+        &ds,
+        "entity",
+        &serde_json::json!({"iri": ex("a"), "assertions": true, "mode": "strict"}),
+        &opts(),
+    )
+    .unwrap();
+    let diff = body["namedIndividual"]["differentIndividuals"]
+        .as_array()
+        .unwrap();
+    assert_eq!(diff.len(), 1, "assertions=true {body}");
+    assert_eq!(diff[0]["expression"], ex("a"), "assertions=true {body}");
+
+    // With assertions=false, bare owl:differentFrom triples stay out of the eager read,
+    // while an AllDifferent blank-node axiom is held in `o.ontology` and exercises the
+    // eager `onto.different_individuals(&i)` wire path.
+    let body_no_assert = wire::call(
+        &ds,
+        "entity",
+        &serde_json::json!({"iri": ex("a"), "assertions": false, "mode": "strict"}),
+        &opts(),
+    )
+    .unwrap();
+    assert!(
+        body_no_assert["namedIndividual"]["differentIndividuals"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "bare triple should not appear with assertions=false: {body_no_assert}"
+    );
+
+    let ds_all_diff = dataset(
+        ":o a owl:Ontology . :a a owl:NamedIndividual . \
+         [] a owl:AllDifferent ; owl:members ( :a :a ) .",
+    );
+    let body_eager = wire::call(
+        &ds_all_diff,
+        "entity",
+        &serde_json::json!({"iri": ex("a"), "assertions": false, "mode": "strict"}),
+        &opts(),
+    )
+    .unwrap();
+    let diff_eager = body_eager["namedIndividual"]["differentIndividuals"]
+        .as_array()
+        .unwrap();
+    assert_eq!(diff_eager.len(), 1, "eager assertions=false {body_eager}");
+    assert_eq!(
+        diff_eager[0]["expression"],
+        ex("a"),
+        "eager assertions=false {body_eager}"
+    );
+}
+
+#[test]
 fn streams_give_every_graph_of_an_assertion() {
     let held = ":o a owl:Ontology . :A a owl:Class . :p a owl:ObjectProperty .
         :a a owl:NamedIndividual , [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :A ] .
@@ -1671,7 +1746,7 @@ fn entity_operations_answer_in_the_route_forms() {
 
 mod classification {
     use super::*;
-    use crate::handles::ontology::classify::ClassifyRequest;
+    use crate::handles::ontology::classify::{Classified, ClassifyRequest};
     use crate::handles::ontology::wire;
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -1690,6 +1765,144 @@ mod classification {
 
     fn named(g: &str) -> GraphRef {
         GraphRef::Named(g.to_string())
+    }
+
+    const DL663_CHAIN: &str = "
+        :o a owl:Ontology .
+        :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class .
+        :r a owl:ObjectProperty . :t a owl:ObjectProperty .
+        :t owl:propertyChainAxiom ( :r owl:topObjectProperty ) .
+        :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] .
+    ";
+    const DL663_DOMAIN: &str = ":t rdfs:domain :D .";
+
+    fn dl663_has_domain(answer: &Classified) -> bool {
+        answer.classification.taxonomy.is_subclass(&c("A"), &c("D"))
+    }
+
+    fn dl663_partial_chain(answer: &Classified) {
+        use sparkles_owl::classify::{Excluded, Gap};
+
+        let chain = sparkles_owl::ofn_read::parse_axiom(
+            "SubObjectPropertyOf(ObjectPropertyChain(<http://ex.org/r> owl:topObjectProperty) <http://ex.org/t>)",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            answer.excluded.as_slice(),
+            [Excluded {
+                axiom: chain.kind,
+                gap: Gap::Partial("property chains through the top object property"),
+            }],
+        );
+        assert!(answer.classification.complete_for_taken);
+        assert!(!answer.classification.complete);
+        assert_eq!(answer.classification.stats.unmapped, 0);
+        assert!(!answer.classification.taxonomy.is_subclass(&c("C"), &c("D")));
+    }
+
+    #[test]
+    fn dl663_dataset_default_answer_is_cached() {
+        let ds = dataset(&format!("{DL663_CHAIN} {DL663_DOMAIN}"));
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let cr = ClassifyRequest::default();
+        let first = h.classify(&req, &cr, &opts()).unwrap();
+        assert!(!first.reused);
+        dl663_partial_chain(&first);
+        let cached = h.classify(&req, &cr, &opts()).unwrap();
+        assert!(cached.reused);
+        assert!(Arc::ptr_eq(&first.classification, &cached.classification));
+        assert_eq!(first.publication.id, cached.publication.id);
+        assert!(
+            dl663_has_domain(&first) && dl663_has_domain(&cached),
+            "dl663 missing: Dataset default cached domain",
+        );
+        println!("dl663 ok: Dataset default cached domain");
+    }
+
+    #[test]
+    fn dl663_dataset_el_only_keeps_its_partition() {
+        let ds = dataset(&format!("{DL663_CHAIN} {DL663_DOMAIN}"));
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let default = ClassifyRequest::default();
+        let el_only = ClassifyRequest {
+            el_only: true,
+            ..Default::default()
+        };
+        let first = h.classify(&req, &default, &opts()).unwrap();
+        let elk = h.classify(&req, &el_only, &opts()).unwrap();
+        dl663_partial_chain(&elk);
+        assert!(!dl663_has_domain(&elk));
+        assert!(!elk.reused && elk.retained);
+        let again = h.classify(&req, &el_only, &opts()).unwrap();
+        assert!(again.reused && again.retained);
+        assert!(Arc::ptr_eq(&elk.classification, &again.classification));
+        assert_eq!(again.publication.id, elk.publication.id);
+        assert_eq!(again.classification.taxonomy, elk.classification.taxonomy);
+        let cached = h.classify(&req, &default, &opts()).unwrap();
+        assert!(cached.reused && cached.retained);
+        assert!(Arc::ptr_eq(&first.classification, &cached.classification));
+        assert_eq!(cached.publication.id, first.publication.id);
+
+        let default_source = cached.publication.identity();
+        let elk_source = elk.publication.identity();
+        assert_eq!(default_source["commit"], elk_source["commit"]);
+        assert_eq!(default_source["producer"]["elOnly"], false);
+        assert_eq!(elk_source["producer"]["elOnly"], true);
+        assert_ne!(
+            default_source["inputFingerprint"],
+            elk_source["inputFingerprint"]
+        );
+        println!("dl663 ok: Dataset EL-only cache partition");
+    }
+
+    #[test]
+    fn dl663_dataset_domain_edit_refreshes_the_answer() {
+        let ds = dataset(DL663_CHAIN);
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let cr = ClassifyRequest::default();
+        let classify = || h.classify(&req, &cr, &opts()).unwrap();
+
+        let before = classify();
+        dl663_partial_chain(&before);
+        assert!(!dl663_has_domain(&before));
+        assert!(classify().reused);
+
+        ds.update(&format!("{PREFIXES} INSERT DATA {{ {DL663_DOMAIN} }}"))
+            .unwrap();
+        let added = classify();
+        assert!(!added.reused);
+        dl663_partial_chain(&added);
+        assert_ne!(added.publication.id, before.publication.id);
+        assert!(added.opened.snapshot.commit > before.opened.snapshot.commit);
+        let fresh = dataset(&format!("{DL663_CHAIN} {DL663_DOMAIN}"))
+            .ontology()
+            .classify(&req, &cr, &opts())
+            .unwrap();
+        assert_eq!(added.classification.taxonomy, fresh.classification.taxonomy);
+        assert_eq!(added.excluded, fresh.excluded);
+        let cached = classify();
+        assert!(cached.reused);
+        assert!(Arc::ptr_eq(&added.classification, &cached.classification));
+
+        ds.update(&format!("{PREFIXES} DELETE DATA {{ {DL663_DOMAIN} }}"))
+            .unwrap();
+        let removed = classify();
+        assert!(!removed.reused && !dl663_has_domain(&removed));
+        dl663_partial_chain(&removed);
+        assert_ne!(removed.publication.id, added.publication.id);
+        assert_eq!(
+            removed.classification.taxonomy,
+            before.classification.taxonomy
+        );
+        assert!(
+            dl663_has_domain(&added) && dl663_has_domain(&cached),
+            "dl663 missing: Dataset post-edit domain",
+        );
+        println!("dl663 ok: Dataset post-edit domain");
     }
 
     #[test]
@@ -1987,6 +2200,281 @@ mod classification {
         let all = h.classify(&req, &abox, &opts()).unwrap();
         assert!(!all.classification.consistent);
         assert!(!all.reused);
+        // the terminology alone does not answer for the whole ontology, whose assertions
+        // can make it inconsistent, so they count as left out
+        use sparkles_owl::classify::{Consistency, Gap, NOT_READ};
+        assert!(!tbox.classification.complete);
+        assert!(tbox.classification.complete_for_taken);
+        assert_eq!(tbox.classification.consistency, Consistency::Unknown);
+        assert!(tbox.classification.incomplete.len() >= 4);
+        assert!(matches!(
+            &tbox.excluded[..],
+            [e] if matches!(&e.gap, Gap::Outside { rule, .. } if rule == NOT_READ)
+        ));
+        let strict = ClassifyRequest {
+            strict: true,
+            ..Default::default()
+        };
+        let err = h.classify(&req, &strict, &opts()).err().unwrap();
+        assert!(
+            err.to_string().contains("classify with the assertions"),
+            "{err}"
+        );
+    }
+
+    /// Any assertion the terminology alone did not read leaves the answer incomplete, even
+    /// one that cannot change an answer, and a commit that adds the first one makes the
+    /// kept answer incomplete too.
+    #[test]
+    fn any_assertion_not_read_leaves_the_terminology_incomplete() {
+        use sparkles_owl::classify::{Consistency, Gap, NOT_READ};
+        let ds = dataset(&format!("{ONTO} :Cell rdfs:subClassOf :Thing2 ."));
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let first = h
+            .classify(&req, &ClassifyRequest::default(), &opts())
+            .unwrap();
+        assert!(first.classification.complete, "{:?}", first.excluded);
+        assert!(first.excluded.is_empty());
+        ds.update(&format!(
+            "{PREFIXES} INSERT DATA {{ :size a owl:DatatypeProperty . :x a :Cell ; :partOf :y . :y :size 3 . }}"
+        ))
+        .unwrap();
+        let c = h
+            .classify(&req, &ClassifyRequest::default(), &opts())
+            .unwrap();
+        assert!(!c.reused);
+        assert!(!c.classification.complete && c.classification.complete_for_taken);
+        assert_eq!(c.classification.consistency, Consistency::Unknown);
+        assert!(
+            matches!(&c.excluded[..], [e] if matches!(&e.gap, Gap::Outside { rule, .. } if rule == NOT_READ)),
+            "{:?}",
+            c.excluded
+        );
+        assert!(
+            c.classification
+                .incomplete
+                .iter()
+                .any(|k| k == &self::c("Cell"))
+        );
+        let strict = ClassifyRequest {
+            strict: true,
+            ..Default::default()
+        };
+        assert!(h.classify(&req, &strict, &opts()).is_err());
+        // with the assertions the same store is complete
+        let all = ClassifyRequest {
+            assertions: true,
+            strict: true,
+            ..Default::default()
+        };
+        let a = h.classify(&req, &all, &opts()).unwrap();
+        assert!(a.classification.complete, "{:?}", a.excluded);
+    }
+
+    /// The patterns of ordinary published ontologies and their individuals map to axioms or
+    /// to annotations, so they count no unmapped triple and leave the run complete: an
+    /// ontology header with annotations, a version IRI and an import, annotations of
+    /// classes, properties and individuals, deprecation, `owl:AllDifferent` and
+    /// `owl:AllDisjointClasses` lists, negative property assertions and property chains.
+    #[test]
+    fn common_ontology_patterns_map_every_triple() {
+        let body = ":o a owl:Ontology ; owl:versionIRI :o1 ; owl:versionInfo \"1\" ;
+                rdfs:comment \"An ontology\" ; rdfs:seeAlso :doc ; owl:imports <http://ex.org/missing> .
+            :doc a owl:NamedIndividual .
+            :note a owl:AnnotationProperty . :note rdfs:subPropertyOf rdfs:comment .
+            :A a owl:Class ; rdfs:label \"A\"@en ; :note \"n\" ; rdfs:isDefinedBy :o .
+            :B a owl:Class ; rdfs:subClassOf :A ; owl:deprecated true .
+            :C a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :A ] .
+            :D a owl:Class . :E a owl:Class .
+            [] a owl:AllDisjointClasses ; owl:members ( :C :D :E ) .
+            :r a owl:ObjectProperty ; rdfs:domain :A ; rdfs:range :A ; rdfs:label \"r\" .
+            :s a owl:ObjectProperty ; owl:propertyChainAxiom ( :r :r ) .
+            :d a owl:DatatypeProperty ; rdfs:range xsd:string .
+            :x a owl:NamedIndividual , :A ; rdfs:label \"x\" ; rdfs:seeAlso :doc ; :r :y ; :d \"v\" .
+            :y a owl:NamedIndividual , :C .
+            :z a owl:NamedIndividual .
+            [] a owl:AllDifferent ; owl:distinctMembers ( :x :y :z ) .
+            [] a owl:NegativePropertyAssertion ; owl:sourceIndividual :x ;
+                owl:assertionProperty :r ; owl:targetIndividual :z .
+            :x owl:sameAs :x2 .";
+        let ds = dataset(body);
+        let h = ds.ontology();
+        let o = h.open(&OntologyRequest::default(), &opts()).unwrap();
+        assert!(o.ontology.unmapped.is_empty(), "{:?}", o.ontology.unmapped);
+        let c = h
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest {
+                    assertions: true,
+                    ..Default::default()
+                },
+                &opts(),
+            )
+            .unwrap();
+        let k = &c.classification;
+        assert_eq!(k.stats.unmapped, 0);
+        assert!(k.complete, "{:?}", c.excluded);
+    }
+
+    /// More unmapped triples than the answer lists: it keeps the first
+    /// [`UNMAPPED_LISTED`](sparkles_owl::classify::UNMAPPED_LISTED) in a stable order,
+    /// counts them all and says that the list is truncated, on the wire too.
+    #[test]
+    fn a_long_list_of_unmapped_triples_is_truncated() {
+        use sparkles_owl::classify::UNMAPPED_LISTED;
+        let n = UNMAPPED_LISTED + 20;
+        let body: String = (0..n)
+            .map(|i| format!(":p{i} rdfs:domain :A . "))
+            .chain([":A a owl:Class .".to_string()])
+            .collect();
+        let ds = dataset(&body);
+        let run = || {
+            ds.ontology()
+                .classify(
+                    &OntologyRequest::default(),
+                    &ClassifyRequest::default(),
+                    &opts(),
+                )
+                .unwrap()
+        };
+        let c = run();
+        let k = &c.classification;
+        assert_eq!(k.stats.unmapped, n);
+        assert_eq!(k.unmapped.count, n);
+        assert_eq!(k.unmapped.triples.len(), UNMAPPED_LISTED);
+        assert!(k.unmapped.truncated);
+        assert!(!k.complete);
+        assert_eq!(
+            run().classification.unmapped,
+            k.unmapped,
+            "the order is stable"
+        );
+        let j = wire::call(&ds, "classify", &json!({}), &opts()).unwrap();
+        assert_eq!(j["unmappedTruncated"], true, "{}", j["unmappedTriples"]);
+        assert_eq!(
+            j["unmappedTriples"].as_array().unwrap().len(),
+            UNMAPPED_LISTED
+        );
+        assert_eq!(j["stats"]["unmapped"], n);
+        let first = &j["unmappedTriples"][0];
+        assert!(
+            first["predicate"] == "<http://www.w3.org/2000/01/rdf-schema#domain>"
+                && first["object"] == format!("<{}>", ex("A"))
+                && first["subject"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("<http://ex.org/p"),
+            "{first}"
+        );
+    }
+
+    /// RDFS-style typings, `rdfs:Class` and `rdf:Property` without an OWL type, carry no
+    /// logical content, so a classification counts no unmapped triple for them.
+    #[test]
+    fn rdfs_style_typings_count_no_unmapped_triple() {
+        let ds = dataset(
+            ":A a owl:Class . :q a rdf:Property . :t a rdfs:Class . :B a owl:Class .
+            :B rdfs:subClassOf :A .",
+        );
+        let h = ds.ontology();
+        let o = h.open(&OntologyRequest::default(), &opts()).unwrap();
+        // the read reports the lone rdf:Property typing, as the DL profile check needs
+        assert_eq!(o.ontology.unmapped.len(), 1, "{:?}", o.ontology.unmapped);
+        let c = h
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest::default(),
+                &opts(),
+            )
+            .unwrap();
+        let k = &c.classification;
+        assert_eq!(k.stats.unmapped, 0, "{:?}", k.unmapped);
+        assert!(k.complete, "{:?}", c.excluded);
+    }
+
+    /// A triple that maps to no axiom, here the domain of a property that is not
+    /// declared, leaves every classification incomplete, of the terminology alone and
+    /// with the assertions, and a commit that adds one makes the kept answer incomplete.
+    #[test]
+    fn a_triple_that_maps_to_no_axiom_leaves_the_answer_incomplete() {
+        use sparkles_owl::classify::Consistency;
+        let body = ":A a owl:Class . :B a owl:Class . :C a owl:Class .
+            :A owl:disjointWith :B . :C rdfs:subClassOf :B .";
+        let ds = dataset(body);
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let first = h
+            .classify(&req, &ClassifyRequest::default(), &opts())
+            .unwrap();
+        assert!(first.classification.complete && first.classification.stats.unmapped == 0);
+        ds.update(&format!("{PREFIXES} INSERT DATA {{ :p rdfs:domain :A . }}"))
+            .unwrap();
+        for assertions in [false, true] {
+            let c = h
+                .classify(
+                    &req,
+                    &ClassifyRequest {
+                        assertions,
+                        ..Default::default()
+                    },
+                    &opts(),
+                )
+                .unwrap();
+            let k = &c.classification;
+            assert!(!c.reused, "assertions {assertions}");
+            assert!(
+                k.stats.unmapped > 0,
+                "assertions {assertions}: {:?}",
+                c.excluded
+            );
+            // the answer lists the triple, as the wire does
+            let domain = format!(
+                "<{}> <http://www.w3.org/2000/01/rdf-schema#domain> <{}>",
+                ex("p"),
+                ex("A")
+            );
+            assert!(
+                k.unmapped.triples.iter().any(|t| t.to_string() == domain),
+                "assertions {assertions}: {:?}",
+                k.unmapped
+            );
+            assert!(!k.unmapped.truncated);
+            assert!(
+                !k.complete && k.complete_for_taken,
+                "assertions {assertions}"
+            );
+            assert_eq!(
+                k.consistency,
+                Consistency::Unknown,
+                "assertions {assertions}"
+            );
+            assert!(
+                k.incomplete.contains(&self::c("C")),
+                "assertions {assertions}"
+            );
+            let strict = ClassifyRequest {
+                assertions,
+                strict: true,
+                ..Default::default()
+            };
+            let Err(err) = h.classify(&req, &strict, &opts()) else {
+                panic!("assertions {assertions}: a strict run answered");
+            };
+            assert!(err.to_string().contains("map to no axiom"), "{err}");
+        }
+        // with the assertions that make it inconsistent through the domain
+        ds.update(&format!(
+            "{PREFIXES} INSERT DATA {{ :x :p :y . :x a :B . }}"
+        ))
+        .unwrap();
+        let all = ClassifyRequest {
+            assertions: true,
+            ..Default::default()
+        };
+        let c = h.classify(&req, &all, &opts()).unwrap();
+        assert!(!c.classification.complete);
+        assert_ne!(c.classification.consistency, Consistency::Consistent);
     }
 
     #[test]
@@ -2121,11 +2609,11 @@ mod classification {
             "a partial answer has more"
         );
         assert_eq!(j["tier"], json!("disjunctive"));
-        assert_eq!(j["partial"], json!(!cl.complete));
+        assert_eq!(j["partial"], json!(!cl.complete_for_taken));
         assert_eq!(j["complete"], json!(part.complete()));
         assert_eq!(j["incompleteCount"], json!(cl.incomplete.len()));
         let consistency = j["consistency"].as_str().unwrap();
-        if cl.complete {
+        if cl.complete_for_taken {
             assert!(everything || got == want);
             assert!(part.complete());
             assert_eq!(j["incomplete"], json!([]));
@@ -2431,7 +2919,7 @@ mod classification {
                     ..opts()
                 };
                 match ds.ontology().classify(&req, &partial_request(), &o) {
-                    Ok(c) if !c.classification.complete => Some((ds, c)),
+                    Ok(c) if !c.classification.complete_for_taken => Some((ds, c)),
                     _ => None,
                 }
             })
@@ -2445,5 +2933,311 @@ mod classification {
         assert!(next.complete());
         let again = h.classify(&req, &partial_request(), &opts()).unwrap();
         assert!(again.reused && again.complete());
+    }
+
+    #[test]
+    fn el_and_horn_partial_answers_under_budgets_and_non_retention() {
+        let n = if cfg!(debug_assertions) { 50 } else { 150 };
+        let mut el_body = String::from(
+            ":r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . :s a owl:ObjectProperty .\n\
+             :part a owl:ObjectProperty , owl:TransitiveProperty .\n\
+             :s owl:propertyChainAxiom ( :r1 :r2 ) .\n",
+        );
+        for i in 0..n {
+            let next = (i + 1) % n;
+            el_body.push_str(&format!(
+                ":A{i} a owl:Class ; rdfs:subClassOf :A{next} , [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B{i} ] .\n\
+                 :B{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :C{next} ] .\n\
+                 :C{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :part ; owl:someValuesFrom :P{next} ] .\n\
+                 :P{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :part ; owl:someValuesFrom :P{next} ] .\n\
+                 [ a owl:Restriction ; owl:onProperty :s ; owl:someValuesFrom :C{i} ] rdfs:subClassOf :D{i} .\n",
+            ));
+        }
+        let mut horn_body = String::from(
+            ":r a owl:ObjectProperty . :rinv a owl:ObjectProperty ; owl:inverseOf :r .\n",
+        );
+        let hn = if cfg!(debug_assertions) { 45 } else { 120 };
+        for i in 0..hn {
+            let b = (7 * i + 3) % hn;
+            let d = (11 * i + 5) % hn;
+            horn_body.push_str(&format!(
+                ":H{i} a owl:Class ;\n\
+                  rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :M{i} ] ,\n\
+                                  [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :F{b} ] ,\n\
+                                  [ a owl:Restriction ; owl:onProperty :r ; owl:maxCardinality 1 ] ,\n\
+                                  [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :G{d} ] .\n\
+                 :M{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :rinv ; owl:allValuesFrom :Back{i} ] .\n",
+            ));
+        }
+
+        let req = OntologyRequest::default();
+        for (tier, body) in [("el", el_body), ("horn", horn_body)] {
+            let full = dataset(&body)
+                .ontology()
+                .classify(&req, &partial_request(), &opts())
+                .unwrap();
+            assert!(full.complete());
+            assert_eq!(full.classification.stats.tier.as_str(), tier);
+            let peak = full.classification.stats.peak_memory as u64;
+            let (ds, part) = (1..20)
+                .find_map(|k| {
+                    let ds = dataset(&body);
+                    let o = QueryOptions {
+                        max_memory_bytes: Some(peak * k / 20),
+                        ..opts()
+                    };
+                    match ds.ontology().classify(&req, &partial_request(), &o) {
+                        Ok(c) if !c.classification.complete_for_taken => Some((ds, c)),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| panic!("{tier}: no budget produced a partial answer"));
+            assert!(!part.complete());
+            assert_eq!(part.classification.stats.tier.as_str(), tier);
+            assert!(!part.classification.stats.horn_over_budget);
+            // Soundness: every emitted subsumption must hold in full.
+            let got = pairs(&part.classification.taxonomy);
+            let want = pairs(&full.classification.taxonomy);
+            assert!(
+                got.is_subset(&want),
+                "{tier}: partial answer added unentailed pairs"
+            );
+            // Non-retention: partial answer is not published or cached.
+            let kept_read = ds
+                .ontology()
+                .kept_classification(&req, &super::kept::KeptQuery::default(), &opts())
+                .unwrap();
+            assert_eq!(
+                kept_read.status,
+                super::kept::Status::Unavailable,
+                "{tier}: partial answer must not be published to kept classification"
+            );
+            let next = ds
+                .ontology()
+                .classify(&req, &ClassifyRequest::default(), &opts())
+                .unwrap();
+            assert!(!next.reused, "{tier}: partial answer was kept");
+            assert!(next.complete());
+            // Target write with partial is rejected.
+            let writes = ClassifyRequest {
+                target: Some(named("http://ex.org/taxonomy")),
+                ..partial_request()
+            };
+            assert!(matches!(
+                ds.ontology().classify(&req, &writes, &opts()),
+                Err(Error::Invalid(_))
+            ));
+            // Assertions + partial stops cleanly under a tight memory budget without
+            // publishing a kept classification.
+            let assert_body = format!(
+                "{body}\n:ind0 a :{}0 .\n",
+                if tier == "el" { "A" } else { "H" }
+            );
+            let assert_req = ClassifyRequest {
+                assertions: true,
+                ..partial_request()
+            };
+            let full_assert = dataset(&assert_body)
+                .ontology()
+                .classify(&req, &assert_req, &opts())
+                .unwrap();
+            assert!(full_assert.complete());
+            let assert_peak = full_assert.classification.stats.peak_memory as u64;
+            let (assert_ds, part_assert) = (1..20)
+                .find_map(|k| {
+                    let ds = dataset(&assert_body);
+                    let o = QueryOptions {
+                        max_memory_bytes: Some(assert_peak * k / 20),
+                        ..opts()
+                    };
+                    match ds.ontology().classify(&req, &assert_req, &o) {
+                        Ok(c) if !c.classification.complete_for_taken => Some((ds, c)),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| {
+                    panic!("{tier}: no budget produced a partial answer with assertions=true")
+                });
+            assert!(!part_assert.complete());
+            assert_eq!(part_assert.classification.stats.tier.as_str(), tier);
+            assert!(!part_assert.classification.stats.horn_over_budget);
+            assert!(
+                pairs(&part_assert.classification.taxonomy)
+                    .is_subset(&pairs(&full_assert.classification.taxonomy)),
+                "{tier}: partial assertions answer added unentailed pairs"
+            );
+            assert_eq!(
+                assert_ds
+                    .ontology()
+                    .kept_classification(&req, &super::kept::KeptQuery::default(), &opts())
+                    .unwrap()
+                    .status,
+                super::kept::Status::Unavailable,
+                "{tier}: partial assertions answer must not be published"
+            );
+        }
+    }
+
+    #[test]
+    fn file_classification_complete_and_per_class_incomplete_on_wire_and_frame() {
+        let body = cases(if cfg!(debug_assertions) { 120 } else { 400 }, false);
+        let ttl = format!(
+            "@prefix : <http://ex.org/> .\n\
+             @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n{body}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let complete_path = dir.path().join("complete.ttl");
+        std::fs::write(&complete_path, &ttl).unwrap();
+        let req = OntologyRequest::default();
+
+        let file = super::file::OntologyFile::read(&complete_path, &req, 1)
+            .unwrap()
+            .expect("turtle file reads directly");
+        let full_file = file.classify(&partial_request(), &opts()).unwrap();
+        assert!(full_file.complete());
+
+        let peak = full_file.classification.stats.peak_memory as u64;
+        let partial_file = (1..20)
+            .find_map(|k| {
+                let o = QueryOptions {
+                    max_memory_bytes: Some(peak * k / 20),
+                    ..opts()
+                };
+                match file.classify(&partial_request(), &o) {
+                    Ok(c)
+                        if !c.classification.complete_for_taken
+                            && !c.classification.incomplete.is_empty() =>
+                    {
+                        Some(c)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("no budget gave a partial file classification");
+        assert!(!partial_file.complete());
+
+        // Excluded axioms also make FileClassification::complete() false.
+        let excl_path = dir.path().join("excluded.ttl");
+        std::fs::write(
+            &excl_path,
+            "@prefix : <http://ex.org/> .
+             @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             :A a owl:Class . :B a owl:Class .
+             :a a :A .
+             :A rdfs:subClassOf :B .\n",
+        )
+        .unwrap();
+        let excl_file = super::file::OntologyFile::read(&excl_path, &req, 1)
+            .unwrap()
+            .expect("turtle file reads directly");
+        let excl_cls = excl_file
+            .classify(&ClassifyRequest::default(), &opts())
+            .unwrap();
+        assert!(!excl_cls.excluded.is_empty());
+        assert!(!excl_cls.complete());
+
+        // Partial dataset classification: check legacy `about` (even when `limit: 1` truncates
+        // top-level `incomplete`) and `projection=frame`.
+        let (ds, part) = (1..20)
+            .find_map(|k| {
+                let ds = dataset(&body);
+                let o = QueryOptions {
+                    max_memory_bytes: Some(peak * k / 20),
+                    ..opts()
+                };
+                match ds.ontology().classify(&req, &partial_request(), &o) {
+                    Ok(c)
+                        if !c.classification.complete_for_taken
+                            && c.classification.incomplete.len() > 1 =>
+                    {
+                        Some((ds, c))
+                    }
+                    _ => None,
+                }
+            })
+            .expect("no budget answered in part with multiple incomplete classes");
+        let open_iri = part
+            .classification
+            .incomplete
+            .last()
+            .unwrap()
+            .as_str()
+            .to_string();
+        let renderer = crate::owl::ofn::Renderer::new(ds.prefixes());
+
+        let legacy_open = wire::classify_body(
+            "ds",
+            &part,
+            &req,
+            &renderer,
+            &wire::ClassifyQuery {
+                about: Some(open_iri.clone()),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy_open["incomplete"].as_array().unwrap().len(), 1);
+        assert_ne!(legacy_open["incomplete"][0], json!(open_iri));
+        assert_eq!(legacy_open["class"]["iri"], json!(open_iri));
+        assert_eq!(legacy_open["class"]["incomplete"], json!(true));
+
+        let frame_open = wire::classify_body(
+            "ds",
+            &part,
+            &req,
+            &renderer,
+            &wire::ClassifyQuery {
+                projection: Some(wire::ClassifyProjection::Frame),
+                about: Some(open_iri.clone()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(frame_open["frame"]["iri"], json!(open_iri));
+        assert_eq!(frame_open["frame"]["incomplete"], json!(true));
+        assert_eq!(frame_open["frame"]["outcome"]["partial"], json!(true));
+        assert_eq!(frame_open["frame"]["outcome"]["complete"], json!(false));
+        assert_eq!(frame_open["frame"]["retention"]["kept"], json!(false));
+        assert!(frame_open["frame"]["retention"]["resultId"].is_null());
+
+        // Complete classification reports `incomplete: false` on both legacy `about` and frame.
+        let full = ds
+            .ontology()
+            .classify(&req, &ClassifyRequest::default(), &opts())
+            .unwrap();
+        let legacy_done = wire::classify_body(
+            "ds",
+            &full,
+            &req,
+            &renderer,
+            &wire::ClassifyQuery {
+                about: Some(open_iri.clone()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy_done["class"]["incomplete"], json!(false));
+
+        let frame_done = wire::classify_body(
+            "ds",
+            &full,
+            &req,
+            &renderer,
+            &wire::ClassifyQuery {
+                projection: Some(wire::ClassifyProjection::Frame),
+                about: Some(open_iri),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(frame_done["frame"]["incomplete"], json!(false));
+        assert_eq!(frame_done["frame"]["outcome"]["partial"], json!(false));
+        assert_eq!(frame_done["frame"]["outcome"]["complete"], json!(true));
     }
 }

@@ -8,3 +8,10 @@ license.workspace = true
 # No workspace dependencies, so the bindings' own workspaces can take this crate by path.
 [dependencies]
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
+
+[features]
+# Compile mimalloc with `-ftls-model=local-dynamic` on Unix instead of `initial-exec`.
+# Dynamically loaded shared libraries (`cdylib` bindings loaded via `dlopen`) enable this so
+# the linker does not set `DF_STATIC_TLS` and force the library's entire `PT_TLS` segment
+# into glibc's bounded static TLS surplus.
+local-dynamic-tls = ["libmimalloc-sys/local_dynamic_tls"]

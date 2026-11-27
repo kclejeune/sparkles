@@ -14,16 +14,13 @@
 //! | +2, +n | message length (u16 LE) and UTF-8 bytes (when flagged) |
 //! | +4 | CRC-32 of the bytes before it |
 //!
-//! An ordinary commit appends its record durably *before* the commit point (the WAL
-//! write, or the `CURRENT` switch of a bulk commit), so a durable commit always has its
-//! annotation. When the sync of an ordinary commit's WAL records fails, the commit may
-//! still come back at the next open, so its record is not taken back. The writer refuses
-//! further commits, and the next open drops the record if the commit did not survive. A
-//! commit of a group (see `store/group.rs`) only queues its record. The leader of its
-//! fence writes the records of the whole prefix at the file's written end, at the same
-//! time as the prefix's WAL records and terms, and acknowledges the commits only after all
-//! three writes are durable. An acknowledged commit therefore has its annotation too, but
-//! a commit that was not acknowledged can reach the disk without it. Its commit record
+//! A bulk commit appends its record durably *before* the `CURRENT` switch, so a durable
+//! bulk commit always has its annotation. Every persistent WAL commit (see
+//! `store/group.rs`, X16 Phase 6) queues its record. The leader of its fence writes the
+//! records of the whole prefix at the file's written end, at the same time as the
+//! prefix's WAL records and terms, and acknowledges the commits only after all three
+//! writes are durable. An acknowledged commit therefore has its annotation too, but a
+//! commit that was not acknowledged can reach the disk without it. Its commit record
 //! carries the `WAL_FLAG_ANNOTATED` bit, and the next open truncates the log from the
 //! first such commit whose record is missing, when no later commit shows it was durable.
 //!
@@ -350,6 +347,23 @@ impl Annotations {
     pub fn take_prealloc(&mut self) -> (u64, u64) {
         let (was, now) = self.tail.as_ref().map_or((0, 0), |t| t.take_prealloc());
         (was + std::mem::take(&mut self.retired), now)
+    }
+
+    /// The annotations file's written end and allocated length.
+    pub(crate) fn file_lengths(&self) -> (u64, u64) {
+        self.tail.as_ref().map_or((0, 0), |tail| {
+            let io = tail.io.lock();
+            (io.end, io.alloc)
+        })
+    }
+
+    /// The header the next annotation will write if it creates the file.
+    pub(crate) fn pending_header(&self) -> u64 {
+        if self.path.is_some() && self.tail.is_none() {
+            HEADER as u64
+        } else {
+            0
+        }
     }
 
     /// Cut the zeros preallocated after the records, before the store closes: a file that

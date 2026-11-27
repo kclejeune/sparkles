@@ -14,6 +14,8 @@ use oxrdf::Term;
 use sparkles::algo::{Aggregate, Control, Graph, Par, RawEdges};
 use sparkles::sparql::{self, QueryOptions};
 use sparkles::store::Snapshot;
+#[cfg(feature = "mcp")]
+use sparkles::store::{BoundReadSource, Store};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -105,17 +107,58 @@ pub fn read_with(
     extra: &Extra<'_>,
     ctl: &Control,
 ) -> Result<Projection, String> {
+    read_with_query(
+        |text| {
+            ctl.check().map_err(|e| e.to_string())?;
+            sparql::query(snap.clone(), text, opts)
+                .and_then(|r| r.rows())
+                .map_err(|e| e.to_string())
+        },
+        settings,
+        extra,
+        ctl,
+    )
+}
+
+/// Read the projection from a bound read source (such as an evidence view) with the
+/// principal's options and `extra`'s graphs, keeping the source's reservation alive.
+#[cfg(feature = "mcp")]
+pub fn read_with_source(
+    source: BoundReadSource,
+    store: &Store,
+    opts: &QueryOptions,
+    settings: &GraphragSettings,
+    extra: &Extra<'_>,
+    ctl: &Control,
+) -> Result<Projection, String> {
+    let mut source_opts = opts.clone();
+    if source_opts.graphs.is_none() {
+        source_opts.graphs = Some(Arc::new(sparkles::access::GraphAccess::all()));
+    }
+    read_with_query(
+        |text| {
+            ctl.check().map_err(|e| e.to_string())?;
+            sparql::query_source(source.clone(), store, text, &source_opts)
+                .and_then(|r| r.rows())
+                .map_err(|e| e.to_string())
+        },
+        settings,
+        extra,
+        ctl,
+    )
+}
+
+fn read_with_query(
+    q: impl Fn(&str) -> Result<sparql::output::OwnedRows, String>,
+    settings: &GraphragSettings,
+    extra: &Extra<'_>,
+    ctl: &Control,
+) -> Result<Projection, String> {
     if settings.projection.weight.is_some() {
         return Err(
             "projection.weight is not supported by this server's community build; remove it".into(),
         );
     }
-    let q = |text: &str| -> Result<sparql::output::OwnedRows, String> {
-        ctl.check().map_err(|e| e.to_string())?;
-        sparql::query(snap.clone(), text, opts)
-            .and_then(|r| r.rows())
-            .map_err(|e| e.to_string())
-    };
     // the graphs the principal sees, limited to the projection's
     let mut graphs: Vec<String> = q("SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }")?
         .into_iter()

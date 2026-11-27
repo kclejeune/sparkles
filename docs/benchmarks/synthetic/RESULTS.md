@@ -372,7 +372,8 @@ these features limit what a cold lookup reads:
   a query reads. `SPARKLES_IO_HINTS=off` disables them.
 * A sparse vocabulary index, `vocab.idx`, holds the first key of every 128th front-coded
   block. It narrows a lookup to one range of offsets and data, and costs 66 KB at 10.5M and
-  8.4 MB of memory at 1.01B quads. `SPARKLES_SPARSE_VOCAB=off` disables its use.
+  8.4 MB of memory at 1.01B quads. The historical ablation disabled it with
+  `SPARKLES_SPARSE_VOCAB=off` on the measured revision.
 * An index join with up to 16,384 keys requests its blocks before it decodes the first, so
   their reads overlap.
 * A filter, sort or aggregate over non-canonical numeric literals reads 8-byte values from
@@ -1015,13 +1016,38 @@ and item 678's pair compared
 The screens against the base ran three rounds and read a geometric mean of 0.980 in
 streaming and 0.970 in automatic execution, with no query 10% slower, and automatic
 `str-pair-colleague` read 0.777. Roadmap item 1088 follows the streaming cost of
-`str-pair-colleague`, whose names rarely repeat, item 1140 the cost of the table's growth
-on `str-pair-names` against the per-worker maps, and item 1089 the 12-thread cost of
-`str-filter-two` and the costs of 0.2% to 2.8% that the screens found in queries the
-floors do not reach, together with item 678's costs
-on `lang-filter`, `str-filter-two` and `distinct-join` of 1.8% to 2.9%. Automatic
-`str-filter-two` spread by 22% to 23% between server processes of one build, which item
-1087 follows.
+`str-pair-colleague`, whose names rarely repeat, and item 1089 follows the 12-thread cost
+of `str-filter-two` and the costs of 0.2% to 2.8% that the screens found in queries the
+floors do not reach, together with item 678's costs on `lang-filter`, `str-filter-two` and
+`distinct-join` of 1.8% to 2.9%. Automatic `str-filter-two` spread by 22% to 23% between
+server processes of one build, which item 1087 follows.
+
+Item 1140 shipped sample-based initial sizing and direct entry migration on growth for
+the shared floor table, leaving the Forge table above as historical evidence for
+`174de1f8..3a8b7adb`. On `atlas` at 1.05M triples in twelve alternating ABBA and BAAB
+rounds of 16 measured requests per query and server process, with four processes per round
+across 12 rounds, `329f82f9` against its own base `a643de75` returned byte-identical
+sorted TSV answers across every cell and control, and `f0240009` only extracted an inline
+stratum-bounds helper and tightened a unit test. Both one-thread A/B cells stayed within
+the 3% spread limit at 1.79% in streaming execution and 1.77% in eager execution, whereas
+the separate six-round, 12-request-per-process `streaming-1t` A/A control failed at 4.55%
+and `eager-1t` A/A passed at 1.45%. Against `a643de75`, `str-pair-names` improved by 3.0%
+in streaming execution at 0.970×, 27.40 against 28.23 ms with a 95% interval of 0.966 to
+0.974 and 0.975× instructions, and by 10.0% in eager execution at 0.900×, 24.95 against
+27.68 ms with a pooled ratio of 0.901×, a 95% interval of 0.896 to 0.903 and 0.918×
+instructions, faster in all twelve rounds in both modes. Eager `str-pair-lt` stayed flat
+at 1.000× and streaming `str-filter-two` crossed 1.0 at 1.002×. That Atlas comparison
+qualifies only `a643de75..329f82f9` on `atlas` and does not establish recovery of the
+separate Forge gap against `174de1f8`. Both 12-thread cells failed the 3% spread
+diagnostic without a repeat run, with A/B spreads of 7.19% in streaming and 40.50% in
+eager execution against 9.37% and 25.30% in their A/A controls, leaving their ratios,
+such as eager `str-pair-names` at 0.954×, as observations from cells that failed the
+diagnostic. Six small one-thread observations whose added time under
+`pooled base median × (order-balanced ratio − 1)` and on paired round medians exceeded
+0.5 µs despite unchanged or lower instruction counts move to item 1089. Eager
+`str-pair-colleague`, at +36.6 µs against its valid A/A control's +22.6 µs with
+overlapping 95% intervals, awaits confirmation, and the
+[X14 Outcome](../../specs/X14-unified-executor/SPEC.md#outcome) lists each line.
 
 ### Forge record at batch 30 against cc94ac7f
 
@@ -1266,7 +1292,7 @@ samples, the answers, the scripts and the screen.
 
 All runs used one Rayon thread with the server on CPU 2, the client on CPU 4 and spinners
 on both, at 1.05M triples. The atlas runs went through `scripts/nsc-bench-remote.sh` on
-atlas, while an unpinned single-threaded job of another lane ran there. The wally builds
+atlas, while an unpinned single-threaded job ran there. The wally builds
 used `scripts/nsc-build.sh`, and the server of cf033f12 is that of bf740bed, the merge of
 item 454, since cf033f12 changed only a Kotlin test.
 
@@ -1330,3 +1356,81 @@ same time. On Namespace, the wally builds of 125edd41 and 6b8f86e6 ran in 4 roun
 timed requests over all 30 queries. The fix ran `expr-bind-group` at 0.852 of 125edd41 and
 the 30 queries at a geometric mean of 0.956. The first pass flagged `not-exists` at 1.119
 and `star-lookup` at 1.232, and the rerun in 8 rounds of 40 read them at 1.010 and 0.985.
+
+### Matrix flags at batches 49 and 50
+
+The forge matrices of b47b582b and 0779d666 ran `order-by-full` and `optional-chain` far
+slower than the matrix of 6dbf2a08 in the 10.5M cell with 12 threads, as the table shows.
+The range from 6dbf2a08 to b47b582b holds item 1136's admission before construction, and
+the range to 0779d666 adds batch 50. The matrix of 0779d666 also flagged eager
+`export-500k` at 1.94 in that cell. The same matrices flagged these queries above 0.3 ms in
+the other cells, as ratios to the 6dbf2a08 matrix.
+
+| query | mode | cell | b47b582b | 0779d666 |
+|---|---|---|--:|--:|
+| `order-by-full` | eager | 10.5M, one thread | 1.145 | 1.260 |
+| `order-by-full` | streaming | 10.5M, one thread | 1.119 | 1.283 |
+| `optional-chain` | streaming | 10.5M, one thread | | 1.129 |
+| `order-by-full` | eager | 1.05M, 12 threads | 1.144 | 1.106 |
+| `order-by-full` | streaming | 1.05M, 12 threads | 1.215 | 1.127 |
+| `export-500k` | eager | 1.05M, 12 threads | | 1.802 |
+| `export-500k` | streaming | 1.05M, 12 threads | | 1.056 |
+| `optional-chain` | streaming | 1.05M, 12 threads | 1.065 | 1.086 |
+| `expr-bind-group` | streaming | 1.05M, 12 threads | 1.073 | |
+| `expr-agg-arg` | streaming | 1.05M, 12 threads | | 1.061 |
+| `expr-order-key` | streaming | 1.05M, 12 threads | | 1.087 |
+| `regex-iri` | eager | 1.05M, 12 threads | 1.082 | 1.067 |
+| `export-500k` | eager | 1.05M, one thread | | 1.081 |
+
+An empty cell is a ratio that the matrix comparison did not flag.
+
+A [same-day run](runs/2026-11-21-matrix-flags-forge-full3/README.md) of the three matrix
+binaries reran the 10.5M cell with 12 threads through the unmodified matrix harness, in six
+invocations in the order 6dbf2a08, b47b582b, 0779d666, 0779d666, b47b582b, 6dbf2a08. Each
+build had four eager and four streaming server epochs of all 31 queries on a shared store,
+and every invocation returned the same answers.
+
+| query | mode | 6dbf2a08 matrix ms | b47b582b matrix ms | 0779d666 matrix ms | same-day 6dbf2a08 ms | same-day b47b582b ms | same-day 0779d666 ms |
+|---|---|--:|--:|--:|--:|--:|--:|
+| `order-by-full` | eager | 124.6 | 181.5 | 195.1 | 108.5 | 103.2 | 103.6 |
+| `order-by-full` | streaming | 114.2 | 197.8 | 209.4 | 107.0 | 106.6 | 106.5 |
+| `optional-chain` | eager | 26.2 | 37.3 | 42.4 | 25.1 | 24.9 | 25.3 |
+| `optional-chain` | streaming | 26.4 | 34.9 | 38.4 | 26.5 | 26.6 | 26.6 |
+| `export-500k` | eager | 2.41 | 2.40 | 4.68 | 2.32 | 2.38 | 2.38 |
+
+In the same-day run the three builds agree on these queries within the spread of their
+epochs. Every build runs below the times of the 6dbf2a08 matrix on four of the five query
+and mode pairs. On streamed `optional-chain` the builds take 26.51 to 26.65 ms, 1.005 to
+1.010 times the 26.38 ms of that matrix. The flags of this cell therefore did not reproduce
+in this run. One run cannot rule out an effect of either range that appears only under the
+conditions of the matrices, and the cause of the flags is not known.
+
+The same-day run held the same locks and used the same data as the matrices, with the disk
+96% to 97% full, and its throttle counters did not change. In the two slow matrices
+`knows-reach` took 1.013 to 1.031 times as long as in the 6dbf2a08 matrix, far less than
+the flagged queries. The other three cells have no same-day run, and roadmap item 1267
+holds their flags. If the next forge matrix still flags these cells against 6dbf2a08, the
+next step is a same-day rerun of the 6dbf2a08 binary's matrix with host sampling and a
+same-day check of the three binaries in the flagged cells.
+
+Paired epoch by epoch with its neighbour in the run order, b47b582b is slower than 6dbf2a08
+in all four paired epochs of a mode on nine query and mode pairs above 0.3 ms, and faster in
+all four on five, so most of these single directions are within what four pairs give by
+chance. `class-predicate-list` and `class-predicates` are slower in both modes, by 2.5% to
+3.4%. The 0779d666 arm reads 1.022 to 1.035 on them, and both matrices read 1.006 to
+1.022, so roadmap item 1255 records them as costs of item 1136. In this run b47b582b takes
+10.53 and 10.90 ms on `class-predicate-list` and 10.41 and 10.81 ms on `class-predicates`,
+eager and streamed, as medians of its four epochs in each mode.
+
+| query | mode | 6dbf2a08 ms | median ratio | lowest ratio |
+|---|---|--:|--:|--:|
+| `class-predicate-list` | eager | 10.08 | 1.034 | 1.018 |
+| `class-predicate-list` | streaming | 10.60 | 1.033 | 1.011 |
+| `class-predicates` | eager | 10.13 | 1.026 | 1.018 |
+| `class-predicates` | streaming | 10.54 | 1.025 | 1.017 |
+
+The other pairs slower in all four epochs are leads that need an interleaved A/B before
+they count as costs. They are eager `not-exists` at 1.032, streamed `expr-bind-group` at
+1.034, eager `expr-agg-arg` at 1.016, and `distinct-join` at 1.015 eager and 1.010 streamed,
+with lowest ratios of 1.001 to 1.016. Streamed `order-by-full` reads 0.996 here. Queries
+under 0.3 ms are not judged from these epochs.

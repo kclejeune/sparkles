@@ -24,7 +24,8 @@ mod relax;
 mod terms;
 
 pub use materialize::{MaterializeOptions, materialize};
-pub use module::bottom_module;
+pub(crate) use module::coverage_refs;
+pub use module::{Coverage, Dropped, bottom_module};
 pub use reason::{
     EquivalentClasses, Generator, NewOntology, ReasonOptions, Tautologies, is_tautology, reason,
 };

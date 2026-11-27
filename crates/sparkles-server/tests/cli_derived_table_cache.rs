@@ -2,55 +2,38 @@
 
 #![cfg(feature = "reasoning")]
 
+mod common;
+
 use serde_json::Value as J;
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
-
 struct Server {
-    child: Child,
+    child: common::ServerProcess,
     base: String,
     client: reqwest::blocking::Client,
     _dir: tempfile::TempDir,
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 impl Server {
     fn start(extra: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let port = (48240..48260)
-            .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-            .expect("a free test port");
-        let child = Command::new(BIN)
-            .args([
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--spill",
-                "off",
-                "--total-query-memory-mb",
-                "64",
-                "--result-cache-mb",
-                "0",
-            ])
-            .arg("--data")
-            .arg(dir.path().join("data"))
-            .args(extra)
-            .env_remove("SPARKLES_AUTH_CONFIG")
-            .env_remove("SPARKLES_BACKUP_CONFIG")
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(dir.path().join("server.log")).unwrap())
-            .spawn()
-            .unwrap();
+        let (child, port) = common::ServerProcess::start(
+            common::serve()
+                .args([
+                    "--spill",
+                    "off",
+                    "--total-query-memory-mb",
+                    "64",
+                    "--result-cache-mb",
+                    "0",
+                ])
+                .arg("--data")
+                .arg(dir.path().join("data"))
+                .args(extra)
+                .env_remove("SPARKLES_AUTH_CONFIG")
+                .env_remove("SPARKLES_BACKUP_CONFIG"),
+            &dir.path().join("server.log"),
+        );
         let mut server = Self {
             child,
             base: format!("http://127.0.0.1:{port}"),

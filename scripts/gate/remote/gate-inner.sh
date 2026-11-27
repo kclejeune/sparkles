@@ -220,7 +220,7 @@ if [ "$part" != conformance ]; then
   # leaves the pass/fail run and runs alone afterwards (mise run test:timing-cohort).
   # A commit whose changed-crates.py predates the variable runs the group as before.
   export SPARKLES_TEST_EXCLUDE_GROUP=host-timing
-  step ci scripts/ci.sh "${force[@]}" --jobs "$jobs" "${ci_args[@]}"
+  step ci env SPARKLES_CI_GATE_RUN="$name" scripts/ci.sh "${force[@]}" --jobs "$jobs" "${ci_args[@]}"
   # New CI revisions retain actual JUnit under their original lease. Copy only that
   # retained evidence here, after ci.sh has returned; never recover it from a target.
   # shellcheck disable=SC2329 # step invokes the function passed as its command.
@@ -232,7 +232,7 @@ if [ "$part" != conformance ]; then
       cp -a target/ci/. "$out/ci-receipts/" || return
     fi
     if [ -f scripts/ci-retain-junit.py ]; then
-      python3 scripts/ci-retain-junit.py verify --directory "$out/ci-receipts/junit"
+      SPARKLES_CI_GATE_RUNS="$G/out" python3 scripts/ci-retain-junit.py verify --directory "$out/ci-receipts/junit"
     else
       echo 'legacy source does not provide JUnit retention' > "$out/ci-receipts/junit-unsupported.txt"
     fi

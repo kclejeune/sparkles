@@ -11,7 +11,75 @@ impl Snapshot {
         preparation: &Preparation,
         each: impl FnMut([Id; 4]) -> std::result::Result<bool, E>,
     ) -> std::result::Result<(), E> {
-        self.scan_prepared_inner::<E, false>(perm, prefix, preparation, each)
+        self.scan_prepared_range_inner::<E, false>(
+            perm,
+            pad(prefix, 0),
+            pad(prefix, u64::MAX),
+            preparation,
+            each,
+        )
+    }
+
+    pub(crate) fn scan_prepared_range<E: From<Error>>(
+        &self,
+        perm: Perm,
+        lo: Key,
+        hi: Key,
+        preparation: &Preparation,
+        each: impl FnMut([Id; 4]) -> std::result::Result<bool, E>,
+    ) -> std::result::Result<(), E> {
+        self.scan_prepared_range_inner::<E, false>(perm, lo, hi, preparation, each)
+    }
+
+    /// Exact number of quads with a key prefix under `preparation`, returning both the
+    /// count and the base-index selection work performed.
+    pub(crate) fn count_prepared_with_work(
+        &self,
+        perm: Perm,
+        prefix: &[u64],
+        preparation: &Preparation,
+    ) -> Result<(u64, crate::index::PreparedCountWork)> {
+        preparation.check()?;
+        let (base, work) = if prefix.is_empty() {
+            (
+                self.perm(perm).rows,
+                crate::index::PreparedCountWork {
+                    count_calls: 1,
+                    ..crate::index::PreparedCountWork::default()
+                },
+            )
+        } else {
+            self.perm(perm).count_between_prepared_with_work(
+                &self.cache,
+                &pad(prefix, 0),
+                &pad(prefix, u64::MAX),
+                preparation,
+            )?
+        };
+        let pi = perm.index();
+        let ins = Delta::count_prefix(&self.delta.ins[pi], prefix);
+        let del = Delta::count_prefix(&self.delta.del[pi], prefix);
+        preparation.check()?;
+        Ok(((base + ins).saturating_sub(del), work))
+    }
+
+    /// Exact point lookup of a quad under `preparation` controls and memory reservation.
+    pub(crate) fn contains_prepared(
+        &self,
+        quad: &[Id; 4],
+        preparation: &Preparation,
+    ) -> Result<bool> {
+        preparation.check()?;
+        let k = Perm::Spo.to_key(quad);
+        let pi = Perm::Spo.index();
+        if self.delta.ins[pi].contains(&k) {
+            return Ok(true);
+        }
+        if self.delta.del[pi].contains(&k) {
+            return Ok(false);
+        }
+        self.perm(Perm::Spo)
+            .contains_prepared(&self.cache, &k, preparation)
     }
 
     /// Check one physical graph without scanning past its first surviving quad.
@@ -31,22 +99,30 @@ impl Snapshot {
         preparation: &Preparation,
         mut each: impl FnMut(Id) -> Result<()>,
     ) -> Result<()> {
-        self.scan_prepared_inner::<Error, true>(Perm::Gspo, &[], preparation, |quad| {
-            each(quad[crate::index::G])?;
-            Ok(true)
-        })
+        self.scan_prepared_range_inner::<Error, true>(
+            Perm::Gspo,
+            pad(&[], 0),
+            pad(&[], u64::MAX),
+            preparation,
+            |quad| {
+                each(quad[crate::index::G])?;
+                Ok(true)
+            },
+        )
     }
 
-    fn scan_prepared_inner<'a, E: From<Error>, const DISTINCT_FIRST: bool>(
+    fn scan_prepared_range_inner<'a, E: From<Error>, const DISTINCT_FIRST: bool>(
         &'a self,
         perm: Perm,
-        prefix: &[u64],
+        lo: Key,
+        hi: Key,
         preparation: &Preparation,
         mut each: impl FnMut([Id; 4]) -> std::result::Result<bool, E>,
     ) -> std::result::Result<(), E> {
         preparation.check()?;
-        let lo = pad(prefix, 0);
-        let hi = pad(prefix, u64::MAX);
+        if lo > hi {
+            return Ok(());
+        }
         let pi = perm.index();
         let (inserts, deletes) = (&self.delta.ins[pi], &self.delta.del[pi]);
         let mut inserted = Delta::key_range(inserts, lo, hi).peekable();

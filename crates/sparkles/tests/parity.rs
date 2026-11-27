@@ -447,6 +447,24 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("detachEvidenceGraph", "evidence.detach", |ds| {
             let _ = sparkles::evidence::detach(ds, &any::<String>());
         }),
+        op!("reauthenticateEvidence", "evidence.reauthenticate", |ds| {
+            let _ = sparkles::evidence::reauthenticate(ds, ds, &any(), &any(), &any());
+        }),
+        op!(
+            "reconcileEvidenceProjection",
+            "evidence.reconcile_projection",
+            |ds| {
+                let _ = sparkles::evidence::reconcile_projection(
+                    ds,
+                    ds,
+                    "",
+                    None,
+                    &any(),
+                    None,
+                    &any(),
+                );
+            }
+        ),
         op!("listEvidenceHolds", "evidence.holds", |ds| {
             let _ = sparkles::evidence::holds(ds);
         }),
@@ -520,6 +538,14 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("resolveIdentities", "evidence.resolve_entities", |ds| {
             let _ = sparkles::evidence::resolve_entities(ds, ds, "", &[], None, &any());
         }),
+        op!(
+            "rebuildIdentityMap",
+            "evidence.rebuild_resolution_map",
+            |ds| {
+                let _ =
+                    sparkles::evidence::rebuild_resolution_map(ds, ds, "", None, &any(), &any());
+            }
+        ),
         op!("listEvidenceDependents", "evidence.find_dependents", |ds| {
             let _ = sparkles::evidence::find_dependents(ds, ds, &[], false, None, &any());
         }),
@@ -642,6 +668,42 @@ fn entries() -> Vec<(&'static str, Entry)> {
                 &any(),
             );
         }),
+        op_if!(
+            "ontology",
+            "previewOntologyPatterns",
+            "ontology.patterns.preview",
+            |ds| {
+                if let Ok(o) = ds.ontology().open(&any(), &any()) {
+                    let v = sparkles::owl::manchester::Vocabulary::of_ontology(
+                        &o.ontology,
+                        std::collections::BTreeMap::<String, String>::new(),
+                    );
+                    let _ = sparkles::owl::patterns::evaluate("", any(), &any(), &v, &any());
+                }
+            }
+        ),
+        op_if!(
+            "ontology",
+            "applyOntologyPatterns",
+            "ontology.patterns.apply",
+            |ds| {
+                let _ = ds.ontology().edit_from_head(
+                    &any(),
+                    None,
+                    None,
+                    &any(),
+                    |_, _| {},
+                    |o| {
+                        let v = sparkles::owl::manchester::Vocabulary::of_ontology(
+                            &o.ontology,
+                            std::collections::BTreeMap::<String, String>::new(),
+                        );
+                        let _ = sparkles::owl::patterns::evaluate("", any(), &any(), &v, &any());
+                        Ok::<_, ()>((any(), ()))
+                    },
+                );
+            }
+        ),
         // the import map (item 624) is a file of the server beside the dataset, like the
         // ingest and memory settings, and a fetch goes through the server's outbound
         // policy; a library caller passes the map's targets in `OntologyRequest`
@@ -1159,7 +1221,15 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("getResourceLicense", Process),
         server_only!("getResourceNotice", Process),
         server_only!("getVocabularyHeader", Process),
+        server_only!("getVocabularyRecipes", Process),
         server_only!("installVocabularyPrefixes", Process),
+        // C32: linked-data publishing serves HTTP content negotiation, 303 redirects and
+        // HTML/RDF documents over the server's resource catalog
+        server_only!("resolveLinkedData", Process),
+        server_only!("getLinkedDataDocument", Process),
+        server_only!("resolveHostedNamespace", Process),
+        server_only!("resolveHostedNamespaceSlash", Process),
+        server_only!("resolveHostedTerm", Process),
         server_only!("listAsks", Process),
         server_only!("deleteAsks", Process),
         server_only!("askFeedback", Process),
@@ -1255,6 +1325,7 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.clone_to_memory_with",
     "dataset.branch",
     "dataset.run_mapping",
+    "evidence.claim_states",
     "history.wait_for_commit",
     "history.prune",
     "history.tick",
@@ -1291,6 +1362,7 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.run_mapping("", None, &any(), &any(), None);
     ds.clone_to_with("clone", &Default::default(), &Default::default());
     ds.clone_to_memory_with("clone", &Default::default(), &Default::default());
+    let _ = sparkles::evidence::binding::claim_states(ds, None, None, "", &[], &any());
     ds.algorithms().query_text(&any(), false);
     ds.algorithms().stats(&any(), &Default::default());
     ds.algorithms().run_write(

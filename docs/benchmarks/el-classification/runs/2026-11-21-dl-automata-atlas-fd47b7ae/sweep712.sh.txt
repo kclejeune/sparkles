@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# sweep712.sh [DIR [OUT]]: every ORE 2015 DL file of DIR (default the development set) on one thread with SPARKLES_DL_AUTOMATA 0 and 2,
+# one process per side, recording tier, dlWork, dlStored, conclusions and the taxonomy hash.
+set -u
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/lanes/dl-automata-712
+D=${1:-/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/archived-worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev}
+H=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/lanes/outside-census/HELD-OUT-DO-NOT-RUN.txt
+O=$L/evidence/${2:-sweep712}; mkdir -p $O; : > $O/log.txt
+for f in $D/*.owl; do
+  n=$(basename $f)
+  if grep -qxF "$n" $H; then echo "$n SEALED-SKIP" >> $O/log.txt; continue; fi
+  n=${n%.owl}
+  for lv in 0 2; do
+    SPARKLES_DL_AUTOMATA=$lv systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=0 -p OOMPolicy=continue \
+      timeout 600 $L/evidence/el_classify-tip --threads 1 --taxonomy $O/$n.l$lv.tax $f > $O/$n.l$lv.json 2> $O/$n.l$lv.err
+    st=$?
+    sha=$(LC_ALL=C sort $O/$n.l$lv.tax 2>/dev/null | sha256sum | cut -c1-16)
+    rm -f $O/$n.l$lv.tax
+    echo "$n l$lv $st $sha $(grep '^{' $O/$n.l$lv.json | jq -c '[.tier,.dlWork,.dlStored,.conclusions,.dlAttemptOver,.classifyMs[0]]')" >> $O/log.txt
+  done
+done
+echo SWEEP-DONE >> $O/log.txt

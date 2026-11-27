@@ -73,9 +73,73 @@ thread_local! {
 
 /// The largest allocation `f` makes on this thread.
 pub(crate) fn record_largest(f: impl FnOnce()) -> usize {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LARGEST.with(|cell| cell.set((false, 0)));
+        }
+    }
+    let _reset = Reset;
     LARGEST.with(|cell| cell.set((true, 0)));
     f();
-    LARGEST.with(|cell| cell.replace((false, 0)).1)
+    LARGEST.with(|cell| cell.get().1)
+}
+
+thread_local! {
+    // Whether this thread records net live bytes, current net live bytes, and peak live bytes.
+    static PEAK_LIVE: Cell<(bool, isize, usize)> = const { Cell::new((false, 0, 0)) };
+}
+
+/// The peak net live heap bytes allocated on this thread while `f` runs.
+pub(crate) fn record_peak_live(f: impl FnOnce()) -> usize {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PEAK_LIVE.with(|cell| cell.set((false, 0, 0)));
+        }
+    }
+    let _reset = Reset;
+    PEAK_LIVE.with(|cell| cell.set((true, 0, 0)));
+    f();
+    PEAK_LIVE.with(|cell| cell.get().2)
+}
+
+/// Heap allocation statistics observed on one test thread.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AllocStats {
+    pub(crate) total_alloc: usize,
+    pub(crate) peak_live: usize,
+}
+
+thread_local! {
+    // (active, net_live, peak_live, total_alloc)
+    static STATS: Cell<(bool, isize, usize, usize)> = const { Cell::new((false, 0, 0, 0)) };
+}
+
+/// Observe heap allocations made on this thread while `f` runs: total bytes requested
+/// across `alloc`/`realloc` and peak net live bytes (including worst-case realloc
+/// overlap before the previous allocation is freed).
+pub(crate) fn record_alloc_stats<R>(f: impl FnOnce() -> R) -> (R, AllocStats) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STATS.with(|cell| cell.set((false, 0, 0, 0)));
+        }
+    }
+    let _reset = Reset;
+    STATS.with(|cell| {
+        assert!(!cell.get().0, "nested record_alloc_stats on one thread");
+        cell.set((true, 0, 0, 0));
+    });
+    let out = f();
+    let (_, _, peak_live, total_alloc) = STATS.with(Cell::get);
+    (
+        out,
+        AllocStats {
+            total_alloc,
+            peak_live,
+        },
+    )
 }
 
 thread_local! {
@@ -330,6 +394,23 @@ pub(crate) fn record_unadmitted_events(
     preparation: &Preparation,
     f: impl FnOnce(),
 ) -> ([Maximum; STAGES], usize) {
+    record_growth(preparation.test_used_counter(), f)
+}
+
+/// The peak co-resident bytes allocated by `f` on this thread.
+pub(crate) fn record_peak(f: impl FnOnce()) -> u64 {
+    let counter = std::sync::atomic::AtomicU64::new(0);
+    let (max, _) = record_growth(&counter, || {
+        let _stage = Stage::enter(0);
+        f();
+    });
+    max[0].excess as u64
+}
+
+fn record_growth(
+    counter: &std::sync::atomic::AtomicU64,
+    f: impl FnOnce(),
+) -> ([Maximum; STAGES], usize) {
     let layout = std::alloc::Layout::new::<Observation>();
     struct Reset(*mut Observation, std::alloc::Layout);
     impl Drop for Reset {
@@ -349,7 +430,7 @@ pub(crate) fn record_unadmitted_events(
     assert!(!observation.is_null());
     let reset = Reset(observation, layout);
     // SAFETY: valid and not yet shared.
-    unsafe { (*observation).counter = preparation.test_used_counter() as *const _ as usize };
+    unsafe { (*observation).counter = counter as *const _ as usize };
     OBSERVATION.with(|cell| cell.set(observation));
     f();
     let (max, peak, failed, depth) = with(|o| (o.max, o.peak, o.failed, o.depth)).unwrap();
@@ -669,12 +750,41 @@ struct AllocationObserver;
 // returned pointers. A selected test-thread watch retains its actual Preparation until
 // cleared. The hooks read atomics and update Copy TLS and the observation, which lives
 // in System memory: no allocation, callback, borrow, panic or reentry.
+fn observe_largest(size: usize) {
+    let _ = LARGEST.try_with(|cell| {
+        let (on, largest) = cell.get();
+        if on {
+            cell.set((on, largest.max(size)));
+        }
+    });
+}
+
 unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let _ = LARGEST.try_with(|cell| {
-            let (on, largest) = cell.get();
+        observe_largest(layout.size());
+        let _ = PEAK_LIVE.try_with(|cell| {
+            let (on, live, peak) = cell.get();
             if on {
-                cell.set((on, largest.max(layout.size())));
+                let next = live + layout.size() as isize;
+                let peak = if next > 0 {
+                    peak.max(next as usize)
+                } else {
+                    peak
+                };
+                cell.set((on, next, peak));
+            }
+        });
+        let _ = STATS.try_with(|cell| {
+            let (on, live, peak, total) = cell.get();
+            if on {
+                let s = layout.size();
+                let next_live = live + s as isize;
+                let next_peak = if next_live > 0 {
+                    peak.max(next_live as usize)
+                } else {
+                    peak
+                };
+                cell.set((on, next_live, next_peak, total + s));
             }
         });
         admitted(layout.size());
@@ -683,6 +793,18 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
         pointer
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        let _ = PEAK_LIVE.try_with(|cell| {
+            let (on, live, peak) = cell.get();
+            if on {
+                cell.set((on, live - layout.size() as isize, peak));
+            }
+        });
+        let _ = STATS.try_with(|cell| {
+            let (on, live, peak, total) = cell.get();
+            if on {
+                cell.set((on, live - layout.size() as isize, peak, total));
+            }
+        });
         let _ = DEALLOCATION.try_with(|watch| {
             let (watched, counter, _, count) = watch.get();
             if watched != 0 && watched == pointer as usize {
@@ -695,8 +817,40 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
         unsafe { std::alloc::System.dealloc(pointer, layout) };
     }
     unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        let _ = LARGEST.try_with(|cell| {
+            let (on, largest) = cell.get();
+            if on {
+                cell.set((on, largest.max(size)));
+            }
+        });
+        let _ = PEAK_LIVE.try_with(|cell| {
+            let (on, live, peak) = cell.get();
+            if on {
+                let next = live + size as isize - layout.size() as isize;
+                let peak = if next > 0 {
+                    peak.max(next as usize)
+                } else {
+                    peak
+                };
+                cell.set((on, next, peak));
+            }
+        });
+        let _ = STATS.try_with(|cell| {
+            let (on, live, peak, total) = cell.get();
+            if on {
+                let transient = live + size as isize;
+                let next_peak = if transient > 0 {
+                    peak.max(transient as usize)
+                } else {
+                    peak
+                };
+                let next_live = live + size as isize - layout.size() as isize;
+                cell.set((on, next_live, next_peak, total + size));
+            }
+        });
         // Watched staging byte vectors are complete and never grow after arm. A
         // reallocation to the selected size acquires storage of that size.
+        observe_largest(size);
         admitted(size);
         let new = unsafe { std::alloc::System.realloc(pointer, layout, size) };
         reallocated(pointer, new, size);

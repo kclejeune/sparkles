@@ -75,8 +75,8 @@ impl Engine<'_> {
     }
 
     /// The id of the result `id` of query `call` ([`Engine::fresh_result_term`]).
-    fn result_id(&self, ctx: &sparkles_core::sparql::Ctx, id: Id, call: u64) -> Option<Id> {
-        Self::fresh_result_term(ctx, id, &format!("q{call}")).map(|t| self.lit_id(&t))
+    fn result_id(&self, ctx: &sparkles_core::sparql::Ctx, id: Id, call: u64) -> Result<Option<Id>> {
+        Ok(Self::fresh_result_term(ctx, id, &format!("q{call}"))?.map(|t| self.lit_id(&t)))
     }
 
     fn is_true(&self, id: Id) -> bool {
@@ -509,7 +509,7 @@ impl Engine<'_> {
                     let (table, ctx) = self.run_query(query, &binds)?;
                     if !table.is_empty()
                         && table.width() > 0
-                        && let Some(id) = self.result_id(&ctx, table.get(0, 0), self.next_call())
+                        && let Some(id) = self.result_id(&ctx, table.get(0, 0), self.next_call())?
                     {
                         out.push(id);
                     }
@@ -549,7 +549,7 @@ impl Engine<'_> {
         }
         let call = self.next_call();
         for row in 0..table.len() {
-            if let Some(id) = self.result_id(ctx, table.get(row, 0), call) {
+            if let Some(id) = self.result_id(ctx, table.get(row, 0), call)? {
                 out.push(id);
             }
         }

@@ -672,7 +672,7 @@ impl CatchUp {
             .ok_or_else(|| Error::Corrupt(format!("compaction: dangling id {id:?}")))?;
         let n = match self.gen_.vocab.find(&key) {
             Ok(i) => Id::vocab(i),
-            Err(_) => Id::delta(self.gen_.dvocab.insert(&key)?),
+            Err(_) => self.gen_.intern_delta_key(&key)?,
         };
         self.ids.insert(id.0, n);
         Ok(n)
@@ -714,7 +714,7 @@ impl CatchUp {
                     .gen_
                     .perm(Perm::Spo)
                     .contains(&self.cache, &Perm::Spo.to_key(&n))?;
-                apply(&mut self.delta, &n, *op == WAL_INSERT, in_base);
+                apply(&self.gen_, &mut self.delta, &n, *op == WAL_INSERT, in_base);
                 translated.push((*op, n));
             }
             // WAL_FLAG_ANNOTATED is not carried: the commits copied here were durable,
@@ -1358,7 +1358,9 @@ impl Store {
         if cancelled() {
             return Err(Error::Cancelled);
         }
-        cu.sync(&mut w.vocab_sync)?;
+        if let Some(g) = &self.group {
+            cu.sync(&mut g.vocab.lock())?;
+        }
         w.next_bnode = w.next_bnode.max(cu.next_bnode);
         let new_no = commit::generation_number(&name);
         if let Some(root) = &self.root {
@@ -1401,7 +1403,13 @@ impl Store {
                 &mut w,
                 &gen_,
                 NextLog {
-                    wal: cu.wal.take().expect("a persistent store has a log"),
+                    wal: Arc::new(
+                        cu.wal
+                            .take()
+                            .expect("a persistent store has a log")
+                            .into_inner()
+                            .map_err(|e| e.into_error())?,
+                    ),
                     tail: wal::Tail::new(cu.wal_len, cu.wal_len),
                     len: cu.wal_len,
                     index,
@@ -1751,7 +1759,7 @@ fn relink_id(generation: &Generation, key: &[u8]) -> Result<Id> {
     if let Ok(id) = generation.vocab.find(key) {
         return Ok(Id::vocab(id));
     }
-    Ok(Id::delta(generation.dvocab.insert(key)?))
+    generation.intern_delta_key(key)
 }
 
 /// Read a dataset's `compaction.json` (`None` without one).

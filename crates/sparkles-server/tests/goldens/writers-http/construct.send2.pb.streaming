@@ -1,0 +1,16 @@
+200 application/rdf+protobuf
+QO
+
+
+	urn:ex:s1
+
+
+urn:ex:p0.
+42(http://www.w3.org/2001/XMLSchema#integer'%
+
+
+	urn:ex:s1
+
+
+urn:ex:p
+b0

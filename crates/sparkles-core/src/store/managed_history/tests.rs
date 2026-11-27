@@ -56,7 +56,7 @@ fn empty_generation_has_an_independent_encoding_and_digest() {
         first.identity.generation.to_string(),
         "sha256:c4fd704beda2e1ace90201cdf6f2dde7f3a251e8239a636e850c4a22c20f5e51"
     );
-    let decoded: Owned<Generation> = decode(golden, &preparation).unwrap();
+    let decoded = Generation::decode(golden, &preparation).unwrap();
     decoded.value.validate(&preparation).unwrap();
     assert_eq!(decoded.value, first.document.value);
 }
@@ -68,6 +68,23 @@ fn complete_settings_and_every_protection_are_retained() {
         enabled: true,
         source_records: vec!["urn:source".into()],
         proposals: vec!["urn:proposal".into()],
+        decisions: vec!["urn:decisions".into()],
+        supports: vec!["urn:supports".into()],
+        projections: vec!["urn:output".into()],
+        policies: [(
+            "main".into(),
+            crate::evidence::Policy {
+                version: 1,
+                admitted_kinds: vec![crate::evidence::ClaimKind::Reported],
+                required_scope: Vec::new(),
+                conflicts: crate::evidence::ConflictMode::Refuse,
+                boundary: vec!["urn:proposal".into(), "urn:source".into()],
+                decisions: "urn:decisions".into(),
+                supports: "urn:supports".into(),
+                output: "urn:output".into(),
+            },
+        )]
+        .into(),
         ..Default::default()
     };
     let canonical = settings.canonical(preparation.control()).unwrap();
@@ -77,6 +94,7 @@ fn complete_settings_and_every_protection_are_retained() {
             .protections
             .insert(graph.clone(), Uuid::from_u128(index as u128 + 11));
     }
+    entry.projection_only.insert("urn:output".into());
     let installed = Installed::new(
         ManagedGraphs {
             revision: 7,
@@ -94,7 +112,12 @@ fn complete_settings_and_every_protection_are_retained() {
         &preparation,
     )
     .unwrap();
-    let decoded: Owned<Generation> = decode(&prepared.bytes.value, &preparation).unwrap();
+    assert_eq!(prepared.document.value.format, 2);
+    let wrong_version = std::str::from_utf8(&prepared.bytes.value)
+        .unwrap()
+        .replacen("\"format\":2", "\"format\":1", 1);
+    assert!(Generation::decode(wrong_version.as_bytes(), &preparation).is_err());
+    let decoded = Generation::decode(&prepared.bytes.value, &preparation).unwrap();
     decoded.value.validate(&preparation).unwrap();
     assert!(decoded.value.matches_installed(&installed));
     assert_eq!(decoded.value.evidence_state, EvidenceState::Enabled);
@@ -112,18 +135,19 @@ fn duplicate_unknown_or_noncanonical_documents_never_become_history() {
     for input in [
         original.replacen("\"format\":1", "\"format\":1,\"format\":1", 1),
         original.replacen("\"owners\":{}", "\"owners\":{},\"surprise\":1", 1),
+        original.replacen("\"format\":1", "\"format\":2", 1),
         original.replacen("\"ordinal\":1", "\"ordinal\":true", 1),
         original.replacen("\"format\":1", "\"format\":true", 1),
         format!(" {original}"),
     ] {
         assert!(
-            decode::<Generation>(input.as_bytes(), &preparation).is_err(),
+            Generation::decode(input.as_bytes(), &preparation).is_err(),
             "{input}"
         );
     }
-    let future = br#"{"format":2,"futurePayload":[false]}"#;
+    let future = br#"{"format":3,"futurePayload":[false]}"#;
     assert!(matches!(
-        decode::<Generation>(future, &preparation),
+        Generation::decode(future, &preparation),
         Err(Error::Unsupported(_))
     ));
 }
@@ -142,14 +166,14 @@ fn bounds_and_cancellation_are_checked_before_copy_or_decode() {
         )
         .is_err()
     );
-    assert!(decode::<Generation>(br#"{"format":1}"#, &preparation).is_err());
+    assert!(Generation::decode(br#"{"format":1}"#, &preparation).is_err());
     let control = Control::none();
     let cancel = control.cancel.clone();
     let preparation = Preparation::new(control, 1 << 20).unwrap();
     cancel.cancel();
     assert!(matches!(encode(&1, &preparation), Err(Error::Cancelled)));
     assert!(matches!(
-        decode::<Generation>(br#"{"format":1}"#, &preparation),
+        Generation::decode(br#"{"format":1}"#, &preparation),
         Err(Error::Cancelled)
     ));
 }
@@ -297,6 +321,11 @@ fn activation_is_recorded_by_the_reader_or_the_history_directory() {
     assert!(!activation_recorded(root).unwrap());
     check_activated_registry(root, None).unwrap();
     std::fs::remove_file(root.join(crate::jobs::FILE)).unwrap();
+    assert!(!activation_recorded(root).unwrap());
+    check_activated_registry(root, None).unwrap();
+    // reader 10 belongs to control-only staged prefix recovery v2, which also does not
+    // require configuration history to be activated
+    dataset(crate::store::STAGED_PREFIXES_V2_READER);
     assert!(!activation_recorded(root).unwrap());
     check_activated_registry(root, None).unwrap();
     // the history directory alone records activation too

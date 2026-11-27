@@ -85,6 +85,9 @@ fn read(
         caller,
         deadline: None,
         aggregate_errors: None,
+        memory_parent: None,
+        memory_pool: None,
+        max_memory_bytes: None,
     })?;
     Ok(rows_of(&r.rows))
 }
@@ -1012,6 +1015,39 @@ fn service_view_read_reads_rows() {
     assert!(sparql::query(s.snapshot(), &bad, &o).is_err());
 }
 
+/// `SERVICE view:read` returns an ordered window's rows in the window's order, and two
+/// rows with the same projected terms stay two rows at their own places.
+#[test]
+fn service_view_read_keeps_a_window_in_order() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { :p1 :name \"x\" ; :age 40 . :p2 :name \"y\" ; :age 30 . \
+         :p3 :name \"x\" ; :age 20 . :p4 :name \"z\" ; :age 10 }",
+    );
+    let rt = runtime(&s, None);
+    let def = "SELECT ?name WHERE { ?p :name ?name ; :age ?age } ORDER BY DESC(?age) LIMIT 3";
+    rt.put(&s, "oldest", ViewDef::table(q(def))).unwrap();
+    rt.round(&s);
+    let text = q("PREFIX view: <urn:x-sparkles:view#> SELECT ?name WHERE { \
+                  SERVICE view:read { [] view:name \"oldest\" ; view:bind ?name } }");
+    let o = QueryOptions {
+        views: Some(rt.clone()),
+        ..Default::default()
+    };
+    let read = |s: &Store| -> Vec<String> {
+        let r = sparql::query(s.snapshot(), &text, &o).unwrap();
+        r.test_application_rows()
+            .iter()
+            .map(|r| show(&r[0]))
+            .collect()
+    };
+    assert_eq!(read(&s), ["x", "y", "x"]);
+    upd(&s, "INSERT DATA { :p5 :name \"w\" ; :age 35 }");
+    rt.round(&s);
+    assert_eq!(read(&s), ["x", "w", "y"]);
+}
+
 struct Fixed(Vec<String>);
 
 impl crate::access::GuardDecision for Fixed {
@@ -1122,6 +1158,9 @@ fn a_view_reads_at_the_query_commit() {
             caller: None,
             deadline: None,
             aggregate_errors: None,
+            memory_parent: None,
+            memory_pool: None,
+            max_memory_bytes: None,
         })
         .map(|r| (r.commit, rows_of(&r.rows)))
     };
@@ -1151,6 +1190,9 @@ fn a_view_reads_at_the_query_commit() {
         caller: None,
         deadline: None,
         aggregate_errors: None,
+        memory_parent: None,
+        memory_pool: None,
+        max_memory_bytes: None,
     }) else {
         panic!("a read past the history without the snapshot");
     };
@@ -1518,6 +1560,9 @@ fn a_read_back_after_a_switch_uses_the_new_mode() {
             caller: None,
             deadline: None,
             aggregate_errors: None,
+            memory_parent: None,
+            memory_pool: None,
+            max_memory_bytes: None,
         })
         .unwrap();
     assert_eq!(rows_of(&r.rows), ["a", "b"]);
@@ -1685,6 +1730,9 @@ fn a_view_read_back_keeps_its_default_graph() {
             caller: None,
             deadline: None,
             aggregate_errors: None,
+            memory_parent: None,
+            memory_pool: None,
+            max_memory_bytes: None,
         })
         .map(|r| rows_of(&r.rows));
     assert_eq!(r.ok(), Some(vec!["a".to_string()]));
@@ -2135,4 +2183,611 @@ fn views_recover_from_crashes() {
     ] {
         crash_and_recover(TEST, name);
     }
+}
+
+/// Item 419: a live query with ORDER BY and LIMIT streams its rows with positions, a
+/// client that applies them keeps the window in order, its diffs do not merge, and a
+/// resume starts with a reset.
+#[test]
+fn an_ordered_live_query_streams_positions() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let rt = runtime(&s, None);
+    let query = "SELECT ?p ?a WHERE { ?p :age ?a } ORDER BY DESC(?a) LIMIT 2";
+    let live = rt
+        .live(&s, &q(query), None, &LiveOptions::default())
+        .unwrap();
+    let one = |r: &super::live::LiveRow| r.terms.iter().map(show).collect::<Vec<_>>().join(" ");
+    let mut client: Vec<String> = Vec::new();
+    let apply = |client: &mut Vec<String>, e: &LiveEvent| match e {
+        LiveEvent::Snapshot { rows, .. } => {
+            *client = rows.iter().map(one).collect();
+            let at: Vec<Option<u64>> = rows.iter().map(|r| r.position).collect();
+            assert_eq!(at, (0..rows.len() as u64).map(Some).collect::<Vec<_>>());
+        }
+        LiveEvent::Diff { removed, added, .. } => {
+            let mut gone: Vec<u64> = removed
+                .iter()
+                .map(|r| r.position.expect("a position"))
+                .collect();
+            gone.sort_unstable_by(|a, b| b.cmp(a));
+            for p in gone {
+                client.remove(p as usize);
+            }
+            let mut came: Vec<(u64, String)> = added
+                .iter()
+                .map(|r| (r.position.expect("a position"), one(r)))
+                .collect();
+            came.sort();
+            for (p, r) in came {
+                client.insert(p as usize, r);
+            }
+        }
+        other => panic!("{other:?}"),
+    };
+    let first = live.try_next().unwrap();
+    apply(&mut client, &first);
+    assert_eq!(client, ["c 50", "b 40"]);
+    upd(&s, "INSERT DATA { :d :age 45 }");
+    rt.round(&s);
+    let e = live.try_next().expect("a row entered");
+    assert!(e.merge(&e).is_none(), "positioned diffs do not merge");
+    apply(&mut client, &e);
+    assert_eq!(client, ["c 50", "d 45"]);
+    // a row that moves inside the window and keeps its terms
+    upd(
+        &s,
+        "DELETE DATA { :d :age 45 } ; INSERT DATA { :d :age 55 }",
+    );
+    rt.round(&s);
+    apply(&mut client, &live.try_next().expect("a row moved"));
+    assert_eq!(client, ["d 55", "c 50"]);
+    upd(&s, "DELETE DATA { :c :age 50 }");
+    rt.round(&s);
+    apply(&mut client, &live.try_next().expect("a row left"));
+    assert_eq!(client, ["d 55", "b 40"]);
+    // a commit after the window sends nothing
+    upd(&s, "INSERT DATA { :e :age 1 }");
+    rt.round(&s);
+    assert!(live.try_next().is_none());
+    // a resume at the circuit's commit starts with a reset as well, since a circuit
+    // built again may order ties otherwise
+    let at = rt
+        .live(
+            &s,
+            &q(query),
+            None,
+            &LiveOptions {
+                after: Some(s.snapshot().commit),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        at.try_next(),
+        Some(LiveEvent::Snapshot { reset: true, .. })
+    ));
+    let before = s.snapshot().commit;
+    upd(&s, "INSERT DATA { :f :age 60 }");
+    rt.round(&s);
+    let resumed = rt
+        .live(
+            &s,
+            &q(query),
+            None,
+            &LiveOptions {
+                after: Some(before),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    match resumed.try_next().unwrap() {
+        LiveEvent::Snapshot { reset, rows, .. } => {
+            assert!(reset);
+            assert_eq!(rows.iter().map(one).collect::<Vec<_>>(), ["f 60", "d 55"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The events a live query holds now.
+fn drain(l: &super::live::LiveQuery) -> Vec<LiveEvent> {
+    std::iter::from_fn(|| l.try_next()).collect()
+}
+
+/// A live query whose ordered window fails a pass publishes nothing of that pass: the
+/// subscriber receives only the error, and a new evaluation gives the query's rows.
+fn a_failed_window_pass_publishes_nothing(
+    setup: &str,
+    change: &str,
+    budget: Option<u64>,
+    arm: impl FnOnce(),
+    code: &str,
+) {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, setup);
+    let rt = runtime(&s, None);
+    let query = "SELECT ?s ?v WHERE { ?s :v ?v } ORDER BY ?v LIMIT 2";
+    let l = rt
+        .live(
+            &s,
+            &q(query),
+            None,
+            &LiveOptions {
+                max_memory_bytes: budget,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let first = l.try_next().expect("the first rows");
+    let (_, rows) = live_rows(&first);
+    assert_eq!(rows.len(), 2);
+    upd(&s, change);
+    struct ClearHooks;
+    impl Drop for ClearHooks {
+        fn drop(&mut self) {
+            super::runtime::PASS_CANCEL.with(|c| *c.borrow_mut() = None);
+            super::ops::window::CANCEL_PLACING.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    let clear = ClearHooks;
+    arm();
+    rt.round(&s);
+    drop(clear);
+    let events = drain(&l);
+    assert!(
+        matches!(&events[..], [LiveEvent::Error { code: c, .. }] if c == code),
+        "{events:?}"
+    );
+    let again = rt
+        .live(&s, &q(query), None, &LiveOptions::default())
+        .unwrap();
+    let e = again.try_next().expect("the rows again");
+    assert_eq!(e.commit(), Some(s.snapshot().commit));
+    let mut want = oracle(&s, query, None);
+    let mut got = live_rows(&e).1;
+    want.sort();
+    got.sort();
+    assert_eq!(got, want);
+}
+
+/// A commit whose changes' keys pass a live window's budget ends the query with
+/// `over-budget`, although the window that would follow fits it.
+#[test]
+fn a_window_over_budget_publishes_nothing() {
+    let setup = format!(
+        "INSERT DATA {{ {} }}",
+        (0..10)
+            .map(|i| format!(":s{i} :v {i}"))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    let change = format!(
+        "INSERT DATA {{ {} }}",
+        (0..3000)
+            .map(|i| format!(":n{i} :v {}", -1 - i))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    a_failed_window_pass_publishes_nothing(&setup, &change, Some(64 << 10), || {}, "over-budget");
+}
+
+/// A pass cancelled while a live window refills its reserve ends the query with
+/// `pass-timeout`, though too few rows follow for a periodic check.
+#[test]
+fn a_window_cancelled_while_refilling_publishes_nothing() {
+    let setup = format!(
+        "INSERT DATA {{ {} }}",
+        (0..200)
+            .map(|i| format!(":s{i} :v {i}"))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    // the first 101 rows leave, so the reserve of 100 runs out and the window refills
+    let change = format!(
+        "DELETE DATA {{ {} }}",
+        (0..101)
+            .map(|i| format!(":s{i} :v {i}"))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    let arm = || {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        super::runtime::PASS_CANCEL.with(|c| *c.borrow_mut() = Some(flag.clone()));
+        super::ops::window::CANCEL_PLACING.with(|c| *c.borrow_mut() = Some((3, flag)));
+    };
+    a_failed_window_pass_publishes_nothing(&setup, &change, None, arm, "pass-timeout");
+}
+
+/// A checkpoint written by the previous compiler before shared-variable EXISTS slices
+/// switched from `Op::Match` to substitution is skipped at the fingerprint check before
+/// decoding, and the rebuilt view matches the direct query.
+#[test]
+fn shared_exists_window_skips_old_compiler_checkpoint() {
+    const QUERY: &str = "SELECT ?outer WHERE {
+        VALUES ?outer { 1 2 }
+        FILTER EXISTS {
+            { SELECT REDUCED ?outer ?x WHERE { VALUES (?outer ?x) { (1 10) (2 20) } } ORDER BY ?x LIMIT 1 }
+        }
+    }";
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = persistent(dir.path(), true);
+        load(&s);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.put(&s, "shared_exists", ViewDef::table(QUERY)).unwrap();
+        rt.round(&s);
+        assert_eq!(
+            read(&rt, &s, "shared_exists", None).unwrap(),
+            oracle(&s, QUERY, None)
+        );
+        rt.close(&s);
+    }
+
+    // Rewrite the checkpoint's header to the old compiler's fingerprint while keeping
+    // the valid decodable body and CRC32: if recovery did not skip on fingerprint before
+    // `Circuit::decode`, the body would decode and increment `loaded`.
+    let files = super::persist::list(&dir.path().join("views/shared_exists/main"));
+    assert_eq!(files.len(), 1, "expected one checkpoint");
+    let raw = std::fs::read(&files[0].1).unwrap();
+    let (header, body) = super::persist::decode_as(super::persist::VIEW, &raw).unwrap();
+    let parsed = spargebra::SparqlParser::new().parse_query(QUERY).unwrap();
+    let old_fp =
+        super::runtime::checkpoint_fingerprint_for_compiler("f13-phase2-3", &parsed, QUERY);
+    let new_fp = super::runtime::checkpoint_fingerprint_for_compiler(
+        super::runtime::COMPILER,
+        &parsed,
+        QUERY,
+    );
+    assert_eq!(header.fingerprint, new_fp);
+    assert_ne!(old_fp, new_fp);
+    let old_bytes = super::persist::encode_as(
+        super::persist::VIEW,
+        &super::persist::Header {
+            fingerprint: old_fp,
+            ..header
+        },
+        body,
+    );
+    std::fs::write(&files[0].1, &old_bytes).unwrap();
+
+    {
+        let s = persistent(dir.path(), true);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.round(&s);
+        assert_eq!(
+            rt.stats(&s).loaded,
+            0,
+            "old-compiler checkpoint must be skipped before decoding"
+        );
+        let got = read(&rt, &s, "shared_exists", None).unwrap();
+        let want = oracle(&s, QUERY, None);
+        assert_eq!(got, want);
+        assert_eq!(got, vec!["1".to_string(), "2".to_string()]);
+        rt.close(&s);
+    }
+
+    // The replacement checkpoint written under the new compiler loads on the next restart.
+    {
+        let s = persistent(dir.path(), true);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.round(&s);
+        assert_eq!(rt.stats(&s).loaded, 1, "new-compiler checkpoint loads");
+        assert_eq!(
+            read(&rt, &s, "shared_exists", None).unwrap(),
+            oracle(&s, QUERY, None)
+        );
+        rt.close(&s);
+    }
+}
+
+/// Maintained SUM/AVG views with arbitrary-precision values checkpoint and recover across
+/// restarts and enforce caps only after cancellation and averaging.
+#[test]
+fn big_numeric_sum_avg_view_checkpoints_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = persistent(dir.path(), true);
+    let max_int = "9".repeat(4_096);
+    let setup = format!(
+        "INSERT DATA {{ \
+         :a :g :g1 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :b :g :g1 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :c :g :g1 ; :v \"-{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :d :g :g2 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :e :g :g2 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> . \
+         :f :g :decimal ; :v 0.00000000000000000004 . \
+         :g :g :decimal ; :v 0.00000000000000000002 \
+         }}"
+    );
+    upd(&s, &setup);
+    let sum_q = "SELECT ?g (SUM(?v) AS ?s) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
+    let avg_q = "SELECT ?g (AVG(?v) AS ?a) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
+    {
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.put(&s, "big-sum", ViewDef::table(q(sum_q))).unwrap();
+        rt.put(&s, "big-avg", ViewDef::table(q(avg_q))).unwrap();
+        rt.round(&s);
+        let mut got_sum = read(&rt, &s, "big-sum", None).unwrap();
+        let mut want_sum = oracle(&s, sum_q, None);
+        got_sum.sort();
+        want_sum.sort();
+        assert_eq!(got_sum, want_sum);
+        let mut got_avg = read(&rt, &s, "big-avg", None).unwrap();
+        let mut want_avg = oracle(&s, avg_q, None);
+        got_avg.sort();
+        want_avg.sort();
+        assert_eq!(got_avg, want_avg);
+        rt.close(&s);
+    }
+    // Checkpoints were written for both views holding big-number state.
+    let sum_state_dir = dir.path().join("views/big-sum/main");
+    let sum_files = super::persist::list(&sum_state_dir);
+    assert_eq!(sum_files.len(), 1, "big-number SUM view must checkpoint");
+    assert_eq!(
+        super::persist::list(&dir.path().join("views/big-avg/main")).len(),
+        1,
+        "big-number AVG view must checkpoint"
+    );
+
+    drop(s);
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    rt.round(&s);
+    assert_eq!(rt.stats(&s).loaded, 2);
+    assert_eq!(rt.stats(&s).resets, 0);
+
+    let check_decimal = |sum: &str, avg: &str| {
+        let decimal_row = |name| {
+            read(&rt, &s, name, None)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.starts_with("decimal "))
+                .unwrap()
+        };
+        assert_eq!(decimal_row("big-sum"), format!("decimal {sum}"));
+        assert_eq!(decimal_row("big-avg"), format!("decimal {avg}"));
+    };
+    check_decimal("0.00000000000000000006", "0.00000000000000000003");
+
+    // Retract the values only after recovery so both restored maps must take them back.
+    upd(
+        &s,
+        &format!(
+            "DELETE DATA {{
+                :e :g :g2 ; :v \"{max_int}\"^^<http://www.w3.org/2001/XMLSchema#integer> .
+                :f :g :decimal ; :v 0.00000000000000000004
+            }}"
+        ),
+    );
+    rt.round(&s);
+    assert_eq!(
+        rt.stats(&s).resets,
+        0,
+        "retractions use the recovered state"
+    );
+    check_decimal("0.00000000000000000002", "0.00000000000000000002");
+    assert_eq!(
+        read(&rt, &s, "big-sum", None).unwrap(),
+        oracle(&s, sum_q, None)
+    );
+    assert_eq!(
+        read(&rt, &s, "big-avg", None).unwrap(),
+        oracle(&s, avg_q, None)
+    );
+    rt.close(&s);
+}
+
+#[test]
+fn sum_view_rebuilds_a_phase2_4_checkpoint() {
+    use super::persist::{self, Writer};
+    use super::terms::Terms;
+    use super::zset::ZSet;
+    use crate::id::Id;
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = persistent(dir.path(), true);
+    let big = "\"99999999999999999999999\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+    upd(&s, &format!("INSERT DATA {{ :g :v 4, {big} }}"));
+    let query = q("SELECT ?g (SUM(?v) AS ?s) WHERE { ?g :v ?v } GROUP BY ?g");
+    let state_dir = dir.path().join("views/legacy-sum/main");
+    {
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.put(&s, "legacy-sum", ViewDef::table(query.clone()))
+            .unwrap();
+        rt.round(&s);
+        rt.close(&s);
+    }
+
+    let snap = s.snapshot();
+    let terms = Terms::default();
+    let group = snap.lookup_iri("http://ex/g").unwrap();
+    let mut saved = ZSet::new();
+    saved.add(vec![group, Id::UNDEF].into(), 1);
+    let mut legacy = Writer::new(&snap, &terms);
+    legacy.zset(&saved).unwrap();
+    // Compiler f13-phase2-4 wrote the group and its last output before the SUM state.
+    // Project, extend and the single triple-pattern child held no checkpoint state.
+    legacy.u64(1);
+    legacy.row(&[group]).unwrap();
+    legacy.i64(2);
+    legacy.u64(1);
+    legacy.row(&[group, Id::UNDEF]).unwrap();
+    legacy.i64(2); // rows
+    legacy.i64(1); // the old compiler classified the big integer as an error
+    legacy.i64(0); // unbound arguments
+    legacy.i128(4); // integer subtotal
+    legacy.u64(0); // decimal map
+    legacy.u64(0); // float map
+    legacy.u64(0); // double map
+
+    let parsed = spargebra::SparqlParser::new().parse_query(&query).unwrap();
+    let mut key = Sha256::new();
+    key.update(b"f13-phase2-4\0");
+    key.update(super::runtime::key::normalized(&parsed, &query));
+    key.update([0]);
+    key.update(0u64.to_le_bytes()); // unrestricted access
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(&key.finalize()[..8]);
+    fingerprint.update(b"\0aggregate-errors\0");
+    fingerprint.update(sparql::AggregateErrors::default().as_str());
+    let fingerprint = u64::from_le_bytes(fingerprint.finalize()[..8].try_into().unwrap());
+
+    let files = persist::list(&state_dir);
+    assert_eq!(files.len(), 1);
+    let latest = &files[0].1;
+    let bytes = std::fs::read(latest).unwrap();
+    let (mut header, _) = persist::decode(&bytes).unwrap();
+    assert_ne!(
+        fingerprint, header.fingerprint,
+        "f13-phase2-4 must have a distinct key"
+    );
+    header.fingerprint = fingerprint;
+    std::fs::write(latest, persist::encode(&header, &legacy.finish())).unwrap();
+    drop(snap);
+    drop(s);
+
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    rt.round(&s);
+    let stats = rt.stats(&s);
+    assert_eq!(stats.loaded, 0);
+    assert_eq!(stats.passes, 1, "the view was built from the store");
+    assert_eq!(
+        read(&rt, &s, "legacy-sum", None).unwrap(),
+        ["g 100000000000000000000003"]
+    );
+    upd(&s, &format!("DELETE DATA {{ :g :v {big} }}"));
+    rt.round(&s);
+    assert_eq!(read(&rt, &s, "legacy-sum", None).unwrap(), ["g 4"]);
+    rt.close(&s);
+}
+
+#[test]
+fn maintained_numeric_aggregates_use_arq_avg_and_staged_float_promotion() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+         INSERT DATA {
+            :a :g :decimal ; :v 100000000000000000000.0 .
+            :b :g :decimal ; :v 100000000000000000000.0 .
+            :c :g :decimal ; :v -100000000000000000000.0 .
+            :d :g :decimal ; :v -100000000000000000000.0 .
+            :e :g :decimal ; :v 0.0 .
+            :f :g :decimal ; :v 0.000000000000000001 .
+            :g :g :float ; :v \"2e38\"^^xsd:float .
+            :h :g :float ; :v \"3e38\"^^xsd:float .
+            :i :g :float ; :v \"0\"^^xsd:double .
+            :j :g :fixed ; :v 1.000000059604644776 .
+            :k :g :fixed ; :v \"0\"^^xsd:float .
+            :l :g :fixed ; :v \"0\"^^xsd:double .
+            :m :g :cancelled ; :v 1.000000059604644776 .
+            :n :g :cancelled ; :v 0.00000000000000000001 .
+            :o :g :cancelled ; :v -0.00000000000000000001 .
+            :p :g :cancelled ; :v \"0\"^^xsd:float .
+            :r :g :cancelled ; :v \"0\"^^xsd:double .
+         }",
+    );
+    let rt = runtime(&s, None);
+    rt.put(
+        &s,
+        "numeric",
+        ViewDef::table(q("SELECT ?g (SUM(?v) AS ?s) (AVG(?v) AS ?a)
+                          WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g")),
+    )
+    .unwrap();
+    rt.round(&s);
+    assert_eq!(
+        read(&rt, &s, "numeric", None).unwrap(),
+        [
+            "cancelled 1 0.2",
+            "decimal 0.000000000000000001 0.000000000000000000166667",
+            "fixed 1 0.3333333333333333",
+            "float INF INF",
+        ]
+    );
+}
+
+#[test]
+fn maintained_integer_avg_fits_tight_view_budget() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { :a :v 4611686018427387904 . :b :v 4611686018427387904 }",
+    );
+    let rt = runtime(&s, None);
+    let mut def = ViewDef::table(q("SELECT (AVG(?v) AS ?a) WHERE { ?x :v ?v }"));
+    def.memory_bytes = 16 * 1024;
+    rt.put(&s, "integer-avg", def).unwrap();
+    rt.round(&s);
+    assert_eq!(
+        read(&rt, &s, "integer-avg", None).unwrap(),
+        ["4611686018427387904"]
+    );
+
+    upd(&s, "INSERT DATA { :c :v 0 }");
+    rt.round(&s);
+    assert_eq!(
+        read(&rt, &s, "integer-avg", None).unwrap(),
+        ["3074457345618258602.666666666666666666666667"]
+    );
+}
+
+#[test]
+fn maintained_decimal_avg_updates_retracts_and_rebuilds_old_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let query = q("SELECT (AVG(?v) AS ?a) WHERE { ?x :v ?v }");
+    {
+        let s = persistent(dir.path(), true);
+        upd(&s, "INSERT DATA { :a :v -2.0 . :b :v 0 . :c :v 0 }");
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.put(&s, "decimal-avg", ViewDef::table(&query)).unwrap();
+        rt.round(&s);
+        assert_eq!(
+            read(&rt, &s, "decimal-avg", None).unwrap(),
+            ["-0.666666666666666666666667"]
+        );
+        upd(&s, "DELETE DATA { :c :v 0 }");
+        rt.round(&s);
+        assert_eq!(read(&rt, &s, "decimal-avg", None).unwrap(), ["-1"]);
+        upd(&s, "INSERT DATA { :c :v 0 }");
+        rt.round(&s);
+        rt.close(&s);
+    }
+
+    {
+        let s = persistent(dir.path(), true);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.round(&s);
+        assert_eq!(rt.stats(&s).loaded, 1);
+        assert_eq!(
+            read(&rt, &s, "decimal-avg", None).unwrap(),
+            ["-0.666666666666666666666667"]
+        );
+        rt.close(&s);
+    }
+
+    let files = super::persist::list(&dir.path().join("views/decimal-avg/main"));
+    let latest = &files.first().unwrap().1;
+    let raw = std::fs::read(latest).unwrap();
+    let (mut header, body) = super::persist::decode_as(super::persist::VIEW, &raw).unwrap();
+    let parsed = spargebra::SparqlParser::new().parse_query(&query).unwrap();
+    let old_fingerprint =
+        super::runtime::checkpoint_fingerprint_for_compiler("f13-phase2-6", &parsed, &query);
+    assert_ne!(header.fingerprint, old_fingerprint);
+    header.fingerprint = old_fingerprint;
+    let old_bytes = super::persist::encode_as(super::persist::VIEW, &header, body);
+    std::fs::write(latest, old_bytes).unwrap();
+
+    let s = persistent(dir.path(), true);
+    let rt = runtime(&s, Some(dir.path().to_path_buf()));
+    rt.round(&s);
+    assert_eq!(rt.stats(&s).loaded, 0);
+    assert_eq!(
+        read(&rt, &s, "decimal-avg", None).unwrap(),
+        ["-0.666666666666666666666667"]
+    );
+    rt.close(&s);
 }

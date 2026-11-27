@@ -109,7 +109,8 @@ pub(super) struct BulkPreview<'a> {
     pub view: &'a Snapshot,
     /// the state on the built generation
     pub candidate: &'a Snapshot,
-    pub commit: CommitInfo,
+    pub commit: Option<CommitInfo>,
+    pub kind: CommitKind,
     pub changes: Changes<'a>,
     /// graphs the rebuild left out (a replace)
     pub drop_graphs: &'a [Id],
@@ -224,8 +225,8 @@ impl Store {
             dataset_id: self.owner_dataset_id(),
             branch_id: self.branch_id(),
             head: b.head,
-            commit: Some(b.commit),
-            kind: b.commit.kind,
+            commit: b.commit,
+            kind: b.kind,
             message: b.message,
             graphs,
             changes,
@@ -243,10 +244,15 @@ impl Store {
 
 impl WriteTxn<'_> {
     /// Project storage for the effective commit or a complete simulated replay prefix.
-    pub(super) fn preview_storage(&self, inserts: bool, wal_bytes: u64) -> StorageCheck {
+    pub(super) fn preview_storage(
+        &self,
+        inserts: bool,
+        quota_bytes: u64,
+        disk_bytes: u64,
+    ) -> StorageCheck {
         let store = self.store;
         let mut storage = match (&store.root, store.opts.max_memory_bytes) {
-            (Some(_), _) => match store.quota.project_commit(wal_bytes) {
+            (Some(_), _) => match store.quota.project_commit(quota_bytes) {
                 Some((limit, used, projected)) => StorageCheck {
                     refused: None,
                     limit: Some(limit),
@@ -265,11 +271,13 @@ impl WriteTxn<'_> {
             },
             (None, None) => StorageCheck::default(),
         };
-        storage.refused = self.check_storage_for(inserts, wal_bytes).err();
+        storage.refused = self
+            .check_storage_for(inserts, quota_bytes, disk_bytes)
+            .err();
         storage
     }
 
-    /// The preview of a commit through the WAL, made where `publish_log` would write it.
+    /// The preview of a commit through the WAL, made where `publish_grouped` would write it.
     pub(super) fn preview_log(&mut self, dr: &DryRun) -> Result<Preview> {
         self.preview_log_inner(dr, None)
     }
@@ -313,7 +321,15 @@ impl WriteTxn<'_> {
             };
             let storage = match checks {
                 Some(checks) => checks.storage,
-                None => self.preview_storage(self.net_ins > 0, self.wal_bytes()),
+                None => {
+                    let (vocab, annotation) =
+                        self.pending_storage_bytes(self.mark.entries(), message.as_deref());
+                    let bytes = self
+                        .wal_bytes()
+                        .saturating_add(vocab)
+                        .saturating_add(annotation);
+                    self.preview_storage(self.net_ins > 0, bytes, bytes)
+                }
             };
             let commit = self.next_commit(validation.as_deref());
             (Some(commit), validation, storage, message)

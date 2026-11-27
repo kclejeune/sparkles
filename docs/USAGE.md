@@ -1,108 +1,101 @@
 # Usage
 
-Start with [getting started and operations](GETTING-STARTED.md) for a first query,
-deployment and security guidance. This guide covers running and operating Sparkles in
-detail. Its sections are grouped by task. The
-first group covers the server, the command-line tools, maintenance, backups and outbound
-requests. The next ones cover branches, path search, graph algorithms and embeddings,
-then the web UI, then the MCP server, agent memory and the model-backed features. The
-last two groups cover embedding the library, the Python, JVM, JavaScript and Rust
-clients, and deployment with Docker, Kubernetes, NixOS and Home Manager.
-[API.md](API.md) specifies the HTTP API, and [DEVELOPMENT.md](DEVELOPMENT.md) covers
-building from source and testing.
+This is the operational reference for running Sparkles as a server, using its CLI tools,
+embedding its libraries, connecting AI agents, and deploying to production. Start with
+[GETTING-STARTED.md](GETTING-STARTED.md) for a five-minute quick start, evaluation and
+security checklist. See [API.md](API.md) for exact HTTP contracts,
+[ARCHITECTURE.md](ARCHITECTURE.md) for engine internals, and
+[DEVELOPMENT.md](DEVELOPMENT.md) for building from source and testing.
 
 Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
 without a migration path, so keep backups of anything you cannot regenerate.
 
+## Quick navigation
+
+| Area | Start here | Key topics |
+|---|---|---|
+| **Server & security** | [Running the server](#running-the-server) | [Network exposure](#network-exposure), [TLS](#tls), [Endpoints](#endpoints-and-operations), [Write previews](#previewing-a-write), [Fuseki & Jena clients](#fuseki-and-jena-clients), [Migrating from Fuseki](#migrating-from-fuseki), [Graph & triple access](#restricting-users-to-some-graphs), [`serve` options](#serve-options), [Memory & caches](#memory-and-caches) |
+| **CLI & data tools** | [Command-line tools](#command-line-tools) | [File tools (`convert`, `qparse`)](#file-tools), [SHACL & ShEx](#validating-with-shacl-and-shex), [Stored queries](#stored-queries), [Incremental views](#incremental-views), [GraphQL](#graphql), [CSV/TSV](#loading-csv-and-tsv), [R2RML/RML/YARRRML](#mappings-r2rml-rml-and-yarrrml), [Formatting](#formatting), [Linting](#linting) |
+| **Versioning, branches & analytics** | [Branches and merges](#branches-and-merges) | [Branches, relink, merge & revert](#branches-and-merges), [Path search](#finding-paths), [Graph algorithms](#graph-algorithms), [Embeddings on write](#embeddings-computed-on-write), [Local embedding models](#local-embedding-models) |
+| **Backups & maintenance** | [Backup repositories](#backup-repositories) | [Automatic compaction](#automatic-compaction), [Encrypted repositories](#encrypted-repositories), [Checking a database](#checking-a-database), [Upgrading databases](#upgrading-databases), [Outbound SERVICE/LOAD](#outbound-requests-service-and-load), [Notifications](#sending-notifications) |
+| **Web UI** | [The Explore overview](#the-explore-overview) | [Arcs on the map](#arcs-on-the-map), [Facets](#facets-and-use-in-query), [Embedding map](#the-embedding-map), [Pattern pane](#the-pattern-pane), [Lenses](#lenses-on-the-graph), [Validation overlay](#the-validation-overlay), [Editing forms](#editing-forms), [Time slider](#the-time-slider) |
+| **MCP & AI agents** | [MCP server (LLM agents)](#mcp-server-llm-agents) | [MCP over HTTP](#over-http), [OAuth](#connecting-with-oauth), [Agent memory](#agent-memory), [Session transcripts](#session-transcripts), [Document ingestion](#ingesting-documents-in-the-server), [Asking questions with a model](#asking-questions-with-a-model), [Community reports (GraphRAG)](#community-reports-graphrag) |
+| **Embeddings & bindings** | [Embedding the library](#embedding-the-library) | [Rust library](#embedding-the-library), [Python](#python), [JVM (Apache Jena)](#jvm-apache-jena), [JavaScript & TypeScript](#javascript-and-typescript), [Rust HTTP client](#rust-client) |
+| **Deployment** | [Docker](#docker) | [Docker & Compose](#docker), [Kubernetes (Helm)](#kubernetes-helm), [NixOS](#deploying-on-nixos), [Home Manager](#home-manager) |
+
+### Full section index
+
 **Running and operating the server**
 
 * [Running the server](#running-the-server)
-  * [Network exposure](#network-exposure)
-  * [TLS](#tls)
-  * [Endpoints and operations](#endpoints-and-operations)
-  * [Previewing a write](#previewing-a-write)
-  * [Fuseki and Jena clients](#fuseki-and-jena-clients)
-  * [Migrating from Fuseki](#migrating-from-fuseki)
-  * [Restricting users to some graphs](#restricting-users-to-some-graphs)
-  * [Hiding some triples from some users](#hiding-some-triples-from-some-users)
-  * [`serve` options](#serve-options)
+  * [Network exposure](#network-exposure) · [Limits that are off by default](#limits-that-are-off-by-default) · [TLS](#tls)
+  * [Endpoints and operations](#endpoints-and-operations) · [Previewing a write](#previewing-a-write)
+  * [Fuseki and Jena clients](#fuseki-and-jena-clients) · [Migrating from Fuseki](#migrating-from-fuseki)
+  * [Restricting users to some graphs](#restricting-users-to-some-graphs) · [Hiding some triples from some users](#hiding-some-triples-from-some-users)
+  * [`serve` options](#serve-options) · [Threads on hybrid processors](#threads-on-hybrid-processors) · [Memory and caches](#memory-and-caches)
 * [Command-line tools](#command-line-tools)
-  * [Shell completions and man pages](#shell-completions-and-man-pages)
-  * [Constraints next to the counts](#constraints-next-to-the-counts)
-  * [What each class uses, and what changed](#what-each-class-uses-and-what-changed)
-  * [File tools](#file-tools)
-  * [Validating with SHACL and ShEx](#validating-with-shacl-and-shex)
-  * [Authoring SHACL shapes](#authoring-shacl-shapes)
-  * [Drafting shapes from the data](#drafting-shapes-from-the-data)
-  * [Stored queries](#stored-queries)
-  * [DESCRIBE modes](#describe-modes)
-  * [GraphQL](#graphql)
-  * [Loading CSV and TSV](#loading-csv-and-tsv)
-* [Formatting](#formatting)
-* [Linting](#linting)
+  * [Shell completions and man pages](#shell-completions-and-man-pages) · [Constraints next to the counts](#constraints-next-to-the-counts) · [What each class uses, and what changed](#what-each-class-uses-and-what-changed)
+  * [File tools](#file-tools) · [Validating with SHACL and ShEx](#validating-with-shacl-and-shex) · [Authoring SHACL shapes](#authoring-shacl-shapes) · [Drafting shapes from the data](#drafting-shapes-from-the-data)
+  * [Stored queries](#stored-queries) · [Incremental views](#incremental-views) · [DESCRIBE modes](#describe-modes) · [Aggregate errors](#aggregate-errors)
+  * [GraphQL](#graphql) · [Loading CSV and TSV](#loading-csv-and-tsv) · [Mappings (R2RML, RML and YARRRML)](#mappings-r2rml-rml-and-yarrrml)
+* [Formatting](#formatting) · [Linting](#linting)
 * [Automatic compaction](#automatic-compaction)
 * [Backup repositories](#backup-repositories)
-* [Checking a database](#checking-a-database)
-* [Upgrading databases](#upgrading-databases)
+  * [Encrypted repositories](#encrypted-repositories) · [Encrypted repositories in the server](#encrypted-repositories-in-the-server)
+* [Checking a database](#checking-a-database) · [Upgrading databases](#upgrading-databases)
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
   * [Correlated, bulk and cached SERVICE](#correlated-bulk-and-cached-service)
 * [Sending notifications](#sending-notifications)
 
-**Working with the data**
+**Versioning, branches, analytics and embeddings**
 
 * [Branches and merges](#branches-and-merges)
 * [Finding paths](#finding-paths)
+  * [Finding paths in Explore](#finding-paths-in-explore) · [Finding paths on the query page](#finding-paths-on-the-query-page)
 * [Graph algorithms](#graph-algorithms)
-* [Embeddings computed on write](#embeddings-computed-on-write)
-* [Local embedding models](#local-embedding-models)
+* [Embeddings computed on write](#embeddings-computed-on-write) · [Local embedding models](#local-embedding-models)
 
 **The web UI**
 
-* [The Explore overview](#the-explore-overview)
-* [Arcs on the map](#arcs-on-the-map)
-* [Facets and Use in query](#facets-and-use-in-query)
-* [The embedding map](#the-embedding-map)
-* [The Pattern pane](#the-pattern-pane)
-* [Lenses on the graph](#lenses-on-the-graph)
-  * [Algorithm lenses](#algorithm-lenses)
-* [The validation overlay](#the-validation-overlay)
-* [Editing forms](#editing-forms)
-* [The time slider](#the-time-slider)
+* [The Explore overview](#the-explore-overview) · [Arcs on the map](#arcs-on-the-map) · [Facets and Use in query](#facets-and-use-in-query) · [The embedding map](#the-embedding-map)
+* [The Pattern pane](#the-pattern-pane) ([The plan on the pattern](#the-plan-on-the-pattern))
+* [Lenses on the graph](#lenses-on-the-graph) ([Algorithm lenses](#algorithm-lenses) · [Why is this inferred?](#why-is-this-inferred))
+* [The validation overlay](#the-validation-overlay) · [Editing forms](#editing-forms)
+* [The time slider](#the-time-slider) ([Commit diffs on the graph](#commit-diffs-on-the-graph))
 
 **Agents and models**
 
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
-  * [Connecting with OAuth](#connecting-with-oauth)
-  * [Handing a query to the web UI](#handing-a-query-to-the-web-ui)
-  * [Agent memory grants](#agent-memory-grants)
+  * [Over HTTP](#over-http) · [Connecting with OAuth](#connecting-with-oauth) · [Handing a query to the web UI](#handing-a-query-to-the-web-ui) · [Agent memory grants](#agent-memory-grants)
 * [Agent memory](#agent-memory)
+  * [Session transcripts](#session-transcripts) · [Reviewing imported memory in the terminal](#reviewing-imported-memory-in-the-terminal) · [Exporting memory](#exporting-memory) · [Local use and output](#local-use-and-output)
+  * [Ingesting documents and reviewing memory](#ingesting-documents-and-reviewing-memory) · [Ingesting documents in the server](#ingesting-documents-in-the-server) · [Maintaining agent memory](#maintaining-agent-memory)
 * [Asking questions with a model](#asking-questions-with-a-model)
-  * [The Settings tab](#the-settings-tab)
-  * [Escalation](#escalation)
-  * [The Ask bar](#the-ask-bar)
-  * [Measuring models](#measuring-models)
+  * [Turning on the assistant in the server](#turning-on-the-assistant-in-the-server) · [Changing dataset settings from the command line](#changing-dataset-settings-from-the-command-line) · [The Settings tab](#the-settings-tab) · [Declared prefixes](#declared-prefixes)
+  * [Changing models and keys at runtime](#changing-models-and-keys-at-runtime) · [Provider presets](#provider-presets) · [Internal certificates and TLS options](#internal-certificates-and-tls-options) · [Prompt caching](#prompt-caching)
+  * [Escalation](#escalation) · [The Ask bar](#the-ask-bar) · [Measuring models](#measuring-models) · [Explaining a query](#explaining-a-query)
 * [Community reports (GraphRAG)](#community-reports-graphrag)
 
 **Libraries and clients**
 
 * [Embedding the library](#embedding-the-library)
+  * [Incremental query execution](#incremental-query-execution) · [Registered scalar functions](#registered-scalar-functions) · [Registered aggregates](#registered-aggregates) · [Registered property functions](#registered-property-functions) · [Dataset administration](#dataset-administration) · [Library errors](#library-errors)
 * [Python](#python)
+  * [Async datasets and cursors](#async-datasets-and-cursors) · [Datasets, loading and queries](#datasets-loading-and-queries) · [Terms](#terms) · [Quads and transactions](#quads-and-transactions) · [Catalog and administration handles](#catalog-and-administration-handles) · [History, snapshots and clones](#history-snapshots-and-clones) · [Search indexes and write-time validation](#search-indexes-and-write-time-validation) · [Query builder](#query-builder) · [rdflib](#rdflib) · [Errors and threads](#errors-and-threads)
 * [JVM (Apache Jena)](#jvm-apache-jena)
-  * [Opening a Jena dataset](#opening-a-jena-dataset)
-  * [Jena transactions](#jena-transactions)
-  * [Jena queries and updates](#jena-queries-and-updates)
-  * [Loads, receipts and the TDB2 import](#loads-receipts-and-the-tdb2-import)
-  * [Blank node labels](#blank-node-labels)
-  * [Jena exceptions](#jena-exceptions)
-  * [Differences from TDB2](#differences-from-tdb2)
+  * [Reading a kept classification on the JVM](#reading-a-kept-classification-on-the-jvm) · [Opening a Jena dataset](#opening-a-jena-dataset) · [Jena transactions](#jena-transactions) · [Jena queries and updates](#jena-queries-and-updates) · [Loads, receipts and the TDB2 import](#loads-receipts-and-the-tdb2-import) · [Catalog, history and administration](#catalog-history-and-administration) · [Fuseki assembler](#fuseki-assembler) · [Blank node labels](#blank-node-labels) · [Jena exceptions](#jena-exceptions) · [Differences from TDB2](#differences-from-tdb2)
 * [JavaScript and TypeScript](#javascript-and-typescript)
 * [Rust client](#rust-client)
+  * [Queries and updates](#queries-and-updates) · [Graph Store, uploads and the admin API](#graph-store-uploads-and-the-admin-api) · [Other SPARQL servers](#other-sparql-servers) · [Credentials, retries and deadlines](#credentials-retries-and-deadlines) · [Blocking](#blocking)
 
 **Deployment**
 
 * [Docker](#docker)
+  * [Images and variants](#images-and-variants) · [Compose profiles](#compose-profiles) · [Network exposure in a container](#network-exposure-in-a-container) · [Authentication in a container](#authentication-in-a-container) · [Configuring the container](#configuring-the-container) · [Upgrading the container](#upgrading-the-container) · [Backing up the container's data](#backing-up-the-containers-data)
 * [Kubernetes (Helm)](#kubernetes-helm)
+  * [Installing the chart](#installing-the-chart) · [Settings, models and secrets](#settings-models-and-secrets) · [Configuration reload](#configuration-reload) · [Local models](#local-models) · [OCR in Kubernetes](#ocr-in-kubernetes) · [Upgrades and backups](#upgrades-and-backups) · [Resources](#resources)
 * [Deploying on NixOS](#deploying-on-nixos)
+  * [Model providers and credentials](#model-providers-and-credentials) · [Local embedding models on NixOS](#local-embedding-models-on-nixos) · [Declarative dataset settings](#declarative-dataset-settings) · [Shutdown](#shutdown)
 * [Home Manager](#home-manager)
 
 ## Running the server
@@ -117,6 +110,10 @@ out.
 ```sh
 sparkles serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
 ```
+
+Set `--port 0` to let the operating system choose the TCP port. The server logs the
+bound address on stderr during startup when INFO logging is enabled. Use `/$/ready` to check when the
+datasets are open.
 
 The server and CLI use [mimalloc](https://github.com/microsoft/mimalloc) as their
 allocator. It comes from the `mimalloc` cargo feature of `sparkles-server`, which is on
@@ -597,8 +594,8 @@ does not change it. The first run in each mode is slower than the later ones, so
 whose runs in both modes are quick settles only once the slower mode has run twice, and
 until then its next run goes to the mode that lost with one run. A text therefore runs
 at most twice in its slower mode. The remembered times do not age. The server remembers up to 4,096
-texts and forgets all of them at once when a new text arrives after that, and roadmap
-item 577 covers aging. On forge, DBpedia's
+texts and forgets all of them at once when a new text arrives after that ([ROADMAP.md](ROADMAP.md),
+item 577). In local measurements on an Intel Core i5-13500, DBpedia's
 `births-by-decade` at 50M triples takes 3.2 ms as a cursor and 1.8 ms eagerly, and it
 runs eagerly after its first run. An eager trial that outgrows its memory budget runs
 again with automatic execution within the same deadline and budgets, and the text keeps
@@ -614,17 +611,16 @@ On Linux, the kernel lists the two kinds of core of an Intel hybrid processor in
 `/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus`. When both lists exist
 and the server may run on cores of both kinds, `--request-cpus auto` runs request work
 on the performance cores, and the query pool leaves one CPU free for every four
-efficiency cores, or part of four. The pool's threads run on every CPU. On forge, an
-Intel Core i5-13500 with six performance cores of two logical CPUs each and eight
-efficiency cores, the pool has 18 threads. The third instance of BSBM BI `q3` at 10M
-then takes 23 to 24 ms in every server process, against 37 to 44 ms with
-`--request-cpus all`.
+efficiency cores, or part of four. The pool's threads run on every CPU. On a 14-core
+Intel Core i5-13500 (six performance cores of two logical CPUs each and eight
+efficiency cores), the pool has 18 threads, and the third instance of BSBM BI `q3` at 10M
+takes 23 to 24 ms in every server process against 37 to 44 ms with `--request-cpus all`.
 
 The performance cores hold only so many requests at once. Request work runs there while
 at most one request per physical performance core is in flight, counting the request
 itself and every response still being sent, and runs on every CPU when more are. A
 thread moves when it starts a request's work, and only when the load asks for the other
-placement. On a host with forge's processor, four readers and a writer get 1,019 reads a
+placement. On that hybrid processor, four readers and a writer get 1,019 reads a
 second against 977 with `--request-cpus all`, and sixteen readers get as many reads and
 writes as with every CPU. The [hybrid placement
 run](benchmarks/writes/runs/2026-11-02-hybrid-mixed-atlas/README.md) records the
@@ -649,9 +645,11 @@ SERVICE entries of one dataset only.
 
 Demand reasoning has a separate process-wide cache of derived tables, set by
 `--derived-table-cache-mb`. Its default is 256 MiB in either profile, and zero disables
-retention. This limit bounds the retained-table estimate, which counts a shared chunk
-for each cached table holding it and is not RSS. Queries may keep tables alive after
-eviction. Operators with the metrics permission see its configured capacity, estimated
+retention. This limit bounds the calibrated retained-table estimate across deduplicated
+shared tables and chunks, spare vector capacity, cache-key strings, hash-table capacity,
+and allocator metadata, and is not RSS. Queries may keep tables alive after eviction,
+which reduces the cache's eviction allowance until those queries finish. Operators with
+the metrics permission see its configured capacity, estimated
 bytes, table count, hits and misses in `/$/stats` and `/$/server/memory`. Other dataset
 readers do not receive those process-wide counters. The host-derived query pool leaves
 out this configured cache beside the storage caches.
@@ -673,10 +671,10 @@ in the page cache. The next start with `--prewarm` becomes ready as fast as with
 then reads the list on one background thread at a lower CPU priority, and logs `prewarm
 of /NAME finished` with what it read and how long it took. It stops when the block
 cache is full or the server shuts down, and it ignores a list that a compaction made
-stale. On forge at 10.5M, with the list of a warm pass, a cold `star-lookup` took 3.3 ms
-instead of 11.4 ms after a background read of 15 ms, and the time to ready stayed at
-52 ms. The prewarm reads data that the next queries may never touch, so it is off by
-default.
+stale. In local measurements at 10.5M triples with the list from a warm pass, a cold
+`star-lookup` took 3.3 ms instead of 11.4 ms after a 15 ms background read, and time to
+ready stayed at 52 ms. Because prewarm reads data that upcoming queries may never touch,
+it is off by default.
 
 Two steps that `serve` takes by default shorten the first request after a start without
 reading any data. Before the server reports ready, it runs one query that reads nothing
@@ -746,6 +744,9 @@ sparkles dump    --loc db --out dump.trig.gz  # syntax from the extension too, o
 sparkles dump    --loc db --format ttl --merge   # every graph as one Turtle graph
 sparkles dump    --loc db --format nt --graph http://ex.org/g   # one graph's triples
 sparkles dump    --server URL --dataset ds --out ds.rt   # a server's dataset, in RDF Thrift
+sparkles git write-tree --loc db --out tree/  # canonical per-graph Turtle/N-Quads tree (--branch, --at, --syntax)
+sparkles git verify     --dir tree/           # stream-verify manifest, layout, checksums and RDF (--no-checksums)
+sparkles git export     --loc db --out repo/  # export branch history to Git (--branch, --git-branch, --mode commits|squash)
 sparkles backup  --loc db --out backups/      # zstd; --compress gzip --level 9, --threads 8
 sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles clone   --loc db --to part --graph default --graph 'http://ex.org/g/*'   # some graphs only
@@ -763,19 +764,20 @@ sparkles infer   --loc db --profile rdfs --max-inferred 200000000   # allow 200 
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
 sparkles infer   --loc db --ontology-graph http://ex.org/onto --imports fetch   # input graphs and owl:imports
 sparkles ontology summary --loc db             # OWL 2 header, axiom and entity counts, unmapped triples
-sparkles ontology axioms  --loc db --type SubClassOf --about http://ex.org/Person   # functional-style syntax (--format json)
+sparkles ontology axioms  --loc db --type SubClassOf --about http://ex.org/Person   # functional-style syntax (--format json|owx|omn|obo|obographs)
 sparkles ontology check   --loc db --profile el,rl   # OWL 2 profile checks (exit 1 when outside one)
 sparkles ontology check   onto.ttl --profile all     # check a file without a database
 sparkles ontology edit    --loc db --add new.json --remove old.json   # JSON axioms, in one commit
 sparkles ontology classify --loc db --format text   # OWL 2 EL taxonomy (exit 1 when unsatisfiable)
-sparkles ontology classify go.ofn > go-taxonomy.ofn  # classify a file without a database
+sparkles ontology classify go.ofn > go-taxonomy.ofn  # classify a file without a database (--format ofn|owx|omn|obo|obographs)
+sparkles ontology classify go.ofn --el-only --format text   # OWL 2 EL rules alone: ELK's taxonomy
 sparkles ontology classify --loc db --target http://ex.org/taxonomy   # write the taxonomy to a graph
 sparkles ontology classify dl.ofn --timeout 10 --partial --format json   # what 10 s proved (exit 2 when partial)
-sparkles ontology reason --input go.owl --output go-reasoned.ofn   # robot reason: the ontology with its inferred axioms
-sparkles ontology reason --input go.owl --reasoner ELK --output go-elk.ofn   # OWL 2 EL rules alone: ROBOT's output with ELK
-sparkles ontology reduce --input x.owl --output y.ofn   # robot reduce: without the entailed subclass axioms
-sparkles ontology relax  --input x.owl --output y.owl   # robot relax: subclass axioms from equivalences
-sparkles ontology reason --input x.owl relax reduce --output y.owl   # a chain in one process, as ROBOT runs it
+sparkles ontology reason --input go.owl --output go-reasoned.ofn   # robot reason: writes .ofn, .owx, .omn, .obo, .json, .owl, .ttl or .nt (optional .gz)
+sparkles ontology reason --input go.owl --reasoner ELK --output go-elk.obo   # OWL 2 EL rules alone, writing OBO 1.4
+sparkles ontology reduce --input x.owl --output y.json   # robot reduce: without the entailed subclass axioms, writing OBO Graphs JSON
+sparkles ontology relax  --input x.owl --output y.owx    # robot relax: subclass axioms from equivalences, writing OWL/XML
+sparkles ontology reason --input x.owl relax reduce --output y.omn   # a chain in one process, writing Manchester OWL syntax
 sparkles ontology materialize --input go.owl --term BFO:0000050 --output y.ofn   # robot materialize: direct part-of superclasses
 sparkles ontology materialize --input x.owl --term-file terms.txt reduce --output y.ofn   # properties from a file, then reduce
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
@@ -1064,16 +1066,13 @@ pages, so `man sparkles-serve` works after `nix profile install`.
 `--format yaml` prints it as YAML. A running server serves the same document at
 `/$/openapi.json` ([API.md](API.md#openapi-description)).
 
-Three environment variables change cold-read paths for comparisons.
 `SPARKLES_IO_HINTS=off` maps the index and vocabulary files without access hints, so
-that a page fault reads the device's whole read-ahead window and blocks are not read
-ahead. `SPARKLES_SPARSE_VOCAB=off` looks terms up without `vocab.idx`.
-`SPARKLES_READ_WINDOW_KB` sets the target compressed bytes requested ahead by one scan,
-4096 KiB by default. A refill includes existing unconsumed advice and coalesced gaps in
-that budget. Whole-block progress can extend it through one next block and its bridged
-gap, which is at most 64 KiB. It bounds requested coverage rather than physical I/O in
-flight. Zero restores per-block hints. Cached columns that are evicted before consumption
-receive fallback advice at the block they need. An index build sends its permutation and
+a page fault uses the device's normal read-ahead policy. With hints enabled, each
+scan targets 4 MiB of compressed bytes requested ahead. A refill counts existing
+unconsumed advice and coalesced gaps in that budget. Whole-block progress can
+extend it through one next block and its bridged gap of at most 64 KiB. The target
+measures requested coverage. Cached columns evicted before consumption receive
+fallback advice at the block they need. An index build sends its permutation and
 vocabulary files to the device as it writes them.
 
 `SPARKLES_UI_DIR=DIR` makes the server read the web UI from a UI build directory, such as
@@ -1166,50 +1165,40 @@ sparkles rset results.srj --results text      # JSON, XML or TSV results to anot
 sparkles rdfpatch changes.rdfp                # the rows of RDF Patch files, and their counts
 ```
 
-`convert` reads files, or standard input when no file is given or a file is `-`. It takes
-the syntax from `--syntax`, then from the file extension. When neither decides, it looks
-at the first 8 KiB of the content after decompression. XML is RDF/XML or TriX by its root
-element. JSON is RDF/JSON when its top level maps subjects to objects of predicates, and
-JSON-LD otherwise. Binary content is RDF Thrift or RDF Protobuf when its first row has
-the shape Jena writes. Text whose statements are each one line of terms is N-Quads or
-N-Triples, other Turtle-like text is TriG when it has a `GRAPH` keyword or a `{` block and
-Turtle otherwise, and lines with the same number of tabs or commas are TSV or CSV.
-Content that fits two syntaxes, such as `{}`, is an error that names both. Standard
-input that matches nothing is read as N-Quads, as before. An extension or `--syntax`
-always wins over the content. Besides the W3C syntaxes `convert` reads and writes Jena's
-TriX (`trix`), RDF Thrift (`rt`), RDF Protobuf (`rpb`) and RDF/JSON (`rj`). `load` takes them as well, and
-`query --results trix` (or `rt`, `rpb`, `rj`) writes CONSTRUCT and DESCRIBE results in
-them. Compressed inputs are detected as `load` detects them. The output
-streams, so a file larger than memory converts in bounded memory. Turtle, TriG and
-RDF/XML output declare the prefixes that the input declared before its first statement.
-A quad in a named graph cannot be written in a triple syntax, so `convert` drops it with
-a warning, or with `--merge` writes it into the default graph.
+`convert` reads files or standard input (when no file or `-` is given), resolving syntax
+from `--syntax`, then file extension, and finally sniffing the first 8 KiB after
+decompression: XML becomes RDF/XML or TriX by root element; JSON becomes RDF/JSON when
+its top level maps subjects to predicate-object maps and JSON-LD otherwise; binary data
+matches RDF Thrift or RDF Protobuf; single-line statement text matches N-Quads or
+N-Triples; Turtle-like text with `GRAPH` or `{` matches TriG and Turtle otherwise; and
+uniformly delimited lines match TSV or CSV. Ambiguous content (such as `{}`) errors and
+names both candidates, while unmatched stdin defaults to N-Quads.
+
+Besides the W3C syntaxes, `convert`, `load` and `query --results` support Jena's TriX
+(`trix`), RDF Thrift (`rt`), RDF Protobuf (`rpb`) and RDF/JSON (`rj`). Compressed inputs
+are auto-detected as in `load`. Conversion streams in bounded memory, preserving input
+prefix declarations for Turtle, TriG and RDF/XML output. Quads in named graphs cannot be
+written to triple syntaxes, so `convert` drops them with a warning unless `--merge` folds
+them into the default graph.
 
 A directory is read with `--recursive` (`-r`), file by file in path order. `--include`
-and `--exclude` take globs, which can be repeated. A glob without `/` matches the file
-name, and one with `/` matches the path below the directory, where `*` stays within one
-directory and `**` crosses them. A file in a directory whose syntax cannot be told is
-skipped with a warning. CSV and TSV files are converted with the mapping options of
-`load` (`--mapping`, `--template`, `--key`), and `--base` gives the default mapping's
-namespace. A `-metadata.json` file next to a table is read with it rather than converted.
+and `--exclude` take repeatable globs (patterns without `/` match file names; patterns
+with `/` match paths below the directory, with `**` crossing directories). Files whose
+syntax cannot be detected are skipped with a warning. CSV and TSV inputs honor `load`'s
+mapping flags (`--mapping`, `--template`, `--key`, `--base`), and sibling
+`-metadata.json` files are read alongside their table rather than converted separately.
 
-The output goes to standard output, or to `--output-file` (`-o`), whose extension picks
-the syntax and the compression unless `--output` and `--compress` name them. `--out` and
-`--format` are aliases of `--output`, so the file needs its own flag. The output file is
-written to a temporary file in its directory, which replaces it only when every input
-converted without errors. A failed conversion leaves an existing output file as it was.
-An output file that is also one of the inputs is refused before anything is written,
-whether it is named by the same path, a symbolic link or a hard link. To convert a file
-in place, write to another file and rename it. `--out-dir DIR`
-writes one file per input instead, at the input's path below the directory it was found
-in, with the output syntax's extension in place of the input's. `--compress` adds its
-extension. The files are converted in parallel, `--jobs` (`-j`) at a time, by default
-one per CPU up to 8. A file that exists is replaced only with `--overwrite`, and a file
-that fails to convert leaves nothing behind. An input is never its own output there
-either. With directories or `--out-dir`, `convert`
-prints the statements of each file and a summary with the number of files, the total
-and the time. Errors give the file, line and column, and the exit status is 1 when any
-file failed.
+Output goes to stdout or to `--output-file` (`-o`), whose extension selects syntax and
+compression unless `--output` (`--out`, `--format`) or `--compress` overrides them.
+Single-file output writes to a sibling temporary file and swaps atomically on success,
+leaving existing files untouched on error and refusing any output path (including symlinks
+or hard links) that matches an input.
+
+`--out-dir DIR` writes one output file per input under the relative path, running `--jobs`
+(`-j`) files in parallel (default: one per CPU, up to 8). Existing files are replaced only
+with `--overwrite`, failed conversions leave no partial files, and inputs can never
+overwrite themselves. Directory and `--out-dir` runs print per-file statement counts plus
+a summary; syntax errors report file, line and column and exit 1.
 
 `--count`, `--sink` and `--validate` write no data. Files are then parsed in parallel, as
 `load` parses them. When a file has a syntax error, it is parsed again in order so that
@@ -1837,27 +1826,21 @@ a JSON literal counts as a context or a term, and a term's own scoped context ap
 its value. A JSON-LD fix is offered only when the document with that edit expands to the same dataset, so a
 document that names a context by URL gets no fixes and keeps its text.
 
-In a Turtle, TriG or JSON-LD document, the plain string objects of `sh:select`, `sh:ask`,
-`sh:construct` and `sh:update` are linted as SPARQL, with every rule above, and a finding
-is placed inside the literal, whatever escapes or line breaks come before it. The query
-sees the prefixes of `sh:prefixes` and `sh:declare`, with the `owl:imports` closure, and
-those of the document itself. Each query sees the declarations and parameters of the node
-that holds it, in its graph. A literal is linted only when that node is certain: a subject
-the source names, or else the only node that holds the query when no other string of the
-document repeats its text. An ambiguous literal, such as the same query on two blank
-nodes, is skipped rather than given another node's findings. In JSON-LD the expansion
-decides which values are queries and who holds them, so a document that names a context
-by URL, or one over 8 MiB, gets no query findings. Each query is confirmed by expanding the
-document again, within a budget of four times its size (at least 1 MiB, at most 64 MiB)
-for all queries and fixes together, so a large document with many queries lints only
-some of them. A document prefix that a query uses counts as used, so
-`--fix` keeps it. SHACL binds `$this`, `$shapesGraph`, `$currentShape`,
-`$value` and `$PATH` before it runs a query, and the validators of a constraint component
-also see its parameters, so the variable rules count them as bound. A fix is offered only
-in a long string (`"""` or `'''`) without escapes, and only when the edited query means
-what it meant. The SHACL-SPARQL engine resolves only the `sh:declare` prefixes of a query,
-so a query that works only through the document's own prefixes lints clean here and
-fails when validation runs it. SHACLC has no syntax for these properties.
+In a Turtle, TriG or JSON-LD document, plain string objects of `sh:select`, `sh:ask`,
+`sh:construct` and `sh:update` are linted as SPARQL under all rules above, with diagnostic
+positions mapped back into the literal despite escapes or line breaks. Each query sees the
+prefixes of `sh:prefixes` and `sh:declare` (including `owl:imports` closure) plus document
+prefixes, as well as the holding node's parameters; ambiguous literals (such as identical
+query strings on two blank nodes) are skipped rather than misattributed. JSON-LD documents
+with remote URL contexts or exceeding 8 MiB receive no embedded query findings, and
+verification expansion is bounded at four times document size (1 MiB to 64 MiB).
+
+SHACL pre-bound variables (`$this`, `$shapesGraph`, `$currentShape`, `$value`, `$PATH`)
+and constraint component parameters count as bound, and document prefixes used by embedded
+queries count as used for `--fix`. Safe fixes apply only inside escape-free long strings
+(`"""` or `'''`) when semantics remain unchanged. Because the SHACL-SPARQL engine resolves
+only `sh:declare` prefixes at validation time, a query relying solely on document prefixes
+lints clean here but fails during validation. SHACLC has no syntax for these properties.
 
 The SPARQL rules look at variables in their scope. A subquery's variables are its own,
 and `MINUS` and `EXISTS` patterns bind nothing outside themselves. A variable whose name
@@ -2216,6 +2199,7 @@ and 2 when there are warnings only.
 | `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
 | `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |
 | `patterns` | `patterns.bin` has a valid layout, and in full mode its checksum matches and every subject's pattern, the subjects of each pattern and the predicate totals match SPO. A pattern file of a version this release does not read is a warning, because queries then read the permutations. A missing file that `meta.json` records is a warning too. |
+| `reifiers` | `reifiers.bin` has a valid layout, and in full mode its checksum matches, its keys strictly increase and its entries match POS. A reifier index of a version this release does not read is a warning, because claim lookups then fall back to scanning until the next compaction. A missing file that `meta.json` records is a warning too. |
 | `reasoning` | `reasoning.json` parses and names an existing commit. |
 
 Errors are states that `Store::open` refuses, that lose acknowledged data or history, or
@@ -2665,23 +2649,19 @@ CONFLICT  <http://ex.org/a> <http://ex.org/age>  (default graph)
 1 conflict, nothing merged. Resolve with --on-conflict or --resolve FILE.
 ```
 
-A conflict is a cell, a subject and a predicate in a graph, that both sides changed in
-different ways. `--on-conflict ours`, `theirs` or `union` resolves every conflict one way,
-and `--resolve FILE.json` reads a JSON array of resolutions for single graphs, subjects or
-cells, such as `[{"graph": null, "subject": "<http://ex.org/a>", "predicate":
-"<http://ex.org/age>", "take": "objects", "objects": ["33"]}]`. `--expect-source N` and
-`--expect-target N` refuse the merge when either head moved since the report was read.
-`--exempt IRI`, once per predicate,
-keeps both sides' changes to that predicate instead of reporting a conflict, and `branch
-exempt --loc db IRI…` sets the dataset's own list of such predicates (`--clear` empties
-it). `--conflicts subject` treats a whole subject as one value, and `--conflicts quad` never
-reports a conflict. `--replay` makes a fast-forward
-that replays the source's commits one by one, each with its kind, message and author.
-`--squash` applies the changes as one commit that records no second
-parent, so the source stays ahead of the target and keeps its own history to itself.
-`--dry-run` shows what the merge would do. The exit status is 0 after
-a merge or when the target is already up to date, 2 when conflicts stopped the merge,
-and 1 on any other error.
+A conflict is a cell — a subject and predicate in a graph — that both sides changed
+differently. `--on-conflict ours`, `theirs` or `union` resolves every conflict uniformly,
+while `--resolve FILE.json` supplies per-graph, per-subject or per-cell resolutions (such
+as `[{"graph": null, "subject": "<http://ex.org/a>", "predicate": "<http://ex.org/age>",
+"take": "objects", "objects": ["33"]}]`). `--expect-source N` and `--expect-target N`
+guard against concurrent head movement, `--exempt IRI` (or dataset-wide `branch exempt
+--loc db IRI…`, cleared with `--clear`) keeps both sides' changes to a predicate, and
+`--conflicts subject` or `--conflicts quad` changes conflict granularity.
+
+`--replay` fast-forwards by replaying source commits individually with their kind, message
+and author, while `--squash` applies changes as one commit without a second parent so the
+source retains independent history. `--dry-run` previews the merge without committing.
+Exit status is 0 on merge or already up-to-date, 2 on conflicts, and 1 on other errors.
 
 When two branches have merged into each other, they can have several best common
 ancestors. If those ancestors' changes combine without conflicts, the merge combines
@@ -2931,27 +2911,19 @@ in the output graph with the commit it computed at, so a reader knows which stat
 numbers describe. It commits in batches so that a large result does not hold the writer
 lock for long.
 
-A write-back run is an update, so the server's query timeout does not apply to it. It has
-no deadline unless the request has a `timeout` or the server runs with
-`--update-timeout`. Without a deadline, a run that waits for `--algo-threads` waits until
-a thread is free or the run is cancelled. Thread admission has no queue order, so a run
-that asks for several threads can wait while one-thread calls keep taking the free slots.
-On a server with a query memory pool, the task holds its initial grant of the pool while
-it waits for threads, because it takes the grant when it starts. A dataset has at most
-one write-back task at a time, so the grants held this way add up to one initial grant
-for each dataset. The wait has no deadline, so those grants stay held until the threads
-are free or the task is cancelled, and queries can answer `503` meanwhile if the pool is
-otherwise full.
-The run keeps the algorithm's result as term identifiers and decodes the terms of one
-batch at a time, so the decoded terms of a large result never sit in memory together.
-The identifiers of the whole result stay in memory until the run ends, up to
-`--max-rows` rows. The plan of the write-back also keeps an index of the rows that have a
-node, ordered by node, which takes 8 bytes for each row. A run under a memory pool charges
-that index to its grant before it builds it, and gives it back when the run ends. The
-index is the price of writing each node's rows together without decoding the result up
-front. On a server with a query memory pool, a run takes its initial grant
-when its task starts and waits for it up to `--query-admission-wait`, as a request
-does.
+A write-back run is an update, so `--update-timeout` (or a per-request `timeout`) governs
+it rather than the query timeout. Without a deadline, a run waiting for `--algo-threads`
+blocks until slots free up or it is cancelled (admission is unordered, so single-thread
+calls can slip ahead of multi-thread requests). On a server with a query memory pool, a
+write-back task claims its initial pool grant at startup (waiting up to
+`--query-admission-wait`) and holds it while waiting for threads; at most one write-back
+runs per dataset, so queued write-backs can hold up to one initial grant per dataset and
+cause `503` responses if the pool is tight.
+
+During write-back, the run keeps result term identifiers in memory (up to `--max-rows`)
+and decodes one batch of terms at a time, plus an 8-byte-per-row node-ordered index
+charged to the memory pool so each node's rows write together without full up-front term
+decoding.
 
 Query and task cancellation both reach computation, result preparation and writer
 admission. A supplied timeout and task deadline share the earlier absolute bound from
@@ -3661,22 +3633,19 @@ path, the value and the messages. `V` opens the results of the selected node, an
 edge of the result's path and the value, and marks them. At 390 px the results open as a
 sheet at the bottom of the screen.
 
-**Suggest fix** writes a SPARQL Update for the common constraints: `sh:minCount`,
-`sh:maxCount`, `sh:datatype`, `sh:class`, `sh:in`, `sh:hasValue` and `sh:closed`, and the
-ShEx cardinality, datatype, value set and closed failures. The update holds the result's
-terms, and what the result does not say is a placeholder such as `?value`, which must be
-filled in before **Preview** runs. When the guard's data graph is one named graph, the
-update writes that graph. When it is several graphs, or the default graph of a server
-started with `--union-default-graph`, the update holds `GRAPH ?graph` for the graph that
-holds the triple. A shapes graph or the Validate panel's shapes validate the default
-graph, so on such a server their updates hold `GRAPH ?graph` too. Preview is a dry run of the update
-([C15](specs/C15-write-previews.md)). It lists the changes and says whether the guard
-would still report the result, or that the guard's answer does not tell, as when it
-validated only some of the shapes and the state still has results it did not list. **Run** commits the update only after a preview of the same
-text, and the overlay then validates the drawn nodes again, so a fixed badge goes away.
-**Open in Query** takes the update to the query editor instead. Constraints that are not
-on one predicate, `sh:pattern`, `sh:sparql`, `sh:node` and qualified shapes get no
-suggestion.
+**Suggest fix** drafts a SPARQL Update for common single-predicate constraints
+(`sh:minCount`, `sh:maxCount`, `sh:datatype`, `sh:class`, `sh:in`, `sh:hasValue`,
+`sh:closed`, and the ShEx cardinality, datatype, value-set and closed failures). Missing
+terms appear as placeholders such as `?value` that must be filled in before **Preview**.
+When the guard covers one named graph, the update targets it; for multi-graph guards or
+`--union-default-graph` servers, it wraps triples in `GRAPH ?graph`.
+
+**Preview** runs a dry run ([C15](specs/C15-write-previews.md)), listing changes and
+whether the guard still flags the issue (or noting when partial validation leaves other
+results unchecked). **Run** commits only after previewing the same update text and
+re-validates the drawn nodes; **Open in Query** sends the draft to the query editor
+instead. Complex paths, `sh:pattern`, `sh:sparql`, `sh:node` and qualified shapes receive
+no suggestion.
 
 With the graph's **History** open, the overlay validates the state the slider shows, and it
 pauses while the history plays. It validates the drawn nodes as focus nodes, so a
@@ -3697,22 +3666,19 @@ write-time SHACL guard by default ([Write-time validation](API.md#write-time-val
 and the dataset's `forms` setting can name shapes graphs instead or draft shapes from the
 data. Forms from drafted shapes say that the shapes are not enforced.
 
-The form merges the property shapes of every node shape that applies, groups the fields by
-`sh:group`, orders them by `sh:order` and labels them by `sh:name`, with `sh:description`
-as help. A required field says so in words. Each field's input follows its constraints:
-radio buttons or a select for `sh:in`, a checkbox or a three-way select for booleans, date
-inputs, number inputs with the type's step and the shape's bounds, a text input with a
-language for `rdf:langString`, a text area for long strings, an entity picker for
-`sh:class` and IRIs, and a term input for a field without constraints. A known
-`dash:editor` such as `dash:TextAreaEditor` replaces the choice, and a known `dash:viewer`
-such as `dash:LabelViewer` or `dash:URIViewer` chooses how a read-only value is shown. The
-entity picker searches the instances of the field's `sh:class` by label, through the
-full-text index when the dataset has one. Triples of the resource that no shape describes
-are listed under **Other properties**, read-only. A field the caller's grants hide is
-absent, and one marked `dash:readOnly`, protected from the caller's writes or with a
-complex path is read-only with the reason beside it. A value stored in a graph the caller
-cannot write is shown read-only inside an editable field. Date-time values keep their
-timezone when edited, and a new `xsd:dateTimeStamp` takes the browser's offset.
+The form merges property shapes from every applicable node shape, groups fields by
+`sh:group`, orders them by `sh:order` and labels them by `sh:name` with `sh:description`
+help text. Inputs adapt to constraints (radio buttons or selects for `sh:in`, checkboxes
+or three-way selects for booleans, date/number inputs with type steps and bounds,
+language-tagged text for `rdf:langString`, text areas for long strings, full-text-backed
+entity pickers for `sh:class` and IRIs, and generic term inputs otherwise), and honor
+known `dash:editor` and `dash:viewer` overrides.
+
+Unshaped triples appear read-only under **Other properties**. Hidden fields are omitted,
+and `dash:readOnly`, write-protected or complex-path fields are shown read-only with the
+reason beside them (values in unwritable graphs stay read-only inside editable fields).
+Date-time values preserve their timezone on edit, and new `xsd:dateTimeStamp` values take
+the browser's offset.
 
 A field whose property shape names `sh:node` shows each blank-node value as a nested form
 of that shape, so a SKOS-XL label or an address is edited in place under its resource.
@@ -3735,22 +3701,17 @@ empty form at `/ui/datasets/{name}/edit?class=…`. The first save mints the res
 from the `forms` setting's `newIri`, a `urn:uuid:` IRI by default, writes its `rdf:type`
 with the values, and opens the form of the new resource.
 
-The browser checks values as they are typed: XSD lexical forms, patterns with their flags,
-lengths, numeric and date ranges, allowed values, counts, `sh:languageIn` and
-`sh:uniqueLang`. A problem shows under its field, and the bar at the bottom counts problems
-and changes. **Preview** sends the change to the server, which runs it as a dry run and
-validates the touched resources against every constraint of the shapes, including
-`sh:class`, `sh:node` and SHACL-SPARQL. Its results appear under their fields, and the
-preview lists the triples the save would remove and add. Checks follow the shapes beyond
-a fixed graph radius. If complete discovery exceeds its allowance, the preview refuses
-rather than presenting partial conformance. A refused recheck invalidates earlier
-approval of the same changes. **Save** commits the change as one
-commit with the message typed beside it. With a guard in `reject` mode, Save checks first
-and writes nothing when the guard would reject the change. Otherwise a save with problems
-asks once more with **Save with problems**. After a failed save, an error summary at the
-top of the form lists every problem, and each entry moves the focus to its field. The
-fields are disabled while a save and the reload after it run, so nothing typed meanwhile
-is lost.
+The browser validates values live as you type (XSD lexical forms, patterns, lengths,
+numeric and date ranges, allowed values, counts, `sh:languageIn` and `sh:uniqueLang`),
+reporting issues inline and totaling problems and changes in the footer bar. **Preview**
+runs a server dry run covering all constraints — including `sh:class`, `sh:node` and
+SHACL-SPARQL — following shapes beyond a fixed radius and refusing if full discovery
+exceeds its allowance (invalidating any earlier approval).
+
+**Save** writes one commit with the entered message. Under a `reject` guard, Save checks
+first and blocks failing writes; otherwise a save with problems asks to confirm via
+**Save with problems**. Failed saves show a clickable error summary at the top of the
+form, and fields lock during save and reload so in-progress edits are not lost.
 
 Saves go to `main` when the caller may write it and it is not protected. When `main` is
 protected, or the `forms` setting's `saveTo` is `branch`, the first save creates the
@@ -3876,8 +3837,17 @@ an MCP host such as Claude Desktop, Claude Code or an IDE agent:
 ```sh
 sparkles mcp --loc /data/books                 # a database directory (name: books)
 sparkles mcp --loc books=/data/books --loc films=/data/films
+sparkles mcp --loc /data/books --model-config models.json --model-secret openai=env:OPENAI_API_KEY
 sparkles mcp --data a.ttl b.nt --name demo     # files, in one in-memory dataset
 ```
+
+To enable the `ask` tool in a standalone stdio session, open a persistent database with
+`--loc` whose `assistant.json` sets `"enabled": true`, and pass `--model-config` (with
+any `--model-secret` sources its providers name). An in-memory `--data` dataset starts
+with its assistant disabled, and `--url` refuses `--model-config` and `--model-secret`
+because a bridged server uses its own model configuration. Without `--allow-update`, the
+session runs read-only and keeps Ask usage and retry state in memory without writing
+`asks.json`.
 
 Configure the host in `claude_desktop_config.json`, or in a project's `.mcp.json` for
 Claude Code. For Claude Code, `claude mcp add sparkles -- sparkles mcp --loc /data/books`
@@ -3943,6 +3913,11 @@ The tools are read-only unless the operator turns on the write tool:
   citation names the fact's graph and, when a reifier records it, the source, time,
   author, confidence and quote. Superseded facts are listed on request, and facts that
   two graphs disagree on are marked.
+* `ask` answers a plain-language question using the server's checked, self-repairing
+  question-to-SPARQL pipeline over the caller's view. It is listed only while model
+  providers are configured and a visible dataset has an enabled assistant with an allowed
+  draft pair, and carries `openWorldHint: true` because prompts go to configured model
+  providers.
 * `validate_shacl` and `validate_shex` check a shapes graph, or a ShEx schema with a
   shape map, against a snapshot. They return counts and the first 20 results with node,
   shape and reason. They do not follow imports. `validate_shacl` takes the shapes in
@@ -4392,27 +4367,21 @@ is less than 10 minutes old unless the session's end hook named it. `status` war
 Claude Code transcripts that its `cleanupPeriodDays` will delete soon. `setup
 --transcripts` adds `--transcripts` to the session end hook.
 
-Besides Claude Code and Codex, the import finds the transcripts of Gemini CLI
-(`~/.gemini/tmp/<project hash>/chats`), Cursor
-(`~/.cursor/projects/<project>/agent-transcripts`), the GitHub Copilot CLI
-(`~/.copilot/session-state/<session>/events.jsonl`, for sessions that ran in the
-project) and Aider (`.aider.chat.history.md` in the project). `GEMINI_CLI_HOME` and
-`COPILOT_HOME` move the first and the last of those directories, and
-`AIDER_CHAT_HISTORY_FILE` names Aider's file. The adapter names `gemini-cli`, `cursor`,
-`copilot` and `aider` select them, and a sync without a name reads all of them. Their
-instruction files are the generic adapter's. Gemini CLI, Cursor and Copilot do not
-document their log formats, so a version that writes something new may leave turns out.
-Aider's file does not say which lines are the person's and which are the model's. A reply
-that contains a level-4 Markdown heading is read as a turn of the person, and a reply line
-that starts with `> ` is read as one of Aider's notices and dropped. Cursor's text form
-starts a new turn at any line that begins with `A:` or `user:`, which can also happen
-inside an answer. Aider's log has no session id, so the session is named after the file
-and a short hash of its path below the repository, and the histories in a project's
-directory and in its root are two sessions.
-`--transcript FILE` imports one file, wherever it is. A file that none of these
-adapters recognizes is read by the generic adapter, which understands JSON lines or a
-JSON value of messages with a speaker and a text, Markdown with `## User` and
-`## Assistant` headings, and text with `User:` and `Assistant:` lines.
+Besides Claude Code and Codex, transcript import discovers Gemini CLI
+(`~/.gemini/tmp/<project hash>/chats`, override `GEMINI_CLI_HOME`), Cursor
+(`~/.cursor/projects/<project>/agent-transcripts`), GitHub Copilot CLI
+(`~/.copilot/session-state/<session>/events.jsonl`, override `COPILOT_HOME`) and Aider
+(`.aider.chat.history.md`, override `AIDER_CHAT_HISTORY_FILE`). Adapter names
+`gemini-cli`, `cursor`, `copilot` and `aider` select individual harnesses; running without
+a name reads all of them, while their instruction files use the generic adapter.
+
+Because Gemini CLI, Cursor and Copilot do not document their log formats, newer releases
+may omit turns. Aider's markdown log lacks explicit speaker tags, so level-4 headings mark
+user turns, `> ` lines are dropped as notices, and session IDs hash the file path below
+the repository. Cursor's text format splits turns on lines starting with `A:` or `user:`.
+`--transcript FILE` imports a single file from anywhere; unrecognized files fall back to
+the generic adapter (JSONL/JSON speaker-text messages, `## User` / `## Assistant`
+Markdown, or `User:` / `Assistant:` text).
 
 ### Reviewing imported memory in the terminal
 
@@ -4582,43 +4551,30 @@ directory of `--pdf-ocr-models`. It loads PDFium from `--pdfium-lib` and ONNX Ru
 from `--onnxruntime-lib`, or from their usual library paths, and never downloads a model.
 `--pdf-workers` (2 by default) limits the conversions that run at once.
 
-On Linux the server converts each PDF and Office file in a child process of its own,
-started from the same `sparkles` binary. The child runs under an address-space limit of
-`--convert-memory` MiB, 2048 by default and at least 256, a CPU-time limit and, without
-OCR, a file-size limit of zero. The server kills it when the task's deadline passes, so
-a file that makes a converter loop or allocate without end fails with
-`conversion-timeout` or `conversion-failed` and frees its worker slot. The child gets a
-cleared environment without the server's keys and tokens, but it runs as the server's
-user, so this limits resources and is not a sandbox. The child parses with at most four
-threads and lets glibc's malloc keep at most two arenas, so the threads fit under the
-limit whatever the host's core count. When a child ends without a result, the error
-quotes the end of what it wrote to its standard error, such as a panic's message.
-Starting the child adds about 10 ms to each document. The server starts one child when it starts. If that child cannot set
-its limits, for example under a system call filter that forbids them, the server logs
-the reason and refuses PDF and Office files with status 500 until it is restarted with
-`--convert-in-process`. That flag converts on threads of the server instead, where a
-conversion that overruns its deadline keeps its worker slot until it ends and its memory
-is bounded only by the converters' own limits. On macOS and other platforms, which do
-not enforce the address-space limit, conversions always run on threads. With OCR, give
-`--convert-memory` at least 4096, because PDFium and ONNX Runtime map their libraries
-and models into the child's address space. OCR in a child has not been measured.
+On Linux, each PDF and Office conversion runs in a dedicated child process spawned from
+`sparkles` (~10 ms startup overhead) under an address-space cap (`--convert-memory`,
+default 2,048 MiB, minimum 256 MiB; raise to at least 4,096 MiB for OCR), a CPU-time limit
+and (without OCR) a zero file-size limit. The child inherits a cleared environment without
+server secrets, caps parsing at four threads and two glibc malloc arenas, and is killed on
+task deadline (`conversion-timeout` or `conversion-failed`, quoting stderr tail on crash).
+It runs as the server user, so this provides resource bounds rather than a security
+sandbox.
 
-Word, PowerPoint and OpenDocument files (`.docx`, `.pptx`, `.odt`, `.odp`) need a build
-with the `office` feature, which is on by default. The server converts them to Markdown
-with their headings, lists, tables and footnotes. Each slide of a presentation starts
-with a `<!-- Page N -->` marker and a `# Slide N: Title` heading, so the review page
-shows the slide of each fact, and the speaker notes follow the slide's text. A file
-that is encrypted or in an old binary format (`.doc`, `.ppt`, `.xls`) is refused. An
-Excel or OpenDocument spreadsheet (`.xlsx`, `.ods`) gets a mapping draft for each
-visible sheet, up to 20 sheets, with the sheet as CSV to upload with its mapping. Without
-a `base`, the rows of each sheet get their own namespace that includes the sheet's
-position, so two sheets never share one. A hyperlink whose target is longer than 2,048
-bytes keeps its text and loses its URL. Hidden sheets, hidden
-slides and hidden Word text are left out, while the hidden rows and columns of a visible
-sheet are read, because they are data. These conversions share
-the `--pdf-workers` limit and the child processes with PDF conversion. A conversion
-holds at most 128 MiB of output besides the file and its XML trees, so a small file
-cannot ask for more memory, and a file that would is refused with `too-large`.
+At startup the server probes one child process; if the environment blocks resource limits
+(for example under a strict seccomp filter), PDF and Office uploads return `500` until
+restarted with `--convert-in-process` (also used on macOS and other platforms without
+address-space enforcement). In-process conversions run on server threads where deadline
+overruns hold worker slots until completion. OCR in a child process has not been measured.
+
+Word, PowerPoint and OpenDocument files (`.docx`, `.pptx`, `.odt`, `.odp`) require the
+`office` feature (on by default) and convert to Markdown with headings, lists, tables and
+footnotes; slides add `<!-- Page N -->` markers, `# Slide N: Title` headings and speaker
+notes. Encrypted or legacy binary formats (`.doc`, `.ppt`, `.xls`) are refused. Excel and
+OpenDocument spreadsheets (`.xlsx`, `.ods`) generate per-sheet CSVW mapping drafts for up
+to 20 visible sheets, each with a distinct default namespace. Hidden sheets, slides and
+Word text are omitted while hidden rows/columns of visible sheets are preserved; hyperlinks
+over 2,048 bytes keep only their text. Office conversions share `--pdf-workers` and child
+processes with PDF, capping output at 128 MiB (`too-large` above that).
 
 When the model drafts a mapping that maps a column to IRIs of a class the dataset has,
 the draft links that column's values to the existing entities. The most frequent values
@@ -4811,6 +4767,23 @@ tokens used. `--json` prints one JSON object with every attempt, the result, the
 summary and the usage of each model call, and `--events` prints each step as a JSON line
 as it happens. `--no-run` stops after the check, and `--no-summary` leaves the summary
 out.
+
+`--review-policy POLICY` and `--matching-policy POLICY` pass evidence claim policies to
+the asking pipeline, with the same checks and JSON output as `POST /{ds}/ask`
+([C25](specs/C25-evidence-and-assessments.md#recall-and-ask-with-claims)). Both options
+require a database whose configuration history is activated and refuse `--mode global`,
+unknown policies or wrong policy kinds before any model call. For policy-bearing
+questions, the summary step enforces the dataset's `send`, `sendByProvider` and
+`rowsForSummary` settings even when `--pair summarize=...` is given. With
+`--review-policy`, the summary step sees claim occurrences about the linked entities and
+may cite them as `[c1]`, and the human output prints a `# claims` section below the
+summary. With `--matching-policy`, linked entities expand across the policy's resolution
+map and the human output prints a `# resolution` line. When those human sections use
+compacted IRIs, a `# prefixes` line follows them with the matching namespace bindings. In
+`--json` and `--questions`, `--review-policy` adds `claims` (and `summary.claimCitations`
+when a summary runs) and `--matching-policy` adds `resolution`. In `--events`, those
+members appear on the `summary` event when a summary runs or on a terminal `policy` event
+when no summary runs.
 
 `--questions FILE` asks every question of a JSON-lines file in place of the question
 argument, or of standard input with `-`. Each line is `{"id", "question",
@@ -5572,9 +5545,7 @@ opposite. `sparkles ask --mode global` and `"mode": "global"` in `POST /{ds}/ask
 same from the command line and the API. A caller who may not read the reports gets an
 answer from the data and a note that the summaries are unavailable.
 
-Agents read the reports with the MCP tool `community_reports`, and `recall` with
-`"communities": true` adds the report of each seed's community after its facts. A
-project brief lists the best rated reports of the coarsest level.
+Agents read the reports with the MCP tool `community_reports`, which also accepts `reviewPolicy` to restrict selection to reports built under that policy and `matchingPolicy` to resolve identities referenced by their findings. Global `POST /{ds}/ask` accepts the same two options. `recall` with `"communities": true` adds the report of each seed's community after its facts. A project brief lists the best rated reports of the coarsest level.
 
 ## Embedding the library
 
@@ -5791,25 +5762,21 @@ that serves answers to its own consumers can describe each one as a
 `sparkles::sparql::Consumer` and let `sparkles::sparql::choose_execution` pick the mode,
 as the server, the CLI and the bindings do.
 
-Python has `Dataset.select_cursor` and `Dataset.graph_cursor`. A Python cursor can be
-iterated, closed with `close()`, used as a context manager, asked for stats and
-serialized directly. When a Python cursor fails, during iteration or in `serialize()`,
-its status becomes `failed` and every later `next()` raises `InvalidInputError`, so a
-loop cannot mistake it for a complete answer. `serialize()` responds to Ctrl-C as a
-query does. Iteration decodes ahead of the row it returns, up to 255 further rows and
-until they pass one mebibyte of text. It holds those rows, about one mebibyte and one
-row at most, outside the query's memory budget until they are read. `Dataset.query` and `Dataset.select` still run eagerly, because their
-results are collected values whose iteration cannot fail. Node runs `query`, `select`,
-`construct` and `queryToStream` in automatic mode by default and accepts
-`execution: 'eager' | 'streaming' | 'auto'` in its query options. A streamed Node result
-has no `size` and can reject while it is read. Queries in a Node transaction run eagerly.
-JVM queries also run in automatic mode by default, and Jena reads a streamed SELECT in
-batches through its usual result sets and graph adapters. Setting the context symbol
-`Sparkles.STREAMING_EXECUTION` to false runs every query eagerly, and true streams every
-SELECT. A streamed result can throw `QueryCancelledException` or another query error from
-`hasNext()` partway through, as any ARQ result set can. Queries in a write transaction run
-eagerly, and reading a result after its transaction has ended throws
-`JenaTransactionException`. Close result sets and iterators when stopping early.
+* **Python:** `Dataset.select_cursor` and `Dataset.graph_cursor` return cursors that
+  support iteration, `close()`, context managers, stats and direct `serialize()` (which
+  responds to Ctrl-C). Iteration decodes up to 255 rows ahead (capped at ~1 MiB of text
+  outside the query budget). If a cursor fails during iteration or serialization, its
+  status becomes `failed` and later `next()` calls raise `InvalidInputError`.
+  `Dataset.query` and `Dataset.select` stay eager because they return collected values.
+* **Node.js:** `query`, `select`, `construct` and `queryToStream` default to automatic
+  mode and accept `execution: 'eager' | 'streaming' | 'auto'`. Streamed results omit
+  `size` and can reject during consumption; queries inside a transaction run eagerly.
+* **JVM (Jena):** Queries default to automatic mode and stream SELECT batches through
+  standard Jena result sets and graph adapters (`Sparkles.STREAMING_EXECUTION` forces
+  `false` for eager or `true` to stream every SELECT). Streamed results can throw
+  `QueryCancelledException` or another query error from `hasNext()`. Queries in write
+  transactions run eagerly, and reading after a transaction ends throws
+  `JenaTransactionException`. Close result sets and iterators when stopping early.
 
 ### Registered scalar functions
 
@@ -5855,7 +5822,11 @@ other error aborts the query. Such a failure also keeps a write transaction that
 query belongs to from committing, even if the application catches the query error. A
 callback cannot run nested queries or writes on the same dataset or its branches.
 Callbacks are trusted application code and must check for cancellation during their
-own long-running work.
+own long-running work. A callback sees the rows of its own calls, and the engine
+promises nothing about how the query divides its other work into batches. A callback
+that reads state another part of the query also touches, such as a SERVICE target in
+the same process, its `work` hook or its cancellation checks, can see batch lengths
+change between releases and optimizer settings.
 
 The default volatility is `Volatile`. Queries that call registered functions skip the
 result cache. The batch interface receives one row of arguments per call. Registered
@@ -6034,7 +6005,7 @@ RDFS on read calls a registered function only where the query writes it
 ([API.md](API.md#rdfs-on-read)). A schema that declares the predicate a subproperty of
 another, or gives it a domain or range, adds no call, and the seeds of query-time
 reasoning are not read through one. An OWL 2 QL ontology that relates the predicate to
-another property can still add a call, which roadmap item 1205 covers. A callback
+another property can still add a call ([ROADMAP.md](ROADMAP.md), item 1205). A callback
 reached from a query that was not prepared for it fails that query with an error.
 
 The default volatility is `Volatile`. Queries that call registered callbacks skip the
@@ -6287,7 +6258,7 @@ update or commit has already succeeded, its successful result is returned even i
 cancellation races its acknowledgement. Other native errors keep their existing classes
 and fields.
 
-Further async administration and bulk entry points remain under roadmap item 58.
+Further async administration and bulk entry points remain under [ROADMAP.md](ROADMAP.md) (item 58).
 
 ### Datasets, loading and queries
 
@@ -6531,7 +6502,8 @@ schedule, and `sparkles.preview_schedule` previews one.
 A history diff iterates over `(op, Quad)` pairs, where `op` is `"+"` or `"-"`.
 `history.changes(after)` returns a fixed page of commit changes, and each commit change
 iterates over the same pairs. Snapshots, commits and backup records are immutable.
-`settings` holds the compaction, DESCRIBE, quota, retention and change-log settings.
+`branches.update(name, note=None)` clears an existing branch note, whereas omitting `note`
+leaves it unchanged. `settings` holds the compaction, DESCRIBE, quota, retention and change-log settings.
 `reasoning` holds materialization, its status and diagnostics, and the RDFS
 configuration. `validation` holds SHACL, ShEx and the write guard, and `indexes.geo`
 controls spatial indexing. These handles replace the earlier flat administration
@@ -6772,7 +6744,7 @@ These two new conveniences throw `JenaTransactionException` on a dataset returne
 `at()` or during an active read or write transaction. The guard runs before native work
 or flushing buffered writes. For retained committed history, call them on the live
 dataset with `OntologyRead.at` instead. They do not read uncommitted changes. Wrapper-source
-integration remains in roadmap item 588; existing ontology methods retain their behavior.
+integration remains in [ROADMAP.md](ROADMAP.md) (item 588); existing ontology methods retain their behavior.
 See the [ontology API](API.md#ontology) for read states, provenance and paging contracts.
 
 ### Opening a Jena dataset

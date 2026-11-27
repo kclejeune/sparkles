@@ -225,7 +225,7 @@ impl Tools<'_> {
             .collect();
         Ok(Outcome::Structured(json!({
             "dataset": ds.name,
-            "commit": r.snap.commit,
+            "commit": r.commit(),
             "predicate": predicate,
             "ranking": ranking,
             "hits": hits,

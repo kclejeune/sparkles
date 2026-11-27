@@ -322,35 +322,73 @@ fn a_symlinked_generation_is_checked_as_the_generation_it_names() {
     );
 }
 
-/// A clone copies the registry, whose history root names an `evidence-history`
-/// closure that the clone does not carry. Cloning an activated store therefore
-/// refuses before it writes anything (roadmap item 764).
+/// Cloning an activated store establishes a fresh destination configuration-history
+/// lineage with a format 2 `evidence-history/origin.json` provenance closure and
+/// records reader 11, while keeping the source unchanged and independent.
 #[test]
-fn cloning_an_activated_store_refuses_before_writing() {
+fn cloning_an_activated_store_establishes_destination_root_and_provenance() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("db");
     drop(ordinary(&root));
     activate(&root);
     let store = Store::open(&root, StoreOptions::default()).unwrap();
     let before = std::fs::read(root.join("managed.json")).unwrap();
+    let preparation = Preparation::new(Control::none(), 64 << 20).unwrap();
+    let src_view = store
+        .evidence_view(&sparkles_core::history::At::Head, &preparation)
+        .unwrap();
     let absent = temporary.path().join("absent");
     let empty = temporary.path().join("empty");
     std::fs::create_dir(&empty).unwrap();
     for destination in [&absent, &empty] {
-        let refused = store.clone_to(destination, &Default::default());
-        let error = refused.expect_err("an activated store must not clone");
-        assert_eq!(error.code(), "unsupported", "{error}");
-        assert!(
-            error.to_string().contains("configuration history"),
-            "{error}"
+        let report = store.clone_to(destination, &Default::default()).unwrap();
+        assert_eq!(
+            reader(destination),
+            u64::from(sparkles_core::commit::DATASET_READER)
         );
+        assert!(destination.join("evidence-history/origin.json").is_file());
+        let origin = json(&destination.join("evidence-history/origin.json"));
+        assert_eq!(origin["format"].as_u64(), Some(2));
+        assert_eq!(origin["datasetId"], report.dataset_id.to_string());
+        assert!(origin["destination"]["creationCommit"].is_string());
+        assert_eq!(origin["sources"].as_array().unwrap().len(), 1);
+        let check = sparkles_core::check::check(
+            destination,
+            &sparkles_core::check::CheckOptions { quick: false },
+        )
+        .unwrap();
+        assert_eq!(check.errors, 0, "{check:?}");
+        let cloned = Store::open(destination, StoreOptions::default()).unwrap();
+        let head = cloned
+            .evidence_view(&sparkles_core::history::At::Head, &preparation)
+            .unwrap();
+        let at0 = cloned
+            .evidence_view(&sparkles_core::history::At::Commit(0), &preparation)
+            .unwrap();
+        assert_eq!(head.configuration(), at0.configuration());
+        assert_eq!(head.configuration().dataset_id(), cloned.dataset_id());
+        assert_ne!(head.configuration(), src_view.configuration());
+        insert(&cloned, 100);
+        let at1 = cloned
+            .evidence_view(&sparkles_core::history::At::Commit(1), &preparation)
+            .unwrap();
+        assert_eq!(at1.configuration(), head.configuration());
     }
-    assert!(!absent.exists());
-    assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
-    let memory = store.clone_to_memory(&Default::default(), StoreOptions::default());
+    let (memory, mem_report) = store
+        .clone_to_memory(&Default::default(), StoreOptions::default())
+        .unwrap();
+    let mem_head = memory
+        .evidence_view(&sparkles_core::history::At::Head, &preparation)
+        .unwrap();
+    assert_eq!(mem_head.configuration().dataset_id(), mem_report.dataset_id);
+    assert_ne!(mem_head.configuration(), src_view.configuration());
+    insert(&memory, 200);
     assert_eq!(
-        memory.err().expect("nor clone into memory").code(),
-        "unsupported"
+        memory
+            .evidence_view(&sparkles_core::history::At::Commit(1), &preparation)
+            .unwrap()
+            .configuration(),
+        mem_head.configuration()
     );
     // the source is unchanged and still writable
     assert_eq!(std::fs::read(root.join("managed.json")).unwrap(), before);

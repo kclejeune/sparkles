@@ -229,6 +229,7 @@ describe('source-pinned inferred regions', () => {
           consistency: 'consistent',
           excludedCount: 0,
           incompleteCount: 0,
+          unmappedCount: 0,
         },
         entity: about
           ? {
@@ -236,6 +237,7 @@ describe('source-pinned inferred regions', () => {
               present: true,
               representative: about,
               unsatisfiable: false,
+              incomplete: false,
               children: about === 'urn:R' ? 1 : 0,
               parents: 1,
               equivalenceCount: 1,
@@ -404,6 +406,7 @@ describe('source-pinned inferred regions', () => {
           consistency: 'consistent',
           excludedCount: 0,
           incompleteCount: 0,
+          unmappedCount: 0,
         },
         entity: about
           ? {
@@ -411,6 +414,7 @@ describe('source-pinned inferred regions', () => {
               present: true,
               representative: canonical,
               unsatisfiable: false,
+              incomplete: false,
               children: canonical === root ? 1 : 0,
               parents: 1,
               equivalenceCount: canonical === 'urn:A' ? 2 : 1,
@@ -598,5 +602,147 @@ describe('source-pinned inferred regions', () => {
     expect(calls[0].url.searchParams.get('part')).toBe('roots');
     expect(calls[0].init.method ?? 'GET').toBe('GET');
     model.drop();
+  });
+  it('tracks incomplete singleton classes from entity status without relying on row-level flags or alias-only group flags', async () => {
+    const result: ClassificationResult = {
+      resultId: 'kept-incomplete',
+      classifiedCommit: 7,
+      boundStoreId: 'branch',
+      familyId: 'family',
+      inputFingerprint: 'input',
+      sourceFingerprint: 'source',
+      contentFingerprint: 'content',
+      imports: 'dataset',
+      mode: 'lenient',
+      assertions: false,
+      elOnly: false,
+      partialRequested: false,
+      expansion: 'cautious',
+      sourceCounts: { requestedGraphs: 1, resolvedGraphs: 1, imports: 0, warnings: 0 },
+      capabilities: ['namedClassRoots', 'namedClassDirectChildren'],
+      justifications: 'unavailable',
+    };
+    server((call) => {
+      const q = call.url.searchParams;
+      const part = q.get('part') as 'roots' | 'children';
+      const about = q.get('about');
+      const rows =
+        part === 'roots'
+          ? [
+              {
+                iri: 'urn:OpenSingleton',
+                label: 'OpenSingleton',
+                labelLang: 'en',
+                children: 1,
+                parents: 1,
+                equivalenceCount: 1,
+              },
+              {
+                iri: 'urn:GroupedRoot',
+                label: 'GroupedRoot',
+                labelLang: 'en',
+                children: 1,
+                parents: 1,
+                equivalenceCount: 2,
+              },
+              {
+                iri: 'urn:OmittedCount',
+                label: 'OmittedCount',
+                labelLang: 'en',
+                children: 1,
+                parents: 1,
+                equivalenceCount: 2,
+              },
+              {
+                iri: 'urn:NullCount',
+                label: 'NullCount',
+                labelLang: 'en',
+                children: 1,
+                parents: 1,
+                equivalenceCount: 2,
+              },
+            ]
+          : [
+              {
+                iri: 'urn:Child',
+                label: 'Child',
+                labelLang: 'en',
+                children: 0,
+                parents: 1,
+                equivalenceCount: 1,
+              },
+            ];
+      return {
+        commit: 7,
+        status: 'available',
+        result,
+        reason: null,
+        activity: null,
+        staleCommit: null,
+        outcome: {
+          tier: 'el',
+          partial: false,
+          complete: false,
+          consistency: 'unknown',
+          excludedCount: 1,
+          incompleteCount: 2,
+          unmappedCount: 0,
+        },
+        entity: about
+          ? about === 'urn:OmittedCount'
+            ? {
+                iri: about,
+                present: true,
+                representative: null,
+                unsatisfiable: false,
+                incomplete: true,
+              }
+            : about === 'urn:NullCount'
+              ? {
+                  iri: about,
+                  present: true,
+                  representative: null,
+                  unsatisfiable: false,
+                  incomplete: true,
+                  equivalenceCount: null,
+                }
+              : {
+                  iri: about,
+                  present: true,
+                  representative: about,
+                  unsatisfiable: false,
+                  incomplete: true,
+                  children: 1,
+                  parents: 1,
+                  equivalenceCount: about === 'urn:GroupedRoot' ? 2 : 1,
+                }
+          : null,
+        page: {
+          part,
+          about,
+          offset: 0,
+          limit: 100,
+          total: rows.length,
+          items: rows,
+          nextOffset: null,
+        },
+      };
+    });
+    const model = new InferredTree();
+    model.reset(view, 'Class');
+    await model.tree.load(null);
+    expect(model.incomplete).toEqual({});
+    await model.tree.load('urn:OpenSingleton');
+    expect(model.incomplete['urn:OpenSingleton']).toBe(true);
+    await model.tree.load('urn:GroupedRoot');
+    expect(model.incomplete['urn:GroupedRoot']).toBeUndefined();
+    await model.tree.load('urn:OmittedCount');
+    expect(model.error).toBeNull();
+    expect(model.incomplete['urn:OmittedCount']).toBeUndefined();
+    await model.tree.load('urn:NullCount');
+    expect(model.error).toBeNull();
+    expect(model.incomplete['urn:NullCount']).toBeUndefined();
+    model.drop();
+    expect(model.incomplete).toEqual({});
   });
 });

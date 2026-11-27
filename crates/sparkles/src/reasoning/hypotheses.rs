@@ -30,6 +30,12 @@ fn replace(term: &Term, placeholders: &HashMap<String, Term>) -> Term {
 }
 
 fn bounded(error: &Error) -> bool {
+    if matches!(
+        error,
+        Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::ServerMemory
+    ) {
+        return false;
+    }
     matches!(
         error.code(),
         "reasoning-budget" | "budget-exceeded" | "timeout" | "storage-full"
@@ -121,53 +127,76 @@ pub fn check_consistency(
         });
         let mut program = analysis::program(dataset, &options)?;
         let view = analysis::view(snapshot, &options)?;
-        let graphs = analysis::input_graphs(&view, &program, &options);
-        let copy_options = crate::store::StoreOptions {
-            max_memory_bytes: options.max_memory.map(|bytes| (bytes / 8) as u64),
-            result_cache_bytes: 0,
-            service_cache_bytes: 0,
-            ..Default::default()
-        };
-        let base = Dataset::from_store(copy_visible(
-            dataset.store(),
+        let pool = dataset.state().pool.clone();
+        let (graphs, graphs_bytes) = analysis::input_graphs_controlled(
             &view,
-            copy_options.clone(),
+            &program,
+            &options,
             &control,
-            |quad| Ok(graphs.contains(&quad[3])),
-        )?);
-
+            options.max_memory,
+            pool.as_ref().map(|p| p.work_parent()),
+        )?;
+        let after_graphs = options
+            .max_memory
+            .map(|limit| limit.saturating_sub(graphs_bytes));
         let graph = loop {
+            control.check()?;
             let graph = NamedNode::new_unchecked(format!(
                 "urn:x-sparkles:hypothesis:{}",
                 uuid::Uuid::new_v4()
             ));
-            if view.lookup_iri(graph.as_str()).is_none() {
+            let mut admit = |bytes: usize| -> Result<()> {
+                if let Some(limit) = after_graphs
+                    && bytes > limit
+                {
+                    control.check()?;
+                    return Err(analysis::budget(format!(
+                        "checking a hypothesis graph name needs {bytes} bytes, over its memory limit of {limit}"
+                    )));
+                }
+                Ok(())
+            };
+            let mut check = || control.check();
+            if view
+                .lookup_iri_controlled(graph.as_str(), &mut admit, &mut check)?
+                .is_none()
+            {
                 break graph;
             }
         };
+        let (data_graphs, names_bytes) = analysis::graph_refs_controlled(
+            &view,
+            &graphs,
+            &[sparkles_reasoner::GraphRef::Named(graph.as_str().into())],
+            after_graphs,
+            pool.as_ref().map(|p| p.work_parent()),
+            &control,
+        )?;
         program.inputs = sparkles_reasoner::Inputs {
-            data_graphs: graphs
-                .iter()
-                .filter_map(|id| {
-                    if *id == crate::id::Id::DEFAULT_GRAPH {
-                        Some(sparkles_reasoner::GraphRef::Default)
-                    } else {
-                        match view.term(*id) {
-                            Some(Term::NamedNode(node)) => {
-                                Some(sparkles_reasoner::GraphRef::Named(node.into_string()))
-                            }
-                            _ => None,
-                        }
-                    }
-                })
-                .chain(std::iter::once(sparkles_reasoner::GraphRef::Named(
-                    graph.as_str().into(),
-                )))
-                .collect(),
+            data_graphs,
             ontology_graphs: Vec::new(),
             imports: sparkles_reasoner::ImportMode::None,
             location_mapping: Default::default(),
         };
+        let copy_options = crate::store::StoreOptions {
+            max_memory_bytes: options.max_memory.map(|bytes| {
+                (bytes.saturating_sub(graphs_bytes.saturating_add(names_bytes)) / 8) as u64
+            }),
+            result_cache_bytes: 0,
+            service_cache_bytes: 0,
+            ..Default::default()
+        };
+        let base = Dataset::from_store_with(
+            copy_visible(dataset.store(), &view, copy_options, &control, |quad| {
+                Ok(graphs.contains(&quad[3]))
+            })?,
+            crate::DatasetOptions {
+                pool: pool.clone(),
+                ..Default::default()
+            },
+        );
+        drop(graphs);
+
         let checks: Vec<_> = CHECKS
             .iter()
             .filter(|check| check.severity == Severity::Inconsistency)
@@ -176,9 +205,18 @@ pub fn check_consistency(
         let base_snapshot = base.store().snapshot();
         let mut private_options = options.clone();
         private_options.access = None;
+        private_options.max_memory = options
+            .max_memory
+            .map(|limit| limit.saturating_sub(names_bytes));
         private_options.max_inferred = private_options
             .max_inferred
             .or(Some(reasoner.max_derived()));
+        let candidate_copy_options = crate::store::StoreOptions {
+            max_memory_bytes: private_options.max_memory.map(|bytes| (bytes / 8) as u64),
+            result_cache_bytes: 0,
+            service_cache_bytes: 0,
+            ..Default::default()
+        };
         let before = analysis::analyze(
             &base,
             &base_snapshot,
@@ -200,13 +238,19 @@ pub fn check_consistency(
             .all(|check| check_complete(&before.diagnostics, check));
         for hypothesis in hypotheses.iter_mut() {
             control.check()?;
-            let candidate = Dataset::from_store(copy_visible(
-                base.store(),
-                &base_snapshot,
-                copy_options.clone(),
-                &control,
-                |_| Ok(true),
-            )?);
+            let candidate = Dataset::from_store_with(
+                copy_visible(
+                    base.store(),
+                    &base_snapshot,
+                    candidate_copy_options.clone(),
+                    &control,
+                    |_| Ok(true),
+                )?,
+                crate::DatasetOptions {
+                    pool: pool.clone(),
+                    ..Default::default()
+                },
+            );
             (|| -> Result<()> {
                 let mut transaction = candidate
                     .store()

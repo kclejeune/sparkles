@@ -78,6 +78,34 @@ pub const FUNCTIONS: &[&str] = &[
     "maxZ",
 ];
 
+/// Whether the dispatch below can charge a serialized geometry for the rest of
+/// the query through `Call::geometry`, including Jena's spatial functions.
+pub(crate) fn charges_geometry_result(iri: &str) -> bool {
+    matches!(
+        iri.strip_prefix(GEOF),
+        Some(
+            "buffer"
+                | "metricBuffer"
+                | "convexHull"
+                | "boundingCircle"
+                | "concaveHull"
+                | "envelope"
+                | "boundary"
+                | "centroid"
+                | "intersection"
+                | "union"
+                | "difference"
+                | "symDifference"
+                | "transform"
+                | "asWKT"
+                | "asGeoJSON"
+                | "asGML"
+                | "asKML"
+                | "geometryN"
+        )
+    ) || super::spatialf::charges_geometry_result(iri)
+}
+
 /// Evaluate the GeoSPARQL function `iri`; `None` when `iri` is not one.
 pub fn call(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> Option<EvalResult<Val>> {
     if iri.starts_with(super::vocab::SPATIALF) {
@@ -180,10 +208,12 @@ impl Call<'_, '_> {
 
     /// The datatype of argument `i` when it is a GeoJSON literal, else WKT (the
     /// datatype of a geometry result).
-    fn datatype(&self, i: usize) -> &'static str {
+    fn datatype(&self, i: usize) -> EvalResult<&'static str> {
         match self.value(i) {
-            Ok(Value::Other { dt, .. }) => write::result_datatype(&dt),
-            _ => WKT_LITERAL,
+            Ok(Value::Other { dt, .. }) => Ok(write::result_datatype(&dt)),
+            Ok(_) => Ok(WKT_LITERAL),
+            Err(_) if self.ctx.has_memory_failure() => Err(TypeError),
+            Err(_) => Ok(WKT_LITERAL),
         }
     }
 
@@ -209,7 +239,10 @@ impl Call<'_, '_> {
         // held until the query ends, like the local vocabulary the literal lands in
         match self.ctx.charge(lex.len() as u64 + 64) {
             Ok(c) => std::mem::forget(c),
-            Err(_) => return Err(TypeError),
+            Err(error) => {
+                self.ctx.fail_memory(&error);
+                return Err(TypeError);
+            }
         }
         Ok(Val::V(Value::Other {
             lex: lex.into(),
@@ -258,14 +291,14 @@ impl Call<'_, '_> {
         };
         self.sized(&[&g])?;
         let out = construct::buffer(&g, r, &u).map_err(op)?;
-        self.geometry(&out, self.datatype(0))
+        self.geometry(&out, self.datatype(0)?)
     }
 
     fn construct(&self, f: fn(&Geom) -> Result<Geom, OpError>) -> EvalResult<Val> {
         self.arity(1)?;
         let g = self.geom(0)?;
         self.sized(&[&g])?;
-        self.geometry(&f(&g).map_err(op)?, self.datatype(0))
+        self.geometry(&f(&g).map_err(op)?, self.datatype(0)?)
     }
 
     /// `concaveHull(g)` or `concaveHull(g, targetPercent)` (see [`hull::concavity`]).
@@ -278,14 +311,14 @@ impl Call<'_, '_> {
         let g = self.geom(0)?;
         self.sized(&[&g])?;
         let out = hull::concave_hull(&g, concavity).map_err(op)?;
-        self.geometry(&out, self.datatype(0))
+        self.geometry(&out, self.datatype(0)?)
     }
 
     fn overlay(&self, o: Overlay) -> EvalResult<Val> {
         self.arity(2)?;
         let (a, b) = (self.geom(0)?, self.geom(1)?);
         self.sized(&[&a, &b])?;
-        self.geometry(&overlay(&a, &b, o).map_err(op)?, self.datatype(0))
+        self.geometry(&overlay(&a, &b, o).map_err(op)?, self.datatype(0)?)
     }
 
     fn get_srid(&self) -> EvalResult<Val> {
@@ -307,7 +340,7 @@ impl Call<'_, '_> {
         };
         memo::note_crs_ref(self.ctx, &to);
         let out = ops::transform(&g, &to).map_err(op)?;
-        self.geometry(&out, self.datatype(0))
+        self.geometry(&out, self.datatype(0)?)
     }
 
     /// `asWKT`, `asGeoJSON`, `asKML`.
@@ -364,7 +397,7 @@ impl Call<'_, '_> {
             _ => return Err(TypeError),
         };
         let m = accessors::geometry_n(&g, n).map_err(op)?;
-        self.geometry(&m, self.datatype(0))
+        self.geometry(&m, self.datatype(0)?)
     }
 }
 

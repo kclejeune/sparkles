@@ -7,6 +7,33 @@ use std::str::FromStr;
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
+/// Whether `lex` is in the XSD 1.1 lexical space of `xsd:float` and `xsd:double`:
+/// decimal and exponent numerals, `INF`, `+INF`, `-INF` and `NaN`, rejecting Rust
+/// float spellings such as `inf`, `infinity`, `nan` and `-NaN`.
+pub(crate) fn is_float_lexical(lex: &str) -> bool {
+    if matches!(lex, "INF" | "+INF" | "-INF" | "NaN") {
+        return true;
+    }
+    let body = lex.strip_prefix(['+', '-']).unwrap_or(lex);
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(i) => (&body[..i], Some(&body[i + 1..])),
+        None => (body, None),
+    };
+    let (whole, fraction) = match mantissa.find('.') {
+        Some(i) => (&mantissa[..i], Some(&mantissa[i + 1..])),
+        None => (mantissa, None),
+    };
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let mantissa_ok = digits(whole)
+        && fraction.is_none_or(digits)
+        && !(whole.is_empty() && fraction.is_none_or(str::is_empty));
+    let exponent_ok = exponent.is_none_or(|e| {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        !e.is_empty() && digits(e)
+    });
+    mantissa_ok && exponent_ok
+}
+
 fn is_integer_lexical(s: &str) -> bool {
     let d = s.strip_prefix(['+', '-']).unwrap_or(s);
     !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
@@ -70,8 +97,8 @@ pub fn is_valid(l: &Literal) -> bool {
         "unsignedInt" => int_in(t, Some(0), Some(u32::MAX as i128)),
         "unsignedShort" => int_in(t, Some(0), Some(u16::MAX as i128)),
         "unsignedByte" => int_in(t, Some(0), Some(u8::MAX as i128)),
-        "double" => Double::from_str(t).is_ok(),
-        "float" => Float::from_str(t).is_ok(),
+        "double" => is_float_lexical(t) && Double::from_str(t).is_ok(),
+        "float" => is_float_lexical(t) && Float::from_str(t).is_ok(),
         "dateTime" => DateTime::from_str(t).is_ok(),
         "dateTimeStamp" => DateTime::from_str(t).is_ok_and(|d| d.timezone_offset().is_some()),
         "date" => Date::from_str(t).is_ok(),
@@ -112,6 +139,17 @@ mod tests {
         assert!(!is_valid(&lit("1e3", "decimal")));
         assert!(is_valid(&lit("1e3", "double")));
         assert!(is_valid(&lit("INF", "float")));
+        assert!(is_valid(&lit("+INF", "double")));
+        assert!(is_valid(&lit("-INF", "float")));
+        assert!(is_valid(&lit("NaN", "double")));
+        for dt in ["float", "double"] {
+            for bad in [
+                "inf", "-inf", "+inf", "infinity", "Infinity", "nan", "-NaN", "+NaN", ".", "1e",
+                "e3", "1.2.3",
+            ] {
+                assert!(!is_valid(&lit(bad, dt)), "{bad}^^xsd:{dt}");
+            }
+        }
         assert!(!is_valid(&lit("yes", "boolean")));
         assert!(is_valid(&lit("2020-02-29", "date")));
         assert!(!is_valid(&lit("2021-02-29", "date")));

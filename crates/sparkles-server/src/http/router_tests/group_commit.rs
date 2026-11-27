@@ -87,7 +87,6 @@ async fn a_failed_fence_fails_every_request_of_its_group_with_503() {
     let root = temp.path().join("dataset");
     let opts = StoreOptions {
         group_commit: true,
-        group_commit_idle_direct: false,
         ..Default::default()
     };
     let state = Arc::new(
@@ -238,7 +237,6 @@ async fn every_http_write_kind_groups_and_keeps_its_receipt_and_message() {
         let root = temp.path().join("dataset");
         let opts = StoreOptions {
             group_commit: true,
-            group_commit_idle_direct: false,
             ..Default::default()
         };
         let state = Arc::new(
@@ -401,7 +399,6 @@ async fn http_patch_abort_case(fail: bool) {
     let root = temp.path().join("dataset");
     let opts = StoreOptions {
         group_commit: true,
-        group_commit_idle_direct: false,
         ..Default::default()
     };
     let state = Arc::new(

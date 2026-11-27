@@ -9,7 +9,7 @@
 //! that catalog on the thread has released the lock.
 //!
 //! The lock order is the management lock, then `entries`, then `detached` or `refused`.
-//! The queue's mutex is a leaf that is never held while an operation runs.
+//! `expected` and the queue's mutex are leaves that are never held while an operation runs.
 
 use super::{Catalog, Inner};
 use crate::{Error, Result};
@@ -128,6 +128,12 @@ impl Catalog {
             _mark: Marked::push(self, Mark::Holding),
         })
     }
+    /// Exclude a management transition while reconciling a hold. The reader takes
+    /// no management actions and runs no deferred callbacks when it drops the pin.
+    pub(super) fn try_pin_management(&self) -> Option<MutexGuard<'_, ()>> {
+        self.inner.manage.lock.try_lock()
+    }
+
     /// Refuse, without taking the lock, a management call that [`manage`](Self::manage)
     /// would refuse. Entry points that change files or other state before they take the
     /// lock call it first, so a refusal leaves everything as it was. The answer cannot

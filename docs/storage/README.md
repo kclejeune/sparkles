@@ -1,486 +1,139 @@
-# Storage and history capabilities
+# Storage and history
 
-This page describes the available capabilities and their current limits. The
-[capability matrix](../FEATURES.md#capability-status) records delivery status within
-each stated scope.
+Sparkles stores RDF quads in QLever-style sorted, compressed permutation files with an MVCC write-ahead log, durable group commit, online compaction, and git-like versioning with time travel, diffs, change feeds, branches, and merges. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+
+| Section | What it covers |
+|---|---|
+| [Storage and indexes](#storage-and-indexes) | Permutations, vocabulary codecs, cold-read tuning, bulk loading, transactions, group commit, compaction, and clones. |
+| [Versioning and history](#versioning-and-history) | Numbered commits, time travel, diffs, change feeds, history queries, branches, merges, and RDF Patch. |
+| [Configuration and usage](#configuration-and-usage) | Links to CLI, tabular import, compaction, diff, and history references. |
+| [Known gaps](#known-gaps) | Scale boundaries, format cutoff, memory accounting, and history or replication limits. |
 
 ## Storage and indexes
 
-The store follows TDB2's model of bulk loads, transactions, compaction and backups. Its
-index is a set of QLever-style sorted and compressed permutations.
+The storage engine combines TDB2-style bulk loads, durable transactions, compaction, and backups with immutable sorted-block index generations.
 
 ### Indexes and vocabulary
 
-* Terms are 64-bit tagged ids. `xsd:integer`, `xsd:decimal`, `xsd:double`,
-  `xsd:boolean`, `xsd:dateTime` and `xsd:date` values are stored inline when their
-  lexical form is canonical.
-* The index holds 7 permutations (SPO, SOP, PSO, POS, OSP, OPS and GSPO) in compressed
-  blocks of 32k rows. Each block column is split into frames of 2,048 rows with a
-  directory of their first keys, so a point lookup, a short range scan or an index join
-  decodes only the frames that can hold its rows. Every generation records its index
-  format and the features its blocks use in `meta.json`.
-* The base vocabulary is sorted, front-coded and memory-mapped, and an append-only delta
-  vocabulary holds the terms added since. With `--vocab-codec fsst`, a load or compaction
-  also compresses each key's suffix with FSST, which shrinks `vocab.dat` by about 30% and
-  is recorded among the generation's features. FSST is off by default because it slows queries that
-  decode many strings
-  ([X11](../specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)).
-* A numeric column beside the base vocabulary, `vocab.num`, holds the exact value of
-  every numeric literal whose lexical form is not canonical, such as DBpedia's
-  `xsd:float` coordinates or any `xsd:int`. Range filters, sorts and aggregates over these
-  values read 8 bytes per value instead of decoding the key. Loads and compactions write
-  the column, and `sparkles vocab-index` adds it to a database that lacks it
-  ([USAGE.md](../USAGE.md#command-line-tools)).
-* The planner keeps statistics for predicates, with their counts and distinct subjects
-  and objects, and for classes and graphs.
-* Predicate patterns implement QLever's pattern trick
-  ([X11](../specs/X11-index-compression-and-predicate-patterns.md#outcome)). Each generation
-  stores every subject's set of predicates by number, for the default graph and for the
-  union of the named graphs. The patterns answer `GROUP BY ?p` with `COUNT(DISTINCT ?s)`
-  over `?s ?p ?o`, `SELECT DISTINCT ?p` over the same shape, and `spk:hasPredicate` with
-  its QLever name `ql:has-predicate`, corrected for the snapshot's delta. Class profiles
-  use them to skip predicates that no profiled instance has. Under a protection of
-  triples, RDFS on read, a set of named graphs or a large delta, the same queries read the
-  permutations.
+* **Term encoding.** Every RDF term maps to a 64-bit tagged id. Canonical lexical forms of `xsd:integer`, `xsd:decimal`, `xsd:double`, `xsd:boolean`, `xsd:dateTime`, and `xsd:date` are stored inline; all other terms live in the vocabulary so exact RDF lexical identity is preserved.
+* **Seven framed permutations.** Each generation stores seven index orders (SPO, SOP, PSO, POS, OSP, OPS, and GSPO) in compressed blocks of 32,768 rows. Every block column is split into 2,048-row frames with a first-key directory, so point lookups, short range scans, and index joins decode only the frames they touch. Index column frames, bounded point reads, builder run blocks and pattern readers reject overflowing tenth-byte varints as corruption. Each generation records its format version and active block features in `meta.json`.
+* **Vocabulary compression.** The base vocabulary is sorted, front-coded, and memory-mapped, with an append-only delta vocabulary for subsequent writes. Passing `--vocab-codec fsst` during a load or compaction compresses key suffixes with FSST, shrinking `vocab.dat` by roughly 30%. FSST is off by default because it slows string-heavy query workloads ([X11](../specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)).
+* **Numeric side column.** `vocab.num` stores the exact 8-byte numeric value of every non-canonical numeric literal (such as `xsd:float` coordinates or `xsd:int`), allowing range filters, sorts, and aggregates to avoid string decoding. Bulk loads and compactions write it automatically; `sparkles vocab-index` builds it for existing datasets ([USAGE.md](../USAGE.md#command-line-tools)).
+* **Planner statistics and predicate patterns.** Generations retain predicate, class, and graph statistics plus per-subject predicate patterns for the default graph and the union of named graphs ([X11](../specs/X11-index-compression-and-predicate-patterns.md#outcome)). Corrected against the live delta, predicate patterns accelerate `GROUP BY ?p` with `COUNT(DISTINCT ?s)`, `SELECT DISTINCT ?p`, `spk:hasPredicate` (`ql:has-predicate`), and class profiles. Queries under triple protections, RDFS on read, specific named-graph sets, or large deltas fall back to ordinary permutations.
 
 ### Cold reads
 
-These read paths are tuned for queries over data that is not yet in memory
-([X07](../specs/X07-cold-sparse-reads.md), [API.md](../API.md#the-io-profile)).
+Read paths are tuned for queries running against data that is not resident in the block or OS page cache ([X07](../specs/X07-cold-sparse-reads.md), [API.md](../API.md#the-io-profile)).
 
-* A query hints the vocabulary groups of all its constants in one batch and requests
-  the blocks of its first scans at plan time. Each scan pass has its own read-ahead
-  window that grows from 1 MiB to the limit that `SPARKLES_READ_WINDOW_KB` sets. A warm
-  repeat of a query makes no read hint.
-* Index joins decode the columns they need on a separate pool, and optional warmup
-  observes cancellation and deadlines. Each step has its own `Optimizations` flag.
-* A point lookup decodes the frames of 2,048 rows that can hold its keys. An index join whose keys in one block span more than a quarter of the block's
-  frames reads the block whole at its first cold frame, so a large join does not read
-  frames one by one before it reads their block again.
-* `sparkles serve --prewarm` records, at shutdown and every `--prewarm-interval` seconds,
-  the decoded blocks that each persistent dataset's block cache holds
-  and the pages of its vocabulary and frame directories that are in the page cache. The
-  next start with `--prewarm` reads them in the background once the server is ready, at
-  a lower CPU priority than requests. The list is `prewarm.json` in the database
-  directory. A list for another generation is ignored, and a list of an unknown version
-  is refused with a warning while the dataset serves as usual. Recording takes page
-  residency from the page cache, so a list written soon after a load holds every page
-  the load left there, up to 4 GiB. On forge at 10.5M, with the list of a warm pass, cold
-  `star-lookup` takes 3.3 ms instead of 11.4 ms and `star-join` 33 ms instead of 78 ms,
-  after a background read of 15 and 71 ms. The interval is 300 seconds by default.
-* Before `sparkles serve` reports ready, it runs one query that reads no data on a scratch
-  in-memory dataset, and a background thread maps the executable's code into memory. The
-  first request after a start then finds the query path built and its code resident, and
-  the served stores stay as cold as before. The mapped code adds about 100 MB of shared
-  file pages to the resident set. `--no-warm-up` and `--no-code-prefault` turn the steps
-  off, and the embedded library takes neither ([USAGE.md](../USAGE.md#memory-and-caches)).
-* `profile=io` on a query returns its phase times, the index columns it decoded, the
-  bytes it requested and sampled page residency, for callers with the `metrics`
-  permission. `/$/metrics` counts decoded columns, read-ahead bytes and vocabulary
-  groups read.
+* **Batched hints and adaptive read-ahead.** Queries prefetch vocabulary groups for all constants in one batch and issue read hints for initial scans at plan time. Each scan maintains its own read-ahead window that grows from 1 MiB to a target of 4 MiB. Warm repeat queries issue no hints.
+* **Parallel frame decoding and whole-block switching.** Index joins decode required columns on a dedicated pool while observing cancellation and deadlines. Point lookups decode individual 2,048-row frames, whereas an index join touching more than a quarter of a block's frames reads the whole block on its first cold frame to avoid repeated random reads.
+* **Restart prewarming.** `sparkles serve --prewarm` records cached decoded blocks and resident vocabulary/directory pages in `prewarm.json` on shutdown and every `--prewarm-interval` seconds (default 300 s, up to 4 GiB). On restart, the server reloads them in the background at reduced CPU priority once ready, ignoring mismatched generations and refusing unknown versions with a warning. On a 10.5M-triple benchmark dataset, prewarming reduces cold `star-lookup` from 11.4 ms to 3.3 ms and `star-join` from 78 ms to 33 ms after 15 ms and 71 ms of background reading.
+* **Startup warm-up.** Before reporting ready, `sparkles serve` runs a zero-data query on a scratch store and maps the executable's code pages in the background (adding about 100 MB of shared file pages to RSS). Disable these steps with `--no-warm-up` and `--no-code-prefault`; embedded library openings run neither ([USAGE.md](../USAGE.md#memory-and-caches)).
+* **I/O profiling.** Callers with the `metrics` permission can pass `profile=io` to inspect per-phase timings, decoded columns, requested bytes, and sampled page residency. `/$/metrics` tracks decoded columns, read-ahead bytes, and vocabulary groups read.
 
 ### Loading data
 
-* The parallel bulk loader reads Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD,
-  streaming or buffered, and chooses the mode itself unless told. Input can be
-  compressed with gzip, xz, bzip2, zstd, brotli or LZ4. `sparkles load` and the library's
-  `Dataset::load_file` also read Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
-* Inputs larger than the memory budget are sorted externally.
-* Large updates and inference batches take a bulk write path that merges them into a
-  rebuilt generation and publishes it by an atomic switch of `CURRENT`.
-* One rule picks the bulk path or a transaction for a load, a graph replacement, a bulk
-  insert and an RDF Patch. A write takes the bulk path when its size is above the store's
-  bulk threshold, 250,000 quads by default. Files are sized at about 80 bytes per quad,
-  and streams are read ahead up to 80 bytes per threshold quad, 20 MB by default, to
-  tell. A load into an empty store takes the bulk path whatever its size, unless all its
-  inputs are streams that end within 8 MiB, while a graph replacement into an empty store
-  follows the threshold, so a small first PUT goes in by a transaction. A write limited to
-  some graphs parses its inputs in a transaction, and batches that check triple
-  protections, managed graphs or control records stay transactional, as does a patch once
-  it has met a delete row. A large stream load into a dataset that holds data, and a load
-  into an empty one, are bulk commits, so the change-log limit of bulk commits under the
-  limitations below applies to them. SPARQL `LOAD` always inserts in a transaction.
-  Roadmap item 846 tracks a bulk path for a large `LOAD`.
-* CSV and TSV tables map to triples ([C05](../specs/C05-tabular-imports.md),
-  [USAGE.md](../USAGE.md#loading-csv-and-tsv)). `sparkles load`, `sparkles csv`,
-  `POST /{ds}/upload` and the web UI's upload form accept them. A table maps with a
-  default mapping in which a key column or the row number names each row, with W3C CSVW
-  metadata, or with Tarql-style CONSTRUCT templates that the SPARQL engine runs in
-  batches. CSVW covers datatypes and formats, null values, defaults, lists, virtual
-  columns and RFC 6570 URI templates. Tables stream, compressed or not, and an invalid
-  cell stops the load and names its row and column. The 270 RDF tests of the W3C CSVW
-  test suite pass in minimal and standard mode.
-* CSVW's standard mode adds the table group, table and row descriptions, and primary and
-  foreign keys are checked across the tables of a load in the order their references
-  need. A CONSTRUCT template can call Tarql's `tarql:expandPrefix` and
-  `tarql:expandPrefixedName`, and with `--lookup` or `lookup=true` it reads the
-  dataset's head to link rows to resources the dataset has.
-* R2RML, RML and YARRRML mappings load CSV, TSV, JSON, JSON Lines, Parquet and SQLite
-  sources ([F19](../specs/F19-mappings-and-virtual-graphs/README.md),
-  [USAGE.md](../USAGE.md#mappings-r2rml-rml-and-yarrrml)). RML covers both the rml.io
-  vocabulary and RML-Core. `sparkles map run`, `sparkles load --mapping` and uploads run
-  them. Each source is read once as a stream, and values keep their natural types. A join
-  over one SQLite connection runs as one SQL statement, and other joins use a hash table
-  within the memory budget. Function maps call GREL, IDLab and SPARQL functions.
-  `sparkles map` also checks a mapping, converts YARRRML to RML-Core Turtle and drafts an
-  R2RML mapping from a SQLite database. The W3C R2RML test cases pass on SQLite apart
-  from three, and the RML-Core cases with CSV and JSON sources apart from one. A join
-  condition compares references or RML-Core expression maps.
-* Mappings of every kind can be stored per dataset with versions and run again
-  ([API.md](../API.md#stored-mappings)). A run in replace mode commits only the net change.
-  The Graph Store protocol takes CSV bodies with a stored or default mapping, and the
-  server reads SQLite databases through the named connections of its `connections`
-  settings kind.
+* **Parallel bulk loader.** The bulk loader parses Turtle, N-Triples, N-Quads, TriG, RDF/XML, and JSON-LD (raw or compressed with gzip, xz, bzip2, zstd, brotli, or LZ4), choosing streaming or buffered mode automatically and falling back to external sorting when input exceeds the memory budget. `sparkles load` and `Dataset::load_file` also accept TriX, RDF Thrift, RDF Protobuf, and RDF/JSON.
+* **Bulk vs. transactional path selection.** Loads, graph replacements, single-operation SPARQL `LOAD` requests, bulk inserts, and RDF Patches share one threshold (250,000 quads by default, estimated at ~80 bytes/quad with up to 20 MB plus one byte of stream lookahead). Writes above the threshold take the bulk path, rebuilding a generation and switching `CURRENT` atomically. Loads into an empty store always take the bulk path unless every input is a stream under 8 MiB, while a small first Graph Store `PUT` or single-operation SPARQL `LOAD` uses a transaction. Graph-restricted writes, multi-operation SPARQL updates, updates inside an open write transaction, writes under triple protections, managed graphs, control records, and patches containing deletions stay transactional.
+* **Tabular imports (CSV, TSV, CSVW, Tarql).** `sparkles load`, `sparkles csv`, `POST /{ds}/upload`, and the UI upload form import CSV and TSV streams using default row-key mappings, W3C CSVW metadata, or Tarql-style `CONSTRUCT` templates ([C05](../specs/C05-tabular-imports.md), [USAGE.md](../USAGE.md#loading-csv-and-tsv)). CSVW covers datatypes, formats, nulls, defaults, lists, virtual columns, RFC 6570 URI templates, and standard-mode table/row metadata with cross-table primary and foreign key checks; all 270 RDF tests of the W3C CSVW suite pass. `CONSTRUCT` templates support `tarql:expandPrefix`, `tarql:expandPrefixedName`, and `--lookup` (`lookup=true`) against the dataset head. Invalid cells abort the load with row and column numbers.
+* **R2RML, RML, and YARRRML mappings.** `sparkles map run`, `sparkles load --mapping`, and HTTP uploads stream CSV, TSV, JSON, JSON Lines, Parquet, and SQLite sources using R2RML, rml.io RML, RML-Core, or YARRRML ([F19](../specs/F19-mappings-and-virtual-graphs/README.md), [USAGE.md](../USAGE.md#mappings-r2rml-rml-and-yarrrml)). Joins within one SQLite database run as a single SQL statement, while cross-source joins use budgeted hash tables; function maps call GREL, IDLab, and SPARQL functions. `sparkles map` validates mappings, converts YARRRML to RML-Core Turtle, and drafts R2RML from SQLite schemas. All W3C R2RML test cases pass on SQLite except three, and all CSV/JSON RML-Core cases pass except one.
+* **Stored mappings.** Mappings can be versioned and stored per dataset ([API.md](../API.md#stored-mappings)), re-run in replace mode to commit only net changes, applied directly to CSV Graph Store bodies, and connected to named SQLite sources via `connections` settings.
 
 ### Transactions and durability
 
-* Reads use MVCC snapshots with a single writer, and a write-ahead log replays safely
-  after a crash.
-* The exclusive process lock on `sparkles.lock` at the dataset root is shared by the main
-  store, branch stores and branch set. A retained branch store keeps that lock through
-  resource destruction after main closes, including when the branch was removed or
-  retired.
-* A commit is acknowledged once its WAL record and any new vocabulary entries are
-  synchronized. The two writes are issued in parallel, and the update vocabulary is
-  written in checksummed chunks, so a torn tail is detected and trimmed at open.
-* Group commit shares one synchronization among concurrent writers and is on by default
-  for persistent stores ([X09](../specs/X09-group-commit-by-default.md)).
-  `--no-group-commit` or `SPARKLES_GROUP_COMMIT=off` turns it off, and the Node and
-  Python bindings take a `groupCommit` or `group_commit` option. The JVM library follows
-  the default.
-* Group commit covers SPARQL updates, Graph Store writes, uploads, RDF Patch, commit
-  messages and digests, preconditions, graph-restricted writes, SHACL-guarded writes,
-  writes during a compaction, and datasets with a full-text, spatial or embedding index.
-  ShEx-guarded datasets go through the group path one commit at a time. No index on disk
-  ever names a commit that the log could lose. A commit that does not qualify, or one made
-  while a full-text index recovers or rebuilds or while a spatial index builds, takes the
-  ordinary path.
-* A fence's leader writes the records, new terms and annotation records of all its
-  commits at once. When the records fit in the space the log has preallocated and in one
-  write of at most 64 KiB, and the terms and the commit messages and digests fit the same
-  way in the vocabulary and in `annotations.bin`, all three go through write-through
-  handles, so the fence persists without a device cache flush on a drive with FUA
-  ([results](../benchmarks/writes/RESULTS.md#written-through-annotation-records)).
-  Otherwise the file that does not fit, such as the vocabulary of a fence that adds a
-  long literal, is written with a buffered write and `fdatasync`. The next fence
-  synchronizes while the last one publishes and applies its full-text changes.
-* Group commit costs memory. A persistent dataset queues up to 64 commits or 4 MiB of
-  log records and staged full-text documents, plus the speculative snapshots of the
-  commits in flight. The 4 MiB is an admission threshold, and a single commit larger than
-  it drains the queue and is queued alone, so the queue then holds that commit's size.
-  The queued records wait on the heap until their fence writes them. On an indexed
-  10.5M-triple dataset with sixteen writers, that state raised peak resident memory by
-  15 to 21 MiB.
-* `/$/metrics` reports the synchronization time, the commits per fence, the wait, and why
-  commits fell back or failed. `/$/stats/{ds}` says whether the dataset groups commits.
-* Every write-ahead log starts with a header record and every commit record carries
-  metadata, so a commit record without it is damage: a torn tail when no later record
-  proves the commit durable, and corruption otherwise. A header that a crash tore at the
-  log's creation reads as an empty log, which the open creates again.
-* A dataset with durable jobs has a control keyspace beside its quads
-  ([C26 §7](../specs/C26-durable-jobs-and-delivery.md#7-persistence-recovery-and-compatibility)).
-  Its state is held in memory, checkpointed in `control.bin` and recovered at open. A
-  write that changes quads carries its control records in the same write-ahead log
-  record at log version 3, and a write without quads appends a frame to `control.log`
-  and creates no commit. One writer lock and one frame sequence order the two logs, so
-  the open refuses a gap, a repeated frame or a frame that follows a lost commit as an
-  integrity error. The control state costs memory in proportion to the job records it
-  holds, which the jobs settings bound at 256 MiB by default.
-* A data directory belongs on a local file system. Sparkles does not support NFS for a
-  data directory, because the process lock is an advisory file lock and the index files
-  are memory-mapped, and neither is reliable across clients of a network file system.
-  Every open, including one that only reads, creates and writes `sparkles.lock` inside
-  the directory, and the lock file cannot be placed elsewhere. A read-only mount of a
-  copy therefore cannot be opened either. A copy can be served from a local directory
-  after a backup or a clone is restored there.
+* **MVCC and write-ahead logging.** Readers observe consistent MVCC snapshots while a single writer serializes commits into a checksummed WAL. Every WAL starts with a header record and every commit carries metadata; torn tails are trimmed on open while mid-log damage is refused as corruption. A commit is acknowledged only after its WAL record and checksummed delta-vocabulary chunks are synchronized in parallel.
+* **Exclusive local locking.** Persistent datasets take an advisory process lock on `sparkles.lock` at the dataset root, shared across the main store, branch stores, and branch set until every retained handle is destroyed. Because every open writes `sparkles.lock` and memory-maps index files, data directories must reside on a writable local file system rather than NFS or a read-only mount. To serve a copy, restore a backup or clone into a local directory.
+* **Group commit.** Persistent stores enable group commit by default to share one synchronization fence across concurrent writers ([X09](../specs/X09-group-commit-by-default.md)); disable it with `--no-group-commit`, `SPARKLES_GROUP_COMMIT=off`, or the Python/Node `group_commit`/`groupCommit` option. Group commit covers SPARQL updates, Graph Store writes, uploads, RDF Patch, commit messages and digests, preconditions, graph-restricted writes, SHACL guards, writes during compaction, and datasets with full-text, spatial, or embedding indexes (ShEx-guarded datasets serialize one commit at a time, and index rebuilds fall back to the ordinary path). When a fence's WAL, vocabulary, and `annotations.bin` writes each fit preallocated space within 64 KiB, all three use write-through handles to avoid device cache flushes on FUA drives ([results](../benchmarks/writes/RESULTS.md#written-through-annotation-records)); larger writes use buffered I/O plus `fdatasync`. Each persistent dataset queues up to 64 commits or 4 MiB of staged log/full-text data plus in-flight snapshots (raising peak RSS by 15 to 21 MiB under 16 concurrent writers on a 10.5M-triple indexed dataset). Metrics appear in `/$/metrics` and `/$/stats/{ds}`.
+* **Control keyspace for durable jobs.** Datasets with durable jobs maintain an in-memory control keyspace checkpointed to `control.bin` ([C26 §7](../specs/C26-durable-jobs-and-delivery.md#7-persistence-recovery-and-compatibility)). Quad-mutating job transitions embed control records inside WAL version 3 records, while quad-free transitions append to `control.log` under the same writer lock and frame sequence, refusing gaps or lost commits on open. Control state memory is capped at 256 MiB by default.
 
 ### Compaction, clones and integrity
 
-* Compaction writes a new generation, `gen-NNNN`, and publishes it by an atomic switch of
-  `CURRENT`. The build reads a snapshot while writes continue, the commits made meanwhile
-  are carried into the new generation's log, and the writer lock is held only for the
-  switch. After a power loss during a compaction or bulk load, the next open deletes an
-  unfinished build directory, sets any other directory above `CURRENT` aside under a new
-  name, and refuses a directory that holds generations but no `CURRENT`. `sparkles check`
-  reports such a leftover as a warning.
-* Automatic compaction runs on a server ([C13](../specs/C13-automatic-compaction.md),
-  [API.md](../API.md#automatic-compaction)). It starts when a dataset's delta reaches a share
-  of the base index or a size, its log reaches a size, its oldest change reaches an age, or
-  after a quiet period. Flags set the policy, and a per-dataset override comes from
-  `compaction.json`, `/$/compaction/{ds}` or `sparkles compaction`. It waits for
-  bulk loads, backups, restores, the retention window and free disk space, takes a task
-  slot only when one is free, and builds with fewer threads at a lower priority. A delta
-  that adds no terms is compacted partially, rewriting only the blocks it touches.
-* `POST /$/datasets/{ds}/clone` and `sparkles clone` copy a dataset into an independent
-  sandbox from one snapshot. The clone has the same quads and blank-node ids and a new
-  dataset id with `forkedFrom`. A source with no changes since its last compaction is
-  cloned by sharing its index files, by reflink where the file system supports it, by
-  copy otherwise, or by hard link on request. A clone can copy only some graphs, can be an
-  in-memory dataset, and waits for one of the `--max-clones` slots. A dataset whose
-  configuration history is activated cannot be cloned. Roadmap item 764.
-* `/$/backup` and dumps write N-Quads, compressed with zstd by default or with gzip, xz,
-  bzip2, brotli or LZ4. Request and response bodies can be compressed with `zstd`, `br`
-  or `gzip`. See [Operations](../operations/README.md#backups) for incremental backup
-  repositories.
-* `sparkles check` and `sparkles::check` run a read-only integrity check that is safe
-  beside a running server ([USAGE.md](../USAGE.md#checking-a-database)). It checks the
-  layout, every block of the 7 permutations and their consistency, vocabulary order and
-  id ranges, WAL checksums and commit continuity, the catalog, full-text segment
-  checksums, and the spatial index files.
-* In-memory datasets run on the same engine, with the base in a temporary directory.
-
+* **Online compaction.** Compaction builds a new generation (`gen-NNNN`) from a snapshot while writes continue, replays concurrent commits into the new WAL, and holds the writer lock only for the atomic `CURRENT` swap. Deltas adding no new vocabulary terms run partial compaction, rewriting only modified blocks. On recovery after power loss, opening deletes incomplete build directories, renames stray generations above `CURRENT`, and refuses directories with generations but no `CURRENT`.
+* **Automatic compaction.** Servers compact datasets automatically when delta size, share of base index, WAL size, oldest change age, or idle thresholds trigger ([C13](../specs/C13-automatic-compaction.md), [API.md](../API.md#automatic-compaction)). Override server flags per dataset via `compaction.json`, `/$/compaction/{ds}`, or `sparkles compaction`, or disable with `--no-auto-compact`. Auto-compaction defers to bulk loads, backups, restores, retention windows, free disk space, and task slots, running with reduced threads and lower priority.
+* **Clones.** `POST /$/datasets/{ds}/clone` and `sparkles clone` fork a consistent snapshot into a new independent dataset with identical quads and blank-node ids, a fresh dataset UUID, and `forkedFrom` provenance. Unmodified compacted generations share index files via reflink (where supported), file copy, or explicit hard links. Clones support graph subsets, in-memory targets, and concurrency caps (`--max-clones`). Clones of datasets with activated configuration history establish a fresh destination configuration-history root with source provenance under `evidence-history/imports/` and remain independent of later source writes.
+* **Dumps and integrity checks.** `/$/backup` and `sparkles dump` export N-Quads compressed with zstd by default (or gzip, xz, bzip2, brotli, LZ4); see [Operations](../operations/README.md#backups) for incremental backup repositories. `sparkles check` and `sparkles::check` perform a read-only integrity audit safe to run beside a live server, verifying layout, all seven permutations, vocabulary ordering and id bounds, WAL checksums, commit continuity, catalog state, full-text segments, and spatial index files ([USAGE.md](../USAGE.md#checking-a-database)). In-memory datasets run the same engine backed by a temporary directory.
 
 ## Versioning and history
 
-Every write is a numbered commit, and past states, diffs, branches and the change history
-stay readable.
+Every committed write advances a gap-free commit sequence, keeping historical states, diffs, change feeds, and branches accessible.
 
 ### Commits
 
-* Each dataset has a UUID and a gap-free commit sequence with timestamps and net counts.
-  Writes return receipts and `Sparkles-Commit` headers, and `/$/commits` and
-  `sparkles log` list the commit catalog.
-* A write's `Sparkles-Commit-Message` header, or `--message` on `update` and `load`, is
-  stored with its commit and shown in receipts, `/$/commits` and `sparkles log`. With
-  `--commit-digests`, a SHA-256 digest chains each commit's net changes.
-* Graph Store GET and HEAD return entity tags named after the commit read.
-  `If-None-Match` answers `304`, and `If-Match` on PUT, POST and DELETE is an optimistic
-  concurrency check made under the writer lock that answers `412` on a mismatch.
-* `dryRun=true` or `Sparkles-Dry-Run: true` previews an update, Graph Store write or
-  upload by running it up to its commit and rolling it back
-  ([API.md](../API.md#write-previews)). The response gives the commit it would create, net
-  counts per graph, optionally the changed quads as JSON or RDF Patch, the validation
-  summary, the quota effect and the outcome of `If-Match`, with the status the write would
-  get. Nothing is written and no commit number is used.
-* A Graph Store `PUT` through the write-ahead log records only the quads that change.
-* A commit catalog horizon, set by `catalog` in `PUT /$/history/{ds}` or
-  `sparkles snapshot catalog`, prunes the records, messages and digests of commits older
-  than both the readable history and the horizon.
+* **Commit receipts and metadata.** Each dataset has a durable UUID and monotonically numbered commits with timestamps and net counts, exposed in receipts, `Sparkles-Commit` headers, `/$/commits`, and `sparkles log`. Attach messages with `Sparkles-Commit-Message` or `--message`, and enable chained SHA-256 change digests with `--commit-digests`.
+* **Optimistic concurrency and minimal `PUT` diffs.** Graph Store `GET` and `HEAD` return commit-based ETags. `If-None-Match` returns `304`, and `If-Match` on `PUT`, `POST`, and `DELETE` checks the head under the writer lock and answers `412` on mismatch. Transactional Graph Store `PUT` logs only net changed quads.
+* **Dry-run write previews.** Setting `dryRun=true` or `Sparkles-Dry-Run: true` executes an update, Graph Store write, or upload up to commit and rolls it back without consuming a commit number ([API.md](../API.md#write-previews)). The response reports projected commit number, per-graph net counts, optional changed quads (JSON or RDF Patch), validation results, quota impact, and `If-Match` outcome.
+* **Catalog pruning.** Setting a `catalog` horizon via `PUT /$/history/{ds}` or `sparkles snapshot catalog` prunes commit catalog entries, messages, and digests older than both readable history and the horizon.
 
 ### Time travel
 
-* `?at=commit:N`, `time:…` or `snapshot:NAME` reads a past state in queries, explain,
-  Graph Store GET, SHACL validation, stats and schema discovery. The Graph Store adds
-  Memento headers and `Accept-Datetime` negotiation. `--at` does the same on `query`,
-  `dump` and `clone`.
-* Named snapshots keep a commit readable across compaction. They can expire, be taken on
-  a schedule and be kept materialized for fast reads. A retention window keeps older
-  commits readable within a disk cap. Snapshots and the window are
-  managed through `/$/snapshots`, `/$/history` and `sparkles snapshot`.
-* A past state is rebuilt from the nearest known state in the write-ahead log, found
-  through a sparse index, by replaying forward or undoing backward. In-memory datasets
-  keep the states their snapshots and window hold.
-
-The Rust library provides `Store::snapshot_at_limited` and
-`Store::snapshot_at_with_branch_limited` for request-scoped history preparation.
-`Dataset::history()` exposes matching trusted methods. They accept a memory cap
-alongside `HistoryOptions`, preserve exact inherited origins, and check cancellation
-and deadlines while preparing live, cached or cold states. The cap cannot exceed the
-store's history capacity. Cold origin reads do not recover or rewrite another Store.
-
-These trusted handles return a snapshot for subsequent use. They do not prepare access
-masks or query guards, and their cap does not cover a later query. Controlled permission
-preparation and guarded Dataset, C25 and U02 adoption are planned. Roadmap item 395.
-Existing HTTP and query entry points retain their documented limits.
-
-A branch-time read inherits a parent state only strictly before the fork timestamp.
-If pruning removes the metadata needed to resolve its own state, the read returns
-`HistoryGone` with the original time selector and no invented commit sequence.
+* **Point-in-time reads.** Query, explain, Graph Store `GET`, SHACL validation, stats, and schema discovery accept `?at=commit:N`, `time:…`, or `snapshot:NAME`, with Memento headers and `Accept-Datetime` negotiation on Graph Store routes. The CLI supports `--at` on `query`, `dump`, and `clone`.
+* **Snapshots and retention.** Named snapshots pin commits across compaction, supporting expiry, schedules, and optional materialization for fast reads. Retention windows keep recent commits readable within a disk cap, managed via `/$/snapshots`, `/$/history`, and `sparkles snapshot`. Historical states reconstruct by replaying forward or undoing backward from the nearest WAL anchor indexed sparsely; in-memory datasets keep states held by snapshots and the retention window.
+* **Branch-time inheritance.** Reading a branch by timestamp inherits parent branch history only strictly before the fork timestamp. If pruning removed required resolution metadata, reads return `HistoryGone` with the original selector rather than inventing a commit number.
+* **Bounded Rust history preparation.** `Store::snapshot_at_limited`, `Store::snapshot_at_with_branch_limited`, and `Dataset::history()` prepare historical snapshots under a memory cap (up to the store's history capacity), cancellation, and deadline while preserving exact inherited origins without mutating cold origin stores. These handles return raw snapshots without preparing access masks or query guards; guarded Dataset, C25, and U02 adoption is tracked in roadmap [item 395](../ROADMAP.md).
 
 ### Diffs, change feed and history queries
 
-* Any two readable commits can be compared through `GET /{ds}/diff`, `sparkles diff` and
-  `Store::diff` ([API.md](../API.md#diffs-between-commits)). A diff comes as JSON counts
-  and quads, as N-Quads lines marked `+` and `-`, or as RDF Patch in text or RDF Thrift,
-  for one graph or all. Within the retained logs a diff reads only the changes between the
-  commits, and across a bulk commit it compares the two states with a sorted merge.
-* A diff can name a branch on either side with `fromBranch` and `toBranch`, and can keep
-  only changes whose subject or object is one of up to 1,000 `term` values. With
-  `group=class` it returns counts grouped by subject class, predicate and object class or
-  datatype, up to 5,000 groups.
-* `GET /$/commits/{ds}/timeline` lists a branch's commits in buckets with the size of
-  their changes. `POST /{ds}/sparql/diff` runs a SELECT query at two states and returns the
-  rows only one of them has, comparing 128-bit row hashes so that large results fit the
-  memory budget ([API.md](../API.md#comparing-a-query-between-two-states)).
-* `GET /{ds}/changes` and `Store::changes` serve a change feed of the commits after a given
-  one, as JSON or one RDF Patch per commit, in pages bounded by commits and quads. It
-  resumes from any readable commit, long-polls with `wait=`, and streams server-sent
-  events that resume with `Last-Event-ID`.
-* History queries search the changes across commits ([API.md](../API.md#history-queries)).
-  Through `SERVICE hist:changes` in SPARQL, `GET /{ds}/history`, `sparkles history` and
-  `Store::history_changes`, each added or removed quad comes back with its commit's
-  number, time, kind, author and message, and the triple pattern is written as an RDF 1.2
-  reifier. The pattern's terms and the commit range can come from the rest of the join
-  group. HTTP, CLI and library results report unrecorded commits within that range,
-  including the covered portion of a gap that extends beyond the requested window. HTTP
-  history and diff term filters accept RDF 1.2 triple terms, including nested triple terms
-  with integer, decimal or double objects. Numeric lexical values and datatypes are
-  preserved when matching recorded quads. Malformed terms return 400.
-* History queries read a per-dataset change log that outlives compactions. It is written
-  off the commit path, indexed by subject, predicate, object and graph, recovered from the
-  write-ahead log after a crash, and trimmed by commit count, age or size. Diffs and the
-  change feed read it where the retained generations no longer can. Graph views and
-  protections of triples apply.
+* **Commit and branch diffs.** `GET /{ds}/diff`, `sparkles diff`, and `Store::diff` compare any two readable commits (across branches via `fromBranch` and `toBranch`) as JSON counts/quads, `+`/`-` N-Quads, or text/Thrift RDF Patch ([API.md](../API.md#diffs-between-commits)). Retained WAL ranges read only intervening changes, while cross-bulk diffs merge the two states. Filters accept up to 1,000 `term` values (including nested RDF 1.2 triple terms with numeric objects, preserving lexical form and datatype) and `group=class` summarizes up to 5,000 subject-class/predicate/object-class groups.
+* **Timelines and query diffs.** `GET /$/commits/{ds}/timeline` buckets commit activity by change size. `POST /{ds}/sparql/diff` runs a `SELECT` query against two states and returns differing rows using 128-bit row hashes to stay within query memory budgets ([API.md](../API.md#comparing-a-query-between-two-states)).
+* **Change feed.** `GET /{ds}/changes` and `Store::changes` stream commits after a starting sequence as JSON or per-commit RDF Patch in bounded pages, supporting long-polling (`wait=`) and SSE resume via `Last-Event-ID`.
+* **History queries.** `SERVICE hist:changes`, `GET /{ds}/history`, `sparkles history`, and `Store::history_changes` search quad additions and removals across commits with commit number, timestamp, kind, author, and message, matching triple patterns written as RDF 1.2 reifiers ([API.md](../API.md#history-queries)). Terms and commit ranges can be driven by join inputs, and unrecorded gaps inside a requested window are reported explicitly. HTTP history filters accept nested RDF 1.2 triple terms with numeric objects and return `400` on malformed terms. History queries read an off-commit-path per-dataset change log indexed by S, P, O, and G that survives compaction, recovers from the WAL, trims by count/age/size, and enforces graph and triple protections. Streamed history queries without `hist:limit` or join input page whole commits under the query memory budget and temporarily pin retention until closed.
 
 ### Branches and merges
 
-Branches work like git branches on the quad store
-([F09](../specs/F09-branches-and-merges.md), [API.md](../API.md#branches-and-merges)).
+Branches provide git-like isolated workspaces over the quad store ([F09](../specs/F09-branches-and-merges.md), [API.md](../API.md#branches-and-merges)).
 
-* A persistent branch starts from any readable commit of another branch and shares that
-  generation's index files until it compacts, so creating one writes a few kilobytes.
-  In-memory branches share immutable base state and keep their writes and validation
-  state separate.
-* A branch has its own commits, history, snapshots, write guard and writer lock. Requests
-  choose one with `?branch=`, the path form `/{ds}@{branch}/…` or `--branch`.
-* A merge finds the merge base and either fast-forwards or merges quad sets three ways.
-  It reports conflicts by cell or subject with the base, ours and theirs objects, and takes
-  resolutions per graph, subject or cell, a rule for the rest, and the heads the caller
-  saw. The merge is one commit of kind `merge` that passes the target's write-time
-  validation, and a dry run previews it.
-* Merges can also squash a branch into one commit, replay its commits one by one, run as
-  cancellable tasks, and keep both sides' changes to exempt predicates. Reverts and
-  cherry-picks are merges of one commit. Blank nodes keep their labels across branches.
-* Branches can be protected, renamed, deleted, which re-parents the branches created from
-  them, and limited by grants. `/$/branches`, `/$/merge`, `/$/revert`, `/$/cherry-pick`,
-  `sparkles branch`, `merge`, `revert` and `cherry-pick`, and the web UI's Branches panel
-  and merge page, manage them. A branch backup restores as an independent dataset.
-* Direct Rust `Store` and `Dataset` calls to delete or rename a branch, change its
-  note or read its information return `conflict` when they would wait for a write
-  transaction held by the same thread. Refusal leaves the names, metadata and
-  transaction unchanged. Calls from other threads wait for the transaction to finish. Deleting an unrelated branch can postpone collection of old
-  generations in the store whose transaction is open until its next compaction or reopen.
-  Python's named branch get, update and delete and JVM note changes use their existing
-  caller ownership guards. Further worker-mediated branch dependencies remain under
-  roadmap item 754. Python `branches.update(name, note=None)` currently leaves the note
-  unchanged. Clearing the note explicitly is planned. Roadmap item 755.
+* **Lightweight creation and isolation.** Persistent branches fork from any readable commit and share base index files until compacted, writing only a few kilobytes. In-memory branches share immutable base state with separate deltas and validation states. Every branch has its own commits, history, snapshots, write guard, and writer lock, selected via `?branch=`, `/{ds}@{branch}/…`, or `--branch`. Blank-node labels remain stable across branches.
+* **Three-way merges, squashes, and replays.** Merges compute the merge base and either fast-forward or perform a three-way quad merge, reporting cell- or subject-level conflicts with base, ours, and theirs values. Callers supply per-graph, per-subject, per-cell, or fallback resolutions plus expected heads. Merges also support squashing, commit-by-commit replay, cancellable tasks, exempt predicates that retain both sides' edits, dry-run previews, and target write-time validation. Reverts and cherry-picks run as single-commit merges.
+* **Administration and concurrency.** Manage branches through `/$/branches`, `/$/merge`, `/$/revert`, `/$/cherry-pick`, `sparkles branch|merge|revert|cherry-pick`, and the web UI. Branches support protection rules, renaming, deletion (re-parenting child branches), grant restrictions, and independent backup restores. Direct Rust `Store` and `Dataset` calls to delete, rename, inspect, or edit notes on a branch return `conflict` without mutating state when the calling thread holds a conflicting write transaction, while other threads wait normally. Deleting an unrelated branch can defer old-generation cleanup on an open transaction's store until the next compaction or reopen. Python `branches.update` clears a branch note when passed explicit `note=None` and leaves the existing note unchanged when `note` is omitted. Further worker-mediated branch ownership checks remain in roadmap [item 754](../ROADMAP.md).
 
 ### RDF Patch
 
-* A patch applies in text or binary form as one commit of kind `patch`, as Fuseki's
-  `patch` operation does, through `POST` and `PATCH /{ds}/patch`, a patch sent to `/{ds}`,
-  `sparkles patch`, `Store::apply_patch` and the Python `Dataset.apply_patch`
-  ([F10](../specs/F10-replication.md), [API.md](../API.md#applying-rdf-patch)).
-* `TA` aborts the whole patch, and `PA` and `PD` change the prefixes. A `prev` header that
-  names a commit of the dataset applies the patch only while that commit is the head.
-  Write-time validation, quotas, graph-limited grants, dry runs and receipts apply as to
-  other writes.
+Text and binary (Thrift) RDF Patches apply atomically as a single `patch` commit through `POST`/`PATCH /{ds}/patch`, `POST /{ds}`, `sparkles patch`, `Store::apply_patch`, and Python `Dataset.apply_patch` ([F10](../specs/F10-replication.md), [API.md](../API.md#applying-rdf-patch)). `TA` aborts the entire patch, `PA` and `PD` update prefixes, and a `prev` header enforces optimistic head checking. Write guards, quotas, graph grants, dry runs, and receipts apply identically to other writes.
 
-## Known gaps
+### Git serialization and export
 
-These limits name the roadmap items that address them. Current priorities and
-dependencies are recorded in the [central roadmap](../ROADMAP.md).
+Datasets serialize to a versioned canonical directory layout (`format_version = 1`, profile `sparkles-git-v1`) through `sparkles::git` and `sparkles git write-tree`, writing `.sparkles-git/manifest.json` and one sorted, subject-grouped Turtle or sorted N-Quads file per non-empty graph with stable prefixes and dataset-wide RDFC-1.0 blank-node labels ([F25](../specs/F25-git-sync-and-remotes/SPEC.md)). Serialized output is byte-identical across build feature sets and preserves cross-graph blank-node links, including blank nodes referenced inside `cdt:List` and `cdt:Map` composite literals. RDFC-1.0 does not standardize RDF 1.2 triple terms, so blank nodes nested inside triple terms carry oxrdf's own labeling. Dataset-wide canonicalization holds the snapshot's quads in memory and enforces configurable quad, blank-node, ambiguous-neighborhood, and output byte limits (`WriteOptions`) matching the default read ceilings. Writes reject root and managed-path symlinks, unmanaged destination collisions, and corrupt or unsupported prior manifests before modifying the tree.
 
-### Storage and execution
+`sparkles::git::verify_git_tree` and `sparkles git verify` stream-verify manifest version and schema (rejecting duplicate JSON keys and unknown versions), canonical graph ordering and filenames, canonical `c14n<N>` blank-node labels, non-symlink regular files, absence of unlisted files under `graphs/`, bounded file and quad limits, SHA-256 digests, deduplicated quad counts, and RDF syntax; streaming verification does not re-run RDFC-1.0 canonicalization or re-check serializer line ordering. `sparkles::git::read_git_tree` and `sparkles::git::import_git_tree` load a verified tree into a dataset in one additive write transaction, publishing quads and prefixes jointly so dry runs, refused writes, and prefix persistence errors abort before quads become visible.
 
-* The largest measured dataset is English DBpedia, 1.24 billion triples on one machine.
-  Nothing larger, such as Wikidata, has been tried. Roadmap item 1.
-* Databases and backups written before the first release are refused with a message that
-  names `sparkles dump` from the release that wrote them and `sparkles load`. There is no
-  upgrade step for them, and `sparkles migrate --check` reports the files that are too
-  old ([X16](../specs/X16-storage-consolidation/SPEC.md#phase-1-first-release-format-cutoff-item-479)).
-* FSST vocabulary compression is off by default. With it, a DBpedia export takes 1.05
-  times as long as with front coding, and warm queries that decode many strings run 4% to
-  12% slower. Single-term lookups are the follow-up. Roadmap item 160.
-* Vocabulary codec and predicate-pattern choices have no dataset-local layered settings.
-  A planned change adds settings for subsequent builds and compactions while retaining
-  each existing generation's recorded format. Roadmap item 343.
-* The first query that arrives about 2 s after a start is slower than one that arrives at
-  once, because the server's idle threads and cores wake up for it. Roadmap item 572.
-* Cold `export-1m` at 1.01B takes 1,293 ms with framed block columns, 4% above the
-  measurement of the earlier unframed layout, and 17 times as long with
-  `SPARKLES_IO_HINTS=off`. Roadmap item 573.
-* Warm point lookups run 1.6% to 2.5% more instructions per request for the index join's
-  check of cold segments. Roadmap item 516.
-* The prewarm restores the block cache and the pages of the generation's files. It does
-  not restore the result cache, and it reads data that the next queries may never touch.
-  Its list holds at most 4 GiB of pages.
-* Group commit on datasets with a full-text, spatial or embedding index meets its gates
-  ([X09](../specs/X09-group-commit-by-default.md#phase-4)). A serial commit pays 0.1% to
-  0.3% more instructions for the group's admission checks, and spatial readers at 1.05M
-  under mixed load measured a p50 ratio of 1.028, both within their gates. Roadmap
-  item 448.
-* A first load of a small file or buffered body into an empty dataset, from a Graph Store
-  POST or `sparkles load`, rebuilds the index. The rebuild's fixed cost of about 20 to
-  25 ms makes a first POST of 10 to 1,000 quads take 24 to 34 ms, where a first PUT of the
-  same body, which takes a transaction, takes 0.7 to 8.5 ms. Roadmap item 1097.
-* Branch stores share their dataset's quota, which counts the zeros preallocated after
-  each store's log and delta vocabulary as those of the store written last. With several
-  branches written, the zeros of the others count as data. Roadmap item 560.
-* A clone refuses a dataset whose configuration history is activated, because the
-  clone would keep the registry's history root without the evidence-history files that
-  it names. A backup and a restore that keeps the identity copy such a dataset. Roadmap
-  item 764.
-* The benchmark hosts' drive alternates between a fast state, in which a
-  write-through write takes about 0.2 ms, and a slow state, in which every write-through
-  write and every cache flush takes about 1.5 ms. Write-through fences are faster in both
-  states, and their gain over flushing fences is smaller in the slow state
-  ([results](../benchmarks/writes/RESULTS.md#fences-in-each-drive-state)).
-* Automatic execution streams eligible large scans, groupings and ASK joins. Other
-  plans remain eager, including an EXISTS evaluated once per outer key when its cursor
-  is slower. Without spill, sorts without LIMIT collect their input, and DESCRIBE stays
-  collected. The UI, MCP and Python's collected query API collect results, while explicit
-  cursors and the JVM's automatic execution can pull SELECT batches. Roadmap item 7.
-* Disk spill is on by default. A DISTINCT above an ORDER BY that cannot move below the
-  sort, or above a ranking, keeps its whole set. Roadmap item 497. A grouping's
-  single group can outgrow the budget, and eager operators still fail at their budget. A
-  spilled join below an operator that relies on its order, such as an ORDER BY, a
-  DISTINCT or a GROUP_CONCAT, writes its output once more to merge it. Roadmap
-  item 496. Automatic execution keeps a DISTINCT over partly ordered input eager though
-  its cursor is faster. Roadmap item 498.
-* Incremental table views and SSE live queries are available. Graph views, per-fact
-  provenance and commit-time maintenance remain planned. Roadmap item 17. Live operator
-  profiling and running-query monitoring are also planned. Roadmap item 27.
-* A query whose plan would nest deeper than 4000 levels is refused, so a basic graph
-  pattern holds at most 1998 triple patterns ([nesting limits](../API.md#nesting-limits)).
-  Planning time grows with the square of the number of triple patterns, and a star of
-  1998 patterns on one frequent predicate takes about 3 s to plan. `/{ds}/sparql/explain`
-  reads plans of at most 256 levels. Roadmap item 84.
-* A SERVICE call to this server runs in process only from the SPARQL query and update
-  endpoints, so one from an MCP tool or GraphQL waits behind its caller's grant. SHACL,
-  ShEx validation outside its selectors, diff, and the `/$/stats`, `/$/schema` and
-  `/$/validate` reads hold their admitted grant idle while their own query takes a second
-  one. An eager CONSTRUCT or DESCRIBE result keeps its query's peak estimate in the pool
-  until it is released. Roadmap item 7.
-* The server-wide caches count the bytes of the values they hold, and the process uses
-  more. The heap behind the result cache is about 1.2 times the bytes it counts, and
-  evicted entries leave free pages in thread heaps. Ten datasets at `--cache-mb 32` use
-  1.157 times the anonymous memory that one dataset and the cache bytes predict. Roadmap
-  item 88.
+`Dataset::export_git` and `sparkles git export` (including `--branch`) export a branch to a standalone non-bare Git repository commit-by-commit or squashed, writing UTC timestamps, messages, RFC 822 commit trailers (including inherited origin, merge, and replay provenance), and a bounded versioned per-branch bidirectional Sparkles-commit to Git-SHA mapping (`format_version = 1`, stored by default under `<git-dir>/sparkles/mappings/`). Exports refuse bare repositories, linked worktrees, dirty indexes, and in-progress Git merge or rebase states; stage commits through an isolated temporary index and `commit-tree`; synchronize the working tree from raw blob objects without attribute filters; and record a crash-recoverable pending publication journal around compare-and-swap ref updates. Exports use the branch's live prefix table, pin the target branch by UUID, require retained commit history for per-commit replay, and fail before publishing if a retained change-log segment is corrupt or unreadable. Git ref import onto `git/<remote>/<ref>` branches, webhook-driven sync, and server-to-server remotes remain tracked in roadmap [item 460](../ROADMAP.md).
 
+Checkout flushes the pending journal and its parent directories before moving the branch ref or changing the worktree. The version 5 journal records the deepest mapping directory that existed before export. When checkout moves a tracked file aside, it keeps the file in a private directory until the destination directory has been synced. Recovery checks the directory's ownership receipt before restoring or retiring that file. If a displaced edit and its destination both exist, each retry reports the saved edit's path until the conflict is resolved. If a receipt name is occupied by another file, export stops and leaves the occupant in place. Checkout makes newly created worktree directories durable before publishing the index. Before clearing the journal, recovery flushes the mapping directory and the parents of newly created mapping directories, even when the mapping already matches. Export accepts only version 5. It refuses versions 1 through 4 and unknown versions before replay and leaves their journals in place for inspection.
 
-### Versioning and history
+Export refuses pre-existing dirty tracked files and leaves those edits in place. During checkout and recovery, processes running as the repository owner must leave the worktree directory structure, private move-out directories and `.git` metadata under the exporter’s control. A writer that keeps a writable file descriptor open or edits a tracked file after its final check can change the file while the exporter publishes the index. The recovery guarantee assumes those writes do not race checkout.
 
-* A past state can be read only while a retained generation holds it, even when the
-  change log has its changes. Full-text search works at the head only. Roadmap items 23
-  and 52.
-* A bulk commit into a non-empty dataset is recorded in the change log with counts only
-  when it loads or drops more than 1,000,000 quads, even if few of them change. After a
-  crash right after a bulk commit, the log can lack that commit's changes. Roadmap
-  item 52.
-* A patch is applied as one commit even when it holds several `TX … TC` transactions, and
-  a patch from another dataset cannot name its existing blank nodes. There are no patch
-  logs and no replicas that follow a server. Roadmap items 66 and 74.
+Moving a tracked entry requires atomic no-replace rename on Linux, macOS or Windows. The move-out filesystem must support hard links for ownership receipts. Windows checkout also requires the filesystem to accept a directory flush through a writable directory handle. Export reports an error when the required operation is unavailable.
 
 ## Configuration and usage
 
-The following guides describe configuration and supported UI, command-line, HTTP
-or library workflows. Exact HTTP contracts remain in the API reference.
+| Topic | Reference |
+|---|---|
+| CLI commands, `git`, `vocab-index`, and database integrity checks | [Command-line tools](../USAGE.md#command-line-tools), [Checking a database](../USAGE.md#checking-a-database) |
+| Memory caches, warm-up, and I/O profiling | [Memory and caches](../USAGE.md#memory-and-caches), [The I/O profile](../API.md#the-io-profile) |
+| Tabular CSV/TSV and R2RML/RML/YARRRML imports | [Loading CSV and TSV](../USAGE.md#loading-csv-and-tsv), [Mappings](../USAGE.md#mappings-r2rml-rml-and-yarrrml), [Stored mappings](../API.md#stored-mappings) |
+| Automatic compaction and write previews | [Automatic compaction](../API.md#automatic-compaction), [Write previews](../API.md#write-previews) |
+| Diffs, query diffs, history queries, branches, and RDF Patch | [Diffs](../API.md#diffs-between-commits), [Query diffs](../API.md#comparing-a-query-between-two-states), [History queries](../API.md#history-queries), [Branches](../API.md#branches-and-merges), [RDF Patch](../API.md#applying-rdf-patch) |
 
-* Read [Command-line tools](../USAGE.md#command-line-tools).
-* Read [Loading CSV and TSV](../USAGE.md#loading-csv-and-tsv).
-* Read [Mappings (R2RML, RML and YARRRML)](../USAGE.md#mappings-r2rml-rml-and-yarrrml).
-* Read [Checking a database](../USAGE.md#checking-a-database).
-* Read [The I/O profile](../API.md#the-io-profile).
-* Read [Stored mappings](../API.md#stored-mappings).
-* Read [Automatic compaction](../API.md#automatic-compaction).
-* Read [Write previews](../API.md#write-previews).
-* Read [Diffs between commits](../API.md#diffs-between-commits).
-* Read [Comparing a query between two states](../API.md#comparing-a-query-between-two-states).
+## Known gaps
+
+Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
+
+### Storage and execution
+
+* **Scale and format cutoff.** The largest measured dataset is English DBpedia (1.24 billion input triples on one machine); larger graphs such as Wikidata have not been benchmarked (roadmap [item 1](../ROADMAP.md)). Databases and backups written before the first-release format cutoff are refused with a message directing `sparkles dump` and `sparkles load`, and `sparkles migrate --check` identifies obsolete files ([X16](../specs/X16-storage-consolidation/SPEC.md#phase-1-first-release-format-cutoff-item-479)).
+* **Codec settings and read-path costs.** FSST vocabulary compression stays off by default because string-heavy queries run 4% to 12% slower and DBpedia exports take 1.05× longer; single-term lookup optimization is roadmap [item 160](../ROADMAP.md). Dataset-local layered settings for vocabulary codecs and predicate patterns remain planned (roadmap [item 343](../ROADMAP.md)). The first query arriving roughly 2 seconds after startup pays idle thread/core wakeup overhead (roadmap [item 572](../ROADMAP.md)), cold `export-1m` at 1.01B takes 1,293 ms with framed columns (4% above unframed, and 17× slower with `SPARKLES_IO_HINTS=off`; roadmap [item 573](../ROADMAP.md)), and warm point lookups run 1.6% to 2.5% more instructions for cold-segment checks (roadmap [item 516](../ROADMAP.md)). Prewarming restores blocks and file pages up to 4 GiB, not the result cache, and may read blocks future queries do not touch.
+* **Caller-owned snapshot retention.** Caller-owned snapshot getters intentionally hand out unbudgeted views that pin their referenced generation and delta storage until dropped (`Store::snapshot`, `Dataset::snapshot`, `QuadIter::snapshot`, `Embedder::snapshot`, `WriteTxn::view`, `WriteTxn::base`, `WriteTxn::read_view`, `Snapshot::without_cache_fill`, `Snapshot::with_overlay`, `sparql::with_union_default`, `Opened::snapshot`, `ReportOutcome::snapshot`, context structs carrying an `Arc<Snapshot>`, and clones of `Snapshot::generation` or `Snapshot::delta`). An uncommitted `WriteTxn::view` or `WriteTxn::read_view` must not be retained past `WriteTxn::discard_terms` or a dry-run drop. Checked transaction reads use `WriteTxn::prepare_read_view`, which reserves transaction snapshot storage up front and returns a `PreparedTxnView` borrowed from the writer so neither the view nor its `ScopedQueryResult` can outlive the transaction or survive vocabulary rollback. Incremental view snapshot retention is accounted under roadmap [item 675](../ROADMAP.md), and `Store::managed_snapshot` returns registry metadata rather than an RDF snapshot.
+* **Write-path and quota edges.** Group commit adds 0.1% to 0.3% instructions to serial commits and measured a 1.028 p50 ratio on spatial readers under mixed load at 1.05M (roadmap [item 448](../ROADMAP.md)). On benchmark drives that alternate between fast (~0.2 ms) and slow (~1.5 ms) write-through states, write-through fences remain faster than flushing fences with a smaller margin in the slow state ([results](../benchmarks/writes/RESULTS.md#fences-in-each-drive-state)). A small first `POST` or `sparkles load` into an empty dataset incurs a ~20 to 25 ms index rebuild compared to 0.7 to 8.5 ms for a transactional first `PUT` (roadmap [item 1097](../ROADMAP.md)). Branch stores share dataset quotas, and preallocated WAL/vocabulary zero padding from non-last-written branches counts toward quota usage (roadmap [item 560](../ROADMAP.md)).
+* **Streaming, spill, and memory accounting.** Remaining eager execution fallbacks, MCP and collected Python result buffering, non-spilling `DISTINCT` above `ORDER BY` or rankings, single-group spill bounds, extra merge passes on order-dependent spilled joins, and partly ordered `DISTINCT` admission are tracked in roadmap [items 7, 496, 497, and 498](../ROADMAP.md). Graph views, commit-time view maintenance, and live query profiling remain in roadmap [items 17 and 27](../ROADMAP.md). Queries nesting past 4,000 plan levels (over 1,998 triple patterns in one BGP) are refused, quadratic BGP planning takes ~3 s at 1,998 patterns, and `/{ds}/sparql/explain` caps plan depth at 256 (roadmap [item 84](../ROADMAP.md)). Self-`SERVICE` runs in-process only from SPARQL endpoints, validation/diff/stats endpoints hold an outer admission slot while running inner queries, and eager `CONSTRUCT`/`DESCRIBE` retains peak pool credit until dropped (roadmap [item 7](../ROADMAP.md)). Server caches count value bytes rather than allocator overhead (~1.2× heap for the result cache; ten datasets at `--cache-mb 32` use 1.157× predicted anonymous memory; roadmap [item 88](../ROADMAP.md)).
+
+### Versioning and history
+
+* **Historical retention and search.** Point-in-time reads require a retained generation even if the change log still holds the diffs, and full-text search covers head commits only (roadmap [items 23 and 52](../ROADMAP.md)).
+* **Large bulk commits in the change log.** Bulk commits loading or dropping more than 1,000,000 quads into a non-empty dataset record counts only in the change log, and a crash immediately after a bulk commit can omit its change-log entry (roadmap [item 52](../ROADMAP.md)).
+* **RDF Patch and replication.** Multi-transaction (`TX … TC`) patches commit as one transaction, patches from other datasets cannot target existing blank nodes, and neither rotating patch logs nor streaming replicas exist (roadmap [items 66 and 74](../ROADMAP.md)).
 
 ## Roadmap
 
-The remaining work described above refers to [item 1](../ROADMAP.md), [item 4](../ROADMAP.md), [item 7](../ROADMAP.md), [item 17](../ROADMAP.md), [item 23](../ROADMAP.md), [item 27](../ROADMAP.md), [item 52](../ROADMAP.md), [item 66](../ROADMAP.md), [item 74](../ROADMAP.md), [item 84](../ROADMAP.md), [item 88](../ROADMAP.md), [item 160](../ROADMAP.md), [item 343](../ROADMAP.md), [item 448](../ROADMAP.md), [item 496](../ROADMAP.md), [item 497](../ROADMAP.md), [item 498](../ROADMAP.md), [item 516](../ROADMAP.md), [item 560](../ROADMAP.md).
-The central roadmap owns priority and dependencies. Its
-[completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
-link partially complete specs to their remaining work and acceptance criteria.
+Core design specifications for this area are [C05](../specs/C05-tabular-imports.md), [C13](../specs/C13-automatic-compaction.md), [C26](../specs/C26-durable-jobs-and-delivery.md), [F09](../specs/F09-branches-and-merges.md), [F10](../specs/F10-replication.md), [F19](../specs/F19-mappings-and-virtual-graphs/README.md), [X07](../specs/X07-cold-sparse-reads.md), [X09](../specs/X09-group-commit-by-default.md), [X11](../specs/X11-index-compression-and-predicate-patterns.md), and [X16](../specs/X16-storage-consolidation/SPEC.md). Write measurements live in [docs/benchmarks/writes/RESULTS.md](../benchmarks/writes/RESULTS.md).
+
+The central [roadmap](../ROADMAP.md) owns priorities and dependencies, and its [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs) cover items 1, 7, 17, 23, 27, 52, 66, 74, 84, 88, 160, 343, 395, 448, 496–498, 516, 560, 572, 573, 754, and 1097.

@@ -17,8 +17,9 @@
 //!
 //! * [`NOT_NUMERIC`]: the literal's value is not a number (a string, a date, an
 //!   ill-typed numeric literal…). Comparing it with a number is a type error.
-//! * [`UNKNOWN`]: a number the column does not hold, a decimal with more significant
-//!   digits than fit into 59 bits. Its key is decoded as before.
+//! * [`UNKNOWN`]: a number the column does not hold, such as an integer outside `i64`, a
+//!   decimal outside `oxsdatatypes::Decimal`, or a decimal with more significant digits
+//!   than fit into 59 bits. Its key is decoded as before.
 //! * [`INTEGER`], [`DECIMAL`], [`FLOAT`], [`DOUBLE`] (bit 3 set): the value is the next
 //!   entry of the value array, in id order. An integer is its `i64`, a float the bits of
 //!   its `f32`, a double the bits of its `f64` and a decimal its exact value as a
@@ -39,7 +40,7 @@
 //! Layout, little-endian:
 //!
 //! ```text
-//! magic "SPKVNUM2" | vocabulary length u64 | covered u64 | values u64
+//! magic "SPKVNUM4" | vocabulary length u64 | covered u64 | values u64
 //!   | positions u64 | segments u64
 //! kinds: ceil(positions / 16) u64 words, position p in bits 4·(p % 16) of word p / 16
 //! rank: ceil(positions / 128) u32, the values before each group of 128 positions,
@@ -61,7 +62,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The column's file name in a generation directory.
 pub const FILE: &str = "vocab.num";
-const MAGIC: &[u8; 8] = b"SPKVNUM2";
+const MAGIC: &[u8; 8] = b"SPKVNUM4";
 const HEADER: usize = 48;
 /// The kinds and the rank are kept in memory up to this size. DBpedia's take 4.3 MB.
 const RESIDENT: usize = 64 << 20;
@@ -182,6 +183,7 @@ pub fn classify(key: &[u8]) -> (u8, u64) {
             Some(p) => (DECIMAL, p),
             None => (UNKNOWN, 0),
         },
+        Value::BigInteger(_) | Value::BigDecimal(_) => (UNKNOWN, 0),
         Value::Float(f) => (FLOAT, f32::from(f).to_bits() as u64),
         Value::Double(d) => (DOUBLE, f64::from(d).to_bits()),
         _ => (NOT_NUMERIC, 0),
@@ -229,39 +231,78 @@ impl NumColumn {
     /// `0..literals`. `None` when the file is missing, or does not describe this
     /// vocabulary (then numbers are decoded from their keys).
     pub(super) fn open(dir: &Path, len: u64, literals: u64) -> Option<NumColumn> {
-        Self::open_inner(dir, len, literals, None).ok().flatten()
+        Self::open_with(dir, len, literals, &mut crate::budgeted::Unlimited)
+            .ok()
+            .flatten()
+            .map(|loaded| loaded.value)
     }
 
-    pub(super) fn open_controlled(
-        dir: &Path,
-        len: u64,
-        literals: u64,
-        budget: &mut crate::store::cold::ColdBudget<'_>,
-    ) -> Result<Option<crate::store::cold::Loaded<NumColumn>>> {
-        budget.check()?;
-        let start = budget.used();
-        match Self::open_inner(dir, len, literals, Some(budget)) {
-            Ok(Some(value)) => Ok(Some(crate::store::cold::Loaded {
-                value,
-                charge: budget.used() - start,
-            })),
-            Ok(None) => {
-                budget.release(budget.used() - start);
-                Ok(None)
-            }
-            Err(error) => {
-                budget.release(budget.used() - start);
-                Err(error)
-            }
+    /// Whether `dir/vocab.num` already holds a valid current-format numeric column for
+    /// a vocabulary of `len` ids whose literals are `0..literals`.
+    pub(crate) fn is_current(dir: &Path, len: u64, literals: u64) -> bool {
+        let path = dir.join(FILE);
+        let Ok(mut f) = File::open(&path) else {
+            return false;
+        };
+        let Ok(meta) = f.metadata() else {
+            return false;
+        };
+        let Ok(file_len) = usize::try_from(meta.len()) else {
+            return false;
+        };
+        if file_len < HEADER {
+            return false;
         }
+        let mut hdr = [0u8; HEADER];
+        if f.read_exact(&mut hdr).is_err() {
+            return false;
+        }
+        let (covered, count, positions, nsegs) = (
+            word(&hdr, 16),
+            word(&hdr, 24),
+            word(&hdr, 32),
+            word(&hdr, 40),
+        );
+        if hdr[..8] != *MAGIC
+            || word(&hdr, 8) != len
+            || covered != literals
+            || count > positions
+            || positions > covered
+        {
+            return false;
+        }
+        let Some((_, _, segs, end)) = layout(positions, count, nsegs) else {
+            return false;
+        };
+        if end != file_len {
+            return false;
+        }
+        if f.seek(SeekFrom::Start(segs as u64)).is_err() {
+            return false;
+        }
+        let mut next = (0u64, 0u64);
+        let mut seg_buf = [0u8; 24];
+        for _ in 0..nsegs {
+            if f.read_exact(&mut seg_buf).is_err() {
+                return false;
+            }
+            let (lo, hi, base) = (word(&seg_buf, 0), word(&seg_buf, 8), word(&seg_buf, 16));
+            if lo < next.0 || hi <= lo || hi > covered || base != next.1 {
+                return false;
+            }
+            next = (hi, base + (hi - lo));
+        }
+        next.1 == positions
     }
 
-    fn open_inner(
+    pub(super) fn open_with<C: crate::budgeted::BudgetControl>(
         dir: &Path,
         len: u64,
         literals: u64,
-        mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
-    ) -> Result<Option<NumColumn>> {
+        control: &mut C,
+    ) -> Result<Option<crate::store::cold::Loaded<NumColumn>>> {
+        control.check(0)?;
+        let start = control.used();
         let mut failure = None;
         macro_rules! admit {
             ($expression:expr) => {
@@ -297,11 +338,11 @@ impl NumColumn {
                 if end != b.len() {
                     return None;
                 }
-                let list: Box<[Segment]> = if let Some(budget) = budget.as_deref_mut() {
+                let list: Box<[Segment]> = if C::ACCOUNTS {
                     let mut list = Vec::new();
-                    admit!(budget.reserve(&mut list, nsegs as usize));
+                    admit!(control.reserve(&mut list, nsegs as usize));
                     for index in 0..nsegs as usize {
-                        admit!(budget.check());
+                        admit!(control.check(0));
                         let at = segs + index * 24;
                         list.push((word(b, at), word(b, at + 8), word(b, at + 16)));
                     }
@@ -317,8 +358,8 @@ impl NumColumn {
                 // ascending, apart, inside the literals, and their ids are the positions
                 let mut next = (0, 0);
                 for &(lo, hi, base) in &list {
-                    if let Some(budget) = budget.as_deref_mut() {
-                        admit!(budget.check());
+                    if C::ACCOUNTS {
+                        admit!(control.check(0));
                     }
                     if lo < next.0 || hi <= lo || hi > covered || base != next.1 {
                         return None;
@@ -339,8 +380,8 @@ impl NumColumn {
                 return None;
             };
             let head = if values <= RESIDENT {
-                if let Some(budget) = budget.as_deref_mut() {
-                    Some(admit!(budget.read_from(&mut f, values as u64)).into_boxed_slice())
+                if C::ACCOUNTS {
+                    Some(admit!(control.read_from(&mut f, values as u64)).into_boxed_slice())
                 } else {
                     let mut head = vec![0u8; values];
                     (&f).read_exact(&mut head)
@@ -351,13 +392,7 @@ impl NumColumn {
                 None
             };
             let chunks = b.len().div_ceil(HINT_CHUNK);
-            let hinted = if let Some(budget) = budget.as_deref_mut() {
-                admit!(budget.filled(chunks.div_ceil(64)))
-            } else {
-                (0..chunks.div_ceil(64))
-                    .map(|_| AtomicU64::new(0))
-                    .collect()
-            };
+            let hinted = admit!(control.filled(chunks.div_ceil(64)));
             Some(NumColumn {
                 head,
                 hinted,
@@ -370,14 +405,32 @@ impl NumColumn {
             })
         })();
         match failure {
-            Some(error) => Err(error),
-            None => Ok(value),
+            Some(error) => {
+                control.release(control.used() - start);
+                Err(error)
+            }
+            None => match value {
+                Some(value) => Ok(Some(crate::store::cold::Loaded {
+                    value,
+                    charge: control.used() - start,
+                })),
+                None => {
+                    control.release(control.used() - start);
+                    Ok(None)
+                }
+            },
         }
     }
 
     /// Ranges of ids that hold every number.
     pub fn segments(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Whether this numeric column is backed by a memory-mapped file.
+    #[inline]
+    pub(crate) fn is_mapped(&self) -> bool {
+        matches!(self.bytes, Bytes::Map(_))
     }
 
     /// Whether base id `id` may be a number. The answer costs no read: an id outside
@@ -872,7 +925,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     fn numeric_expected_page(at: usize, len: usize) -> std::collections::BTreeSet<usize> {
-        // Independent SPKVNUM2 byte layout and system page size, not locate().
+        // Independent SPKVNUM4 byte layout and system page size, not locate().
         // SAFETY: sysconf has no pointer arguments or other preconditions.
         let ps = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
         (at / ps..(at + len).div_ceil(ps)).collect()
@@ -1085,7 +1138,7 @@ pub(crate) mod tests {
             i if i == tail => Numeric::Integer(777),
             _ => Numeric::NotNumeric,
         };
-        // Derive load ranges from the fixture's documented two segments and SPKVNUM2
+        // Derive load ranges from the fixture's documented two segments and SPKVNUM4
         // layout, without calling locate(), kind_word(), rank_at() or layout().
         let expected_pages = |ids: &[u64], mapped: bool| {
             let positions = PROFILE_NUMBERS + 1;
@@ -1279,7 +1332,9 @@ pub(crate) mod tests {
     fn same(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => x == y,
+            (Value::BigInteger(x), Value::BigInteger(y)) => x == y,
             (Value::Decimal(x), Value::Decimal(y)) => x == y,
+            (Value::BigDecimal(x), Value::BigDecimal(y)) => x == y,
             (Value::Float(x), Value::Float(y)) => {
                 f32::from(*x).to_bits() == f32::from(*y).to_bits()
             }
@@ -1456,10 +1511,10 @@ pub(crate) mod tests {
                 &Literal::new_simple_literal(format!("{i}")).into(),
             ));
         }
-        // strings between the digits and "inf": two segments
+        // strings between the digits and "INF": two segments
         for i in 0..GAP + 100 {
             keys.push(term_key(
-                &Literal::new_simple_literal(format!("a{i:06}")).into(),
+                &Literal::new_simple_literal(format!("A{i:06}")).into(),
             ));
         }
         keys.sort();
@@ -1548,5 +1603,46 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), col);
         let v = Vocab::open(dir.path()).unwrap();
         assert_eq!(v.numeric().unwrap().get(7), Numeric::Integer(7));
+    }
+
+    #[test]
+    fn legacy_spkvnum2_column_is_ignored_warned_and_upgradable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut keys = vec![
+            term_key(&Literal::new_typed_literal("1.5", oxrdf::vocab::xsd::DOUBLE).into()),
+            term_key(&Literal::new_typed_literal("inf", oxrdf::vocab::xsd::DOUBLE).into()),
+            term_key(&Literal::new_typed_literal("INF", oxrdf::vocab::xsd::DOUBLE).into()),
+            term_key(&NamedNode::new_unchecked("http://ex.org/a").into()),
+        ];
+        keys.sort();
+        let mut w = VocabWriter::create(dir.path()).unwrap();
+        for k in &keys {
+            w.push(k).unwrap();
+        }
+        w.finish().unwrap();
+        let current = std::fs::read(dir.path().join(FILE)).unwrap();
+        assert_eq!(&current[..8], b"SPKVNUM4");
+
+        // Downgrade the magic to legacy SPKVNUM2 (as written before item 1077).
+        let mut legacy = current.clone();
+        legacy[..8].copy_from_slice(b"SPKVNUM2");
+        std::fs::write(dir.path().join(FILE), &legacy).unwrap();
+
+        // Opening ignores legacy SPKVNUM2 cleanly so queries decode from keys.
+        assert!(Vocab::open(dir.path()).unwrap().numeric().is_none());
+        // `sparkles check --full` reports a warning (error = false), not a hard error.
+        let check = crate::vocab::verify_numeric_column(dir.path(), true).unwrap();
+        assert!(
+            matches!(check, Err((false, _))),
+            "expected warning for legacy SPKVNUM2, got {check:?}"
+        );
+        // Rebuilding upgrades vocab.num back to SPKVNUM4.
+        assert!(crate::vocab::add_numeric_column(dir.path()).unwrap() > 0);
+        assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), current);
+        assert!(Vocab::open(dir.path()).unwrap().numeric().is_some());
+        assert!(matches!(
+            crate::vocab::verify_numeric_column(dir.path(), true),
+            Some(Ok(_))
+        ));
     }
 }

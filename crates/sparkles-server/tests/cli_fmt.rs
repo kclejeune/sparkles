@@ -8,6 +8,8 @@
 
 #![cfg(feature = "fmt")]
 
+mod common;
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -719,28 +721,20 @@ fn the_endpoint_on_a_running_server() {
 
 /// A server on a temporary data directory, stopped when dropped.
 struct Server {
-    child: std::process::Child,
+    _child: common::ServerProcess,
     port: u16,
 }
 
 impl Server {
     fn start(data: &Path, env: &[(&str, &str)]) -> Server {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut c = Command::new(BIN);
-        c.args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
-            .arg("--data")
-            .arg(data.join("data"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        let mut command = common::serve();
+        command.arg("--data").arg(data.join("data"));
         for (k, v) in env {
-            c.env(k, v);
+            command.env(k, v);
         }
+        let (child, port) = common::ServerProcess::start(&mut command, &data.join("server.log"));
         let s = Server {
-            child: c.spawn().unwrap(),
+            _child: child,
             port,
         };
         let t0 = std::time::Instant::now();
@@ -773,13 +767,6 @@ impl Server {
     fn post(&self, path: &str, ct: &str, body: &str) -> (u16, String) {
         self.request("POST", path, ct, body)
             .unwrap_or_else(|| panic!("POST {path}"))
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 

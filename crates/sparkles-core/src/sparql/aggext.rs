@@ -125,7 +125,11 @@ impl Arq {
 /// The value of the custom aggregate `iri` over the evaluated values of one group
 /// (after DISTINCT; `Err` for a row whose expression was an error); unbound when `iri`
 /// is not a known aggregate or the aggregate is an error.
-pub(crate) fn aggregate(ctx: &Ctx, iri: &str, vals: &[std::result::Result<Id, ()>]) -> Id {
+pub(crate) fn aggregate(
+    ctx: &Ctx,
+    iri: &str,
+    vals: &[std::result::Result<Id, ()>],
+) -> crate::error::Result<Id> {
     if let Some(arq) = Arq::of(iri) {
         return arq_aggregate(ctx, arq, vals);
     }
@@ -134,21 +138,25 @@ pub(crate) fn aggregate(ctx: &Ctx, iri: &str, vals: &[std::result::Result<Id, ()
         .strip_prefix(crate::geo::vocab::GEOF)
         .and_then(|local| crate::geo::aggregates::evaluate(ctx, local, vals))
     {
-        return id;
+        ctx.check()?;
+        return Ok(id);
     }
     let _ = (ctx, iri, vals);
-    Id::UNDEF
+    Ok(Id::UNDEF)
 }
 
 /// A value as a double, as ARQ's `NodeValue.getDouble`; `None` for a value that is not a
-/// number (and for unbound).
-fn double_of(ctx: &Ctx, id: Id) -> Option<f64> {
-    match id.tag() {
+/// number (and for unbound). Propagates any memory or control refusal.
+fn double_of_checked(ctx: &Ctx, id: Id) -> crate::error::Result<Option<f64>> {
+    Ok(match id.tag() {
         Tag::Int => Some(id.as_i64() as f64),
         Tag::Double => Some(id.as_f64()),
         Tag::Undef => None,
-        _ => Some(f64::from(Num::of(&ctx.value(id)?).ok()?.to_double())),
-    }
+        _ => match ctx.value_checked(id)? {
+            Some(v) => Num::of(&v).ok().map(|n| f64::from(n.to_double())),
+            None => None,
+        },
+    })
 }
 
 /// `x` as an `xsd:decimal`, as ARQ's `NodeValue.makeDecimal(double)` (the shortest
@@ -164,25 +172,41 @@ fn decimal_id(ctx: &Ctx, x: f64) -> Id {
     d.map_or(Id::UNDEF, |d| ctx.intern_value(&Value::Decimal(d)))
 }
 
-fn arq_aggregate(ctx: &Ctx, arq: Arq, vals: &[std::result::Result<Id, ()>]) -> Id {
+fn arq_aggregate(
+    ctx: &Ctx,
+    arq: Arq,
+    vals: &[std::result::Result<Id, ()>],
+) -> crate::error::Result<Id> {
     if let Arq::Stat { .. } = arq {
         let mut acc = StatAcc::default();
-        for v in vals {
-            acc.add(ctx, v.ok());
+        for (i, v) in vals.iter().enumerate() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            acc.add(ctx, v.ok())?;
         }
-        return acc.finish(ctx, arq);
+        let id = acc.finish(ctx, arq);
+        ctx.check()?;
+        return Ok(id);
     }
+    let _xs_charge = ctx.charge((vals.len() as u64).saturating_mul(8).saturating_add(64))?;
     let mut xs = Vec::with_capacity(vals.len());
-    for v in vals {
-        match v.ok().and_then(|id| double_of(ctx, id)) {
+    for (i, v) in vals.iter().enumerate() {
+        if i.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        let Ok(id) = *v else {
+            return Ok(Id::UNDEF);
+        };
+        match double_of_checked(ctx, id)? {
             Some(x) => xs.push(x),
-            None => return Id::UNDEF,
+            None => return Ok(Id::UNDEF),
         }
     }
     if xs.is_empty() {
-        return Id::from_i64(0).unwrap_or(Id::UNDEF);
+        return Ok(Id::from_i64(0).unwrap_or(Id::UNDEF));
     }
-    match arq {
+    let id = match arq {
         Arq::Median => {
             xs.sort_unstable_by(f64::total_cmp);
             let n = xs.len();
@@ -195,7 +219,9 @@ fn arq_aggregate(ctx: &Ctx, arq: Arq, vals: &[std::result::Result<Id, ()>]) -> I
         }
         Arq::Mode => decimal_id(ctx, mode(&xs)),
         Arq::Stat { .. } => unreachable!(),
-    }
+    };
+    ctx.check()?;
+    Ok(id)
 }
 
 /// The most frequent value; among equally frequent values the one that reached that
@@ -235,15 +261,19 @@ pub(crate) struct StatAcc {
 
 impl StatAcc {
     /// Add one row's value: `None` (an expression error) or a value that is not a number
-    /// makes the aggregate an error.
+    /// makes the aggregate an error. Propagates memory and control refusals immediately.
     #[inline]
-    pub(crate) fn add(&mut self, ctx: &Ctx, id: Option<Id>) {
+    pub(crate) fn add(&mut self, ctx: &Ctx, id: Option<Id>) -> crate::error::Result<()> {
         if self.error {
-            return;
+            return Ok(());
         }
-        let Some(d) = id.and_then(|id| double_of(ctx, id)) else {
+        let Some(id) = id else {
             self.error = true;
-            return;
+            return Ok(());
+        };
+        let Some(d) = double_of_checked(ctx, id)? else {
+            self.error = true;
+            return Ok(());
         };
         self.count += 1;
         if self.count == 1 {
@@ -255,22 +285,39 @@ impl StatAcc {
             self.sum += dk;
             self.sum_sq += dk * dk;
         }
+        Ok(())
     }
 
-    pub(crate) fn finish(&self, ctx: &Ctx, arq: Arq) -> Id {
+    pub(crate) fn finish_value(&self, arq: Arq) -> Option<f64> {
         let Arq::Stat { population, root } = arq else {
-            return Id::UNDEF;
+            return None;
         };
         if self.error || self.count == 0 {
-            return Id::UNDEF;
+            return None;
         }
         let n = self.count;
         let n1 = if population { n } else { n - 1 };
         if n1 == 0 {
-            return Id::UNDEF;
+            return None;
         }
         let var = (self.sum_sq - (self.sum * self.sum) / n as f64) / n1 as f64;
-        let x = if root { var.sqrt() } else { var };
-        ctx.intern_value(&Value::Double(x.into()))
+        Some(if root { var.sqrt() } else { var })
+    }
+
+    pub(crate) fn try_finish(&self, ctx: &Ctx, arq: Arq) -> crate::error::Result<Id> {
+        match self.finish_value(arq) {
+            Some(x) => ctx.try_intern_value(&Value::Double(x.into())),
+            None => Ok(Id::UNDEF),
+        }
+    }
+
+    pub(crate) fn finish(&self, ctx: &Ctx, arq: Arq) -> Id {
+        match self.try_finish(ctx, arq) {
+            Ok(id) => id,
+            Err(error) => {
+                ctx.fail_memory(&error);
+                Id::UNDEF
+            }
+        }
     }
 }

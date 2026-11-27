@@ -95,8 +95,13 @@ impl Features {
                 self.expression(a);
                 self.expression(b);
             }
-            K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
-                self.alc |= matches!(&a.kind, K::DisjointClasses(_) | K::DisjointUnion(..));
+            K::EquivalentClasses(cs) => {
+                for c in cs {
+                    self.expression(c);
+                }
+            }
+            K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
+                self.alc = true;
                 for c in cs {
                     self.expression(c);
                 }
@@ -114,9 +119,15 @@ impl Features {
                     }
                 }
             }
-            K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
+            K::EquivalentObjectProperties(ps) => {
                 self.hierarchy = true;
-                self.roles |= matches!(&a.kind, K::DisjointObjectProperties(_));
+                for p in ps {
+                    self.property(p);
+                }
+            }
+            K::DisjointObjectProperties(ps) => {
+                self.hierarchy = true;
+                self.roles = true;
                 for p in ps {
                     self.property(p);
                 }

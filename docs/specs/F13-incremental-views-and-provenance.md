@@ -355,8 +355,16 @@ id tuples, stored in columnar chunks of the kind `sparql::table::Table` already 
 The state of every view counts against its `memoryBytes` and against a server-wide pool
 of `--views-memory`, which [X08](X08-disk-spill-and-server-memory.md)'s server-wide memory pool provides. A view whose state
 passes its budget is `suspended` with `over-budget`, and its reads fail with
-`503 view-suspended` until a rebuild with a larger budget. A live query whose state
-passes the per-query budget fails with an `error` event naming the budget.
+`503 view-suspended` until a rebuild with a larger budget.
+
+A live query's per-query budget bounds its circuit and the decoded events queued for
+that subscriber. A budget refusal during the initial build or snapshot decoding fails
+the subscription request with `over-budget`. A subscriber joining a shared circuit
+can open a stream even if the decoded snapshot exceeds its queue limit. The queue
+overflows, and the first read requests a fresh `reset`. Queue overflow during
+delivery follows the same rule. If a later circuit update or diff cannot be admitted,
+or the reset exceeds its budget, the subscription ends with `over-budget`. Unread
+decoded rows hold server pool credit until delivery, overflow, or close.
 
 ### 3.6 Internal circuits
 
@@ -876,8 +884,9 @@ records it. The fixed-point operator of item 417 was delivered on 2026-11-01, an
 [Fixed-point operator](#fixed-point-operator) records it. The aggregates and the
 correlated `EXISTS` of item 418 were delivered on 2026-11-10, and
 [Aggregates and correlated EXISTS](#aggregates-and-correlated-exists) records them. The
-rest of Phases 2 and 3 is not built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as
-items 416 and 419 to 429.
+ordered windows of item 419 were delivered on 2026-11-21, and
+[Ordered windows](#ordered-windows) records them. The rest of Phases 2 and 3 is not
+built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as items 416 and 420 to 429.
 
 - `crates/sparkles-core/src/incr/` holds the core. `zset.rs` keeps rows of ids with
   `i64` weights. `compile.rs` compiles the spargebra algebra into a circuit of the
@@ -1569,6 +1578,101 @@ ran three rounds on a Namespace instance with `serial-literal` at 0.85 of the ba
 transactions per second, `mixed` at 0.94 and `writers` at 1.23, with every range
 overlapping, which item 907 pins on the batch screen and forge.
 
+### Ordered windows
+
+Item 419 delivered the ordered windows of §4.4 on 2026-11-21. A SELECT with `ORDER BY`
+and `LIMIT k OFFSET m` compiles to the window operator of `incr/ops/window.rs` in place
+of the `recompute` node it was before.
+
+- The compiler peels the algebra's `Slice`, `Distinct`, `Project` and `OrderBy`. Each
+  order expression that is not a variable becomes a hidden variable bound by an `Extend`
+  below the projection, the projection keeps the key variables, and a projection above
+  the window drops them again. A `DISTINCT` ordered by a variable it does not project
+  stays a `recompute` node, since its rows are not the distinct projected rows. So do
+  `LIMIT` without `ORDER BY`, which §4.4 leaves out, `OFFSET` without `LIMIT`, an
+  `EXISTS` in an order key and a window under `GRAPH ?g`.
+- The operator keeps the best `k + m + max(k, 100)` copies of its input in a vector
+  sorted by the engine's sort keys (`sparql::sortkey`), which reproduce `order_cmp`. Every
+  row it does not keep orders at or after every row it keeps, and it may keep only some
+  copies of a row, which is what lets a trim and a refill cut through ties and
+  duplicates. It also keeps the input's total weight, so it knows when rows exist beyond
+  the kept ones. A row enters when it orders no later than the last kept row or when the
+  kept rows hold the whole input. Removals subtract from the row's entry.
+- When the kept rows fall below `k + m` while the input holds more, the operator runs its
+  input's `init` at the new snapshot and refills from those rows. The kept rows that the
+  input still holds stay in their order, with no more copies than the input has, and the
+  input's other best rows join them at their places. An operator evaluated again can give
+  other rows than its maintained state, since a maintained `SAMPLE` keeps its value while
+  the group holds it, so a kept row the input no longer gives is dropped. The spec's refill by the query engine was not used, because the
+  circuit's floating-point sums and its `GROUP_CONCAT` and `SAMPLE` can differ from a
+  one-off evaluation, so the engine's rows would not match the input's rows by id. The
+  cost is one evaluation of the input per refill, which a run of deletions at the front
+  pays once per `max(k, 100)` of them.
+- A refill reconciles only the rows the window kept. It counts each kept row's copies in
+  the input as the input streams past, so its bookkeeping is bounded by the window and
+  not by the input. The heap that collects the best rows, its sort keys' strings, the
+  rows the window holds until the new ones replace them and that bookkeeping are charged
+  to the pass's memory budget at every row, so a window over long keys fails with a
+  memory error while it builds and not after. The keys that a pass computes for its
+  changes and for rows loaded from a checkpoint are charged the same way. A fresh build
+  appends the heap's sorted rows without searching among them, so ties cost no more than
+  other rows. Computing the keys of loaded rows and of a pass's changes and the
+  placement of the heap's rows obey the pass's cancellation and deadline, which are also
+  checked before and after the heap's sort and at the end of each phase, before its
+  result is installed, but not within the sort or within one key's decoding. A pass that
+  fails while it places the rows leaves the window empty with the input's total, a
+  consistent state, and the runtime then fails the view, which a rebuild starts again
+  from the input. A named view that starts its own circuit builds without a memory
+  limit, for this operator as for every other, which item 1298 takes.
+- Rows that the order does not tell apart keep the order in which they entered the kept
+  rows. The vector is saved in order and the keys depend on the terms, so a checkpoint
+  and a generation switch keep it. Keys whose order is not total, such as dates with and
+  without a timezone or NaN, make a sorted vector unsound, so a window that holds or
+  receives one rebuilds its rows from its input at each pass that changes it.
+- Each kept row has a serial that lives in memory, and its copies are numbered. The
+  window before and after a pass is a list of copies, and the copies in one list and not
+  the other are the moves. The window at a SELECT's root reports them, with positions
+  counted from the first row the query returns, as `LiveRow::position`. A row that moves
+  with the same projected values appears in both lists, which is why a positioned diff
+  comes from the operator and not from the result's consolidated change. The result and
+  its history stay a Z-set, so views read at past commits as before, without the order.
+  A live query's snapshot lists the window in order, `view:read` returns it in order, a
+  positioned diff does not merge under `coalesceMs`, and a resume or a re-evaluation of
+  an ordered query sends a `reset`. The live-query wire format gains an optional
+  `position` and no version, since a client that ignores it reads a correct multiset
+  change, as the format's other optional fields do. Python's events add `positions`,
+  `removed_positions` and `added_positions`.
+- `ops::Op` gained a variant, so `COMPILER` is `f13-phase2-3` and every view
+  checkpointed by an earlier compiler is refused by its fingerprint and built again
+  once. The window's state is its input's total weight and its rows with their copies,
+  in order.
+- Under a provenance setting a window's rows carry unknown witnesses, as the `recompute`
+  node did, while its input keeps its annotations current. A refill under one carries
+  them through, which a test checks.
+- The inner nodes of a property path that the compiler expands into triple patterns had
+  names starting with `__incr`, which a query variable can also take, so such a variable
+  joined with the path's inner node. They now start with `#`, which no SPARQL variable
+  can spell, as the window's hidden keys and the fixed-point operator's names do (item
+  549).
+
+The window's differential tests in `incr/window_tests.rs` check eight windows through
+random histories against a model of the data, with ties, duplicates, an offset, an
+expression key, a key outside the projection, `DISTINCT`, a grouped count and `LIMIT 0`.
+They compare the keys position by position and the rows of each key, allowing any choice
+among ties at the window's edges, and a client that applies every pass's moves must hold
+the window in order. Further tests cover changes above, inside and below a window, a row
+that moves, duplicates that a window cuts, the number of refills over 250 deletions, the
+compiler's fallbacks and a window in a subquery against the engine.
+
+On wally with 200,000 people, a maintained pass of the three windows of
+`window_against_recompute` costs 13 to 17 µs at the median, against 0.8 to 2.1 ms for
+the query evaluated again, which is what each commit cost before. A refill evaluates the
+window's input again and costs about 55 ms on the ages. A full reserve takes 100
+deletions at the front, so of the 400 commits with 200 such deletions only the one with
+the 101st deletion should refill. The
+[writes benchmark](../benchmarks/writes/RESULTS.md#ordered-windows-in-views) gives the
+table and its run record.
+
 ### Maintained assessments and conservative dependencies
 
 [F22](F22-analysis-lifecycle.md) defines the lifecycle of maintained analysis results.
@@ -1625,6 +1729,55 @@ all 776 tests. Twenty repetitions of all six HTTP group commit tests pass, inclu
 the persistent reopen assertion that exposed the directory lock race. The worker
 callback case that reopens through a retained state and the thread-local destruction
 case each pass 100 repetitions.
+
+### View read deadlines across mode changes
+
+Item 1101 separated mode change recording from per-circuit recompilation so a view read
+never holds the registry lock across another view's running pass or waits past its
+deadline or cancellation.
+
+The registry tracks a monotonically increasing mode generation alongside the dataset's
+inference, aggregate-error reading, and host revision. Mode sampling runs outside the
+registry lock. A host replacement or settings change invalidates the published mode until
+a fresh sample is recorded. Timed readers use the published mode without calling the host,
+and planning uses it only after a host has published a current mode and the registry is
+immediately available. A newer host revision takes precedence over older samples.
+
+Idle circuits recompile outside the registry lock. A worker or live join can start a
+replacement build after the old operators have been dropped and their detached budget
+leases have returned credit to the pool. Worker rounds process idle circuits before busy
+circuits and recheck the host mode outside circuit state after waiting for a busy circuit.
+They check the published revision again when they reacquire state. A new RDFS setting
+with an unchanged checkpoint key still starts a new mode generation. Rounds release their
+busy-cell references before garbage collection and checkpointing.
+
+View reads revalidate the runtime mode inside the circuit lock before accepting a version
+or preparing a fallback. Both streaming and eager reads honor deadlines and cancellation,
+including while waiting for an `allowStale` read and when circuit metadata is busy. An
+eager fallback checks both controls while preparing, installing and decoding its results.
+In an ordered fallback, those checks cover entries skipped by the offset and entries
+scanned for memory accounting. The private circuit keeps its term dictionary and result
+for decoding. A missing view returns `view-not-found` when the registry entry is checked.
+Metadata for a view waiting on a mode change reports a build in progress and omits the
+previous plan and row count.
+`wait_built` uses one metadata snapshot to decide whether the build completed and returns
+current metadata with the commit and row count published by that pass. Its timeout bounds
+the wait and it does not run a build. Garbage collection preserves the live-query switch
+boundary when dropping an unswitched dead circuit.
+
+Tests synchronize competing worker and live-join builds while the old pool credit is still
+held, pause mode sampling while timed operations run, replace an equal-schema RDFS setting
+during Pass 2, and change the reading between the Pass 2 probe and admission. They hold
+the registry during a catalog attach while a Pass 2 host callback consults runtime stats
+and publish a new host revision after a concurrent sample of the old revision. Tests
+hold circuit metadata past the read deadline and reopen a dataset with a nondefault
+aggregate-error reading before its first plan. They also complete a build between the
+catalog's snapshot and its return decision, check metadata while worker and live builders
+are about to publish, and cancel eager fallbacks during result installation, ordered
+output preparation and retained window accounting. Other tests synchronize GC ownership
+release before checkpointing, change mode after the reader's first generation check,
+advance the epoch at expiration, and cancel eager and streaming queries after an
+incomplete view read has waited.
 
 ### Scope changes
 

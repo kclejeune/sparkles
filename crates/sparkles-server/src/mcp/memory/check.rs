@@ -433,7 +433,7 @@ impl Tools<'_> {
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let deadline = self.call.arrived + timeout;
+        let deadline = self.deadline(timeout);
         let r = self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?;
         let mut terms = Terms::new(&prefixes, 500);
         let mut issues: Vec<Issue> = Vec::new();
@@ -441,7 +441,7 @@ impl Tools<'_> {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let mut out = json!({ "dataset": ds.name, "commit": r.snap.commit });
+        let mut out = json!({ "dataset": ds.name, "commit": r.commit() });
         let parsed = match sparkles::sparql::parse_query(&a.query, None, &pv) {
             Ok(q) => q,
             Err(e) => {
@@ -555,7 +555,7 @@ impl Tools<'_> {
             if known.contains_key(o.as_str()) || lookups >= MAX_LOOKUPS {
                 continue;
             }
-            let ok = match r.snap.lookup_term(&Term::NamedNode(o.clone())) {
+            let ok = match r.snap().lookup_term(&Term::NamedNode(o.clone())) {
                 // never stored: absent everywhere
                 None => false,
                 Some(_) => {
@@ -646,11 +646,11 @@ impl Tools<'_> {
                 };
                 // a report from the index statistics samples the objects: a literal that
                 // is an object of the predicate meets it whatever the sample holds
-                if !rep.basis.is_exact() && *meet == Meet::Pattern && is_object(&r.snap, p, l) {
+                if !rep.basis.is_exact() && *meet == Meet::Pattern && is_object(r.snap(), p, l) {
                     continue;
                 }
                 let (objects, sampled) =
-                    self.entry_objects(&ds, &r.snap, rep, entry, deadline, &ctx)?;
+                    self.entry_objects(&ds, r.snap(), rep, entry, deadline, &ctx)?;
                 if let Some(issue) = literal_issue(p, l, *meet, &objects.literals, &mut terms) {
                     let mut issue = issue;
                     issue.at = locate(&a.query, p.as_str(), &prefix_map);
@@ -697,7 +697,7 @@ impl Tools<'_> {
             opts.prefixes = pv.clone();
             opts.timeout =
                 Some(super::super::tools::remaining(deadline).map_err(|e| ctx.engine(e))?);
-            let (_, plan) = sparkles::sparql::explain(r.snap.clone(), &a.query, &opts)
+            let (_, plan) = sparkles::sparql::explain(r.snap().clone(), &a.query, &opts)
                 .map_err(|e| ctx.engine(e))?;
             // a view restricted by grants sees no estimates (-1)
             let root = plan.estimated_rows;
@@ -714,7 +714,7 @@ impl Tools<'_> {
                 });
             }
         }
-        out["commit"] = r.snap.commit.into();
+        out["commit"] = r.commit().into();
         Ok(Outcome::Structured(finish(out, &issues, estimated, &terms)))
     }
 

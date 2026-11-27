@@ -25,14 +25,56 @@ pub struct Rows {
 impl Rows {
     /// The estimated bytes the entry holds.
     pub fn bytes(&self) -> u64 {
-        let terms: usize = self
-            .rows
-            .iter()
-            .flatten()
-            .map(|t| t.as_ref().map_or(0, term_bytes) + 16)
-            .sum();
-        let vars: usize = self.vars.iter().map(|v| v.len() + 24).sum();
-        (terms + vars + self.rows.len() * 24 + 64) as u64
+        let rows: u64 = self.rows.iter().map(|r| Self::row_bytes(r)).sum();
+        Self::vars_bytes(&self.vars) + rows + 64
+    }
+
+    /// What one row adds to [`Rows::bytes`].
+    pub(crate) fn row_bytes(row: &[Option<Term>]) -> u64 {
+        Self::row_bytes_of(row.iter().map(Option::as_ref))
+    }
+
+    /// [`Rows::row_bytes`] of a row's borrowed slots, which weighs a row before it is
+    /// built.
+    pub(crate) fn row_bytes_of<'a>(row: impl IntoIterator<Item = Option<&'a Term>>) -> u64 {
+        let terms: usize = row.into_iter().map(|t| t.map_or(0, term_bytes) + 16).sum();
+        (terms + 24) as u64
+    }
+
+    /// The bytes one row keeps allocated: its slots at their capacity, its vector's
+    /// header and what its terms keep outside their slots (see [`term_alloc_bytes`]).
+    /// [`Rows::bytes`] is the cache's weight, an estimate that this exceeds for wide
+    /// rows of mostly unbound slots and for triple terms.
+    #[allow(clippy::ptr_arg, reason = "the capacity of the row is what it keeps")]
+    pub(crate) fn retained_row_bytes(row: &Vec<Option<Term>>) -> u64 {
+        Self::retained_slots_bytes(row.capacity(), row.iter().flatten())
+    }
+
+    /// [`Rows::retained_row_bytes`] of a row of `capacity` slots holding `terms`, which
+    /// sizes a row from borrowed terms before it is built.
+    pub(crate) fn retained_slots_bytes<'a>(
+        capacity: usize,
+        terms: impl IntoIterator<Item = &'a Term>,
+    ) -> u64 {
+        let slots = capacity * std::mem::size_of::<Option<Term>>();
+        let terms: usize = terms.into_iter().map(term_alloc_bytes).sum();
+        (slots + std::mem::size_of::<Vec<Option<Term>>>() + terms) as u64
+    }
+
+    /// The bytes the entry keeps allocated, by [`Rows::retained_row_bytes`] and the
+    /// capacities of its vectors.
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        let rows: u64 = self.rows.iter().map(Self::retained_row_bytes).sum();
+        let spare =
+            (self.rows.capacity() - self.rows.len()) * std::mem::size_of::<Vec<Option<Term>>>();
+        let vars = self.vars.capacity() * std::mem::size_of::<String>()
+            + self.vars.iter().map(String::capacity).sum::<usize>();
+        rows + (spare + vars + std::mem::size_of::<Self>()) as u64
+    }
+
+    /// What the variable names add to [`Rows::bytes`].
+    pub(crate) fn vars_bytes(vars: &[String]) -> u64 {
+        vars.iter().map(|v| v.len() as u64 + 24).sum()
     }
 }
 
@@ -44,11 +86,33 @@ fn term_bytes(t: &Term) -> usize {
             l.value().len() + l.language().map_or(0, str::len) + l.datatype().as_str().len() + 48
         }
         Term::Triple(t) => {
-            term_bytes(&t.subject.clone().into())
-                + t.predicate.as_str().len()
-                + term_bytes(&t.object)
-                + 24
+            subject_text(&t.subject) + 24 + t.predicate.as_str().len() + term_bytes(&t.object) + 24
         }
+    }
+}
+
+fn subject_text(s: &oxrdf::NamedOrBlankNode) -> usize {
+    match s {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+        oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+    }
+}
+
+/// The bytes a term keeps allocated outside the slot that holds it: its text with an
+/// allowance of 24 bytes for each string, as [`term_bytes`] counts it, and for a
+/// triple term the boxed triple and what its parts keep, at every level of nesting.
+/// [`term_bytes`] is the cache's weight and leaves the boxes out.
+fn term_alloc_bytes(t: &Term) -> usize {
+    match t {
+        Term::Triple(t) => {
+            std::mem::size_of::<oxrdf::Triple>()
+                + subject_text(&t.subject)
+                + 24
+                + t.predicate.as_str().len()
+                + 24
+                + term_alloc_bytes(&t.object)
+        }
+        t => term_bytes(t),
     }
 }
 
@@ -228,6 +292,11 @@ impl ServiceCache {
         c.insert(NsKey { ns: self.ns, key }, rows);
     }
 
+    /// The largest entry, with its key, that [`ServiceCache::put`] keeps.
+    pub(crate) fn max_entry_bytes(&self) -> u64 {
+        self.store.max_entry_bytes
+    }
+
     pub fn remove(&self, key: &str) {
         if let Some(c) = &self.store.cache {
             c.remove(&NsKeyRef { ns: self.ns, key });
@@ -281,17 +350,105 @@ impl ServiceCache {
     }
 }
 
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 = self.0.saturating_add(s.len());
+        Ok(())
+    }
+}
+
+/// Exact serialized byte length of [`key`] for the same arguments, without allocating.
+pub fn key_len(scope: &str, url: &str, pattern: &str, values: &[(&str, &Term)]) -> usize {
+    let mut len = scope
+        .len()
+        .saturating_add(url.len())
+        .saturating_add(pattern.len())
+        .saturating_add(3);
+    for &(v, t) in values {
+        let mut c = ByteCounter(0);
+        let _ = write!(c, "{t}");
+        len = len
+            .saturating_add(v.len())
+            .saturating_add(c.0)
+            .saturating_add(3);
+    }
+    len
+}
+
+struct CheckedWriter<F, E> {
+    buf: String,
+    admit: F,
+    err: Option<E>,
+}
+
+impl<F, E> Write for CheckedWriter<F, E>
+where
+    F: FnMut(usize) -> std::result::Result<(), E>,
+{
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if self.err.is_some() {
+            return Err(std::fmt::Error);
+        }
+        let needed = self.buf.len().saturating_add(s.len());
+        if needed > self.buf.capacity() {
+            let next_cap = self.buf.capacity().saturating_mul(2).max(needed);
+            if let Err(e) = (self.admit)(next_cap) {
+                self.err = Some(e);
+                return Err(std::fmt::Error);
+            }
+            self.buf.reserve(needed - self.buf.len());
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
+}
+
+/// Build the key of one request, admitting its serialized capacity before allocating the
+/// `String` and before any buffer growth while formatting terms.
+pub fn try_key<E>(
+    scope: &str,
+    url: &str,
+    pattern: &str,
+    values: &[(&str, &Term)],
+    mut admit: impl FnMut(usize) -> std::result::Result<(), E>,
+) -> std::result::Result<String, E> {
+    let exact = key_len(scope, url, pattern, values);
+    admit(exact)?;
+    let buf = String::with_capacity(exact);
+    if buf.capacity() > exact {
+        admit(buf.capacity())?;
+    }
+    let mut w = CheckedWriter {
+        buf,
+        admit,
+        err: None,
+    };
+    let _ = write!(w, "{scope}\u{0}{url}\u{0}{pattern}\u{0}");
+    if let Some(e) = w.err {
+        return Err(e);
+    }
+    if !values.is_empty() {
+        let mut vs: Vec<_> = values.to_vec();
+        vs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (v, t) in vs {
+            if write!(w, "?{v}={t};").is_err()
+                && let Some(e) = w.err
+            {
+                return Err(e);
+            }
+        }
+    }
+    debug_assert_eq!(w.buf.len(), exact);
+    Ok(w.buf)
+}
+
 /// The key of one request: the caller's scope, the endpoint, the SERVICE pattern as
 /// written and the values substituted into it, by variable name.
 pub fn key(scope: &str, url: &str, pattern: &str, values: &[(&str, &Term)]) -> String {
-    let mut s = String::with_capacity(scope.len() + url.len() + pattern.len() + 64);
-    let _ = write!(s, "{scope}\u{0}{url}\u{0}{pattern}\u{0}");
-    let mut vs: Vec<_> = values.to_vec();
-    vs.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    for (v, t) in vs {
-        let _ = write!(s, "?{v}={t};");
-    }
-    s
+    try_key::<std::convert::Infallible>(scope, url, pattern, values, |_| Ok(()))
+        .unwrap_or_else(|e| match e {})
 }
 
 #[cfg(test)]
@@ -385,6 +542,29 @@ mod tests {
         assert_eq!(
             key("", "u", "p", &[("a", &a), ("b", &b)]),
             key("", "u", "p", &[("b", &b), ("a", &a)])
+        );
+    }
+
+    /// The bytes a row keeps count the box of every triple term, at every level of
+    /// nesting, beside the terms' text.
+    #[test]
+    fn retained_bytes_count_every_boxed_triple() {
+        let n = |s: &str| NamedNode::new(s).unwrap();
+        let depth = 8;
+        let mut t: Term = n("urn:o").into();
+        for _ in 0..depth {
+            t = Term::Triple(Box::new(oxrdf::Triple::new(n("urn:s"), n("urn:p"), t)));
+        }
+        let row = vec![Some(t)];
+        let text = depth * ("urn:s".len() + "urn:p".len()) + "urn:o".len();
+        let at_least = std::mem::size_of::<Option<Term>>()
+            + std::mem::size_of::<Vec<Option<Term>>>()
+            + depth * std::mem::size_of::<oxrdf::Triple>()
+            + text;
+        assert!(
+            Rows::retained_row_bytes(&row) >= at_least as u64,
+            "{} < {at_least}",
+            Rows::retained_row_bytes(&row)
         );
     }
 }

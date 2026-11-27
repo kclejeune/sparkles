@@ -1,11 +1,8 @@
 # X16: Storage consolidation
 
-> **Status:** in progress. The plan below is ordered and audited against the code, and
-> phase 2 has shipped.
+> **Status:** implemented in part (Phases 1, 2, 3, 4, 5 apart from `imbl`, and items 846 and 1062). The plan below is ordered and audited against the code.
 >
-> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479 and 830 to 833
-> hold the phases that are ready to start, and each is named in its phase. Items 484 and 832 are
-> complete, and item 1152 takes the last `imbl` maps of Phase 5. The later candidate phases get their numbers when their prerequisites land.
+> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Item 833 holds the remaining ready phase, item 1152 takes the last `imbl` maps of Phase 5, and items 479, 484, 830, 831, 832, 846 and 1062 are complete. The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -109,7 +106,7 @@ dataset file gains `format` 2 and the index gains format 5.
 | Kind | Today | After the cutoff | How |
 |---|---|---|---|
 | `index` | It reads 2, 3 and 4, and writes 3 without features and 4 with them. | It reads and writes 5. Format 5 is format 4 with the `features` list always present and `vocab.idx` required. | Drop the format 2 unsegmented layout from the open paths of `index.rs` and `cold.rs`, and `PLAIN_FORMAT_VERSION` from `builder.rs`. Add format 5 to `READABLE_INDEX_FORMATS` alone and move `builder::FORMAT_VERSION` to it. The tests keep the whole-column writer as a reference decoder for the segmented one, and item 847 removes the `Option` around `Segments`. |
-| `vocab-index` | Every build writes `vocab.idx`, but a reader opens a generation without one, and `add_vocab_index` writes it for a generation an older build left bare. | Index format 5 requires it, and a format 5 generation without one, or whose index does not describe its vocabulary's block offsets, is corrupt. The open compares the first and last offsets and `check` every entry's offset and key, and item 848 measures a full key check at open. | Require the file in `Vocab::open_codec` and `open_controlled`, delete `add_vocab_index`, and add a refusal test for a format 4 generation and a corruption test for a format 5 generation without the file. The `sparse` field stays optional for the empty vocabulary and the `SPARKLES_SPARSE_VOCAB` switch, and item 847 makes it and the permutations' `segs` required. |
+| `vocab-index` | Every build writes `vocab.idx`, but a reader opens a generation without one, and `add_vocab_index` writes it for a generation an older build left bare. | Index format 5 requires it, and a format 5 generation without one, or whose index does not describe its vocabulary's block offsets, is corrupt. The open compares the first and last offsets and `check` every entry's offset and key, and item 848 measures a full key check at open. | Require the file in `Vocab::open_codec` and `open_controlled`, delete `add_vocab_index`, and add a refusal test for a format 4 generation and a corruption test for a format 5 generation without the file. The `sparse` field stays optional for empty vocabularies and reads whose budget cannot hold the index. Item 847 tracks making the index structures required. |
 | `wal` | It reads 0, 1 and 2. A plain store writes 1 and an activated store writes 2. | It reads 1 and 2 and writes them as today. | Delete `Framing::Mixed`, `fold_legacy`, `walStrictFrom` in `commit.json`, the headerless branches of `WalCursor`, `WalIndex::scan`, `apply_backward`, `probe.rs`, `history_limited.rs`, `backup.rs` and `diff.rs`. |
 | `delta-vocab` | It reads 1 and 2, with a `migrate` step from 1. | It reads and writes 2. | Delete `convert_legacy_file`, the step and the legacy parser of `vocab/delta.rs`. |
 | `dataset` | It reads `format` 1 with readers 1 to 8. A new plain store writes reader 5 and an activated store reader 8. | It reads and writes `format` 2 with readers 5 to 8, and `minimumReader` keeps its meaning. | Write `format` 2 from both dataset writers, `dataset_file_bytes` and `clone_dataset_file_bytes`, which `Store::clone_to` uses, refuse `format` 1 with the dump-and-reload message in `check_dataset_value`, and delete the branches that handle readers below 5, which are a dataset without branches, relinked generations, framed deltas or log headers. The branches for `managed.json` and `holds.json` stay, since a plain store still lacks both. |
@@ -299,8 +296,9 @@ does not check each quad's graph. A batch from `insert_bulk` or a patch has its 
 checked as it is staged, so a restriction does not keep it out of a rebuild, as before the
 phase. The table test includes a patch whose delete row removes nothing and still takes
 the transactional path. The group admission's
-`Fallback::Bulk` reads the same plan. SPARQL `LOAD` keeps inserting per quad, as
-[decision 4](#decisions) records.
+`Fallback::Bulk` reads the same plan. SPARQL `LOAD` stayed transactional in Phase 4, and
+item 846 added `Entry::SparqlLoad` for a single-operation `LOAD`, as [decision 4](#decisions)
+and the Outcome section record.
 
 The gate is the load benchmark of [docs/benchmarks](../../benchmarks/README.md) at 1.05M
 and 10.5M with no load slower, and the table test, which records the plan each entry
@@ -531,12 +529,13 @@ follows them.
    which is format 4 with the `features` list always present and `vocab.idx` required,
    since a second write form and an optional file serve nobody after the cutoff and the
    mandatory index then has a version of its own.
-4. **SPARQL `LOAD` and the load plan.** `LOAD` inserts per quad today whatever its size.
-   Letting it take the bulk plan when it is the only operation of its request would make
-   a large `LOAD` as fast as `sparkles load`, but changes which path an update takes and
-   therefore its memory and lock profile. The recommendation is to leave `LOAD` alone in
-   Phase 4 and record the choice in the load plan's table. Item 846 takes the bulk plan
-   for a large `LOAD` with its own memory and lock measurement.
+4. **SPARQL `LOAD` and the load plan.** `LOAD` stayed transactional in Phase 4 so that an
+   update kept one memory and lock profile. Item 846 added `Entry::SparqlLoad` to
+   `LoadPlan::choose` for a `LOAD` that is the only operation of its request, following the
+   strict threshold rule of `replace_with` so small loads stay transactional and large
+   unrestricted loads take the bulk rebuild path. Multi-operation requests, calls inside an
+   open write transaction and graph-restricted writes stay transactional. The Outcome
+   section records the measured memory and lock profile.
 5. **The import transport's reader.** The unwired import transport writes `minimumReader`
    one above the build's `DATASET_READER` for an imported destination, which is 10 now
    that reader 9 belongs to the job ledger. The recommendation is to
@@ -716,6 +715,71 @@ finished stage does not. The `insn_screen` binary's text grew by 0.08%. The comp
 time of `sparkles-core` before and after the stage is still to be timed on a quiet
 host.
 
+The third stage of Phase 3 is built for the cold, commit, index, link, history,
+branching and lifecycle readers. `budgeted.rs` adds `BudgetControl` for mutable
+accounting carriers (`Unlimited` and `ColdBudget`), implements `Control` for
+`Preparation`, `WriteOptions` and `FnControl`, and adds `read_lock` and `no_wait` to
+`Control`. Under `Unlimited`, every accounting step compiles away and file, JSON and
+digest helpers lower directly to `std::fs`, `serde_json` and `sha2`. Twenty-four twin
+readers fold into generic implementations: `Segments::open_with`, `PermIndex::open_with`,
+`PermIndex::contains_with`, `decode_point_column_with`, `for_each_key_range_masked_with`
+and `for_each_segment_rows` in `index.rs`; `Snapshot::scan_between_cols_with`,
+`distinct_first_with`, `for_each_graph_id_with`, `Store::history_generation_with` and
+`Store::resolve_under` in `store.rs` and `store/history_limited.rs`;
+`Generation::open_base_with`, `open_sealed_with` and `retained_bytes_with` in
+`store/cold.rs`; `read_link_with`, `apply_overlay_with` and `Generation::open_linked_with`
+in `store/link.rs`; `parse_dataset_with`, `read_dataset_file_with`,
+`decode_gen_commit_bytes_with`, `read_gen_commit_with` and `walk_catalog_with` in
+`commit.rs`; `decode_file_with`, `checked_document` and `checked_file` in `history.rs`;
+`any_by_id_with`, `normalize_with`, `listed_with` and `Control::lock` in
+`store/branching.rs`; and `WeakLink::upgrade_with` in `store/lifecycle.rs`. Ordinary
+`read_catalog` now shares `walk_catalog_with` and refuses a recognized primary header with
+a future version before `Catalog::open` reconciles it, while keeping a zero version
+reconcilable on the ordinary path. The `limit.read_limit()` bridges in `store/wal.rs` and
+the unified index, link, branching and lifecycle readers are removed. `read_limit` still
+serves Stage 2's vocabulary bridges (`dvocab.len_limited` and
+`dvocab.resident_bytes_limited`), `Control`'s default lock and refusal helpers,
+`HistoryCeiling` lock acquisition, `cache_limited_snapshot`,
+`authenticate_retained_generation`, and `ColdBudget` initialization in
+`history_generation_with` and `retained_bytes_with`.
+
+The second stage of Phase 3 finishes item 830 across the vocabulary stack. `budgeted.rs`
+extends `BudgetControl` with `key_step`, `read_from`, `read_mutable_prefix` and `crc32`,
+removes its three vocabulary-specific bridge methods, implements `Control` for
+`task::Control` and adds `FnMutControl` for fallible closure callers. `vocab/cold.rs`
+folds `hash_with`, `compare_with`, `equal_with`, `copy_with`, `Index::find_with` and
+`Index::insert_with` onto `BudgetControl`, keeping chunked `FxHasher` fingerprints
+identical between `Unlimited` and controlled opens. `vocab/numeric.rs` folds `open` and
+`open_controlled` into `NumColumn::open_with`, and `vocab/fsst.rs` folds
+`first_byte_with` over `Control` and `measure_with` over a zero-cost `SuffixMeasure`
+trait. `vocab/delta.rs` folds `parse_delta_with`, `open_read_only_with`,
+`open_layered_with`, `extend_read_only_with`, `len_with`, `resident_bytes_with` and
+`with_control`, removing the `dvocab.len_limited` and `dvocab.resident_bytes_limited`
+`read_limit` bridges across `store.rs`, `store/cold.rs`, `store/branching/readonly.rs`
+and `store/configuration_history/validation.rs`. `vocab.rs` folds `Sparse::read_with`,
+`Sparse::decode_with`, `Vocab::open_with`, `boundary_with` and `AppendVocab::push_with`
+onto `BudgetControl` and `Control`, and introduces zero-cost `BlockScratch` and
+`HintAdmit` traits so `decode_block_with`, `get_sorted_with`, `find_with`,
+`prefetch_sorted_with`, `prefetch_value_pages_with` and `prefetch_terms_with` serve the
+unlimited, checked, owned-checked, exact and controlled-capacity paths from single
+implementations while preserving the unchecked dense loop and plain checked register loop.
+
+Item 1062 unifies the change-log and read-only change-log codecs in `store/changelog.rs`
+and `store/changelog/readonly.rs`. A single `decode_record_with` generic over `Control`
+and a zero-cost `RecordSink` trait serves `OwnedRecordSink` for owned `Record` values,
+`ViewRecordSink` for borrowed `RecordView` slices with in-place trailing entry
+validation, and `TimestampRecordSink` for timestamp-only validation. Shared `Control`
+and `BudgetControl` helpers (`read_settings_with`, `crc32_with`, `frame_with`,
+`read_exact_at_loop_with`, `read_exact_at_with`, `arc_bytes_with`, `valid_utf8_with`,
+`arc_text_with`, `decode_meta_with`, `footprint_with`, `read_file_frame_with`,
+`ChangeLog::read_with`, `SegIndex::decode_with`, `ChangeLog::index_with`,
+`ChangeLog::read_index_with` and the hole sorting and deduplication helpers shared by
+`HoleCollector::finish_with` and `ReadOnlyLog::scan`) replace the `_checked` twins and
+the duplicate decoders and hole normalizers in `changelog/readonly.rs`. The quiet-Intel
+`bench:insn`, `sparkles-core` binary size, compile time and spill matrix acceptance
+measurements for Stage 2 and Stage 3 run at the batch gate before push and are appended
+here once recorded.
+
 Phase 4 is built. `LoadPlan::choose` in `store/load_plan.rs` takes a `LoadInputs` and a
 `Sizes` that reads a source's estimate or probes its streams only when the plan depends
 on it, and `load_with`, `replace_with`, `insert_bulk` and `patch_apply` ask it. The
@@ -760,6 +824,54 @@ took 1.01, 1.00 and 0.94 times the base's time persistent and 1.02, 0.99 and 0.9
 memory. The gates were the table test, the entry-point tests, the deadline tests at the
 default and the saturated threshold, lane CI and eight review rounds. Durability, the write-ahead
 log and the on-disk formats did not change.
+
+Item 846 extends `LoadPlan::choose` with `Entry::SparqlLoad` for a SPARQL `LOAD` that is
+the only operation of its request. It follows the strict threshold rule of `replace_with`
+on both empty and non-empty stores, so a small file or HTTP stream stays transactional and
+avoids the rebuild's fixed cost, while an unrestricted file whose estimate exceeds
+`bulk_threshold` or an HTTP stream whose decoded bytes exceed `bulk_threshold * 80`
+(20 MiB at the default threshold of 250,000 quads) takes the bulk rebuild path through
+`Store::load_sparql`. A graph-restricted write, a multi-operation update request and an
+update inside an open write transaction stay transactional so that per-quad graph checks,
+triple protections and multi-operation atomicity are unchanged. `LOAD <uri>` and
+`LOAD <uri> INTO GRAPH <g>` keep their default-graph remapping and named-graph retention
+across all RDF, Jena and OWL functional-style syntaxes, and a bulk `LOAD INTO GRAPH`
+leaves the commit's default-graph change flag false. Repeating an above-threshold `LOAD` of
+already-present ground quads preserves the head commit, returns `committed: false`,
+skips commit-only branch protection and publication-fit checks, and still registers newly
+declared source prefixes. For a single-operation `LOAD` through `run_single_load`,
+`LOAD SILENT` carries source-error provenance through preparation, probing and parsing so
+it hides only source, fetch, format and parse failures (returning an unchanged-head
+receipt) while preserving permission refusals, outbound timeouts and response-size
+ceilings, outbound and decompression budgets, cancellation, deadlines, preconditions, write
+guards, publish hooks, dry runs, managed-graph boundaries, storage limits and store or
+builder failures. Multi-operation updates and `update_in` stay on the legacy transactional
+handler, where outbound policy timeouts and raw response-size limits still surface as
+`Error::Invalid`.
+
+File permission checks, codec detection, outbound HTTP requests and the stream size probe
+now run before the exclusive writer lock is acquired, so network latency and stream
+probing no longer block concurrent writers. Once the plan is chosen, the bulk path holds
+the exclusive writer lock across the generation build, write-guard validation and atomic
+`CURRENT` switch while concurrent readers continue lock-free against the previous
+snapshot. For an HTTP `LOAD`, stream probing holds at most `bulk_threshold * 80 + 1`
+decoded bytes in memory (with buffer capacity capped at that limit) before the parse starts
+and releases that prefix buffer once replayed; a file `LOAD` buffers nothing to choose its
+plan. An approximate directional profile on an 8-vCPU, 16 GiB Boat worker in release builds
+at 1,000,000 N-Triples quads (~80 MiB) loaded into a 1,000-quad seeded store (one process
+per arm; Boat timings are approximate rather than a quiet Intel host A/B, recorded in the
+[loading report](../../benchmarks/loading/RESULTS.md#bulk-sparql-load)) measured wall time,
+peak resident set (`VmHWM`), maximum concurrent snapshot read latency and the first
+observed `WriterBusy` probe sample (`first_busy`, polled every 1 ms to estimate pre-lock
+time at millisecond resolution rather than the writer's full hold interval). A persistent
+file load took 1.811 s and 575 MiB peak RSS on the bulk path against 3.009 s and 1,011 MiB
+transactional, and a persistent loopback HTTP load took 1.376 s with a 12.8 ms first busy
+sample and 560 MiB peak RSS against 2.287 s and 1,014 MiB transactional. An in-memory file
+load took 1.192 s and 798 MiB against 2.090 s and 1,013 MiB, and an in-memory HTTP load
+took 1.750 s with a 13.8 ms first busy sample and 778 MiB against 2.190 s and 1,016 MiB.
+Maximum concurrent snapshot read latency stayed within 5 to 27 µs during all bulk rebuilds,
+and each bulk load left an empty delta. Durability, the write-ahead log and the on-disk
+formats did not change.
 
 Phase 5 is built apart from the `imbl` maps. `index::encode_deltas` writes the zig-zag
 delta varints of an index column frame and of a run block's column, and
@@ -815,6 +927,18 @@ user-space instructions per request within the noise floor of the counts, with r
 1.0012 over the 31 benchmark queries in both modes and eight rounds. These cells therefore point to code
 placement rather than added work, and [item 1246](../../ROADMAP.md) confirms them on the forge matrix
 after the push.
+
+Item 1208 closes a tenth-byte overflow gap in the shared delta-varint decoders of Phase 5
+and the temporary pattern run reader. `read_varint10` loops over the first nine bytes and
+validates the tenth byte only after nine continuation bytes, accepting `0x00` or `0x01` and
+rejecting `0x02` through `0xff` as corrupt so that index column frames and builder run blocks
+cannot truncate values wider than 64 bits. `read_varint_checked` and `patterns::read_run`
+apply the same tenth-byte bound at shift 63 for bounded point column reads, temporary pattern
+runs and the other checked varint callers, and `patterns::read_run` checks cumulative subject
+addition for overflow. Unit tests cover every overflowing tenth byte from `0x02` through
+`0x7f`, non-terminating tenth bytes, padded tenth-byte zero encodings and round-trips of the
+largest valid 64-bit varint across index column frames, bounded reads, builder run blocks and
+temporary pattern runs.
 
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the

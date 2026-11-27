@@ -276,3 +276,123 @@ fn a_copy_is_charged_with_a_bound_literals_language() {
     };
     assert!(b.bytes() >= tag.len(), "{}", b.bytes());
 }
+
+/// Each temporary rendered branch must be admitted against `groups_held` BEFORE allocating
+/// owned patterns, bindings, or fresh variables (`self.fresh_var()`).
+#[test]
+fn temporary_branch_is_admitted_before_rendering_or_fresh_var_allocation() {
+    let long_prop = format!("p_{}", "x".repeat(16 * 1024));
+    let t = tbox(&format!(
+        "@prefix ex: <{EX}> . @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+         ex:A a owl:Class . ex:{long_prop} a owl:ObjectProperty ; rdfs:domain ex:A ."
+    ));
+    let patterns = vec![TriplePattern {
+        subject: TermPattern::Variable(Variable::new_unchecked("s")),
+        predicate: NamedNodePattern::NamedNode(oxrdf::vocab::rdf::TYPE.into()),
+        object: TermPattern::NamedNode(NamedNode::new_unchecked(format!("{EX}A"))),
+    }];
+
+    // 4 KiB pool easily admits PerfectRef's two compact Cqs (~200 B) and the tiny first
+    // branch (?s a ex:A), but cannot admit rendering the second branch (?s ex:p_<16 KiB> ?__ql1).
+    let pool = sparkles_core::sparql::pool::QueryPool::new(4 * 1024);
+    let budget =
+        crate::budget::Budget::with_parent(Some(16 * 1024 * 1024), Some(pool.work_parent()));
+    let mut counts = FxHashMap::default();
+    counts.insert("?s".to_string(), 2);
+    let stop = || Ok(());
+    let mut rw = Rewriter {
+        tbox: &t,
+        max_union: DEFAULT_MAX_UNION,
+        stop: &stop,
+        bound: FxHashMap::default(),
+        counts,
+        all_distinguished: false,
+        fresh: 0,
+        path_warned: false,
+        derive: Vec::new(),
+        nodes: Vec::new(),
+        warnings: Vec::new(),
+        emitted_held: crate::budget::Held::new(&budget),
+        budget: budget.clone(),
+    };
+    let err = match rw.bgp(&patterns) {
+        Ok(_) => panic!("expected ServerMemory refusal on large temporary branch"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            sparkles_core::Error::BudgetExceeded(sparkles_core::Budget {
+                kind: sparkles_core::BudgetKind::ServerMemory,
+                ..
+            })
+        ),
+        "expected ServerMemory refusal, got: {err:?}"
+    );
+    assert_eq!(
+        rw.fresh, 0,
+        "fresh_var() must not run before temporary branch admission succeeds"
+    );
+    drop(rw);
+    drop(budget);
+    assert_eq!(pool.granted(), 0);
+}
+
+fn subclass_tbox() -> Tbox {
+    tbox(&format!(
+        "@prefix ex: <{EX}> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+         ex:B rdfs:subClassOf ex:A ."
+    ))
+}
+
+#[test]
+fn temporary_group_backing_capacity_is_admitted() {
+    let t = subclass_tbox();
+    let query = parse(&format!("PREFIX ex: <{EX}> SELECT ?s {{ ?s a ex:A }}"));
+    // Both branches land in the same group. The old per-branch estimate fits this pool,
+    // but the outer vector and the spare capacity in the inner vector do not.
+    let pool = sparkles_core::sparql::pool::QueryPool::new(1320);
+    let budget = crate::budget::Budget::with_parent(Some(4096), Some(pool.work_parent()));
+    let result = rewrite_query_in_budget(&query, &[], &t, DEFAULT_MAX_UNION, &budget, &|| Ok(()));
+    assert!(
+        matches!(
+            result,
+            Err(sparkles_core::Error::BudgetExceeded(
+                sparkles_core::Budget {
+                    kind: sparkles_core::BudgetKind::ServerMemory,
+                    ..
+                }
+            ))
+        ),
+        "expected ServerMemory refusal, charged peak was {}",
+        budget.peak()
+    );
+    assert_eq!(budget.used(), 0);
+    drop(budget);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn projection_names_move_into_emitted_credit() {
+    let t = subclass_tbox();
+    let name = "v".repeat(64 * 1024);
+    let query = parse(&format!(
+        "PREFIX ex: <{EX}> SELECT ?{name} {{ ?{name} a ex:A }}"
+    ));
+    // One shared projection name, two temporary patterns, and two emitted patterns fit.
+    // Charging the shared name a second time while those patterns overlap does not fit.
+    let cap = 5 * name.len() + 16 * 1024;
+    let pool = sparkles_core::sparql::pool::QueryPool::new(cap as u64);
+    let budget = crate::budget::Budget::with_parent(Some(cap * 2), Some(pool.work_parent()));
+    let rewritten =
+        rewrite_query_in_budget(&query, &[], &t, DEFAULT_MAX_UNION, &budget, &|| Ok(()))
+            .unwrap()
+            .unwrap();
+    assert!(budget.used() >= 3 * name.len());
+    let payload = rewritten.into_rewritten();
+    assert_eq!(branches(&payload), vec![2]);
+    assert_eq!(budget.used(), 0);
+    drop(budget);
+    assert_eq!(pool.granted(), 0);
+}

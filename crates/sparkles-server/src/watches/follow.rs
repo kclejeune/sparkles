@@ -75,7 +75,7 @@ pub struct Followers {
 
 impl Followers {
     /// The names every follower keeps (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "auth"))]
     pub(crate) fn names(&self) -> usize {
         self.by_branch.values().map(Follower::names).sum()
     }
@@ -362,7 +362,7 @@ impl Follower {
     }
 
     /// The names the follower keeps (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "auth"))]
     pub(crate) fn names(&self) -> usize {
         self.names.iris.len()
     }

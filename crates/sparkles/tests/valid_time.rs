@@ -632,6 +632,7 @@ mod availability {
                     reported_available_at: None,
                 },
                 lineage: Default::default(),
+                was_revision_of: None,
             }],
             claims: vec![ClaimInput {
                 version: RecordVersion::V1,

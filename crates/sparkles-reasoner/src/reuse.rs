@@ -56,6 +56,7 @@ use crate::engine::{CHead, CRule, Slot};
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::id::{Id, Tag};
+use sparkles_core::incr::footprint::Resolved as FootprintResolved;
 use sparkles_core::index::Perm;
 use sparkles_core::store::Chunk;
 use sparkles_core::store::{Delta, Snapshot};
@@ -70,20 +71,11 @@ pub(crate) const MAX_CHANGES: usize = 100_000;
 const MEMO: usize = 16;
 
 /// The patterns of facts that a session's rules read or give, against which a differing
-/// quad is tested.
+/// quad is tested, backed by the shared incremental [`FootprintResolved`].
 #[derive(Default, Debug)]
 pub(crate) struct Relevance {
-    /// a pattern matches every fact, so every change is relevant
-    all: bool,
-    /// predicates whose every fact is relevant
-    preds: FxHashSet<u64>,
-    /// (predicate, subject) and (predicate, object) pairs with the other position free
-    ps: FxHashSet<(u64, u64)>,
-    po: FxHashSet<(u64, u64)>,
-    /// patterns with every position constant
-    pso: FxHashSet<[u64; 3]>,
-    /// patterns with a variable predicate and a constant subject or object
-    free: Vec<(Option<u64>, Option<u64>)>,
+    /// resolved triple patterns of the rules, schema and always-relevant predicates
+    footprint: FootprintResolved,
     /// an atom reads only which predicates the facts use: its predicate is a variable,
     /// and its subject and object are variables that occur nowhere else in the rule, as
     /// in `(?x ?p ?y) -> (?p rdf:type rdf:Property)`
@@ -105,12 +97,25 @@ impl Relevance {
         always: &[u64],
         cap: usize,
     ) -> Relevance {
-        let mut r = Relevance::default();
+        let mut r = Relevance {
+            footprint: schema.resolved_footprint(),
+            ..Relevance::default()
+        };
         for &p in schema.preds.iter().chain(always) {
-            r.add(Slot::Any, Slot::Const(p), Slot::Any);
+            if Id(p).tag() == Tag::Local {
+                r.locals.insert(p);
+            }
         }
         for &c in &schema.classes {
-            r.add(Slot::Any, Slot::Const(schema.rdf_type), Slot::Const(c));
+            if Id(c).tag() == Tag::Local {
+                r.locals.insert(c);
+            }
+        }
+        if Id(schema.rdf_type).tag() == Tag::Local && !schema.classes.is_empty() {
+            r.locals.insert(schema.rdf_type);
+        }
+        for &p in always {
+            r.add(Slot::Any, Slot::Const(p), Slot::Any);
         }
         for rule in rules {
             let once = singletons(rule);
@@ -144,9 +149,9 @@ impl Relevance {
                     _ => {}
                 }
             }
-            if r.all || r.len() > cap {
+            if r.footprint.everything() || r.footprint.pattern_count() > cap {
                 return Relevance {
-                    all: true,
+                    footprint: FootprintResolved::all(),
                     ..Relevance::default()
                 };
             }
@@ -159,13 +164,9 @@ impl Relevance {
         self.uses
     }
 
-    fn len(&self) -> usize {
-        self.preds.len() + self.ps.len() + self.po.len() + self.pso.len() + self.free.len()
-    }
-
     fn add(&mut self, s: Slot, p: Slot, o: Slot) {
         let c = |x: Slot| match x {
-            Slot::Const(c) => Some(c),
+            Slot::Const(c) => Some(Id(c)),
             _ => None,
         };
         for x in [s, p, o] {
@@ -175,22 +176,7 @@ impl Relevance {
                 self.locals.insert(c);
             }
         }
-        match (c(s), c(p), c(o)) {
-            (_, None, None) if c(s).is_none() => self.all = true,
-            (s, None, o) => self.free.push((s, o)),
-            (None, Some(p), None) => {
-                self.preds.insert(p);
-            }
-            (Some(s), Some(p), None) => {
-                self.ps.insert((p, s));
-            }
-            (None, Some(p), Some(o)) => {
-                self.po.insert((p, o));
-            }
-            (Some(s), Some(p), Some(o)) => {
-                self.pso.insert([s, p, o]);
-            }
-        }
+        self.footprint.add_triple_pattern(c(s), c(p), c(o));
     }
 
     /// Give the constants that were not terms of the store their keys, with `key` the
@@ -220,26 +206,19 @@ impl Relevance {
     /// one of the `gained` terms, constants of the rules that the store did not hold at the
     /// anchor's commit, so that a pattern named them by a local id.
     pub(crate) fn reads(&self, t: &[u64; 3], gained: &FxHashSet<u64>) -> bool {
-        if self.all {
+        if self.footprint.everything() {
             return true;
         }
         if !gained.is_empty() && t.iter().any(|x| gained.contains(x)) {
             return true;
         }
-        let [s, p, o] = *t;
-        self.preds.contains(&p)
-            || self.ps.contains(&(p, s))
-            || self.po.contains(&(p, o))
-            || self.pso.contains(t)
-            || self
-                .free
-                .iter()
-                .any(|&(fs, fo)| fs.is_none_or(|x| x == s) && fo.is_none_or(|x| x == o))
+        self.footprint
+            .matches_triple(&[Id(t[0]), Id(t[1]), Id(t[2])])
     }
 
     /// Every fact is relevant, so the anchor never answers another commit.
     pub(crate) fn everything(&self) -> bool {
-        self.all
+        self.footprint.everything()
     }
 }
 
@@ -372,7 +351,7 @@ fn answers(
         }
         if a.relevance.uses() {
             // an access mask hides quads that the check below would count
-            if snap.mask.is_some() {
+            if snap.has_mask() {
                 relevant = true;
                 return false;
             }

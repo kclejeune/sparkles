@@ -283,10 +283,10 @@ impl<'q> PropertyScan<'q> {
                     last = Some(key);
                     return Ok(true);
                 }
-                let decoded = ctx.charge(256)?;
+                let decoded = ctx.charge(0)?;
                 let terms = spo
                     .map(|id| {
-                        ctx.term(id)
+                        ctx.term_checked_into(id, &decoded)?
                             .ok_or_else(|| Error::invalid("invalid captured RDF term"))
                     })
                     .into_iter()
@@ -296,7 +296,6 @@ impl<'q> PropertyScan<'q> {
                         .map(|b| n.saturating_add(b))
                         .map_err(|e| e.engine())
                 })?;
-                decoded.add(cost.saturating_sub(128))?;
                 if cost > MAX_BATCH_BYTES {
                     return Err(Error::invalid("property read triple exceeds byte ceiling"));
                 }
@@ -317,6 +316,8 @@ impl<'q> PropertyScan<'q> {
                     return Err(Error::invalid("invalid captured predicate"));
                 };
                 triples.push(Triple::new(subject, predicate, terms[2].clone()));
+                drop(terms);
+                drop(decoded);
                 bytes += cost;
                 self.previous = Some(spo);
                 last = Some(key);
@@ -373,6 +374,21 @@ pub struct Spec {
 }
 
 impl Spec {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        descriptor: Arc<PropertyDescriptor>,
+        subject: Vec<PT>,
+        object: Vec<PT>,
+        graph: Arc<GraphFilter>,
+    ) -> Self {
+        Self {
+            descriptor,
+            subject,
+            object,
+            graph,
+        }
+    }
+
     pub(super) fn copy_layout(&self, layout: &mut super::checked_layout::Layout<'_>) -> Result<()> {
         layout.slots::<Self>(1)?;
         layout.vector(&self.subject)?;
@@ -732,8 +748,9 @@ fn run_inner(ctx: &Ctx, spec: &Spec, input: &Table, vars: &[VarId]) -> Result<Ta
                     if id.is_undef() {
                         return Ok(None);
                     }
+                    let decode_charge = ctx.charge(0)?;
                     let term = ctx
-                        .term(*id)
+                        .term_checked_into(*id, &decode_charge)?
                         .ok_or_else(|| Error::invalid("invalid property input RDF term"))?;
                     // term_bytes includes this value's inline RDF slot; add only
                     // its remainder because even None slots were charged up front.
@@ -745,6 +762,7 @@ fn run_inner(ctx: &Ctx, spec: &Spec, input: &Table, vars: &[VarId]) -> Result<Ta
                         return Err(Error::invalid("property input exceeds batch byte ceiling"));
                     }
                     args_charge.add(cost)?;
+                    drop(decode_charge);
                     context.remember(&term)?;
                     Ok(Some(term))
                 })

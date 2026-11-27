@@ -107,6 +107,11 @@ const FILTERS: &[&str] = &[
     "STRSTARTS(STR({X}), \"1\")",
     "STRSTARTS({X}, \"ünï\")",
     "STRSTARTS({X}, \"Ada\"@en-us)",
+    "STRSTARTS({X}, \"Ada\"@en-us--ltr)",
+    "STRSTARTS({X}, \"Ada\"@en-us--rtl)",
+    "CONTAINS({X}, \"r\"@ar)",
+    "CONTAINS({X}, \"r\"@ar--rtl)",
+    "STRENDS({X}, \"1\"@en-US--ltr)",
     "REGEX({X}, \"^Ada\")",
     "REGEX(STR({X}), \"^http://ex.org/s1\", \"s\")",
     "REGEX(STR({X}), \"^b\\\"?q\")",
@@ -246,26 +251,28 @@ fn id_ranges_match_reading_every_key() {
     // the subjects of ex:v twice over: the filter runs on a join's rows
     let shape = "SELECT ?s ?v WHERE { ?s ex:v ?v . ?s ex:v ?u FILTER({E}) } ORDER BY ?v ?s";
     let filters = [
-        r#"STRSTARTS({X}, "Ab")"#,
-        r#"STRSTARTS({X}, "Ada"@en-us)"#,
-        r#"STRSTARTS(STR({X}), "http://ex.org/i1")"#,
-        r#"STRSTARTS(STR({X}), "1")"#,
-        r#"STRSTARTS({X}, "ünï")"#,
-        r#"REGEX({X}, "^Ada")"#,
-        r#"REGEX({X}, "^ab", "s")"#,
-        r#"REGEX({X}, "^ab", "i")"#,
-        r#"REGEX(STR({X}), "^b\"?q")"#,
-        r#"REGEX({X}, "^Ab") && LANGMATCHES(LANG({X}), "en")"#,
-        r#"STRSTARTS({X}, "zzz")"#,
+        (r#"STRSTARTS({X}, "Ab")"#, true),
+        (r#"STRSTARTS({X}, "Ada"@en-us--ltr)"#, true),
+        (r#"STRSTARTS({X}, "Ada"@en-us)"#, false),
+        (r#"STRSTARTS({X}, "Ada"@en-us--rtl)"#, false),
+        (r#"STRSTARTS(STR({X}), "http://ex.org/i1")"#, true),
+        (r#"STRSTARTS(STR({X}), "1")"#, true),
+        (r#"STRSTARTS({X}, "ünï")"#, true),
+        (r#"REGEX({X}, "^Ada")"#, true),
+        (r#"REGEX({X}, "^ab", "s")"#, true),
+        (r#"REGEX({X}, "^ab", "i")"#, true),
+        (r#"REGEX(STR({X}), "^b\"?q")"#, true),
+        (r#"REGEX({X}, "^Ab") && LANGMATCHES(LANG({X}), "en")"#, true),
+        (r#"STRSTARTS({X}, "zzz")"#, false),
     ];
     let generic = Optimizations::ALL
         .disable("count_filter_runs,filter_scan_runs")
         .unwrap();
     let check = |s: &Store| {
-        for f in filters {
+        for (f, expect_non_empty) in filters {
             let q = shape.replace("{E}", &f.replace("{X}", "?v"));
             let a = solutions(&run(s, &q, generic));
-            assert!(!a.is_empty() || f.contains("zzz"), "{q}");
+            assert_eq!(!a.is_empty(), expect_non_empty, "{q}");
             let generic_run = run(s, &q, Optimizations::NONE);
             assert_eq!(a, solutions(&generic_run), "{q}");
             super::opt_tests::same_as_reference(s, &q, &generic_run);

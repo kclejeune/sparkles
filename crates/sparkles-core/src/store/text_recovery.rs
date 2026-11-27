@@ -1796,7 +1796,6 @@ mod tests {
                 root,
                 StoreOptions {
                     group_commit: true,
-                    group_commit_idle_direct: false,
                     ..Default::default()
                 },
             )

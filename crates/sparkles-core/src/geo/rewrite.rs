@@ -19,17 +19,16 @@
 
 use super::GeomRef;
 use super::config::GeoConfig;
-use super::exec::{Counters, config, graph_iri, state};
+use super::exec::{Counters, config, graph_iri_checked, state};
 use super::geom::Geom;
 use super::join::JoinItem;
-use super::memo::{MemoKey, max_vertices, parse_value};
 use super::ops::relate::{self, Prepared};
 use super::search::{self, SearchStats};
 use super::vocab::{self, Relation};
 use crate::error::Result;
 use crate::id::{Id, Tag};
 use crate::index::Perm;
-use crate::sparql::ctx::Ctx;
+use crate::sparql::ctx::{Charge, Ctx};
 use crate::sparql::geojoin::JoinTest;
 use crate::sparql::georewrite::{RelateEnd, SpatialRelateSpec};
 use crate::sparql::table::{Table, VarId};
@@ -73,7 +72,7 @@ pub fn spatial_relate(
     spec: &SpatialRelateSpec,
     vars: &[VarId],
 ) -> Result<(Table, Counters)> {
-    let mut r = Relate::new(ctx, spec);
+    let mut r = Relate::new(ctx, spec)?;
     if let Some(p) = spec.property {
         r.asserted(p)?;
     }
@@ -116,17 +115,20 @@ struct Relate<'a> {
     st: SearchStats,
     /// literal pairs that passed
     pairs: u64,
+    /// Credit for `geoms` entries (declared last so containers drop before the charge).
+    geoms_charge: Charge<'a>,
 }
 
 impl<'a> Relate<'a> {
-    fn new(ctx: &'a Ctx, spec: &'a SpatialRelateSpec) -> Relate<'a> {
+    fn new(ctx: &'a Ctx, spec: &'a SpatialRelateSpec) -> Result<Relate<'a>> {
         let cfg = config(ctx);
         let preds = cfg
             .predicates
             .iter()
             .filter_map(|p| ctx.snap.lookup_iri(p))
             .collect();
-        Relate {
+        let geoms_charge = ctx.charge(0)?;
+        Ok(Relate {
             ctx,
             spec,
             preds,
@@ -140,7 +142,8 @@ impl<'a> Relate<'a> {
             out: FxHashSet::default(),
             st: SearchStats::default(),
             pairs: 0,
-        }
+            geoms_charge,
+        })
     }
 
     // ------------------------------------------------------------------ output --
@@ -247,34 +250,45 @@ impl<'a> Relate<'a> {
     }
 
     /// Whether serialization quads of graph `g` are in the index's scope.
-    fn in_scope(&mut self, g: u64) -> bool {
-        let (ctx, cfg) = (self.ctx, &self.cfg);
-        *self
-            .scope
-            .entry(g)
-            .or_insert_with(|| graph_iri(ctx, Id(g)).is_some_and(|i| cfg.graph_in_scope(&i)))
+    fn in_scope(&mut self, g: u64) -> Result<bool> {
+        if let Some(&cached) = self.scope.get(&g) {
+            return Ok(cached);
+        }
+        let in_scope =
+            graph_iri_checked(self.ctx, Id(g))?.is_some_and(|i| self.cfg.graph_in_scope(&i));
+        self.scope.insert(g, in_scope);
+        Ok(in_scope)
     }
 
     /// Whether a serialization quad of graph `g` counts.
-    fn ser_graph(&mut self, g: u64) -> bool {
-        self.spec.graph.accepts(g) && self.in_scope(g)
+    fn ser_graph(&mut self, g: u64) -> Result<bool> {
+        Ok(self.spec.graph.accepts(g) && self.in_scope(g)?)
     }
 
     /// The geometry of a literal, parsed as the functions parse it.
-    fn geom(&mut self, lit: Id) -> Option<GeomRef> {
-        let ctx = self.ctx;
-        self.geoms
-            .entry(lit)
-            .or_insert_with(|| {
-                let v = ctx.value(lit)?;
-                let max = max_vertices(ctx);
-                let g = ctx
-                    .geo
-                    .get_or_parse(MemoKey::Id(lit), || parse_value(&v, max))?;
-                super::memo::note_crs(ctx, &g);
-                Some(g)
-            })
-            .clone()
+    fn geom(&mut self, lit: Id) -> Result<Option<GeomRef>> {
+        if let Some(cached) = self.geoms.get(&lit) {
+            return Ok(cached.clone());
+        }
+        let g = super::memo::by_id_checked(self.ctx, lit)?;
+        let bytes = g
+            .as_ref()
+            .map_or(64, |g| (g.mem_size() as u64).saturating_add(64));
+        self.geoms_charge.add(bytes)?;
+        self.geoms.insert(lit, g.clone());
+        Ok(g)
+    }
+
+    /// Keep the geometry itself when a search's charged column entry is temporary.
+    fn retain_hit(&mut self, hit: &search::Hit) -> Result<()> {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.geoms.entry(hit.o)
+            && let Ok(g) = super::memo::noted(self.ctx, hit.entry.geom(&self.ctx.snap))
+        {
+            self.geoms_charge
+                .add((g.mem_size() as u64).saturating_add(64))?;
+            entry.insert(Some(g));
+        }
+        Ok(())
     }
 
     /// The serialization rows of geometry `s`.
@@ -287,7 +301,7 @@ impl<'a> Relate<'a> {
                 Ok(())
             })?;
             for k in keys {
-                if self.ser_graph(k[3]) {
+                if self.ser_graph(k[3])? {
                     out.push(Ser {
                         s,
                         o: Id(k[2]),
@@ -381,29 +395,17 @@ impl<'a> Relate<'a> {
         let ctx = self.ctx;
         if search::indexed(&ctx.snap, &self.preds).is_some() {
             // the index's geometries, so that only the literals it leaves out are parsed
-            let mut known: Vec<(Id, GeomRef)> = Vec::new();
             let mut st = SearchStats::default();
-            search::window_with(
-                ctx,
-                &self.preds,
-                &[WORLD],
-                &self.spec.graph,
-                false,
-                &mut st,
-                &mut |hits| {
-                    for h in hits {
-                        if let Ok(g) = super::memo::noted(ctx, h.entry.geom(&ctx.snap)) {
-                            known.push((h.o, g));
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
+            let preds = self.preds.clone();
+            let graph = self.spec.graph.clone();
+            search::window_with(ctx, &preds, &[WORLD], &graph, false, &mut st, &mut |hits| {
+                for h in hits {
+                    self.retain_hit(h)?;
+                }
+                Ok(())
+            })?;
             self.st.nodes += st.nodes;
             self.st.rechecked += st.rechecked;
-            for (o, g) in known {
-                self.geoms.entry(o).or_insert(Some(g));
-            }
         } else {
             self.st.fallback = true;
         }
@@ -419,7 +421,7 @@ impl<'a> Relate<'a> {
         }
         let mut rows = Vec::with_capacity(keys.len());
         for k in keys {
-            if self.ser_graph(k[3]) {
+            if self.ser_graph(k[3])? {
                 rows.push(Ser {
                     s: Id(k[1]),
                     o: Id(k[2]),
@@ -442,35 +444,23 @@ impl<'a> Relate<'a> {
         match window {
             Some(w) if search::indexed(&ctx.snap, &self.preds).is_some() => {
                 let mut rows = Vec::new();
-                let mut found: Vec<(Id, GeomRef)> = Vec::new();
                 let mut st = SearchStats::default();
-                search::window_with(
-                    ctx,
-                    &self.preds,
-                    &[w],
-                    &self.spec.graph,
-                    false,
-                    &mut st,
-                    &mut |hits| {
-                        for h in hits {
-                            rows.push(Ser {
-                                s: h.s,
-                                o: h.o,
-                                g: h.g,
-                            });
-                            if let Ok(g) = super::memo::noted(ctx, h.entry.geom(&ctx.snap)) {
-                                found.push((h.o, g));
-                            }
-                        }
-                        Ok(())
-                    },
-                )?;
+                let preds = self.preds.clone();
+                let graph = self.spec.graph.clone();
+                search::window_with(ctx, &preds, &[w], &graph, false, &mut st, &mut |hits| {
+                    for h in hits {
+                        rows.push(Ser {
+                            s: h.s,
+                            o: h.o,
+                            g: h.g,
+                        });
+                        self.retain_hit(h)?;
+                    }
+                    Ok(())
+                })?;
                 self.st.candidates += st.candidates;
                 self.st.nodes += st.nodes;
                 self.st.rechecked += st.rechecked;
-                for (o, g) in found {
-                    self.geoms.entry(o).or_insert(Some(g));
-                }
                 Ok(rows)
             }
             // an empty geometry meets nothing
@@ -508,17 +498,19 @@ impl<'a> Relate<'a> {
         let mut qs: Vec<Id> = by_lit.keys().copied().collect();
         qs.sort_unstable();
         for q in qs {
-            let Some(qg) = self.geom(q) else {
+            let Some(qg) = self.geom(q)? else {
                 continue;
             };
             let rows = self.candidates(&qg)?;
             let mut distinct: Vec<Id> = rows.iter().map(|r| r.o).collect();
             distinct.sort_unstable();
             distinct.dedup();
-            let items: Vec<(Id, GeomRef)> = distinct
-                .into_iter()
-                .filter_map(|o| self.geom(o).map(|g| (o, g)))
-                .collect();
+            let mut items: Vec<(Id, GeomRef)> = Vec::with_capacity(distinct.len());
+            for o in distinct {
+                if let Some(g) = self.geom(o)? {
+                    items.push((o, g));
+                }
+            }
             let pass = self.refine_against(&qg, subject_const, &items)?;
             let graphs = &by_lit[&q];
             for r in rows.iter().filter(|r| pass.contains(&r.o)) {
@@ -583,17 +575,16 @@ impl<'a> Relate<'a> {
         }
         let mut lits: Vec<Id> = by_lit.keys().copied().collect();
         lits.sort_unstable();
-        let items: Vec<Item> = lits
-            .into_iter()
-            .filter_map(|lit| {
-                let geom = self.geom(lit)?;
-                Some(Item {
+        let mut items: Vec<Item> = Vec::with_capacity(lits.len());
+        for lit in lits {
+            if let Some(geom) = self.geom(lit)? {
+                items.push(Item {
                     lit,
                     bbox: geom.bbox84(),
                     geom,
-                })
-            })
-            .collect();
+                });
+            }
+        }
         // a sweep over the envelopes, in parallel; the spatial join kernel
         // (`super::join::pairs`) can take its place for the geometries with an envelope
         let pairs = literal_pairs(
@@ -645,7 +636,7 @@ impl<'a> Relate<'a> {
         let mut graphs: Vec<Id> = Vec::new();
         let mut any = false;
         for x in &la {
-            let Some(gx) = self.geom(x.lit) else {
+            let Some(gx) = self.geom(x.lit)? else {
                 continue;
             };
             let mut tester = ConstTest::new(gx, self.spec.rel, true, self.op_vertices);
@@ -655,7 +646,7 @@ impl<'a> Relate<'a> {
                     (Some(p), _) | (None, Some(p)) => Some(p),
                     (None, None) => None,
                 };
-                let Some(gy) = self.geom(y.lit) else {
+                let Some(gy) = self.geom(y.lit)? else {
                     continue;
                 };
                 self.st.refined += 1;

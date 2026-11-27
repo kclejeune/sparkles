@@ -49,6 +49,20 @@ pub const FUNCTIONS: &[&str] = &[
     "transformSRS",
 ];
 
+/// Whether the dispatch below can charge a serialized geometry through `Call::geometry`.
+pub(super) fn charges_geometry_result(iri: &str) -> bool {
+    matches!(
+        iri.strip_prefix(SPATIALF),
+        Some(
+            "convertLatLon"
+                | "convertLatLonBox"
+                | "transform"
+                | "transformDatatype"
+                | "transformSRS"
+        )
+    )
+}
+
 /// Evaluate the Jena filter function `iri`; `None` when `iri` is not one.
 pub fn call(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> Option<EvalResult<Val>> {
     let local = iri.strip_prefix(SPATIALF)?;
@@ -144,10 +158,12 @@ impl Call<'_, '_> {
     }
 
     /// The datatype of geometry argument `i` (a GeoJSON literal or else WKT).
-    fn datatype(&self, i: usize) -> &'static str {
+    fn datatype(&self, i: usize) -> EvalResult<&'static str> {
         match self.value(i) {
-            Ok(Value::Other { dt, .. }) => write::result_datatype(&dt),
-            _ => WKT_LITERAL,
+            Ok(Value::Other { dt, .. }) => Ok(write::result_datatype(&dt)),
+            Ok(_) => Ok(WKT_LITERAL),
+            Err(_) if self.ctx.has_memory_failure() => Err(TypeError),
+            Err(_) => Ok(WKT_LITERAL),
         }
     }
 
@@ -156,7 +172,10 @@ impl Call<'_, '_> {
         let lex = write::serialize(g, dt).ok_or(TypeError)?;
         match self.ctx.charge(lex.len() as u64 + 64) {
             Ok(c) => std::mem::forget(c),
-            Err(_) => return Err(TypeError),
+            Err(error) => {
+                self.ctx.fail_memory(&error);
+                return Err(TypeError);
+            }
         }
         Ok(Val::V(Value::Other {
             lex: lex.into(),
@@ -289,7 +308,7 @@ impl Call<'_, '_> {
         self.arity(1 + usize::from(datatype.is_some()) + usize::from(srs.is_some()))?;
         let g = self.geom(0)?;
         let dt = match datatype {
-            None => self.datatype(0),
+            None => self.datatype(0)?,
             Some(i) => {
                 let dt = self.uri(i)?;
                 if !super::vocab::is_geometry_datatype(&dt) {

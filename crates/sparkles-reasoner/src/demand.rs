@@ -49,6 +49,8 @@ use crate::engine::{Atom, CBuiltin, CHead, CRule, Slot, Step};
 use crate::graph::Triple;
 use crate::terms::Terms;
 use rustc_hash::{FxHashMap, FxHashSet};
+use sparkles_core::id::Id;
+use sparkles_core::incr::footprint::Resolved as FootprintResolved;
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -810,14 +812,40 @@ pub(crate) struct Vocab {
 }
 
 impl Vocab {
+    /// The schema vocabulary as a shared incremental [`FootprintResolved`]: every
+    /// schema predicate `(None, Some(p), None)` and every meta-class typing
+    /// `(None, Some(rdf_type), Some(c))`.
+    pub(crate) fn resolved_footprint(&self, rdf_type: u64) -> FootprintResolved {
+        let mut fp = FootprintResolved::default();
+        for &p in &self.schema {
+            fp.add_triple_pattern(None, Some(Id(p)), None);
+        }
+        for &c in &self.meta {
+            fp.add_triple_pattern(None, Some(Id(rdf_type)), Some(Id(c)));
+        }
+        fp
+    }
+
+    #[cfg(test)]
     pub(crate) fn of(rules: &[CRule], terms: &Terms) -> Vocab {
+        Self::of_controlled(rules, terms, || Ok(())).expect("uncontrolled vocab classification")
+    }
+
+    pub(crate) fn of_controlled(
+        rules: &[CRule],
+        terms: &Terms,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Vocab> {
         const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
         const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
         const OWL: &str = "http://www.w3.org/2002/07/owl#";
-        let iri = |c: u64| match terms.term(c) {
-            Some(oxrdf::Term::NamedNode(n)) => Some(n.into_string()),
-            _ => None,
-        };
+        const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        #[derive(Clone, Copy)]
+        enum PredClass {
+            Schema,
+            RdfType,
+            Other,
+        }
         let is_schema = |i: &str| {
             matches!(
                 i.strip_prefix(RDFS),
@@ -843,33 +871,54 @@ impl Vocab {
                 })
             })
         };
-        let rdf_type = format!("{RDF}type");
         let mut v = Vocab {
             schema: FxHashSet::default(),
             meta: FxHashSet::default(),
         };
-        let mut see = |p: Slot, o: Slot| {
-            let Slot::Const(p) = p else { return };
-            let Some(pi) = iri(p) else { return };
-            if is_schema(&pi) {
-                v.schema.insert(p);
-            } else if pi == rdf_type
-                && let Slot::Const(c) = o
-                && iri(c).is_some_and(|ci| is_meta(&ci))
-            {
-                v.meta.insert(c);
+        let mut see = |p: Slot, o: Slot| -> anyhow::Result<()> {
+            check()?;
+            let Slot::Const(p) = p else {
+                return Ok(());
+            };
+            let Some(pred_class) = terms.with_iri_controlled(p, &mut check, |pi| {
+                if is_schema(pi) {
+                    PredClass::Schema
+                } else if pi == RDF_TYPE {
+                    PredClass::RdfType
+                } else {
+                    PredClass::Other
+                }
+            })?
+            else {
+                return Ok(());
+            };
+            match pred_class {
+                PredClass::Schema => {
+                    v.schema.insert(p);
+                }
+                PredClass::RdfType => {
+                    if let Slot::Const(c) = o
+                        && terms
+                            .with_iri_controlled(c, &mut check, is_meta)?
+                            .unwrap_or(false)
+                    {
+                        v.meta.insert(c);
+                    }
+                }
+                PredClass::Other => {}
             }
+            Ok(())
         };
         for r in rules {
             for a in &r.atoms {
-                see(a.p, a.o);
+                see(a.p, a.o)?;
             }
             for h in &r.head {
                 let (_, p, o) = head_slots(h);
-                see(p, o);
+                see(p, o)?;
             }
         }
-        v
+        Ok(v)
     }
 }
 
@@ -877,7 +926,7 @@ impl Vocab {
 struct StageBuilder<'a> {
     est: Estimate<'a>,
     rdf_type: u64,
-    vocab: &'a Vocab,
+    schema_fp: FootprintResolved,
     rules: &'a [CRule],
     heads: Vec<(Slot, Slot, Slot)>,
     /// the rules with a head of each constant predicate, and those with a head whose
@@ -916,7 +965,7 @@ impl StageBuilder<'_> {
     /// Only the preliminary schema pass suppresses derived instance premises.
     /// Ordinary demand must follow them even when its head is a schema fact.
     fn asks(&self, a: &Atom, schema_copy: bool) -> bool {
-        self.intensional(a) && (!schema_copy || schema_reads(a, self.vocab, self.rdf_type))
+        self.intensional(a) && (!schema_copy || schema_reads(a, &self.schema_fp, self.rdf_type))
     }
 
     fn intensional(&self, a: &Atom) -> bool {
@@ -1049,10 +1098,7 @@ impl StageBuilder<'_> {
         if tracing::enabled!(target: "sparkles_reasoner::demand", tracing::Level::DEBUG) {
             let show = |k: &Key| {
                 let p = match k.p {
-                    KeyP::Const(c) => self
-                        .terms
-                        .term(c)
-                        .map_or_else(|| format!("#{c}"), |t| t.to_string()),
+                    KeyP::Const(c) => format!("#{c}"),
                     p => format!("{p:?}"),
                 };
                 format!("{p}^{}{}", k.adornment(), if k.neq { "!" } else { "" })
@@ -1472,6 +1518,18 @@ pub(crate) struct Closed {
 }
 
 impl Closed {
+    /// The closed schema relations as a shared incremental [`FootprintResolved`].
+    pub(crate) fn resolved_footprint(&self) -> FootprintResolved {
+        let mut fp = FootprintResolved::default();
+        for &p in &self.preds {
+            fp.add_triple_pattern(None, Some(Id(p)), None);
+        }
+        for &c in &self.classes {
+            fp.add_triple_pattern(None, Some(Id(self.rdf_type)), Some(Id(c)));
+        }
+        fp
+    }
+
     pub(crate) fn closes(&self, a: &Atom) -> bool {
         match a.p {
             Slot::Const(p) if self.preds.contains(&p) => true,
@@ -1488,12 +1546,13 @@ impl Closed {
     }
 }
 
-/// Body relations the preliminary schema pass follows beyond their stored facts.
-fn schema_reads(a: &Atom, vocab: &Vocab, rdf_type: u64) -> bool {
+/// Body relations the preliminary schema pass follows beyond their stored facts, tested
+/// through the shared incremental [`FootprintResolved`] of `vocab`.
+fn schema_reads(a: &Atom, fp: &FootprintResolved, rdf_type: u64) -> bool {
     match a.p {
-        Slot::Const(p) if vocab.schema.contains(&p) => true,
+        Slot::Const(p) if fp.matches_predicate(Id(p)) => true,
         Slot::Const(p) if p == rdf_type => match a.o {
-            Slot::Const(c) => vocab.meta.contains(&c),
+            Slot::Const(c) => fp.matches_triple(&[Id::UNDEF, Id(p), Id(c)]),
             Slot::Var(_) => true,
             Slot::Any => false,
         },
@@ -1605,6 +1664,7 @@ pub(crate) fn complete_schema(
     };
     // The preliminary pass reads equality as stored and omits equality-only
     // producers. Its equality and every dependent relation must remain open.
+    let schema_fp = vocab.resolved_footprint(rdf_type);
     let omitted_equality = equality(rules, same_as);
     for (ri, r) in rules.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -1617,7 +1677,7 @@ pub(crate) fn complete_schema(
         let blocked = r
             .atoms
             .iter()
-            .any(|a| !schema_reads(a, vocab, rdf_type) && can_derive(a))
+            .any(|a| !schema_reads(a, &schema_fp, rdf_type) && can_derive(a))
             // These positive reads are demanded, but their schema-pass copies
             // can still miss transitive instance premises. Decline a static
             // completeness proof; the bounded abstract model may prove coverage.
@@ -1629,7 +1689,7 @@ pub(crate) fn complete_schema(
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
-                if schema_reads(a, vocab, rdf_type) && can_derive(a) {
+                if schema_reads(a, &schema_fp, rdf_type) && can_derive(a) {
                     waiting
                         .entry(Relation::of(a.p, a.o, rdf_type))
                         .or_default()
@@ -2174,6 +2234,7 @@ pub(crate) fn schema_roots(vocab: &Vocab, rdf_type: u64) -> Vec<(Key, [u64; 3])>
 /// With `replay` set, the rules are a lowered program's with an IR feature (item 839),
 /// which runs as `engine::run_program` runs it and reads a list again when its cells
 /// arrive: a stage whose lists are not completed below asks for the list cells it reads.
+#[cfg(test)]
 pub(crate) fn transform(
     rules: &[CRule],
     terms: &Terms,
@@ -2183,16 +2244,44 @@ pub(crate) fn transform(
     linear: bool,
     replay: bool,
 ) -> Result<Program, TransformError> {
+    transform_controlled(rules, terms, roots, est, pass, linear, replay, &mut || {
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn transform_controlled(
+    rules: &[CRule],
+    terms: &Terms,
+    roots: &[Key],
+    est: Estimate<'_>,
+    pass: Pass<'_>,
+    linear: bool,
+    replay: bool,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> Result<Program, TransformError> {
     // A lower stage of every derived list can depend on itself when a rule reads one
     // list to build another, which the keys cannot tell apart. The program is then made
     // again with lists read as the stage holds them (Codex re-review F17-P1 #3).
     // A program whose noValue lies on a cycle stays refused (second Codex re-review of
     // F17-P1, #2).
-    match transform_in(rules, terms, roots, est, pass, true, linear, replay) {
-        Err(TransformError::NotStratified) if !negation_on_a_cycle(rules, terms) => {
-            transform_in(rules, terms, roots, est, pass, false, linear, replay)
+    match transform_in(rules, terms, roots, est, pass, true, linear, replay, check) {
+        Err(TransformError::NotStratified) => {
+            if negation_on_a_cycle_controlled(rules, terms, check)? {
+                Err(TransformError::NotStratified)
+            } else {
+                transform_in(rules, terms, roots, est, pass, false, linear, replay, check)
+            }
         }
         r => r,
+    }
+}
+
+fn map_control_err(err: anyhow::Error) -> TransformError {
+    if let Some(m) = BudgetFailure::from_anyhow(&err) {
+        TransformError::Memory(m)
+    } else {
+        TransformError::Control(err)
     }
 }
 
@@ -2201,7 +2290,16 @@ pub(crate) fn transform(
 /// those of body atoms, of `noValue` patterns, of the facts a `listForAll` tests, and the
 /// `rdf:first` and `rdf:rest` of the lists that builtins and head actions read. A
 /// variable predicate stands for every predicate, and a variable class for every class.
+#[cfg(test)]
 pub(crate) fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
+    negation_on_a_cycle_controlled(rules, terms, &mut || Ok(())).unwrap_or(false)
+}
+
+fn negation_on_a_cycle_controlled(
+    rules: &[CRule],
+    terms: &Terms,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> Result<bool, TransformError> {
     // the nodes that read or give every predicate, and every class; the others are
     // constant predicates and classes
     const READS_ALL: usize = 0;
@@ -2209,11 +2307,14 @@ pub(crate) fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
     const READS_TYPES: usize = 2;
     const GIVES_TYPES: usize = 3;
     const SPECIAL: usize = 4;
-    let rdf_type = terms
-        .try_id_for(&oxrdf::Term::NamedNode(
-            oxrdf::vocab::rdf::TYPE.into_owned(),
-        ))
-        .ok();
+    let rdf_type = Some(
+        terms
+            .try_id_for_controlled(
+                &oxrdf::Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()),
+                &mut *check,
+            )
+            .map_err(map_control_err)?,
+    );
     let mut ids: FxHashMap<(u64, Option<u64>), usize> = FxHashMap::default();
     let mut classes: Vec<usize> = Vec::new();
     let mut node = |p: Slot, o: Slot, head: bool| -> usize {
@@ -2321,7 +2422,7 @@ pub(crate) fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
         }
         false
     };
-    negative.iter().any(|&(h, d)| reaches(d, h))
+    Ok(negative.iter().any(|&(h, d)| reaches(d, h)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2334,7 +2435,9 @@ fn transform_in(
     list_stages: bool,
     linear: bool,
     replay: bool,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
 ) -> Result<Program, TransformError> {
+    check().map_err(map_control_err)?;
     let closed = match pass {
         Pass::Closed(c) => Some(c),
         _ => None,
@@ -2353,17 +2456,21 @@ fn transform_in(
     };
     let dummy = terms.try_fresh_bnode().map_err(TransformError::Memory)?;
     let rdf_type = terms
-        .try_id_for(&oxrdf::Term::NamedNode(
-            oxrdf::vocab::rdf::TYPE.into_owned(),
-        ))
-        .map_err(TransformError::Memory)?;
-    let vocab = Vocab::of(rules, terms);
+        .try_id_for_controlled(
+            &oxrdf::Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()),
+            &mut *check,
+        )
+        .map_err(map_control_err)?;
+    let vocab = Vocab::of_controlled(rules, terms, &mut *check).map_err(map_control_err)?;
     // equality as a lower stage, when rules derive owl:sameAs and read it
     let same_as = terms
-        .try_id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-            "http://www.w3.org/2002/07/owl#sameAs",
-        )))
-        .map_err(TransformError::Memory)?;
+        .try_id_for_controlled(
+            &oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                "http://www.w3.org/2002/07/owl#sameAs",
+            )),
+            &mut *check,
+        )
+        .map_err(map_control_err)?;
     let derives = |r: &CRule| {
         r.head
             .iter()
@@ -2457,7 +2564,7 @@ fn transform_in(
         let mut b = StageBuilder {
             est,
             rdf_type,
-            vocab: &vocab,
+            schema_fp: vocab.resolved_footprint(rdf_type),
             rules: stage_rules,
             heads: heads.to_vec(),
             by_pred,
@@ -2533,6 +2640,8 @@ pub(crate) enum TransformError {
     TooLarge(usize),
     #[error("{0}")]
     Memory(BudgetFailure),
+    #[error("{0}")]
+    Control(anyhow::Error),
 }
 
 #[cfg(test)]

@@ -210,7 +210,7 @@ fn shared_options(history: u64, local: u64) -> StoreOptions {
 fn effective_shared_capacity_precedes_live_memory_and_persistent_fast_paths() {
     for memory in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let options = shared_options(64 << 10, 512 << 20);
+        let options = shared_options(4096, 512 << 20);
         let store = if memory {
             Store::in_memory(options)
         } else {

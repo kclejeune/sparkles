@@ -1,0 +1,178 @@
+ore_ont_10073.owl.json rss MiB 196 185
+ore_ont_10409.owl.json rss MiB 27 28
+ore_ont_10594.owl.json rss MiB 27 26
+ore_ont_10985.owl.json rss MiB 23 28
+ore_ont_11110.owl.json rss MiB 66 66
+ore_ont_11311.owl.json rss MiB 62 72
+ore_ont_12414.owl.json rss MiB 121 114
+ore_ont_12448.owl.json rss MiB 86 82
+ore_ont_12901.owl.json rss MiB 250 218
+ore_ont_13545.owl.json rss MiB 11 12
+ore_ont_1370.owl.json rss MiB 153 142
+ore_ont_13755.owl.json rss MiB 12 12
+ore_ont_14375.owl.json rss MiB 52 47
+ore_ont_14551.owl.json rss MiB 37 38
+ore_ont_14767.owl.json rss MiB 25 29
+ore_ont_15231.owl.json rss MiB 5 4
+ore_ont_15516.owl.json rss MiB 6 6
+ore_ont_15544.owl.json rss MiB 23 28
+ore_ont_15733.owl.json rss MiB 49 43
+ore_ont_15993.owl.json rss MiB 5 5
+ore_ont_16642.owl.json rss MiB 27 27
+ore_ont_1790.owl.json rss MiB 23 23
+ore_ont_1823.owl.json rss MiB 5 5
+ore_ont_2456.owl.json rss MiB 5 5
+ore_ont_2624.owl.json rss MiB 17 16
+ore_ont_2700.owl.json rss MiB 23 23
+ore_ont_2775.owl.json rss MiB 5 4
+ore_ont_2817.owl.json rss MiB 28 23
+ore_ont_3050.owl.json rss MiB 28 28
+ore_ont_3114.owl.json rss MiB 28 27
+ore_ont_3357.owl.json rss MiB 27 26
+ore_ont_3529.owl.json rss MiB 25 24
+ore_ont_3795.owl.json rss MiB 27 27
+ore_ont_4210.owl.json rss MiB 26 22
+ore_ont_4510.owl.json rss MiB 329 277
+ore_ont_4527.owl.json rss MiB 8 8
+ore_ont_4662.owl.json rss MiB 24 25
+ore_ont_4755.owl.json rss MiB 164 151
+ore_ont_5448.owl.json rss MiB 28 28
+ore_ont_5481.owl.json rss MiB 196 187
+ore_ont_5502.owl.json rss MiB 18 16
+ore_ont_580.owl.json rss MiB 4 4
+ore_ont_5857.owl.json rss MiB 501 498
+ore_ont_6266.owl.json rss MiB 28 28
+ore_ont_6478.owl.json rss MiB 46 45
+ore_ont_6765.owl.json rss MiB 28 27
+ore_ont_6817.owl.json rss MiB 7 7
+ore_ont_7195.owl.json rss MiB 14 14
+ore_ont_7251.owl.json rss MiB 21 21
+ore_ont_7417.owl.json rss MiB 5 4
+ore_ont_7663.owl.json rss MiB 5 5
+ore_ont_7858.owl.json rss MiB 24 25
+ore_ont_7914.owl.json rss MiB 420 337
+ore_ont_8203.owl.json rss MiB 10 10
+ore_ont_9151.owl.json rss MiB 151 139
+ore_ont_9654.owl.json rss MiB 749 729
+ore_ont_9761.owl.json rss MiB 14 13
+ore_ont_980.owl.json rss MiB 27 27
+ore_ont_9890.owl.json rss MiB 10 10
+file run out_a out_b nonanon_a nonanon_b tier_a tier_b ms_a ms_b cons_a cons_b
+ore_ont_10073.owl.json default 0 0 0 0 el el 156 148 Consistent Consistent
+ore_ont_10073.owl.json rooted 0 0 0 0 el el 144 152 Consistent Consistent
+ore_ont_10409.owl.json default 83 83 83 83 disjunctive disjunctive 36 34 Consistent Consistent
+ore_ont_10409.owl.json rooted 83 83 83 83 disjunctive disjunctive 34 33 Consistent Consistent
+ore_ont_10594.owl.json default 11 11 11 11 disjunctive disjunctive 18 17 Consistent Consistent
+ore_ont_10594.owl.json rooted 11 11 11 11 disjunctive disjunctive 15 15 Consistent Consistent
+ore_ont_10985.owl.json default 83 83 83 83 disjunctive disjunctive 36 35 Consistent Consistent
+ore_ont_10985.owl.json rooted 83 83 83 83 disjunctive disjunctive 32 26 Consistent Consistent
+ore_ont_11110.owl.json default 0 0 0 0 el el 46 49 Consistent Consistent
+ore_ont_11110.owl.json rooted 0 0 0 0 el el 42 39 Consistent Consistent
+ore_ont_11311.owl.json default 0 0 0 0 horn horn 60 56 Consistent Consistent
+ore_ont_11311.owl.json rooted 0 0 0 0 horn horn 59 56 Consistent Consistent
+ore_ont_12414.owl.json default 0 0 0 0 el el 78 73 Consistent Consistent
+ore_ont_12414.owl.json rooted 0 0 0 0 el el 72 67 Consistent Consistent
+ore_ont_12448.owl.json default 0 0 0 0 el el 60 59 Consistent Consistent
+ore_ont_12448.owl.json rooted 0 0 0 0 el el 57 55 Consistent Consistent
+ore_ont_12901.owl.json default 0 0 0 0 horn horn 215 203 Consistent Consistent
+ore_ont_12901.owl.json rooted 0 0 0 0 horn horn 204 173 Consistent Consistent
+ore_ont_13545.owl.json default 62 62 62 62 disjunctive disjunctive 9 8 Consistent Consistent
+ore_ont_13545.owl.json rooted 62 62 62 62 disjunctive disjunctive 8 7 Consistent Consistent
+ore_ont_1370.owl.json default 0 0 0 0 el el 135 100 Consistent Consistent
+ore_ont_1370.owl.json rooted 0 0 0 0 el el 119 94 Consistent Consistent
+ore_ont_13755.owl.json default 0 0 0 0 el el 5 5 Consistent Consistent
+ore_ont_13755.owl.json rooted 0 0 0 0 el el 4 4 Consistent Consistent
+ore_ont_14375.owl.json default 0 0 0 0 horn horn 40 36 Consistent Consistent
+ore_ont_14375.owl.json rooted 0 0 0 0 horn horn 37 34 Consistent Consistent
+ore_ont_14551.owl.json default 146 146 146 146 disjunctive disjunctive 29 28 Consistent Consistent
+ore_ont_14551.owl.json rooted 146 146 146 146 disjunctive disjunctive 28 26 Consistent Consistent
+ore_ont_14767.owl.json default 11 11 11 11 disjunctive disjunctive 18 18 Consistent Consistent
+ore_ont_14767.owl.json rooted 11 11 11 11 disjunctive disjunctive 15 16 Consistent Consistent
+ore_ont_15231.owl.json default 0 0 0 0 el el 0 0 Consistent Consistent
+ore_ont_15231.owl.json rooted 0 0 0 0 el el 0 0 Consistent Consistent
+ore_ont_15516.owl.json default 17 17 15 15 disjunctive disjunctive 2 2 Consistent Consistent
+ore_ont_15516.owl.json rooted 17 17 15 15 disjunctive disjunctive 1 1 Consistent Consistent
+ore_ont_15544.owl.json default 83 83 83 83 disjunctive disjunctive 36 34 Consistent Consistent
+ore_ont_15544.owl.json rooted 83 83 83 83 disjunctive disjunctive 32 33 Consistent Consistent
+ore_ont_15733.owl.json default 0 0 0 0 horn horn 31 29 Consistent Consistent
+ore_ont_15733.owl.json rooted 0 0 0 0 horn horn 26 29 Consistent Consistent
+ore_ont_15993.owl.json default 48 48 29 29 disjunctive disjunctive 1 1 Consistent Consistent
+ore_ont_15993.owl.json rooted 48 48 29 29 disjunctive disjunctive 1 1 Consistent Consistent
+ore_ont_16642.owl.json default 11 11 11 11 disjunctive disjunctive 18 19 Consistent Consistent
+ore_ont_16642.owl.json rooted 11 11 11 11 disjunctive disjunctive 16 15 Consistent Consistent
+ore_ont_1790.owl.json default 83 83 83 83 disjunctive disjunctive 36 37 Consistent Consistent
+ore_ont_1790.owl.json rooted 83 83 83 83 disjunctive disjunctive 29 26 Consistent Consistent
+ore_ont_1823.owl.json default 42 42 42 42 disjunctive disjunctive 1 1 Consistent Consistent
+ore_ont_1823.owl.json rooted 42 42 42 42 disjunctive disjunctive 0 1 Consistent Consistent
+ore_ont_2456.owl.json default 0 0 0 0 el el 1 1 Consistent Consistent
+ore_ont_2456.owl.json rooted 0 0 0 0 el el 0 1 Consistent Consistent
+ore_ont_2624.owl.json default 0 0 0 0 el el 10 10 Consistent Consistent
+ore_ont_2624.owl.json rooted 0 0 0 0 el el 9 8 Consistent Consistent
+ore_ont_2700.owl.json default 11 11 11 11 disjunctive disjunctive 21 21 Consistent Consistent
+ore_ont_2700.owl.json rooted 11 11 11 11 disjunctive disjunctive 16 15 Consistent Consistent
+ore_ont_2775.owl.json default 0 0 0 0 horn horn 0 1 Consistent Consistent
+ore_ont_2775.owl.json rooted 0 0 0 0 horn horn 0 0 Consistent Consistent
+ore_ont_2817.owl.json default 83 83 83 83 disjunctive disjunctive 33 34 Consistent Consistent
+ore_ont_2817.owl.json rooted 83 83 83 83 disjunctive disjunctive 30 32 Consistent Consistent
+ore_ont_3050.owl.json default 83 83 83 83 disjunctive disjunctive 38 34 Consistent Consistent
+ore_ont_3050.owl.json rooted 83 83 83 83 disjunctive disjunctive 28 32 Consistent Consistent
+ore_ont_3114.owl.json default 83 83 83 83 disjunctive disjunctive 38 34 Consistent Consistent
+ore_ont_3114.owl.json rooted 83 83 83 83 disjunctive disjunctive 29 33 Consistent Consistent
+ore_ont_3357.owl.json default 11 11 11 11 disjunctive disjunctive 19 17 Consistent Consistent
+ore_ont_3357.owl.json rooted 11 11 11 11 disjunctive disjunctive 16 15 Consistent Consistent
+ore_ont_3529.owl.json default 0 0 0 0 el el 15 12 Consistent Consistent
+ore_ont_3529.owl.json rooted 0 0 0 0 el el 15 11 Consistent Consistent
+ore_ont_3795.owl.json default 11 11 11 11 disjunctive disjunctive 19 21 Consistent Consistent
+ore_ont_3795.owl.json rooted 11 11 11 11 disjunctive disjunctive 17 19 Consistent Consistent
+ore_ont_4210.owl.json default 11 11 11 11 disjunctive disjunctive 19 17 Consistent Consistent
+ore_ont_4210.owl.json rooted 11 11 11 11 disjunctive disjunctive 17 15 Consistent Consistent
+ore_ont_4510.owl.json default 0 0 0 0 horn horn 326 256 Consistent Consistent
+ore_ont_4510.owl.json rooted 0 0 0 0 horn horn 326 228 Consistent Consistent
+ore_ont_4527.owl.json default 0 0 0 0 el el 4 3 Consistent Consistent
+ore_ont_4527.owl.json rooted 0 0 0 0 el el 3 3 Consistent Consistent
+ore_ont_4662.owl.json default 0 0 0 0 el el 15 12 Consistent Consistent
+ore_ont_4662.owl.json rooted 0 0 0 0 el el 12 10 Consistent Consistent
+ore_ont_4755.owl.json default 0 0 0 0 el el 146 131 Consistent Consistent
+ore_ont_4755.owl.json rooted 0 0 0 0 el el 164 126 Consistent Consistent
+ore_ont_5448.owl.json default 83 83 83 83 disjunctive disjunctive 41 34 Consistent Consistent
+ore_ont_5448.owl.json rooted 83 83 83 83 disjunctive disjunctive 38 26 Consistent Consistent
+ore_ont_5481.owl.json default 0 0 0 0 el el 182 153 Consistent Consistent
+ore_ont_5481.owl.json rooted 0 0 0 0 el el 197 156 Consistent Consistent
+ore_ont_5502.owl.json default 56 56 56 56 disjunctive disjunctive 12 13 Consistent Consistent
+ore_ont_5502.owl.json rooted 56 56 56 56 disjunctive disjunctive 11 8 Consistent Consistent
+ore_ont_580.owl.json default 0 0 0 0 horn horn 0 0 Consistent Consistent
+ore_ont_580.owl.json rooted 0 0 0 0 horn horn 0 0 Consistent Consistent
+ore_ont_5857.owl.json default 38 38 38 38 disjunctive disjunctive 534 438 Consistent Consistent
+ore_ont_5857.owl.json rooted 0 0 0 0 disjunctive disjunctive 2814 1812 Consistent Consistent
+ore_ont_6266.owl.json default 83 83 83 83 disjunctive disjunctive 45 34 Consistent Consistent
+ore_ont_6266.owl.json rooted 83 83 83 83 disjunctive disjunctive 44 32 Consistent Consistent
+ore_ont_6478.owl.json default 0 0 0 0 el el 26 19 Consistent Consistent
+ore_ont_6478.owl.json rooted 0 0 0 0 el el 26 21 Consistent Consistent
+ore_ont_6765.owl.json default 83 83 83 83 disjunctive disjunctive 50 35 Consistent Consistent
+ore_ont_6765.owl.json rooted 83 83 83 83 disjunctive disjunctive 47 27 Consistent Consistent
+ore_ont_6817.owl.json default 0 0 0 0 el el 3 4 Consistent Consistent
+ore_ont_6817.owl.json rooted 0 0 0 0 el el 2 3 Consistent Consistent
+ore_ont_7195.owl.json default 0 0 0 0 el el 11 8 Consistent Consistent
+ore_ont_7195.owl.json rooted 0 0 0 0 el el 10 7 Consistent Consistent
+ore_ont_7251.owl.json default 0 0 0 0 el el 13 10 Consistent Consistent
+ore_ont_7251.owl.json rooted 0 0 0 0 el el 12 8 Consistent Consistent
+ore_ont_7417.owl.json default 0 0 0 0 horn horn 1 1 Consistent Consistent
+ore_ont_7417.owl.json rooted 0 0 0 0 horn horn 1 1 Consistent Consistent
+ore_ont_7663.owl.json default 0 0 0 0 el el 1 1 Consistent Consistent
+ore_ont_7663.owl.json rooted 0 0 0 0 el el 0 1 Consistent Consistent
+ore_ont_7858.owl.json default 0 0 0 0 el el 17 11 Consistent Consistent
+ore_ont_7858.owl.json rooted 0 0 0 0 el el 14 10 Consistent Consistent
+ore_ont_7914.owl.json default 41 41 41 41 disjunctive disjunctive 887 513 Consistent Consistent
+ore_ont_7914.owl.json rooted 41 41 41 41 disjunctive disjunctive 2069 1118 Consistent Consistent
+ore_ont_8203.owl.json default 0 0 0 0 el el 9 5 Consistent Consistent
+ore_ont_8203.owl.json rooted 0 0 0 0 el el 7 5 Consistent Consistent
+ore_ont_9151.owl.json default 1075 1075 1075 1075 disjunctive disjunctive 239 144 Consistent Consistent
+ore_ont_9151.owl.json rooted 1075 1075 1075 1075 disjunctive disjunctive 217 120 Consistent Consistent
+ore_ont_9654.owl.json default 12 12 12 12 disjunctive disjunctive 1183 694 Consistent Consistent
+ore_ont_9654.owl.json rooted 12 12 12 12 disjunctive disjunctive 1164 655 Consistent Consistent
+ore_ont_9761.owl.json default 0 0 0 0 el el 10 7 Consistent Consistent
+ore_ont_9761.owl.json rooted 0 0 0 0 el el 9 6 Consistent Consistent
+ore_ont_980.owl.json default 11 11 11 11 disjunctive disjunctive 26 18 Consistent Consistent
+ore_ont_980.owl.json rooted 11 11 11 11 disjunctive disjunctive 21 16 Consistent Consistent
+ore_ont_9890.owl.json default 88 88 88 88 disjunctive disjunctive 11 7 Consistent Consistent
+ore_ont_9890.owl.json rooted 88 88 88 88 disjunctive disjunctive 8 6 Consistent Consistent

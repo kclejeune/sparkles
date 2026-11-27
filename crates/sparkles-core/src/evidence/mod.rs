@@ -8,6 +8,7 @@ mod canonical;
 mod model;
 mod prepare;
 mod primitives;
+pub mod reauth;
 pub mod resolve;
 pub mod review;
 mod settings;

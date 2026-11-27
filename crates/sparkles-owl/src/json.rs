@@ -159,6 +159,199 @@ pub fn annotation(a: &Annotation) -> Value {
     Value::Object(m)
 }
 
+/// Conservative zero-allocation lower bound check on whether the JSON encoding of `ax`
+/// could fit within `max_bytes`. Returns `false` immediately once the lower bound exceeds
+/// `max_bytes`, avoiding allocating `serde_json::Value` trees for entries that will be
+/// omitted from a size-capped response.
+pub fn axiom_fits_bytes(ax: &Axiom, max_bytes: usize) -> bool {
+    struct Counter {
+        used: usize,
+        limit: usize,
+    }
+    impl Counter {
+        fn add(&mut self, n: usize) -> bool {
+            self.used = self.used.saturating_add(n);
+            self.used <= self.limit
+        }
+        fn iri(&mut self, s: &str) -> bool {
+            self.add(s.len().saturating_add(2))
+        }
+        fn lit(&mut self, l: &Literal) -> bool {
+            let mut n = l.value().len().saturating_add(13); // {"@value":""}
+            if let Some(lang) = l.language() {
+                n = n.saturating_add(lang.len()).saturating_add(15); // ,"@language":""
+            } else if l.datatype() != crate::vocab::XSD_STRING {
+                n = n.saturating_add(l.datatype().len()).saturating_add(11); // ,"@type":""
+            }
+            self.add(n)
+        }
+        fn ind(&mut self, i: &Individual) -> bool {
+            match i {
+                Individual::Named(n) => self.iri(n.as_str()),
+                Individual::Anonymous(a) => self.add(a.label().len().saturating_add(4)),
+            }
+        }
+        fn ope(&mut self, p: &ObjectPropertyExpression) -> bool {
+            match p {
+                ObjectPropertyExpression::Property(p) => self.iri(p.as_str()),
+                ObjectPropertyExpression::InverseOf(p) => {
+                    self.add(p.as_str().len().saturating_add(16))
+                }
+            }
+        }
+        fn dr(&mut self, r: &DataRange) -> bool {
+            match r {
+                DataRange::Datatype(d) => self.iri(d.as_str()),
+                DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => {
+                    self.add(32) && rs.iter().all(|x| self.dr(x) && self.add(1))
+                }
+                DataRange::ComplementOf(r) => self.add(36) && self.dr(r),
+                DataRange::OneOf(ls) => {
+                    self.add(30) && ls.iter().all(|l| self.lit(l) && self.add(1))
+                }
+                DataRange::DatatypeRestriction(d, fs) => {
+                    self.add(52)
+                        && self.iri(d.as_str())
+                        && fs.iter().all(|f| {
+                            self.add(22) && self.iri(f.facet.as_str()) && self.lit(&f.value)
+                        })
+                }
+            }
+        }
+        fn ce(&mut self, c: &ClassExpression) -> bool {
+            use ClassExpression as C;
+            match c {
+                C::Class(c) => self.iri(c.as_str()),
+                C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+                    self.add(36) && cs.iter().all(|x| self.ce(x) && self.add(1))
+                }
+                C::ObjectComplementOf(c) => self.add(38) && self.ce(c),
+                C::ObjectOneOf(is) => self.add(36) && is.iter().all(|i| self.ind(i) && self.add(1)),
+                C::ObjectSomeValuesFrom(p, c) | C::ObjectAllValuesFrom(p, c) => {
+                    self.add(48) && self.ope(p) && self.ce(c)
+                }
+                C::ObjectHasValue(p, i) => self.add(48) && self.ope(p) && self.ind(i),
+                C::ObjectHasSelf(p) => self.add(36) && self.ope(p),
+                C::ObjectMinCardinality(_, p, f)
+                | C::ObjectMaxCardinality(_, p, f)
+                | C::ObjectExactCardinality(_, p, f) => {
+                    self.add(56) && self.ope(p) && f.as_ref().is_none_or(|x| self.ce(x))
+                }
+                C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => {
+                    self.add(46) && ps.iter().all(|p| self.iri(p.as_str())) && self.dr(r)
+                }
+                C::DataHasValue(p, l) => self.add(42) && self.iri(p.as_str()) && self.lit(l),
+                C::DataMinCardinality(_, p, r)
+                | C::DataMaxCardinality(_, p, r)
+                | C::DataExactCardinality(_, p, r) => {
+                    self.add(54) && self.iri(p.as_str()) && r.as_ref().is_none_or(|x| self.dr(x))
+                }
+            }
+        }
+        fn ann(&mut self, a: &Annotation) -> bool {
+            if !self.add(24) || !self.iri(a.property.as_str()) {
+                return false;
+            }
+            let ok_val = match &a.value {
+                AnnotationValue::Iri(i) => self.iri(i.as_str()),
+                AnnotationValue::Literal(l) => self.lit(l),
+                AnnotationValue::Anonymous(b) => self.add(b.label().len().saturating_add(4)),
+            };
+            ok_val && a.annotations.iter().all(|inner| self.ann(inner))
+        }
+    }
+
+    use AxiomKind as K;
+    let mut c = Counter {
+        used: 0,
+        limit: max_bytes,
+    };
+    if !c.add(ax.axiom_type().name().len().saturating_add(12)) {
+        return false;
+    }
+    let body_ok = match &ax.kind {
+        K::Declaration(e) => {
+            c.add(e.kind().name().len().saturating_add(16)) && c.iri(e.iri().as_str())
+        }
+        K::SubClassOf(a, b) => c.add(26) && c.ce(a) && c.ce(b),
+        K::EquivalentClasses(cs) => c.add(12) && cs.iter().all(|x| c.ce(x)),
+        K::DisjointClasses(cs) => c.add(12) && cs.iter().all(|x| c.ce(x)),
+        K::DisjointUnion(cls, cs) => c.add(20) && c.iri(cls.as_str()) && cs.iter().all(|x| c.ce(x)),
+        K::SubObjectPropertyOf(sub, sup) => {
+            let sub_ok = match sub {
+                SubObjectPropertyExpression::Expression(p) => c.ope(p),
+                SubObjectPropertyExpression::Chain(ps) => ps.iter().all(|p| c.ope(p)),
+            };
+            c.add(30) && sub_ok && c.ope(sup)
+        }
+        K::EquivalentObjectProperties(ps) => c.add(16) && ps.iter().all(|p| c.ope(p)),
+        K::DisjointObjectProperties(ps) => c.add(16) && ps.iter().all(|p| c.ope(p)),
+        K::InverseObjectProperties(a, b) => c.add(20) && c.ope(a) && c.ope(b),
+        K::ObjectPropertyDomain(p, ce) | K::ObjectPropertyRange(p, ce) => {
+            c.add(22) && c.ope(p) && c.ce(ce)
+        }
+        K::FunctionalObjectProperty(p)
+        | K::InverseFunctionalObjectProperty(p)
+        | K::ReflexiveObjectProperty(p)
+        | K::IrreflexiveObjectProperty(p)
+        | K::SymmetricObjectProperty(p)
+        | K::AsymmetricObjectProperty(p)
+        | K::TransitiveObjectProperty(p) => c.add(13) && c.ope(p),
+        K::SubDataPropertyOf(a, b) => c.add(30) && c.iri(a.as_str()) && c.iri(b.as_str()),
+        K::EquivalentDataProperties(ps) => c.add(16) && ps.iter().all(|p| c.iri(p.as_str())),
+        K::DisjointDataProperties(ps) => c.add(16) && ps.iter().all(|p| c.iri(p.as_str())),
+        K::DataPropertyDomain(p, ce) => c.add(22) && c.iri(p.as_str()) && c.ce(ce),
+        K::DataPropertyRange(p, dr) => c.add(21) && c.iri(p.as_str()) && c.dr(dr),
+        K::FunctionalDataProperty(p) => c.add(13) && c.iri(p.as_str()),
+        K::DatatypeDefinition(d, dr) => c.add(21) && c.iri(d.as_str()) && c.dr(dr),
+        K::HasKey(ce, ops, dps) => {
+            c.add(46)
+                && c.ce(ce)
+                && ops.iter().all(|p| c.ope(p))
+                && dps.iter().all(|p| c.iri(p.as_str()))
+        }
+        K::SameIndividual(is) => c.add(16) && is.iter().all(|i| c.ind(i)),
+        K::DifferentIndividuals(is) => c.add(16) && is.iter().all(|i| c.ind(i)),
+        K::ClassAssertion(ce, i) => c.add(24) && c.ce(ce) && c.ind(i),
+        K::ObjectPropertyAssertion(p, a, b) | K::NegativeObjectPropertyAssertion(p, a, b) => {
+            c.add(30) && c.ope(p) && c.ind(a) && c.ind(b)
+        }
+        K::DataPropertyAssertion(p, a, l) | K::NegativeDataPropertyAssertion(p, a, l) => {
+            c.add(30) && c.iri(p.as_str()) && c.ind(a) && c.lit(l)
+        }
+        K::AnnotationAssertion(p, s, v) => {
+            let s_ok = match s {
+                AnnotationSubject::Iri(i) => c.iri(i.as_str()),
+                AnnotationSubject::Anonymous(a) => c.add(a.label().len().saturating_add(4)),
+            };
+            let v_ok = match v {
+                AnnotationValue::Iri(i) => c.iri(i.as_str()),
+                AnnotationValue::Literal(l) => c.lit(l),
+                AnnotationValue::Anonymous(a) => c.add(a.label().len().saturating_add(4)),
+            };
+            c.add(32) && c.iri(p.as_str()) && s_ok && v_ok
+        }
+        K::SubAnnotationPropertyOf(a, b) => c.add(30) && c.iri(a.as_str()) && c.iri(b.as_str()),
+        K::AnnotationPropertyDomain(p, i) | K::AnnotationPropertyRange(p, i) => {
+            c.add(22) && c.iri(p.as_str()) && c.iri(i.as_str())
+        }
+    };
+    if !body_ok {
+        return false;
+    }
+    if !ax.annotations.is_empty() {
+        if !c.add(16) {
+            return false;
+        }
+        for a in &ax.annotations {
+            if !c.ann(a) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// An axiom in its JSON form.
 pub fn axiom(ax: &Axiom) -> Value {
     use AxiomKind as K;
@@ -169,8 +362,14 @@ pub fn axiom(ax: &Axiom) -> Value {
     };
     let ces =
         |cs: &BTreeSet<ClassExpression>| -> Value { cs.iter().map(class_expression).collect() };
+    let ces_bag =
+        |cs: &Multiset<ClassExpression>| -> Value { cs.iter().map(class_expression).collect() };
     let opes = |ps: &BTreeSet<ObjectPropertyExpression>| -> Value { ps.iter().map(ope).collect() };
+    let opes_bag =
+        |ps: &Multiset<ObjectPropertyExpression>| -> Value { ps.iter().map(ope).collect() };
     let dps = |ps: &BTreeSet<DataProperty>| -> Value { ps.iter().map(|p| iri_v(&p.0)).collect() };
+    let dps_bag =
+        |ps: &Multiset<DataProperty>| -> Value { ps.iter().map(|p| iri_v(&p.0)).collect() };
     match &ax.kind {
         K::Declaration(e) => {
             put("kind", e.kind().name().into());
@@ -180,10 +379,11 @@ pub fn axiom(ax: &Axiom) -> Value {
             put("subClass", class_expression(a));
             put("superClass", class_expression(b));
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => put("classes", ces(cs)),
+        K::EquivalentClasses(cs) => put("classes", ces(cs)),
+        K::DisjointClasses(cs) => put("classes", ces_bag(cs)),
         K::DisjointUnion(c, cs) => {
             put("class", iri_v(&c.0));
-            put("classes", ces(cs));
+            put("classes", ces_bag(cs));
         }
         K::SubObjectPropertyOf(sub, sup) => {
             match sub {
@@ -194,9 +394,8 @@ pub fn axiom(ax: &Axiom) -> Value {
             }
             put("superProperty", ope(sup));
         }
-        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
-            put("properties", opes(ps))
-        }
+        K::EquivalentObjectProperties(ps) => put("properties", opes(ps)),
+        K::DisjointObjectProperties(ps) => put("properties", opes_bag(ps)),
         K::InverseObjectProperties(a, b) => {
             put("first", ope(a));
             put("second", ope(b));
@@ -220,9 +419,8 @@ pub fn axiom(ax: &Axiom) -> Value {
             put("subProperty", iri_v(&a.0));
             put("superProperty", iri_v(&b.0));
         }
-        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
-            put("properties", dps(ps))
-        }
+        K::EquivalentDataProperties(ps) => put("properties", dps(ps)),
+        K::DisjointDataProperties(ps) => put("properties", dps_bag(ps)),
         K::DataPropertyDomain(p, c) => {
             put("property", iri_v(&p.0));
             put("domain", class_expression(c));
@@ -241,9 +439,8 @@ pub fn axiom(ax: &Axiom) -> Value {
             put("objectProperties", opes(ops));
             put("dataProperties", dps(dprops));
         }
-        K::SameIndividual(is) | K::DifferentIndividuals(is) => {
-            put("individuals", is.iter().map(individual).collect())
-        }
+        K::SameIndividual(is) => put("individuals", is.iter().map(individual).collect()),
+        K::DifferentIndividuals(is) => put("individuals", is.iter().map(individual).collect()),
         K::ClassAssertion(c, i) => {
             put("class", class_expression(c));
             put("individual", individual(i));
@@ -556,12 +753,20 @@ pub fn read_axiom(v: &Value) -> R<Axiom> {
     let ces = |k: &str| -> R<BTreeSet<ClassExpression>> {
         array(m, k)?.iter().map(read_class_expression).collect()
     };
+    let ces_bag = |k: &str| -> R<Multiset<ClassExpression>> {
+        array(m, k)?.iter().map(read_class_expression).collect()
+    };
     let p = || read_ope(field(m, "property")?);
     let dp = || read_dp(field(m, "property")?);
     let opes = |k: &str| -> R<BTreeSet<ObjectPropertyExpression>> {
         array(m, k)?.iter().map(read_ope).collect()
     };
+    let opes_bag = |k: &str| -> R<Multiset<ObjectPropertyExpression>> {
+        array(m, k)?.iter().map(read_ope).collect()
+    };
     let dps = |k: &str| -> R<BTreeSet<DataProperty>> { array(m, k)?.iter().map(read_dp).collect() };
+    let dps_bag =
+        |k: &str| -> R<Multiset<DataProperty>> { array(m, k)?.iter().map(read_dp).collect() };
     let ind = |k: &str| read_individual(field(m, k)?);
     let ap = |k: &str| Ok::<_, ModelError>(AnnotationProperty(read_iri(field(m, k)?)?));
     let kind = match t {
@@ -576,8 +781,10 @@ pub fn read_axiom(v: &Value) -> R<Axiom> {
         }
         "SubClassOf" => K::SubClassOf(ce("subClass")?, ce("superClass")?),
         "EquivalentClasses" => K::EquivalentClasses(ces("classes")?),
-        "DisjointClasses" => K::DisjointClasses(ces("classes")?),
-        "DisjointUnion" => K::DisjointUnion(Class(read_iri(field(m, "class")?)?), ces("classes")?),
+        "DisjointClasses" => K::DisjointClasses(ces_bag("classes")?),
+        "DisjointUnion" => {
+            K::DisjointUnion(Class(read_iri(field(m, "class")?)?), ces_bag("classes")?)
+        }
         "SubObjectPropertyOf" => {
             let sub = if let Some(c) = m.get("chain") {
                 SubObjectPropertyExpression::Chain(
@@ -593,7 +800,7 @@ pub fn read_axiom(v: &Value) -> R<Axiom> {
             K::SubObjectPropertyOf(sub, read_ope(field(m, "superProperty")?)?)
         }
         "EquivalentObjectProperties" => K::EquivalentObjectProperties(opes("properties")?),
-        "DisjointObjectProperties" => K::DisjointObjectProperties(opes("properties")?),
+        "DisjointObjectProperties" => K::DisjointObjectProperties(opes_bag("properties")?),
         "InverseObjectProperties" => K::InverseObjectProperties(
             read_ope(field(m, "first")?)?,
             read_ope(field(m, "second")?)?,
@@ -612,7 +819,7 @@ pub fn read_axiom(v: &Value) -> R<Axiom> {
             read_dp(field(m, "superProperty")?)?,
         ),
         "EquivalentDataProperties" => K::EquivalentDataProperties(dps("properties")?),
-        "DisjointDataProperties" => K::DisjointDataProperties(dps("properties")?),
+        "DisjointDataProperties" => K::DisjointDataProperties(dps_bag("properties")?),
         "DataPropertyDomain" => K::DataPropertyDomain(dp()?, ce("domain")?),
         "DataPropertyRange" => K::DataPropertyRange(dp()?, read_data_range(field(m, "range")?)?),
         "FunctionalDataProperty" => K::FunctionalDataProperty(dp()?),

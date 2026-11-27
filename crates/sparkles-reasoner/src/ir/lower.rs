@@ -121,6 +121,16 @@ impl std::fmt::Display for LowerError {
 
 impl std::error::Error for LowerError {}
 
+impl LowerError {
+    /// Convert into `anyhow::Error`, preserving typed `BudgetFailure` metadata on memory refusals.
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            LowerError::Memory(m) => anyhow::Error::from(m),
+            other => anyhow::Error::new(other),
+        }
+    }
+}
+
 impl Program {
     /// How the program runs.
     pub fn shape(&self) -> Shape {

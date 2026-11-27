@@ -825,12 +825,47 @@ impl Witnesses {
     }
 
     /// Charge the witnesses to `budget`, as the closure they belong to is.
+    #[cfg(test)]
     pub(crate) fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
-        let n = self.held.bytes();
-        let mut h = Held::try_new(budget, n)?;
-        std::mem::swap(&mut self.held, &mut h);
-        drop(h);
+        let Some(n) = self.plan_budget_transfer(budget)? else {
+            return Ok(());
+        };
+        let mut prepared = Held::try_new_exact(budget, n)?;
+        self.apply_budget_transfer(Some(n), &mut prepared);
+        debug_assert_eq!(prepared.bytes(), 0);
+        drop(prepared);
         Ok(())
+    }
+
+    /// Validate domain rules and compute the exact witness bytes to move onto `budget`.
+    pub(crate) fn plan_budget_transfer(
+        &self,
+        budget: &Arc<Budget>,
+    ) -> Result<Option<usize>, BudgetFailure> {
+        let source = self.held.budget();
+        if Arc::ptr_eq(source, budget) {
+            return Ok(None);
+        }
+        let n = self.held.bytes();
+        if n != 0
+            && source.parent().is_some()
+            && budget.parent().is_some()
+            && source.domain() != budget.domain()
+        {
+            return Err(BudgetFailure::parent(
+                sparkles_budget::ParentRefused::ForeignDomain,
+            ));
+        }
+        Ok(Some(n))
+    }
+
+    /// Commit a validated transfer plan using already-prepared credit on `budget`.
+    pub(crate) fn apply_budget_transfer(&mut self, plan: Option<usize>, prepared: &mut Held) {
+        if let Some(n) = plan {
+            let mut h = prepared.split(n);
+            std::mem::swap(&mut self.held, &mut h);
+            drop(h);
+        }
     }
 
     /// Charge the heap as it is now, even past the limit: the witnesses change one node

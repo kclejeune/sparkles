@@ -122,6 +122,36 @@ impl GeoMemo {
         g
     }
 
+    pub(crate) fn get_cached(&self, key: MemoKey) -> Option<Option<GeomRef>> {
+        if self.budget == 0 {
+            return None;
+        }
+        self.lru.lock().get(key)
+    }
+
+    pub(crate) fn insert_charged(
+        &self,
+        ctx: &Ctx,
+        key: MemoKey,
+        g: Option<GeomRef>,
+    ) -> Option<GeomRef> {
+        if self.budget == 0 {
+            return g;
+        }
+        let bytes = g.as_ref().map_or(64, |g| g.mem_size());
+        let mut lru = self.lru.lock();
+        let need = (lru.bytes + bytes).min(self.budget.max(bytes)) as u64;
+        if !self.charged.covers(need)
+            && ctx
+                .grow_reservation(&self.charged, need, u64::MAX, false)
+                .is_err()
+        {
+            return g;
+        }
+        lru.insert(key, g.clone(), bytes, self.budget);
+        g
+    }
+
     /// Geometries held.
     pub fn len(&self) -> usize {
         self.lru.lock().map.len()
@@ -348,6 +378,20 @@ pub(crate) fn by_id(ctx: &Ctx, id: Id, decoded: Option<&Value>) -> EvalResult<Ge
     if id.is_undef() {
         return Err(TypeError);
     }
+    let Some(v) = decoded else {
+        return match by_id_checked(ctx, id) {
+            Ok(Some(g)) => Ok(g),
+            Ok(None) => Err(TypeError),
+            Err(error) => {
+                ctx.fail_memory(&error);
+                Err(TypeError)
+            }
+        };
+    };
+    if let Err(error) = ctx.check() {
+        ctx.fail_memory(&error);
+        return Err(TypeError);
+    }
     if let Some(g) = from_column(ctx, id) {
         note_crs(ctx, &g);
         return Ok(g);
@@ -356,12 +400,40 @@ pub(crate) fn by_id(ctx: &Ctx, id: Id, decoded: Option<&Value>) -> EvalResult<Ge
     noted(
         ctx,
         ctx.geo
-            .get_or_parse_charged(ctx, MemoKey::Id(id), || match decoded {
-                Some(v) => parse_value(v, max),
-                None => parse_value(&ctx.value(id)?, max),
-            })
+            .get_or_parse_charged(ctx, MemoKey::Id(id), || parse_value(v, max))
             .ok_or(TypeError),
     )
+}
+
+/// Checked variant of [`by_id`], propagating any memory or control refusal instead of
+/// decoding through the legacy eager bypass or returning a type error on refusal.
+pub(crate) fn by_id_checked(ctx: &Ctx, id: Id) -> crate::error::Result<Option<GeomRef>> {
+    ctx.check()?;
+    if id.is_undef() {
+        return Ok(None);
+    }
+    if let Some(g) = from_column(ctx, id) {
+        note_crs(ctx, &g);
+        return Ok(Some(g));
+    }
+    let key = MemoKey::Id(id);
+    if let Some(hit) = ctx.geo.get_cached(key) {
+        if let Some(g) = &hit {
+            note_crs(ctx, g);
+        }
+        return Ok(hit);
+    }
+    let max = max_vertices(ctx);
+    let decode = ctx.charge(0)?;
+    let decoded = ctx.value_checked_into(id, &decode)?;
+    let g = decoded.as_ref().and_then(|v| parse_value(v, max));
+    drop(decoded);
+    drop(decode);
+    let g = ctx.geo.insert_charged(ctx, key, g);
+    if let Some(g) = &g {
+        note_crs(ctx, g);
+    }
+    Ok(g)
 }
 
 /// The geometry column's parse of a stored literal, when the dataset's spatial index

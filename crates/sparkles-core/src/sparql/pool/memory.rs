@@ -41,6 +41,10 @@ impl QueryPool {
         self.domain.id()
     }
 
+    pub(crate) fn memory_domain(&self) -> &MemoryDomain {
+        &self.domain
+    }
+
     pub fn domain_stats(&self) -> DomainStats {
         DomainStats {
             work_capacity: self.capacity,
@@ -89,6 +93,63 @@ impl QueryPool {
                 *owned = owned.checked_sub(bytes).expect("owned work reservation");
                 drop(owned);
                 release_pool.release(bytes);
+            },
+        )
+    }
+
+    /// Combine an unpooled query's memory parent with this pool's work parent in this
+    /// pool's accounting domain. Reservations check and update the outer query's live
+    /// budget first, then reserve from this pool (rolling back the outer lease if the
+    /// pool refuses). Releases drop both leases outside the internal lock.
+    pub(crate) fn combine_unpooled_parent(self: &Arc<Self>, outer: ParentHandle) -> ParentHandle {
+        debug_assert_eq!(
+            outer.domain(),
+            MemoryDomain::unpooled().id(),
+            "combine_unpooled_parent expects an unpooled outer parent"
+        );
+        let backing = self.work_parent();
+        let held = Arc::new(Mutex::new((
+            outer.reserve(0).expect("sealed zero outer reservation"),
+            backing.reserve(0).expect("sealed zero pool reservation"),
+        )));
+        let take_held = held.clone();
+        self.domain.parent(
+            move |bytes| {
+                if bytes == 0 {
+                    return Ok(());
+                }
+                let mut outer_lease = outer.reserve(bytes)?;
+                let mut pool_lease = match backing.reserve(bytes) {
+                    Ok(lease) => lease,
+                    Err(err) => {
+                        drop(outer_lease);
+                        return Err(err);
+                    }
+                };
+                let mut guard = take_held.lock();
+                guard
+                    .0
+                    .try_merge(&mut outer_lease)
+                    .expect("same outer parent");
+                guard
+                    .1
+                    .try_merge(&mut pool_lease)
+                    .expect("same pool work parent");
+                Ok(())
+            },
+            move |bytes| {
+                if bytes == 0 {
+                    return;
+                }
+                let (outer_release, pool_release) = {
+                    let mut guard = held.lock();
+                    (
+                        guard.0.split(bytes).expect("owned outer reservation"),
+                        guard.1.split(bytes).expect("owned pool work reservation"),
+                    )
+                };
+                drop(pool_release);
+                drop(outer_release);
             },
         )
     }

@@ -8,6 +8,7 @@ use crate::store::Snapshot;
 use crate::task::Control;
 use oxrdf::{NamedNode, Term};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use sparkles_budget::{MemoryLease, ParentHandle};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +32,9 @@ impl<T> Shared<T> {
             self.0.as_ref().expect("live preparation"),
             other.0.as_ref().expect("live preparation"),
         )
+    }
+    fn get_mut(&mut self) -> Option<&mut T> {
+        self.0.as_mut().and_then(Arc::get_mut)
     }
     #[cfg(test)]
     fn allocation_address(&self) -> usize {
@@ -58,20 +62,38 @@ impl<T> Drop for Shared<T> {
     }
 }
 
+struct SelectionBudget {
+    limit: u64,
+    used: AtomicU64,
+}
+
 struct Inner {
     control: Control,
     limit: u64,
     used: AtomicU64,
     peak: AtomicU64,
+    selection: Option<SelectionBudget>,
     grant: Option<Arc<crate::sparql::pool::PoolGrant>>,
     context_bytes: u64,
     cancellation: Option<crate::task::Cancellation>,
     original_controls: Option<QueryControl>,
+    inherited_controls: Option<Box<Preparation>>,
+    upstream: Option<Box<Upstream>>,
+}
+
+struct Upstream {
+    parent: ParentHandle,
+    held: Mutex<MemoryLease>,
+    /// Consumer wait credit forwarded by a streaming view rebuild once synchronous mask
+    /// preparation has finished. Zero during mask preparation so the deadline stays fixed.
+    pause: Arc<AtomicU64>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if let Some(grant) = &self.grant {
+        if self.upstream.is_none()
+            && let Some(grant) = &self.grant
+        {
             grant.release(self.context_bytes);
         }
     }
@@ -84,6 +106,7 @@ pub struct Preparation {
     inner: Shared<Inner>,
     no_wait: bool,
     query: Option<QueryControl>,
+    in_selection: bool,
 }
 
 // Inline shallow control handles add no allocation or independent allowance.
@@ -166,13 +189,17 @@ impl Preparation {
                 limit: memory_bytes,
                 used: AtomicU64::new(CONTEXT_BYTES),
                 peak: AtomicU64::new(CONTEXT_BYTES),
+                selection: None,
                 grant,
                 context_bytes: CONTEXT_BYTES,
                 cancellation: None,
                 original_controls: None,
+                inherited_controls: None,
+                upstream: None,
             }),
             no_wait: false,
             query: None,
+            in_selection: false,
         })
     }
 
@@ -284,6 +311,7 @@ impl Preparation {
                 limit,
                 used: AtomicU64::new(bytes),
                 peak: AtomicU64::new(bytes),
+                selection: None,
                 grant,
                 context_bytes: bytes,
                 cancellation: opts.cancellation.clone(),
@@ -292,13 +320,124 @@ impl Preparation {
                     cancellation,
                     deadline,
                 }),
+                inherited_controls: None,
+                upstream: None,
             }),
             no_wait: false,
             query: None,
+            in_selection: false,
         };
         partial.bytes = 0;
         root.check()?;
         Ok(root)
+    }
+
+    /// Prepare a view principal's physical read under the executing query's allowance.
+    pub(crate) fn for_view_rebuild(
+        opts: &crate::sparql::QueryOptions,
+        parent: ParentHandle,
+        inherited: Option<&Self>,
+    ) -> Result<Self> {
+        if let Some(inherited) = inherited {
+            inherited.check()?;
+        }
+        let mut control = Control::with_cancel(opts.cancel.clone().expect("rebuild cancellation"));
+        control.deadline = opts.deadline;
+        if let Some(inherited) = inherited {
+            control.progress = inherited.inner.control.progress.clone();
+        }
+        control.check()?;
+        if let Some(cancellation) = &opts.cancellation {
+            cancellation.check()?;
+        }
+        let bytes = (std::mem::size_of::<Inner>()
+            + 16
+            + std::mem::size_of::<Upstream>()
+            + 32
+            + if inherited.is_some() {
+                std::mem::size_of::<Preparation>()
+            } else {
+                0
+            }) as u64;
+        let limit = opts.max_memory_bytes.expect("rebuild memory limit");
+        if bytes > limit {
+            return Err(memory(limit));
+        }
+        let held = parent.reserve(bytes).map_err(parent_error)?;
+        let preparation = Self {
+            inner: Shared::new(Inner {
+                control,
+                limit,
+                used: AtomicU64::new(bytes),
+                peak: AtomicU64::new(bytes),
+                selection: None,
+                grant: opts.grant.clone(),
+                context_bytes: bytes,
+                cancellation: opts.cancellation.clone(),
+                original_controls: None,
+                inherited_controls: inherited.cloned().map(Box::new),
+                upstream: Some(Box::new(Upstream {
+                    parent,
+                    held: Mutex::new(held),
+                    pause: Arc::new(AtomicU64::new(0)),
+                })),
+            }),
+            no_wait: inherited.is_some_and(|original| original.no_wait),
+            query: None,
+            in_selection: false,
+        };
+        preparation.check()?;
+        Ok(preparation)
+    }
+
+    /// Prepare a child operation (such as incremental circuit masking) under `control`,
+    /// bounded by `memory_bytes` and charging its parent [`ParentHandle`] directly.
+    pub(crate) fn with_parent(
+        control: Control,
+        memory_bytes: u64,
+        parent: ParentHandle,
+        grant: Option<Arc<crate::sparql::pool::PoolGrant>>,
+    ) -> Result<Self> {
+        control.check()?;
+        let bytes =
+            (std::mem::size_of::<Inner>() + 16 + std::mem::size_of::<Upstream>() + 32) as u64;
+        if bytes > memory_bytes {
+            return Err(memory(memory_bytes));
+        }
+        let held = parent.reserve(bytes).map_err(parent_error)?;
+        let preparation = Self {
+            inner: Shared::new(Inner {
+                control,
+                limit: memory_bytes,
+                used: AtomicU64::new(bytes),
+                peak: AtomicU64::new(bytes),
+                selection: None,
+                grant,
+                context_bytes: bytes,
+                cancellation: None,
+                original_controls: None,
+                inherited_controls: None,
+                upstream: Some(Box::new(Upstream {
+                    parent,
+                    held: Mutex::new(held),
+                    pause: Arc::new(AtomicU64::new(0)),
+                })),
+            }),
+            no_wait: false,
+            query: None,
+            in_selection: false,
+        };
+        preparation.check()?;
+        Ok(preparation)
+    }
+
+    /// Shared wait-credit counter for a view rebuild's own ordinary execution deadline.
+    /// `None` for ordinary checked sources whose absolute deadlines never extend on pause.
+    pub(crate) fn view_rebuild_pause(&self) -> Option<Arc<AtomicU64>> {
+        self.inner
+            .upstream
+            .as_ref()
+            .map(|upstream| upstream.pause.clone())
     }
 
     pub(crate) fn with_query_controls(
@@ -338,6 +477,72 @@ impl Preparation {
         Ok(view)
     }
 
+    /// Configured memory limit of this preparation.
+    pub fn limit(&self) -> u64 {
+        self.inner.limit
+    }
+
+    /// Configure a distinct memory ceiling for evidence and physical view
+    /// selection on this preparation, separate from the root execution
+    /// allowance. Both budgets share the same pool grant when pooled, and
+    /// selection reservations stay within `selection_bytes` without reducing
+    /// the execution allowance below [`Self::limit`].
+    ///
+    /// Must be called before cloning or retaining the preparation.
+    pub fn with_selection_limit(mut self, selection_bytes: u64) -> Result<Self> {
+        self.check()?;
+        let inner = self.inner.get_mut().ok_or_else(|| {
+            Error::invalid("selection limit must be configured before sharing a preparation")
+        })?;
+        if selection_bytes < inner.context_bytes {
+            return Err(memory(selection_bytes));
+        }
+        inner.selection = Some(SelectionBudget {
+            limit: selection_bytes,
+            used: AtomicU64::new(inner.context_bytes),
+        });
+        Ok(self)
+    }
+
+    /// Configured selection memory ceiling of this preparation, defaulting to
+    /// [`Self::limit`] when no distinct selection limit was configured.
+    pub fn selection_limit(&self) -> u64 {
+        self.inner
+            .selection
+            .as_ref()
+            .map_or(self.inner.limit, |selection| selection.limit)
+    }
+
+    /// Remaining local room in this preparation's execution allowance (without
+    /// querying any pool grant).
+    pub fn available_bytes(&self) -> u64 {
+        self.inner
+            .limit
+            .saturating_sub(self.inner.used.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn selection_scope(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.in_selection = self.inner.selection.is_some();
+        scoped
+    }
+
+    pub(crate) fn without_selection_scope(&self) -> Self {
+        let mut unscoped = self.clone();
+        unscoped.in_selection = false;
+        unscoped
+    }
+
+    fn active_budget(&self) -> (&AtomicU64, u64) {
+        if self.in_selection
+            && let Some(selection) = &self.inner.selection
+        {
+            (&selection.used, selection.limit)
+        } else {
+            (&self.inner.used, self.inner.limit)
+        }
+    }
+
     /// A separate synchronous preparation with this one's request controls,
     /// descendant query controls and wait policy but its own allowance. Charges
     /// against it never reach this preparation's counter.
@@ -353,13 +558,17 @@ impl Preparation {
                 limit: memory_bytes,
                 used: AtomicU64::new(CONTEXT_BYTES),
                 peak: AtomicU64::new(CONTEXT_BYTES),
+                selection: None,
                 grant: None,
                 context_bytes: CONTEXT_BYTES,
                 cancellation: self.inner.cancellation.clone(),
                 original_controls: self.inner.original_controls.clone(),
+                inherited_controls: self.inner.inherited_controls.clone(),
+                upstream: None,
             }),
             no_wait: self.no_wait,
             query: self.query.clone(),
+            in_selection: false,
         };
         temporary.check()?;
         Ok(temporary)
@@ -381,13 +590,38 @@ impl Preparation {
         self.inner.grant.as_ref()
     }
 
-    /// One checked descendant shares the actual preparation root. The callbacks
-    /// retain genuine ownership and original admission, not a domain label.
-    pub fn memory_parent(&self) -> Result<sparkles_budget::ParentHandle> {
-        let header = self.reserve(PARENT_BYTES)?;
-        let take = self.clone();
-        let give = self.clone();
-        let domain = self
+    /// Trim this preparation's backing pool grant down to currently charged bytes,
+    /// releasing unused `INITIAL_GRANT` slack when a query transitions to idle retention.
+    pub fn trim_grant(&self) {
+        if let Some(grant) = &self.inner.grant {
+            grant.trim_to_used();
+        }
+    }
+
+    /// Create a fresh-control child preparation sharing this preparation's remaining
+    /// memory allowance and backing pool grant, evaluated against `control` instead of
+    /// this preparation's original deadline or cancel flag (for example, rendering a
+    /// retained MCP task result on a later `tasks/get` poll).
+    pub fn child_with_control(&self, control: Control) -> Result<Self> {
+        control.check()?;
+        let root = self.without_selection_scope();
+        root.reserve_bytes(PARENT_BYTES)
+            .map_err(|error| match error {
+                sparkles_budget::ParentRefused::Limit {
+                    scope: sparkles_budget::Scope::Local,
+                    limit,
+                    ..
+                } if root.inner.upstream.is_none() => memory(limit),
+                sparkles_budget::ParentRefused::Overflow => memory(root.active_budget().1),
+                error => parent_error(error),
+            })?;
+        let header = Reservation {
+            preparation: root.clone(),
+            bytes: PARENT_BYTES,
+        };
+        let take = root.clone();
+        let give = root.clone();
+        let domain = root
             .inner
             .grant
             .as_ref()
@@ -403,56 +637,128 @@ impl Preparation {
                 admitted,
             )
             .map_err(parent_error)?;
-        self.check()?;
+        let bytes =
+            (std::mem::size_of::<Inner>() + 16 + std::mem::size_of::<Upstream>() + 32) as u64;
+        let limit = root.inner.limit;
+        if bytes > limit {
+            return Err(memory(limit));
+        }
+        let held = parent.reserve(bytes).map_err(parent_error)?;
+        let child = Self {
+            inner: Shared::new(Inner {
+                control,
+                limit,
+                used: AtomicU64::new(bytes),
+                peak: AtomicU64::new(bytes),
+                selection: None,
+                grant: root.inner.grant.clone(),
+                context_bytes: bytes,
+                cancellation: None,
+                original_controls: None,
+                inherited_controls: None,
+                upstream: Some(Box::new(Upstream {
+                    parent,
+                    held: Mutex::new(held),
+                    pause: Arc::new(AtomicU64::new(0)),
+                })),
+            }),
+            no_wait: false,
+            query: None,
+            in_selection: false,
+        };
+        child.check()?;
+        Ok(child)
+    }
+
+    /// One checked descendant shares the actual preparation root. The callbacks
+    /// retain genuine ownership and original admission, not a domain label.
+    pub fn memory_parent(&self) -> Result<sparkles_budget::ParentHandle> {
+        let root = self.without_selection_scope();
+        let header = root.reserve(PARENT_BYTES)?;
+        let take = root.clone();
+        let give = root.clone();
+        let domain = root
+            .inner
+            .grant
+            .as_ref()
+            .map_or(sparkles_budget::MemoryDomain::unpooled(), |grant| {
+                grant.memory_domain()
+            });
+        let admitted = header.bytes();
+        let parent = domain
+            .parent_with_header(
+                move |bytes| take.reserve_bytes(bytes),
+                move |_: &sparkles_budget::ParentHandle, bytes| give.release_bytes(bytes),
+                header,
+                admitted,
+            )
+            .map_err(parent_error)?;
+        root.check()?;
         Ok(parent)
     }
 
     fn reserve_bytes(&self, bytes: u64) -> std::result::Result<(), sparkles_budget::ParentRefused> {
         use sparkles_budget::{ParentRefused, Scope};
-        let mut used = self.inner.used.load(Ordering::Relaxed);
+        let (counter, limit) = self.active_budget();
+        let mut used = counter.load(Ordering::Relaxed);
         let next = loop {
             let next = used.checked_add(bytes).ok_or(ParentRefused::Overflow)?;
-            if next > self.inner.limit {
+            if next > limit {
                 return Err(ParentRefused::Limit {
-                    limit: self.inner.limit,
+                    limit,
                     requested: next,
                     scope: Scope::Local,
                 });
             }
-            match self.inner.used.compare_exchange_weak(
-                used,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match counter.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => break next,
                 Err(actual) => used = actual,
             }
         };
-        if let Some(grant) = &self.inner.grant
-            && let Err(error) = grant.charge(bytes)
-        {
-            self.inner.used.fetch_sub(bytes, Ordering::Relaxed);
-            let Error::BudgetExceeded(budget) = error else {
-                unreachable!("grant charge only refuses memory")
-            };
-            return Err(ParentRefused::Limit {
-                limit: budget.limit,
-                requested: budget.requested,
-                scope: Scope::Work,
-            });
+        let backing = if let Some(upstream) = &self.inner.upstream {
+            upstream.parent.reserve(bytes).map(|mut lease| {
+                upstream
+                    .held
+                    .lock()
+                    .try_merge(&mut lease)
+                    .expect("same admitted parent");
+            })
+        } else if let Some(grant) = &self.inner.grant {
+            grant.charge(bytes).map_err(|error| {
+                let Error::BudgetExceeded(budget) = error else {
+                    unreachable!("grant charge only refuses memory")
+                };
+                ParentRefused::Limit {
+                    limit: budget.limit,
+                    requested: budget.requested,
+                    scope: Scope::Work,
+                }
+            })
+        } else {
+            Ok(())
+        };
+        if let Err(error) = backing {
+            counter.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(error);
         }
-        self.inner.peak.fetch_max(next, Ordering::Relaxed);
+        if !self.in_selection {
+            self.inner.peak.fetch_max(next, Ordering::Relaxed);
+        }
         Ok(())
     }
 
     fn release_bytes(&self, bytes: u64) {
         #[cfg(test)]
         crate::sparql::checked_source_tests::observe_release(self, bytes);
-        self.inner.used.fetch_sub(bytes, Ordering::Relaxed);
+        let (counter, _) = self.active_budget();
+        counter.fetch_sub(bytes, Ordering::Relaxed);
         #[cfg(test)]
-        crate::test_alloc::released(&self.inner.used, bytes);
-        if let Some(grant) = &self.inner.grant {
+        crate::test_alloc::released(counter, bytes);
+        if let Some(upstream) = &self.inner.upstream {
+            let lease = upstream.held.lock().split(bytes).expect("admitted credit");
+            // Returning parent credit can wake memory waiters synchronously.
+            drop(lease);
+        } else if let Some(grant) = &self.inner.grant {
             // No preparation lock is held when a grant invokes synchronous wakeups.
             grant.release(bytes);
         }
@@ -468,17 +774,27 @@ impl Preparation {
         &self.inner.used
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_peak(&self) -> u64 {
+        self.inner.peak.load(Ordering::Relaxed)
+    }
+
+    /// Bytes currently reserved in the active budget.
+    pub(crate) fn used(&self) -> u64 {
+        let (counter, _) = self.active_budget();
+        counter.load(Ordering::Relaxed)
+    }
+
     /// The allowance not yet reserved. Other clones may reserve it at any moment, so
     /// this only sizes work; storage still needs a [`reserve`](Self::reserve).
     pub(crate) fn room(&self) -> u64 {
-        self.inner
-            .limit
-            .saturating_sub(self.inner.used.load(Ordering::Relaxed))
+        let (counter, limit) = self.active_budget();
+        limit.saturating_sub(counter.load(Ordering::Relaxed))
     }
 
-    // This is a sizing observation only. The actual reservation below the
-    // selection boundary still decides atomic local/pool admission.
-    pub(crate) fn selection_room(&self) -> u64 {
+    /// The active budget's remaining allowance, capped by the backing pool grant's
+    /// growth headroom when one is attached.
+    pub(crate) fn available_room(&self) -> u64 {
         let local = self.room();
         self.inner
             .grant
@@ -486,14 +802,38 @@ impl Preparation {
             .map_or(local, |grant| local.min(grant.growth_room()))
     }
 
-    /// The part of [`Preparation::selection_room`] the grant already covers, which
-    /// needs no pool growth. A selection that loses a race for free granules
-    /// retries with this smaller allowance before any read.
-    pub(crate) fn covered_room(&self) -> u64 {
-        let local = self.room();
-        self.inner.grant.as_ref().map_or(local, |grant| {
-            local.min(grant.granted().saturating_sub(grant.used()))
-        })
+    // This is a sizing observation only. The actual reservation below the
+    // selection boundary still decides atomic local/pool admission.
+    pub(crate) fn selection_room(&self) -> u64 {
+        let local = if let Some(selection) = &self.inner.selection {
+            selection
+                .limit
+                .saturating_sub(selection.used.load(Ordering::Relaxed))
+        } else {
+            self.room()
+        };
+        self.inner
+            .grant
+            .as_ref()
+            .map_or(local, |grant| local.min(grant.growth_room()))
+    }
+
+    /// Reserve the active budget's pool-aware remaining room, retrying once with
+    /// the room the grant already covers when another grant takes free pool
+    /// granules first. Returns the actual reserved allowance and its guard.
+    pub(crate) fn reserve_available(&self) -> Result<(u64, Reservation)> {
+        let allowance = self.available_room();
+        match self.reserve(allowance) {
+            Ok(held) => Ok((allowance, held)),
+            Err(Error::BudgetExceeded(_)) => {
+                let local = self.room();
+                let covered = self.inner.grant.as_ref().map_or(local, |grant| {
+                    local.min(grant.granted().saturating_sub(grant.used()))
+                });
+                Ok((covered, self.reserve(covered)?))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn refuses_wait(&self) -> bool {
@@ -510,18 +850,28 @@ impl Preparation {
     /// order. This is distinct from byte-only admission through an existing parent.
     pub fn check_work(&self) -> std::result::Result<(), sparkles_budget::WorkStopped> {
         use sparkles_budget::WorkStopped;
+        if let Some(original) = &self.inner.inherited_controls {
+            original.check_work()?;
+        }
         self.inner
             .control
             .cancel
             .check()
             .map_err(|_| WorkStopped::Cancelled)?;
-        if self
-            .inner
-            .control
-            .deadline
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
-            return Err(WorkStopped::Timeout);
+        if let Some(deadline) = self.inner.control.deadline {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                let expired = match &self.inner.upstream {
+                    Some(upstream) => {
+                        let paused = Duration::from_nanos(upstream.pause.load(Ordering::Relaxed));
+                        deadline.checked_add(paused).is_some_and(|end| now >= end)
+                    }
+                    None => true,
+                };
+                if expired {
+                    return Err(WorkStopped::Timeout);
+                }
+            }
         }
         if let Some(cancellation) = &self.inner.cancellation {
             cancellation.check().map_err(|_| WorkStopped::Cancelled)?;
@@ -707,6 +1057,34 @@ impl Preparation {
         Ok(false)
     }
 
+    pub(crate) fn allows_named_graph_iri(&self, graphs: &Graphs, iri: &str) -> Result<bool> {
+        self.check()?;
+        let Graphs::Only(rule) = graphs else {
+            return Ok(true);
+        };
+        if iri == crate::sparql::ctx::DEFAULT_GRAPH_IRI {
+            Ok(rule.default_graph)
+        } else if iri == crate::sparql::ctx::UNION_GRAPH_IRI {
+            Ok(false)
+        } else {
+            self.named_rule(rule, iri)
+        }
+    }
+
+    pub(crate) fn covers_named_graph_iri(
+        &self,
+        protection: &Protection,
+        iri: &str,
+    ) -> Result<bool> {
+        match &protection.graphs {
+            Some(graphs) => self.allows_named_graph_iri(graphs, iri),
+            None => {
+                self.check()?;
+                Ok(true)
+            }
+        }
+    }
+
     pub(crate) fn covers_graph(
         &self,
         protection: &Protection,
@@ -736,7 +1114,9 @@ impl Preparation {
 
     /// Copy provider-owned text under an ownership reservation from this request.
     pub fn copy_string(&self, text: &str, ownership: &mut Reservation) -> Result<String> {
-        if !self.inner.same(&ownership.preparation.inner) {
+        if !self.inner.same(&ownership.preparation.inner)
+            || self.in_selection != ownership.preparation.in_selection
+        {
             return Err(Error::Unsupported(
                 "provider storage belongs to another preparation".into(),
             ));
@@ -760,6 +1140,29 @@ impl Preparation {
         each: impl FnMut([Id; 4]) -> Result<bool>,
     ) -> Result<()> {
         snap.scan_prepared(perm, prefix, self, each)
+    }
+
+    /// Check whether `quad` is present in `snap` under this preparation's controls
+    /// and memory budget.
+    pub fn contains(&self, snap: &Snapshot, quad: &[Id; 4]) -> Result<bool> {
+        snap.contains_prepared(quad, self)
+    }
+
+    /// Return the first live physical quad in `[lo, hi]` under `perm`, seeking
+    /// directly via block, segment, row and delta bounds.
+    pub(crate) fn first_in_range(
+        &self,
+        snap: &Snapshot,
+        perm: Perm,
+        lo: crate::index::Key,
+        hi: crate::index::Key,
+    ) -> Result<Option<[Id; 4]>> {
+        let mut found = None;
+        snap.scan_prepared_range::<Error>(perm, lo, hi, self, |q| {
+            found = Some(q);
+            Ok(false)
+        })?;
+        Ok(found)
     }
 
     /// Resolve an IRI with controlled reconstruction and delta-vocabulary waiting.
@@ -794,12 +1197,11 @@ impl Preparation {
     }
 
     fn lookup_vocab_key(&self, snap: &Snapshot, key: &[u8]) -> Result<Option<Id>> {
-        let mut workspace = self.reserve(0)?;
-        if let Ok(id) = snap.generation.vocab.find_with_controlled(
-            key,
-            |bytes| workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256)),
-            |phase| self.checkpoint(phase),
-        )? {
+        if let Ok(id) = snap
+            .generation
+            .vocab
+            .find_exact_controlled(key, |phase| self.checkpoint(phase))?
+        {
             self.check()?;
             return Ok(Some(Id::vocab(id)));
         }
@@ -893,6 +1295,153 @@ impl Preparation {
         };
         let result = match result {
             Some(result) => result?,
+            None => (each.take().expect("not called"))(None)?,
+        };
+        self.check()?;
+        Ok(result)
+    }
+
+    /// The IRI text of a stored named node, borrowed for `each` without full term
+    /// decoding. Only the key's own bytes and the reconstruction workspace are
+    /// charged, so a long rejected IRI does not pay the general term-decoder
+    /// multiplier. `None` for any non-IRI term. Vocabulary locks are released
+    /// before the callback.
+    pub fn with_iri<R>(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        each: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        self.check()?;
+        let mut each = Some(each);
+        let mut call = |key: &[u8]| -> Result<R> {
+            let each = each.take().expect("called once");
+            let Some(text) = key.strip_prefix(b"<") else {
+                return each(None);
+            };
+            let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+            each(std::str::from_utf8(text).ok())
+        };
+        let mut workspace = self.reserve(0)?;
+        let result = match id.tag() {
+            Tag::Vocab => {
+                if id.payload() >= snap.generation.vocab.len()
+                    || !snap.generation.vocab.is_iri(id.payload())
+                {
+                    None
+                } else {
+                    snap.generation.vocab.get_with_controlled(
+                        id.payload(),
+                        |bytes| {
+                            workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256))
+                        },
+                        |phase| self.checkpoint(phase),
+                        &mut call,
+                    )?
+                }
+            }
+            Tag::Delta => {
+                // Copy the delta IRI into a budgeted temporary buffer so the delta
+                // vocabulary read lock is released before invoking `each`.
+                let copied: Option<(String, Reservation)> =
+                    snap.generation.dvocab.with_prepared(self, |vocab| {
+                        if id.payload() >= snap.dvocab_len {
+                            return Ok(None);
+                        }
+                        let Some(key) = vocab.get(id.payload()) else {
+                            return Ok(None);
+                        };
+                        let Some(text) = key.strip_prefix(b"<") else {
+                            return Ok(None);
+                        };
+                        let Ok(text) = std::str::from_utf8(text) else {
+                            return Ok(None);
+                        };
+                        let mut held = self.reserve(0)?;
+                        let owned = self.copy_string(text, &mut held)?;
+                        Ok(Some((owned, held)))
+                    })?;
+                let out = (each.take().expect("called once"))(
+                    copied.as_ref().map(|(text, _)| text.as_str()),
+                )?;
+                if let Some((owned, held)) = copied {
+                    drop(owned);
+                    drop(held);
+                }
+                self.check()?;
+                return Ok(out);
+            }
+            _ => None,
+        };
+        let result = match result {
+            Some(result) => result?,
+            None => (each.take().expect("not called"))(None)?,
+        };
+        self.check()?;
+        Ok(result)
+    }
+
+    /// The lexical form of a vocabulary-stored typed literal with `datatype`, borrowed
+    /// for `each` without decoding it as a term. Only literals stored under `Tag::Vocab`
+    /// or `Tag::Delta` as `TextKey::Typed` keys match, including `xsd:base64Binary` and
+    /// any non-inlined lexical form of a datatype that can otherwise be inlined. Literals
+    /// stored under an inline tag, `xsd:string` literals stored as simple literal keys
+    /// for [`with_simple_literal`](Self::with_simple_literal), and any other term or
+    /// mismatched datatype pass `None`. On `Vocab`, reconstruction growth is settled to
+    /// the reconstructed key capacity before `each` runs so large retained literals do
+    /// not over-charge the allowance.
+    pub fn with_typed_literal<R>(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        datatype: &str,
+        each: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        self.check()?;
+        let mut each = Some(each);
+        let mut call = |key: &[u8]| -> Result<R> {
+            let each = each.take().expect("called once");
+            let lexical = match crate::id::TextKey::parse(key) {
+                Some(crate::id::TextKey::Typed(text, dt)) if dt == datatype => Some(text),
+                _ => None,
+            };
+            each(lexical)
+        };
+        let workspace = std::cell::RefCell::new(self.reserve(0)?);
+        let result = match id.tag() {
+            Tag::Vocab => snap.generation.vocab.get_with_controlled_capacity_checked(
+                id.payload(),
+                |old, new| {
+                    workspace
+                        .borrow_mut()
+                        .grow_to((old as u64).saturating_add(new as u64).saturating_add(256))
+                },
+                |cap| {
+                    workspace
+                        .borrow_mut()
+                        .release_to((cap as u64).saturating_add(256));
+                    Ok(())
+                },
+                |phase| self.checkpoint(phase),
+                |key| call(key),
+            )?,
+            Tag::Delta => snap.generation.dvocab.with_prepared(self, |vocab| {
+                if id.payload() >= snap.dvocab_len {
+                    return Ok(None);
+                }
+                vocab
+                    .get(id.payload())
+                    .map(|key| {
+                        let _held = self.reserve((key.len() as u64).saturating_add(64))?;
+                        call(key)
+                    })
+                    .transpose()
+            })?,
+            _ => None,
+        };
+        drop(workspace);
+        let result = match result {
+            Some(result) => result,
             None => (each.take().expect("not called"))(None)?,
         };
         self.check()?;
@@ -1043,9 +1592,10 @@ impl Preparation {
         self.reserve_bytes(bytes).map_err(|error| match error {
             sparkles_budget::ParentRefused::Limit {
                 scope: sparkles_budget::Scope::Local,
+                limit,
                 ..
-            }
-            | sparkles_budget::ParentRefused::Overflow => memory(self.inner.limit),
+            } if self.inner.upstream.is_none() => memory(limit),
+            sparkles_budget::ParentRefused::Overflow => memory(self.active_budget().1),
             error => parent_error(error),
         })?;
         let held = Reservation {
@@ -1107,7 +1657,7 @@ impl Preparation {
 
     /// A privacy-safe memory refusal for provider allocation failures or overflow.
     pub fn exhausted(&self) -> Error {
-        memory(self.inner.limit)
+        memory(self.active_budget().1)
     }
 
     pub(crate) fn history_options(&self) -> crate::history::HistoryOptions {
@@ -1464,19 +2014,24 @@ impl Reservation {
         Ok(())
     }
     /// Release the allowance above `bytes` once the owner retains no more than that.
-    pub(crate) fn release_to(&mut self, bytes: u64) {
+    pub fn release_to(&mut self, bytes: u64) {
         if bytes < self.bytes {
             self.preparation.release_bytes(self.bytes - bytes);
             self.bytes = bytes;
         }
     }
 
-    pub(crate) fn bytes(&self) -> u64 {
+    /// Bytes currently reserved by this owner.
+    pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
     pub(crate) fn merge(&mut self, mut other: Self) {
         assert!(self.preparation.inner.same(&other.preparation.inner));
+        assert_eq!(
+            self.preparation.in_selection,
+            other.preparation.in_selection
+        );
         self.bytes = self.bytes.checked_add(other.bytes).expect("admitted sum");
         other.bytes = 0;
     }
@@ -1693,15 +2248,22 @@ impl Exemptions {
 }
 
 /// An exact bound access policy and the physical snapshot it reads.
-/// Its reservations live as long as this returned owner. Accessors borrow that
-/// owner; independently cloning raw data requires the caller's own accounting.
+/// Its reservations live as long as this returned owner. Checked consumers retain
+/// it through [`Self::read_source`] and cannot extract a cloneable raw snapshot or
+/// bound policy.
 ///
-/// ```compile_fail,E0308
+/// ```compile_fail
 /// use sparkles_core::access::PreparedView;
 /// use sparkles_core::store::Snapshot;
-/// use std::sync::Arc;
-/// fn escape(view: &PreparedView) -> Arc<Snapshot> {
-///     Arc::clone(view.snapshot())
+/// fn escape(view: &PreparedView) -> Snapshot {
+///     view.snapshot().clone()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use sparkles_core::access::{GraphAccess, PreparedView};
+/// fn escape(view: &PreparedView) -> GraphAccess {
+///     view.access().clone()
 /// }
 /// ```
 #[derive(Clone)]
@@ -1717,6 +2279,13 @@ struct PreparedInner {
     // Inline in this same admitted backing; no second carrier allocation. Its
     // physical selected source/original policy precede its selection credit.
     selected: Option<crate::store::bound_read_source::PreparedRead>,
+    // When prepared from a BoundEvidenceView, retain that owner and its
+    // selection credit alongside the weak identity of the original policy Arc.
+    evidence: Option<crate::store::BoundEvidenceView>,
+    evidence_policy: Option<std::sync::Weak<GraphAccess>>,
+    // When prepared from a WriteTxn, retain the admitted transaction snapshot
+    // reservation and Store origin.
+    txn: Option<crate::store::bound_read_source::PreparedTxn>,
     _held: Reservation,
 }
 
@@ -1745,15 +2314,19 @@ impl PreparedView {
         held: Reservation,
         preparation: &Preparation,
     ) -> Result<Self> {
-        Self::new_selected(access, snapshot, held, preparation, None)
+        Self::new_owned(access, snapshot, held, preparation, None, None, None, None)
     }
 
-    pub(crate) fn new_selected(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_owned(
         access: Arc<GraphAccess>,
         snapshot: Arc<Snapshot>,
         held: Reservation,
         preparation: &Preparation,
         selected: Option<crate::store::bound_read_source::PreparedRead>,
+        evidence: Option<crate::store::BoundEvidenceView>,
+        evidence_policy: Option<std::sync::Weak<GraphAccess>>,
+        txn: Option<crate::store::bound_read_source::PreparedTxn>,
     ) -> Result<Self> {
         // Couple all incoming payloads and their credits on the stack before
         // any fallible validation, so early exits obey the same drop order.
@@ -1761,6 +2334,9 @@ impl PreparedView {
             access,
             snapshot,
             selected,
+            evidence,
+            evidence_policy,
+            txn,
             _held: held,
         };
         preparation.check()?;
@@ -1793,12 +2369,33 @@ impl PreparedView {
         )
     }
 
+    pub(crate) fn validate_query_instance(&self, store: &crate::store::Store) -> Result<()> {
+        if let Some(selected) = self.inner.selected.as_ref() {
+            return selected.validate_instance(store);
+        }
+        if let Some(evidence) = self.inner.evidence.as_ref() {
+            return evidence.validate_instance(store);
+        }
+        if let Some(txn) = self.inner.txn.as_ref() {
+            return txn.validate_instance(store);
+        }
+        // Raw-input legacy masked_controlled views carry no Store-minted origin.
+        Ok(())
+    }
+
     pub(crate) fn validate_instance(&self, store: &crate::store::Store) -> Result<()> {
-        self.inner
-            .selected
-            .as_ref()
-            .ok_or_else(|| Error::invalid("strict source requires a Store-minted physical origin"))?
-            .validate_instance(store)
+        if let Some(selected) = self.inner.selected.as_ref() {
+            return selected.validate_instance(store);
+        }
+        if let Some(evidence) = self.inner.evidence.as_ref() {
+            return evidence.validate_instance(store);
+        }
+        if let Some(txn) = self.inner.txn.as_ref() {
+            return txn.validate_instance(store);
+        }
+        Err(Error::invalid(
+            "strict source requires a Store-minted physical origin",
+        ))
     }
 
     pub(crate) fn is_original_policy(&self, policy: &Arc<GraphAccess>) -> bool {
@@ -1806,18 +2403,146 @@ impl PreparedView {
             .selected
             .as_ref()
             .is_some_and(|selected| selected.is_original_policy(policy))
+            || self
+                .inner
+                .evidence_policy
+                .as_ref()
+                .is_some_and(|identity| std::ptr::eq(identity.as_ptr(), Arc::as_ptr(policy)))
+    }
+
+    pub(crate) fn is_txn(&self) -> bool {
+        self.inner.txn.is_some()
     }
 
     /// Bound policy to apply while consuming the physical snapshot.
-    pub fn access(&self) -> &GraphAccess {
+    pub(crate) fn access(&self) -> &GraphAccess {
         &self.inner.access
     }
 
     /// Physical triple mask. Apply `access()` too; graph restrictions are not
-    /// enforced by this raw snapshot alone. The opaque read-source factory is
-    /// the ownership boundary for checked consumers retaining this preparation.
-    pub fn snapshot(&self) -> &Snapshot {
+    /// enforced by this raw snapshot alone.
+    pub(crate) fn snapshot(&self) -> &Snapshot {
         &self.inner.snapshot
+    }
+
+    /// Cloned `Arc` handle to the physical masked snapshot.
+    pub(crate) fn snapshot_arc(&self) -> Arc<Snapshot> {
+        self.inner.snapshot.clone()
+    }
+
+    /// Whether the graph named by `term` (the default graph when `None`) is readable.
+    pub fn readable(&self, term: Option<&oxrdf::Term>) -> bool {
+        self.inner.access.readable(term)
+    }
+
+    /// Whether the graph named by `iri` is readable under this prepared policy.
+    pub fn allows_read_iri(&self, iri: &str) -> bool {
+        self.inner.access.read.allows_iri(iri)
+    }
+
+    /// Whether the guarded named graph `iri` is readable under this prepared policy:
+    /// either reads are unrestricted, or `iri` is allowed by the read rule and exempted
+    /// by a snapshot-bound guard whose pattern matches `iri`.
+    pub fn allows_guarded_read_iri(&self, iri: &str) -> bool {
+        self.inner.access.allows_guarded_read_iri(iri)
+    }
+
+    /// See [`GraphAccess::visit_guarded_read_iris`].
+    pub fn visit_guarded_read_iris<E>(
+        &self,
+        visit: impl FnMut(&str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        self.inner.access.visit_guarded_read_iris(visit)
+    }
+
+    /// Whether the graph named by `term` (the default graph when `None`) is writable.
+    pub fn writable(&self, term: Option<&oxrdf::Term>) -> bool {
+        self.inner.access.writable(term)
+    }
+
+    /// Whether the graph named by `iri` is writable under this prepared policy.
+    pub fn writable_iri(&self, iri: &str) -> bool {
+        self.inner.access.writable_iri(iri)
+    }
+
+    /// Whether reads see every graph without graph-level filtering.
+    pub fn reads_all(&self) -> bool {
+        self.inner.access.reads_all()
+    }
+
+    /// Whether reads see every graph and every triple without a mask.
+    pub fn reads_everything(&self) -> bool {
+        self.inner.access.reads_everything()
+    }
+
+    /// Whether this prepared policy hides triples from reads.
+    pub fn hides_triples(&self) -> bool {
+        self.inner.access.hides_triples()
+    }
+
+    /// Whether this prepared view's bound policy equals `expected`.
+    pub fn policy_matches(&self, expected: &GraphAccess) -> bool {
+        self.inner.access.as_ref() == expected
+    }
+
+    /// Whether this prepared view's bound read rule equals `expected`.
+    pub fn read_policy_matches(&self, expected: &crate::access::Graphs) -> bool {
+        self.inner.access.read == *expected
+    }
+
+    /// Commit sequence reflected by this prepared view.
+    pub fn commit(&self) -> u64 {
+        self.inner.snapshot.commit
+    }
+
+    /// Number of quads in the underlying masked snapshot (before graph-level filtering).
+    pub fn len(&self) -> u64 {
+        self.inner.snapshot.len()
+    }
+
+    /// Whether the underlying masked snapshot has no quads.
+    pub fn is_empty(&self) -> bool {
+        self.inner.snapshot.is_empty()
+    }
+
+    /// Whether the prepared snapshot carries a triple-level access mask.
+    pub fn has_mask(&self) -> bool {
+        self.inner.snapshot.has_mask()
+    }
+
+    /// Process-unique identifier of the prepared snapshot's triple mask, if any.
+    pub fn mask_id(&self) -> Option<u64> {
+        self.inner.snapshot.mask_id()
+    }
+
+    /// Whether this prepared view shares the exact physical snapshot `other`.
+    pub fn same_snapshot(&self, other: &Snapshot) -> bool {
+        std::ptr::eq(self.inner.snapshot.as_ref(), other)
+    }
+
+    /// Whether two prepared views share the exact same physical snapshot allocation.
+    pub fn same_snapshot_as(&self, other: &PreparedView) -> bool {
+        Arc::ptr_eq(&self.inner.snapshot, &other.inner.snapshot)
+    }
+
+    /// Whether the prepared snapshot's delta predicate statistics are consistent.
+    pub fn delta_predicates_consistent(&self) -> bool {
+        self.inner.snapshot.delta.predicates_consistent()
+    }
+
+    /// Visit each quad visible under both this view's triple mask and graph read policy.
+    pub fn for_each_visible_quad(
+        &self,
+        mut f: impl FnMut([crate::id::Id; 4]) -> Result<()>,
+    ) -> Result<()> {
+        let snap = &self.inner.snapshot;
+        let access = &self.inner.access;
+        snap.for_each_quad(|q| {
+            if access.readable_id(snap, q[3]) {
+                f(*q)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -2295,5 +3020,81 @@ mod tests {
         expected.sort_unstable();
         sort_by(&mut values, &preparation, |a, b| Ok(a.cmp(b))).unwrap();
         assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn child_with_control_enforces_parent_limit_after_expiry_and_bounds_concurrent_children() {
+        let pool = crate::sparql::pool::QueryPool::new(16 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let root_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Build and charge the root BEFORE expiring its deadline so a slow runner
+        // cannot hit `Error::Timeout` during setup.
+        let mut root = Preparation::with_grant(
+            Control::with_cancel(root_cancel.clone()),
+            8192,
+            grant.clone(),
+        )
+        .unwrap();
+        // Simulate 5000 bytes retained on the root preparation.
+        root.reserve_bytes(5000).unwrap();
+        let past_deadline = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        root.inner
+            .get_mut()
+            .expect("unique root before creating Reservation")
+            .control
+            .deadline = Some(past_deadline);
+        let retained = Reservation {
+            preparation: root.clone(),
+            bytes: 5000,
+        };
+        let baseline_used = root.inner.used.load(Ordering::Relaxed);
+        let baseline_grant = grant.used();
+
+        assert!(
+            matches!(root.check(), Err(Error::Timeout)),
+            "root preparation deadline must be expired before child_with_control"
+        );
+        root_cancel.store(true, Ordering::SeqCst);
+
+        // Construct a child with a fresh live deadline and cancel flag.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut fresh = Control::with_cancel(cancel.clone());
+        fresh.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
+        let child1 = root.child_with_control(fresh).unwrap();
+        assert!(child1.check().is_ok());
+        // Child1 cannot exceed the root's remaining headroom (8192 - used).
+        let err = child1.reserve(4000).err().expect("expected budget error");
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Memory,
+                ..
+            })
+        ));
+        // Reserve 1000 bytes in child1; a second concurrent child shares the same remaining cap.
+        let r1 = child1.reserve(1000).unwrap();
+        let child2 = root.child_with_control(Control::none()).unwrap();
+        let err2 = child2.reserve(2000).err().expect("expected budget error");
+        assert!(matches!(
+            err2,
+            Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Memory,
+                ..
+            })
+        ));
+        // Cancelling child1's control stops child1 without affecting child2.
+        cancel.store(true, Ordering::SeqCst);
+        assert!(matches!(child1.check(), Err(Error::Cancelled)));
+        assert!(child2.check().is_ok());
+
+        drop((r1, child1, child2));
+        assert_eq!(root.inner.used.load(Ordering::Relaxed), baseline_used);
+        assert_eq!(grant.used(), baseline_grant);
+        drop((retained, root));
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
     }
 }

@@ -1,0 +1,1 @@
+{"head":{"vars":["s","élan","y"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:ex:s1"},"élan":{"type":"bnode","value":"b0"},"y":{"type":"uri","value":"urn:ex:s1"}},{"s":{"type":"uri","value":"urn:ex:s1"},"élan":{"type":"uri","value":"urn:ex:o"},"y":{"type":"literal","value":"after\no"}}]}}

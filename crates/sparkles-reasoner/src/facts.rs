@@ -39,6 +39,55 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// object before a probe of the base tier.
 const FEW_OBJECTS: u64 = 4096;
 
+/// Raw store rows inspected between metered scan callbacks.
+const METER_BATCH: u64 = 1024;
+
+trait RawMeter {
+    const ENABLED: bool;
+    fn tick(&mut self) -> anyhow::Result<()>;
+    fn flush(&mut self) -> anyhow::Result<()>;
+}
+
+struct NoMeter;
+
+impl RawMeter for NoMeter {
+    const ENABLED: bool = false;
+    #[inline(always)]
+    fn tick(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    #[inline(always)]
+    fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct BatchMeter<'a> {
+    pending: u64,
+    cb: &'a mut dyn FnMut(u64) -> anyhow::Result<()>,
+}
+
+impl RawMeter for BatchMeter<'_> {
+    const ENABLED: bool = true;
+    #[inline]
+    fn tick(&mut self) -> anyhow::Result<()> {
+        self.pending += 1;
+        if self.pending >= METER_BATCH {
+            let n = std::mem::take(&mut self.pending);
+            (self.cb)(n)?;
+        }
+        Ok(())
+    }
+    #[inline]
+    fn flush(&mut self) -> anyhow::Result<()> {
+        if self.pending > 0 {
+            let n = std::mem::take(&mut self.pending);
+            (self.cb)(n)?;
+        }
+        Ok(())
+    }
+}
+
 /// What [`Base::classify`] learned: by predicate, whether the store has it and has few
 /// distinct objects for it.
 #[derive(Default)]
@@ -340,7 +389,7 @@ impl Base {
 
     /// The passes of an ordered scan: one per input graph.
     #[inline]
-    fn passes(&self) -> usize {
+    pub(crate) fn passes(&self) -> usize {
         self.graphs.len().max(1)
     }
 
@@ -399,6 +448,22 @@ impl Base {
         r
     }
 
+    /// [`for_each`](Self::for_each), metering every raw store row inspected before
+    /// input-graph filtering, bound checks, and multi-graph deduplication.
+    pub(crate) fn for_each_metered(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        meter: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+        f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        let mut memo = Memo::default();
+        let r = self.for_each_with_metered(&mut memo, s, p, o, meter, f);
+        self.add_scans(memo.scans);
+        r
+    }
+
     /// [`for_each`](Self::for_each), reading blocks through `memo`.
     pub fn for_each_with(
         &self,
@@ -406,6 +471,36 @@ impl Base {
         s: Option<u64>,
         p: Option<u64>,
         o: Option<u64>,
+        f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        self.for_each_with_impl(memo, s, p, o, &mut NoMeter, f)
+    }
+
+    /// [`for_each_with`](Self::for_each_with), metering every raw store row inspected
+    /// before input-graph filtering, bound checks, and multi-graph deduplication.
+    pub(crate) fn for_each_with_metered(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        meter: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+        f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        let mut batch = BatchMeter {
+            pending: 0,
+            cb: meter,
+        };
+        self.for_each_with_impl(memo, s, p, o, &mut batch, f)
+    }
+
+    fn for_each_with_impl<M: RawMeter>(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        meter: &mut M,
         f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
         let mut f = f;
@@ -423,13 +518,22 @@ impl Base {
             // count does not depend on what is remembered: exactly with one input graph,
             // and as one scan when the reader stops early with several
             for t in kept {
+                if M::ENABLED {
+                    meter.tick()?;
+                }
                 if !f(*t) {
                     memo.scans += 1;
+                    if M::ENABLED {
+                        meter.flush()?;
+                    }
                     return Ok(false);
                 }
             }
             if complete {
                 memo.scans += self.passes() as u64;
+                if M::ENABLED {
+                    meter.flush()?;
+                }
                 return Ok(true);
             }
             let skip = kept.len();
@@ -441,7 +545,7 @@ impl Base {
             }
             let mut seen = 0;
             let mut many = !keep;
-            let done = self.scan_all(memo, s, p, o, |t| {
+            let done = self.scan_all_impl(memo, s, p, o, meter, |t| {
                 seen += 1;
                 if seen <= skip {
                     return true;
@@ -455,12 +559,19 @@ impl Base {
                 }
                 f(t)
             })?;
+            if M::ENABLED {
+                meter.flush()?;
+            }
             if keep {
                 l.put(k, &few, done && !many);
             }
             return Ok(done);
         }
-        self.scan_all(memo, s, p, o, f)
+        let done = self.scan_all_impl(memo, s, p, o, meter, f)?;
+        if M::ENABLED {
+            meter.flush()?;
+        }
+        Ok(done)
     }
 
     /// Every pass of a pattern's scan, in order.
@@ -470,11 +581,33 @@ impl Base {
         s: Option<u64>,
         p: Option<u64>,
         o: Option<u64>,
+        f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        self.scan_all_impl(memo, s, p, o, &mut NoMeter, f)
+    }
+
+    fn scan_all_impl<M: RawMeter>(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        meter: &mut M,
         mut f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
         let (perm, lo, hi) = self.access(s, p, o);
         for pass in 0..self.passes() {
-            if !self.scan(memo, perm, lo, hi, [s, p, o], Some(pass), None, &mut f)? {
+            if !self.scan_impl(
+                memo,
+                perm,
+                lo,
+                hi,
+                [s, p, o],
+                Some(pass),
+                None,
+                meter,
+                &mut f,
+            )? {
                 return Ok(false);
             }
         }
@@ -539,6 +672,22 @@ impl Base {
         bound: [Option<u64>; 3],
         pass: Option<usize>,
         allow: Option<u64>,
+        f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        self.scan_impl(memo, perm, lo, hi, bound, pass, allow, &mut NoMeter, f)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_impl<M: RawMeter>(
+        &self,
+        memo: &mut Memo,
+        perm: Perm,
+        lo: Key,
+        hi: Key,
+        bound: [Option<u64>; 3],
+        pass: Option<usize>,
+        allow: Option<u64>,
+        meter: &mut M,
         mut f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
         memo.scans += 1;
@@ -554,7 +703,16 @@ impl Base {
         // them: its rows are adjacent, so it is emitted once they end
         let mut cur: Option<(Triple, usize)> = None;
         let mut completed = true;
-        let mut row = |k: [u64; 4], f: &mut dyn FnMut(Triple) -> bool| -> bool {
+        let mut meter_err: Option<anyhow::Error> = None;
+        let mut row = |k: [u64; 4], meter: &mut M, f: &mut dyn FnMut(Triple) -> bool| -> bool {
+            if M::ENABLED
+                && let Err(e) = meter.tick()
+            {
+                meter_err = Some(e);
+                completed = false;
+                cur = None;
+                return false;
+            }
             let mut order = 0;
             if check_graph {
                 let g = k[at[3]];
@@ -607,38 +765,87 @@ impl Base {
         };
         let snap = &*self.snap;
         if touched(snap, perm, &lo, &hi) {
-            snap.scan_between(perm, lo, hi, |c| {
-                if entered >= allow {
-                    cut = true;
-                    return Ok(false);
+            if M::ENABLED {
+                let state = std::cell::RefCell::new((&mut *meter, None::<anyhow::Error>));
+                let check = || -> sparkles_core::Result<()> {
+                    let mut guard = state.borrow_mut();
+                    if guard.1.is_some() {
+                        return Err(sparkles_core::Error::Cancelled);
+                    }
+                    if let Err(e) = guard.0.tick() {
+                        guard.1 = Some(e);
+                        return Err(sparkles_core::Error::Cancelled);
+                    }
+                    Ok(())
+                };
+                let scan_res = snap.scan_between_checked(perm, lo, hi, check, |c| {
+                    if entered >= allow {
+                        cut = true;
+                        return Ok(false);
+                    }
+                    let mut guard = state.borrow_mut();
+                    let m = &mut *guard.0;
+                    Ok(match c {
+                        Chunk::Block(b, s, e) => {
+                            entered += (e - s) as u64;
+                            let cols = &b.cols;
+                            (s..e).all(|i| {
+                                row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], m, &mut f)
+                            })
+                        }
+                        Chunk::Row(k) => {
+                            entered += 1;
+                            row(k, m, &mut f)
+                        }
+                    })
+                });
+                let (_, merge_err) = state.into_inner();
+                if let Some(e) = merge_err.or_else(|| meter_err.take()) {
+                    return Err(e);
                 }
-                Ok(match c {
-                    Chunk::Block(b, s, e) => {
-                        entered += (e - s) as u64;
-                        let cols = &b.cols;
-                        (s..e)
-                            .all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], &mut f))
+                scan_res?;
+            } else {
+                snap.scan_between(perm, lo, hi, |c| {
+                    if entered >= allow {
+                        cut = true;
+                        return Ok(false);
                     }
-                    Chunk::Row(k) => {
-                        entered += 1;
-                        row(k, &mut f)
-                    }
-                })
-            })?;
+                    Ok(match c {
+                        Chunk::Block(b, s, e) => {
+                            entered += (e - s) as u64;
+                            let cols = &b.cols;
+                            (s..e).all(|i| {
+                                row(
+                                    [cols[0][i], cols[1][i], cols[2][i], cols[3][i]],
+                                    meter,
+                                    &mut f,
+                                )
+                            })
+                        }
+                        Chunk::Row(k) => {
+                            entered += 1;
+                            row(k, meter, &mut f)
+                        }
+                    })
+                })?;
+            }
         } else {
             let idx = snap.perm(perm);
             let (b0, b1) = idx.key_block_range(&lo, &hi);
-            let mut rows_of =
-                |blk: &Block, whole: bool, entered: &mut u64, f: &mut dyn FnMut(Triple) -> bool| {
-                    let (s, e) = if whole {
-                        (0, blk.len())
-                    } else {
-                        blk.key_range(&lo, &hi)
-                    };
-                    *entered += (e - s) as u64;
-                    let cols = &blk.cols;
-                    (s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], f))
+            let mut rows_of = |blk: &Block,
+                               whole: bool,
+                               entered: &mut u64,
+                               meter: &mut M,
+                               f: &mut dyn FnMut(Triple) -> bool| {
+                let (s, e) = if whole {
+                    (0, blk.len())
+                } else {
+                    blk.key_range(&lo, &hi)
                 };
+                *entered += (e - s) as u64;
+                let cols = &blk.cols;
+                (s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], meter, f))
+            };
             'blocks: for b in b0..b1 {
                 if entered >= allow {
                     cut = true;
@@ -647,14 +854,14 @@ impl Base {
                 let m = &idx.blocks[b];
                 let whole = m.first >= lo && m.last <= hi;
                 if whole {
-                    if !rows_of(memo.block(snap, idx, b)?, true, &mut entered, &mut f) {
+                    if !rows_of(memo.block(snap, idx, b)?, true, &mut entered, meter, &mut f) {
                         break;
                     }
                     continue;
                 }
                 match memo.rows(snap, idx, b, &lo, &hi)? {
                     Rows::Whole(blk) => {
-                        if !rows_of(blk, false, &mut entered, &mut f) {
+                        if !rows_of(blk, false, &mut entered, meter, &mut f) {
                             break;
                         }
                     }
@@ -665,7 +872,7 @@ impl Base {
                                 break 'blocks;
                             }
                             let blk = memo.segment(snap, idx, b, s)?;
-                            if !rows_of(blk, false, &mut entered, &mut f) {
+                            if !rows_of(blk, false, &mut entered, meter, &mut f) {
                                 break 'blocks;
                             }
                         }
@@ -676,6 +883,9 @@ impl Base {
         #[cfg(test)]
         {
             memo.rows += entered;
+        }
+        if let Some(e) = meter_err {
+            return Err(e);
         }
         Ok(!cut && completed && last(cur, &mut f))
     }
@@ -852,7 +1062,9 @@ impl Base {
             return self.probe(memo, t);
         };
         let k = *t;
-        if let Some((any, _)) = l.peek(&k) {
+        if let Some((any, complete)) = l.peek(&k)
+            && (complete || any)
+        {
             return Ok(any);
         }
         let found = self.probe(memo, t)?;

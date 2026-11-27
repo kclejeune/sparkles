@@ -32,7 +32,7 @@ mod changes;
 mod commit_graph;
 mod conditional;
 mod cursor;
-mod describe;
+pub(crate) mod describe;
 mod diff;
 mod dry_run;
 mod entailments;
@@ -88,6 +88,8 @@ mod ontology {
     pub(super) use self::summary as imports_fetch;
     pub(super) use self::summary as imports_get;
     pub(super) use self::summary as imports_patch;
+    pub(super) use self::summary as patterns_apply;
+    pub(super) use self::summary as patterns_preview;
 
     pub(super) async fn axioms() -> ApiResult {
         not_built()
@@ -235,6 +237,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/$/ontology/{ds}/imports/fetch",
             post(ontology::imports_fetch),
+        )
+        .route(
+            "/$/ontology/{ds}/patterns/preview",
+            post(ontology::patterns_preview),
+        )
+        .route(
+            "/$/ontology/{ds}/patterns/apply",
+            post(ontology::patterns_apply),
         )
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
@@ -438,6 +448,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::assist::routes());
     let app = app.merge(crate::settings::http::routes());
     let app = app.merge(crate::resources::http::routes());
+    let app = app.merge(crate::linked_data::http::routes());
     // outbound notifications: status and test sends (C21)
     let app = app.merge(crate::notify::http::routes());
     let app = app.merge(crate::watches::http::routes());
@@ -970,6 +981,8 @@ impl From<Error> for ApiError {
             {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
+            // a strict classification whose answer would not be complete
+            Error::Component(c) if c.component == "classifier" => StatusCode::UNPROCESSABLE_ENTITY,
             // a write handler answers a dry run with its preview before errors are mapped
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -996,6 +1009,9 @@ impl From<Error> for ApiError {
                 "requested": b.requested,
             }),
             Error::Component(c) if c.component == "reasoner" => {
+                json!({ "error": msg, "code": c.code })
+            }
+            Error::Component(c) if c.component == "classifier" => {
                 json!({ "error": msg, "code": c.code })
             }
             #[cfg(feature = "ontology")]
@@ -1142,8 +1158,8 @@ pub(crate) async fn blocking<T: Send + 'static>(
 
 // ------------------------------------------------------------------ params ------
 
-#[derive(Default, Debug)]
-pub(crate) struct Params(Vec<(String, String)>);
+#[derive(Clone, Default, Debug)]
+pub(crate) struct Params(pub(crate) Vec<(String, String)>);
 
 impl Params {
     /// No parameters, for a route whose options come from the server alone.
@@ -1161,7 +1177,7 @@ impl Params {
     fn extend_form(&mut self, body: &[u8]) {
         self.0.extend(form_urlencoded::parse(body).into_owned());
     }
-    fn get(&self, k: &str) -> Option<&str> {
+    pub(crate) fn get(&self, k: &str) -> Option<&str> {
         self.0.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str())
     }
     fn has(&self, k: &str) -> bool {
@@ -1290,6 +1306,13 @@ enum OutFormat {
 }
 
 impl OutFormat {
+    fn format(self) -> results::Format {
+        match self {
+            OutFormat::Rdf(f) => results::Format::Rdf(f),
+            OutFormat::Jena(j) => results::Format::Jena(j),
+        }
+    }
+
     fn file_extension(self) -> &'static str {
         match self {
             OutFormat::Rdf(f) => f.file_extension(),
@@ -1498,6 +1521,15 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
     caller::request_options(st, ds, params)
 }
 
+#[cfg(test)]
+pub(super) fn query_options_for_test(st: &AppState, ds: &Dataset) -> (QueryOptions, CancelOnDrop) {
+    let params = Params(Vec::new());
+    let mut options = query_options(st, ds, &params);
+    let (cancel, guard) = cancel_on_drop();
+    options.cancel = Some(cancel);
+    (options, guard)
+}
+
 /// The reasoning mode a request's `reasoning` parameter names. An unknown value reads
 /// the dataset's materialized inferences, `false` reads the asserted data alone, and an
 /// absent value is the dataset's query-time default (spec F17 §2.2), which is
@@ -1574,12 +1606,12 @@ pub(crate) fn demand_view(
     profile: Option<&str>,
     max_derived: Option<usize>,
 ) -> ApiResult<Option<sparkles::reasoning::InferenceView>> {
-    use sparkles::reasoning::ReasoningMode;
     if mode.demand().is_none() {
         return Ok(None);
     }
     #[cfg(feature = "reasoning")]
     {
+        use sparkles::reasoning::ReasoningMode;
         let profile = match profile {
             None => None,
             Some(p) => Some(p.parse::<sparkles_reasoner::Profile>().map_err(|e| {
@@ -1883,13 +1915,11 @@ pub(crate) async fn run_query(
     // otherwise name for nobody (item 180).
     opts.no_plan_patterns = sfmt != SolutionsFormat::Sparkles && !params_wants_sparkles(&headers);
     // Automatic execution decides once the query is planned, and a plan it keeps eager
-    // continues below exactly as an eager request does. The policy runs some requests
-    // eagerly without asking, since SPARQL Results Thrift has no cursor writer and
-    // initial bindings rule out every automatic plan.
+    // continues below exactly as an eager request does. The policy runs a request with
+    // initial bindings eagerly without asking, since they rule out every automatic plan.
     let execution = sparkles::sparql::choose_execution(&sparkles::sparql::Consumer {
         requested,
         default: st.default_execution,
-        cursor_format: !thrift,
         initial_bindings: !bindings.is_empty(),
         ..Default::default()
     })
@@ -1987,46 +2017,65 @@ pub(crate) async fn run_query(
     let auto = auto
         && !trial
         && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
-    // the error body of the Sparkles format carries the plan as far as it ran
-    let failed_plan = sfmt == SolutionsFormat::Sparkles;
-    let run = {
-        let ds = ds.clone();
-        let claim = claim.clone();
-        move || {
-            let _claim = claim;
-            let t = std::time::Instant::now();
-            let t0 = crate::otel::start();
-            let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
-            let seq = snap.commit;
-            let automatic = |snap, opts: &sparkles::sparql::QueryOptions| {
-                sparkles::sparql::query_execution_with_plan(
-                    snap,
-                    &query,
-                    opts,
-                    &Default::default(),
-                    sparkles::sparql::ExecutionMode::Auto,
-                )
-                .map(|execution| match execution {
-                    sparkles::sparql::QueryExecution::Eager(r) => Ran::Eager(r.into_result()),
-                    cursor => Ran::Cursor(Box::new(cursor)),
-                })
-            };
-            let ran = if auto {
-                automatic(snap, &opts)
-            } else if trial {
-                // An eager trial that outgrows its memory budget runs again with automatic
-                // execution, as an eager run that automatic execution chose would, and its
-                // text is not tried eagerly again. The two runs count as one request: they
-                // share one deadline, one count of rows produced and one outbound budget.
-                let shared = one_request(&opts);
-                match sparkles::sparql::query_with_plan(snap.clone(), &query, &shared) {
-                    Err(f) if outgrew_memory(&f.error) => {
-                        QUICK.record_eager_failure(quick_key);
-                        automatic(snap, &shared)
-                    }
-                    ran => ran.map(Ran::Eager),
-                }
-            } else {
+    #[cfg(test)]
+    let force_pool = {
+        let probe = algo::probe::current();
+        probe.completion.is_some() || probe.after_write.is_some()
+    };
+    #[cfg(not(test))]
+    let force_pool = false;
+    let (r, seq, resolved, t0, _began, cancel_guard, prefixes) = if auto || trial {
+        let native_graph = params_wants_sparkles(&headers);
+        let auto_req = cursor::AutoRequest {
+            timeouts: stream_timeouts(&st),
+            query,
+            options: opts,
+            at,
+            params: &params,
+            uri: &uri,
+            guard: _cancel_on_drop,
+            limit,
+            format: sfmt,
+            thrift,
+            rdf_format: rfmt,
+            native_graph,
+            prefixes,
+            io: io.clone(),
+            quick_key,
+            auto,
+            trial,
+            claim: claim.clone(),
+        };
+        let outcome = if in_place && !force_pool {
+            inline::note_in_place(quick_key);
+            cursor::run_in_place(ds.clone(), auto_req).await?
+        } else {
+            cursor::run_auto_pool(ds.clone(), auto_req).await?
+        };
+        match outcome {
+            cursor::AutoOutcome::Responded(resp) => return Ok(resp),
+            cursor::AutoOutcome::Eager {
+                result,
+                seq,
+                resolved,
+                t0,
+                began,
+                guard,
+                prefixes,
+            } => (result, seq, resolved, t0, began, guard, prefixes),
+        }
+    } else {
+        // Eager execution (either explicit `execution=eager` or quick eager shortcut).
+        let failed_plan = sfmt == SolutionsFormat::Sparkles;
+        let run = {
+            let ds = ds.clone();
+            let claim = claim.clone();
+            move || {
+                let _claim = claim;
+                let t = std::time::Instant::now();
+                let t0 = crate::otel::start();
+                let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
+                let seq = snap.commit;
                 let ran = sparkles::sparql::query_with_plan(snap, &query, &opts);
                 if let Err(f) = &ran
                     && outgrew_memory(&f.error)
@@ -2034,69 +2083,39 @@ pub(crate) async fn run_query(
                     // a cursor that keeps to the budget stays the text's mode
                     QUICK.record_eager_failure(quick_key);
                 }
-                ran.map(Ran::Eager)
-            };
-            let r = match ran {
-                Ok(Ran::Cursor(cursor)) => return Ok((Ran::Cursor(cursor), seq, resolved, t0, t)),
-                Ok(Ran::Eager(r)) => r,
-                Err(f) => {
-                    let mut e: ApiError = f.error.into();
-                    if failed_plan && let (Some(plan), Some(body)) = (f.plan, e.1.as_object_mut()) {
-                        // writing the plan and dropping it recurse as deep as the plan
-                        let value = sparkles::sparql::depth::with_stack(plan.depth(), move || {
-                            serde_json::to_value(&plan).unwrap_or_default()
-                        });
-                        body.insert("plan".into(), value);
-                        body.insert("commit".into(), seq.into());
+                let r = match ran {
+                    Ok(r) => r,
+                    Err(f) => {
+                        let mut e: ApiError = f.error.into();
+                        if failed_plan
+                            && let (Some(plan), Some(body)) = (f.plan, e.1.as_object_mut())
+                        {
+                            let value =
+                                sparkles::sparql::depth::with_stack(plan.depth(), move || {
+                                    serde_json::to_value(&plan).unwrap_or_default()
+                                });
+                            body.insert("plan".into(), value);
+                            body.insert("commit".into(), seq.into());
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
-                }
-            };
-            tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
-            Ok((Ran::Eager(r), seq, resolved, t0, t))
+                };
+                tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
+                Ok((r, seq, resolved, t0, t))
+            }
+        };
+        let ran = if in_place {
+            inline::note_in_place(quick_key);
+            inline::run(run).and_then(|r| r)
+        } else {
+            blocking(run).await
+        };
+        if ran.is_err() {
+            // a query that failed (a timeout, say) is not known to be quick any more
+            QUICK.record(quick_key, f64::INFINITY);
         }
-    };
-    let ran = if in_place {
-        inline::note_in_place(quick_key);
-        inline::run(run).and_then(|r| r)
-    } else {
-        blocking(run).await
-    };
-    if ran.is_err() {
-        // a query that failed (a timeout, say) is not known to be quick any more
-        QUICK.record(quick_key, f64::INFINITY);
-    }
-    // `began` is when the run started on its thread, after any hop to the blocking pool,
-    // as the eager path's query and serialization times count
-    let (r, seq, resolved, t0, began) = ran.map_err(|e| with_timeout(e, timeout))?;
-    let r = match r {
-        Ran::Eager(r) => r,
-        Ran::Cursor(cursor) => {
-            return cursor::serve(
-                ds,
-                *cursor,
-                seq,
-                resolved,
-                cursor::Serve {
-                    timeouts: stream_timeouts(&st),
-                    params,
-                    uri,
-                    guard: _cancel_on_drop,
-                    limit,
-                    format: sfmt,
-                    thrift,
-                    rdf_format: rfmt,
-                    native_graph: params_wants_sparkles(&headers),
-                    prefixes,
-                    io,
-                    timeout,
-                    with_extra,
-                    t0,
-                    quick: Some((quick_key, began)),
-                },
-            )
-            .await;
-        }
+        let (r, seq, resolved, t0, began) = ran.map_err(|e| with_timeout(e, timeout))?;
+        (r, seq, resolved, t0, began, _cancel_on_drop, prefixes)
     };
     let algorithmic = r.uses_algorithms();
     let metadata = r.clone();
@@ -2125,6 +2144,11 @@ pub(crate) async fn run_query(
     }
     // SPARQL Results Thrift is written for SELECT; ASK falls back to the negotiated format
     let thrift = thrift && r.kind == QueryKind::Select && !sparkles_doc;
+    let solutions_format = if thrift {
+        results::Format::ResultsThrift
+    } else {
+        results::Format::Solutions(sfmt)
+    };
     let ct: String = if sparkles_doc {
         SolutionsFormat::Sparkles.media_type().into()
     } else if is_graph {
@@ -2159,28 +2183,23 @@ pub(crate) async fn run_query(
     // The retained answer decodes under the query's own cancel flag, so the request's
     // cancel guard must outlive the handler while a streamed body is written. The
     // response body holds it, so a client that leaves still cancels the writer.
-    let cancel_guard = _cancel_on_drop;
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let ts = std::time::Instant::now();
-        let sent = std::cell::Cell::new(0);
-        let written = if thrift {
-            write_thrift_results(&r, w, send, &sent)
-        } else {
-            serialize_result(
-                &r,
-                w,
-                sparkles_doc,
-                is_graph,
-                sfmt,
-                rfmt,
-                send,
-                &prefixes,
-                seq,
-                &dataset_id,
-                io.as_deref(),
-                &sent,
-            )
-        };
+        let sent = results::RowCount::with_ledger(w.get_ref().ledger());
+        let written = serialize_result(
+            &r,
+            w,
+            sparkles_doc,
+            is_graph,
+            solutions_format,
+            rfmt,
+            send,
+            &prefixes,
+            seq,
+            &dataset_id,
+            io.as_deref(),
+            &sent,
+        );
         rows_written.store(sent.get(), std::sync::atomic::Ordering::Relaxed);
         // phase spans once serialization has ended (the request span is current here)
         attempted_ms.set(attempted_ms.get() + ts.elapsed().as_secs_f64() * 1000.0);
@@ -2198,11 +2217,12 @@ pub(crate) async fn run_query(
     let on_stream_end = move |end: stream::StreamEnd| {
         stream_end_log("query", &end);
         let (outcome, budget) = end.outcome();
-        let rows = if end.error.is_some() {
-            Some(sent_rows.load(std::sync::atomic::Ordering::Relaxed))
-        } else {
-            streamed_base.rows
-        };
+        // the same rule as the cursor route's, which a pre-commit failure never reaches
+        // here today, since its error response is logged from its own report
+        let rows = end.reported_rows(
+            Some(sent_rows.load(std::sync::atomic::Ordering::Relaxed)),
+            streamed_base.rows,
+        );
         stream_report.producer_done(RequestReport {
             outcome,
             budget,
@@ -2313,61 +2333,53 @@ pub(crate) fn io_profile(
 static QUICK: std::sync::LazyLock<inline::QuickQueries> =
     std::sync::LazyLock::new(Default::default);
 
-/// Serialize a query result: the Sparkles JSON document, an RDF graph or solutions.
+/// Serialize a query result: the Sparkles JSON document, an RDF graph or solutions in
+/// `solutions`, a SPARQL result format or SPARQL Results Thrift.
 #[allow(clippy::too_many_arguments)]
 fn serialize_result(
     r: &sparkles::sparql::QueryResult,
     w: &mut LimitedWriter<stream::SwitchWriter>,
     sparkles_doc: bool,
     is_graph: bool,
-    sfmt: SolutionsFormat,
+    solutions: results::Format,
     rfmt: OutFormat,
     send: Option<usize>,
     prefixes: &std::collections::BTreeMap<String, String>,
     seq: u64,
     dataset_id: &str,
     io: Option<&sparkles::ioacct::Profile>,
-    sent: &std::cell::Cell<u64>,
+    sent: &results::RowCount,
 ) -> sparkles::Result<()> {
-    if sparkles_doc {
-        results::write_native_json_counted(
-            r,
-            w,
+    let prefix_list: Vec<(String, String)>;
+    let options = if sparkles_doc {
+        results::WriteOptions {
             send,
-            Some(results::NativeJsonMetadata {
+            metadata: Some(results::NativeJsonMetadata {
                 commit: seq,
                 dataset_id,
                 io,
             }),
-            sent,
-        )
+            ..results::WriteOptions::new(
+                results::Format::Solutions(SolutionsFormat::Sparkles),
+                sent,
+            )
+        }
     } else if is_graph {
-        match rfmt {
-            OutFormat::Rdf(f) => results::write_graph_counted(r, f, prefixes, w, sent),
-            OutFormat::Jena(j) => results::write_jena_graph_counted(r, j, w, sent),
+        prefix_list = prefixes
+            .iter()
+            .map(|(p, ns)| (p.clone(), ns.clone()))
+            .collect();
+        results::WriteOptions {
+            prefixes: &prefix_list,
+            ..results::WriteOptions::new(rfmt.format(), sent)
         }
     } else {
-        results::write_solutions_counted(r, sfmt, w, send, sent)
-    }
-}
-
-/// SELECT results in SPARQL Results Thrift, `send` rows at most, counting in `sent` the
-/// rows written whole.
-fn write_thrift_results(
-    r: &sparkles::sparql::QueryResult,
-    w: &mut LimitedWriter<stream::SwitchWriter>,
-    send: Option<usize>,
-    sent: &std::cell::Cell<u64>,
-) -> sparkles::Result<()> {
-    let mut out = jena_formats::ThriftResults::new(w, r.variables())?;
-    let n = send.map_or(r.len(), |s| s.min(r.len()));
-    for i in 0..n {
-        let row = r.row(i)?;
-        out.row(row.values())?;
-        sent.set(sent.get() + 1);
-    }
-    out.finish()?;
-    Ok(())
+        results::WriteOptions {
+            send,
+            ..results::WriteOptions::new(solutions, sent)
+        }
+    };
+    results::write(results::Source::Result(r), options, w).map(drop)
 }
 
 /// Log how a streamed response ended (its bytes are counted in the metrics).
@@ -2628,21 +2640,35 @@ fn write_response(
     wanted: bool,
     restricted: bool,
 ) -> Response {
+    write_response_with_receipt_map(ds, status, body, receipt, None, wanted, restricted)
+}
+
+fn write_response_with_receipt_map(
+    ds: &Dataset,
+    status: StatusCode,
+    body: Option<J>,
+    receipt: &sparkles::commit::Receipt,
+    receipt_override: Option<serde_json::Map<String, J>>,
+    wanted: bool,
+    restricted: bool,
+) -> Response {
     crate::otel::commit(receipt);
     let validation = receipt.validation.clone().filter(|_| !restricted);
     let r = if wanted {
         let mut doc = body.unwrap_or_else(|| json!({}));
-        if let (Some(m), Ok(J::Object(mut rm))) =
-            (doc.as_object_mut(), serde_json::to_value(receipt))
-        {
-            if restricted {
-                rm.remove("validation");
-                if let Some(c) = rm.get_mut("commit") {
-                    redact_commit_json(c);
+        if let Some(m) = doc.as_object_mut() {
+            if let Some(rm) = receipt_override {
+                m.extend(rm);
+            } else if let Ok(J::Object(mut rm)) = serde_json::to_value(receipt) {
+                if restricted {
+                    rm.remove("validation");
+                    if let Some(c) = rm.get_mut("commit") {
+                        redact_commit_json(c);
+                    }
                 }
+                m.insert("dataset".into(), ds.name.clone().into());
+                m.extend(rm);
             }
-            m.insert("dataset".into(), ds.name.clone().into());
-            m.extend(rm);
         }
         let status = if status == StatusCode::NO_CONTENT {
             StatusCode::OK
@@ -3212,6 +3238,21 @@ async fn read_body(body: axum::body::Body, limit: Option<u64>, flag: &str) -> Ap
         buf.extend_from_slice(&chunk);
     }
     Ok(first.unwrap_or_else(|| buf.into()))
+}
+
+/// Read an admin request body capped at the smaller of the route's own `cap` and the
+/// server's `--max-admin-body-mb` limit, enforcing the ceiling on both declared lengths
+/// and streamed chunks before buffering past it.
+pub(crate) async fn read_admin_body_capped(
+    body: axum::body::Body,
+    limits: &crate::state::Limits,
+    cap: u64,
+    what: &str,
+) -> ApiResult<Bytes> {
+    match limits.max_admin_body_bytes {
+        Some(admin) if admin <= cap => read_body(body, Some(admin), "--max-admin-body-mb").await,
+        _ => read_body(body, Some(cap), what).await,
+    }
 }
 
 /// Body extractors with the ceiling of their request class. Only the Graph Store and
@@ -6424,6 +6465,8 @@ mod stream_idle_tests;
 mod text_tests;
 #[cfg(all(test, feature = "shacl"))]
 mod validation_tests;
+#[cfg(test)]
+mod writer_goldens_tests;
 
 #[cfg(test)]
 mod spool_tests {

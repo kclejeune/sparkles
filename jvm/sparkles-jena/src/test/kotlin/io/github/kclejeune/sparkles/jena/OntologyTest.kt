@@ -546,6 +546,11 @@ class OntologyTest {
                 answered++
                 assertEquals(full.getNumber("classes"), r.getNumber("classes"))
                 if (!r.getBoolean("partial")) {
+                    if (r.get("stats").asObject.getBoolean("coverageStopped")) {
+                        assertFalse(r.getBoolean("complete"))
+                        assertEquals("unknown", r.getString("consistency"))
+                        return@use true
+                    }
                     assertTrue(r.getBoolean("complete"))
                     assertEquals(want, r.getString("consistency"))
                     return@use true
@@ -599,6 +604,83 @@ class OntologyTest {
         }
     }
 
+    /** Item 603 phase 7: cancelling a classification mid-run with `partial = true` returns a sound partial answer. */
+    @Test fun the_native_handle_answers_a_classification_in_part_when_cancelled() {
+        val body = cases(300, false)
+        val query = ClassifyQuery(partial = true, threads = 1, limit = 10000)
+        val (full, took) = SparklesDatasets.memory().use { ds ->
+            UpdateAction.parseExecute(body, ds)
+            val start = System.nanoTime()
+            val r = ds.ontology().classify(OntologyRead(), query)
+            r to (System.nanoTime() - start) / 1_000_000.0
+        }
+        assertTrue(full.getBoolean("complete"))
+        var partialCount = 0
+        var answered = 0
+        fun answers(ms: Long): Boolean {
+            return SparklesDatasets.memory().use { ds ->
+                UpdateAction.parseExecute(body, ds)
+                SparklesOperation().use { op ->
+                    val canceller = Thread {
+                        try {
+                            Thread.sleep(ms)
+                            op.cancel()
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    canceller.isDaemon = true
+                    canceller.start()
+                    val r = try {
+                        ds.ontology().classify(OntologyRead(), query, op)
+                    } catch (_: org.apache.jena.query.QueryCancelledException) {
+                        return@use false
+                    } finally {
+                        canceller.interrupt()
+                        canceller.join()
+                    }
+                    answered++
+                    assertEquals(full.getNumber("classes"), r.getNumber("classes"))
+                    if (!r.getBoolean("partial")) {
+                        if (r.get("stats").asObject.getBoolean("coverageStopped")) {
+                            assertFalse(r.getBoolean("complete"))
+                            assertEquals("unknown", r.getString("consistency"))
+                            return@use true
+                        }
+                        assertTrue(r.getBoolean("complete"))
+                        assertEquals("consistent", r.getString("consistency"))
+                        return@use true
+                    }
+                    assertFalse(r.getBoolean("complete"), "a partial answer is presented as complete")
+                    val open = r.get("incomplete").asArray
+                    assertEquals(open.size, r.getNumber("incompleteCount").toInt())
+                    val c = r.getString("consistency")
+                    assertTrue(c == "consistent" || c == "unknown", c)
+                    if (c == "unknown") assertTrue(open.size + 2 >= r.getNumber("classes").toInt())
+                    partialCount++
+                    return@use true
+                }
+            }
+        }
+        fun after(ms: Long) = ms + maxOf(1L, Math.round(0.08 * ms))
+        val limit = maxOf(2000L, (20 * took).toLong())
+        var lo = 0L
+        var ms = 2L
+        while (ms < limit && !answers(ms)) {
+            lo = ms
+            ms = after(ms)
+        }
+        var hi = ms
+        while (hi - lo > 1) {
+            val mid = (lo + hi) / 2
+            if (answers(mid)) hi = mid else lo = mid
+        }
+        while (answered < 20 && ms < limit) {
+            ms = after(ms)
+            answers(ms)
+        }
+        assertTrue(partialCount > 0, "no cancellation gave a partial answer")
+    }
+
     /** Items 608 and 457: Manchester text read against the graph, and a DL query of it. */
     @Test fun the_native_handle_reads_manchester_and_answers_dl_queries() {
         SparklesDatasets.memory().use { ds ->
@@ -623,5 +705,290 @@ class OntologyTest {
             assertEquals(listOf("http://ex.org/Professor"), r.get("subclasses").asArray.map { it.asString.value() })
             assertEquals(listOf("http://ex.org/ann"), r.get("instances").asArray.map { it.asString.value() })
         }
+    }
+
+    @Test fun el_only_classifies_queries_and_caches_separately_from_default() {
+        SparklesDatasets.memory().use { ds ->
+            UpdateAction.parseExecute(
+                """PREFIX : <http://ex.org/>
+                   PREFIX owl: <http://www.w3.org/2002/07/owl#>
+                   PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                   INSERT DATA {
+                     :o a owl:Ontology .
+                     :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class . :BC a owl:Class .
+                     :r a owl:ObjectProperty .
+                     :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] ,
+                                        [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :C ] .
+                     :BC owl:equivalentClass [ a owl:Class ; owl:intersectionOf ( :B :C ) ] .
+                     [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :BC ] rdfs:subClassOf :D .
+                   }""",
+                ds,
+            )
+            val onto = ds.ontology()
+
+            val full = onto.classify(query = ClassifyQuery(about = "http://ex.org/A"))
+            assertFalse(full.getBoolean("reused"))
+            assertEquals("horn", full.getString("tier"))
+            assertTrue(full.getBoolean("complete"))
+            assertFalse(full.get("classificationSource").asObject.get("producer").asObject.getBoolean("elOnly"))
+            assertTrue(full.get("class").asObject.get("superClasses").asArray.map { it.asString.value() }.contains("http://ex.org/D"))
+
+            val elk = onto.classify(query = ClassifyQuery(about = "http://ex.org/A", elOnly = true))
+            assertFalse(elk.getBoolean("reused"))
+            assertEquals("horn", elk.getString("tier"))
+            assertFalse(elk.getBoolean("complete"))
+            assertTrue(elk.getBoolean("completeForTaken"))
+            assertEquals(1L, elk.get("excludedCount").asNumber.value().toLong())
+            assertTrue(elk.get("classificationSource").asObject.get("producer").asObject.getBoolean("elOnly"))
+            assertFalse(elk.get("class").asObject.get("superClasses").asArray.map { it.asString.value() }.contains("http://ex.org/D"))
+
+            val full2 = onto.classify(query = ClassifyQuery(about = "http://ex.org/A"))
+            assertTrue(full2.getBoolean("reused"))
+            assertEquals(full.getString("resultId"), full2.getString("resultId"))
+
+            val elk2 = onto.classify(query = ClassifyQuery(about = "http://ex.org/A", elOnly = true))
+            assertTrue(elk2.getBoolean("reused"))
+            assertEquals(elk.getString("resultId"), elk2.getString("resultId"))
+
+            val keptFull = onto.keptClassification()
+            assertEquals("available", keptFull.getString("status"))
+            assertFalse(keptFull.get("result").asObject.getBoolean("elOnly"))
+            assertEquals(full.getString("resultId"), keptFull.get("result").asObject.getString("resultId"))
+
+            val keptElk = onto.keptClassification(query = KeptClassificationQuery(elOnly = true))
+            assertEquals("available", keptElk.getString("status"))
+            assertTrue(keptElk.get("result").asObject.getBoolean("elOnly"))
+            assertEquals(elk.getString("resultId"), keptElk.get("result").asObject.getString("resultId"))
+
+            val qHorn = onto.dlQuery(DlQuery("r some (B and C)", reasoning = "el", answers = listOf("subclasses")))
+            assertEquals("el", qHorn.get("reasoning").asObject.getString("engine"))
+            assertFalse(qHorn.get("reasoning").asObject.getBoolean("elOnly"))
+            assertEquals(listOf("http://ex.org/A"), qHorn.get("subclasses").asArray.map { it.asString.value() })
+
+            val qElk = onto.dlQuery(DlQuery("r some (B and C)", answers = listOf("subclasses"), elOnly = true))
+            assertEquals("el", qElk.get("reasoning").asObject.getString("engine"))
+            assertTrue(qElk.get("reasoning").asObject.getBoolean("elOnly"))
+            assertFalse(qElk.get("reasoning").asObject.getBoolean("complete"))
+            assertTrue(qElk.get("subclasses").asArray.isEmpty())
+
+            assertThrows(SparklesInvalidException::class.java) {
+                onto.dlQuery(DlQuery("r some (B and C)", reasoning = "rl", elOnly = true))
+            }
+
+            // Copy preserves elOnly across the legacy copy overload and allows toggling it.
+            val qBase = DlQuery("r some (B and C)", elOnly = true)
+            assertTrue(qBase.copy(limit = 20).elOnly)
+            assertFalse(qBase.copy(limit = 20, elOnly = false).elOnly)
+            val cBase = ClassifyQuery(about = "http://ex.org/A", elOnly = true)
+            assertTrue(cBase.copy(limit = 20).elOnly)
+            assertFalse(cBase.copy(limit = 20, elOnly = false).elOnly)
+            val kBase = KeptClassificationQuery(part = "roots", elOnly = true)
+            assertTrue(kBase.copy(limit = 20).elOnly)
+            assertFalse(kBase.copy(limit = 20, elOnly = false).elOnly)
+        }
+    }
+
+    /**
+     * Regression guard for M1: previously compiled Kotlin callers link against the pre-694
+     * synthetic default-argument constructors and `copy` / `copy$default` descriptors.
+     */
+    @Test fun query_classes_preserve_legacy_kotlin_binary_descriptors() {
+        val marker = Class.forName("kotlin.jvm.internal.DefaultConstructorMarker")
+
+        // DlQuery: 6-arg primary, synthetic default constructor, copy, and copy$default
+        assertNotNull(
+            DlQuery::class.java.getDeclaredConstructor(
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                marker,
+            ),
+        )
+        assertNotNull(
+            DlQuery::class.java.getDeclaredMethod(
+                "copy",
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+            ),
+        )
+        assertNotNull(
+            DlQuery::class.java.getDeclaredMethod(
+                "copy\$default",
+                DlQuery::class.java,
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Any::class.java,
+            ),
+        )
+
+        // ClassifyQuery: 13-arg synthetic default constructor, copy, and copy$default
+        assertNotNull(
+            ClassifyQuery::class.java.getDeclaredConstructor(
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                marker,
+            ),
+        )
+        assertNotNull(
+            ClassifyQuery::class.java.getDeclaredMethod(
+                "copy",
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Boolean::class.javaPrimitiveType,
+            ),
+        )
+        assertNotNull(
+            ClassifyQuery::class.java.getDeclaredMethod(
+                "copy\$default",
+                ClassifyQuery::class.java,
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Boolean::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Any::class.java,
+            ),
+        )
+
+        // KeptClassificationQuery: 6-arg synthetic default constructor, copy, and copy$default
+        assertNotNull(
+            KeptClassificationQuery::class.java.getDeclaredConstructor(
+                String::class.java,
+                String::class.java,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                marker,
+            ),
+        )
+        assertNotNull(
+            KeptClassificationQuery::class.java.getDeclaredMethod(
+                "copy",
+                String::class.java,
+                String::class.java,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                List::class.java,
+            ),
+        )
+        assertNotNull(
+            KeptClassificationQuery::class.java.getDeclaredMethod(
+                "copy\$default",
+                KeptClassificationQuery::class.java,
+                String::class.java,
+                String::class.java,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                Any::class.java,
+            ),
+        )
+
+        // Pre-694 Java constructor overloads remain public and non-synthetic.
+        assertFalse(DlQuery::class.java.getDeclaredConstructor(String::class.java).isSynthetic)
+        assertFalse(
+            DlQuery::class.java.getDeclaredConstructor(
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                List::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+            ).isSynthetic,
+        )
+        assertFalse(ClassifyQuery::class.java.getDeclaredConstructor().isSynthetic)
+        assertFalse(KeptClassificationQuery::class.java.getDeclaredConstructor().isSynthetic)
+    }
+
+    /**
+     * Regression guard for round-2 P2: untyped and adapted Kotlin callable references to
+     * constructors and `copy` resolve unambiguously with no overload conflict.
+     */
+    @Test fun query_classes_preserve_unambiguous_kotlin_callable_references() {
+        val makeDl = ::DlQuery
+        val copyDl = DlQuery("http://ex.org/A")::copy
+        val makeDl1: (String) -> DlQuery = ::DlQuery
+        val makeDl6: (String, String, String, List<String>, Int, Int) -> DlQuery = ::DlQuery
+        val makeDl7: (String, String, String, List<String>, Int, Int, Boolean) -> DlQuery = ::DlQuery
+        val copyDl1: (String) -> DlQuery = DlQuery("http://ex.org/A", elOnly = true)::copy
+        val copyDl6: (String, String, String, List<String>, Int, Int) -> DlQuery =
+            DlQuery("http://ex.org/A", elOnly = true)::copy
+        val copyDl7: (String, String, String, List<String>, Int, Int, Boolean) -> DlQuery =
+            DlQuery("http://ex.org/A", elOnly = true)::copy
+        assertNotNull(makeDl)
+        assertNotNull(copyDl)
+        assertFalse(makeDl1("http://ex.org/A").elOnly)
+        assertFalse(makeDl6("http://ex.org/A", "manchester", "auto", emptyList(), 1000, 0).elOnly)
+        assertTrue(makeDl7("http://ex.org/A", "manchester", "auto", emptyList(), 1000, 0, true).elOnly)
+        assertTrue(copyDl1("http://ex.org/B").elOnly)
+        assertTrue(copyDl6("http://ex.org/B", "manchester", "auto", emptyList(), 1000, 0).elOnly)
+        assertFalse(copyDl7("http://ex.org/B", "manchester", "auto", emptyList(), 1000, 0, false).elOnly)
+
+        val makeClassify = ::ClassifyQuery
+        val copyClassify = ClassifyQuery()::copy
+        val makeClassify0: () -> ClassifyQuery = ::ClassifyQuery
+        val copyClassify0: () -> ClassifyQuery = ClassifyQuery(elOnly = true)::copy
+        assertNotNull(makeClassify)
+        assertNotNull(copyClassify)
+        assertFalse(makeClassify0().elOnly)
+        assertTrue(copyClassify0().elOnly)
+
+        val makeKept = ::KeptClassificationQuery
+        val copyKept = KeptClassificationQuery()::copy
+        val makeKept0: () -> KeptClassificationQuery = ::KeptClassificationQuery
+        val copyKept0: () -> KeptClassificationQuery = KeptClassificationQuery(elOnly = true)::copy
+        assertNotNull(makeKept)
+        assertNotNull(copyKept)
+        assertFalse(makeKept0().elOnly)
+        assertTrue(copyKept0().elOnly)
     }
 }

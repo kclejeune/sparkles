@@ -1009,7 +1009,7 @@ export interface paths {
         put?: never;
         /**
          * Stop protecting an evidence graph
-         * @description Needs `admin` on the dataset. Ordinary writes can change the graph until the settings are recorded again.
+         * @description Needs `admin` on the dataset. Ordinary writes can change the graph until the settings are recorded again. Refused with `409 locked-by-config` when `serve --settings` locks evidence enabled and locks a role or policy requiring the graph.
          */
         post: operations["detachEvidenceGraph"];
         delete?: never;
@@ -1062,6 +1062,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/evidence/{ds}/identities/rebuild": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rebuild a resolution map
+         * @description Needs unrestricted `admin` on the dataset or branch. Recomputes the clusters of the matching policy's current authenticated accepted decisions in its current protected identity-graph boundary, rewrites its output graph atomically and records the new protections and boundary in a fresh `ev:ResolutionMap` revision, restoring reviews and reads that answered `503 projection-unavailable`. Refusals write nothing: `400` for a malformed request or unknown matching policy, `403` for a read-only server or missing unrestricted admin grant, `409 policy-changed`, `409 head-changed`, `409 identity-conflict`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile`, `409 evidence-settings-drift`, `422 incomplete-evidence` and `503 authority-changed`.
+         */
+        post: operations["rebuildIdentityMap"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/evidence/{ds}/projections/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reconcile a review policy's accepted projection
+         * @description Needs `admin` on the dataset or selected branch, with update grants on the policy's supports and output graphs and unmasked read grants on its decisions, supports and output graphs and on every configured proposal graph. Rebuilds the review policy's output graph strictly from the live acceptance supports that authenticate under the current protections, or empties it when none vouch, and records the new protection nonces in a fresh `ev:Projection` record that supersedes prior unsuperseded projection records of the policy, or reuses the active projection record when the protections and output are already valid. Restores normal reviews, withdrawals and policy reads after a detach and new protection of the policy's decisions, supports or output graph. Refusals write nothing: `400` for a malformed request, unknown policy or matching policy, `403` for a read-only server or missing or masked grants, `409 evidence-settings-drift`, `409 policy-changed`, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile` when the profile is disabled or a policy graph is still detached, `422 incomplete-evidence`, `503` for `managed-unavailable`, `projection-unavailable` when the supports, output or conflict mode changed without raising the policy version, `authority-changed`, or temporary query memory pool exhaustion (with `Retry-After`), and `507` when the request exceeds the configured query memory pool.
+         */
+        post: operations["reconcileEvidenceProjection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/evidence/{ds}/reauthenticate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-authenticate evidence records under a graph's current protection
+         * @description Needs `admin` on the dataset and target branch, and requires activated configuration history (`409 configuration-history-inactive` otherwise). Verifies records written under an earlier protection nonce in a protected evidence record graph against their retained, configuration-bound publication views, recorded digests, retained content, passage spans and receipt lineage, and atomically marks the verified records and their receipt operations under the graph's current protection nonce together with an audit operation. Refuses tampered, unretained or mismatched records without writing (`409 immutable-record-conflict`, `409 target-changed`, `422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable`, `422 incomplete-evidence`). Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ, `409 head-changed` for a stale `ifHead`, `409 idempotency-conflict` for a reused key with another payload, `409 unsupported-profile` while the graph is detached or the profile is disabled, and `503 authority-changed` when authorization changes before publication.
+         */
+        post: operations["reauthenticateEvidence"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/evidence/{ds}/settings": {
         parameters: {
             query?: never;
@@ -1076,7 +1136,7 @@ export interface paths {
         get: operations["getEvidenceSettings"];
         /**
          * Set the evidence settings
-         * @description Needs `admin` on the dataset. Records complete settings and protects every graph of their roles. A configuration that would stop protecting a graph, or that races with another change, is a `409` that writes nothing.
+         * @description Needs `admin` on the dataset. Records complete settings and protects every graph of their roles. A configuration that would stop protecting a graph, change a field locked by `serve --settings` (`locked-by-config`), or race with another change is a `409` that writes nothing.
          */
         put: operations["putEvidenceSettings"];
         post?: never;
@@ -1860,6 +1920,106 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ld": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Resolve a hosted IRI with content negotiation
+         * @description Resolves an IRI under a hosted vocabulary namespace or configured version IRI. Slash IRIs answer `303 See Other` with `Vary: Accept` to `/$/ld/doc`; hash IRIs answer `200 OK` directly. Shows only data the caller is permitted to read.
+         */
+        get: operations["resolveLinkedData"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ld/doc": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the document representation of a hosted IRI
+         * @description Returns the negotiated HTML or bounded `DESCRIBE` RDF representation of a hosted IRI directly with `200 OK` and `Vary: Accept`. Shows only data the caller is permitted to read.
+         */
+        get: operations["getLinkedDataDocument"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ld/ns/{prefix}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Resolve a hosted namespace root by prefix
+         * @description Resolves the namespace IRI owned by `prefix`. Hash namespaces answer `200 OK` directly; slash namespaces answer `303 See Other` with `Vary: Accept`.
+         */
+        get: operations["resolveHostedNamespace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ld/ns/{prefix}/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Resolve a hosted namespace root by prefix with a trailing slash
+         * @description Resolves the namespace IRI owned by `prefix`, matching PURL partial redirects with an empty suffix. Hash namespaces answer `200 OK` directly; slash namespaces answer `303 See Other` with `Vary: Accept`.
+         */
+        get: operations["resolveHostedNamespaceSlash"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ld/ns/{prefix}/{local}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Resolve a term under a hosted namespace prefix
+         * @description Resolves `<namespace_iri><local>` for the hosted namespace owned by `prefix`. Slash IRIs answer `303 See Other` with `Vary: Accept`; hash IRIs answer `200 OK` directly.
+         */
+        get: operations["resolveHostedTerm"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/lint": {
         parameters: {
             query?: never;
@@ -2404,7 +2564,7 @@ export interface paths {
         put?: never;
         /**
          * Classify an ontology and optionally project a bounded class frame
-         * @description Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. The answer's `complete` is false for such a partial answer, `partial` is true, `incomplete` lists the classes whose superclasses it may miss and `consistency` is `consistent`, `inconsistent` or `unknown`. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.
+         * @description Classifies the ontology's terminology using the OWL 2 EL, Horn or disjunctive rules that the axioms need, and answers whether it is consistent, the unsatisfiable classes, the axioms that the classification left out or used only in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses, its equivalent classes and whether it is in the incomplete set, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. With `projection` set to `frame`, `about` returns bounded direct parents, equivalents, source samples and exclusion samples instead of the full taxonomy payload. The dataset keeps the last eligible classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what the active EL, Horn or disjunctive run proved after saturation began. `complete` is false when the run stopped early, left axioms out or used them only in part, left assertions unread or saw unmapped triples, and `incomplete` lists the classes whose superclasses may be missed while `consistency` is `consistent`, `inconsistent` or `unknown`. A finished run has `partial` false and `completeForTaken` true, and still leaves affected classes in `incomplete` when excluded axioms, unread assertions or unmapped triples could affect them. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.
          */
         post: operations["classifyOntology"];
         delete?: never;
@@ -2615,6 +2775,46 @@ export interface paths {
          * @description Reads `text` in OWL 2 Manchester syntax as `as` (`classExpression` by default, or `dataRange`, `individual`, `literal` or `axiom`) and answers its JSON form, its functional-style text and its Manchester rendering. Names are full IRIs in angle brackets, prefixed names with the dataset's prefixes, local names, and labels in single quotes when they hold a space. They resolve against the entities and the `rdfs:label` and `skos:prefLabel` values of the ontology. Text that does not read is `400` with `code` `invalid-manchester`, `reason` (`syntax`, `unknown`, `ambiguous` or `kind`), the span `start` and `end` in UTF-16 code units, and for an ambiguous name the `candidates` with their IRIs, kinds and labels.
          */
         post: operations["parseManchester"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/patterns/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate and commit axioms from a table
+         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target and dataset prefix binding digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: "abort"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: "skip"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.
+         */
+        post: operations["applyOntologyPatterns"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/patterns/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview axioms generated from a table
+         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the pattern preview entity tag (encoding the head commit, import-target digest, and dataset prefix binding digest) and commit headers for `If-Match` on apply.
+         */
+        post: operations["previewOntologyPatterns"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3338,6 +3538,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/resources/{id}/recipes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export PURL or w3id redirection recipes
+         * @description Generates Apache `.htaccess` rules (for `w3id.org` or a self-hosted domain) or PURL redirection recipes for a vocabulary resource's hosted namespaces and version IRIs. Representation negotiation is delegated to Sparkles. Returns `text/plain` by default or JSON on `Accept: application/json` or `format=json`. Needs server `admin`.
+         */
+        get: operations["getVocabularyRecipes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/resources/{id}/versions": {
         parameters: {
             query?: never;
@@ -3685,7 +3905,7 @@ export interface paths {
         };
         /**
          * Get every settings kind
-         * @description Each kind's effective object with its layers, sources and locks.
+         * @description Each kind's effective object with its layers, sources and locks. The `evidence` kind is included only for callers with `admin` on the dataset.
          */
         get: operations["getDatasetSettings"];
         put?: never;
@@ -3705,7 +3925,7 @@ export interface paths {
         };
         /**
          * Get a settings kind
-         * @description The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer.
+         * @description The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer. The `evidence` kind needs `admin` on the dataset and includes `recorded`.
          */
         get: operations["getSettings"];
         /**
@@ -4478,7 +4698,7 @@ export interface paths {
         put?: never;
         /**
          * Propose claims with their evidence
-         * @description Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed` and writes nothing. Refusals write nothing: `400` for a malformed or inconsistent batch, naming its field, `403` for a written graph the caller may not update, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict` for a record identity that holds other content or no authenticated record, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, and `503 authority-changed` when the caller's credential was revoked or the access policy changed before publication.
+         * @description Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A foreign stored fact requires `admin` on every branch and graph of the dataset that serves it. The proposal acquires one hold per referenced dataset before publication. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed`. A replay found before reference resolution writes nothing. Competing proposals may acquire holds before one finds the receipt at the writer check. A refusal before publication writes no proposal records. A publication storage failure may leave a receipt that recovers when the origin reopens. The proposal answers `400` for a malformed or inconsistent batch, naming its field, `403` for insufficient update grants or foreign-source admin, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 hold-conflict`, `409 holds-limit`, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, `503 holds-unavailable` when a durable hold cannot be confirmed, and `503 authority-changed` when the caller's credential or access policy changed before publication. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
          */
         post: operations["proposeClaims"];
         delete?: never;
@@ -4497,8 +4717,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Find the assessments that depend on changed records
-         * @description Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read.
+         * Find the assessments and reports that depend on changed records
+         * @description Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and the community reports in guarded reports graphs proven for the caller whose activity recorded `prov:used` for one of them (including person-edited reports via `gr:editOf`), and with `transitive` the assessments and reports that depend on those, each once at its smallest depth. A graph the caller cannot read or cannot prove under the disclosure guard is not searched, and a record any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
          */
         post: operations["listEvidenceDependents"];
         delete?: never;
@@ -4518,7 +4738,7 @@ export interface paths {
         put?: never;
         /**
          * Resolve entities through a resolution map
-         * @description Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary.
+         * @description Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
          */
         post: operations["resolveIdentities"];
         delete?: never;
@@ -4538,7 +4758,7 @@ export interface paths {
         put?: never;
         /**
          * Verify evidence references
-         * @description Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field.
+         * @description Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
          */
         post: operations["resolveEvidence"];
         delete?: never;
@@ -4558,7 +4778,7 @@ export interface paths {
         put?: never;
         /**
          * Review claims under a policy
-         * @description Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.
+         * @description Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
          */
         post: operations["reviewClaims"];
         delete?: never;
@@ -4578,7 +4798,7 @@ export interface paths {
         put?: never;
         /**
          * Withdraw claim occurrences
-         * @description Needs `write` on the dataset or branch through the update endpoint, update grants on each claim's graph, and update and read grants on the output graph and read grants on the decisions and supports graphs of every review policy. Counts as an update. Records a withdrawal with `prov:invalidatedAtTime` in each claim's graph as one commit of the evidence owner, without making a contrary claim. The claims' supports stop being live, and each projected triple left without a live support leaves its output graph. A claim that is already withdrawn is answered as `existing`. Refusals write nothing: `400`, `403`, `409 head-changed`, `409 target-changed`, `409 idempotency-conflict`, `422 evidence-unavailable`, `503 projection-unavailable` and `503 authority-changed`.
+         * @description Needs `write` on the dataset or branch through the update endpoint, update grants on each claim's graph, and update and read grants on the output graph and read grants on the decisions and supports graphs of every review policy. Counts as an update. Records a withdrawal with `prov:invalidatedAtTime` in each claim's graph as one commit of the evidence owner, without making a contrary claim. The claims' supports stop being live, and each projected triple left without a live support leaves its output graph. A claim that is already withdrawn is answered as `existing`. Refusals write nothing: `400`, `403`, `409 head-changed`, `409 target-changed`, `409 idempotency-conflict`, `422 evidence-unavailable`, `503 projection-unavailable` and `503 authority-changed`. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.
          */
         post: operations["withdrawClaims"];
         delete?: never;
@@ -4964,7 +5184,7 @@ export interface paths {
         put?: never;
         /**
          * Recall facts
-         * @description The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact.
+         * @description The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact. A request using a review or matching policy returns `409 evidence-settings-drift` while the evidence settings need reconciliation.
          */
         post: operations["recallFacts"];
         delete?: never;
@@ -5435,7 +5655,7 @@ export interface components {
             drafts?: number;
             /** @description Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`. */
             explore?: boolean;
-            /** @description A matching policy of the dataset's evidence settings, which resolves the linked entities for the claims the summary reads. Not with `mode` `global`. */
+            /** @description A matching policy of the dataset's evidence settings. In local answers, it resolves the linked entities for the claims the summary reads. In global answers, it resolves the entity identities referenced by the selected community reports. */
             matchingPolicy?: string;
             /** @description The rows returned in `result`, 1000 by default. */
             maxRows?: number;
@@ -5449,7 +5669,7 @@ export interface components {
             /** @description At most 2000 characters. */
             question: string;
             reasoning?: boolean;
-            /** @description A review policy of the dataset's evidence settings. The summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. Not with `mode` `global`. */
+            /** @description A review policy of the dataset's evidence settings. In local answers, the summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. In global answers, only community reports built under that policy are selected. */
             reviewPolicy?: string;
             /** @description Hide the agent memory graphs of the dataset from the query, and use only reviewed community reports. */
             reviewedOnly?: boolean;
@@ -5471,7 +5691,7 @@ export interface components {
             attempts?: {
                 [key: string]: unknown;
             }[];
-            /** @description With `reviewPolicy`, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`. */
+            /** @description With `reviewPolicy` in a local answer, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`. */
             claims?: {
                 [key: string]: unknown;
             };
@@ -5484,7 +5704,7 @@ export interface components {
                 code: string;
                 message: string;
             };
-            /** @description In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports and the map `batches`. */
+            /** @description In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports, the map `batches` and, with `reviewPolicy`, the requested `reviewPolicy`. */
             global?: {
                 [key: string]: unknown;
             };
@@ -5509,7 +5729,7 @@ export interface components {
             reports?: {
                 [key: string]: unknown;
             }[];
-            /** @description With `matchingPolicy`, the map revision read, in the `resolution` form of `recall`. */
+            /** @description With `matchingPolicy`, the map revision read (`policy`, `version`, `revision` and `number`), plus `entities` for mapped identities referenced by the returned reports in a global answer. */
             resolution?: {
                 [key: string]: unknown;
             };
@@ -6280,7 +6500,9 @@ export interface components {
         };
         ClassificationExcluded: {
             /** @description An OWL axiom in the public structural JSON form. */
-            axiom: Record<string, never>;
+            axiom: {
+                [key: string]: unknown;
+            };
             gap: {
                 /** @constant */
                 kind: "omitted";
@@ -6316,6 +6538,7 @@ export interface components {
             partial: boolean;
             /** @enum {string} */
             tier: "el" | "horn" | "disjunctive";
+            unmappedCount: number;
         };
         ClassificationParent: {
             equivalenceCount: number;
@@ -6914,7 +7137,7 @@ export interface components {
         DerivedTableCache: {
             capacityBytes: number;
             enabled: boolean;
-            /** @description The retained-table estimate, counting shared chunks per cached table and excluding caller-held evictions. Neither allocator usage nor RSS. */
+            /** @description The calibrated retained-table estimate across cached tables, deduplicated shared chunks, cache keys, hash-table capacity, and allocator metadata, excluding tables kept alive only by callers. Neither allocator usage nor RSS. */
             estimatedBytes: number;
             hits: number;
             misses: number;
@@ -7248,14 +7471,14 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** @description Changed evidence records whose dependent assessments to find. */
+        /** @description Changed evidence records whose dependent assessments and community reports to find. */
         EvidenceDependents: {
             /** @description The record identities that changed, such as a withdrawn claim, an ended support or the revision a new map revision follows. */
             changed: string[];
-            /** @description Also find the assessments that depend on a dependent. Defaults to `false`. */
+            /** @description Also find the assessments and community reports that depend on a dependent. Defaults to `false`. */
             transitive?: boolean;
         };
-        /** @description The assessments that depend on the changed records, each once at its smallest depth. */
+        /** @description The assessments and community reports that depend on the changed records, each once at its smallest depth. */
         EvidenceDependentsResult: {
             /** @description The commit the records were read at. */
             commit: number;
@@ -7264,12 +7487,26 @@ export interface components {
                 assessment: string;
                 /** @enum {string} */
                 dependence: "target" | "used";
-                /** @description How many assessments lie between it and a changed record, 0 for a direct dependent. */
+                /** @description How many intermediate dependents lie between it and a changed record, 0 for a direct dependent. */
                 depth: number;
                 /** @description Its proposal graph. */
                 graph: string;
                 /** @description The changed record it depends on, or for a transitive dependent the assessment it depends on. */
                 on: string;
+            }[];
+            reports: {
+                /** @description The community the report summarizes, `null` when not recorded. */
+                community: string | null;
+                /** @enum {string} */
+                dependence: "used";
+                /** @description How many intermediate dependents lie between it and a changed record, 0 for a direct dependent. */
+                depth: number;
+                /** @description Its guarded reports graph. */
+                graph: string;
+                /** @description The changed record its activity used, or for a transitive dependent the assessment or report it depends on. */
+                on: string;
+                /** @description A community report in a guarded reports graph. */
+                report: string;
             }[];
         };
         /** @description The graph to stop protecting. */
@@ -7296,6 +7533,11 @@ export interface components {
              * @description When the hold was acquired.
              */
             created: string;
+            /**
+             * Format: uuid
+             * @description The dataset whose operation acquired this hold, when it differs from this dataset.
+             */
+            forDatasetId?: string;
             /**
              * Format: uuid
              * @description The hold's identity.
@@ -7344,6 +7586,86 @@ export interface components {
             /** @description The name of a matching policy of the evidence settings. */
             policy: string;
         };
+        /** @description Administered rebuild of a matching policy's resolution map in its current boundary. */
+        EvidenceIdentitiesRebuild: {
+            /** @description Check and preview the rebuild without committing it. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. */
+            idempotencyKey?: string;
+            /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
+            ifHead?: number;
+            /** @description The commit message. */
+            message?: string;
+            /** @description The name of a matching policy of the evidence settings. */
+            policy: string;
+            /** @description Optional expected policy version, else `409 policy-changed`. */
+            policyVersion?: number;
+        };
+        /** @description The outcome of rebuilding a matching policy's resolution map. */
+        EvidenceIdentitiesRebuildResult: {
+            /** @description The protected identity graphs of the policy's boundary recorded on the revision, sorted. */
+            boundary: string[];
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay. */
+            changed: {
+                inserted: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                /** @description A review under a matching policy that changed which accepted decisions its resolution map follows. */
+                map?: {
+                    decisionsAdded: string[];
+                    decisionsEnded: string[];
+                    /** @description The entities whose selected entity changed. */
+                    entities: string[];
+                    number: number;
+                    /** @description The matching policy. */
+                    policy: string;
+                    /** @description The revision it follows, whose consumers may need review. */
+                    previous: string | null;
+                    /** @description The resolution map revision the operation published. */
+                    revision: string;
+                };
+                removed: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                supportsAdded: string[];
+                supportsEnded: string[];
+            };
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The revision number, from 1. */
+            number: number;
+            /** @description The operation, the rebuilt revision's availability receipt. */
+            operation: string;
+            /** @description The matching policy. */
+            policy: string;
+            /** @description The matching policy version recorded on the revision. */
+            policyVersion: number;
+            /** @description The previous authenticated revision it follows, or `null` when none existed or earlier revisions no longer authenticate. */
+            previous: string | null;
+            /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
+            /** @description The resolution map revision published by the rebuild, also for a replay. */
+            revision: string;
+        };
         /** @description What the current resolution map selects for each entity. */
         EvidenceIdentitiesResult: {
             /** @description The commit the map was read at. */
@@ -7364,6 +7686,84 @@ export interface components {
             policy: string;
             /** @description The latest resolution map revision, `null` before the first. */
             revision: string | null;
+        };
+        /** @description Reconcile a review policy's accepted projection after a changed protection. */
+        EvidenceProjectionReconcile: {
+            /** @description Check and preview the reconciliation without committing it. */
+            dryRun?: boolean;
+            /** @description Makes a retry with the same payload answer the first receipt. */
+            idempotencyKey?: string;
+            /** @description Publish only while this commit is the branch head, else `409 head-changed`. */
+            ifHead?: number;
+            /** @description The commit message. */
+            message?: string;
+            /** @description The name of a review policy of the evidence settings. */
+            policy: string;
+            /** @description Optional expected policy version, else `409 policy-changed`. */
+            policyVersion?: number;
+        };
+        /** @description The outcome of reconciling a review policy's accepted projection. */
+        EvidenceProjectionReconcileResult: {
+            /**
+             * Format: uuid
+             * @description The branch the commit published on.
+             */
+            branchId: string;
+            /** @description The supports, projected triples and resolution map the operation changed, for consumers that track dependent results. Empty for a replay. */
+            changed: {
+                inserted: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                /** @description A review under a matching policy that changed which accepted decisions its resolution map follows. */
+                map?: {
+                    decisionsAdded: string[];
+                    decisionsEnded: string[];
+                    /** @description The entities whose selected entity changed. */
+                    entities: string[];
+                    number: number;
+                    /** @description The matching policy. */
+                    policy: string;
+                    /** @description The revision it follows, whose consumers may need review. */
+                    previous: string | null;
+                    /** @description The resolution map revision the operation published. */
+                    revision: string;
+                };
+                removed: {
+                    /** @description The output graph. */
+                    output: string;
+                    /** @description The projected triple in N-Triples. */
+                    triple: string;
+                }[];
+                supportsAdded: string[];
+                supportsEnded: string[];
+            };
+            /** @description The publishing commit, the first one for a replay, or the head for a dry run. */
+            commit: number;
+            /** @description Whether this request published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The reconciliation operation, which is the availability receipt of any fresh projection record it publishes. */
+            operation: string;
+            /** @description The output graph recorded in the projection record. */
+            output: string;
+            /** @description The reconciled review policy. */
+            policy: string;
+            /** @description The policy version recorded in the projection record. */
+            policyVersion: number;
+            /** @description The active projection record carrying the current protections, or the projection record selected by the original operation on a replay. */
+            projection: string;
+            /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
+            replayed: boolean;
+            /** @description The live authenticated acceptance supports vouched for under the current protections, sorted by IRI. Empty on a replay. */
+            vouchedSupports: string[];
         };
         /** @description One batch of evidence records. At most 1,000 claims, 10,000 links, 1,000 identity proposals and 16 MiB of decoded input. */
         EvidenceProposal: {
@@ -7662,7 +8062,7 @@ export interface components {
                         key?: string;
                     };
                 };
-                /** @description A stored fact in the form of `EvidenceResolveRequest`. A fact of this dataset is held for the operation. */
+                /** @description A stored fact in the form of `EvidenceResolveRequest`. Its commit is held for the operation. */
                 storedFact?: Record<string, never>;
                 structured?: {
                     method: {
@@ -7755,6 +8155,13 @@ export interface components {
                 }[];
                 /** @description The upstream version identifier. */
                 upstreamVersion?: string;
+                /** @description The predecessor source revision this revision supersedes, written as `prov:wasRevisionOf`. */
+                wasRevisionOf?: {
+                    /** @description An existing authenticated record, by its IRI. */
+                    iri?: string;
+                    /** @description A record of this batch, by its key. */
+                    key?: string;
+                };
             }[];
             /** @description The source-record graph, needed when the settings name more than one. */
             sourceGraph?: string;
@@ -7778,7 +8185,7 @@ export interface components {
             };
             /** @description The commit's time, the first availability of its source revisions. `null` for a dry run. */
             firstAvailableAt: string | null;
-            /** @description The source hold of the stored facts of this dataset that the batch references. */
+            /** @description The UUID shared by the source holds of this operation in the referenced datasets. */
             hold: string | null;
             /** @description The operation, which is every record's availability receipt. */
             operation: string;
@@ -7795,6 +8202,78 @@ export interface components {
             }[];
             /** @description Whether the idempotency key had published the same payload, whose receipt this is. */
             replayed: boolean;
+        };
+        /** @description Administered re-authentication request for records of an earlier protection. */
+        EvidenceReauthenticateRequest: {
+            /** @description The target branch name. `main` when absent. */
+            branch?: string;
+            /** @description Verify and preview the changes without committing. */
+            dryRun?: boolean;
+            /** @description The protected evidence record graph to reconcile. */
+            graph: string;
+            /** @description Replays the first reconciliation receipt when repeated with the same payload. */
+            idempotencyKey?: string;
+            /** @description Commit only while the target branch head equals this commit. */
+            ifHead?: number;
+            /** @description Optional commit message. */
+            message?: string;
+            /** @description Specific records to verify and re-authenticate. Omit to reconcile every profile record in `graph`. */
+            records?: {
+                /** @description The record IRI to verify and vouch for. */
+                iri: string;
+                /** @description Optional expected `ev:recordDigest` that the record must match. */
+                recordDigest?: string;
+            }[];
+        };
+        /** @description Result of an administered evidence re-authentication reconciliation. */
+        EvidenceReauthenticateResult: {
+            /**
+             * Format: uuid
+             * @description The reconciled branch's UUID.
+             */
+            branchId: string;
+            /** @description The publishing commit, the first commit on a replay, or the branch head on a dry run or no-op. */
+            commit: number;
+            /** @description Whether this call published a commit. */
+            committed: boolean;
+            dryRun?: {
+                deleted: number;
+                error: string | null;
+                inserted: number;
+                wouldCommit: boolean;
+            };
+            /** @description The reconciled evidence record graph. */
+            graph: string;
+            /** @description The audit `ev:Operation` IRI in the reconciled graph. */
+            operation: string;
+            /** @description Every verified record of the reconciliation. */
+            records: {
+                /** @description Whether the record already carried the graph's current protection nonce. */
+                alreadyAuthenticated: boolean;
+                iri: string;
+                /** @enum {string} */
+                kind: "SourceRevision" | "Rendition" | "Passage" | "EvidenceRef" | "Claim" | "EvidenceLink" | "Assessment" | "Note" | "Decision" | "Task" | "ReviewDecision" | "IdentityProposal" | "AcceptanceSupport" | "Withdrawal" | "Projection" | "ResolutionMap";
+                /** @description The record's preserved `ev:availabilityReceipt` operation IRI. */
+                receipt: string;
+                /** @description The verified `ev:recordDigest`. */
+                recordDigest: string;
+            }[];
+            /** @description Whether an earlier idempotent operation's receipt was returned. */
+            replayed: boolean;
+        };
+        /** @description Recorded evidence settings, protection state and drift status. */
+        EvidenceRecordedStatus: {
+            /** @description Role graphs that an administrator detached. */
+            detached: string[];
+            /** @description The SHA-256 digest of `evidence.json`, `null` before the first configuration. */
+            digest: string | null;
+            /** @description Whether the effective settings differ from the recorded ones, refusing typed evidence operations until reconciled. */
+            drift: boolean;
+            /** @description Role graphs that ordinary writes cannot change. */
+            managed: string[];
+            /** @description The revision of the managed-graph registry, 0 when there is none. */
+            revision: number;
+            settings: components["schemas"]["EvidenceSettings"];
         };
         /** @description Evidence references to verify at their exact retained views. */
         EvidenceResolveRequest: {
@@ -8945,7 +9424,7 @@ export interface components {
             message?: string;
             /** @description From 0 to 1. */
             progress: number;
-            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities and `factGuard` `not-run`. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
+            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities, `factGuard` `not-run`, and `previousRevision` (the linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`, omitted when no predecessor evidence revision is linked, when the recorded link is hidden from the caller or on `already-proposed`). A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
             result?: {
                 [key: string]: unknown;
             };
@@ -9398,6 +9877,7 @@ export interface components {
             entity: null | {
                 children?: number | null;
                 equivalenceCount?: number | null;
+                incomplete: boolean | null;
                 iri: string;
                 parents?: number | null;
                 present: boolean;
@@ -9847,11 +10327,37 @@ export interface components {
                 groupCommit: boolean;
                 name: string;
                 quads: number;
+                queryMemoryPeak: {
+                    /** @description Cumulative counts for `queryMemoryPeakBucketBounds` plus +Inf. The last one equals `count`. */
+                    buckets: number[];
+                    count: number;
+                    sumBytes: number;
+                } | null;
                 /** @description 0 means unlimited. */
                 quotaBytes: number;
                 rateLimited: {
                     [key: string]: number;
                 } | null;
+                rebuilds: {
+                    bulk: {
+                        count: number;
+                        duration: {
+                            /** @description Cumulative counts for `rebuildDurationBucketBounds` plus +Inf. The last one equals `count`. */
+                            buckets: number[];
+                            count: number;
+                            sumSeconds: number;
+                        } | null;
+                    };
+                    compact: {
+                        count: number;
+                        duration: {
+                            /** @description Cumulative counts for `rebuildDurationBucketBounds` plus +Inf. The last one equals `count`. */
+                            buckets: number[];
+                            count: number;
+                            sumSeconds: number;
+                        } | null;
+                    };
+                };
                 resultCache: {
                     bytes: number;
                     capacityBytes: number;
@@ -9861,13 +10367,19 @@ export interface components {
                     misses: number;
                 };
                 resultRows: number;
+                /** @description Rows produced by all operators of queries and updates. */
+                rowsProduced: number;
                 walBytes: number;
             }[];
             /** @constant */
             formatVersion: 1;
             limits: components["schemas"]["Limits"];
             processResidentBytes: number | null;
+            /** @description Upper bounds in bytes of `datasets[*].queryMemoryPeak.buckets`, without +Inf. */
+            queryMemoryPeakBucketBounds: number[];
             ready: boolean;
+            /** @description Upper bounds in seconds of `datasets[*].rebuilds.*.duration.buckets`, without +Inf. */
+            rebuildDurationBucketBounds: number[];
             requests: {
                 /** @description Cumulative counts. The last one, for +Inf, equals `count`. */
                 buckets: number[];
@@ -10899,6 +11411,261 @@ export interface components {
             error: string;
             error_description?: string;
         };
+        OntologyClassification: {
+            class?: {
+                childClasses: string[];
+                children: number;
+                classes: string[];
+                incomplete: boolean;
+                iri: string;
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+                superClasses: string[];
+                unsatisfiable: boolean;
+            };
+            classes: number;
+            classificationSource: components["schemas"]["ClassificationSourceIdentity"];
+            commit: number;
+            /** @description Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way. */
+            complete: boolean;
+            /** @description Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer. */
+            completeForTaken: boolean;
+            /** @enum {string} */
+            consistency: "consistent" | "inconsistent" | "unknown";
+            consistent: boolean;
+            dataset: string;
+            excluded: ({
+                /** @description An OWL axiom in the public structural JSON form. */
+                axiom: {
+                    [key: string]: unknown;
+                };
+                message?: string;
+                ofn: string;
+                partial?: string;
+                rule?: string;
+                type: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            excludedCount: number;
+            graphs: string[];
+            imports: ({
+                graph: string | null;
+                iri: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            incomplete: string[];
+            incompleteCount: number;
+            /** @enum {string} */
+            mode: "lenient" | "strict";
+            next?: number;
+            nodeCount: number;
+            nodes?: {
+                children: number;
+                classes: string[];
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+            }[];
+            offset?: number;
+            partial: boolean;
+            /** Format: uuid */
+            resultId: string;
+            reused: boolean;
+            stats: {
+                added: number;
+                cleared: number;
+                conclusions: number;
+                contexts: number;
+                coverageMs: number;
+                coverageOver: boolean;
+                coverageStopped: boolean;
+                estimatedBytes: number;
+                incremental: boolean;
+                indexMs: number;
+                removed: number;
+                saturationMs: number;
+                taxonomyMs: number;
+                threads: number;
+                unmapped: number;
+            } & {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            tier: "el" | "horn" | "disjunctive";
+            /** @description The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed. */
+            unmappedTriples: {
+                object: string;
+                predicate: string;
+                subject: string;
+            }[];
+            /** @description Whether `stats.unmapped` counts more triples than `unmappedTriples` lists. */
+            unmappedTruncated: boolean;
+            unsatisfiable: string[];
+            unsatisfiableCount: number;
+            warnings: string[];
+            written?: {
+                absent: string[];
+                added: number;
+                addedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+                axiomsTruncated: boolean;
+                committed: boolean;
+                declared: string[];
+                deleted: number;
+                inserted: number;
+                kept: number;
+                present: number;
+                removed: number;
+                removedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+            } & {
+                [key: string]: unknown;
+            };
+        };
+        OntologyClassificationReceipt: {
+            class?: {
+                childClasses: string[];
+                children: number;
+                classes: string[];
+                incomplete: boolean;
+                iri: string;
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+                superClasses: string[];
+                unsatisfiable: boolean;
+            };
+            classes: number;
+            classificationSource: components["schemas"]["ClassificationSourceIdentity"];
+            commit: components["schemas"]["Commit"];
+            committed: boolean;
+            /** @description Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way. */
+            complete: boolean;
+            /** @description Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer. */
+            completeForTaken: boolean;
+            /** @enum {string} */
+            consistency: "consistent" | "inconsistent" | "unknown";
+            consistent: boolean;
+            dataset: string;
+            datasetId: string;
+            excluded: ({
+                /** @description An OWL axiom in the public structural JSON form. */
+                axiom: {
+                    [key: string]: unknown;
+                };
+                message?: string;
+                ofn: string;
+                partial?: string;
+                rule?: string;
+                type: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            excludedCount: number;
+            graphs: string[];
+            imports: ({
+                graph: string | null;
+                iri: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            incomplete: string[];
+            incompleteCount: number;
+            /** @enum {string} */
+            mode: "lenient" | "strict";
+            next?: number;
+            nodeCount: number;
+            nodes?: {
+                children: number;
+                classes: string[];
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+            }[];
+            offset?: number;
+            partial: boolean;
+            /** Format: uuid */
+            resultId: string;
+            reused: boolean;
+            stats: {
+                added: number;
+                cleared: number;
+                conclusions: number;
+                contexts: number;
+                coverageMs: number;
+                coverageOver: boolean;
+                coverageStopped: boolean;
+                estimatedBytes: number;
+                incremental: boolean;
+                indexMs: number;
+                removed: number;
+                saturationMs: number;
+                taxonomyMs: number;
+                threads: number;
+                unmapped: number;
+            } & {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            tier: "el" | "horn" | "disjunctive";
+            /** @description The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed. */
+            unmappedTriples: {
+                object: string;
+                predicate: string;
+                subject: string;
+            }[];
+            /** @description Whether `stats.unmapped` counts more triples than `unmappedTriples` lists. */
+            unmappedTruncated: boolean;
+            unsatisfiable: string[];
+            unsatisfiableCount: number;
+            validation?: components["schemas"]["ValidationSummary"];
+            warnings: string[];
+            written: {
+                absent: string[];
+                added: number;
+                addedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+                axiomsTruncated: boolean;
+                committed: boolean;
+                declared: string[];
+                deleted: number;
+                inserted: number;
+                kept: number;
+                present: number;
+                removed: number;
+                removedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+            } & {
+                [key: string]: unknown;
+            };
+        };
         OntologyFrameClassification: {
             classificationSource: components["schemas"]["ClassificationSourceIdentity"];
             commit: number;
@@ -10916,6 +11683,7 @@ export interface components {
                     total: number;
                     truncated: boolean;
                 };
+                incomplete: boolean;
                 iri: string;
                 outcome: components["schemas"]["ClassificationOutcome"];
                 parents: {
@@ -11698,6 +12466,30 @@ export interface components {
             dataset: string;
             datasetId: string;
         };
+        /** @description Redirection recipes for a hosted vocabulary's namespaces and version IRIs. */
+        RecipeExport: {
+            baseUrl: string;
+            /** @description The generated `.htaccess` or PURL redirection rules. */
+            content: string;
+            /** @enum {string} */
+            kind: "w3id" | "htaccess" | "purl";
+            /** @description Relative `.htaccess` directory mount stripped from `RewriteRule` patterns, when set. */
+            mount?: string;
+            namespaces: {
+                iri: string;
+                prefix: string;
+                /** @enum {string} */
+                style: "slash" | "hash";
+                targetUrl: string;
+            }[];
+            resource: string;
+            versions: {
+                snapshot?: string;
+                targetUrl: string;
+                version: string;
+                versionIri: string;
+            }[];
+        };
         /** @description The arguments of `register_source` without `dataset`. */
         RegisterSourceRequest: {
             dryRun?: boolean;
@@ -12082,8 +12874,12 @@ export interface components {
             licenseClass?: "open" | "attribution" | "share-alike" | "restricted";
             licenseUrl?: string;
             notes?: string;
+            /** @description Optional point-in-time selector (`snapshot:NAME`, `commit:N`, `N`, `time:<RFC 3339>` or `head`) pinning reads of this version. */
+            snapshot?: string;
             /** @description 1 to 64 letters, digits, `.`, `_`, `+` and `-`. */
             version: string;
+            /** @description Optional absolute IRI identifying this version, unique across the catalog. */
+            versionIri?: string;
         };
         /** @description A version to add. It never changes once it is added. */
         ResourceVersionInput: {
@@ -12116,8 +12912,12 @@ export interface components {
             licenseClass?: "open" | "attribution" | "share-alike" | "restricted";
             licenseUrl?: string;
             notes?: string;
+            /** @description Optional point-in-time selector (`snapshot:NAME`, `commit:N`, `N`, `time:<RFC 3339>` or `head`) pinning reads of this version. */
+            snapshot?: string;
             /** @description 1 to 64 letters, digits, `.`, `_`, `+` and `-`. */
             version: string;
+            /** @description Optional absolute IRI identifying this version, unique across the catalog. */
+            versionIri?: string;
         };
         /** @description Where and how to restore a backup. */
         RestoreRequest: {
@@ -12448,13 +13248,15 @@ export interface components {
             /** @description The entity tag of the runtime layer, as in the `ETag` header. */
             etag: string;
             /** @enum {string} */
-            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths" | "forms";
+            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths" | "forms" | "evidence";
             /** @description The fields the settings file locks. */
             locked: string[];
             /** @description Locked fields whose runtime value is kept in the file but ignored. */
             overridden: string[];
             /** @description The runtime values used in place of a different value of the settings file, one entry per field. Locked fields are left out, since their runtime value is ignored. */
             overrides: components["schemas"]["SettingsOverride"][];
+            /** @description The `evidence` kind only: the recorded evidence settings, protection state and whether they differ from the effective settings. */
+            recorded?: components["schemas"]["EvidenceRecordedStatus"];
             /** @description The runtime layer: the fields changed through the API. `null` removes a declared member. */
             runtime: {
                 [key: string]: unknown;
@@ -14059,7 +14861,7 @@ export interface components {
         dryRunHeader: boolean;
         /** @description The dataset name. */
         ds: string;
-        /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
+        /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
         execution: "eager" | "streaming" | "auto";
         /** @description The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter. */
         format: string;
@@ -14081,6 +14883,8 @@ export interface components {
         kind: "assistant" | "memory" | "ingest" | "graphrag" | "forms" | "models" | "notifications";
         /** @description The page size. */
         limit: number;
+        /** @description The local path appended to the hosted namespace IRI. */
+        local: string;
         /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
         maxDerived: number;
         /** @description A lower budget of the serialized result, in MiB. */
@@ -14099,6 +14903,8 @@ export interface components {
         nocache: boolean;
         /** @description The backup policy. */
         policy: string;
+        /** @description A hosted vocabulary namespace prefix. */
+        prefix: string;
         /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
         profile: "io";
         /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
@@ -14401,7 +15207,7 @@ export interface operations {
                 timeout?: components["parameters"]["timeout"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
                 execution?: components["parameters"]["execution"];
                 /** @description Return only the summary of the run. */
                 summary?: boolean;
@@ -16625,6 +17431,121 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    rebuildIdentityMap: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceIdentitiesRebuild"];
+            };
+        };
+        responses: {
+            /** @description The rebuilt resolution map revision and what changed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceIdentitiesRebuildResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reconcileEvidenceProjection: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceProjectionReconcile"];
+            };
+        };
+        responses: {
+            /** @description The reconciled projection, vouched supports and output changes. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceProjectionReconcileResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reauthenticateEvidence: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvidenceReauthenticateRequest"];
+            };
+        };
+        responses: {
+            /** @description The reconciliation receipt and verified records. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvidenceReauthenticateResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
     getEvidenceSettings: {
         parameters: {
             query?: never;
@@ -18575,6 +19496,440 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    resolveLinkedData: {
+        parameters: {
+            query: {
+                /** @description The absolute IRI to resolve. */
+                iri: string;
+                /** @description Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`). */
+                format?: "html" | "turtle" | "jsonld" | "rdfxml" | "ntriples";
+                /** @description Catalog version name to resolve against its pinned snapshot. */
+                version?: string;
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description The DESCRIBE mode of this query, over the dataset's setting. */
+                describe?: components["parameters"]["describe"];
+                /** @description Add the labels of the IRIs a DESCRIBE result links to. */
+                "describe-labels"?: components["parameters"]["describeLabels"];
+                /** @description Include the reifiers of described triples. */
+                "describe-reifiers"?: components["parameters"]["describeReifiers"];
+                /** @description A lower limit on the triples of a DESCRIBE result. */
+                "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
+                /** @description A lower limit on the levels a DESCRIBE follows. */
+                "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The negotiated HTML or bounded DESCRIBE RDF representation. */
+            200: {
+                headers: {
+                    /** @description Script-free Content Security Policy sent on `text/html` responses. */
+                    "Content-Security-Policy"?: string;
+                    /** @description Alternate representation links (and `rel="original"` for historical snapshots of live IRIs). */
+                    Link?: string;
+                    /** @description HTTP-date timestamp of the resolved historical commit (RFC 7089). */
+                    "Memento-Datetime"?: string;
+                    /** @description Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state. */
+                    "Sparkles-At"?: string;
+                    /** @description `true` when the bounded DESCRIBE reached its triple or term limit. */
+                    "Sparkles-Describe-Truncated"?: string;
+                    /** @description Current head commit sequence of the resolved dataset when reading a historical state. */
+                    "Sparkles-Head"?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/ld+json": string;
+                    "application/n-triples": string;
+                    "application/rdf+xml": string;
+                    "text/html": string;
+                    "text/turtle": string;
+                };
+            };
+            /** @description Redirect from a slash IRI to its negotiated document representation. */
+            303: {
+                headers: {
+                    /** @description The document URL for the negotiated representation. */
+                    Location?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            /** @description No supported representation matches `Accept`. */
+            406: {
+                headers: {
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getLinkedDataDocument: {
+        parameters: {
+            query: {
+                /** @description The absolute IRI to describe. */
+                iri: string;
+                /** @description Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`). */
+                format?: "html" | "turtle" | "jsonld" | "rdfxml" | "ntriples";
+                /** @description Catalog version name to resolve against its pinned snapshot. */
+                version?: string;
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description The DESCRIBE mode of this query, over the dataset's setting. */
+                describe?: components["parameters"]["describe"];
+                /** @description Add the labels of the IRIs a DESCRIBE result links to. */
+                "describe-labels"?: components["parameters"]["describeLabels"];
+                /** @description Include the reifiers of described triples. */
+                "describe-reifiers"?: components["parameters"]["describeReifiers"];
+                /** @description A lower limit on the triples of a DESCRIBE result. */
+                "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
+                /** @description A lower limit on the levels a DESCRIBE follows. */
+                "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The negotiated HTML or bounded DESCRIBE RDF representation. */
+            200: {
+                headers: {
+                    /** @description Script-free Content Security Policy sent on `text/html` responses. */
+                    "Content-Security-Policy"?: string;
+                    /** @description Alternate representation links (and `rel="original"` for historical snapshots of live IRIs). */
+                    Link?: string;
+                    /** @description HTTP-date timestamp of the resolved historical commit (RFC 7089). */
+                    "Memento-Datetime"?: string;
+                    /** @description Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state. */
+                    "Sparkles-At"?: string;
+                    /** @description `true` when the bounded DESCRIBE reached its triple or term limit. */
+                    "Sparkles-Describe-Truncated"?: string;
+                    /** @description Current head commit sequence of the resolved dataset when reading a historical state. */
+                    "Sparkles-Head"?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/ld+json": string;
+                    "application/n-triples": string;
+                    "application/rdf+xml": string;
+                    "text/html": string;
+                    "text/turtle": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            /** @description No supported representation matches `Accept`. */
+            406: {
+                headers: {
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resolveHostedNamespace: {
+        parameters: {
+            query?: {
+                /** @description Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`). */
+                format?: "html" | "turtle" | "jsonld" | "rdfxml" | "ntriples";
+                /** @description Catalog version name to resolve against its pinned snapshot. */
+                version?: string;
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description The DESCRIBE mode of this query, over the dataset's setting. */
+                describe?: components["parameters"]["describe"];
+                /** @description Add the labels of the IRIs a DESCRIBE result links to. */
+                "describe-labels"?: components["parameters"]["describeLabels"];
+                /** @description Include the reifiers of described triples. */
+                "describe-reifiers"?: components["parameters"]["describeReifiers"];
+                /** @description A lower limit on the triples of a DESCRIBE result. */
+                "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
+                /** @description A lower limit on the levels a DESCRIBE follows. */
+                "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+            };
+            header?: never;
+            path: {
+                /** @description A hosted vocabulary namespace prefix. */
+                prefix: components["parameters"]["prefix"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The negotiated HTML or bounded DESCRIBE RDF representation. */
+            200: {
+                headers: {
+                    /** @description Script-free Content Security Policy sent on `text/html` responses. */
+                    "Content-Security-Policy"?: string;
+                    /** @description Alternate representation links (and `rel="original"` for historical snapshots of live IRIs). */
+                    Link?: string;
+                    /** @description HTTP-date timestamp of the resolved historical commit (RFC 7089). */
+                    "Memento-Datetime"?: string;
+                    /** @description Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state. */
+                    "Sparkles-At"?: string;
+                    /** @description `true` when the bounded DESCRIBE reached its triple or term limit. */
+                    "Sparkles-Describe-Truncated"?: string;
+                    /** @description Current head commit sequence of the resolved dataset when reading a historical state. */
+                    "Sparkles-Head"?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/ld+json": string;
+                    "application/n-triples": string;
+                    "application/rdf+xml": string;
+                    "text/html": string;
+                    "text/turtle": string;
+                };
+            };
+            /** @description Redirect from a slash namespace IRI to its negotiated document representation. */
+            303: {
+                headers: {
+                    /** @description The document URL for the negotiated representation. */
+                    Location?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            /** @description No supported representation matches `Accept`. */
+            406: {
+                headers: {
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resolveHostedNamespaceSlash: {
+        parameters: {
+            query?: {
+                /** @description Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`). */
+                format?: "html" | "turtle" | "jsonld" | "rdfxml" | "ntriples";
+                /** @description Catalog version name to resolve against its pinned snapshot. */
+                version?: string;
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description The DESCRIBE mode of this query, over the dataset's setting. */
+                describe?: components["parameters"]["describe"];
+                /** @description Add the labels of the IRIs a DESCRIBE result links to. */
+                "describe-labels"?: components["parameters"]["describeLabels"];
+                /** @description Include the reifiers of described triples. */
+                "describe-reifiers"?: components["parameters"]["describeReifiers"];
+                /** @description A lower limit on the triples of a DESCRIBE result. */
+                "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
+                /** @description A lower limit on the levels a DESCRIBE follows. */
+                "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+            };
+            header?: never;
+            path: {
+                /** @description A hosted vocabulary namespace prefix. */
+                prefix: components["parameters"]["prefix"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The negotiated HTML or bounded DESCRIBE RDF representation. */
+            200: {
+                headers: {
+                    /** @description Script-free Content Security Policy sent on `text/html` responses. */
+                    "Content-Security-Policy"?: string;
+                    /** @description Alternate representation links (and `rel="original"` for historical snapshots of live IRIs). */
+                    Link?: string;
+                    /** @description HTTP-date timestamp of the resolved historical commit (RFC 7089). */
+                    "Memento-Datetime"?: string;
+                    /** @description Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state. */
+                    "Sparkles-At"?: string;
+                    /** @description `true` when the bounded DESCRIBE reached its triple or term limit. */
+                    "Sparkles-Describe-Truncated"?: string;
+                    /** @description Current head commit sequence of the resolved dataset when reading a historical state. */
+                    "Sparkles-Head"?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/ld+json": string;
+                    "application/n-triples": string;
+                    "application/rdf+xml": string;
+                    "text/html": string;
+                    "text/turtle": string;
+                };
+            };
+            /** @description Redirect from a slash namespace IRI to its negotiated document representation. */
+            303: {
+                headers: {
+                    /** @description The document URL for the negotiated representation. */
+                    Location?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            /** @description No supported representation matches `Accept`. */
+            406: {
+                headers: {
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resolveHostedTerm: {
+        parameters: {
+            query?: {
+                /** @description Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`). */
+                format?: "html" | "turtle" | "jsonld" | "rdfxml" | "ntriples";
+                /** @description Catalog version name to resolve against its pinned snapshot. */
+                version?: string;
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description The DESCRIBE mode of this query, over the dataset's setting. */
+                describe?: components["parameters"]["describe"];
+                /** @description Add the labels of the IRIs a DESCRIBE result links to. */
+                "describe-labels"?: components["parameters"]["describeLabels"];
+                /** @description Include the reifiers of described triples. */
+                "describe-reifiers"?: components["parameters"]["describeReifiers"];
+                /** @description A lower limit on the triples of a DESCRIBE result. */
+                "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
+                /** @description A lower limit on the levels a DESCRIBE follows. */
+                "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+            };
+            header?: never;
+            path: {
+                /** @description A hosted vocabulary namespace prefix. */
+                prefix: components["parameters"]["prefix"];
+                /** @description The local path appended to the hosted namespace IRI. */
+                local: components["parameters"]["local"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The negotiated HTML or bounded DESCRIBE RDF representation. */
+            200: {
+                headers: {
+                    /** @description Script-free Content Security Policy sent on `text/html` responses. */
+                    "Content-Security-Policy"?: string;
+                    /** @description Alternate representation links (and `rel="original"` for historical snapshots of live IRIs). */
+                    Link?: string;
+                    /** @description HTTP-date timestamp of the resolved historical commit (RFC 7089). */
+                    "Memento-Datetime"?: string;
+                    /** @description Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state. */
+                    "Sparkles-At"?: string;
+                    /** @description `true` when the bounded DESCRIBE reached its triple or term limit. */
+                    "Sparkles-Describe-Truncated"?: string;
+                    /** @description Current head commit sequence of the resolved dataset when reading a historical state. */
+                    "Sparkles-Head"?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/ld+json": string;
+                    "application/n-triples": string;
+                    "application/rdf+xml": string;
+                    "text/html": string;
+                    "text/turtle": string;
+                };
+            };
+            /** @description Redirect from a slash IRI to its negotiated document representation. */
+            303: {
+                headers: {
+                    /** @description The document URL for the negotiated representation. */
+                    Location?: string;
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            /** @description No supported representation matches `Accept`. */
+            406: {
+                headers: {
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     lint: {
         parameters: {
             query?: never;
@@ -19555,6 +20910,8 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale. */
                 inferences?: boolean;
+                /** @description `full` (the default) or `head`. The head answers the header, the counts of declared entities, the graphs read, the imports and the imports closure from bounded index reads, without mapping the whole graph into axioms, and leaves out `axioms`, `axiomCount`, `triples`, `unmapped`, `diagnostics` and `cached`. Its entity tag also names the commit for an edit's `If-Match`. It refuses `metrics`. */
+                view?: "full" | "head";
                 /** @description Also stream assertions and return scoped axiom counts, distinct signature entities, a conservative containing DL and bounded EL, QL, RL and DL reports in metrics. Refuses scopes over 1000000 mapped axioms and assertion triples or signature entities. Ordinary summaries omit this work. */
                 metrics?: boolean;
             };
@@ -19839,6 +21196,8 @@ export interface operations {
                 limit?: number;
                 /** @description Comma-separated preferred label languages, otherwise Accept-Language. */
                 lang?: string;
+                /** @description Read the kept EL-only classification instead of the default classification (false by default). */
+                elOnly?: boolean;
                 /** @description The read deadline in milliseconds. */
                 timeout?: number;
             };
@@ -19906,6 +21265,8 @@ export interface operations {
                 threads?: number;
                 /** @description `json` (the default) or `ofn`. */
                 format?: "json" | "ofn";
+                /** @description Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. Refused if repeated, malformed, or also set in the JSON body. */
+                elOnly?: boolean;
             };
             header?: {
                 /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
@@ -19927,6 +21288,8 @@ export interface operations {
                     about?: string;
                     /** @description Also classify the assertions the store holds, so that they can make the ontology inconsistent. Such a run is not kept. */
                     assertions?: boolean;
+                    /** @description Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. The dataset keeps EL-only classifications separately from default runs. */
+                    elOnly?: boolean;
                     /**
                      * @description The expansion strategy of the disjunctive rules, `cautious` by default. Both give the same answer.
                      * @enum {string}
@@ -19947,13 +21310,15 @@ export interface operations {
                     nodes?: boolean;
                     /** @description The first node listed. */
                     offset?: number;
-                    /** @description Answer what a run with the disjunctive rules proved when its deadline, cancellation or memory budget stops it, instead of failing. Runs of the other rules fail as before. */
+                    /** @description Answer what the active EL, Horn or disjunctive run proved when its deadline, cancellation or memory budget stops it after saturation begins, instead of failing. */
                     partial?: boolean;
                     /**
                      * @description With frame, require about and return bounded direct-parent/equivalence/source/exclusion samples with exact source/outcome. Limit is at most 1,000. False nodes, zero/null offset and null target retain their defaults. Effective nodes, offset, target and OFN output are refused before computing. Ineligible results remain local and advertise no shared continuation. Missing/null projection retains legacy output.
                      * @enum {string|null}
                      */
                     projection?: "frame" | null;
+                    /** @description Refuse with `422` and code `classification-incomplete` when the classifier would leave an axiom out or use one only in part, or the run stopped, so that an answer is always complete for the whole ontology, as HermiT refuses what it does not support. The message names the axioms and the rules they break. */
+                    strict?: boolean;
                     /** @description A named graph outside the graphs read that takes the direct taxonomy. */
                     target?: string;
                     /** @description The worker threads, within the algorithm pool's grant (0 for the grant). */
@@ -19962,17 +21327,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The classification, with the receipt when a write asked for one. */
+            /** @description The classification, or the receipt-bearing classification under `application/x-sparkles+json` when a `target` write asks for a receipt. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        classes: number;
-                        complete: boolean;
-                        consistent: boolean;
-                    } | components["schemas"]["OntologyFrameClassification"];
+                    "application/json": components["schemas"]["OntologyClassification"] | components["schemas"]["OntologyFrameClassification"];
+                    "application/x-sparkles+json": components["schemas"]["OntologyClassificationReceipt"];
                     "text/owl-functional": string;
                 };
             };
@@ -19982,6 +21344,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
             409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
@@ -20058,6 +21421,8 @@ export interface operations {
             content: {
                 "application/json": {
                     answers?: ("equivalents" | "superclasses" | "directSuperclasses" | "subclasses" | "directSubclasses" | "instances")[];
+                    /** @description Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL and using the dataset's EL-only kept saturation. Refused with `reasoning: "rl"` or an expression outside OWL 2 EL. */
+                    elOnly?: boolean;
                     /** @description The class expression: Manchester or functional-style text, or the JSON form. */
                     expression: unknown;
                     /** @description A graph IRI or `default`, or a list of them. */
@@ -20944,6 +22309,469 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    applyOntologyPatterns: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+            };
+            header?: {
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The table, pattern specification, and commit options. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    declare?: boolean;
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    message?: string;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    /**
+                     * @description Whether row errors refuse the commit (`abort`, the default) or skip erroneous rows (`skip`).
+                     * @enum {string}
+                     */
+                    onError?: "abort" | "skip";
+                    spec: {
+                        /** @description Optional base IRI for resolving bare local names. */
+                        baseIri?: string | null;
+                        columns?: {
+                            column: string;
+                            directive: string;
+                            split?: string | null;
+                        }[];
+                        declarations?: {
+                            column: string;
+                            /** @enum {string} */
+                            kind: "Class" | "ObjectProperty" | "DataProperty" | "AnnotationProperty" | "NamedIndividual" | "Datatype";
+                            split?: string | null;
+                        }[];
+                        /** @description In `robot` mode, whether row 2 carries the directive strings. */
+                        headerTemplateRow?: boolean;
+                        /**
+                         * @description `robot` for ROBOT-template column directives, or `pattern` for DOSDP/Cellfie-style parameterized axiom rules.
+                         * @enum {string}
+                         */
+                        mode: "robot" | "pattern";
+                        /** @description Extra prefix bindings merged on top of the dataset's prefixes. */
+                        prefixes?: {
+                            [key: string]: string;
+                        };
+                        rules?: {
+                            annotations?: {
+                                datatype?: string | null;
+                                iri?: boolean;
+                                lang?: string | null;
+                                property: string;
+                                value: string;
+                            }[];
+                            name?: string | null;
+                            requiredColumns?: string[];
+                            skipIfEmpty?: boolean;
+                            split?: {
+                                [key: string]: string;
+                            };
+                            /** @enum {string} */
+                            syntax?: "manchester" | "functional";
+                            template: string;
+                        }[];
+                    };
+                    table: {
+                        /** @description CSV or TSV spreadsheet text (at most 2 MiB and 5,000 data rows). */
+                        data: string;
+                        /**
+                         * @description Delimiter selection (`auto` by default).
+                         * @enum {string}
+                         */
+                        format?: "auto" | "csv" | "tsv";
+                    };
+                    /** @description The graph that takes the added axioms. */
+                    target?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report (JSON, or RDF Patch when `Accept` prefers `application/rdf-patch`, `text/rdf-patch`, or `application/rdf-patch+thrift`) when `dryRun=true`. */
+            200: {
+                headers: {
+                    /** @description The branch, when it is not `main`. */
+                    "Sparkles-Branch"?: string;
+                    /** @description The branch's id, when it is not `main`. */
+                    "Sparkles-Branch-Id"?: string;
+                    /** @description The commit a read saw, or a write produced. */
+                    "Sparkles-Commit"?: number;
+                    /** @description The dataset id. */
+                    "Sparkles-Dataset-Id"?: string;
+                    /** @description Present and `true` on dry-run responses. */
+                    "Sparkles-Dry-Run"?: boolean;
+                    /** @description The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses. */
+                    "Sparkles-Dry-Run-Outcome"?: "commit" | "no-change" | "precondition-failed" | "rejected" | "storage-refused";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        absent?: string[];
+                        added?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        addedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                        axiomsTruncated?: boolean;
+                        committed?: boolean;
+                        declared?: string[];
+                        deleted?: number;
+                        inserted?: number;
+                        kept?: number;
+                        pattern?: {
+                            delimiter?: string;
+                            diagnostics?: {
+                                code?: string;
+                                column?: string | null;
+                                message?: string;
+                                /** @description 1-based source line number. */
+                                row?: number;
+                                /** @enum {string} */
+                                severity?: "error" | "warning";
+                            }[];
+                            diagnosticsTruncated?: boolean;
+                            generated?: number;
+                            headers?: string[];
+                            rowsProcessed?: number;
+                            rowsSkipped?: number;
+                            rowsWithErrors?: number;
+                            valid?: boolean;
+                        };
+                        present?: number;
+                        removed?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        removedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                    } | components["schemas"]["DryRunReport"];
+                    "application/rdf-patch": string;
+                    "application/rdf-patch+thrift": string;
+                    "application/x-sparkles+json": components["schemas"]["Receipt"] & {
+                        absent?: string[];
+                        added?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        addedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                        axiomsTruncated?: boolean;
+                        committed?: boolean;
+                        declared?: string[];
+                        deleted?: number;
+                        inserted?: number;
+                        kept?: number;
+                        pattern?: {
+                            delimiter?: string;
+                            diagnostics?: {
+                                code?: string;
+                                column?: string | null;
+                                message?: string;
+                                /** @description 1-based source line number. */
+                                row?: number;
+                                /** @enum {string} */
+                                severity?: "error" | "warning";
+                            }[];
+                            diagnosticsTruncated?: boolean;
+                            generated?: number;
+                            headers?: string[];
+                            rowsProcessed?: number;
+                            rowsSkipped?: number;
+                            rowsWithErrors?: number;
+                            valid?: boolean;
+                        };
+                        present?: number;
+                        removed?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        removedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                    };
+                    "text/rdf-patch": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            /** @description Precondition failed (`If-Match` did not match the current head, import-target digest, or dataset prefix binding digest), or a dry-run precondition failure report. */
+            412: {
+                headers: {
+                    /** @description Present and `true` on dry-run responses. */
+                    "Sparkles-Dry-Run"?: boolean;
+                    /** @description The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses. */
+                    "Sparkles-Dry-Run-Outcome"?: "commit" | "no-change" | "precondition-failed" | "rejected" | "storage-refused";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DryRunReport"] | components["schemas"]["Error"];
+                };
+            };
+            413: components["responses"]["PayloadTooLarge"];
+            /** @description Pattern evaluation errors (`pattern-errors`), write validation refusal, or a dry-run validation rejection report. */
+            422: {
+                headers: {
+                    /** @description Present and `true` on dry-run responses. */
+                    "Sparkles-Dry-Run"?: boolean;
+                    /** @description The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses. */
+                    "Sparkles-Dry-Run-Outcome"?: "commit" | "no-change" | "precondition-failed" | "rejected" | "storage-refused";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @constant */
+                        code: "pattern-errors";
+                        diagnostics: {
+                            code?: string;
+                            column?: string | null;
+                            message?: string;
+                            /** @description 1-based source line number. */
+                            row?: number;
+                            /** @enum {string} */
+                            severity?: "error" | "warning";
+                        }[];
+                        diagnosticsTruncated: boolean;
+                        error: string;
+                        rowsProcessed: number;
+                        rowsSkipped: number;
+                        rowsWithErrors: number;
+                    } | components["schemas"]["DryRunReport"] | components["schemas"]["Error"];
+                };
+            };
+            /** @description Projected RDF triple or payload budget refusal (`triple-limit`), storage limit refusal, or a dry-run storage refusal report. */
+            507: {
+                headers: {
+                    /** @description Present and `true` on dry-run responses. */
+                    "Sparkles-Dry-Run"?: boolean;
+                    /** @description The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses. */
+                    "Sparkles-Dry-Run-Outcome"?: "commit" | "no-change" | "precondition-failed" | "rejected" | "storage-refused";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DryRunReport"] | components["schemas"]["Error"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    previewOntologyPatterns: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The table, pattern specification, and preview options. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Whether missing entity declarations would be added on apply (true by default). */
+                    declare?: boolean;
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    /** @description The most generated axioms listed in `axioms` (200 by default). */
+                    limit?: number;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    spec: {
+                        /** @description Optional base IRI for resolving bare local names. */
+                        baseIri?: string | null;
+                        columns?: {
+                            column: string;
+                            directive: string;
+                            split?: string | null;
+                        }[];
+                        declarations?: {
+                            column: string;
+                            /** @enum {string} */
+                            kind: "Class" | "ObjectProperty" | "DataProperty" | "AnnotationProperty" | "NamedIndividual" | "Datatype";
+                            split?: string | null;
+                        }[];
+                        /** @description In `robot` mode, whether row 2 carries the directive strings. */
+                        headerTemplateRow?: boolean;
+                        /**
+                         * @description `robot` for ROBOT-template column directives, or `pattern` for DOSDP/Cellfie-style parameterized axiom rules.
+                         * @enum {string}
+                         */
+                        mode: "robot" | "pattern";
+                        /** @description Extra prefix bindings merged on top of the dataset's prefixes. */
+                        prefixes?: {
+                            [key: string]: string;
+                        };
+                        rules?: {
+                            annotations?: {
+                                datatype?: string | null;
+                                iri?: boolean;
+                                lang?: string | null;
+                                property: string;
+                                value: string;
+                            }[];
+                            name?: string | null;
+                            requiredColumns?: string[];
+                            skipIfEmpty?: boolean;
+                            split?: {
+                                [key: string]: string;
+                            };
+                            /** @enum {string} */
+                            syntax?: "manchester" | "functional";
+                            template: string;
+                        }[];
+                    };
+                    table: {
+                        /** @description CSV or TSV spreadsheet text (at most 2 MiB and 5,000 data rows). */
+                        data: string;
+                        /**
+                         * @description Delimiter selection (`auto` by default).
+                         * @enum {string}
+                         */
+                        format?: "auto" | "csv" | "tsv";
+                    };
+                    /** @description The graph that would take the added axioms. */
+                    target?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The preview of generated axioms, diff summary, and row diagnostics. */
+            200: {
+                headers: {
+                    /** @description A weak entity tag naming the commit, ontology import-target digest, and dataset prefix digest, reusable as `If-Match` on apply. */
+                    ETag?: string;
+                    /** @description The branch, when it is not `main`. */
+                    "Sparkles-Branch"?: string;
+                    /** @description The branch's id, when it is not `main`. */
+                    "Sparkles-Branch-Id"?: string;
+                    /** @description The commit a read saw, or a write produced. */
+                    "Sparkles-Commit"?: number;
+                    /** @description The dataset id. */
+                    "Sparkles-Dataset-Id"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        autoDeclarations?: {
+                            iri?: string;
+                            kind?: string;
+                        }[];
+                        axioms?: {
+                            axiom?: Record<string, never>;
+                            manchester?: string | null;
+                            ofn?: string;
+                            rows?: number[];
+                            /** @enum {string} */
+                            status?: "new" | "existing";
+                            type?: string;
+                        }[];
+                        axiomsTruncated?: boolean;
+                        commit?: number;
+                        dataset?: string;
+                        /** @enum {string} */
+                        delimiter?: "csv" | "tsv";
+                        diagnostics?: {
+                            code?: string;
+                            column?: string | null;
+                            message?: string;
+                            /** @description 1-based source line number. */
+                            row?: number;
+                            /** @enum {string} */
+                            severity?: "error" | "warning";
+                        }[];
+                        diagnosticsTruncated?: boolean;
+                        estimatedTriples?: number;
+                        existingAxioms?: number;
+                        generated?: number;
+                        graphs?: string[];
+                        headers?: string[];
+                        newAxioms?: number;
+                        rowsProcessed?: number;
+                        rowsSkipped?: number;
+                        rowsWithErrors?: number;
+                        target?: string;
+                        valid?: boolean;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            413: components["responses"]["PayloadTooLarge"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
@@ -22865,6 +24693,48 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getVocabularyRecipes: {
+        parameters: {
+            query?: {
+                /** @description Recipe target (`w3id` by default). */
+                kind?: "w3id" | "htaccess" | "purl";
+                /** @description Public `http(s)` base URL of this Sparkles server. */
+                base?: string;
+                /** @description Optional `.htaccess` directory mount to strip from `RewriteRule` patterns (defaults to the shared first path segment for `w3id`, or site root for `htaccess`). */
+                mount?: string;
+                /** @description Response format (`text` by default). */
+                format?: "text" | "json";
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The generated recipe. */
+            200: {
+                headers: {
+                    /** @description `Accept`. */
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecipeExport"];
+                    "text/plain": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
     addResourceVersion: {
         parameters: {
             query?: never;
@@ -23683,6 +25553,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -23712,6 +25583,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -23730,10 +25602,12 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, or for `prefixes` a map from prefix names to IRIs. */
+        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. */
         requestBody: {
             content: {
-                "application/json": Record<string, never>;
+                "application/json": {
+                    [key: string]: unknown;
+                };
             };
         };
         responses: {
@@ -23752,6 +25626,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -23790,6 +25665,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -23808,10 +25684,12 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, or for `prefixes` a map from prefix names to IRIs. */
+        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. */
         requestBody: {
             content: {
-                "application/json": Record<string, never>;
+                "application/json": {
+                    [key: string]: unknown;
+                };
             };
         };
         responses: {
@@ -23830,6 +25708,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -25444,7 +27323,7 @@ export interface operations {
                 branch?: components["parameters"]["branch"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];
@@ -25645,7 +27524,7 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
                 execution?: components["parameters"]["execution"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -26071,7 +27950,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The dependent assessments. */
+            /** @description The dependent assessments and community reports. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -26085,8 +27964,10 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
             413: components["responses"]["PayloadTooLarge"];
             422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -26120,6 +28001,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
             413: components["responses"]["PayloadTooLarge"];
             422: components["responses"]["Unprocessable"];
             503: components["responses"]["Unavailable"];
@@ -26159,6 +28041,7 @@ export interface operations {
             409: components["responses"]["Conflict"];
             413: components["responses"]["PayloadTooLarge"];
             422: components["responses"]["Unprocessable"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -27751,7 +29634,7 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
                 execution?: components["parameters"]["execution"];
                 /** @description Run an older version. */
                 version?: number;
@@ -27816,7 +29699,7 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
                 execution?: components["parameters"]["execution"];
                 /** @description Run an older version. */
                 version?: number;
@@ -27901,7 +29784,7 @@ export interface operations {
                 branch?: components["parameters"]["branch"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];
@@ -27978,7 +29861,7 @@ export interface operations {
                 branch?: components["parameters"]["branch"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];
@@ -28062,6 +29945,8 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -28294,7 +30179,7 @@ export interface operations {
                 branch?: components["parameters"]["branch"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];
@@ -28371,7 +30256,7 @@ export interface operations {
                 branch?: components["parameters"]["branch"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];

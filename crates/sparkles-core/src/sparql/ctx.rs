@@ -2,7 +2,7 @@
 //! cancellation and dataset description.
 
 use super::pool::PoolGrant;
-use super::query_memory::{PRIMARY, QueryMemoryLease, QueryMemoryLedger, same};
+use super::query_memory::{PRIMARY, QueryMemoryLease, QueryMemoryLedger};
 use super::table::VarId;
 use super::value::Value;
 use crate::access::{Preparation, PreparationText, Reservation};
@@ -13,7 +13,7 @@ use crate::vocab::AppendVocab;
 use oxrdf::Term;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -54,25 +54,45 @@ impl DatasetSpec {
         access: &crate::access::GraphAccess,
         term: &dyn Fn(Id) -> Option<Term>,
     ) -> Result<()> {
+        self.restrict_checked(snap, access, &|id| Ok(term(id)))
+    }
+
+    /// Checked variant of [`DatasetSpec::restrict`] that propagates decoding and request
+    /// control failures instead of treating a refused graph IRI as absent.
+    pub fn restrict_checked(
+        &mut self,
+        snap: &Snapshot,
+        access: &crate::access::GraphAccess,
+        term: &dyn Fn(Id) -> Result<Option<Term>>,
+    ) -> Result<()> {
         if access.reads_all() {
             return Ok(());
         }
         let (visible, every) = access.visible_named_all(snap)?;
-        let allowed = |g: &Id| {
+        let allowed = |g: &Id| -> Result<bool> {
             if *g == Id::DEFAULT_GRAPH {
-                access.read.default_graph()
+                Ok(access.read.default_graph())
             } else if visible.binary_search(g).is_ok() {
-                true
+                Ok(true)
             } else {
                 // a graph without quads (or a query-local term): by its name
                 match g.tag() {
-                    id::Tag::BNode | id::Tag::Undef | id::Tag::Special => false,
-                    _ => access.readable(term(*g).as_ref()),
+                    id::Tag::BNode | id::Tag::Undef | id::Tag::Special => Ok(false),
+                    _ => Ok(access.readable(term(*g)?.as_ref())),
                 }
             }
         };
+        let filter_graphs = |graphs: &[Id]| -> Result<Vec<Id>> {
+            let mut kept = Vec::with_capacity(graphs.len());
+            for &g in graphs {
+                if allowed(&g)? {
+                    kept.push(g);
+                }
+            }
+            Ok(kept)
+        };
         let union = || visible.to_vec();
-        self.default = match self.default.take() {
+        let new_default = match self.default.as_deref() {
             // every named graph is visible: the union of them all, with its fast paths
             None if every && (self.union_default || snap.union_default_graph) => None,
             _ if self.union_default => Some(union()),
@@ -80,16 +100,21 @@ impl DatasetSpec {
             // the store's default graph, as before (which keeps its fast paths)
             None if access.read.default_graph() => None,
             None => Some(Vec::new()),
-            Some(l) => Some(l.into_iter().filter(allowed).collect()),
+            Some(l) => Some(filter_graphs(l)?),
         };
-        if self.default.is_some() {
-            self.union_default = false;
-        }
-        self.named = match self.named.take() {
+        let new_union_default = if new_default.is_some() {
+            false
+        } else {
+            self.union_default
+        };
+        let new_named = match self.named.as_deref() {
             None if every => None,
             None => Some(union()),
-            Some(l) => Some(l.into_iter().filter(allowed).collect()),
+            Some(l) => Some(filter_graphs(l)?),
         };
+        self.default = new_default;
+        self.union_default = new_union_default;
+        self.named = new_named;
         Ok(())
     }
 }
@@ -118,7 +143,6 @@ impl StepReservation {
     }
 
     /// The bytes charged.
-    #[cfg(test)]
     pub(crate) fn reserved(&self) -> u64 {
         self.reserved.load(Ordering::Acquire)
     }
@@ -144,7 +168,7 @@ const VALUE_CACHE_BYTES: u64 = 64 << 20;
 /// [`VALUE_CACHE_BYTES`] or an eighth of the memory budget, whichever is smaller, and a
 /// shard that reaches its share of that is cleared and freed. The reservation is kept
 /// until the context drops.
-pub(super) struct ValueCache {
+pub(crate) struct ValueCache {
     /// Made on the first value cached or looked up. Most short queries decode nothing
     /// through the cache and skip the 64 shards' allocation, setup and drop.
     shards: std::sync::OnceLock<Box<[RwLock<ValueShard>]>>,
@@ -180,7 +204,7 @@ impl Default for ValueCache {
 impl ValueCache {
     /// The estimated bytes one cached entry keeps: its slot, counted twice since a map
     /// grows by doubling, and the heap storage of its text.
-    pub(super) fn entry_bytes(v: &Value) -> u64 {
+    pub(crate) fn entry_bytes(v: &Value) -> u64 {
         fn text(s: &str) -> u64 {
             s.len() as u64 + 16
         }
@@ -188,7 +212,9 @@ impl ValueCache {
             Value::Iri(a) | Value::BNode(a) | Value::Str(a) => text(a),
             Value::Lang(a, b) | Value::LangDir(a, b, _) => text(a) + text(b),
             Value::Other { lex, dt } => text(lex) + text(dt),
-            Value::Triple(t) => 64 + t.to_string().len() as u64,
+            Value::BigInteger(i) => i.heap_bytes() + 16,
+            Value::BigDecimal(d) => d.heap_bytes() + 16,
+            Value::Triple(t) => 64 + super::graph_triple_bytes(t),
             _ => 0,
         };
         2 * (std::mem::size_of::<(Id, Value)>() as u64 + 1) + heap
@@ -229,15 +255,11 @@ impl ValueCache {
 /// (see [`FloorCache::cap`]).
 const FLOOR_CACHE_BYTES: u64 = 64 << 20;
 
-/// The most reconstruction a cursor's walk of a key and the key before it admits (see
-/// [`Ctx::with_vocab_key_prev`]).
-const PAIR_WALK_BYTES: usize = 4096;
-
-/// The slots of the floor table a query starts with, 512 KiB of words.
-const FLOOR_TABLE_FIRST: usize = 1 << 16;
+/// The default slots of the floor table a query starts with, 512 KiB of words.
+pub(super) const FLOOR_TABLE_FIRST: usize = 1 << 16;
 
 /// The fewest slots a floor table is worth allocating.
-const FLOOR_TABLE_FEWEST: usize = 1 << 10;
+pub(super) const FLOOR_TABLE_FEWEST: usize = 1 << 10;
 
 /// A floor table that grows is replaced by one this many times larger.
 const FLOOR_TABLE_GROWTH: usize = 8;
@@ -246,26 +268,87 @@ const FLOOR_TABLE_GROWTH: usize = 8;
 /// least its slots divided by this.
 const FLOOR_TABLE_EVICTIONS: usize = 32;
 
+/// Minimum lookups in one floor-cached mask or part before evaluating its hit rate
+/// against [`FLOOR_BYPASS_HIT_DENOM`].
+const FLOOR_BYPASS_MIN_LOOKUPS: usize = 2048;
+
+/// A floor pass whose hits are fewer than `lookups / FLOOR_BYPASS_HIT_DENOM` (12.5%)
+/// pauses floor-table use until the next probe mask.
+pub(super) const FLOOR_BYPASS_HIT_DENOM: usize = 8;
+
+/// While bypassing floors due to low hit rate, every `FLOOR_BYPASS_PROBE_INTERVAL`-th
+/// mask runs on floors to populate the table and test whether cross-batch reuse has
+/// risen above the threshold.
+const FLOOR_BYPASS_PROBE_INTERVAL: u32 = 4;
+
+/// Worker-local reusable key reconstruction buffers for floor lookups and direct string
+/// comparisons. Both buffers start empty and allocate only on first use after
+/// decoding-envelope admission.
+#[derive(Default)]
+pub(super) struct FloorScratch {
+    key: Vec<u8>,
+    other: Vec<u8>,
+}
+
+/// How [`super::exec::string_order_mask`] evaluates the next mask or part.
+pub(super) enum FloorMaskPlan {
+    /// Use the shared floor table (or uncached floors when `None` because the memory
+    /// budget refused a table).
+    Floors(Option<Arc<FloorTable>>),
+    /// Bypass the floor table for this mask and compare keys directly.
+    Direct,
+}
+
+/// Result of committing a mask whose sample validated via direct key comparison.
+pub(super) enum DirectCommitPlan {
+    /// Stay on direct key comparison without allocating or growing a floor table.
+    Direct,
+    /// Committing would consider optional table growth or enter `Floors`. `FloorTables`
+    /// was left unchanged so the caller can run a non-sticky floor trial on the validated
+    /// sample before optional table memory is spent.
+    NeedsFloorTrial(Option<Arc<FloorTable>>),
+}
+
+/// Result of looking up a string floor in [`FloorMap::try_floor`].
+pub(super) enum FloorLookup {
+    /// Base-vocabulary simple literal with floor `u64`.
+    Floor(u64),
+    /// Not a base-vocabulary simple literal (evaluate via generic SPARQL comparison).
+    NotSimple,
+    /// Computing the floor refused decoding-envelope admission without recording a sticky
+    /// memory failure (caller may fall back to direct key comparison).
+    Refused,
+}
+
 /// The query's cache of string floors ([`Ctx::string_floor`]). It lasts the query, so the
 /// batches of a cursor share it as the rows of an eager table do, and every worker of a
 /// mask reads and writes the same [`FloorTable`] without a lock.
 ///
-/// The first table has [`FLOOR_TABLE_FIRST`] slots, or fewer when the vocabulary has
-/// fewer strings or the cap allows less. A mask asks before each part of its rows whether
-/// the table should grow ([`Ctx::grow_floor_cache`]), which it does when its estimate of
-/// the floors it evicted that had been read again passes [`FLOOR_TABLE_EVICTIONS`]. A query whose strings
-/// rarely repeat, whose evictions cost nothing, therefore keeps its first table. The new
-/// table is [`FLOOR_TABLE_GROWTH`] times larger and takes the floors of the old one as
-/// they are read. Each table is charged to the query before it is allocated, through a
-/// reservation that grows in steps as the value cache's does, and the old tables stay
-/// charged, since a mask can still hold one. A refused charge, or one past the cache's
-/// cap, keeps the table the query has, or leaves it without one, and the floors it does
-/// not hold are computed each time, which costs about what a direct comparison of the
-/// two keys costs. The reservation is kept until the context drops.
+/// The first table is sized from an estimate of the distinct repeating strings in the
+/// first eligible mask (or [`FLOOR_TABLE_FIRST`] for direct callers), clamped to the
+/// vocabulary's strings and the cache's cap. A mask asks before each part of its rows
+/// whether the table should grow or pause ([`Ctx::begin_floor_mask`]), growing when its
+/// estimate of the floors it evicted that had been read again passes
+/// [`FLOOR_TABLE_EVICTIONS`]. A query whose strings rarely repeat, whose evictions cost
+/// nothing, therefore keeps its first table, and while the table's hit rate stays below
+/// `1 / FLOOR_BYPASS_HIT_DENOM` masks bypass the table for direct key comparison,
+/// probing periodically so inputs that repeat only across later batches re-enable floors.
+/// The new table is [`FLOOR_TABLE_GROWTH`] times larger and receives the live entries
+/// copied from the old table before it is published, so lookups probe only the current
+/// table. Each table is charged to the query before it is allocated, through a
+/// reservation that grows in steps as the value cache's does, and old tables stay charged
+/// until the context drops since an in-flight mask can still hold one. If an oversized
+/// initial table does not fit the remaining memory budget, allocation steps down by
+/// halves to [`FLOOR_TABLE_FEWEST`] before giving up. A refused charge, or one past the
+/// cache's cap, keeps the table the query has, or leaves it without one, and the floors
+/// it does not hold are computed each time, which costs about what a direct comparison of
+/// the two keys costs.
 #[derive(Default)]
 pub(super) struct FloorCache {
-    /// the table the masks write and the one before it, which they read
+    /// the table the masks read and write
     tables: parking_lot::Mutex<FloorTables>,
+    /// whether the cache has already installed a first table or deferred it in bypass mode
+    initialized: AtomicBool,
     /// the bytes of every table allocated
     used: AtomicU64,
     /// the bytes charged for the cache, never fewer than `used`
@@ -276,6 +359,9 @@ pub(super) struct FloorCache {
     /// the slots of the first table, when a test sets them
     #[cfg(test)]
     first_slots: std::sync::atomic::AtomicUsize,
+    /// masks or parts bypassed to direct key comparison (for tests)
+    #[cfg(test)]
+    bypassed: std::sync::atomic::AtomicUsize,
     /// the threads that looked up floors (for tests that a mask spreads over the pool)
     #[cfg(test)]
     threads: parking_lot::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
@@ -284,9 +370,17 @@ pub(super) struct FloorCache {
 #[derive(Default)]
 struct FloorTables {
     cur: Option<Arc<FloorTable>>,
-    prev: Option<Arc<FloorTable>>,
     /// a table was refused, so the cache takes no other
     full: bool,
+    /// saved initial slot estimate when the first eligible mask deferred table allocation
+    deferred_slots: usize,
+    /// remaining lookups before a freshly pre-sized table (`len > FLOOR_TABLE_FIRST`)
+    /// is evaluated for low-hit-rate bypass
+    warmup_lookups: usize,
+    /// whether low hit rate has currently paused floor-table use
+    bypass: bool,
+    /// consecutive bypassed masks or parts since the last floor probe
+    bypass_streak: u32,
 }
 
 /// A direct-mapped table of string floors shared by the workers of a query. Slot
@@ -312,6 +406,10 @@ pub(super) struct FloorTable {
     /// that end against the word each read before its store, which another worker may
     /// have replaced in between
     evicted: std::sync::atomic::AtomicUsize,
+    /// total lookups performed against this table since the last hit-rate check
+    lookups: std::sync::atomic::AtomicUsize,
+    /// cache hits observed against this table since the last hit-rate check
+    hits: std::sync::atomic::AtomicUsize,
 }
 
 impl FloorTable {
@@ -331,12 +429,14 @@ impl FloorTable {
             shift: delta_bits + 1,
             none: (1 << delta_bits) - 1,
             evicted: Default::default(),
+            lookups: Default::default(),
+            hits: Default::default(),
         }
     }
 
     /// The bytes of a table of `slots`: its words, the table and the shared counts of
     /// its `Arc`.
-    fn bytes(slots: usize) -> u64 {
+    pub(super) fn bytes(slots: usize) -> u64 {
         (slots as u64)
             .saturating_mul(8)
             .saturating_add(Self::OVERHEAD)
@@ -371,7 +471,15 @@ impl FloorTable {
         Some((delta != self.none).then(|| p - delta))
     }
 
-    /// The floor of `p`, when the table holds it.
+    /// Read-only cache lookup: `Some(Some(floor))` on a simple-literal hit, `Some(None)`
+    /// on a cached non-simple literal, `None` on a miss.
+    #[inline]
+    pub(super) fn get_cached(&self, p: u64) -> Option<Option<u64>> {
+        self.decode(p, self.slot(p).load(Ordering::Relaxed))
+    }
+
+    /// The floor of `p`, when the table holds it (for tests).
+    #[cfg(test)]
     #[inline]
     fn get(&self, p: u64) -> Option<Option<u64>> {
         self.decode(p, self.slot(p).load(Ordering::Relaxed))
@@ -393,6 +501,29 @@ impl FloorTable {
         };
         self.slot(p).store(word, Ordering::Relaxed);
         true
+    }
+
+    /// Copy every live floor held by this table into a larger table `dst` before `dst` is
+    /// published. Each non-zero slot in `self` recovers its exact base id `p` from its
+    /// slot index and top tag, and distinct slots of `self` map to distinct slots of `dst`.
+    fn copy_into(&self, dst: &mut FloorTable) {
+        debug_assert!(dst.len() > self.len());
+        debug_assert!(dst.bits > self.bits);
+        let dst_mask = dst.slots.len() - 1;
+        for (idx, slot) in self.slots.iter().enumerate() {
+            let word = slot.load(Ordering::Relaxed);
+            if word == 0 {
+                continue;
+            }
+            let top = word >> self.shift;
+            let p = ((top - 1) << self.bits) | (idx as u64);
+            let delta = (word >> 1) & self.none;
+            let floor = (delta != self.none).then(|| p - delta);
+            let read = (word & 1) != 0;
+            if let Some(encoded) = dst.encode(p, floor, read) {
+                *dst.slots[(p as usize) & dst_mask].get_mut() = encoded;
+            }
+        }
     }
 
     /// The words that hold a floor (for tests).
@@ -452,26 +583,60 @@ impl FloorCache {
     pub(super) fn threads(&self) -> usize {
         self.threads.lock().len()
     }
+
+    /// Masks or parts bypassed to direct key comparison due to low floor hit rate.
+    #[cfg(test)]
+    pub(super) fn bypassed(&self) -> usize {
+        self.bypassed.load(Ordering::Relaxed)
+    }
 }
 
-/// A worker's view of the query's [`FloorCache`]: the tables it reads and the counts it
-/// adds to the cache when it ends.
+enum FloorTableRef<'a> {
+    #[cfg(test)]
+    Owned(Arc<FloorTable>),
+    Borrowed(&'a FloorTable),
+}
+
+impl FloorTableRef<'_> {
+    #[inline]
+    fn as_ref(&self) -> &FloorTable {
+        match self {
+            #[cfg(test)]
+            FloorTableRef::Owned(arc) => arc,
+            FloorTableRef::Borrowed(table) => table,
+        }
+    }
+}
+
+/// A worker's view of the query's [`FloorCache`]: the table it reads and writes, its
+/// reusable key reconstruction buffers, and the counts it adds to the cache when it ends.
 pub(super) struct FloorMap<'a> {
     ctx: &'a Ctx,
-    cur: Option<Arc<FloorTable>>,
-    prev: Option<Arc<FloorTable>>,
+    cur: Option<FloorTableRef<'a>>,
+    first_triple: u64,
+    scratch: FloorScratch,
     /// the floors that had been read again that this map's stores evicted
     evicted: usize,
+    /// lookups performed against `cur`
+    lookups: usize,
+    /// cache hits observed against `cur`
+    hits: usize,
     #[cfg(test)]
     computed: usize,
 }
 
 impl Drop for FloorMap<'_> {
     fn drop(&mut self) {
-        if let Some(cur) = &self.cur
-            && self.evicted > 0
-        {
-            cur.evicted.fetch_add(self.evicted, Ordering::Relaxed);
+        if let Some(cur) = self.cur.as_ref().map(FloorTableRef::as_ref) {
+            if self.evicted > 0 {
+                cur.evicted.fetch_add(self.evicted, Ordering::Relaxed);
+            }
+            if self.lookups > 0 {
+                cur.lookups.fetch_add(self.lookups, Ordering::Relaxed);
+            }
+            if self.hits > 0 {
+                cur.hits.fetch_add(self.hits, Ordering::Relaxed);
+            }
         }
         #[cfg(test)]
         {
@@ -484,50 +649,114 @@ impl Drop for FloorMap<'_> {
 
 impl FloorMap<'_> {
     /// [`Ctx::string_floor`] of `id`, computed once while the table holds it.
+    #[cfg(test)]
     #[inline]
     pub(super) fn floor(&mut self, id: Id) -> Option<u64> {
-        let p = id.payload();
-        if id.tag() != Tag::Vocab || p >= self.ctx.snap.generation.vocab.first_triple() {
-            return None;
+        match self.try_floor(id) {
+            FloorLookup::Floor(f) => Some(f),
+            FloorLookup::NotSimple => None,
+            FloorLookup::Refused => self.ctx.string_floor_in(id, &mut self.scratch),
         }
-        let Some(cur) = &self.cur else {
-            return self.compute(id);
+    }
+
+    /// Look up `id`'s string floor without recording a sticky memory failure on a
+    /// decoding-envelope refusal, so a caller with direct key comparison available can
+    /// decline optional floor-only work (such as a block-start predecessor decode) and
+    /// fall back to [`Ctx::simple_literal_cmp_in`] using [`FloorMap::scratch_mut`].
+    #[inline]
+    pub(super) fn try_floor(&mut self, id: Id) -> FloorLookup {
+        let p = id.payload();
+        if id.tag() != Tag::Vocab || p >= self.first_triple {
+            return FloorLookup::NotSimple;
+        }
+        let Some(cur) = self.cur.as_ref().map(FloorTableRef::as_ref) else {
+            return self.try_compute(id);
         };
+        self.lookups += 1;
         let slot = cur.slot(p);
         let word = slot.load(Ordering::Relaxed);
         if let Some(floor) = cur.decode(p, word) {
+            self.hits += 1;
             if word & 1 == 0 {
                 slot.store(word | 1, Ordering::Relaxed);
             }
-            return floor;
+            return match floor {
+                Some(f) => FloorLookup::Floor(f),
+                None => FloorLookup::NotSimple,
+            };
         }
         // The slot held another id's floor, which had been read again when its bit is set.
         let evicts = usize::from(word & 1 == 1);
-        if let Some(floor) = self.prev.as_ref().and_then(|prev| prev.get(p)) {
-            if cur.put(p, floor, true) {
-                self.evicted += evicts;
-            }
-            return floor;
-        }
-        let floor = self.compute(id);
-        // A refused floor recorded a failure that ends the query. It is not kept as the
-        // floor of another kind of value.
-        if (floor.is_some() || self.ctx.check_memory_failure().is_ok())
-            && let Some(cur) = &self.cur
-            && cur.put(p, floor, false)
-        {
-            self.evicted += evicts;
-        }
-        floor
-    }
-
-    #[inline]
-    fn compute(&mut self, id: Id) -> Option<u64> {
         #[cfg(test)]
         {
             self.computed += 1;
         }
-        self.ctx.string_floor(id)
+        match self.ctx.try_string_floor_in(id, &mut self.scratch) {
+            Ok(floor) => {
+                if cur.put(p, floor, false) {
+                    self.evicted += evicts;
+                }
+                match floor {
+                    Some(f) => FloorLookup::Floor(f),
+                    None => FloorLookup::NotSimple,
+                }
+            }
+            // Do not cache a refusal as a non-simple literal or record a sticky failure;
+            // the caller falls back to direct comparison, which records any required refusal.
+            Err(_) => FloorLookup::Refused,
+        }
+    }
+
+    /// Reusable key-reconstruction scratch owned by this worker map, available for a
+    /// per-row [`Ctx::simple_literal_cmp_in`] fallback after [`FloorLookup::Refused`].
+    #[inline]
+    pub(super) fn scratch_mut(&mut self) -> &mut FloorScratch {
+        &mut self.scratch
+    }
+
+    /// Record a floor already computed by [`Ctx::string_floor`] for a base-vocabulary simple
+    /// literal `id`. Preserves lookup, hit, read-bit, eviction and test `computed` accounting
+    /// identically to [`FloorMap::try_floor`] without recomputing the floor.
+    #[inline]
+    pub(super) fn record_floor(&mut self, id: Id, floor: u64, computed: bool) {
+        let p = id.payload();
+        debug_assert!(id.tag() == Tag::Vocab && p < self.first_triple);
+        #[cfg(test)]
+        if computed {
+            self.computed += 1;
+        }
+        #[cfg(not(test))]
+        let _ = computed;
+        let Some(cur) = self.cur.as_ref().map(FloorTableRef::as_ref) else {
+            return;
+        };
+        self.lookups += 1;
+        let slot = cur.slot(p);
+        let word = slot.load(Ordering::Relaxed);
+        if cur.decode(p, word).is_some() {
+            self.hits += 1;
+            if word & 1 == 0 {
+                slot.store(word | 1, Ordering::Relaxed);
+            }
+            return;
+        }
+        let evicts = usize::from(word & 1 == 1);
+        if cur.put(p, Some(floor), false) {
+            self.evicted += evicts;
+        }
+    }
+
+    #[inline]
+    fn try_compute(&mut self, id: Id) -> FloorLookup {
+        #[cfg(test)]
+        {
+            self.computed += 1;
+        }
+        match self.ctx.try_string_floor_in(id, &mut self.scratch) {
+            Ok(Some(f)) => FloorLookup::Floor(f),
+            Ok(None) => FloorLookup::NotSimple,
+            Err(_) => FloorLookup::Refused,
+        }
     }
 }
 
@@ -588,6 +817,10 @@ pub struct Optimizations {
     /// OPTIONAL on one variable, with both sides sorted on it and always binding it,
     /// runs as a merge in the left side's order
     pub merge_left_join: bool,
+    /// a streamed merge OPTIONAL with a condition tests it on the pairs of the left rows
+    /// that a loaded right batch decides before it copies any output row, instead of
+    /// copying every pair and extension and testing the batch afterwards
+    pub merge_pair_conditions: bool,
     /// OPTIONAL whose right side is a triple pattern sorted on a variable that every row
     /// of the evaluated left side binds reads the pattern only for the left side's
     /// distinct values, when probing them costs less than reading the pattern
@@ -629,6 +862,7 @@ pub struct Optimizations {
     pub fused_star_costs: bool,
     /// an index join with few keys asks the kernel to read every block it will visit
     /// before it decodes the first, so a cold server reads them in parallel
+    #[cfg(test)]
     pub prefetch_blocks: bool,
     /// a hash join whose right side is a `text:query` call without a limit searches only
     /// the subjects of a small left side
@@ -644,17 +878,24 @@ pub struct Optimizations {
     pub bound_order_keys: bool,
     /// the vocabulary groups that hold a query's constants are requested together before
     /// the planner looks the constants up one after the other
+    #[cfg(test)]
     pub prefetch_constants: bool,
     /// a FILTER, BIND or ORDER BY over a table of fewer than 4,096 rows asks for the
     /// vocabulary pages of the terms it evaluates before the first row
+    #[cfg(test)]
     pub prefetch_terms: bool,
     /// the blocks of a plan's scans with few blocks are requested before any operator runs
+    #[cfg(test)]
     pub prefetch_first_scan: bool,
     /// the columns of the blocks that an index join has asked the kernel for are decoded
-    /// in parallel on a pool of the cache's own, before the reader gets to them
+    /// in parallel on a pool of the cache's own, before the reader gets to them.
+    /// Integration tests can disable this to check foreground decoding.
+    #[doc(hidden)]
     pub parallel_decode: bool,
     /// a streamed result writer decodes the terms of the next batch on the Rayon pool
-    /// while it writes the current one
+    /// while it writes the current one. Integration tests can disable this to check
+    /// sequential output.
+    #[doc(hidden)]
     pub decode_ahead: bool,
     /// cursor operators that read their whole input before output, and filters without
     /// effects whose rows do not pass, read larger inputs as a long input goes on
@@ -665,7 +906,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 44] = [
+    pub const NAMES: [&str; 39] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -686,6 +927,7 @@ impl Optimizations {
         "filter_scan_runs",
         "gallop_index_join",
         "merge_left_join",
+        "merge_pair_conditions",
         "probed_optional",
         "keyed_left_join",
         "keyed_join",
@@ -698,16 +940,10 @@ impl Optimizations {
         "key_backoff",
         "domain_estimates",
         "fused_star_costs",
-        "prefetch_blocks",
         "text_subject_pushdown",
         "vector_topk",
         "topk_heap",
         "bound_order_keys",
-        "prefetch_constants",
-        "prefetch_terms",
-        "prefetch_first_scan",
-        "parallel_decode",
-        "decode_ahead",
         "grow_input",
         "predicate_patterns",
     ];
@@ -734,6 +970,7 @@ impl Optimizations {
         filter_scan_runs: true,
         gallop_index_join: true,
         merge_left_join: true,
+        merge_pair_conditions: true,
         probed_optional: true,
         keyed_left_join: true,
         keyed_join: true,
@@ -746,13 +983,17 @@ impl Optimizations {
         key_backoff: true,
         domain_estimates: true,
         fused_star_costs: true,
+        #[cfg(test)]
         prefetch_blocks: true,
         text_subject_pushdown: true,
         vector_topk: true,
         topk_heap: true,
         bound_order_keys: true,
+        #[cfg(test)]
         prefetch_constants: true,
+        #[cfg(test)]
         prefetch_terms: true,
+        #[cfg(test)]
         prefetch_first_scan: true,
         parallel_decode: true,
         decode_ahead: true,
@@ -760,7 +1001,7 @@ impl Optimizations {
         predicate_patterns: true,
     };
 
-    /// Everything off: the generic operators only.
+    /// All named optimizations off, using the generic operators.
     pub const NONE: Optimizations = Optimizations {
         range_pushdown: false,
         incremental_group: false,
@@ -782,6 +1023,7 @@ impl Optimizations {
         filter_scan_runs: false,
         gallop_index_join: false,
         merge_left_join: false,
+        merge_pair_conditions: false,
         probed_optional: false,
         keyed_left_join: false,
         keyed_join: false,
@@ -794,16 +1036,20 @@ impl Optimizations {
         key_backoff: false,
         domain_estimates: false,
         fused_star_costs: false,
-        prefetch_blocks: false,
+        #[cfg(test)]
+        prefetch_blocks: true,
         text_subject_pushdown: false,
         vector_topk: false,
         topk_heap: false,
         bound_order_keys: false,
-        prefetch_constants: false,
-        prefetch_terms: false,
-        prefetch_first_scan: false,
-        parallel_decode: false,
-        decode_ahead: false,
+        #[cfg(test)]
+        prefetch_constants: true,
+        #[cfg(test)]
+        prefetch_terms: true,
+        #[cfg(test)]
+        prefetch_first_scan: true,
+        parallel_decode: true,
+        decode_ahead: true,
         grow_input: false,
         predicate_patterns: false,
     };
@@ -830,6 +1076,7 @@ impl Optimizations {
             "filter_scan_runs" => &mut self.filter_scan_runs,
             "gallop_index_join" => &mut self.gallop_index_join,
             "merge_left_join" => &mut self.merge_left_join,
+            "merge_pair_conditions" => &mut self.merge_pair_conditions,
             "probed_optional" => &mut self.probed_optional,
             "keyed_left_join" => &mut self.keyed_left_join,
             "keyed_join" => &mut self.keyed_join,
@@ -842,51 +1089,69 @@ impl Optimizations {
             "key_backoff" => &mut self.key_backoff,
             "domain_estimates" => &mut self.domain_estimates,
             "fused_star_costs" => &mut self.fused_star_costs,
-            "prefetch_blocks" => &mut self.prefetch_blocks,
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
             "vector_topk" => &mut self.vector_topk,
             "topk_heap" => &mut self.topk_heap,
             "bound_order_keys" => &mut self.bound_order_keys,
-            "prefetch_constants" => &mut self.prefetch_constants,
-            "prefetch_terms" => &mut self.prefetch_terms,
-            "prefetch_first_scan" => &mut self.prefetch_first_scan,
-            "parallel_decode" => &mut self.parallel_decode,
-            "decode_ahead" => &mut self.decode_ahead,
             "grow_input" => &mut self.grow_input,
             "predicate_patterns" => &mut self.predicate_patterns,
             _ => return None,
         })
     }
 
-    /// Switch off the named optimizations (`all` switches off every one). Unknown names
+    /// Switch off optimizations by name (`all` selects [`Self::NONE`]). Unknown names
     /// are returned as an error.
     pub fn disable(mut self, names: &str) -> std::result::Result<Optimizations, String> {
-        for n in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-            if n == "all" {
-                self = Optimizations::NONE;
-                continue;
-            }
-            *self.flag(n).ok_or_else(|| {
+        for name in Self::split_names(names) {
+            self.disable_name(name)?;
+        }
+        Ok(self)
+    }
+
+    fn split_names(names: &str) -> impl Iterator<Item = &str> {
+        names
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    fn disable_name(&mut self, name: &str) -> std::result::Result<(), String> {
+        if name == "all" {
+            *self = Self::NONE;
+        } else {
+            *self.flag(name).ok_or_else(|| {
                 format!(
-                    "unknown optimization {n:?} (known: {})",
+                    "unknown optimization {name:?} (known: {})",
                     Self::NAMES.join(", ")
                 )
             })? = false;
         }
-        Ok(self)
+        Ok(())
     }
 }
 
 impl Default for Optimizations {
     /// Everything on, except what `SPARKLES_DISABLE_OPTIMIZATIONS` lists.
+    /// Retired names are ignored and unknown names are logged.
     fn default() -> Optimizations {
         static DEFAULT: std::sync::OnceLock<Optimizations> = std::sync::OnceLock::new();
-        *DEFAULT.get_or_init(|| match std::env::var("SPARKLES_DISABLE_OPTIMIZATIONS") {
-            Ok(v) => Optimizations::ALL.disable(&v).unwrap_or_else(|e| {
-                tracing::warn!(target: "sparkles::sparql::ctx", "SPARKLES_DISABLE_OPTIMIZATIONS: {e}");
-                Optimizations::ALL
-            }),
-            Err(_) => Optimizations::ALL,
+        *DEFAULT.get_or_init(|| {
+            let mut optimizations = Self::ALL;
+            if let Ok(names) = std::env::var("SPARKLES_DISABLE_OPTIMIZATIONS") {
+                for name in Self::split_names(&names) {
+                    if matches!(
+                        name,
+                        "prefetch_blocks" | "prefetch_constants" | "prefetch_terms"
+                            | "prefetch_first_scan" | "parallel_decode" | "decode_ahead"
+                    ) {
+                        continue;
+                    }
+                    if let Err(error) = optimizations.disable_name(name) {
+                        tracing::warn!(target: "sparkles::sparql::ctx", "SPARKLES_DISABLE_OPTIMIZATIONS: {error}");
+                    }
+                }
+            }
+            optimizations
         })
     }
 }
@@ -900,6 +1165,90 @@ pub struct PlanWarning {
     pub message: String,
 }
 
+/// Query-local vocabulary backing: either an owned [`AppendVocab`] for ordinary queries
+/// or an incremental circuit's [`Terms`](crate::incr::terms::Terms) borrowed for the
+/// duration of an accumulator call without copying historical keys.
+enum LocalVocab {
+    Owned(AppendVocab),
+    Circuit(crate::incr::terms::Terms),
+}
+
+impl Default for LocalVocab {
+    fn default() -> Self {
+        Self::Owned(AppendVocab::default())
+    }
+}
+
+impl LocalVocab {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Owned(v) => v.len(),
+            Self::Circuit(t) => t.key_count() as u64,
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<&[u8]> {
+        match self {
+            Self::Owned(v) => v.get(id),
+            Self::Circuit(t) => t.key_bytes(id as usize),
+        }
+    }
+
+    fn find(&self, key: &[u8]) -> Option<u64> {
+        match self {
+            Self::Owned(v) => v.find(key),
+            Self::Circuit(t) => t.find_local_key(key),
+        }
+    }
+
+    fn insert(&mut self, key: &[u8]) -> (u64, bool) {
+        match self {
+            Self::Owned(v) => v.insert(key),
+            Self::Circuit(t) => {
+                let before = t.key_count();
+                let id = t.push_local_key(key);
+                (id.payload(), t.key_count() > before)
+            }
+        }
+    }
+
+    fn clone_owned(&self) -> AppendVocab {
+        match self {
+            Self::Owned(v) => v.clone(),
+            Self::Circuit(t) => {
+                let mut v = AppendVocab::default();
+                for i in 0..t.key_count() {
+                    if let Some(k) = t.key_bytes(i) {
+                        v.insert(k);
+                    }
+                }
+                v
+            }
+        }
+    }
+
+    fn append_only_clone_bytes(&self) -> u64 {
+        match self {
+            Self::Owned(v) => v.append_only_clone_bytes(),
+            Self::Circuit(t) => t.bytes(),
+        }
+    }
+
+    fn physical_bytes(&self) -> u64 {
+        match self {
+            Self::Owned(v) => v.physical_bytes(),
+            Self::Circuit(t) => t.bytes(),
+        }
+    }
+
+    fn insert_peak_bytes(&self, key_len: usize) -> Option<u64> {
+        match self {
+            Self::Owned(v) => v.insert_peak_bytes(key_len),
+            Self::Circuit(t) => t.insert_peak_bytes(key_len),
+        }
+    }
+}
+
 pub struct Ctx {
     pub extensions: Option<Arc<super::extensions::ExtensionRegistry>>,
     /// what query-time reasoning derived for this query (see [`super::reasoning`])
@@ -911,7 +1260,10 @@ pub struct Ctx {
     /// overlay, charged to the query until the context drops.
     pub(super) reasoning_memory: Vec<QueryMemoryLease>,
     pub snap: Arc<Snapshot>,
-    local: RwLock<AppendVocab>,
+    local: RwLock<LocalVocab>,
+    /// Bytes of `local` currently covered by retained context credit (mutated under
+    /// `local.write()`).
+    local_retained: AtomicU64,
     values: ValueCache,
     floors: FloorCache,
     next_bnode: AtomicU64,
@@ -932,6 +1284,11 @@ pub struct Ctx {
     /// wait that is still in progress. A background reader of the deadline would need to
     /// credit a wait before it starts.
     pub deadline_pause: Arc<AtomicU64>,
+    /// Whether the query runs as a cursor under the strict policy. An operator that
+    /// decides at its first pull how to run, such as an in-process SERVICE call, reads
+    /// it, since the operators of an EXISTS pattern are built under the permissive
+    /// policy once their strict build has passed.
+    pub(crate) strict_cursor: AtomicBool,
     pub cancel: Arc<AtomicBool>,
     pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
@@ -952,9 +1309,6 @@ pub struct Ctx {
     /// Budget for the estimated bytes of intermediate results alive at once
     /// (`u64::MAX`: unlimited). See [`Ctx::charge`] and [`Ctx::check_output`].
     pub mem_limit: u64,
-    /// The grant the query charges, fixed before its first charge (see [`Ctx::set_grant`]).
-    /// Contributions retain the grant they were admitted under.
-    grant: Option<Arc<super::pool::PoolGrant>>,
     /// The query's disk reservation for spill files, when spill is on.
     pub(crate) spill: Option<Arc<crate::spill::QuerySpill>>,
     /// Budget for the rows all operators produce together (`u64::MAX`: unlimited). See
@@ -1040,6 +1394,9 @@ pub struct Ctx {
     /// whether the query streams through pull cursors, whose grant follows their live
     /// bytes (see [`Ctx::streams`])
     streams: bool,
+    /// active scoped strict-decode guards (such as constant folding) that refuse eager
+    /// decode envelope overflows instead of silently dropping them
+    strict_decode: AtomicU32,
     // Data and weak retained caches drop before final ledger ownership.
     fast: FastMemory,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
@@ -1047,6 +1404,7 @@ pub struct Ctx {
     // their actual sources. A new mask can share its original source's backing.
     pub(super) source_view: Option<crate::access::PreparedView>,
     pub(super) read_source: Option<crate::store::BoundReadSource>,
+    pub(super) view_source_controls: Option<crate::access::Preparation>,
     pub(super) source_preparation: Option<crate::access::Preparation>,
     pub(super) source_setup: Option<crate::access::Reservation>,
     #[cfg(test)]
@@ -1056,6 +1414,12 @@ pub struct Ctx {
 /// A test observer of the chunks a retained output takes.
 #[cfg(test)]
 pub(super) type ChunkHook = Arc<dyn Fn(&'static str, usize) + Send + Sync>;
+
+// Deterministic test trigger to expire any query deadline at a chosen checkpoint.
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_DEADLINE_EXPIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Set in [`FastMemory::live`] once the ledger has taken the account over.
 const PROMOTED: u64 = 1 << 63;
@@ -1085,8 +1449,9 @@ struct FastMemory {
     peak: AtomicU64,
     /// the account's admitted contribution to `grant`, kept until the context drops
     eager: AtomicU64,
-    /// the grant the account charges, fixed at its first use
-    grant: std::sync::OnceLock<Option<Arc<PoolGrant>>>,
+    /// The grant fixed before the first charge. A promoted account owns its credit
+    /// through the ledger, which shares this grant.
+    grant: Option<Arc<PoolGrant>>,
     /// serializes growth of `eager` with the hand-over to the ledger
     resize: parking_lot::Mutex<()>,
 }
@@ -1123,10 +1488,12 @@ impl FastMemory {
 impl Drop for FastMemory {
     /// An account the ledger never took over returns its eager contribution here.
     fn drop(&mut self) {
-        if *self.live.get_mut() & PROMOTED == 0
-            && let Some(Some(grant)) = self.grant.get()
+        let eager = *self.eager.get_mut();
+        if eager != 0
+            && *self.live.get_mut() & PROMOTED == 0
+            && let Some(grant) = &self.grant
         {
-            grant.release(*self.eager.get_mut());
+            grant.release(eager);
         }
     }
 }
@@ -1150,8 +1517,9 @@ struct MemoryFailure {
     failed: AtomicBool,
 }
 
-/// Resource and ownership refusals and the unconfigured extension refusal become sticky.
-/// Ordinary expression and service errors keep their existing semantics.
+/// Resource and ownership refusals, the unconfigured extension refusal and the strict
+/// cursor policy's refusals become sticky. Ordinary expression and SERVICE errors keep
+/// their existing semantics, so a failed SERVICE inside an EXISTS is still false.
 #[derive(Clone)]
 enum ResourceRefusal {
     Budget(Budget),
@@ -1163,15 +1531,33 @@ enum ResourceRefusal {
     },
     Cancelled,
     Timeout,
+    /// The strict cursor policy's refusal of an eager fallback, met where the operator
+    /// decides how to run at its first pull, such as an in-process SERVICE call inside
+    /// an EXISTS. It fails the query, as the same refusal does outside an expression.
+    Refused(String),
+    /// The strict cursor policy's refusal of a SERVICE response it cannot stream, such as
+    /// one that gives its results before its head. It keeps its SERVICE error.
+    ServiceRefused(String),
     UnconfiguredExtension,
+    Corrupt(String),
 }
 
 impl ResourceRefusal {
-    fn from_error(error: &Error) -> Option<Self> {
+    /// The refusal `error` records, if any. A SERVICE refusal is recognised by its fixed
+    /// beginning, which no endpoint controls (see [`super::cursor::LATE_HEAD`]), and only
+    /// under a strict cursor, the only policy that makes it.
+    fn from_error(error: &Error, strict: bool) -> Option<Self> {
         match error {
+            Error::Service(message) if strict && message.starts_with(super::cursor::LATE_HEAD) => {
+                Some(Self::ServiceRefused(message.clone()))
+            }
             Error::BudgetExceeded(budget) => Some(Self::Budget(*budget)),
             Error::Cancelled => Some(Self::Cancelled),
             Error::Timeout => Some(Self::Timeout),
+            Error::Unsupported(message) if message.starts_with(super::cursor::REFUSAL) => {
+                Some(Self::Refused(message.clone()))
+            }
+            Error::Corrupt(message) => Some(Self::Corrupt(message.clone())),
             error if super::extensions::is_unconfigured(error) => Some(Self::UnconfiguredExtension),
             Error::Component(component) => component
                 .source
@@ -1192,7 +1578,10 @@ impl ResourceRefusal {
             Self::Budget(budget) => Error::BudgetExceeded(budget),
             Self::Cancelled => Error::Cancelled,
             Self::Timeout => Error::Timeout,
+            Self::Refused(message) => Error::Unsupported(message),
+            Self::ServiceRefused(message) => Error::Service(message),
             Self::UnconfiguredExtension => super::extensions::unconfigured(),
+            Self::Corrupt(message) => Error::Corrupt(message),
             Self::Parent {
                 component,
                 code,
@@ -1205,15 +1594,38 @@ impl ResourceRefusal {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeGrowPoint {
+    BeforeLock,
+    BeforeEagerCharge,
+    AfterLedgerSnapshot,
+}
+
+#[cfg(test)]
+type DecodeGrowHook = Arc<dyn Fn(DecodeGrowPoint) + Send + Sync>;
+
 /// The high-water envelope that transient dictionary decoding reserves in both
 /// accounting modes: a key of the largest size seen so far on every worker, charged once
 /// when it grows and released when the work ends (see [`Ctx::reserve_decode_checked`]).
 #[derive(Default)]
 struct DecodeEnvelope {
-    /// the reserved bytes, with the owner of an eager reservation
-    state: parking_lot::Mutex<(u64, Option<u64>)>,
+    /// the reserved bytes, with the `(owner, bytes)` charges backing the envelope
+    state: parking_lot::Mutex<(u64, Vec<(u64, u64)>)>,
     /// the reserved bytes, read without the lock
     reserved: AtomicU64,
+    #[cfg(test)]
+    grow_hook: parking_lot::Mutex<Option<DecodeGrowHook>>,
+}
+
+#[cfg(test)]
+impl DecodeEnvelope {
+    fn notify_grow_hook(&self, point: DecodeGrowPoint) {
+        let hook = self.grow_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1239,12 +1651,8 @@ impl Ctx {
         let _resize = fast.resize.lock();
         let live = fast.live.fetch_or(PROMOTED, Ordering::AcqRel);
         debug_assert_eq!(live & PROMOTED, 0, "one hand-over");
-        let grant = match fast.grant.get() {
-            Some(grant) => grant.clone(),
-            None => self.grant.clone(),
-        };
         QueryMemoryLedger::seeded(
-            grant,
+            fast.grant.clone(),
             live,
             fast.eager.load(Ordering::Acquire),
             fast.peak.load(Ordering::Acquire),
@@ -1262,7 +1670,7 @@ impl Ctx {
     /// its existing lazy fast account. The child retains accounting, not this Ctx.
     pub fn memory_parent(&self) -> Result<sparkles_budget::ParentHandle> {
         self.memory()
-            .child_parent(self.grant.clone(), self.mem_limit)
+            .child_parent(self.fast.grant.clone(), self.mem_limit)
     }
 
     /// Attach a seed subcontext to its outer query before any charge. It retains
@@ -1281,8 +1689,7 @@ impl Ctx {
             ));
         }
         let factory = self
-            .grant
-            .as_ref()
+            .grant()
             .map_or(sparkles_budget::MemoryDomain::unpooled(), |g| {
                 g.memory_domain()
             });
@@ -1295,7 +1702,7 @@ impl Ctx {
                 ),
             )));
         }
-        let ledger = QueryMemoryLedger::nested(self.grant.clone(), parent);
+        let ledger = QueryMemoryLedger::nested(self.fast.grant.clone(), parent);
         self.memory
             .set(ledger)
             .map_err(|_| Error::invalid("query memory already initialized"))?;
@@ -1305,13 +1712,11 @@ impl Ctx {
 
     /// The grant the query charges, if it has one.
     pub fn grant(&self) -> Option<&Arc<PoolGrant>> {
-        self.grant.as_ref()
+        self.fast.grant.as_ref()
     }
 
-    /// Set the grant before any charge, and fix it as the fast account's grant without
-    /// a lazy initialization on the first charge. A grant that changes after a charge
-    /// would leave charges on the old one, so a call after the first charge is a bug
-    /// that debug builds refuse.
+    /// Set the grant before any charge. The fast account borrows this same reference
+    /// on each charge and returns its contribution before dropping it.
     pub(crate) fn set_grant(&mut self, grant: Option<Arc<PoolGrant>>) {
         debug_assert!(
             self.memory.get().is_none()
@@ -1320,26 +1725,20 @@ impl Ctx {
                 && self.fast.peak.load(Ordering::Relaxed) == 0,
             "the grant is set before the first charge"
         );
-        self.fast.grant = std::sync::OnceLock::from(grant.clone());
-        self.grant = grant;
+        self.fast.grant = grant;
     }
 
-    /// Change the grant after charges were made, to test that the ledger keeps each
-    /// contribution on the grant it was admitted under.
+    /// Preserve the old fast account in the ledger before testing a change of grant.
     #[cfg(test)]
     pub(crate) fn reconfigure_grant(&mut self, grant: Option<Arc<PoolGrant>>) {
-        self.grant = grant;
-    }
-
-    /// The fast account's grant, or `None` when the ledger must take the request: it
-    /// exists already, or the public grant changed since the fast account began.
-    #[inline]
-    fn fast_grant(&self) -> Option<Option<&Arc<PoolGrant>>> {
-        if self.memory.get().is_some() {
-            return None;
+        if (self.fast.live.load(Ordering::Relaxed) != 0
+            || self.fast.eager.load(Ordering::Relaxed) != 0
+            || self.fast.peak.load(Ordering::Relaxed) != 0)
+            && !super::query_memory::same(self.grant(), grant.as_ref())
+        {
+            self.memory();
         }
-        let grant = self.fast.grant.get_or_init(|| self.grant.clone()).as_ref();
-        same(grant, self.grant.as_ref()).then_some(grant)
+        self.fast.grant = grant;
     }
 
     /// Admit `bytes` more live estimate (`add`) or check a transient output of
@@ -1347,7 +1746,10 @@ impl Ctx {
     /// owner. `None` when the ledger must take the request.
     #[inline]
     fn fast_admit(&self, bytes: u64, add: bool) -> Option<Result<()>> {
-        let grant = self.fast_grant()?;
+        if self.memory.get().is_some() {
+            return None;
+        }
+        let grant = self.grant();
         let fast = &self.fast;
         let mut cur = fast.live.load(Ordering::Acquire);
         loop {
@@ -1443,9 +1845,19 @@ impl Ctx {
         self.live_bytes()
     }
 
+    #[cfg(test)]
+    pub(super) fn decode_state_unlocked(&self) -> bool {
+        self.decode.state.try_lock().is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn intern_local_raw_for_test(&self, key: &[u8]) -> Id {
+        Id::local(self.local.write().insert(key).0)
+    }
+
     /// The query's live estimate, from the ledger once it exists.
     #[inline]
-    pub(super) fn live_bytes(&self) -> u64 {
+    pub(crate) fn live_bytes(&self) -> u64 {
         match self.memory.get() {
             Some(ledger) => ledger.live.load(Ordering::Relaxed),
             None => self.fast.live.load(Ordering::Relaxed) & !PROMOTED,
@@ -1472,16 +1884,19 @@ impl Ctx {
             owner: Default::default(),
             regex: Default::default(),
             streams: false,
+            strict_decode: AtomicU32::new(0),
             fast: Default::default(),
             memory: Default::default(),
             snap,
             read_source: None,
             source_view: None,
+            view_source_controls: None,
             source_preparation: None,
             source_setup: None,
             #[cfg(test)]
             chunk_hook: parking_lot::Mutex::new(None),
-            local: RwLock::new(AppendVocab::default()),
+            local: RwLock::new(LocalVocab::default()),
+            local_retained: AtomicU64::new(0),
             values: Default::default(),
             floors: Default::default(),
             next_bnode: AtomicU64::new(0),
@@ -1490,6 +1905,7 @@ impl Ctx {
             literal_bnodes: Default::default(),
             deadline: None,
             deadline_pause: Arc::new(AtomicU64::new(0)),
+            strict_cursor: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
             cancellation: None,
             dataset: DatasetSpec::default(),
@@ -1501,7 +1917,6 @@ impl Ctx {
             prepared_var_names: Default::default(),
             max_rows: 200_000_000,
             mem_limit: u64::MAX,
-            grant: None,
             spill: None,
             max_rows_produced: u64::MAX,
             rows_produced: Arc::new(AtomicU64::new(0)),
@@ -1765,8 +2180,45 @@ impl Ctx {
 
     /// Keep the selectivity measured for the conjunct shown as `text` (the first one
     /// measured stays, so that every plan compared sees the same).
-    pub(super) fn set_sampled(&self, text: String, s: super::sample::Sampled) {
-        self.sampled.lock().entry(text).or_insert(s);
+    pub(super) fn set_sampled(
+        &self,
+        scratch: Option<Charge<'_>>,
+        text: String,
+        s: super::sample::Sampled,
+    ) {
+        use sparkles_budget::sizes::{table_bytes, table_grown};
+        let mut samples = self.sampled.lock();
+        if samples.contains_key(&text) {
+            return;
+        }
+        if let Some(held) = &scratch {
+            let cap = samples.capacity();
+            let grown = table_grown(cap, samples.len(), 1);
+            let elem = size_of::<(String, super::sample::Sampled)>();
+            let new_table = if grown == cap {
+                0
+            } else {
+                table_bytes(grown, elem)
+            };
+            let text_bytes = text.capacity();
+            if held
+                .resize(text_bytes.saturating_add(new_table) as u64)
+                .is_err()
+            {
+                return;
+            }
+            samples.insert(text, s);
+            let retired = if grown == cap {
+                0
+            } else {
+                table_bytes(cap, elem)
+            };
+            let _ = held.resize(text_bytes.saturating_add(new_table - retired) as u64);
+            // The query owns the sample text and its table until the context drops.
+            held.disarm();
+        } else {
+            samples.insert(text, s);
+        }
     }
 
     #[inline]
@@ -1774,7 +2226,11 @@ impl Ctx {
         #[cfg(test)]
         CHECKS.with(|n| n.set(n.get() + 1));
         self.check_memory_failure()?;
-        if let Some(preparation) = &self.source_preparation {
+        if let Some(preparation) = self
+            .source_preparation
+            .as_ref()
+            .or(self.view_source_controls.as_ref())
+        {
             // Both source and query absolute controls apply during preparation
             // and execution, without cursor wait extensions or renewed deadlines.
             preparation.check()?;
@@ -1808,6 +2264,10 @@ impl Ctx {
         let Some(d) = self.deadline else {
             return false;
         };
+        #[cfg(test)]
+        if TEST_DEADLINE_EXPIRED.with(std::cell::Cell::get) {
+            return true;
+        }
         let now = Instant::now();
         if now < d {
             return false;
@@ -1851,9 +2311,9 @@ impl Ctx {
         }
     }
 
-    /// Whether the query streams through pull cursors. Both modes charge the same state,
-    /// so only the routing of a query, the accumulation of an EXISTS key set across
-    /// batches and whether a decoding envelope can refuse read it.
+    /// Whether the query streams through pull cursors. Both modes charge the same state
+    /// and refuse decode-envelope overflows alike, so only the routing of a query and the
+    /// accumulation of an EXISTS key set across batches read it.
     #[inline]
     pub(super) fn streams(&self) -> bool {
         self.accounting() == Accounting::Cursor
@@ -1904,12 +2364,9 @@ impl Ctx {
         self.owner.lock().upgrade()
     }
 
-    /// Charge `bytes` of state that outlives the call that builds it, such as a cache
-    /// that belongs to the plan, in both accounting modes. The charge holds a weak owner,
-    /// which avoids a plan and context reference cycle. A context that was never shared
-    /// has no owner to release through, so an eager one keeps such state uncharged, as
-    /// `None` says, while a cursor always has one.
-    pub(super) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
+    /// Weak owner for retained state, or `Ok(None)` when an unattached eager context
+    /// keeps retained state uncharged.
+    fn retained_owner(&self) -> Result<Option<Weak<Ctx>>> {
         let owner = self.owner.lock().clone();
         if owner.strong_count() == 0 {
             if !self.streams {
@@ -1917,9 +2374,60 @@ impl Ctx {
             }
             return Err(Error::invalid("cursor context owner has not been attached"));
         }
+        Ok(Some(owner))
+    }
+
+    /// Charge `bytes` of state that outlives the call that builds it, such as a cache
+    /// that belongs to the plan, in both accounting modes. The charge holds a weak owner,
+    /// which avoids a plan and context reference cycle. A context that was never shared
+    /// has no owner to release through, so an eager one keeps such state uncharged, as
+    /// `None` says, while a cursor always has one.
+    pub(crate) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
+        let Some(owner) = self.retained_owner()? else {
+            return Ok(None);
+        };
         let charge = self.charge(bytes)?;
-        let id = charge.disarm();
+        let id = charge.into_disarmed();
         Ok(Some(RetainedCharge { owner, id, bytes }))
+    }
+
+    /// Split `bytes` out of a live [`QueryMemoryLease`] belonging to this attached context
+    /// into a [`RetainedCharge`] without releasing or re-acquiring from the pool. If the
+    /// lease holds fewer than `bytes`, only the shortfall is reserved.
+    pub(super) fn retained_charge_from_lease(
+        &self,
+        lease: &mut QueryMemoryLease,
+        bytes: u64,
+    ) -> Result<Option<RetainedCharge>> {
+        if lease.service.is_some() || !self.owns_ledger(&lease.ledger) {
+            return Err(Error::invalid(
+                "admission lease belongs to another query account",
+            ));
+        }
+        let Some(owner) = self.retained_owner()? else {
+            return Ok(None);
+        };
+        if bytes == 0 {
+            return Ok(Some(RetainedCharge {
+                owner,
+                id: None,
+                bytes: 0,
+            }));
+        }
+        if bytes <= lease.bytes {
+            lease.bytes -= bytes;
+        } else {
+            let extra = bytes - lease.bytes;
+            lease
+                .ledger
+                .reserve(&lease.owner, self.mem_limit, extra, false)?;
+            lease.bytes = 0;
+        }
+        Ok(Some(RetainedCharge {
+            owner,
+            id: Some(lease.owner.id),
+            bytes,
+        }))
     }
 
     /// The query's program of a regular expression, compiled and charged on first use.
@@ -1958,7 +2466,7 @@ impl Ctx {
                 if self.streams
                     && let Some(ledger) = self.memory.get()
                 {
-                    ledger.trim_zero(self.grant.as_ref());
+                    ledger.trim_zero(self.grant());
                 }
             }
         }
@@ -1966,7 +2474,7 @@ impl Ctx {
 
     /// The bytes this query holds in the server's query memory pool (0 without a pool).
     pub fn granted_bytes(&self) -> u64 {
-        self.grant.as_ref().map_or(0, |g| g.granted())
+        self.grant().map_or(0, |g| g.granted())
     }
 
     pub(super) fn memory_remaining(&self) -> u64 {
@@ -1977,7 +2485,7 @@ impl Ctx {
     /// what the server pool has free plus the unused part of the query's grant.
     pub(super) fn memory_room(&self) -> u64 {
         let own = self.memory_remaining();
-        match &self.grant {
+        match self.grant() {
             Some(grant) => {
                 let pool = grant.pool();
                 let free = pool.capacity().saturating_sub(pool.granted());
@@ -2003,18 +2511,25 @@ impl Ctx {
     fn release_decode_envelope(&self) {
         let envelope = &self.decode;
         let mut state = envelope.state.lock();
-        let (bytes, owner) = std::mem::take(&mut *state);
+        let (bytes, owners) = std::mem::take(&mut *state);
         envelope.reserved.store(0, Ordering::Release);
         drop(state);
-        if bytes == 0 {
-            return;
+        if bytes != 0 {
+            for (owner, owned) in owners {
+                self.release_live(Some(owner), owned);
+            }
         }
-        match owner {
-            // An eager envelope is a charge of its own.
-            Some(owner) => self.release_live(Some(owner), bytes),
-            // A cursor's is decode bytes on the ledger.
-            None => self.memory().release_decode(),
+        if let Some(ledger) = self.memory.get()
+            && ledger.has_envelope()
+        {
+            ledger.release_decode();
         }
+    }
+
+    /// Lightweight relaxed probe for latched fatal refusals on cold error paths.
+    #[inline]
+    pub(crate) fn has_memory_failure(&self) -> bool {
+        self.memory_failure.failed.load(Ordering::Relaxed)
     }
 
     /// Fail with the refusal that infallible code recorded (see
@@ -2040,14 +2555,182 @@ impl Ctx {
 
     /// Record the first supported execution refusal met by infallible code, so
     /// the next check preserves its original typed outcome in both modes.
-    pub(super) fn fail_memory(&self, error: &Error) {
+    pub(crate) fn fail_memory(&self, error: &Error) {
         if self.memory_failure.failed.load(Ordering::Acquire) {
             return;
         }
-        if let Some(refusal) = ResourceRefusal::from_error(error) {
+        let strict = self.strict_cursor.load(Ordering::Relaxed);
+        if let Some(refusal) = ResourceRefusal::from_error(error, strict) {
             let failure = &self.memory_failure;
             failure.failure.lock().get_or_insert(refusal);
             failure.failed.store(true, Ordering::Release);
+        }
+    }
+
+    /// Build a disposable trial context for optional planning estimation (such as FILTER
+    /// selectivity sampling) bounded by the remaining memory of `self`. All decode
+    /// envelopes, value caches, local terms, compiled regexes, and parsed geometries
+    /// live only on the trial context and are released when it drops.
+    fn sampling_trial(&self) -> Result<Arc<Ctx>> {
+        self.check()?;
+        let mut trial = Ctx::new(self.snap.clone());
+        trial.mem_limit = self.memory_remaining();
+        trial.set_grant(self.fast.grant.clone());
+        if self.has_ledger() {
+            trial.set_memory_parent(self.memory_parent()?)?;
+            trial.enable_cursor_accounting()?;
+        }
+        trial.source_preparation = self.source_preparation.clone();
+        trial.read_source = self.read_source.clone();
+        trial.deadline = self.deadline;
+        trial.deadline_pause = self.deadline_pause.clone();
+        trial.cancel = self.cancel.clone();
+        trial.cancellation = self.cancellation.clone();
+        trial.graphs = self.graphs.clone();
+        if let Some(now) = self.now.get() {
+            let _ = trial.now.set(*now);
+        }
+        trial.opt = self.opt;
+        trial.aggregate_errors = self.aggregate_errors;
+        let graph_bytes = [&self.dataset.default, &self.dataset.named]
+            .into_iter()
+            .flatten()
+            .fold(0u64, |bytes, graphs| {
+                bytes.saturating_add(
+                    (graphs.len() as u64).saturating_mul(std::mem::size_of::<Id>() as u64),
+                )
+            });
+        let base_bytes = self
+            .base_iri
+            .as_ref()
+            .map_or(0, |iri| iri.as_str().len() as u64);
+        let fixed_bytes = graph_bytes.saturating_add(base_bytes);
+        let mut admitted = 0;
+        loop {
+            let names = self.var_names.read();
+            let local = self.local.read();
+            let name_bytes = names.iter().fold(0u64, |bytes, name| {
+                bytes.saturating_add(name.len() as u64 + std::mem::size_of::<String>() as u64)
+            });
+            let local_bytes = local.append_only_clone_bytes();
+            let bytes = fixed_bytes
+                .saturating_add(name_bytes)
+                .saturating_add(local_bytes);
+            if bytes <= admitted {
+                *trial.var_names.get_mut() = names.clone();
+                *trial.local.get_mut() = LocalVocab::Owned(local.clone_owned());
+                trial.local_retained.store(local_bytes, Ordering::Release);
+                break;
+            }
+            // Admission may wake a pool entrant. Keep both vocabulary and
+            // variable-name locks free, then recheck the size before copying.
+            drop(local);
+            drop(names);
+            if !trial.retain_bytes(bytes - admitted) {
+                trial.check()?;
+            }
+            admitted = bytes;
+        }
+        trial.dataset = self.dataset.clone();
+        trial.base_iri = self.base_iri.clone();
+        trial
+            .next_bnode
+            .store(self.next_bnode.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(trial.into_shared())
+    }
+
+    /// Run an optional planning estimator on a disposable trial context so a declined
+    /// sample leaves zero decode-envelope, value-cache, local-term, regex, or geometry
+    /// state on `self`. Pre-existing failures, cancellation, and timeout always propagate.
+    pub(super) fn with_sampling_trial<T>(
+        &self,
+        f: impl FnOnce(&Ctx) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        self.check()?;
+        let res = self.sampling_trial().and_then(|trial| {
+            let result = f(&trial).and_then(|value| {
+                trial.check()?;
+                Ok(value)
+            });
+            trial.release_work();
+            result
+        });
+        match res {
+            Ok(v) => {
+                self.check()?;
+                Ok(v)
+            }
+            Err(Error::BudgetExceeded(b))
+                if matches!(b.kind, BudgetKind::Memory | BudgetKind::ServerMemory) =>
+            {
+                self.check()?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Fallible variant of [`Ctx::retain_bytes`]: charges `bytes` more of query-local
+    /// terms and memos without latching [`Ctx::memory_failure`] on refusal, so callers
+    /// with a recovery path (such as parallel fallback or `group_or_spill`) can handle
+    /// the memory error directly.
+    pub(crate) fn try_retain_bytes(&self, bytes: u64) -> Result<()> {
+        self.check_memory_failure()?;
+        let retained = &self.retained;
+        let used = retained.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        if retained.charge.covers(used) {
+            return Ok(());
+        }
+        match self.grow_reservation(&retained.charge, used, u64::MAX, true) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                retained.used.fetch_sub(bytes, Ordering::AcqRel);
+                Err(error)
+            }
+        }
+    }
+
+    /// Retain `bytes` of query-local state by consuming spare `self.retained` headroom
+    /// first and keeping any remainder permanently charged directly out of `source`
+    /// without releasing it back to the pool. Never advances `self.retained.charge.reserved`,
+    /// preserving the `StepReservation` invariant (`reserved >= used`) against concurrent
+    /// `retain_bytes` callers. Any excess above `bytes` stays on `source` to be released
+    /// once temporary growth buffers have freed.
+    fn retain_from_charge(&self, bytes: u64, source: &Charge<'_>) {
+        if bytes == 0 {
+            return;
+        }
+        debug_assert!(source.belongs_to(self));
+        debug_assert!(source.bytes() >= bytes);
+        let from_spare = {
+            let _grow = self.retained.charge.grow.lock();
+            let reserved = self.retained.charge.reserved.load(Ordering::Acquire);
+            let mut claimed = 0u64;
+            if self
+                .retained
+                .used
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    let take = bytes.min(reserved.saturating_sub(cur));
+                    if take == 0 {
+                        None
+                    } else {
+                        claimed = take;
+                        Some(cur + take)
+                    }
+                })
+                .is_err()
+            {
+                claimed = 0;
+            }
+            claimed
+        };
+        let direct = bytes - from_spare;
+        if direct > 0 {
+            let remaining = source.bytes.get() - direct;
+            source.bytes.set(remaining);
+            if remaining == 0 {
+                source.disarm();
+            }
         }
     }
 
@@ -2056,22 +2739,104 @@ impl Ctx {
     /// resource failure into an ordinary unbound BIND, so a refusal is recorded and fails
     /// the next check, and `false` tells the caller not to allocate.
     pub(crate) fn retain_bytes(&self, bytes: u64) -> bool {
-        if self.memory_failure.failed.load(Ordering::Acquire) {
-            return false;
-        }
-        let retained = &self.retained;
-        let used = retained.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
-        if retained.charge.covers(used) {
-            return true;
-        }
-        match self.grow_reservation(&retained.charge, used, u64::MAX, true) {
+        match self.try_retain_bytes(bytes) {
             Ok(()) => true,
             Err(error) => {
-                retained.used.fetch_sub(bytes, Ordering::AcqRel);
                 self.fail_memory(&error);
                 false
             }
         }
+    }
+
+    #[inline]
+    fn decode_workers() -> u64 {
+        if rayon::current_thread_index().is_some() {
+            rayon::current_num_threads() as u64 + 1
+        } else {
+            1
+        }
+    }
+
+    #[inline]
+    fn decode_need(bytes: usize) -> u64 {
+        (bytes as u64)
+            .saturating_mul(8)
+            .saturating_add(1024)
+            .saturating_mul(Self::decode_workers())
+    }
+
+    /// Lock-free check whether the decode envelope already covers `bytes` with no
+    /// latched failure. Used under vocabulary read locks so the hot path never
+    /// double-locks and the cold growth/refusal path always runs after unlocking.
+    #[inline]
+    fn decode_envelope_covers(&self, bytes: usize) -> bool {
+        !self.memory_failure.failed.load(Ordering::Acquire)
+            && self.decode.reserved.load(Ordering::Acquire) >= Self::decode_need(bytes)
+    }
+
+    /// Admit optional vocabulary prefetch scratch. In cursor mode, prefetch reuses the
+    /// query's paid decode envelope and admits any extra optional headroom on the ledger
+    /// as reclaimable bytes (skipping ledger entry when the additional bytes cannot fit
+    /// current local headroom). The returned guard pins those bytes while the scratch
+    /// vectors are live; once it drops, any required charge that would fail with
+    /// `BudgetExceeded` reclaims the idle optional excess first. In eager mode, prefetch
+    /// charges and releases directly on the fast account.
+    pub(super) fn admit_prefetch_scratch(
+        &self,
+        min_bytes: u64,
+        eager_bytes: u64,
+    ) -> Result<PrefetchScratch<'_>> {
+        let Some(ledger) = self.memory.get() else {
+            return Ok(PrefetchScratch::Eager(self.charge(min_bytes)?));
+        };
+        self.check_memory_failure()?;
+        let workers = Self::decode_workers();
+        let min_need = min_bytes.saturating_mul(workers);
+        let eager_need = eager_bytes.saturating_mul(workers);
+        ledger.begin_prefetch();
+        let covered = ledger.envelope_reserved();
+        if covered >= min_need {
+            if eager_need > covered {
+                let extra = eager_need - covered;
+                if extra <= self.memory_remaining() {
+                    let _ = ledger.grow_active_prefetch(self.grant(), self.mem_limit, eager_need);
+                }
+            }
+            return Ok(PrefetchScratch::Cursor {
+                ctx: self,
+                ledger,
+                workers,
+            });
+        }
+        ledger.end_prefetch();
+
+        let remaining = self.memory_remaining();
+        if eager_need > min_need && eager_need - covered <= remaining {
+            if ledger
+                .admit_prefetch(self.grant(), self.mem_limit, eager_need)
+                .is_ok()
+            {
+                return Ok(PrefetchScratch::Cursor {
+                    ctx: self,
+                    ledger,
+                    workers,
+                });
+            }
+            let covered = ledger.envelope_reserved();
+            if covered < min_need && min_need - covered > self.memory_remaining() {
+                return Err(
+                    self.memory_exceeded(self.live_bytes().saturating_add(min_need - covered))
+                );
+            }
+        } else if min_need - covered > remaining {
+            return Err(self.memory_exceeded(self.live_bytes().saturating_add(min_need - covered)));
+        }
+        ledger.admit_prefetch(self.grant(), self.mem_limit, min_need)?;
+        Ok(PrefetchScratch::Cursor {
+            ctx: self,
+            ledger,
+            workers,
+        })
     }
 
     /// Admit transient decoding of a key of `bytes` bytes for an explicitly fallible
@@ -2082,60 +2847,80 @@ impl Ctx {
     #[inline]
     pub(super) fn reserve_decode_checked(&self, bytes: usize) -> Result<()> {
         self.check_memory_failure()?;
-        let workers = if rayon::current_thread_index().is_some() {
-            rayon::current_num_threads() as u64 + 1
-        } else {
-            1
-        };
-        let need = (bytes as u64)
-            .saturating_mul(8)
-            .saturating_add(1024)
-            .saturating_mul(workers);
+        let need = Self::decode_need(bytes);
         if self.decode.reserved.load(Ordering::Acquire) >= need {
             return Ok(());
         }
         self.grow_decode(need)
     }
 
-    /// Whether the decode envelope can refuse a key before it is rebuilt. A cursor's
-    /// callers report a refusal through the next check, and eager callers cannot.
+    /// Whether a scoped strict-decode guard is active on this context (for example,
+    /// constant folding during planning), requiring decodes to check live controls
+    /// during vocabulary reconstruction.
     #[inline]
-    fn envelope_refuses(&self) -> bool {
-        self.streams()
+    fn is_strict_decode(&self) -> bool {
+        self.strict_decode.load(Ordering::Relaxed) != 0
+    }
+
+    /// Enable strict decoding for the lifetime of the returned guard so evaluator term
+    /// and value decodes check live controls during vocabulary reconstruction.
+    pub(super) fn strict_decode_guard(&self) -> StrictDecodeGuard<'_> {
+        self.strict_decode.fetch_add(1, Ordering::AcqRel);
+        StrictDecodeGuard { ctx: self }
     }
 
     #[cold]
     #[inline(never)]
     fn grow_decode(&self, need: u64) -> Result<()> {
         let envelope = &self.decode;
-        let mut state = envelope.state.lock();
-        let (peak, owner) = &mut *state;
-        if need > *peak {
-            // A cursor's callers of `term` and `value` report a refusal through the
-            // next check, so its envelope reserves on the ledger and can fail.
-            if self.envelope_refuses() {
-                let ledger = self.memory();
-                let account = ledger.owner(self.grant.as_ref())?;
-                ledger.reserve(&account, self.mem_limit, need - *peak, true)?;
-            } else {
-                // Eager callers of `term` and `value`, the planner's plan text and the
-                // readers of a finished result among them, cannot report a refusal. An
-                // eager envelope is therefore charged when the budget and the pool allow
-                // it, and otherwise the key is decoded without it, as eager decoding
-                // always was. The next growth tries the charge again.
-                let Ok(charge) = self.charge(need - *peak) else {
-                    return Ok(());
-                };
-                let id = charge.disarm();
-                debug_assert!(owner.is_none() || id.is_none() || *owner == id);
-                if owner.is_none() {
-                    *owner = id;
-                }
+        // A refused charge is dropped after the guard, since even an empty cursor
+        // charge can synchronously wake pool waiters.
+        let charge = self.charge(0)?;
+        #[cfg(test)]
+        envelope.notify_grow_hook(DecodeGrowPoint::BeforeLock);
+        let ledger_target = {
+            let mut state = envelope.state.lock();
+            if need <= state.0 {
+                drop(state);
+                drop(charge);
+                return self.check_memory_failure();
             }
-            *peak = need;
-            envelope.reserved.store(need, Ordering::Release);
+            if let Some(ledger) = self.memory.get() {
+                let eager_paid: u64 = state.1.iter().map(|&(_, owned)| owned).sum();
+                Some((ledger, need.saturating_sub(eager_paid)))
+            } else {
+                #[cfg(test)]
+                envelope.notify_grow_hook(DecodeGrowPoint::BeforeEagerCharge);
+                let (peak, owners) = &mut *state;
+                let delta = need - *peak;
+                charge.add(delta)?;
+                if let Some(id) = charge.disarm() {
+                    if let Some((_, owned)) = owners.iter_mut().find(|(owner, _)| *owner == id) {
+                        *owned += delta;
+                    } else {
+                        owners.push((id, delta));
+                    }
+                }
+                *peak = need;
+                envelope.reserved.store(need, Ordering::Release);
+                None
+            }
+        };
+        if let Some((ledger, target)) = ledger_target {
+            #[cfg(test)]
+            envelope.notify_grow_hook(DecodeGrowPoint::AfterLedgerSnapshot);
+            // Reserve decode bytes directly on the ledger's decode envelope while
+            // `envelope.state` is unlocked so synchronous pool wakes can re-enter safely
+            // and optional cursor prefetch shares the envelope with zero extra ledger ops.
+            let account = ledger.owner(self.grant())?;
+            ledger.reserve_decode_to(&account, self.mem_limit, target)?;
+            let mut state = envelope.state.lock();
+            if need > state.0 {
+                state.0 = need;
+                envelope.reserved.store(need, Ordering::Release);
+            }
         }
-        drop(state);
+        drop(charge);
         self.check_memory_failure()
     }
 
@@ -2156,29 +2941,114 @@ impl Ctx {
     /// decoding inside the envelope. A refusal records a failure and gives `None`.
     #[inline]
     fn with_vocab_key<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
-        if !self.envelope_refuses() {
-            // An envelope that never refuses is charged after the key is rebuilt, on the
-            // vocabulary's unchecked path. Checking it before each step of the rebuild
-            // made an eager `term` about a quarter slower, which writing a large answer
-            // term by term pays for every cell.
-            return self
-                .snap
-                .generation
-                .vocab
-                .get_with(id, |key| self.reserve_decode(key.len()).then(|| f(key)))
-                .flatten();
+        let decode = |key: &[u8]| -> Result<Option<T>> {
+            id::validate_key_framing(key)?;
+            Ok(self.reserve_decode(key.len()).then(|| f(key)))
+        };
+        if self.is_strict_decode() {
+            return match self.snap.generation.vocab.get_with_controlled(
+                id,
+                |need| self.reserve_decode_checked(need),
+                |_| self.check(),
+                decode,
+            ) {
+                Ok(Some(Ok(found))) => found,
+                Ok(None) => None,
+                Ok(Some(Err(error))) | Err(error) => {
+                    self.fail_memory(&error);
+                    None
+                }
+            };
+        }
+        if self.check_memory_failure().is_err() {
+            return None;
         }
         match self.snap.generation.vocab.get_with_checked(
             id,
             |need| self.reserve_decode_checked(need),
-            |key| self.reserve_decode(key.len()).then(|| f(key)),
+            decode,
         ) {
-            Ok(found) => found.flatten(),
-            Err(error) => {
+            Ok(Some(Ok(found))) => found,
+            Ok(None) => None,
+            Ok(Some(Err(error))) | Err(error) => {
                 self.fail_memory(&error);
                 None
             }
         }
+    }
+
+    /// [`Ctx::with_vocab_key`] reusing the caller's scratch buffer across calls.
+    #[inline]
+    fn with_vocab_key_in<T>(
+        &self,
+        id: u64,
+        key: &mut Vec<u8>,
+        mut f: impl FnMut(&[u8]) -> T,
+    ) -> Option<T> {
+        if self.is_strict_decode() {
+            return self.with_vocab_key(id, f);
+        }
+        if self.check_memory_failure().is_err() {
+            return None;
+        }
+        let decode = |k: &[u8]| -> Result<Option<T>> {
+            id::validate_key_framing(k)?;
+            Ok(self.reserve_decode(k.len()).then(|| f(k)))
+        };
+        match self.snap.generation.vocab.get_with_checked_in(
+            id,
+            key,
+            |need| self.reserve_decode_checked(need),
+            decode,
+        ) {
+            Ok(Some(Ok(found))) => found,
+            Ok(None) => None,
+            Ok(Some(Err(error))) | Err(error) => {
+                self.fail_memory(&error);
+                None
+            }
+        }
+    }
+
+    /// [`Ctx::with_vocab_key_in`] without recording a sticky memory failure on refusal.
+    #[inline]
+    fn try_with_vocab_key_in<T>(
+        &self,
+        id: u64,
+        key: &mut Vec<u8>,
+        mut f: impl FnMut(&[u8]) -> T,
+    ) -> Result<Option<T>> {
+        self.check_memory_failure()?;
+        if self.is_strict_decode() {
+            self.check()?;
+            return self
+                .snap
+                .generation
+                .vocab
+                .get_with_controlled(
+                    id,
+                    |need| self.reserve_decode_checked(need),
+                    |_| self.check(),
+                    |k| {
+                        id::validate_key_framing(k)?;
+                        Ok(f(k))
+                    },
+                )
+                .and_then(|opt| opt.transpose());
+        }
+        self.snap
+            .generation
+            .vocab
+            .get_with_checked_in(
+                id,
+                key,
+                |need| self.reserve_decode_checked(need),
+                |k| {
+                    id::validate_key_framing(k)?;
+                    Ok(f(k))
+                },
+            )
+            .and_then(|opt| opt.transpose())
     }
 
     /// The row limit of intermediate results.
@@ -2260,11 +3130,11 @@ impl Ctx {
         if let Some(checked) = self.fast_admit(bytes, false) {
             return checked;
         }
-        let owner = self.memory().owner(self.grant.as_ref())?;
+        let owner = self.memory().owner(self.grant())?;
         self.memory().check_output(&owner, self.mem_limit, bytes)
     }
 
-    pub(super) fn check_output_rows(&self, rows: usize) -> Result<()> {
+    pub(crate) fn check_output_rows(&self, rows: usize) -> Result<()> {
         self.check_rows(rows)?;
         if self.max_rows_produced != u64::MAX {
             let total = self
@@ -2282,7 +3152,7 @@ impl Ctx {
     /// context also retains its admitted pool peak until the context drops.
     pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
         let ledger = self.memory();
-        let owner = ledger.owner(self.grant.as_ref())?;
+        let owner = ledger.owner(self.grant())?;
         ledger.reserve(&owner, self.mem_limit, bytes, false)?;
         Ok(QueryMemoryLease {
             ledger: ledger.clone(),
@@ -2315,10 +3185,8 @@ impl Ctx {
         }
         let fast = match self.memory.get() {
             Some(_) => None,
-            None => match self.fast.grant.get() {
-                Some(Some(_)) => Some(self.fast.eager.load(Ordering::Acquire)),
-                _ => return Ok(()),
-            },
+            None if self.grant().is_some() => Some(self.fast.eager.load(Ordering::Acquire)),
+            None => return Ok(()),
         };
         // The output columns hold no lease, so the result keeps them on top of the
         // live charges.
@@ -2449,21 +3317,33 @@ impl Ctx {
 
     // ---------------------------------------------------------------- terms ------
 
+    /// Fallible variant of [`Ctx::intern_term`] that returns memory refusals without
+    /// latching [`Ctx::memory_failure`].
+    pub(crate) fn try_intern_term(&self, t: &Term) -> Result<Id> {
+        if let Term::BlankNode(b) = t {
+            return match id::parse_bnode_payload(b.as_str()) {
+                Some(p) => Ok(Id::bnode(p)),
+                None => self.try_outside_bnode(b.as_str()),
+            };
+        }
+        if let Some(id) = id::inline_id(t) {
+            return Ok(id);
+        }
+        let key = id::term_key(t);
+        self.try_intern_key(&key)
+    }
+
     /// The id of a term this query decoded from one of its own ids: stored id if the
     /// term exists in the store, else a local id. A blank node label written by
     /// [`bnode_for`] maps back to its id, a stored node's or one this query minted.
     pub fn intern_term(&self, t: &Term) -> Id {
-        if let Term::BlankNode(b) = t {
-            return match id::parse_bnode_payload(b.as_str()) {
-                Some(p) => Id::bnode(p),
-                None => self.outside_bnode(b.as_str()),
-            };
+        match self.try_intern_term(t) {
+            Ok(id) => id,
+            Err(error) => {
+                self.fail_memory(&error);
+                Id::UNDEF
+            }
         }
-        if let Some(id) = id::inline_id(t) {
-            return id;
-        }
-        let key = id::term_key(t);
-        self.intern_key(&key)
     }
 
     /// A literal written in the query text. A blank node label inside a composite literal
@@ -2553,18 +3433,27 @@ impl Ctx {
             .map(|(k, _)| k.clone())
     }
 
-    /// A blank node of this query for a label from outside it.
-    fn outside_bnode(&self, label: &str) -> Id {
+    /// Fallible variant of [`Ctx::outside_bnode`].
+    fn try_outside_bnode(&self, label: &str) -> Result<Id> {
         let mut memo = self.outside_bnodes.lock();
         if let Some(&id) = memo.get(label) {
-            return id;
+            return Ok(id);
         }
-        if !self.retain_bytes(label.len() as u64 + 128) {
-            return Id::UNDEF;
-        }
+        self.try_retain_bytes(label.len() as u64 + 128)?;
         let id = self.fresh_bnode();
         memo.insert(label.to_string(), id);
-        id
+        Ok(id)
+    }
+
+    /// A blank node of this query for a label from outside it.
+    fn outside_bnode(&self, label: &str) -> Id {
+        match self.try_outside_bnode(label) {
+            Ok(id) => id,
+            Err(error) => {
+                self.fail_memory(&error);
+                Id::UNDEF
+            }
+        }
     }
 
     /// Id for a graph name, mapping Jena's special default-graph IRI.
@@ -2582,21 +3471,148 @@ impl Ctx {
         id.tag() == Tag::Local && !self.local_facts
     }
 
-    pub fn intern_key(&self, key: &[u8]) -> Id {
+    /// Fallible variant of [`Ctx::intern_key`] that returns memory refusals without
+    /// latching [`Ctx::memory_failure`].
+    pub(crate) fn try_intern_key(&self, key: &[u8]) -> Result<Id> {
         if let Some(id) = self.snap.lookup_key(key) {
-            return id;
+            return Ok(id);
         }
         if let Some(i) = self.local.read().find(key) {
-            return Id::local(i);
+            return Ok(Id::local(i));
         }
         let mut local = self.local.write();
         if let Some(i) = local.find(key) {
-            return Id::local(i);
+            return Ok(Id::local(i));
         }
-        if !self.retain_bytes(key.len() as u64 + 96) {
-            return Id::UNDEF;
+        let add = key.len() as u64 + 96;
+        self.try_retain_bytes(add)?;
+        let id = Id::local(local.insert(key).0);
+        let covered = self.local_retained.load(Ordering::Acquire);
+        self.local_retained
+            .store(covered.saturating_add(add), Ordering::Release);
+        Ok(id)
+    }
+
+    pub fn intern_key(&self, key: &[u8]) -> Id {
+        match self.try_intern_key(key) {
+            Ok(id) => id,
+            Err(error) => {
+                self.fail_memory(&error);
+                Id::UNDEF
+            }
         }
-        Id::local(local.insert(key).0)
+    }
+
+    /// Look up or intern an already-encoded vocabulary key, pre-admitting decompression
+    /// scratch and local-vocabulary growth peaks (simultaneous old and new hash tables or
+    /// key-pointer buffers during resize) and reconciling against retained physical
+    /// capacities afterward.
+    pub(crate) fn intern_key_checked(&self, key: &[u8]) -> Result<Id> {
+        self.check()?;
+        let vocab_scratch = self.charge(0)?;
+        if let Ok(i) = self.snap.generation.vocab.find_with_checked(key, |need| {
+            let bytes = u64::try_from(need)
+                .ok()
+                .and_then(|n| n.checked_mul(2))
+                .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+            vocab_scratch.resize(bytes)
+        })? {
+            return Ok(Id::vocab(i));
+        }
+        drop(vocab_scratch);
+        if let Some(i) = self
+            .snap
+            .generation
+            .dvocab
+            .find(key)
+            .filter(|&i| i < self.snap.dvocab_len)
+        {
+            return Ok(Id::delta(i));
+        }
+        if let Some(i) = self.local.read().find(key) {
+            return Ok(Id::local(i));
+        }
+        let mut local = self.local.write();
+        if let Some(i) = local.find(key) {
+            return Ok(Id::local(i));
+        }
+        let covered = self.local_retained.load(Ordering::Acquire);
+        let peak = local
+            .insert_peak_bytes(key.len())
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        let transient = peak.saturating_sub(covered);
+        let growth_charge = if transient > 0 {
+            Some(self.charge(transient)?)
+        } else {
+            None
+        };
+        let (id, _) = local.insert(key);
+        let after = local.physical_bytes();
+        let retain_delta = after.saturating_sub(covered);
+        if retain_delta > 0 {
+            let from_source = growth_charge
+                .as_ref()
+                .map_or(0, |charge| charge.bytes().min(retain_delta));
+            if from_source > 0 {
+                self.retain_from_charge(
+                    from_source,
+                    growth_charge
+                        .as_ref()
+                        .expect("pre-admitted growth charge for retained transfer"),
+                );
+            }
+            let rem = retain_delta - from_source;
+            debug_assert_eq!(
+                rem, 0,
+                "insert_peak_bytes must cover post-insert physical_bytes"
+            );
+            if rem > 0 {
+                drop(growth_charge);
+                if !self.retain_bytes(rem) {
+                    self.local_retained
+                        .store(covered.saturating_add(from_source), Ordering::Release);
+                    return Err(self.check_memory_failure().err().unwrap_or_else(|| {
+                        self.memory_exceeded(self.live_bytes().saturating_add(rem))
+                    }));
+                }
+                self.local_retained
+                    .store(covered.saturating_add(retain_delta), Ordering::Release);
+                return Ok(Id::local(id));
+            }
+            self.local_retained
+                .store(covered.saturating_add(retain_delta), Ordering::Release);
+        }
+        drop(growth_charge);
+        Ok(Id::local(id))
+    }
+
+    /// Intern a simple `xsd:string` literal directly from a borrowed lexical value,
+    /// pre-admitting the temporary key buffer before encoding so no intermediate
+    /// `Arc<str>` or `oxrdf::Literal` is allocated outside the query budget.
+    pub(crate) fn intern_simple_str_checked(&self, s: &str) -> Result<Id> {
+        let key_len = s
+            .len()
+            .checked_add(2)
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        let _scratch = self.charge(key_len as u64)?;
+        let mut key = Vec::with_capacity(key_len);
+        id::write_literal_ref_key(oxrdf::LiteralRef::new_simple_literal(s), &mut key);
+        debug_assert_eq!(key.len(), key_len);
+        self.intern_key_checked(&key)
+    }
+
+    /// Intern an IRI directly from a borrowed string, pre-admitting the temporary key
+    /// buffer before encoding.
+    pub(crate) fn intern_iri_checked(&self, iri: &str) -> Result<Id> {
+        let key_len = iri
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        let _scratch = self.charge(key_len as u64)?;
+        let mut key = Vec::with_capacity(key_len);
+        key.push(b'<');
+        key.extend_from_slice(iri.as_bytes());
+        self.intern_key_checked(&key)
     }
 
     /// SERVICE-created encoded terms retain the existing key-byte estimate in eager
@@ -2640,34 +3656,52 @@ impl Ctx {
         }
         let id = Id::local(local.insert(key).0);
         std::mem::forget(charge);
+        let covered = self.local_retained.load(Ordering::Acquire);
+        self.local_retained
+            .store(covered.saturating_add(estimate), Ordering::Release);
         Ok(id)
     }
 
-    pub fn intern_value(&self, v: &Value) -> Id {
+    /// Fallible variant of [`Ctx::intern_value`] that returns memory refusals without
+    /// latching [`Ctx::memory_failure`].
+    pub(crate) fn try_intern_value(&self, v: &Value) -> Result<Id> {
         match v {
-            Value::Bool(b) => Id::from_bool(*b),
+            Value::Bool(b) => Ok(Id::from_bool(*b)),
             Value::Integer(i) => match Id::from_i64(i64::from(*i)) {
-                Some(id) => id,
-                None => self.intern_term(&v.to_term()),
+                Some(id) => Ok(id),
+                None => self.try_intern_term(&v.to_term()),
             },
             // The canonical form of a decimal value parses back to the same value, so
             // its inline id needs neither the text nor the parse of `intern_term`.
             Value::Decimal(d) => match id::pack_decimal(*d) {
-                Some(p) => Id::new(Tag::Decimal, p),
-                None => self.intern_term(&v.to_term()),
+                Some(p) => Ok(Id::new(Tag::Decimal, p)),
+                None => self.try_intern_term(&v.to_term()),
             },
-            _ => self.intern_term(&v.to_term()),
+            _ => self.try_intern_term(&v.to_term()),
+        }
+    }
+
+    pub fn intern_value(&self, v: &Value) -> Id {
+        match self.try_intern_value(v) {
+            Ok(id) => id,
+            Err(error) => {
+                self.fail_memory(&error);
+                Id::UNDEF
+            }
         }
     }
 
     /// Take the local terms and minted blank nodes of `other`, so that this context reads
     /// the ids `other` gave them (a query that reads a view with derived facts).
     pub(crate) fn share_local(&self, other: &Ctx) {
-        let local = other.local.read().clone();
+        let local = other.local.read().clone_owned();
         // The copy is this context's own, so it is charged here, and a refusal fails the
         // next check.
-        self.retain_bytes(local.bytes() as u64);
-        *self.local.write() = local;
+        let bytes = local.bytes() as u64;
+        self.retain_bytes(bytes);
+        let mut dst = self.local.write();
+        *dst = LocalVocab::Owned(local);
+        self.local_retained.store(bytes, Ordering::Release);
         self.next_bnode
             .store(other.next_bnode.load(Ordering::Relaxed), Ordering::Relaxed);
     }
@@ -2703,22 +3737,307 @@ impl Ctx {
         }
     }
 
+    fn decode_local_infallible<T>(
+        &self,
+        payload: u64,
+        mut decode: impl FnMut(&[u8]) -> T,
+    ) -> Option<T> {
+        if self.is_strict_decode()
+            && let Err(error) = self.check()
+        {
+            self.fail_memory(&error);
+            return None;
+        }
+        enum Fast<T> {
+            Done(T),
+            NeedGrow(usize),
+            Corrupt(Error),
+        }
+        let fast = {
+            let local = self.local.read();
+            let key = local.get(payload)?;
+            if self.decode_envelope_covers(key.len()) {
+                match id::validate_key_framing(key) {
+                    Ok(()) => Fast::Done(decode(key)),
+                    Err(error) => Fast::Corrupt(error),
+                }
+            } else {
+                Fast::NeedGrow(key.len())
+            }
+        };
+        match fast {
+            Fast::Done(val) => Some(val),
+            Fast::Corrupt(error) => {
+                self.fail_memory(&error);
+                None
+            }
+            Fast::NeedGrow(len) => {
+                if !self.reserve_decode(len) {
+                    return None;
+                }
+                let res = {
+                    let local = self.local.read();
+                    let key = local.get(payload)?;
+                    id::validate_key_framing(key).map(|()| decode(key))
+                };
+                match res {
+                    Ok(val) => Some(val),
+                    Err(error) => {
+                        self.fail_memory(&error);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    fn decode_delta_infallible<T>(
+        &self,
+        payload: u64,
+        mut decode: impl FnMut(&[u8]) -> T,
+    ) -> Option<T> {
+        if payload >= self.snap.dvocab_len {
+            return None;
+        }
+        if self.is_strict_decode()
+            && let Err(error) = self.check()
+        {
+            self.fail_memory(&error);
+            return None;
+        }
+        enum Fast<T> {
+            Done(T),
+            NeedGrow(usize),
+            Corrupt(Error),
+        }
+        let fast = self.snap.generation.dvocab.with(|vocab| {
+            let key = vocab.get(payload)?;
+            Some(if self.decode_envelope_covers(key.len()) {
+                match id::validate_key_framing(key) {
+                    Ok(()) => Fast::Done(decode(key)),
+                    Err(error) => Fast::Corrupt(error),
+                }
+            } else {
+                Fast::NeedGrow(key.len())
+            })
+        })?;
+        match fast {
+            Fast::Done(val) => Some(val),
+            Fast::Corrupt(error) => {
+                self.fail_memory(&error);
+                None
+            }
+            Fast::NeedGrow(len) => {
+                if !self.reserve_decode(len) {
+                    return None;
+                }
+                let res = self.snap.generation.dvocab.with(|vocab| {
+                    let key = vocab.get(payload)?;
+                    Some(id::validate_key_framing(key).map(|()| decode(key)))
+                })?;
+                match res {
+                    Ok(val) => Some(val),
+                    Err(error) => {
+                        self.fail_memory(&error);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
     pub fn term(&self, id: Id) -> Option<Term> {
         match id.tag() {
-            Tag::Local => {
-                let local = self.local.read();
-                let key = local.get(id.payload())?;
-                self.reserve_decode(key.len()).then(|| id::key_to_term(key))
-            }
-            Tag::Vocab => self.with_vocab_key(id.payload(), id::key_to_term),
-            Tag::Delta => self.snap.generation.dvocab.with(|vocab| {
-                vocab
-                    .get(id.payload())
-                    .and_then(|key| self.reserve_decode(key.len()).then(|| id::key_to_term(key)))
-            }),
+            Tag::Local => self.decode_local_infallible(id.payload(), copied_output_key),
+            Tag::Vocab => self.with_vocab_key(id.payload(), copied_output_key),
+            Tag::Delta => self.decode_delta_infallible(id.payload(), copied_output_key),
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
             _ => self.snap.term(id),
         }
+    }
+
+    #[inline]
+    fn checked_decode_bytes(len: usize) -> u64 {
+        (len as u64).saturating_mul(8).saturating_add(128)
+    }
+
+    /// Decode an id into an RDF term, checking live request controls and charging the
+    /// owned decoded bytes onto `credit` so output credit stays alive with its owner.
+    /// Vocabulary reconstruction scratch is charged separately while the key is rebuilt.
+    pub(crate) fn term_checked_into(&self, id: Id, credit: &Charge<'_>) -> Result<Option<Term>> {
+        assert!(
+            credit.belongs_to(self),
+            "decode credit belongs to its query"
+        );
+        self.check()?;
+        match id.tag() {
+            Tag::Undef | Tag::Special => Ok(None),
+            Tag::Local => {
+                let len = self
+                    .local
+                    .read()
+                    .get(id.payload())
+                    .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                    .transpose()?;
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                credit.add(Self::checked_decode_bytes(len))?;
+                self.check()?;
+                Ok(self.local.read().get(id.payload()).map(copied_output_key))
+            }
+            Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| {
+                id::validate_key_framing(key)?;
+                credit.add(Self::checked_decode_bytes(key.len()))?;
+                self.check()?;
+                Ok(copied_output_key(key))
+            }),
+            Tag::Delta => {
+                if id.payload() >= self.snap.dvocab_len {
+                    return Ok(None);
+                }
+                let len = self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|vocab| {
+                        vocab
+                            .get(id.payload())
+                            .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                    })
+                    .transpose()?;
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                credit.add(Self::checked_decode_bytes(len))?;
+                self.check()?;
+                Ok(self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|vocab| vocab.get(id.payload()).map(copied_output_key)))
+            }
+            Tag::BNode => {
+                credit.add(Self::checked_decode_bytes(0))?;
+                Ok(Some(Term::BlankNode(bnode_for(id))))
+            }
+            _ => {
+                let term = self.snap.term(id);
+                if term.is_some() {
+                    credit.add(Self::checked_decode_bytes(0))?;
+                }
+                Ok(term)
+            }
+        }
+    }
+
+    /// Decode one transient RDF term under live request controls and the query's memory
+    /// budget, propagating any memory or control refusal with its original error instead
+    /// of returning `None`. Callers that retain or decode multiple terms together should
+    /// pass a live [`Charge`] to [`Ctx::term_checked_into`].
+    pub fn term_checked(&self, id: Id) -> Result<Option<Term>> {
+        let decode = self.charge(0)?;
+        self.term_checked_into(id, &decode)
+    }
+
+    /// Decode an id into a value, checking live request controls and charging the owned
+    /// decoded bytes onto `credit` so output credit stays alive with its owner.
+    /// Vocabulary reconstruction scratch and optional value-cache admission stay separate.
+    pub(crate) fn value_checked_into(&self, id: Id, credit: &Charge<'_>) -> Result<Option<Value>> {
+        assert!(
+            credit.belongs_to(self),
+            "decode credit belongs to its query"
+        );
+        self.check()?;
+        match id.tag() {
+            Tag::Undef | Tag::Special => Ok(None),
+            Tag::Int => Ok(Some(Value::Integer(id.as_i64().into()))),
+            Tag::Bool => Ok(Some(Value::Bool(id.as_bool()))),
+            Tag::Double => Ok(Some(Value::Double(id.as_f64().into()))),
+            Tag::Decimal => Ok(Some(Value::Decimal(id::unpack_decimal(id.payload())))),
+            Tag::DateTime | Tag::Date => {
+                Ok(id::inline_to_literal(id).map(|l| Value::from_literal(&l)))
+            }
+            Tag::BNode => {
+                credit.add(Self::checked_decode_bytes(0))?;
+                Ok(Some(Value::BNode(bnode_for(id).as_str().into())))
+            }
+            _ => {
+                if id.tag() == Tag::Vocab
+                    && let Some(v) = self.column_value(id.payload())
+                {
+                    return Ok(Some(v));
+                }
+                if let Some(v) = self.values.get(id) {
+                    return Ok(Some(v));
+                }
+                let v = match id.tag() {
+                    Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| {
+                        id::validate_key_framing(key)?;
+                        credit.add(Self::checked_decode_bytes(key.len()))?;
+                        self.check()?;
+                        Ok(decode_value_key(key))
+                    })?,
+                    Tag::Delta => {
+                        if id.payload() >= self.snap.dvocab_len {
+                            return Ok(None);
+                        }
+                        let len = self
+                            .snap
+                            .generation
+                            .dvocab
+                            .with(|v| {
+                                v.get(id.payload())
+                                    .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                            })
+                            .transpose()?;
+                        match len {
+                            Some(len) => {
+                                credit.add(Self::checked_decode_bytes(len))?;
+                                self.check()?;
+                                self.snap
+                                    .generation
+                                    .dvocab
+                                    .with(|v| v.get(id.payload()).map(decode_value_key))
+                            }
+                            None => None,
+                        }
+                    }
+                    Tag::Local => {
+                        let len = self
+                            .local
+                            .read()
+                            .get(id.payload())
+                            .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                            .transpose()?;
+                        match len {
+                            Some(len) => {
+                                credit.add(Self::checked_decode_bytes(len))?;
+                                self.check()?;
+                                self.local.read().get(id.payload()).map(decode_value_key)
+                            }
+                            None => None,
+                        }
+                    }
+                    _ => unreachable!("dictionary value tag"),
+                };
+                if let Some(v) = v {
+                    self.cache_value(id, &v);
+                    Ok(Some(v))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Decode one transient value under live request controls and the query's memory
+    /// budget, propagating any memory or control refusal with its original error instead
+    /// of returning `None`. Callers that retain or decode multiple values together should
+    /// pass a live [`Charge`] to [`Ctx::value_checked_into`].
+    pub(crate) fn value_checked(&self, id: Id) -> Result<Option<Value>> {
+        let decode = self.charge(0)?;
+        self.value_checked_into(id, &decode)
     }
 
     /// Decode one retained output cell after admitting its owned payload. Unlike the
@@ -2742,7 +4061,7 @@ impl Ctx {
                     .local
                     .read()
                     .get(id.payload())
-                    .map(|key| output_key_bytes(self, key, 0))
+                    .map(|key| output_key_bytes(self, key))
                     .transpose()?;
                 match bytes {
                     None => None,
@@ -2760,7 +4079,7 @@ impl Ctx {
                     .with(|vocab| {
                         vocab
                             .get(id.payload())
-                            .map(|key| output_key_bytes(self, key, 0))
+                            .map(|key| output_key_bytes(self, key))
                     })
                     .transpose()?;
                 match bytes {
@@ -2836,7 +4155,7 @@ impl Ctx {
                     .local
                     .read()
                     .get(id.payload())
-                    .map(|key| output_key_bytes(self, key, 0))
+                    .map(|key| output_key_bytes(self, key))
                     .transpose()?;
                 if let Some(bytes) = bytes {
                     row.add(bytes)?;
@@ -2853,7 +4172,7 @@ impl Ctx {
                     .with(|vocab| {
                         vocab
                             .get(id.payload())
-                            .map(|key| output_key_bytes(self, key, 0))
+                            .map(|key| output_key_bytes(self, key))
                     })
                     .transpose()?;
                 if let Some(bytes) = bytes {
@@ -2980,7 +4299,7 @@ impl Ctx {
         }
         let decode = || {
             self.check()?;
-            storage.add(output_key_bytes(self, key, 0)?)?;
+            storage.add(output_key_bytes(self, key)?)?;
             #[cfg(test)]
             {
                 use crate::algo::memory::probe;
@@ -3025,6 +4344,57 @@ impl Ctx {
             },
             f,
         )
+    }
+
+    /// Reconstruct one base vocabulary key with query-owned scratch credit and live
+    /// request-control checkpoints. Twice the requested size covers old and new buffers
+    /// during reallocation.
+    pub(super) fn with_controlled_vocab_key<T>(
+        &self,
+        id: u64,
+        mut f: impl FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        self.check()?;
+        let scratch = self.charge(0)?;
+        let mut reserved = 0;
+        self.snap
+            .generation
+            .vocab
+            .get_with_controlled(
+                id,
+                |need| {
+                    let bytes = (need as u64).saturating_mul(2);
+                    scratch.add(bytes.saturating_sub(reserved))?;
+                    reserved = bytes;
+                    Ok(())
+                },
+                |_| self.check(),
+                &mut f,
+            )?
+            .transpose()
+    }
+
+    /// Inspect the borrowed vocabulary key of `id` across base, delta, and query-local
+    /// vocabularies with live request controls and query-owned scratch admission.
+    /// `f` must only inspect the borrowed bytes and must not call `ctx.charge()` or
+    /// `ctx.check()`, because delta and local closures run under vocabulary locks.
+    pub(crate) fn with_controlled_key<T>(
+        &self,
+        id: Id,
+        mut f: impl FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        self.check()?;
+        match id.tag() {
+            Tag::Vocab => self.with_controlled_vocab_key(id.payload(), f),
+            Tag::Delta => self.snap.generation.dvocab.with(|v| {
+                if id.payload() >= self.snap.dvocab_len {
+                    return Ok(None);
+                }
+                v.get(id.payload()).map(&mut f).transpose()
+            }),
+            Tag::Local => self.with_local_key(id.payload(), &mut f).transpose(),
+            _ => Ok(None),
+        }
     }
 
     /// Algorithm-owned key reconstruction never populates the eager value cache.
@@ -3114,8 +4484,8 @@ impl Ctx {
         mut cover: impl FnMut(u64) -> Result<()>,
     ) -> Result<Option<Term>> {
         let mut decode = |key: &[u8]| -> Result<Option<Term>> {
-            cover((key.len() as u64).saturating_mul(8).saturating_add(128))?;
-            Ok(Some(id::key_to_term(key)))
+            cover(self.batch_key_decode_bytes(key)?)?;
+            Ok(Some(copied_output_key(key)))
         };
         match id.tag() {
             Tag::Local => self.local.read().get(id.payload()).map_or(Ok(None), decode),
@@ -3135,20 +4505,37 @@ impl Ctx {
         }
     }
 
+    fn batch_key_decode_bytes(&self, key: &[u8]) -> Result<u64> {
+        let envelope = (key.len() as u64).saturating_mul(8).saturating_add(128);
+        if id::is_key_triple(key) {
+            // Compact triple keys can hide a component vector and boxed triple
+            // at each level, even when there is very little lexical text, while
+            // wide triple terms still need the legacy eightfold envelope floor.
+            Ok(output_key_bytes(self, key)?.max(envelope))
+        } else {
+            Ok(envelope)
+        }
+    }
+
     pub(super) fn decoded_bytes(&self, id: Id) -> Result<u64> {
-        let size = match id.tag() {
-            Tag::Local => self.local.read().get(id.payload()).map_or(0, <[u8]>::len),
-            Tag::Vocab => self
-                .with_cursor_vocab_key(id.payload(), <[u8]>::len)?
-                .unwrap_or(0),
-            Tag::Delta => self
-                .snap
-                .generation
-                .dvocab
-                .with(|v| v.get(id.payload()).map_or(0, <[u8]>::len)),
-            _ => 0,
+        self.check()?;
+        let size = |key: &[u8]| self.batch_key_decode_bytes(key);
+        let bytes = match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map(size),
+            Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| Ok(size(key)))?,
+            Tag::Delta => {
+                if id.payload() >= self.snap.dvocab_len {
+                    None
+                } else {
+                    self.snap
+                        .generation
+                        .dvocab
+                        .with(|v| v.get(id.payload()).map(size))
+                }
+            }
+            _ => None,
         };
-        Ok((size as u64).saturating_mul(8).saturating_add(128))
+        bytes.unwrap_or(Ok(128))
     }
 
     /// The value of a base vocabulary id from the numeric column, when it holds one.
@@ -3162,26 +4549,66 @@ impl Ctx {
     /// Inline and numeric-column values keep their existing paths. Dictionary
     /// reconstruction and admitted decoding retain the same owner and charges.
     pub(super) fn cursor_value_checked(&self, id: Id) -> Result<Option<Value>> {
-        self.check_memory_failure()?;
-        let decode = |key: &[u8]| -> Result<Value> {
-            self.reserve_decode_checked(key.len())?;
-            Ok(Value::from_key(key))
-        };
+        self.check()?;
         match id.tag() {
+            Tag::Undef | Tag::Special => Ok(None),
+            Tag::Int => Ok(Some(Value::Integer(id.as_i64().into()))),
+            Tag::Bool => Ok(Some(Value::Bool(id.as_bool()))),
+            Tag::Double => Ok(Some(Value::Double(id.as_f64().into()))),
+            Tag::Decimal => Ok(Some(Value::Decimal(id::unpack_decimal(id.payload())))),
+            Tag::DateTime | Tag::Date => {
+                Ok(id::inline_to_literal(id).map(|l| Value::from_literal(&l)))
+            }
+            Tag::BNode => Ok(Some(Value::BNode(bnode_for(id).as_str().into()))),
             Tag::Vocab => {
                 if let Some(value) = self.column_value(id.payload()) {
                     return Ok(Some(value));
                 }
-                self.with_cursor_vocab_key(id.payload(), decode)?
-                    .transpose()
+                self.with_controlled_vocab_key(id.payload(), |key| {
+                    id::validate_key_framing(key)?;
+                    self.reserve_decode_checked(key.len())?;
+                    self.check()?;
+                    Ok(decode_value_key(key))
+                })
             }
-            Tag::Delta => self
-                .snap
-                .generation
-                .dvocab
-                .with(|v| v.get(id.payload()).map(decode).transpose()),
-            Tag::Local => self.with_local_key(id.payload(), decode).transpose(),
-            _ => Ok(self.value(id)),
+            Tag::Delta => {
+                if id.payload() >= self.snap.dvocab_len {
+                    return Ok(None);
+                }
+                let len = self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|v| {
+                        v.get(id.payload())
+                            .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                    })
+                    .transpose()?;
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                self.reserve_decode_checked(len)?;
+                self.check()?;
+                Ok(self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(decode_value_key)))
+            }
+            Tag::Local => {
+                let len = self
+                    .local
+                    .read()
+                    .get(id.payload())
+                    .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                    .transpose()?;
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                self.reserve_decode_checked(len)?;
+                self.check()?;
+                Ok(self.local.read().get(id.payload()).map(decode_value_key))
+            }
         }
     }
 
@@ -3206,16 +4633,10 @@ impl Ctx {
                 if let Some(v) = self.values.get(id) {
                     return Some(v);
                 }
-                let decode =
-                    |key: &[u8]| self.reserve_decode(key.len()).then(|| Value::from_key(key));
                 let v = match id.tag() {
-                    Tag::Vocab => self.with_vocab_key(id.payload(), Value::from_key),
-                    Tag::Delta => self
-                        .snap
-                        .generation
-                        .dvocab
-                        .with(|v| v.get(id.payload()).and_then(decode)),
-                    Tag::Local => self.local.read().get(id.payload()).and_then(decode),
+                    Tag::Vocab => self.with_vocab_key(id.payload(), decode_value_key),
+                    Tag::Delta => self.decode_delta_infallible(id.payload(), decode_value_key),
+                    Tag::Local => self.decode_local_infallible(id.payload(), decode_value_key),
                     _ => unreachable!("dictionary value tag"),
                 }?;
                 self.cache_value(id, &v);
@@ -3270,7 +4691,7 @@ impl Ctx {
     /// bytes. A small budget takes small steps, so that the slack of the steps never
     /// holds more than a sixty-fourth of it.
     #[inline]
-    pub(super) fn reservation_step(&self) -> u64 {
+    pub(crate) fn reservation_step(&self) -> u64 {
         (self.mem_limit / 64).clamp(256, EAGER_STEP)
     }
 
@@ -3290,11 +4711,24 @@ impl Ctx {
         if used <= reserved {
             return Ok(());
         }
+        let need = used - reserved;
         let step = self.reservation_step();
-        let ahead = used.next_multiple_of(step).min(cap).max(used);
+        // When a required (`exact`) reservation grows under tight remaining budget, cap
+        // speculative lookahead slack so a small interning charge cannot swallow the
+        // headroom left for batch publication or row decoding.
+        let ahead = if exact && self.mem_limit < u64::MAX {
+            let avail = self.mem_limit.saturating_sub(self.live_bytes());
+            let slack = step.min(avail.saturating_sub(need) / 4);
+            used.next_multiple_of(step)
+                .min(used.saturating_add(slack))
+                .min(cap)
+                .max(used)
+        } else {
+            used.next_multiple_of(step).min(cap).max(used)
+        };
         let (charge, admitted) = match self.charge(ahead - reserved) {
             Ok(charge) => (charge, ahead),
-            Err(_) if exact && ahead > used => (self.charge(used - reserved)?, used),
+            Err(_) if exact && ahead > used => (self.charge(need)?, used),
             Err(error) => return Err(error),
         };
         let id = charge.disarm();
@@ -3327,7 +4761,11 @@ impl Ctx {
                     TermKind::Literal
                 }
             }
-            Tag::Delta => self.snap.key(id).map_or(TermKind::None, |k| key_kind(&k)),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|d| d.get(id.payload()).map_or(TermKind::None, key_kind)),
             Tag::Local => self
                 .local
                 .read()
@@ -3341,40 +4779,52 @@ impl Ctx {
     /// literal's key is `"` lexical 0xFF, and UTF-8 byte order is code point order.
     /// `None` when either id is another kind of term.
     pub(super) fn simple_literal_cmp(&self, a: Id, b: Id) -> Option<std::cmp::Ordering> {
+        self.simple_literal_cmp_in(a, b, &mut FloorScratch::default())
+    }
+
+    /// [`Ctx::simple_literal_cmp`] reusing the caller's scratch buffers across calls.
+    /// Checks and decodes `a` before `b` so a cursor's memory refusal on the left operand
+    /// is recorded even when the right operand is not a base-vocabulary simple literal.
+    #[inline]
+    pub(super) fn simple_literal_cmp_in(
+        &self,
+        a: Id,
+        b: Id,
+        scratch: &mut FloorScratch,
+    ) -> Option<std::cmp::Ordering> {
+        if a.tag() != Tag::Vocab {
+            return None;
+        }
         let v = &self.snap.generation.vocab;
-        let (x, y) = (a.payload(), b.payload());
+        let first_triple = v.first_triple();
+        let x = a.payload();
         // the literals come before the triple terms and the IRIs
-        if x >= v.first_triple() || y >= v.first_triple() {
+        if x >= first_triple {
             return None;
         }
         let lexical = |k: &[u8]| -> Option<std::ops::Range<usize>> {
             (k.len() >= 2 && k[0] == b'"' && k[k.len() - 1] == id::KEY_SEP).then(|| 1..k.len() - 1)
         };
-        // The reconstruction of both keys is reserved before it grows them, within the
-        // high-water envelope of transient decoding ([`Ctx::reserve_decode`]). That
-        // envelope covers a key of the largest size seen so far on every worker, both
-        // keys of a comparison included, is charged once when it grows and is released
-        // when the work ends, so a comparison of keys within it takes no lock. A
-        // reservation that fails records the failure, and the generic comparison
-        // follows.
-        let reserve = |need: usize| {
-            if self.reserve_decode(need) {
-                Ok(())
-            } else {
-                Err(())
-            }
-        };
-        let order = v.get_with_checked(x, reserve, |kx| {
+        let FloorScratch { key, other } = scratch;
+        self.with_vocab_key_in(x, key, |kx| {
             let rx = lexical(kx)?;
-            v.get_with_checked(y, reserve, |ky| {
+            if a == b {
+                return Some(std::cmp::Ordering::Equal);
+            }
+            if b.tag() != Tag::Vocab {
+                return None;
+            }
+            let y = b.payload();
+            if y >= first_triple {
+                return None;
+            }
+            self.with_vocab_key_in(y, other, |ky| {
                 let ry = lexical(ky)?;
                 Some(kx[rx.clone()].cmp(&ky[ry]))
             })
-            .ok()
             .flatten()
-            .flatten()
-        });
-        order.ok().flatten().flatten()
+        })
+        .flatten()
     }
 
     /// For a base-vocabulary simple literal, the first base id whose key starts with its
@@ -3387,92 +4837,110 @@ impl Ctx {
     /// is below `b`'s floor, since the keys between `b`'s floor and `b` all start with
     /// `b`'s lexical form.
     ///
-    /// Both keys it reads and the search for the floor decode inside the envelope
+    /// Key reconstruction and the search for the floor use the decoding envelope
     /// ([`Ctx::reserve_decode`]), so a cursor reserves them on the ledger. A refusal
     /// records a failure, which the next check reports, and gives `None`.
+    #[cfg(test)]
     pub(super) fn string_floor(&self, id: Id) -> Option<u64> {
+        self.string_floor_in(id, &mut FloorScratch::default())
+    }
+
+    /// Compute [`Ctx::string_floor`] reusing the caller's scratch buffers without recording
+    /// a sticky memory failure on decoding-envelope refusal. Returns `Ok(Some(floor))` for a
+    /// base-vocabulary simple literal, `Ok(None)` for any other id, or `Err` when the
+    /// cursor's decoding envelope refuses reconstruction or a prior memory failure is
+    /// already recorded.
+    #[inline]
+    pub(super) fn try_string_floor_in(
+        &self,
+        id: Id,
+        scratch: &mut FloorScratch,
+    ) -> Result<Option<u64>> {
         if id.tag() != Tag::Vocab {
-            return None;
+            return Ok(None);
         }
         let v = &self.snap.generation.vocab;
         let p = id.payload();
         if p >= v.first_triple() {
-            return None;
+            return Ok(None);
         }
-        self.with_vocab_key_prev(p, |prev, key| {
-            if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
-                return None;
-            }
-            let prefix = &key[..key.len() - 1];
-            // Most strings extend none, which the key before them shows by not starting
-            // with them. That key comes from the same walk of the block, or is read on its
-            // own when it starts a block or is long.
-            let extended = match prev {
-                Some(k) => k.starts_with(prefix),
-                None if p == 0 => false,
-                None => self.with_vocab_key(p - 1, |k| k.starts_with(prefix))?,
-            };
-            if !extended {
-                return Some(p);
-            }
-            self.vocab_lower_bound(prefix)
-        })
-        .flatten()
+        let FloorScratch { key, other } = scratch;
+        let Some(res) =
+            self.try_with_vocab_key_prefix_in(p, key, |shared, key| -> Result<Option<u64>> {
+                if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
+                    return Ok(None);
+                }
+                let prefix = &key[..key.len() - 1];
+                // Within a block, the stored common prefix tells whether the preceding
+                // key extends this simple literal. Across blocks, compare the keys.
+                let extended = match shared {
+                    Some(len) => len >= prefix.len(),
+                    None if p == 0 => false,
+                    None => {
+                        match self.try_with_vocab_key_in(p - 1, other, |k| k.starts_with(prefix))? {
+                            Some(ext) => ext,
+                            None => return Ok(None),
+                        }
+                    }
+                };
+                if !extended {
+                    return Ok(Some(p));
+                }
+                self.try_vocab_lower_bound(prefix).map(Some)
+            })?
+        else {
+            return Ok(None);
+        };
+        res
     }
 
-    /// `f(prev, key)` of the key of base vocabulary id `id` and, when the same walk of
-    /// its block gives it, the key before it
-    /// ([`crate::vocab::Vocab::get_with_prev`]), with both reconstructions and decodings
-    /// inside the envelope. A refusal records a failure and gives `None`.
-    ///
-    /// A cursor's walk admits at most [`PAIR_WALK_BYTES`] of reconstruction, and only what
-    /// the envelope grants. A longer key on the way, or one the envelope refuses, such as
-    /// a long string before a short language-tagged one that needs no floor, sends the
-    /// read to [`Ctx::with_vocab_key`] of `id` alone with `prev` `None`, so the key before
-    /// is reserved only when the caller reads it. An eager walk cannot be refused, so it
-    /// reads both keys in one walk whatever their length.
-    fn with_vocab_key_prev<T>(
+    /// [`Ctx::string_floor`] reusing the caller's scratch buffers across calls.
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn string_floor_in(&self, id: Id, scratch: &mut FloorScratch) -> Option<u64> {
+        match self.try_string_floor_in(id, scratch) {
+            Ok(floor) => floor,
+            Err(error) => {
+                self.fail_memory(&error);
+                None
+            }
+        }
+    }
+
+    /// Read a vocabulary key and, within its block, its common prefix length with
+    /// the preceding key, reusing `key` across calls. Admits scratch through the
+    /// decoding envelope before allocation and returns any refusal without recording it.
+    #[inline]
+    fn try_with_vocab_key_prefix_in<T>(
         &self,
         id: u64,
-        f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
-    ) -> Option<T> {
-        let mut f = Some(f);
-        let mut decode = |prev: Option<&[u8]>, key: &[u8]| {
-            let longest = prev.map_or(0, <[u8]>::len).max(key.len());
-            if !self.reserve_decode(longest) {
-                return None;
-            }
-            f.take().map(|f| f(prev, key))
-        };
-        if !self.envelope_refuses() {
-            return self
-                .snap
-                .generation
-                .vocab
-                .get_with_prev(id, &mut decode)
-                .flatten();
+        key: &mut Vec<u8>,
+        f: impl FnOnce(Option<usize>, &[u8]) -> T,
+    ) -> Result<Option<T>> {
+        self.check_memory_failure()?;
+        let vocab = &self.snap.generation.vocab;
+        if self.is_strict_decode() {
+            self.check()?;
+            let mut f = Some(f);
+            return vocab
+                .get_with_controlled(
+                    id,
+                    |need| self.reserve_decode_checked(need),
+                    |_| self.check(),
+                    |k| {
+                        id::validate_key_framing(k)?;
+                        Ok(f.take().map(|f| f(None, k)))
+                    },
+                )
+                .and_then(|opt| opt.transpose())
+                .map(Option::flatten);
         }
-        // The walk is a shortcut, so a key on the way that is long or that the envelope
-        // refuses records nothing. The key alone is read instead, which records a refusal
-        // of its own reconstruction, and its caller reads the key before when it needs it.
-        let walked = self.snap.generation.vocab.get_with_prev_checked(
+        vocab.get_with_shared_prefix_checked_in(
             id,
-            |need| {
-                if need > PAIR_WALK_BYTES {
-                    return Err(());
-                }
-                self.reserve_decode_checked(need).map_err(|_| ())
-            },
-            &mut decode,
-        );
-        match walked {
-            Ok(found) => found.flatten(),
-            Err(()) => {
-                let mut f = f.take();
-                self.with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
-                    .flatten()
-            }
-        }
+            key,
+            |need| self.reserve_decode_checked(need),
+            f,
+        )
     }
 
     /// The query's floor cache.
@@ -3481,113 +4949,488 @@ impl Ctx {
         &self.floors
     }
 
+    /// First non-literal base vocabulary id.
+    #[inline]
+    pub(super) fn first_triple(&self) -> u64 {
+        self.snap.generation.vocab.first_triple()
+    }
+
+    /// Whether `id` is a base-vocabulary literal id (before triple terms and IRIs), which
+    /// may be a simple literal with a cached string floor.
+    #[inline]
+    pub(super) fn may_be_base_literal(&self, id: Id) -> bool {
+        id.tag() == Tag::Vocab && id.payload() < self.snap.generation.vocab.first_triple()
+    }
+
+    /// Whether the floor cache has not yet attempted to allocate its first table.
+    #[inline]
+    pub(super) fn floor_cache_needs_init(&self) -> bool {
+        !self.floors.initialized.load(Ordering::Acquire)
+    }
+
     /// A map of the query's floor cache for one worker of a mask (see [`FloorCache`]),
-    /// which allocates the cache's first table when it has none.
+    /// which allocates the cache's first table at [`FLOOR_TABLE_FIRST`] when it has none.
+    #[cfg(test)]
     pub(super) fn floor_map(&self) -> FloorMap<'_> {
+        self.floor_map_for(FLOOR_TABLE_FIRST)
+    }
+
+    /// A map of the query's floor cache for one worker of a mask, sizing the first table
+    /// to at most `first_slots` when no table has been installed yet.
+    #[cfg(test)]
+    pub(super) fn floor_map_for(&self, first_slots: usize) -> FloorMap<'_> {
         let mut tables = self.floors.tables.lock();
         if tables.cur.is_none() && !tables.full {
-            #[cfg(test)]
             let first = match self.floors.first_slots.load(Ordering::Relaxed) {
-                0 => FLOOR_TABLE_FIRST,
+                0 => first_slots,
                 slots => slots,
             };
-            #[cfg(not(test))]
-            let first = FLOOR_TABLE_FIRST;
             self.install_floor_table(&mut tables, first);
+            self.floors.initialized.store(true, Ordering::Release);
         }
         FloorMap {
             ctx: self,
-            cur: tables.cur.clone(),
-            prev: tables.prev.clone(),
+            cur: tables.cur.clone().map(FloorTableRef::Owned),
+            first_triple: self.snap.generation.vocab.first_triple(),
+            scratch: FloorScratch::default(),
             evicted: 0,
+            lookups: 0,
+            hits: 0,
             #[cfg(test)]
             computed: 0,
         }
     }
 
+    /// A worker's map borrowing a `FloorTable` snapshot taken once for the whole mask or
+    /// part, avoiding per-worker mutex acquisitions and `Arc` refcount traffic.
+    #[inline]
+    pub(super) fn floor_map_borrowed<'a>(
+        &'a self,
+        table: Option<&'a FloorTable>,
+        first_triple: u64,
+    ) -> FloorMap<'a> {
+        FloorMap {
+            ctx: self,
+            cur: table.map(FloorTableRef::Borrowed),
+            first_triple,
+            scratch: FloorScratch::default(),
+            evicted: 0,
+            lookups: 0,
+            hits: 0,
+            #[cfg(test)]
+            computed: 0,
+        }
+    }
+
+    /// Initialize the floor cache from the first eligible mask's slot and reuse estimate.
+    /// When `worth_caching` is false, defers table allocation and enters bypass mode so
+    /// low-repeat streams compare keys directly until the periodic probe mask runs.
+    pub(super) fn init_floor_cache(&self, slots: usize, worth_caching: bool) -> FloorMaskPlan {
+        let mut tables = self.floors.tables.lock();
+        if !self.floors.initialized.load(Ordering::Relaxed) && tables.cur.is_none() && !tables.full
+        {
+            #[cfg(test)]
+            let first = match self.floors.first_slots.load(Ordering::Relaxed) {
+                0 => slots,
+                s => s,
+            };
+            #[cfg(not(test))]
+            let first = slots;
+            if worth_caching {
+                self.install_floor_table(&mut tables, first);
+                if let Some(cur) = &tables.cur
+                    && cur.len() > FLOOR_TABLE_FIRST
+                {
+                    tables.warmup_lookups = cur.len() / 2;
+                }
+                self.floors.initialized.store(true, Ordering::Release);
+                return FloorMaskPlan::Floors(tables.cur.clone());
+            }
+            tables.deferred_slots = first;
+            tables.bypass = true;
+            tables.bypass_streak = 1;
+            self.floors.initialized.store(true, Ordering::Release);
+            #[cfg(test)]
+            self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+            return FloorMaskPlan::Direct;
+        }
+        self.begin_floor_mask_locked(&mut tables)
+    }
+
+    /// Defer floor-table allocation and enter bypass mode when the first eligible mask's
+    /// sample refused floor-only decoding. If another mask initialized the cache first,
+    /// commits this mask directly without allocating or growing a table.
+    pub(super) fn init_floor_cache_after_refused_floor_trial(&self, slots: usize) -> FloorMaskPlan {
+        let mut tables = self.floors.tables.lock();
+        if !self.floors.initialized.load(Ordering::Relaxed) && tables.cur.is_none() && !tables.full
+        {
+            #[cfg(test)]
+            let first = match self.floors.first_slots.load(Ordering::Relaxed) {
+                0 => slots,
+                s => s,
+            };
+            #[cfg(not(test))]
+            let first = slots;
+            tables.deferred_slots = first;
+            tables.bypass = true;
+            tables.bypass_streak = 1;
+            self.floors.initialized.store(true, Ordering::Release);
+            #[cfg(test)]
+            self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+            return FloorMaskPlan::Direct;
+        }
+        self.begin_floor_mask_after_refused_floor_trial_locked(&mut tables)
+    }
+
+    /// Whether the current floor table has enough low-hit lookups past its warmup budget
+    /// to enter direct bypass if table growth does not happen first.
+    fn low_hit_bypass_pending(tables: &FloorTables, cur: &FloorTable) -> bool {
+        let lookups = cur.lookups.load(Ordering::Relaxed);
+        if lookups < FLOOR_BYPASS_MIN_LOOKUPS {
+            return false;
+        }
+        let hits = cur.hits.load(Ordering::Relaxed);
+        let low_hit = hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM) < lookups;
+        low_hit && tables.warmup_lookups <= lookups
+    }
+
+    /// Preview the floor mode and table used to validate the next mask's sample without
+    /// mutating [`FloorCache`] state. Whenever bypass is active (including on a scheduled
+    /// periodic probe) or a low-hit bypass can take effect (including when table growth is
+    /// also pending and could still be declined after sample decoding enlarges the decode
+    /// envelope), this selects [`FloorMaskPlan::Direct`] so sample validation compares keys
+    /// directly and never triggers a speculative floor-only predecessor decode before
+    /// [`Ctx::begin_floor_mask`] commits the mode.
+    pub(super) fn peek_floor_plan(&self) -> FloorMaskPlan {
+        let tables = self.floors.tables.lock();
+        if tables.bypass {
+            return FloorMaskPlan::Direct;
+        }
+        if let Some(cur) = &tables.cur
+            && Self::low_hit_bypass_pending(&tables, cur)
+        {
+            return FloorMaskPlan::Direct;
+        }
+        FloorMaskPlan::Floors(tables.cur.clone())
+    }
+
+    /// Choose whether the next mask or eager part runs against the shared floor table
+    /// (growing it when read-again evictions crossed the threshold) or bypasses the table
+    /// for direct key comparison while its hit rate stays low.
+    pub(super) fn begin_floor_mask(&self) -> FloorMaskPlan {
+        let mut tables = self.floors.tables.lock();
+        self.begin_floor_mask_locked(&mut tables)
+    }
+
+    /// Commit a mask whose sample validated through direct key comparison. If the mask
+    /// commits `Direct` without allocating or growing a floor table, applies the state
+    /// transition and returns [`DirectCommitPlan::Direct`]. Otherwise leaves `FloorTables`
+    /// unchanged and returns [`DirectCommitPlan::NeedsFloorTrial`] so the caller can account
+    /// for the sample's floor decodes non-stickily before optional table memory is spent.
+    pub(super) fn begin_floor_mask_after_direct(&self) -> DirectCommitPlan {
+        let mut tables = self.floors.tables.lock();
+        if !tables.bypass {
+            if let Some(cur) = &tables.cur {
+                let growth_pending = !tables.full
+                    && cur.evicted.load(Ordering::Relaxed) >= cur.len() / FLOOR_TABLE_EVICTIONS;
+                if growth_pending && self.can_grow_floor_table_locked(cur) {
+                    return DirectCommitPlan::NeedsFloorTrial(Some(cur.clone()));
+                }
+                if Self::low_hit_bypass_pending(&tables, cur) {
+                    let _ = cur.lookups.swap(0, Ordering::Relaxed);
+                    let _ = cur.hits.swap(0, Ordering::Relaxed);
+                    if growth_pending {
+                        tables.full = true;
+                    }
+                    tables.warmup_lookups = 0;
+                    tables.bypass = true;
+                    tables.bypass_streak = 1;
+                    #[cfg(test)]
+                    self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+                    return DirectCommitPlan::Direct;
+                }
+            }
+            return DirectCommitPlan::NeedsFloorTrial(tables.cur.clone());
+        }
+        if tables.bypass_streak + 1 < FLOOR_BYPASS_PROBE_INTERVAL {
+            tables.bypass_streak += 1;
+            #[cfg(test)]
+            self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+            return DirectCommitPlan::Direct;
+        }
+        DirectCommitPlan::NeedsFloorTrial(tables.cur.clone())
+    }
+
+    /// Commit a mask to direct comparison after a fallible floor trial on its validated
+    /// sample refused decoding-envelope admission, skipping optional table growth and
+    /// deferred table allocation so the validated direct path succeeds cleanly.
+    pub(super) fn begin_floor_mask_after_refused_floor_trial(&self) -> FloorMaskPlan {
+        let mut tables = self.floors.tables.lock();
+        self.begin_floor_mask_after_refused_floor_trial_locked(&mut tables)
+    }
+
+    fn begin_floor_mask_after_refused_floor_trial_locked(
+        &self,
+        tables: &mut FloorTables,
+    ) -> FloorMaskPlan {
+        if !tables.bypass {
+            let bypass = tables.cur.as_ref().is_some_and(|cur| {
+                if Self::low_hit_bypass_pending(tables, cur) {
+                    let _ = cur.lookups.swap(0, Ordering::Relaxed);
+                    let _ = cur.hits.swap(0, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            });
+            if bypass {
+                tables.warmup_lookups = 0;
+                tables.bypass = true;
+                tables.bypass_streak = 1;
+            }
+        } else if tables.bypass_streak + 1 < FLOOR_BYPASS_PROBE_INTERVAL {
+            tables.bypass_streak += 1;
+        } else {
+            tables.bypass_streak = 1;
+        }
+        #[cfg(test)]
+        self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+        FloorMaskPlan::Direct
+    }
+
+    fn begin_floor_mask_locked(&self, tables: &mut FloorTables) -> FloorMaskPlan {
+        if !tables.bypass {
+            if tables.cur.is_some() {
+                let grew = self.maybe_grow_floor_table(tables);
+                if grew {
+                    tables.warmup_lookups = 0;
+                } else if let Some(cur) = &tables.cur {
+                    let lookups = cur.lookups.swap(0, Ordering::Relaxed);
+                    let hits = cur.hits.swap(0, Ordering::Relaxed);
+                    if lookups >= FLOOR_BYPASS_MIN_LOOKUPS {
+                        let low_hit = hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM) < lookups;
+                        if !low_hit {
+                            tables.warmup_lookups = 0;
+                        } else if tables.warmup_lookups > lookups {
+                            tables.warmup_lookups -= lookups;
+                        } else {
+                            tables.warmup_lookups = 0;
+                            tables.bypass = true;
+                            tables.bypass_streak = 1;
+                            #[cfg(test)]
+                            self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+                            return FloorMaskPlan::Direct;
+                        }
+                    }
+                }
+            }
+            return FloorMaskPlan::Floors(tables.cur.clone());
+        }
+        if tables.bypass_streak + 1 < FLOOR_BYPASS_PROBE_INTERVAL {
+            tables.bypass_streak += 1;
+            #[cfg(test)]
+            self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+            return FloorMaskPlan::Direct;
+        }
+        tables.bypass = false;
+        tables.bypass_streak = 0;
+        if tables.cur.is_none() && !tables.full {
+            let slots = if tables.deferred_slots > 0 {
+                tables.deferred_slots
+            } else {
+                FLOOR_TABLE_FIRST
+            };
+            #[cfg(test)]
+            let slots = match self.floors.first_slots.load(Ordering::Relaxed) {
+                0 => slots,
+                s => s,
+            };
+            self.install_floor_table(tables, slots);
+        }
+        if let Some(cur) = &tables.cur {
+            cur.lookups.store(0, Ordering::Relaxed);
+            cur.hits.store(0, Ordering::Relaxed);
+        }
+        FloorMaskPlan::Floors(tables.cur.clone())
+    }
+
     /// Replace the floor cache's table by a larger one when the floors it evicted that
     /// had been read again pass [`FLOOR_TABLE_EVICTIONS`] (see [`FloorCache`]). A mask
     /// asks before each part of its rows, so that the workers of one part share a table.
+    #[cfg(test)]
     pub(super) fn grow_floor_cache(&self) {
         let mut tables = self.floors.tables.lock();
-        let Some(cur) = &tables.cur else {
-            return;
-        };
-        if tables.full || cur.evicted.load(Ordering::Relaxed) < cur.len() / FLOOR_TABLE_EVICTIONS {
-            return;
-        }
-        let slots = cur.len().saturating_mul(FLOOR_TABLE_GROWTH);
-        self.install_floor_table(&mut tables, slots);
+        let _ = self.maybe_grow_floor_table(&mut tables);
     }
 
-    /// Make a table of at most `slots` the floor cache's current one, charged first, with
-    /// the current table kept for reading. The slots are no more than the vocabulary's
-    /// strings need, since past that no two ids share a slot, and no more than the cap
-    /// holds. A cap that allows fewer than [`FLOOR_TABLE_FEWEST`] slots leaves the cache
-    /// full, unless the vocabulary's strings need no more than the cap allows, and so does
-    /// a refused charge or one past the cap.
-    #[cold]
-    #[inline(never)]
-    fn install_floor_table(&self, tables: &mut FloorTables, slots: usize) {
-        let cache = &self.floors;
+    fn clamped_floor_slots(&self, requested: usize, cap: u64) -> Option<usize> {
         let first_triple = self.snap.generation.vocab.first_triple();
-        let cap = FloorCache::cap(self.mem_limit);
+        let max_pow2 = 1usize << (usize::BITS - 1);
+        let slots = requested
+            .max(1)
+            .checked_next_power_of_two()
+            .unwrap_or(max_pow2);
         let most = usize::try_from(first_triple)
             .unwrap_or(usize::MAX)
             .checked_next_power_of_two()
-            .unwrap_or(usize::MAX);
+            .unwrap_or(max_pow2);
         let room =
             usize::try_from(cap.saturating_sub(FloorTable::OVERHEAD) / 8).unwrap_or(usize::MAX);
         // the largest power of two of words that fits the cap with the table's overhead
         let room = if room == 0 { 0 } else { 1 << room.ilog2() };
         let wanted = slots.min(most);
         if room < wanted && room < FLOOR_TABLE_FEWEST {
-            tables.full = true;
-            return;
+            return None;
         }
-        let slots = wanted.min(room);
-        if tables.cur.as_ref().is_some_and(|cur| slots <= cur.len()) {
-            // the table is as large as the strings or the cap allow
-            tables.full = true;
-            return;
-        }
-        let bytes = FloorTable::bytes(slots);
-        // Every table allocated stays charged, since a mask may still read an old one.
-        let used = cache.used.load(Ordering::Acquire).saturating_add(bytes);
-        if used > cap
-            || (!cache.charge.covers(used)
-                && self
-                    .grow_reservation(&cache.charge, used, cap, false)
-                    .is_err())
-        {
-            tables.full = true;
-            return;
-        }
-        cache.used.store(used, Ordering::Release);
-        tracing::debug!(target: "sparkles::sparql::exec", "string floor table of {slots} slots");
-        let table = Arc::new(FloorTable::new(slots, first_triple));
-        tables.prev = tables.cur.replace(table);
+        Some(wanted.min(room))
     }
 
-    /// The first base id whose key is not below `key`, searched inside the decoding
-    /// envelope. A refusal records a failure and gives `None`.
-    fn vocab_lower_bound(&self, key: &[u8]) -> Option<u64> {
-        let v = &self.snap.generation.vocab;
-        if !self.envelope_refuses() {
-            let (Ok(i) | Err(i)) = v.find(key);
-            return Some(i);
+    fn can_grow_floor_table_locked(&self, cur: &FloorTable) -> bool {
+        let cap = FloorCache::cap(self.mem_limit);
+        let requested = cur.len().saturating_mul(FLOOR_TABLE_GROWTH);
+        let Some(slots) = self.clamped_floor_slots(requested, cap) else {
+            return false;
+        };
+        if slots <= cur.len() {
+            return false;
         }
-        match v.find_with_checked(key, |need| self.reserve_decode_checked(need)) {
-            Ok(Ok(i) | Err(i)) => Some(i),
-            Err(error) => {
-                self.fail_memory(&error);
-                None
+        let step = self.reservation_step();
+        let used = self
+            .floors
+            .used
+            .load(Ordering::Acquire)
+            .saturating_add(FloorTable::bytes(slots));
+        let ahead = used.next_multiple_of(step).min(cap).max(used);
+        let delta = ahead.saturating_sub(self.floors.charge.reserved());
+        used <= cap && (delta == 0 || delta <= self.memory_room() / 2)
+    }
+
+    fn maybe_grow_floor_table(&self, tables: &mut FloorTables) -> bool {
+        let Some(cur) = &tables.cur else {
+            return false;
+        };
+        if tables.full || cur.evicted.load(Ordering::Relaxed) < cur.len() / FLOOR_TABLE_EVICTIONS {
+            return false;
+        }
+        let prev_len = cur.len();
+        let slots = prev_len.saturating_mul(FLOOR_TABLE_GROWTH);
+        self.install_floor_table(tables, slots);
+        tables.cur.as_ref().is_some_and(|t| t.len() > prev_len)
+    }
+
+    /// Make a table of at most `slots` the floor cache's current one, charged first, with
+    /// live entries from any previous table copied in before publication. The slots are
+    /// no more than the vocabulary's strings need, since past that no two ids share a
+    /// slot, and no more than the cap holds. A cap that allows fewer than
+    /// [`FLOOR_TABLE_FEWEST`] slots leaves the cache full, unless the vocabulary's strings
+    /// need no more than the cap allows. When an initial table does not fit the remaining
+    /// budget, it steps down by halves to [`FLOOR_TABLE_FEWEST`] before leaving the cache
+    /// full.
+    #[cold]
+    #[inline(never)]
+    fn install_floor_table(&self, tables: &mut FloorTables, slots: usize) {
+        let cache = &self.floors;
+        let first_triple = self.snap.generation.vocab.first_triple();
+        let cap = FloorCache::cap(self.mem_limit);
+        let Some(mut slots) = self.clamped_floor_slots(slots, cap) else {
+            tables.full = true;
+            return;
+        };
+        let step = self.reservation_step();
+        let base_used = cache.used.load(Ordering::Acquire);
+        let reserved = cache.charge.reserved();
+        loop {
+            if tables.cur.as_ref().is_some_and(|cur| slots <= cur.len()) {
+                // the table is as large as the strings or the cap allow
+                tables.full = true;
+                return;
             }
+            let bytes = FloorTable::bytes(slots);
+            // Every table allocated stays charged, since a mask may still read an old one.
+            let used = base_used.saturating_add(bytes);
+            let ahead = used.next_multiple_of(step).min(cap).max(used);
+            let delta = ahead.saturating_sub(reserved);
+            // Keep at least half the remaining room for required query state (such as
+            // decoding envelopes) when admitting an optional floor table.
+            let fits = used <= cap
+                && (delta == 0
+                    || (delta <= self.memory_room() / 2
+                        && self
+                            .grow_reservation(&cache.charge, used, cap, false)
+                            .is_ok()));
+            if fits {
+                cache.used.store(used, Ordering::Release);
+                break;
+            }
+            if tables.cur.is_none() && slots > FLOOR_TABLE_FEWEST {
+                slots /= 2;
+                continue;
+            }
+            tables.full = true;
+            return;
         }
+        tracing::debug!(target: "sparkles::sparql::exec", "string floor table of {slots} slots");
+        let mut table = FloorTable::new(slots, first_triple);
+        if let Some(old) = &tables.cur {
+            old.copy_into(&mut table);
+        }
+        tables.cur = Some(Arc::new(table));
+    }
+
+    /// The first base id whose key is not below `key`, checking the query's controls
+    /// in strict decode mode.
+    fn try_vocab_lower_bound(&self, key: &[u8]) -> Result<u64> {
+        let v = &self.snap.generation.vocab;
+        self.check_memory_failure()?;
+        if self.is_strict_decode() {
+            self.check()?;
+            let (Ok(i) | Err(i)) = v.find_exact_controlled(key, |_| self.check())?;
+            return Ok(i);
+        }
+        let (Ok(i) | Err(i)) =
+            v.find_with_checked(key, |need| self.reserve_decode_checked(need))?;
+        Ok(i)
     }
 
     pub fn local_len(&self) -> u64 {
         self.local.read().len()
+    }
+
+    /// Back this context's query-local vocabulary directly with an incremental circuit's
+    /// [`Terms`](crate::incr::terms::Terms) so `Tag::Local` ids resolve and intern on
+    /// demand without copying historical keys.
+    pub(crate) fn swap_circuit_terms(
+        &self,
+        terms: crate::incr::terms::Terms,
+    ) -> crate::incr::terms::Terms {
+        let mut guard = self.local.write();
+        let bytes = terms.bytes();
+        let prev = match std::mem::replace(&mut *guard, LocalVocab::Circuit(terms)) {
+            LocalVocab::Circuit(prev) => prev,
+            LocalVocab::Owned(_) => crate::incr::terms::Terms::default(),
+        };
+        self.local_retained.store(bytes, Ordering::Release);
+        prev
+    }
+
+    /// Take back the [`Terms`](crate::incr::terms::Terms) previously attached with
+    /// [`Ctx::swap_circuit_terms`], restoring an empty owned vocabulary.
+    pub(crate) fn take_circuit_terms(&self) -> crate::incr::terms::Terms {
+        let mut guard = self.local.write();
+        let prev = match std::mem::take(&mut *guard) {
+            LocalVocab::Circuit(terms) => terms,
+            LocalVocab::Owned(_) => crate::incr::terms::Terms::default(),
+        };
+        self.local_retained.store(0, Ordering::Release);
+        prev
+    }
+
+    #[cfg(test)]
+    pub(crate) fn circuit_terms_backing_ptrs(&self) -> Option<(usize, Option<usize>)> {
+        match &*self.local.read() {
+            LocalVocab::Circuit(terms) => Some(terms.backing_ptrs()),
+            LocalVocab::Owned(_) => None,
+        }
     }
 }
 
@@ -3610,7 +5453,7 @@ fn output_key_term(ctx: &Ctx, key: &[u8], row: &RowCredit<'_>) -> Result<Term> {
         )?;
         return Ok(text.into_term());
     }
-    row.add(output_key_bytes(ctx, key, 0)?)?;
+    row.add(output_key_bytes(ctx, key)?)?;
     Ok(copied_output_key(key))
 }
 
@@ -3626,97 +5469,16 @@ fn copied_output_key(key: &[u8]) -> Term {
     }
 }
 
-fn output_key_bytes(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
-    if depth == 0 && key.first() == Some(&b'(') {
-        return super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || {
-            output_key_bytes_inner(ctx, key, depth)
-        });
+fn decode_value_key(key: &[u8]) -> Value {
+    if key.first() == Some(&b'(') {
+        super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || Value::from_key(key))
+    } else {
+        Value::from_key(key)
     }
-    output_key_bytes_inner(ctx, key, depth)
 }
-fn output_key_bytes_inner(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
-    let overflow = || ctx.memory_exceeded(u64::MAX);
-    let malformed = || Error::Corrupt("invalid vocabulary triple-term key".into());
-    if depth > crate::nesting::MAX_TRIPLE_TERMS {
-        return Err(malformed());
-    }
-    if key.first() != Some(&b'(') {
-        // UTF-8 text is copied into String. The fixed allowance covers
-        // a datatype/language string, blank-node formatting and string construction.
-        // A damaged key's lossy UTF-8 route can expand each byte to three bytes.
-        let bytes = (key.len() as u64).checked_mul(3).ok_or_else(overflow)?;
-        // Literal separators and blank-node binary IDs are not UTF-8 text.
-        let mut overlap = 64u64;
-        let valid = match key.first() {
-            Some(b'"') => {
-                let sep = key
-                    .iter()
-                    .rposition(|&b| b == id::KEY_SEP)
-                    .unwrap_or(key.len());
-                let suffix = key.get(sep + 1..).unwrap_or(&[]);
-                if suffix.first() == Some(&b'@') {
-                    // lang_literal borrows a temporary decoded tag while oxrdf
-                    // copies that tag into its final owned String.
-                    let tag = &suffix[1..];
-                    let copies = if std::str::from_utf8(tag).is_ok() {
-                        1
-                    } else {
-                        3
-                    };
-                    overlap = overlap
-                        .checked_add(
-                            (tag.len() as u64)
-                                .checked_mul(copies)
-                                .ok_or_else(overflow)?,
-                        )
-                        .ok_or_else(overflow)?;
-                }
-                std::str::from_utf8(&key[1..sep]).is_ok() && std::str::from_utf8(suffix).is_ok()
-            }
-            Some(b'_') => true,
-            _ => std::str::from_utf8(key).is_ok(),
-        };
-        return (if valid { key.len() as u64 } else { bytes })
-            .checked_add(overlap)
-            .ok_or_else(overflow);
-    }
-    let mut bytes =
-        (3 * std::mem::size_of::<Term>()) as u64 + std::mem::size_of::<oxrdf::Triple>() as u64;
-    let mut pos = 1usize;
-    for _ in 0..3 {
-        // Only existing three-component headers are walked, without allocation.
-        // Invalid lengths are corruption; they are not relabeled budget failures.
-        let mut len = 0u64;
-        let mut shift = 0;
-        loop {
-            let next = *key.get(pos).ok_or_else(malformed)?;
-            pos += 1;
-            if shift == 63 && next > 1 {
-                return Err(malformed());
-            }
-            len |= u64::from(next & 127)
-                .checked_shl(shift)
-                .ok_or_else(malformed)?;
-            if next & 128 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(malformed());
-            }
-        }
-        let len = usize::try_from(len).map_err(|_| malformed())?;
-        let end = pos.checked_add(len).ok_or_else(malformed)?;
-        let part = key.get(pos..end).ok_or_else(malformed)?;
-        bytes = bytes
-            .checked_add(output_key_bytes(ctx, part, depth + 1)?)
-            .ok_or_else(overflow)?;
-        pos = end;
-    }
-    if pos != key.len() {
-        return Err(malformed());
-    }
-    Ok(bytes)
+
+fn output_key_bytes(ctx: &Ctx, key: &[u8]) -> Result<u64> {
+    id::key_decode_bytes_with(key, || ctx.memory_exceeded(u64::MAX))
 }
 
 /// Estimated bytes of `rows` rows of `width` ids (a row of a zero-width table still
@@ -3724,6 +5486,17 @@ fn output_key_bytes_inner(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
 #[inline]
 pub fn table_bytes(rows: usize, width: usize) -> u64 {
     (rows as u64).saturating_mul(width.max(1) as u64 * 8)
+}
+
+/// RAII guard returned by [`Ctx::strict_decode_guard`].
+pub(super) struct StrictDecodeGuard<'a> {
+    ctx: &'a Ctx,
+}
+
+impl Drop for StrictDecodeGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.strict_decode.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Estimated memory held by a running operator (its input tables), released when the
@@ -3773,6 +5546,40 @@ impl Charge<'_> {
         self.bytes.get()
     }
 
+    /// An empty child charge sharing this charge's owner on the same context, suitable
+    /// for later adoption via [`Charge::adopt_charge`] without an owner mismatch.
+    pub(super) fn part(&self) -> Charge<'_> {
+        Charge {
+            ctx: self.ctx,
+            bytes: std::cell::Cell::new(0),
+            owner: std::cell::Cell::new(self.owner.get()),
+        }
+    }
+
+    /// Resize this live charge to `bytes` and transfer ownership into a [`RetainedCharge`]
+    /// without releasing or double-charging.
+    pub(super) fn into_retained(self, bytes: u64) -> Result<Option<RetainedCharge>> {
+        Self::transfer_retained(&mut Some(self), bytes)
+    }
+
+    /// Transfer a charge without consuming it if admission fails.
+    pub(super) fn transfer_retained(
+        source: &mut Option<Self>,
+        bytes: u64,
+    ) -> Result<Option<RetainedCharge>> {
+        let held = source.as_ref().expect("live charge to transfer");
+        let Some(owner) = held.ctx.retained_owner()? else {
+            return Ok(None);
+        };
+        held.resize(bytes)?;
+        let id = source.take().expect("admitted live charge").disarm();
+        Ok(Some(RetainedCharge {
+            owner,
+            id: (bytes > 0).then_some(id).flatten(),
+            bytes,
+        }))
+    }
+
     pub(super) fn belongs_to(&self, ctx: &Ctx) -> bool {
         std::ptr::eq(self.ctx, ctx)
     }
@@ -3812,7 +5619,7 @@ impl Charge<'_> {
             .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
         let owner = self.owner.get().or(part.owner.get());
         let part = source.take().expect("checked live input credit");
-        part.disarm();
+        part.into_disarmed();
         self.owner.set(owner);
         self.bytes.set(bytes);
         Ok(())
@@ -3838,16 +5645,36 @@ impl Charge<'_> {
         let ledger = self.ctx.memory();
         let owner = match self.owner.get() {
             Some(id) => ledger.owner_by_id(id),
-            None => ledger.owner(self.ctx.grant.as_ref())?,
+            None => ledger.owner(self.ctx.grant())?,
         };
         ledger.reserve(&owner, self.ctx.mem_limit, bytes, false)?;
         self.owner.set(Some(owner.id));
         self.bytes.set(owned);
         Ok(())
     }
+    /// Grow the charge to cover `bytes`, `step` bytes ahead when the budget and the pool
+    /// allow it and exactly otherwise.
+    pub(crate) fn cover(&self, bytes: u64, step: u64) -> Result<()> {
+        let current = self.bytes.get();
+        if bytes <= current {
+            return Ok(());
+        }
+        match self.add(bytes.saturating_add(step).saturating_sub(current)) {
+            Err(Error::BudgetExceeded(_)) if step > 0 => self.add(bytes - current),
+            result => result,
+        }
+    }
     fn disarm(&self) -> Option<u64> {
         self.bytes.set(0);
         self.owner.take()
+    }
+    /// Transfer this charge's ownership without running `Drop` (and without invoking
+    /// `trim_zero` or pool wakers when nothing was released).
+    fn into_disarmed(self) -> Option<u64> {
+        let owner = self.owner.take();
+        self.bytes.set(0);
+        std::mem::forget(self);
+        owner
     }
     /// Transfer this already admitted physical allocation to an immutable output.
     /// The receiving context is the actual account owner, not a domain token.
@@ -3857,7 +5684,7 @@ impl Charge<'_> {
             "output account owner"
         );
         let bytes = self.bytes.get();
-        let owner = self.disarm();
+        let owner = self.into_disarmed();
         OutputCredit {
             ctx: ctx.clone(),
             owner,
@@ -3868,7 +5695,7 @@ impl Charge<'_> {
 
     /// Move query-only input ownership into the returned backing without a release
     /// interval. Existing nonalgorithm kernels retain their estimate policy.
-    pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
+    pub(crate) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
         if bytes > self.bytes.get() {
             self.add(bytes - self.bytes.get())?;
         } else {
@@ -3881,7 +5708,7 @@ impl Charge<'_> {
             .owner
             .get()
             .map(|id| ledger.owner_by_id(id))
-            .map_or_else(|| ledger.owner(self.ctx.grant.as_ref()), Ok)?;
+            .map_or_else(|| ledger.owner(self.ctx.grant()), Ok)?;
         self.disarm();
         Ok(QueryMemoryLease {
             ledger: ledger.clone(),
@@ -3965,6 +5792,53 @@ impl Drop for Charge<'_> {
     }
 }
 
+/// Guard for optional vocabulary prefetch scratch admitted by
+/// [`Ctx::admit_prefetch_scratch`]. In eager mode it holds a direct [`Charge`]; in
+/// cursor mode it pins the ledger's active prefetch scope until dropped so idle
+/// optional headroom can be reclaimed by required charges once scratch vectors are
+/// freed.
+pub(super) enum PrefetchScratch<'a> {
+    Eager(Charge<'a>),
+    Cursor {
+        ctx: &'a Ctx,
+        ledger: &'a QueryMemoryLedger,
+        workers: u64,
+    },
+}
+
+impl PrefetchScratch<'_> {
+    pub(super) fn grow(&mut self, total_bytes: u64) -> Result<()> {
+        match self {
+            Self::Eager(charge) => charge.resize(total_bytes),
+            Self::Cursor {
+                ctx,
+                ledger,
+                workers,
+            } => {
+                ctx.check_memory_failure()?;
+                let need = total_bytes.saturating_mul(*workers);
+                let covered = ledger.envelope_reserved();
+                if covered >= need {
+                    return Ok(());
+                }
+                let extra = need - covered;
+                if extra > ctx.memory_remaining() {
+                    return Err(ctx.memory_exceeded(ctx.live_bytes().saturating_add(extra)));
+                }
+                ledger.grow_active_prefetch(ctx.grant(), ctx.mem_limit, need)
+            }
+        }
+    }
+}
+
+impl Drop for PrefetchScratch<'_> {
+    fn drop(&mut self) {
+        if let Self::Cursor { ledger, .. } = self {
+            ledger.end_prefetch();
+        }
+    }
+}
+
 /// Final physical output credit. Retaining the real context keeps its original
 /// fast account or promoted ledger alive. Moving a paid charge here never returns
 /// and reacquires its credit and never forces fast eager queries onto the ledger.
@@ -3981,7 +5855,7 @@ impl OutputCredit {
             return Ok(ctx.charge(bytes)?.into_output(ctx));
         }
         let ledger = ctx.memory();
-        let owner = ledger.owner(ctx.grant.as_ref())?;
+        let owner = ledger.owner(ctx.grant())?;
         ledger.reserve_receiving(&owner, ctx.mem_limit, bytes)?;
         Ok(Self {
             ctx: ctx.clone(),
@@ -4010,7 +5884,7 @@ impl OutputCredit {
             .checked_add(part.bytes.get())
             .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
         let part = slot.take().expect("validated worker credit");
-        let owner = part.disarm();
+        let owner = part.into_disarmed();
         self.owner = self.owner.or(owner);
         self.bytes = bytes;
         Ok(())
@@ -4048,8 +5922,7 @@ impl OutputCredit {
         };
         let result = held.resize(bytes);
         let bytes = held.bytes();
-        let owner = held.disarm();
-        drop(held);
+        let owner = held.into_disarmed();
         self.bytes = bytes;
         self.owner = owner;
         result
@@ -4068,7 +5941,7 @@ impl Drop for OutputCredit {
 }
 
 /// Weak retained state never owns the context, grant or ledger.
-pub(super) struct RetainedCharge {
+pub(crate) struct RetainedCharge {
     owner: Weak<Ctx>,
     id: Option<u64>,
     bytes: u64,
@@ -4098,7 +5971,7 @@ impl RetainedCharge {
             exact_receiving: false,
         }
     }
-    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+    pub(crate) fn resize(&mut self, bytes: u64) -> Result<()> {
         // A size that does not change takes neither the owner nor an account. A sort key
         // column of numbers resized its charge on every row this way.
         if bytes == self.bytes {
@@ -4117,7 +5990,7 @@ impl RetainedCharge {
                 owner: std::cell::Cell::new(self.id),
             };
             charge.add(bytes - self.bytes)?;
-            self.id = charge.disarm();
+            self.id = charge.into_disarmed();
         } else {
             ctx.release_live(self.id, self.bytes - bytes);
         }
@@ -4161,7 +6034,7 @@ impl RetainedCharge {
     /// charge, without releasing and charging them again.
     pub(super) fn absorb(&mut self, part: Charge<'_>) {
         let bytes = part.bytes.get();
-        let id = part.disarm();
+        let id = part.into_disarmed();
         if bytes == 0 {
             return;
         }
@@ -4170,6 +6043,30 @@ impl RetainedCharge {
             self.id = id;
         }
         self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Split up to `take` already-admitted bytes from this charge into a [`Charge`] on
+    /// the same owner and admit any remaining shortfall up to `bytes`, without releasing
+    /// or re-acquiring the reused bytes. If admitting the shortfall fails, nothing changes.
+    pub(crate) fn split<'a>(&mut self, ctx: &'a Ctx, take: u64, bytes: u64) -> Result<Charge<'a>> {
+        debug_assert!(
+            std::ptr::eq(self.owner.as_ptr(), ctx),
+            "the charge's context"
+        );
+        let take = take.min(self.bytes).min(bytes);
+        let extra = bytes - take;
+        let charge = self.part(ctx);
+        if extra > 0 {
+            charge.add(extra)?;
+        }
+        if take > 0 {
+            self.bytes -= take;
+            if self.bytes == 0 {
+                self.id = None;
+            }
+            charge.bytes.set(charge.bytes.get() + take);
+        }
+        Ok(charge)
     }
 }
 impl Drop for RetainedCharge {
@@ -4181,17 +6078,17 @@ impl Drop for RetainedCharge {
 }
 
 /// Cursor ownership can adopt an admitted algorithm lease without release/recharge.
-pub(super) struct OwnedCharge {
+pub(crate) struct OwnedCharge {
     ctx: Arc<Ctx>,
     lease: QueryMemoryLease,
 }
 impl OwnedCharge {
-    pub(super) fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.lease.bytes
     }
-    pub(super) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
+    pub(crate) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
         let ledger = ctx.memory();
-        let owner = ledger.owner(ctx.grant.as_ref())?;
+        let owner = ledger.owner(ctx.grant())?;
         ledger.reserve(&owner, ctx.mem_limit, bytes, false)?;
         Ok(Self {
             ctx: ctx.clone(),
@@ -4213,8 +6110,21 @@ impl OwnedCharge {
             lease: slot.take().expect("admitted output"),
         })
     }
-    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+    pub(crate) fn resize(&mut self, bytes: u64) -> Result<()> {
         self.lease.resize(self.ctx.mem_limit, bytes)
+    }
+    pub(super) fn cover(&mut self, bytes: u64, step: u64) -> Result<()> {
+        if bytes <= self.lease.bytes {
+            return Ok(());
+        }
+        let target = bytes.max(self.lease.bytes.saturating_add(step));
+        if self.resize(target).is_err() {
+            self.resize(bytes)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn check(&self) -> Result<()> {
+        self.ctx.check()
     }
     /// Adopt the actual predecoded payload guard; the existing cursor ledger is
     /// required and checked before the source is consumed.
@@ -4236,7 +6146,7 @@ impl OwnedCharge {
             .checked_add(held.bytes())
             .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
         let held = source.take().expect("validated graph payload");
-        held.disarm();
+        held.into_disarmed();
         self.lease.bytes = bytes;
         Ok(())
     }
@@ -4268,6 +6178,7 @@ pub enum TermKind {
 #[cfg(test)]
 mod charge_tests {
     use super::*;
+    use crate::builder::{BuildOptions, VocabCodec};
     use crate::store::{Store, StoreOptions};
 
     #[test]
@@ -4445,7 +6356,7 @@ mod charge_tests {
             assert_eq!(term, id::key_to_term(key), "{key:?}");
             assert_eq!(
                 row.used.get(),
-                output_key_bytes(&ctx, key, 0).unwrap(),
+                output_key_bytes(&ctx, key).unwrap(),
                 "{key:?}"
             );
         }
@@ -4489,14 +6400,14 @@ mod charge_tests {
     }
 
     /// The executors read the accounting mode in at most this many places outside tests.
-    /// Stage 4 of item 453 lowered it as each twin merged, and item 827 took the planning
-    /// reads out, so that a query plans alike in every mode. The routing of
-    /// `query_execution_with_plan`, the EXISTS key set accumulated across batches and the
-    /// decoding envelope remain, with the four reads of the flag that decide whether a
-    /// cursor owner exists, whether a context without an owner may keep retained state
-    /// uncharged, whether an empty release trims the ledger and whether a finished
-    /// query's pool contribution shrinks.
-    const MODE_CHECKS: usize = 7;
+    /// Stage 4 of item 453 lowered it as each twin merged, item 827 took the planning
+    /// reads out so that a query plans alike in every mode, and item 1308 Wave 2 removed
+    /// the eager decoding-envelope bypass. The routing of `query_execution_with_plan` and
+    /// the EXISTS key set accumulated across batches remain, with the four reads of the
+    /// flag that decide whether a cursor owner exists, whether a context without an owner
+    /// may keep retained state uncharged, whether an empty release trims the ledger and
+    /// whether a finished query's pool contribution shrinks.
+    const MODE_CHECKS: usize = 6;
 
     /// Counts the reads of the accounting mode in the non-test sources of the SPARQL
     /// engine, and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453). A
@@ -4737,6 +6648,33 @@ mod charge_tests {
         ctx
     }
 
+    #[test]
+    fn a_zero_charge_context_keeps_one_grant_reference_and_does_not_touch_its_credit() {
+        use super::super::pool::{GRANT_RELEASES, QueryPool};
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = QueryPool::new(64 << 10);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = Ctx::new(store.snapshot());
+        let releases = GRANT_RELEASES.with(|n| n.get());
+        let grows = super::FAST_GROWS.with(|n| n.get());
+        let ledger_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        let (_, stats) = crate::test_alloc::record_alloc_stats(|| {
+            ctx.set_grant(Some(grant.clone()));
+            assert_eq!(Arc::strong_count(&grant), 2);
+            drop(ctx.charge(0).unwrap());
+            ctx.check_output(0, 0).unwrap();
+            drop(ctx);
+        });
+        assert_eq!(stats.total_alloc, 0);
+        assert_eq!(super::FAST_GROWS.with(|n| n.get()), grows);
+        assert_eq!(GRANT_RELEASES.with(|n| n.get()), releases);
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            ledger_ops
+        );
+        assert_eq!((grant.used(), pool.granted()), (0, 0));
+    }
+
     /// A plain query's estimate grows a few bytes at a time. The fast account admits a
     /// step from the grant at once, so the next small increases take neither its lock
     /// nor the grant's counters.
@@ -4914,6 +6852,34 @@ mod charge_tests {
         }
     }
 
+    /// A required (`exact`) reservation under tight remaining budget caps its speculative
+    /// lookahead slack so a small retained charge leaves headroom for batch publication
+    /// and row decoding instead of taking a full `reservation_step()`.
+    #[test]
+    fn tight_retained_reservation_caps_speculative_slack() {
+        let store = Store::in_memory(StoreOptions::default());
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 1100 << 10;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let step = ctx.reservation_step();
+            let headroom = step + 800;
+            let held = ctx
+                .charge(ctx.mem_limit - ctx.live_bytes() - headroom)
+                .unwrap();
+            assert!(ctx.retain_bytes(148), "cursor {cursor}");
+            let remaining = ctx.mem_limit - ctx.live_bytes();
+            assert!(
+                remaining >= headroom / 2,
+                "cursor {cursor}: remaining {remaining} must keep at least half of {headroom}"
+            );
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+            drop(held);
+        }
+    }
+
     /// Decoding a term reserves the decode envelope in both accounting modes, and the end
     /// of the work releases it. A cursor refuses a decode that the budget cannot hold,
     /// gives no term and fails the next check, so a refused decode never becomes an
@@ -4938,15 +6904,11 @@ mod charge_tests {
             ctx.release_work();
             assert_eq!(ctx.live_bytes(), live, "cursor {cursor}: and released");
             let held = ctx.charge(MIB - live - 100).unwrap();
-            if cursor {
-                assert_eq!(ctx.term(literals[1].0), None);
-                assert!(
-                    matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
-                );
-            } else {
-                assert!(ctx.term(literals[1].0).is_some());
-                assert!(ctx.check().is_ok());
-            }
+            assert_eq!(ctx.term(literals[1].0), None, "cursor {cursor}");
+            assert!(
+                matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "cursor {cursor}"
+            );
             drop(held);
         }
     }
@@ -5016,14 +6978,39 @@ mod charge_tests {
             assert!(t.put(p, Some(0), false));
             assert_eq!(t.get(p), Some(Some(0)));
         }
+        // copying a smaller table into a larger one preserves every floor, non-literal
+        // marker and read bit under the wider slot layout
+        let small = FloorTable::new(16, first_triple);
+        let samples = [
+            (0u64, Some(0), false),
+            (17, Some(15), true),
+            (35, None, true),
+            (
+                first_triple - 1,
+                Some(first_triple - 1 - (small.none - 1)),
+                false,
+            ),
+            (first_triple - 5, None, false),
+        ];
+        for &(id, floor, read) in &samples {
+            assert!(small.put(id, floor, read));
+        }
+        let mut larger = FloorTable::new(128, first_triple);
+        small.copy_into(&mut larger);
+        assert_eq!(larger.entries(), samples.len());
+        for &(id, floor, read) in &samples {
+            assert_eq!(larger.get(id), Some(floor), "id {id}");
+            let word = larger.slot(id).load(Ordering::Relaxed);
+            assert_eq!(word & 1 == 1, read, "read bit for id {id}");
+        }
     }
 
     /// The floor of every stored string is the same in both modes and is the first id
-    /// whose key starts with its lexical form. A cursor reserves the keys a floor reads
+    /// whose key starts with its lexical form. Both modes reserve the keys a floor reads
     /// and the search for it, so a long string refuses once the budget is held, and the
-    /// refusal fails the next check. An eager floor reads it unchecked.
+    /// refusal fails the next check.
     #[test]
-    fn string_floors_agree_across_modes_and_reserve_their_reads_in_a_cursor() {
+    fn string_floors_agree_across_modes_and_reserve_their_reads_in_both_modes() {
         use crate::io::Source;
         use oxrdfio::RdfFormat;
         let store = Store::in_memory(StoreOptions::default());
@@ -5094,15 +7081,362 @@ mod charge_tests {
             }
             let held = ctx.charge(MIB - ctx.live_bytes() - 100).unwrap();
             let floor = ctx.string_floor(Id::vocab(long_id));
-            if cursor {
-                assert_eq!(floor, None);
-                assert!(
-                    matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
+            assert_eq!(floor, None, "cursor {cursor}");
+            assert!(
+                matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "cursor {cursor}"
+            );
+            drop(held);
+        }
+    }
+
+    fn store_with_floor_literals(literals: &[oxrdf::Term], codec: VocabCodec) -> Store {
+        use std::fmt::Write;
+
+        let store = Store::in_memory(StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(codec),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut nt = String::new();
+        for literal in literals {
+            writeln!(nt, "<urn:s> <urn:p> {literal} .").unwrap();
+        }
+        store
+            .load(&[crate::io::Source::from_bytes(
+                nt.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        assert_eq!(store.snapshot().generation.vocab_codec(), codec);
+        store
+    }
+
+    #[test]
+    fn a_cursor_floor_reads_a_long_literal_without_reading_its_huge_predecessor() {
+        let literals = [
+            oxrdf::Literal::new_simple_literal(format!("a{}", "x".repeat(1 << 20))).into(),
+            oxrdf::Literal::new_simple_literal(format!("b{}", "y".repeat(5 << 10))).into(),
+        ];
+        for codec in [VocabCodec::Front, VocabCodec::Fsst] {
+            let store = store_with_floor_literals(&literals, codec);
+            let snap = store.snapshot();
+            let [huge, long] = literals
+                .each_ref()
+                .map(|term| snap.lookup_term(term).unwrap());
+            assert_eq!(long.payload(), huge.payload() + 1);
+            assert!(!(long.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+
+            let mut ctx = Ctx::new(snap);
+            ctx.mem_limit = 2 * MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            assert_eq!(ctx.string_floor(long), Some(long.payload()), "{codec:?}");
+            assert!(ctx.check().is_ok());
+            assert_eq!(ctx.with_vocab_key(huge.payload(), |_| ()), None);
+            assert!(
+                matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
+            );
+        }
+    }
+
+    #[test]
+    fn string_floors_use_adjacent_prefixes_in_both_codecs() {
+        use oxrdf::{BaseDirection, Literal, NamedNode};
+
+        let literals = [
+            Literal::new_language_tagged_literal("ab", "en")
+                .unwrap()
+                .into(),
+            Literal::new_simple_literal("a").into(),
+            Literal::new_directional_language_tagged_literal("bb", "ar", BaseDirection::Rtl)
+                .unwrap()
+                .into(),
+            Literal::new_simple_literal("b").into(),
+            Literal::new_typed_literal("cb", NamedNode::new("urn:dt").unwrap()).into(),
+            Literal::new_simple_literal("c").into(),
+            Literal::new_simple_literal("dè").into(),
+            Literal::new_simple_literal("dé").into(),
+        ];
+        for codec in [VocabCodec::Front, VocabCodec::Fsst] {
+            let store = store_with_floor_literals(&literals, codec);
+            let snap = store.snapshot();
+            let ids = literals
+                .each_ref()
+                .map(|term| snap.lookup_term(term).unwrap());
+            for pair in ids.as_chunks::<2>().0 {
+                assert_eq!(pair[1].payload(), pair[0].payload() + 1);
+                assert!(!(pair[1].payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+            }
+            for cursor in [false, true] {
+                let mut ctx = Ctx::new(snap.clone());
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                for pair in ids[..6].as_chunks::<2>().0 {
+                    assert_eq!(ctx.string_floor(pair[0]), None);
+                    assert_eq!(ctx.string_floor(pair[1]), Some(pair[0].payload()));
+                }
+                // These keys share the first byte of è and é, but neither extends the other.
+                assert_eq!(ctx.string_floor(ids[6]), Some(ids[6].payload()));
+                assert_eq!(ctx.string_floor(ids[7]), Some(ids[7].payload()));
+                assert_eq!(
+                    ctx.string_floor(Id::vocab(snap.generation.vocab.len())),
+                    None
                 );
-            } else {
-                assert_eq!(floor, expected[long_id as usize]);
+                assert!(ctx.check().is_ok(), "{codec:?} cursor {cursor}");
+            }
+        }
+    }
+
+    #[test]
+    fn reused_floor_and_direct_cmp_scratch_matches_single_shot_and_refuses_strictly() {
+        use oxrdf::{Literal, NamedNode};
+
+        let long = format!("z{}", "a".repeat(256 << 10));
+        let mut literals: Vec<oxrdf::Term> = Vec::new();
+        for i in 0..40 {
+            literals.push(Literal::new_simple_literal(format!("w{i:02}")).into());
+            literals.push(Literal::new_simple_literal(format!("w{i:02}ext")).into());
+        }
+        literals.push(
+            Literal::new_language_tagged_literal("w05", "en")
+                .unwrap()
+                .into(),
+        );
+        literals.push(Literal::new_typed_literal("w06", NamedNode::new_unchecked("urn:dt")).into());
+        literals.push(Literal::new_simple_literal(&long).into());
+
+        for codec in [VocabCodec::Front, VocabCodec::Fsst] {
+            let store = store_with_floor_literals(&literals, codec);
+            let snap = store.snapshot();
+            let ids: Vec<Id> = literals
+                .iter()
+                .map(|t| snap.lookup_term(t).unwrap())
+                .collect();
+            let long_id = *ids.last().unwrap();
+            let lang_id = ids[ids.len() - 3];
+            let typed_id = ids[ids.len() - 2];
+            let iri_id = snap
+                .lookup_term(&NamedNode::new_unchecked("urn:s").into())
+                .unwrap();
+
+            for cursor in [false, true] {
+                let mut ctx = Ctx::new(snap.clone());
+                ctx.mem_limit = 64 * MIB;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let mut scratch = FloorScratch::default();
+                for &id in &ids {
+                    assert_eq!(
+                        ctx.string_floor_in(id, &mut scratch),
+                        ctx.string_floor(id),
+                        "{codec:?} cursor {cursor}"
+                    );
+                }
+                for &a in &ids[..12] {
+                    assert_eq!(
+                        ctx.simple_literal_cmp_in(a, a, &mut scratch),
+                        Some(std::cmp::Ordering::Equal)
+                    );
+                    for &b in &ids[..12] {
+                        assert_eq!(
+                            ctx.simple_literal_cmp_in(a, b, &mut scratch),
+                            ctx.simple_literal_cmp(a, b),
+                            "{codec:?} cursor {cursor}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    ctx.simple_literal_cmp_in(lang_id, lang_id, &mut scratch),
+                    None
+                );
+                assert_eq!(
+                    ctx.simple_literal_cmp_in(typed_id, typed_id, &mut scratch),
+                    None
+                );
+                assert_eq!(
+                    ctx.simple_literal_cmp_in(iri_id, iri_id, &mut scratch),
+                    None
+                );
+                assert_eq!(
+                    ctx.simple_literal_cmp_in(Id::UNDEF, ids[0], &mut scratch),
+                    None
+                );
                 assert!(ctx.check().is_ok());
             }
+
+            // Strict left-to-right memory refusal in cursor mode.
+            let mut ctx = Ctx::new(snap.clone());
+            ctx.mem_limit = MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            let held = ctx.charge(MIB - ctx.live_bytes() - 4096).unwrap();
+            let mut scratch = FloorScratch::default();
+            // Ineligible left literal does not decode the budget-exceeding right literal.
+            assert_eq!(
+                ctx.simple_literal_cmp_in(lang_id, long_id, &mut scratch),
+                None
+            );
+            assert!(
+                ctx.check().is_ok(),
+                "{codec:?}: right operand must not be decoded"
+            );
+            // Budget-exceeding left literal records its refusal even when right is an IRI.
+            assert_eq!(
+                ctx.simple_literal_cmp_in(long_id, iri_id, &mut scratch),
+                None
+            );
+            assert!(
+                matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "{codec:?}: left decode refusal must be recorded"
+            );
+            drop(held);
+        }
+    }
+
+    #[test]
+    fn cursor_fsst_lookup_succeeds_when_optional_room_is_refused() {
+        use oxrdf::Literal;
+
+        let mid_pad = "alpha_beta_gamma_delta_".repeat(5);
+        let long_pad = "alpha_beta_gamma_delta_".repeat(8);
+        let mut literals: Vec<oxrdf::Term> = (0..160u32)
+            .map(|i| {
+                Literal::new_simple_literal(format!("m-{mid_pad}delta_tail_{i:04}_alpha_beta"))
+                    .into()
+            })
+            .collect();
+        for i in 0..32u32 {
+            literals.push(
+                Literal::new_simple_literal(format!("z-{long_pad}delta_tail_{i:02}_alpha_beta"))
+                    .into(),
+            );
+        }
+        let store = store_with_floor_literals(&literals, VocabCodec::Fsst);
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.is_fsst());
+
+        // Pick a verified FSST-coded simple literal with at most 8 suffix codes (`fast_room`)
+        // whose full vocab key fits in 192 bytes while `key.len() + 64` exceeds 192 bytes.
+        let (target_term, target_id) = literals
+            .iter()
+            .find_map(|term| {
+                let id = snap.lookup_term(term).unwrap();
+                let p = id.payload();
+                let key = snap.generation.vocab.get(p).unwrap();
+                (key.len() > 128
+                    && key.len() <= 192
+                    && !(p as usize).is_multiple_of(crate::vocab::FC_BLOCK)
+                    && snap
+                        .generation
+                        .vocab
+                        .entry_coded_len(p)
+                        .is_some_and(|codes| codes <= 8))
+                .then(|| (term.clone(), id))
+            })
+            .expect(
+                "fixture must contain a verified FSST-coded simple literal in (128, 192] with <= 8 codes",
+            );
+
+        // Pick a verified FSST-coded simple literal longer than 192 bytes with at most 8 codes.
+        let (grown_id, grown_len) = literals
+            .iter()
+            .find_map(|term| {
+                let id = snap.lookup_term(term).unwrap();
+                let p = id.payload();
+                let key = snap.generation.vocab.get(p).unwrap();
+                (key.len() > 192
+                    && !(p as usize).is_multiple_of(crate::vocab::FC_BLOCK)
+                    && snap
+                        .generation
+                        .vocab
+                        .entry_coded_len(p)
+                        .is_some_and(|codes| codes <= 8))
+                .then_some((id, key.len()))
+            })
+            .expect(
+                "fixture must contain a verified FSST-coded simple literal > 192 bytes with <= 8 codes",
+            );
+
+        // Outside Rayon, `Ctx::decode_workers() == 1`, so `n` bytes needs
+        // `(n * 8 + 1024)` bytes while optional 64-byte FSST headroom exceeds it.
+        let room_for = |bytes: usize| (bytes as u64 * 8 + 1024) * Ctx::decode_workers();
+        let room_for_192 = room_for(192);
+        // (a) `string_floor_in` via `try_with_vocab_key_prefix_in`
+        {
+            let mut ctx = Ctx::new(snap.clone());
+            ctx.mem_limit = MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            let held = ctx.charge(MIB - ctx.live_bytes() - room_for_192).unwrap();
+            let mut scratch = FloorScratch::default();
+            assert_eq!(
+                ctx.string_floor_in(target_id, &mut scratch),
+                Some(target_id.payload()),
+                "string_floor_in must succeed when 192-byte scratch fits and extra FSST headroom is refused"
+            );
+            assert!(
+                ctx.check().is_ok(),
+                "string_floor_in must not record a memory failure when required capacity fits"
+            );
+            drop(held);
+        }
+        // (b) `simple_literal_cmp_in` via `with_vocab_key_in` (`total <= 192`, `fast_room` refused)
+        {
+            let mut ctx = Ctx::new(snap.clone());
+            ctx.mem_limit = MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            let held = ctx.charge(MIB - ctx.live_bytes() - room_for_192).unwrap();
+            let mut scratch = FloorScratch::default();
+            assert_eq!(
+                ctx.simple_literal_cmp_in(target_id, target_id, &mut scratch),
+                Some(std::cmp::Ordering::Equal),
+                "simple_literal_cmp_in must succeed when 192-byte scratch fits and fast_room is refused"
+            );
+            assert!(
+                ctx.check().is_ok(),
+                "simple_literal_cmp_in must not record a memory failure"
+            );
+            drop(held);
+        }
+        // (c) scalar `term` via fresh-buffer `with_vocab_key`
+        {
+            let mut ctx = Ctx::new(snap.clone());
+            ctx.mem_limit = MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            let held = ctx.charge(MIB - ctx.live_bytes() - room_for_192).unwrap();
+            assert_eq!(
+                ctx.term(target_id),
+                Some(target_term.clone()),
+                "scalar term lookup must succeed when 192-byte scratch fits"
+            );
+            assert!(
+                ctx.check().is_ok(),
+                "scalar term lookup must not record a memory failure"
+            );
+            drop(held);
+        }
+        // (d) `simple_literal_cmp_in` via `with_vocab_key_in` (`total > 192`, `fast_room` refused,
+        // fallback grows to required `grown_len`)
+        {
+            let mut ctx = Ctx::new(snap.clone());
+            ctx.mem_limit = MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            let held = ctx
+                .charge(MIB - ctx.live_bytes() - room_for(grown_len))
+                .unwrap();
+            let mut scratch = FloorScratch::default();
+            assert_eq!(
+                ctx.simple_literal_cmp_in(grown_id, grown_id, &mut scratch),
+                Some(std::cmp::Ordering::Equal),
+                "simple_literal_cmp_in must grow to required length after fast_room refusal"
+            );
+            assert!(
+                ctx.check().is_ok(),
+                "simple_literal_cmp_in must not record a memory failure after optional headroom fallback"
+            );
             drop(held);
         }
     }
@@ -5334,5 +7668,424 @@ mod charge_tests {
         assert_eq!(accepted.load(Ordering::SeqCst), 0);
         drop((g1, g2));
         assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn grow_decode_serializes_mode_selection_across_ledger_promotion() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        fn recv_bounded<T>(rx: &mpsc::Receiver<T>, msg: &str) -> T {
+            rx.recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|err| panic!("{msg}: {err}"))
+        }
+
+        let store = Store::in_memory(StoreOptions::default());
+
+        // Case 1: Decoder 1 pauses before acquiring `decode.state`, `memory_parent()`
+        // promotes the context to a ledger, and Decoder 2 enters the ledger path and
+        // pauses after snapshotting `eager_paid == 0`. When Decoder 1 resumes, it must
+        // observe the promoted ledger under `decode.state` instead of taking a stale
+        // eager branch and double-charging the envelope.
+        {
+            let need = Ctx::decode_need(128);
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = need;
+            let ctx = ctx.into_shared();
+
+            let before_lock_calls = Arc::new(AtomicUsize::new(0));
+            let after_snap_calls = Arc::new(AtomicUsize::new(0));
+            let (t1_paused_tx, t1_paused_rx) = mpsc::channel::<()>();
+            let (t1_go_tx, t1_go_rx) = mpsc::channel::<()>();
+            let (t2_paused_tx, t2_paused_rx) = mpsc::channel::<()>();
+            let (t2_go_tx, t2_go_rx) = mpsc::channel::<()>();
+            let t1_paused_tx = Arc::new(parking_lot::Mutex::new(Some(t1_paused_tx)));
+            let t1_go_rx = Arc::new(parking_lot::Mutex::new(Some(t1_go_rx)));
+            let t2_paused_tx = Arc::new(parking_lot::Mutex::new(Some(t2_paused_tx)));
+            let t2_go_rx = Arc::new(parking_lot::Mutex::new(Some(t2_go_rx)));
+
+            let bl_calls = before_lock_calls.clone();
+            let as_calls = after_snap_calls.clone();
+            *ctx.decode.grow_hook.lock() = Some(Arc::new(move |point| match point {
+                DecodeGrowPoint::BeforeLock => {
+                    if bl_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        t1_paused_tx.lock().take().unwrap().send(()).unwrap();
+                        let rx = t1_go_rx.lock().take().unwrap();
+                        recv_bounded(&rx, "decoder 1 was not released before lock");
+                    }
+                }
+                DecodeGrowPoint::AfterLedgerSnapshot => {
+                    if as_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        t2_paused_tx.lock().take().unwrap().send(()).unwrap();
+                        let rx = t2_go_rx.lock().take().unwrap();
+                        recv_bounded(&rx, "decoder 2 was not released after snapshot");
+                    }
+                }
+                DecodeGrowPoint::BeforeEagerCharge => {
+                    panic!("neither decoder should take the eager branch after promotion");
+                }
+            }));
+
+            let (r1_tx, r1_rx) = mpsc::channel();
+            let ctx1 = ctx.clone();
+            let t1 = std::thread::spawn(move || {
+                let _ = r1_tx.send(ctx1.reserve_decode_checked(128));
+            });
+
+            recv_bounded(&t1_paused_rx, "decoder 1 did not pause before decode lock");
+
+            // Promote to the shared ledger while decoder 1 is paused before the lock.
+            let _parent = ctx.memory_parent().unwrap();
+
+            let (r2_tx, r2_rx) = mpsc::channel();
+            let ctx2 = ctx.clone();
+            let t2 = std::thread::spawn(move || {
+                let _ = r2_tx.send(ctx2.reserve_decode_checked(128));
+            });
+
+            recv_bounded(
+                &t2_paused_rx,
+                "decoder 2 did not pause after ledger snapshot",
+            );
+
+            // Release decoder 1 first; it must enter the ledger path and fund `need` once.
+            t1_go_tx.send(()).unwrap();
+            let r1 = recv_bounded(&r1_rx, "decoder 1 did not finish");
+            r1.expect("decoder 1 must succeed on the promoted ledger path");
+
+            // Release decoder 2; it must reuse the already-funded ledger decode target.
+            t2_go_tx.send(()).unwrap();
+            let r2 = recv_bounded(&r2_rx, "decoder 2 did not finish");
+            r2.expect("decoder 2 must succeed without double-charging the envelope");
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+            *ctx.decode.grow_hook.lock() = None;
+
+            assert_eq!(ctx.live_bytes(), need);
+            assert!(ctx.decode.state.lock().1.is_empty());
+            assert!(ctx.check().is_ok());
+            ctx.release_work();
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+
+        // Case 2: Decoder 1 acquires `decode.state` before `memory_parent()` promotes
+        // the ledger, then falls back to `Charge::add` on the promoted ledger while
+        // still holding `decode.state`. Decoder 2 requests a larger envelope and must
+        // wait until Decoder 1 records its eager-paid owner bytes, then reserve only
+        // the remaining delta on the ledger.
+        {
+            let need1 = Ctx::decode_need(128);
+            let need2 = Ctx::decode_need(256);
+            assert!(need2 > need1);
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = need2;
+            let ctx = ctx.into_shared();
+
+            let before_lock_calls = Arc::new(AtomicUsize::new(0));
+            let (t1_eager_tx, t1_eager_rx) = mpsc::channel::<()>();
+            let (t1_go_tx, t1_go_rx) = mpsc::channel::<()>();
+            let (t2_before_lock_tx, t2_before_lock_rx) = mpsc::channel::<()>();
+            let t1_eager_tx = Arc::new(parking_lot::Mutex::new(Some(t1_eager_tx)));
+            let t1_go_rx = Arc::new(parking_lot::Mutex::new(Some(t1_go_rx)));
+            let t2_before_lock_tx = Arc::new(parking_lot::Mutex::new(Some(t2_before_lock_tx)));
+
+            let bl_calls = before_lock_calls.clone();
+            *ctx.decode.grow_hook.lock() = Some(Arc::new(move |point| match point {
+                DecodeGrowPoint::BeforeLock => {
+                    if bl_calls.fetch_add(1, Ordering::AcqRel) == 1 {
+                        t2_before_lock_tx.lock().take().unwrap().send(()).unwrap();
+                    }
+                }
+                DecodeGrowPoint::BeforeEagerCharge => {
+                    t1_eager_tx.lock().take().unwrap().send(()).unwrap();
+                    let rx = t1_go_rx.lock().take().unwrap();
+                    recv_bounded(&rx, "decoder 1 was not released in eager branch");
+                }
+                DecodeGrowPoint::AfterLedgerSnapshot => {}
+            }));
+
+            let (r1_tx, r1_rx) = mpsc::channel();
+            let ctx1 = ctx.clone();
+            let t1 = std::thread::spawn(move || {
+                let _ = r1_tx.send(ctx1.reserve_decode_checked(128));
+            });
+
+            recv_bounded(&t1_eager_rx, "decoder 1 did not enter locked eager branch");
+
+            let _parent = ctx.memory_parent().unwrap();
+
+            let (r2_tx, r2_rx) = mpsc::channel();
+            let ctx2 = ctx.clone();
+            let t2 = std::thread::spawn(move || {
+                let _ = r2_tx.send(ctx2.reserve_decode_checked(256));
+            });
+
+            recv_bounded(&t2_before_lock_rx, "decoder 2 did not reach decode lock");
+            assert!(
+                !ctx.decode_state_unlocked(),
+                "decoder 1 must hold decode.state across its eager fallback charge"
+            );
+
+            t1_go_tx.send(()).unwrap();
+            let r1 = recv_bounded(&r1_rx, "decoder 1 did not finish eager fallback");
+            let r2 = recv_bounded(&r2_rx, "decoder 2 did not finish ledger delta");
+            t1.join().unwrap();
+            t2.join().unwrap();
+            *ctx.decode.grow_hook.lock() = None;
+
+            r1.expect("decoder 1 must succeed");
+            r2.expect("decoder 2 must succeed by charging only need2 - need1");
+            assert_eq!(ctx.live_bytes(), need2);
+            let eager_paid: u64 = ctx.decode.state.lock().1.iter().map(|&(_, b)| b).sum();
+            assert_eq!(eager_paid, need1);
+            assert!(ctx.check().is_ok());
+            ctx.release_work();
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    /// Checked local-vocabulary insertion transfers the retained portion of its
+    /// pre-admitted growth charge directly into `self.retained` before releasing the
+    /// transient excess, so a contending waiter on the shared `QueryPool` cannot steal
+    /// the retained granules during handoff and leave an inserted entry unaccounted.
+    #[test]
+    fn intern_key_checked_transfers_retained_credit_without_pool_release() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(48 * MIB);
+        let grant = Arc::new(pool.try_grant(16 * MIB).unwrap());
+        let other = pool.try_grant(24 * MIB).unwrap();
+        let mut ctx = pooled(&store, &grant);
+        ctx.mem_limit = 64 * MIB;
+        ctx.enable_cursor_accounting().unwrap();
+
+        let ticket_slot: Arc<parking_lot::Mutex<Option<super::super::pool::Ticket>>> =
+            Default::default();
+        let stolen: Arc<parking_lot::Mutex<Option<super::super::pool::PoolGrant>>> =
+            Default::default();
+        let ticket_for_wake = ticket_slot.clone();
+        let stolen_for_wake = stolen.clone();
+        let ticket = pool.enter(
+            8 * MIB,
+            Some(Arc::new(move || {
+                if let Some(ticket) = ticket_for_wake.lock().as_mut()
+                    && let Some(g) = ticket.poll()
+                {
+                    *stolen_for_wake.lock() = Some(g);
+                }
+            })),
+        );
+        *ticket_slot.lock() = Some(ticket);
+
+        // `growth_charge` grows `grant` from 16 MiB to 24 MiB (consuming the last 8 MiB
+        // of the 48 MiB pool while staying within the 24 MiB waiting-pool half share).
+        // If `growth_charge` were dropped before retaining the 22 MiB entry, `grant`
+        // would trim back to 16 MiB, wake the 8 MiB waiter synchronously, and fail the
+        // subsequent `retain_bytes` call with `ServerMemory`.
+        let key = vec![b'k'; (22 * MIB) as usize];
+        let id = ctx
+            .intern_key_checked(&key)
+            .expect("retained credit must stay pinned across handoff under pool contention");
+        assert_eq!(id.tag(), Tag::Local);
+        assert!(
+            stolen.lock().is_none(),
+            "retained granules must not be released to a contending pool waiter"
+        );
+        let physical = ctx.local.read().physical_bytes();
+        assert_eq!(ctx.local_retained.load(Ordering::Acquire), physical);
+        assert!(
+            ctx.live_bytes() >= physical,
+            "live bytes ({}) must cover retained local vocabulary ({physical})",
+            ctx.live_bytes()
+        );
+
+        drop(ticket_slot.lock().take());
+        drop(stolen.lock().take());
+        drop(other);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    /// `retain_from_charge` never advances `self.retained.charge.reserved`, so concurrent
+    /// `retain_bytes` calls cannot mistake directly-retained bytes for `StepReservation`
+    /// headroom and skip charging past `mem_limit`.
+    #[test]
+    fn retain_from_charge_preserves_step_reservation_invariant_under_concurrency() {
+        let store = Store::in_memory(StoreOptions::default());
+
+        // 1. Deterministic A < B interleaving (16 KiB retain_bytes pauses before
+        // `grow_reservation`, 60 KiB `retain_from_charge` completes under a 64 KiB cap):
+        // `grow_reservation` must refuse rather than observing `used_a <= reserved`.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 64 << 10;
+            let used_a = ctx.retained.used.fetch_add(16 << 10, Ordering::AcqRel) + (16 << 10);
+            assert!(!ctx.retained.charge.covers(used_a));
+
+            let src = ctx.charge(60 << 10).unwrap();
+            ctx.retain_from_charge(60 << 10, &src);
+            drop(src);
+
+            let res = ctx.grow_reservation(&ctx.retained.charge, used_a, u64::MAX, true);
+            assert!(
+                res.is_err(),
+                "16 KiB retain_bytes must refuse when 60 KiB is already retained under 64 KiB cap"
+            );
+            ctx.retained.used.fetch_sub(16 << 10, Ordering::AcqRel);
+            assert!(
+                ctx.retained.charge.reserved() >= ctx.retained.used.load(Ordering::Acquire),
+                "reserved ({}) must stay >= used ({})",
+                ctx.retained.charge.reserved(),
+                ctx.retained.used.load(Ordering::Acquire)
+            );
+            assert_eq!(ctx.live_bytes(), 60 << 10);
+        }
+
+        // 2. Deterministic A > B interleaving (60 KiB retain_bytes pauses before
+        // `grow_reservation`, 16 KiB `retain_from_charge` completes): under 64 KiB cap it
+        // must refuse; under 128 KiB cap it must charge all 60 KiB on top of the 16 KiB.
+        for (limit, expect_ok) in [(64 << 10, false), (128 << 10, true)] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = limit;
+            let used_a = ctx.retained.used.fetch_add(60 << 10, Ordering::AcqRel) + (60 << 10);
+
+            let src = ctx.charge(16 << 10).unwrap();
+            ctx.retain_from_charge(16 << 10, &src);
+            drop(src);
+
+            let res = ctx.grow_reservation(&ctx.retained.charge, used_a, u64::MAX, true);
+            assert_eq!(res.is_ok(), expect_ok);
+            if res.is_err() {
+                ctx.retained.used.fetch_sub(60 << 10, Ordering::AcqRel);
+            } else {
+                assert!(
+                    ctx.live_bytes() >= (76 << 10),
+                    "live bytes ({}) must cover both 60 KiB and 16 KiB",
+                    ctx.live_bytes()
+                );
+            }
+            assert!(ctx.retained.charge.reserved() >= ctx.retained.used.load(Ordering::Acquire));
+            assert!(ctx.live_bytes() <= limit);
+        }
+
+        // 3. Existing spare headroom in `self.retained` is reused without changing
+        // `reserved`, while only the overflow stays permanently charged out of `source`.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 16 << 20;
+            assert!(ctx.retain_bytes(16 << 10));
+            let reserved_before = ctx.retained.charge.reserved();
+            assert!(reserved_before > (16 << 10));
+            let spare = reserved_before - (16 << 10);
+            let want = spare + (12 << 10);
+            let src = ctx.charge(want + (4 << 10)).unwrap();
+            ctx.retain_from_charge(want, &src);
+            drop(src);
+            assert_eq!(ctx.retained.charge.reserved(), reserved_before);
+            assert_eq!(ctx.retained.used.load(Ordering::Acquire), reserved_before);
+            assert_eq!(ctx.live_bytes(), reserved_before + (12 << 10));
+        }
+
+        // 4. Multi-threaded stress test: concurrent `retain_bytes` and
+        // `intern_key_checked` under a tight budget preserve `reserved >= used` and
+        // `live_bytes <= mem_limit`.
+        for trial in 0..8usize {
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 96 << 10;
+            let ctx = Arc::new(raw);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|s| {
+                let c1 = ctx.clone();
+                let b1 = barrier.clone();
+                s.spawn(move || {
+                    b1.wait();
+                    for _ in 0..32 {
+                        if !c1.retain_bytes(4 << 10) {
+                            break;
+                        }
+                    }
+                });
+                let c2 = ctx.clone();
+                let b2 = barrier.clone();
+                s.spawn(move || {
+                    b2.wait();
+                    for i in 0..32usize {
+                        let key = format!("<urn:t{trial}:{i}:{}>", "x".repeat(2048));
+                        if c2.intern_key_checked(key.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            });
+            assert!(
+                ctx.retained.charge.reserved() >= ctx.retained.used.load(Ordering::Acquire),
+                "trial {trial}: reserved ({}) < used ({})",
+                ctx.retained.charge.reserved(),
+                ctx.retained.used.load(Ordering::Acquire)
+            );
+            assert!(
+                ctx.live_bytes() <= ctx.mem_limit,
+                "trial {trial}: live bytes ({}) exceeded mem_limit ({})",
+                ctx.live_bytes(),
+                ctx.mem_limit
+            );
+        }
+    }
+
+    #[test]
+    fn circuit_vocab_checked_insert_covers_long_keys_and_refuses_before_mutation() {
+        let store = Store::in_memory(StoreOptions::default());
+        let long_key = format!("\"{}\x00", "a".repeat(256));
+        let expected_retained =
+            crate::incr::terms::Terms::key_retained_bytes(long_key.len()).unwrap();
+        assert!(expected_retained > long_key.len() as u64 + 96);
+
+        // 1. Direct checked insertion into an attached empty circuit term table with a key
+        // longer than 48 bytes must cover `Terms::bytes()` without tripping `rem == 0`.
+        {
+            let ctx = Ctx::new(store.snapshot());
+            ctx.swap_circuit_terms(crate::incr::terms::Terms::default());
+            let id = ctx
+                .intern_key_checked(long_key.as_bytes())
+                .expect("long key insertion must fit");
+            assert_eq!(id.tag(), Tag::Local);
+            assert_eq!(
+                ctx.local_retained.load(Ordering::Acquire),
+                expected_retained
+            );
+            let terms = ctx.take_circuit_terms();
+            assert_eq!(terms.key_count(), 1);
+            assert_eq!(terms.bytes(), expected_retained);
+        }
+
+        // 2. Budget strictly between `key_len + 96` and `2 * key_len + 48` must refuse
+        // BEFORE mutating the attached circuit term table.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = long_key.len() as u64 + 96 + 16;
+            assert!(ctx.mem_limit < expected_retained);
+            ctx.swap_circuit_terms(crate::incr::terms::Terms::default());
+            let err = ctx
+                .intern_key_checked(long_key.as_bytes())
+                .expect_err("long key insertion must refuse before mutating terms");
+            assert!(
+                matches!(
+                    err,
+                    crate::error::Error::BudgetExceeded(b)
+                        if b.kind == crate::BudgetKind::Memory
+                ),
+                "expected BudgetKind::Memory, got {err:?}"
+            );
+            let terms = ctx.take_circuit_terms();
+            assert_eq!(
+                terms.key_count(),
+                0,
+                "refused checked insertion must not mutate attached circuit terms"
+            );
+            assert_eq!(terms.bytes(), 0);
+        }
     }
 }

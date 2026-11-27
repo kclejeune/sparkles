@@ -1,106 +1,35 @@
 # Editor integration
 
-An editor can format SPARQL, and the other languages `sparkles fmt` formats, in two ways:
+Sparkles formats and lints SPARQL, Turtle, TriG, N-Triples, N-Quads, JSON-LD, and SHACL Compact Syntax inside text editors in two ways: through `sparkles lsp` (a Language Server Protocol server over stdio) or by piping buffers through `sparkles fmt --stdin-filepath`. Both modes require the `sparkles` binary on `PATH`, built with the default `fmt` feature, and both read the nearest `.sparklesfmt.toml` so editor formatting always matches the CLI and CI.
 
-- **As a formatter command.** Formatter plugins pipe the buffer through
-  `sparkles fmt --stdin-filepath PATH`, which reads stdin and prints the formatted text.
-  The path is never opened; it only names the buffer. The language comes from its
-  extension and the options from the `.sparklesfmt.toml` nearest to it. A path that
-  matches the working directory's `.sparklesfmtignore` comes back unchanged. On a syntax
-  error, the command prints nothing on stdout, writes a `path:LINE:COL: error: …` line to
-  stderr and exits with status 2, so the buffer is left as it is.
-- **As a language server.** `sparkles lsp` speaks the Language Server Protocol over stdin
-  and stdout. It formats documents and publishes syntax errors, the formatter's warnings
-  and the findings of `sparkles lint` as diagnostics while you type. It handles
-  `textDocument/formatting`, `textDocument/rangeFormatting`, which formats the whole
-  document, `textDocument/codeAction` for the lint's safe fixes, and
-  `textDocument/completion` for prefixes.
-
-Both need the `sparkles` binary on the `PATH`, built with the `fmt` feature (on by
-default).
+| Mode | Capabilities | Best for |
+|---|---|---|
+| Language server (`sparkles lsp`) | Formatting, live syntax and lint diagnostics, safe quick fixes, and prefix completion. | Daily editing in Neovim, Helix, or any LSP-capable editor. |
+| Formatter command (`sparkles fmt`) | Format-on-save via stdin/stdout or in-place `--write`, respecting `.sparklesfmtignore`. | Lightweight format-only plugins such as conform.nvim, apheleia, or VS Code Run on Save. |
 
 ## The language server
 
-`sparkles lsp` talks over stdio, its only transport. It accepts `--stdio`, which changes
-nothing. The server provides:
+`sparkles lsp` communicates over stdio (its only transport; `--stdio` is accepted as a no-op). It exits with status `0` after `shutdown` and `exit`, or status `1` if the client disconnects without `shutdown`.
 
-- **Formatting.** The server returns one edit that covers only the part of the document
-  that changes, so undo, folds and marks elsewhere survive. A document that is already
-  formatted gets no edit. Range formatting formats the whole document and returns the
-  same edit, because a formatted range depends on what lies around it.
-- **Diagnostics.** The server publishes diagnostics when a document opens and on every
-  change. Each has the source `sparkles fmt` and its kind as the code:
-  - A syntax error (`syntax`) is an error at its position.
-  - Output the formatter refuses (`unsafe-format`, `unstable-format`) is a warning. It
-    means the formatter's safety checks failed; please report it. A broken config file
-    (`config`) is also a warning.
-  - The formatter's warnings about the document appear at their own position.
-    `comment-moved` is a warning: a comment sat where no element starts or ends, and was
-    printed before the enclosing element. `undeclared-prefix`, for a prefix used but not
-    declared in the document, is information, as is any other kind. A warning without a
-    position appears at the start of the document. An example is `option-not-implemented`,
-    for a config key this build does not act on yet.
+### Capabilities
 
-  Documents in every language the formatter handles are also linted, and so is the SPARQL in the
-  `sh:select`, `sh:ask`, `sh:construct` and `sh:update` literals of a shapes graph. Each finding has the source
-  `sparkles lint`, its rule as the code (`unused-prefix`, `cartesian-product`, …) and the
-  rule's severity, with the levels of the `[lint]` table of the nearest
-  `.sparklesfmt.toml`. The lint's `undefined-prefix` error takes the place of the
-  formatter's `undeclared-prefix` note.
-
-  Diagnostics are cleared when the problem is fixed and when the document is closed. A
-  document with a syntax error is not formatted. Formatting it returns no edit rather
-  than an error, because its diagnostic already says why. Warnings do not stop
-  formatting.
-- **Quick fixes.** A lint finding with a safe fix (`unused-prefix`, `language-tag-case`,
-  `redundant-datatype`) offers it as a `quickfix` code action. The `source.fixAll.sparkles`
-  action applies every safe fix at once, as `sparkles lint --fix` does, and only when the
-  result means the same as the document. An `undefined-prefix` finding for a prefix the
-  server knows offers a quick fix that adds its declaration. `source.fixAll.sparkles`
-  leaves that one out, because the IRI comes from the configuration and not from the
-  document.
-- **Completion.** In SPARQL, Turtle and TriG documents the server completes prefixes, as
-  [Prefixes](#prefixes) describes.
-- **Options.** Options come only from `.sparklesfmt.toml`. The server uses the file
-  nearest to the document, found the way `sparkles fmt` finds it, and reads it again on
-  every request, so an edit to it applies at once. Documents that are not files, such as
-  an unsaved buffer, use the defaults. There are no editor-side settings, so the editor,
-  the command line and CI always agree.
-- **Language.** The server takes the language from the editor's language id (`sparql`,
-  `turtle`, `ttl`, `trig`, `ntriples`, `nquads`, `jsonld`, `json-ld`, `shaclc`). Failing that, it
-  uses the file extension, as `sparkles fmt` reads it, and then the content. A language
-  this build does not format yet is refused with "… formatting is not available yet" and
-  gets no diagnostics.
-- **Positions.** Positions are in UTF-16 code units, the protocol's default, or in bytes
-  when the client offers the `utf-8` position encoding. Lines end at `\n`, `\r\n` or
-  `\r`. Formatted text always uses `\n` line endings.
-
-The server exits with status 0 after `shutdown` and `exit`, and with status 1 when the
-client exits or disconnects without `shutdown`.
+* **Minimal formatting edits.** `textDocument/formatting` returns a single edit spanning only changed lines so undo history, folds, and marks elsewhere survive, returning no edits when a file is already formatted. `textDocument/rangeFormatting` formats the entire document because surrounding declarations affect layout.
+* **Live diagnostics.** On open and on every change, the server publishes diagnostics from `sparkles fmt` and `sparkles lint`, clearing them when fixed or when the document closes. Syntax errors (`syntax`) prevent formatting without returning an LSP error because the diagnostic already explains the failure; warnings do not block formatting. `sparkles fmt` reports `unsafe-format` or `unstable-format` (internal safety-check warnings worth reporting), `config` (broken `.sparklesfmt.toml`), `comment-moved` (warning), `undeclared-prefix` (information), and `option-not-implemented` (unsupported config key, placed at line 1). `sparkles lint` publishes rule codes (`unused-prefix`, `cartesian-product`, and others) using severities from the `[lint]` table of `.sparklesfmt.toml`, including embedded SPARQL inside `sh:select`, `sh:ask`, `sh:construct`, and `sh:update` literals. Its `undefined-prefix` error supersedes the formatter's `undeclared-prefix` note.
+* **Quick fixes.** Safe lint fixes (`unused-prefix`, `language-tag-case`, `redundant-datatype`) appear as `quickfix` code actions, and `source.fixAll.sparkles` applies all verified safe fixes at once. Known prefixes flagged by `undefined-prefix` also offer an individual quick fix to insert the declaration, though `source.fixAll.sparkles` skips these because the IRI comes from configuration rather than the document.
+* **Configuration and language detection.** All formatting, lint, and prefix options come from the nearest `.sparklesfmt.toml`, re-read on every request so changes apply immediately; unsaved buffers without a path use defaults. Language detection checks the editor language id (`sparql`, `turtle`, `ttl`, `trig`, `ntriples`, `nquads`, `jsonld`, `json-ld`, `shaclc`), then file extension, then file content. Unsupported languages return `"… formatting is not available yet"` with no diagnostics.
+* **Positions and line endings.** Positions default to UTF-16 code units or use UTF-8 byte offsets when the client negotiates `utf-8`. Input accepts `\n`, `\r\n`, and `\r`; formatted output always uses `\n`.
 
 ### Prefixes
 
-The server completes the prefixes it knows. After `PREFIX` or `@prefix` it offers the
-whole declaration of each prefix the document does not declare yet, such as
-`kclj: <https://kclj.io/sparkles/>`, with the closing ` .` after `@prefix`. Where a
-prefixed name starts, it offers the prefix names, such as `kclj:`. Accepting a name whose
-prefix the document does not declare also adds the declaration after the last `PREFIX`,
-`BASE`, `@prefix` or `@base` line at the top of the document, or at its start when there
-is none. A SPARQL document gets `PREFIX kclj: <…>`. A Turtle or TriG document gets
-`@prefix kclj: <…> .` when it already uses `@prefix`, and the `PREFIX` form otherwise.
-Nothing is offered inside IRIs, strings and comments, or after `?` and `$`.
+In SPARQL, Turtle, and TriG documents, `sparkles lsp` completes known prefixes (`textDocument/completion`). After `PREFIX` or `@prefix`, it offers full undeclared prefix declarations (with trailing ` .` after `@prefix`). At the start of a prefixed name, it offers prefix names and automatically inserts the missing declaration after the last existing `PREFIX`/`BASE`/`@prefix`/`@base` line (matching `@prefix` style when already used in Turtle/TriG, and `PREFIX` otherwise). Completion is suppressed inside IRIs, strings, comments, and variables (`?` or `$`).
 
-The known prefixes come from three sources. A later source wins when two bind the same
-name.
+Known prefixes merge three sources, with later sources overriding earlier ones:
 
-1. The well-known prefixes that every Sparkles server knows, such as `rdf`, `xsd`,
-   `schema`, `prov` and the `mem` vocabulary of agent memory.
-2. A dataset on a Sparkles server, when the config file's `[lsp]` table names one.
-3. The `[prefixes]` table of the config file.
+1. Sparkles' built-in well-known prefixes (such as `rdf`, `xsd`, `schema`, `prov`, and `mem`).
+2. A remote dataset's active prefixes from `GET /$/prefixes/{dataset}`, when configured under `[lsp]`.
+3. Explicit entries in the `[prefixes]` table of `.sparklesfmt.toml`.
 
-Both tables live in the `.sparklesfmt.toml` nearest to the document, the same file that
-holds the formatter's options and the `[lint]` table. The formatter and `sparkles lint`
-check both tables and otherwise ignore them.
+Both tables live in the nearest `.sparklesfmt.toml` alongside formatter and `[lint]` settings (`sparkles fmt` and `sparkles lint` validate both tables and otherwise ignore them):
 
 ```toml
 [prefixes]
@@ -112,28 +41,11 @@ server = "https://sparkles.example.org"
 dataset = "slurp"
 ```
 
-A prefix name is a letter followed by letters, digits, `_`, `-` and `.`, and it does not
-end in `.`. The empty name `""` is allowed too. Each IRI must be absolute. A mistake in
-either table is a config error, which the server reports as a `config` diagnostic and
-`sparkles fmt` reports as an error.
+Prefix names must be empty (`""`) or start with a letter followed by letters, digits, `_`, `-`, or `.` without a trailing `.`, and all IRIs must be absolute. Invalid entries report a `config` diagnostic in the LSP and an error in `sparkles fmt`.
 
-With `server` and `dataset` set, the server reads the dataset's prefixes from
-`GET /$/prefixes/{dataset}`, which answers the prefixes in force on that dataset,
-including the ones the server's settings file declares. It takes the token from
-`SPARKLES_TOKEN`, or else from the credentials that `sparkles auth login` saved for that
-server. Plain `http` is refused for hosts other than loopback. The read happens once per
-server and dataset, in the background, when a document that uses the config file opens.
-Completion does not wait for it. A failed read is logged to the server's standard error,
-and completion goes on with the other sources. Without an `[lsp]` table the language
-server never contacts a server, and it never falls back to `SPARKLES_SERVER` or the
-default server of the credentials file. A build without the `auth` feature logs that it
-ignores the table.
+When `[lsp]` sets `server` and `dataset`, the language server fetches prefixes once per server/dataset pair in the background on document open without blocking completion, authenticating via `SPARKLES_TOKEN` or credentials saved by `sparkles auth login`. Plain `http` is refused for non-loopback hosts, failed fetches log to stderr while continuing with local sources, and without `[lsp]` the server never makes network calls or reads `SPARKLES_SERVER`. Builds without the `auth` feature log that `[lsp]` is ignored.
 
-Config files are found by walking up from the document's directory, so a
-`~/.sparklesfmt.toml` acts as the user-wide file for every document under the home
-directory that has no nearer config file. Config files are never merged, so a project's
-own `.sparklesfmt.toml` replaces the user-wide one and needs its own `[prefixes]` and
-`[lsp]` tables.
+Because `.sparklesfmt.toml` lookup walks upward and stops at the first file without merging, `~/.sparklesfmt.toml` serves as a user-wide fallback, while a project-level `.sparklesfmt.toml` overrides it completely and must repeat any desired `[prefixes]` and `[lsp]` tables.
 
 ### Neovim (0.11 or later)
 
@@ -145,7 +57,7 @@ vim.lsp.config("sparkles", {
 })
 vim.lsp.enable("sparkles")
 
--- extensions Neovim may not know, JSON-LD apart from plain JSON, and SHACL Compact Syntax
+-- Register extensions Neovim may not recognize and separate JSON-LD from plain JSON
 vim.filetype.add({
   extension = {
     ru = "sparql", trig = "trig", nt = "ntriples", nq = "nquads", jsonld = "jsonld", shaclc = "shaclc",
@@ -154,14 +66,11 @@ vim.filetype.add({
 vim.treesitter.language.register("json", "jsonld")
 ```
 
-Format with `vim.lsp.buf.format()`. With conform.nvim configured as below,
-`lsp_format = "fallback"` uses the server only for filetypes conform has no formatter
-for.
+Format buffers with `vim.lsp.buf.format()`. If you also configure `conform.nvim` below, `lsp_format = "fallback"` delegates only unconfigured filetypes to the language server.
 
 ### Helix
 
-Add this to `languages.toml`, with one `[[language]]` table per language. Where Helix
-already defines a language, these keys are merged into its definition.
+Add the language server and one `[[language]]` table per language to `languages.toml` (Helix merges keys into built-in definitions):
 
 ```toml
 [language-server.sparkles]
@@ -183,9 +92,11 @@ language-servers = ["sparkles"]
 auto-format = true
 ```
 
-`:format` asks the server to format the buffer. With `auto-format`, saving does too.
+Run `:format` to format on demand, or keep `auto-format = true` to format on save.
 
 ## Formatter commands
+
+Formatter plugins pipe buffer text through `sparkles fmt --stdin-filepath PATH`. The path is never opened; it selects the language by extension and locates the nearest `.sparklesfmt.toml`. Paths matching `.sparklesfmtignore` in the working directory pass through unchanged. On syntax errors, `sparkles fmt` writes nothing to stdout, prints `path:LINE:COL: error: …` to stderr, and exits with status `2` so the buffer remains intact.
 
 ### conform.nvim
 
@@ -220,9 +131,7 @@ formatter = { command = "sparkles", args = ["fmt", "--language", "sparql"] }
 auto-format = true
 ```
 
-Without a file name, `sparkles fmt` looks for `.sparklesfmt.toml` in its working
-directory and then in each parent. The language server instead finds the one nearest to
-each file.
+Without a filename, `sparkles fmt` searches upward from its working directory for `.sparklesfmt.toml`, whereas `sparkles lsp` resolves the config file nearest to each open file.
 
 ### Emacs (apheleia)
 
@@ -234,15 +143,11 @@ each file.
     (setf (alist-get mode apheleia-mode-alist) 'sparkles)))
 ```
 
-With `apheleia-mode` or `apheleia-global-mode` on, Emacs formats on save and keeps point
-where it was.
+With `apheleia-mode` or `apheleia-global-mode` active, Emacs formats on save while preserving point.
 
 ### VS Code ("Run on Save")
 
-VS Code has no generic command formatter. Instead, the
-[Run on Save](https://marketplace.visualstudio.com/items?itemName=emeraldwalk.RunOnSave)
-extension (`emeraldwalk.runonsave`) can rewrite the file after each save, and the editor
-reloads it. Add this to `settings.json`:
+There is no dedicated VS Code extension for Sparkles, though any generic LSP client extension can launch `sparkles lsp`. For command-based formatting, install the [Run on Save](https://marketplace.visualstudio.com/items?itemName=emeraldwalk.RunOnSave) extension (`emeraldwalk.runonsave`) and add the following to `settings.json`:
 
 ```json
 {
@@ -257,6 +162,8 @@ reloads it. Add this to `settings.json`:
 }
 ```
 
-`--write` replaces the file only when it changes, so saving a formatted file does not
-reload it. Any VS Code extension that starts a language server for a file type can run
-`sparkles lsp` instead. There is no Sparkles extension.
+Because `--write` rewrites a file only when formatting changes it, saving an already formatted file avoids unnecessary reloads.
+
+## Related guides
+
+See [Formatter and editor support](querying/README.md#formatter-and-editor-support) for the full list of supported formats and lint rules, and [Formatting](USAGE.md#formatting) and [Linting](USAGE.md#linting) for `.sparklesfmt.toml` options.

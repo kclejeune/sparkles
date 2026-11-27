@@ -895,9 +895,11 @@ fn add_configuration_activation(
     if !plan.in_window() || plan.interrupted.is_some() {
         return Ok(());
     }
-    if crate::store::managed_history::activation_needed(root, preparation)? {
+    if let Some(to) =
+        crate::store::managed_history::activation_generation_format(root, preparation)?
+    {
         let _inventory = crate::store::managed_history::activation_inventory(root, preparation)?;
-        plan.steps.push(PlannedStep { kind: "configuration-generation", file: "managed.json".into(), from: 0, to: 1,
+        plan.steps.push(PlannedStep { kind: "configuration-generation", file: "managed.json".into(), from: 0, to,
             summary: "activate complete configuration generations with genuine future-commit coverage on a checked copy" });
     }
     Ok(())

@@ -524,6 +524,8 @@ public class DatasetGraphSparkles internal constructor(
     public fun ontology(): SparklesOntology = SparklesOntology(this)
     public fun graphql(): SparklesGraphQl = SparklesGraphQl(this)
     public fun graph(): SparklesGraphOverview = SparklesGraphOverview(this)
+    /** Evidence settings, durable holds, reference resolution, proposals, reviews and withdrawals (spec C25). */
+    public fun evidence(): SparklesEvidence = SparklesEvidence(this)
 
     /** Serialize one committed snapshot with bounded native byte batches. */
     public fun dump(output: OutputStream, lang: Lang) {

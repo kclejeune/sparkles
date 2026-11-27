@@ -3,20 +3,14 @@
 //! `query`, `update` and `load`.
 #![cfg(feature = "auth")]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn sparkles(home: &Path) -> Command {
     let mut c = Command::new(BIN);
@@ -60,16 +54,9 @@ fn hash_password(home: &Path, pw: &str) -> String {
 /// A server on 127.0.0.1 with datasets `wiki` and `secret`; alice (password
 /// `alice-pw`) administers everything.
 struct Server {
-    child: Child,
+    _child: common::ServerProcess,
     url: String,
     home: tempfile::TempDir,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 fn start() -> Server {
@@ -88,29 +75,15 @@ fn start() -> Server {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let port = free_port();
-    let child = Command::new(BIN)
-        .args([
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--mem",
-            "wiki",
-            "--mem",
-            "secret",
-            "--idle-release-ms",
-            "0",
-        ])
-        .arg("--data")
-        .arg(home.path().join("data"))
-        .arg("--auth-config")
-        .arg(&cfg)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let (child, port) = common::ServerProcess::start(
+        common::serve()
+            .args(["--mem", "wiki", "--mem", "secret", "--idle-release-ms", "0"])
+            .arg("--data")
+            .arg(home.path().join("data"))
+            .arg("--auth-config")
+            .arg(&cfg),
+        &home.path().join("server.log"),
+    );
     let url = format!("http://127.0.0.1:{port}");
     let t0 = Instant::now();
     while reqwest::blocking::get(format!("{url}/$/ready"))
@@ -122,7 +95,11 @@ fn start() -> Server {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    Server { child, url, home }
+    Server {
+        _child: child,
+        url,
+        home,
+    }
 }
 
 /// A browser session of alice: cookie header and CSRF token.
@@ -213,7 +190,7 @@ fn offline_commands() {
     );
 
     let o = run(sparkles(home.path())
-        .args(["serve", "--port", "1", "--auth-config"])
+        .args(["serve", "--port", "0", "--auth-config"])
         .arg(home.path().join("missing.toml"))
         .arg("--data")
         .arg(home.path().join("data")));
@@ -569,31 +546,18 @@ fn mcp_bridge() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let port = free_port();
-    let child = Command::new(BIN)
-        .args([
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--mem",
-            "wiki",
-            "--mem",
-            "secret",
-            "--mcp",
-        ])
-        .arg("--data")
-        .arg(home.path().join("data"))
-        .arg("--auth-config")
-        .arg(&cfg)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let (child, port) = common::ServerProcess::start(
+        common::serve()
+            .args(["--mem", "wiki", "--mem", "secret", "--mcp"])
+            .arg("--data")
+            .arg(home.path().join("data"))
+            .arg("--auth-config")
+            .arg(&cfg),
+        &home.path().join("server.log"),
+    );
     let url = format!("http://127.0.0.1:{port}");
     let _server = Server {
-        child,
+        _child: child,
         url: url.clone(),
         home: tempfile::tempdir().unwrap(),
     };

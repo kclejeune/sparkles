@@ -2,6 +2,8 @@
 //! acceptance examples of spec P02 through the async API, and through the blocking facade
 //! against a server with authentication.
 
+mod common;
+
 use oxrdf::{Literal, NamedNode, Quad, Term, Triple};
 use sparkles_client::{
     At, Client, CommitsOptions, DatasetType, Error, Graph, QueryOptions, RdfBody, ReadOptions,
@@ -9,56 +11,31 @@ use sparkles_client::{
 };
 use std::io::Write;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+#[cfg(feature = "auth")]
+use std::process::Command;
+use std::time::Duration;
 
+#[cfg(feature = "auth")]
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
 
 struct Server {
-    child: Child,
+    _child: common::ServerProcess,
     url: String,
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// A server on a free port of `ports` with its data in `dir`. Each test has its own
-/// ports, so two tests never start servers on the same one.
-fn serve(dir: &Path, ports: std::ops::Range<u16>, extra: &[&str]) -> Server {
-    let port = ports
-        .clone()
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .unwrap_or_else(|| panic!("no free port in {ports:?}"));
-    let child = Command::new(BIN)
-        .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
-        .args(["--idle-release-ms", "0"])
-        .args(extra)
-        .arg("--data")
-        .arg(dir.join("data"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut child = child;
-    let t0 = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the server exited before listening"
-        );
-        assert!(
-            t0.elapsed() < Duration::from_secs(120),
-            "server did not start"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+/// A server with its data in `dir`.
+fn serve(dir: &Path, extra: &[&str]) -> Server {
+    let (child, port) = common::ServerProcess::start(
+        common::serve()
+            .args(["--idle-release-ms", "0"])
+            .args(extra)
+            .arg("--data")
+            .arg(dir.join("data")),
+        &dir.join("server.log"),
+    );
     wait_ready(port);
     Server {
-        child,
+        _child: child,
         url: format!("http://127.0.0.1:{port}"),
     }
 }
@@ -70,7 +47,7 @@ fn iri(s: &str) -> NamedNode {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_client_against_a_server() {
     let dir = tempfile::tempdir().unwrap();
-    let server = serve(dir.path(), 5540..5545, &[]);
+    let server = serve(dir.path(), &[]);
     let client = Client::new(&server.url).unwrap();
     client.ping().await.unwrap();
     let info = client.server().await.unwrap();
@@ -441,7 +418,6 @@ fn blocking_client_with_authentication() {
     }
     let server = serve(
         dir.path(),
-        5545..5550,
         &["--mem", "wiki", "--auth-config", cfg.to_str().unwrap()],
     );
 

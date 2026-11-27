@@ -1,0 +1,3 @@
+200 application/n-quads
+<urn:ex:s1> <urn:ex:p> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<urn:ex:s1> <urn:ex:p> _:b0 .

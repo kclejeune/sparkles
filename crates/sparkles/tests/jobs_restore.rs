@@ -326,3 +326,224 @@ fn a_restore_adopts_paused_runs_beyond_one_scan() {
     }
     assert_eq!(resumed, runs.len());
 }
+
+/// An activated dataset with durable jobs supports both `Dataset::clone_to_with` (empty
+/// job ledger + independent destination configuration-history root) and new-identity
+/// `Catalog::restore` (paused job recovery + destination configuration-history root).
+#[test]
+fn activated_dataset_with_jobs_clones_and_restores_under_new_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+    let repos = cat.repositories().unwrap();
+    repos
+        .add(RepoConfig {
+            name: "local".into(),
+            kind: RepoType::Fs,
+            path: Some(dir.path().join("repo").display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let ds = cat.create("src", &Default::default()).unwrap();
+    let src_root = ds.store().root().unwrap().to_path_buf();
+    ds.update("INSERT DATA { <urn:s> <urn:p> 1 }").unwrap();
+    enable(&ds);
+    drop(ds);
+    drop(cat);
+
+    let prep = sparkles::access::Preparation::new(Default::default(), 64 * 1024 * 1024).unwrap();
+    sparkles::migrate::activate_configuration_history(&src_root, false, &prep).unwrap();
+
+    let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+    let repo = cat.repositories().unwrap().open("local").unwrap();
+    let ds = cat.get("src").unwrap();
+    let queued = submit(&ds, "q-activated");
+    ds.update("INSERT DATA { <urn:s> <urn:p> 2 }").unwrap();
+
+    // Persistent clone via Dataset::clone_to_with gets an empty ledger and its own root.
+    let clone_path = dir.path().join("cloned-ds");
+    ds.clone_to_with(&clone_path, &Default::default(), &Default::default())
+        .unwrap();
+    let cloned = Dataset::open(&clone_path).unwrap();
+    assert!(cloned.store().control_enabled());
+    assert!(
+        cloned
+            .jobs()
+            .list(&Default::default(), &admin())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        cloned
+            .store()
+            .evidence_view(&sparkles::history::At::Head, &prep)
+            .unwrap()
+            .configuration()
+            .dataset_id(),
+        cloned.store().dataset_id()
+    );
+
+    // Backup and new-identity restore preserves paused job recovery and destination root.
+    ds.backups(&repo)
+        .create_with(
+            &CreateOptions {
+                name: "b-act".into(),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    let copy = cat
+        .restore(
+            &repo,
+            "b-act",
+            &RestoreRequest {
+                target: Some("copy-act".into()),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    assert_ne!(copy.store().dataset_id(), ds.store().dataset_id());
+    copy.jobs().recover().unwrap();
+    assert_eq!(state(&copy, queued), State::Paused);
+    copy.jobs().resume(&[queued], &admin()).unwrap();
+    assert_eq!(state(&copy, queued), State::Queued);
+    assert_eq!(
+        copy.store()
+            .evidence_view(&sparkles::history::At::Head, &prep)
+            .unwrap()
+            .configuration()
+            .dataset_id(),
+        copy.store().dataset_id()
+    );
+}
+
+/// Restoring a non-control activated source (WAL version 2) under a new identity
+/// and then enabling jobs upgrades the WAL header in place to version 3 without
+/// invalidating the authenticated imported WAL interval proof. Also verifies
+/// interrupted enablement recovery (`control-enable-log`) and public backup of a
+/// linked branch on an imported family.
+#[test]
+fn enabling_jobs_on_new_identity_restore_preserves_imported_wal_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+    let repos = cat.repositories().unwrap();
+    repos
+        .add(RepoConfig {
+            name: "local".into(),
+            kind: RepoType::Fs,
+            path: Some(dir.path().join("repo").display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    // Source has activated configuration history WITHOUT jobs/control enabled (WAL v2).
+    let ds = cat.create("src-no-jobs", &Default::default()).unwrap();
+    let src_root = ds.store().root().unwrap().to_path_buf();
+    ds.update("INSERT DATA { <urn:s> <urn:p> 1 }").unwrap();
+    drop(ds);
+    drop(cat);
+
+    let prep = sparkles::access::Preparation::new(Default::default(), 64 * 1024 * 1024).unwrap();
+    sparkles::migrate::activate_configuration_history(&src_root, false, &prep).unwrap();
+
+    let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+    let repo = cat.repositories().unwrap().open("local").unwrap();
+    let ds = cat.get("src-no-jobs").unwrap();
+    assert!(!ds.store().control_enabled());
+    ds.update("INSERT DATA { <urn:s> <urn:p> 2 }").unwrap();
+    ds.backups(&repo)
+        .create_with(
+            &CreateOptions {
+                name: "b-no-jobs".into(),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+
+    // 1. Restore under new identity, then enable jobs on the restored copy.
+    let copy = cat
+        .restore(
+            &repo,
+            "b-no-jobs",
+            &RestoreRequest {
+                target: Some("copy-enable-jobs".into()),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    let copy_root = copy.store().root().unwrap().to_path_buf();
+    enable(&copy);
+    let _job = submit(&copy, "after-enable");
+    copy.update("INSERT DATA { <urn:s> <urn:p> 3 }").unwrap();
+    drop(copy);
+    drop(ds);
+    drop(cat);
+
+    // Check and reopen must pass with the upgraded v3 WAL header.
+    let report = sparkles_core::check::check(
+        &copy_root,
+        &sparkles_core::check::CheckOptions { quick: false },
+    )
+    .unwrap();
+    assert_eq!(report.errors, 0, "{report:?}");
+    let reopened = Dataset::open(&copy_root).unwrap();
+    assert!(reopened.store().control_enabled());
+    assert_eq!(
+        reopened
+            .store()
+            .evidence_view(
+                &sparkles::history::At::Commit(reopened.store().head_commit().seq),
+                &prep
+            )
+            .unwrap()
+            .configuration()
+            .dataset_id(),
+        reopened.store().dataset_id()
+    );
+    drop(reopened);
+
+    // 2. Interrupted enablement recovery: restore another new-identity copy,
+    //    write control checkpoint + log without upgrading WAL header (simulating
+    //    crash at `control-enable-log`), then reopen so `upgrade_wal_header_at`
+    //    completes the header upgrade on open.
+    let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+    let repo = cat.repositories().unwrap().open("local").unwrap();
+    let copy2 = cat
+        .restore(
+            &repo,
+            "b-no-jobs",
+            &RestoreRequest {
+                target: Some("copy-interrupted".into()),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    let copy2_root = copy2.store().root().unwrap().to_path_buf();
+    drop(copy2);
+    drop(cat);
+    std::fs::write(
+        copy2_root.join(sparkles_core::control::CHECKPOINT_FILE),
+        sparkles_core::control::encode_checkpoint(&Default::default()),
+    )
+    .unwrap();
+    std::fs::write(
+        copy2_root.join(sparkles_core::control::LOG_FILE),
+        sparkles_core::control::log_header(),
+    )
+    .unwrap();
+    let recovered = Dataset::open(&copy2_root).unwrap();
+    assert!(recovered.store().control_enabled());
+    drop(recovered);
+    let report2 = sparkles_core::check::check(
+        &copy2_root,
+        &sparkles_core::check::CheckOptions { quick: false },
+    )
+    .unwrap();
+    assert_eq!(report2.errors, 0, "{report2:?}");
+    let _reopened2 = Dataset::open(&copy2_root).unwrap();
+}

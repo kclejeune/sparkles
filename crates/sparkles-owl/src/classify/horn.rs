@@ -50,16 +50,29 @@ pub struct HornAx {
     pub autos: FxHashMap<Role, Nfa>,
     /// the axioms outside OWL 2 EL the run takes
     pub taken: usize,
+    /// the ranges of roles that chains reach whose universal on `owl:Thing` the run
+    /// leaves out, since the ranges of the links that end their paths give it
+    /// ([`ends_in_range`])
+    pub ranges_covered: usize,
 }
 
 impl HornAx {
-    pub fn bytes(&self) -> usize {
-        self.clash.capacity() * 8
-            + self.premises.capacity() * 4
+    pub fn bytes_poll<E>(&self, tick: &mut impl FnMut(usize) -> Result<(), E>) -> Result<usize, E> {
+        let mut total = self.clash.capacity() * 8 + self.premises.capacity() * 4;
+        for a in self.autos.values() {
+            tick(1)?;
+            total += 64 + a.trans.capacity() * 16;
+        }
+        Ok(total)
+    }
+
+    pub fn logical_bytes(&self) -> usize {
+        self.clash.len() * 8
+            + self.premises.len() * 4
             + self
                 .autos
                 .values()
-                .map(|a| 64 + a.trans.capacity() * 16)
+                .map(|a| 64 + a.trans.len() * 16)
                 .sum::<usize>()
     }
 }
@@ -104,6 +117,10 @@ impl HornIx {
 
     pub fn bytes(&self) -> usize {
         self.flags.capacity() + self.dead.capacity() * size_of::<Role>()
+    }
+
+    pub fn logical_bytes(&self) -> usize {
+        self.flags.len() + self.dead.len() * size_of::<Role>()
     }
 
     /// Whether `r` is under a role whose transitions the automata lost, for the checks
@@ -248,6 +265,82 @@ pub struct EpsFree {
 }
 
 impl Nfa {
+    /// The labels of the transitions into the final states of [`Nfa::eps_free`], sorted,
+    /// or `None` when its start is final, found without building the closure: a labelled
+    /// transition from a state that the start reaches to one whose ε-transitions reach the
+    /// end. The work is linear in the automaton up to the sort of the labels, and it polls
+    /// `stop` every [`POLL_WORK`] steps and once more after the sort. Its scratch is a few
+    /// words for each state and transition, of which it counts an upper bound before it
+    /// allocates and refuses past `limit` bytes, as the role box refuses its closure.
+    pub fn final_labels(
+        &self,
+        limit: Option<usize>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Role>>, Halt> {
+        // an upper bound: the two lists of each state and their entries, the two marks of
+        // each state, a stack that holds at most every transition's target once more than
+        // the transitions, and the labels, each vector at up to twice its length by growth
+        let (n, m) = (self.states as usize, self.trans.len());
+        let bytes = n * (2 * 24 + 2) + 2 * (2 * m * 4 + (m + 1) * 4 + m * 4);
+        if limit.is_some_and(|l| bytes > l) {
+            return Err(Halt::Memory(bytes));
+        }
+        let mut work = 0usize;
+        let mut tick = || {
+            work += 1;
+            if work.is_multiple_of(POLL_WORK) && stop() {
+                Err(Halt::Stopped)
+            } else {
+                Ok(())
+            }
+        };
+        let n = self.states as usize;
+        let mut back: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for &(p, l, q) in &self.trans {
+            tick()?;
+            out[p as usize].push(q);
+            if l.is_none() {
+                back[q as usize].push(p);
+            }
+        }
+        let mut ends = vec![false; n];
+        let mut stack = vec![self.end];
+        while let Some(x) = stack.pop() {
+            tick()?;
+            if !std::mem::replace(&mut ends[x as usize], true) {
+                stack.extend(back[x as usize].iter().copied());
+            }
+        }
+        if ends[self.start as usize] {
+            return Ok(None);
+        }
+        let mut reached = vec![false; n];
+        let mut stack = vec![self.start];
+        while let Some(x) = stack.pop() {
+            tick()?;
+            if !std::mem::replace(&mut reached[x as usize], true) {
+                stack.extend(out[x as usize].iter().copied());
+            }
+        }
+        let mut ls: Vec<Role> = Vec::new();
+        for &(p, l, q) in &self.trans {
+            tick()?;
+            if let Some(l) = l
+                && reached[p as usize]
+                && ends[q as usize]
+            {
+                ls.push(l);
+            }
+        }
+        ls.sort_unstable();
+        ls.dedup();
+        if stop() {
+            return Err(Halt::Stopped);
+        }
+        Ok(Some(ls))
+    }
+
     /// The automaton with its ε-transitions closed over: a state takes the transitions of
     /// the states its ε-transitions reach, and is final when one of them is the end.
     pub fn eps_free(&self) -> EpsFree {
@@ -316,6 +409,129 @@ impl Nfa {
     }
 }
 
+/// Which universals on `owl:Thing` a run makes for the ranges of the roles that chains
+/// reach (roadmap item 693).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RangeUniversals {
+    /// every one but those whose paths the ranges of their last links cover, the default
+    Covered,
+    /// every one, which `SPARKLES_HORN_RANGES=keep` selects for the comparison of the forms
+    Keep,
+    /// none, which is incomplete and only the tests use, to show which answers need them
+    #[cfg(test)]
+    Drop,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RANGES_OVERRIDE: std::cell::Cell<Option<RangeUniversals>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the range universals of `mode`, for the tests that compare the forms.
+/// The normalization runs on the calling thread, so the override reaches it, and a guard
+/// restores the earlier mode even when `f` panics.
+#[cfg(test)]
+pub fn with_range_universals<T>(mode: RangeUniversals, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<RangeUniversals>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RANGES_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(RANGES_OVERRIDE.with(|c| c.replace(Some(mode))));
+    f()
+}
+
+/// The range universals of a run: the tests' override, then `SPARKLES_HORN_RANGES`.
+pub fn range_universals() -> RangeUniversals {
+    #[cfg(test)]
+    if let Some(m) = RANGES_OVERRIDE.with(|c| c.get()) {
+        return m;
+    }
+    static MODE: std::sync::OnceLock<RangeUniversals> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("SPARKLES_HORN_RANGES").as_deref() {
+        Ok("keep") => RangeUniversals::Keep,
+        _ => RangeUniversals::Covered,
+    })
+}
+
+/// Whether the told ranges already give `c` at the end of every path that implies `r`,
+/// so that `⊤ ⊑ ∀r.c` adds nothing (roadmap item 693, F24's section on the Horn rules).
+/// `told` holds the roles that have `c` as a told range. The last letter of every word
+/// that the automaton of `r` accepts labels a transition into a final state, and the test
+/// asks of each such label `l` that `l` or a role above it, `r` included, be in `told`. The index gives the target of every link
+/// by a role under `l` the ranges of that role and its superroles, and the source of
+/// every link by a role under `l⁻` the same ranges through `∃l⁻.⊤ ⊑ c`
+/// ([`super::index`]'s `horn_index`), and a loop takes the ranges of its role and its
+/// inverse. The empty word, which a final start would accept, and the top property,
+/// which relates every pair, are left to the universal.
+fn ends_in_range(
+    rb: &mut RoleBox,
+    labels: &mut FxHashMap<Role, Option<Vec<Role>>>,
+    told: &[Role],
+    tops: &[Role],
+    r: Role,
+    limit: Option<usize>,
+    stop: &dyn Fn() -> bool,
+) -> Result<bool, Halt> {
+    if tops.contains(&r) {
+        return Ok(false);
+    }
+    // the labels into final states, once for each role whatever its ranges
+    let ls = match labels.entry(r) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let ls = match rb.autos.get(&r) {
+                Some(a) => a.final_labels(limit, stop)?,
+                None => match rb.auto(r, &mut Vec::new()) {
+                    Some(a) => a.final_labels(limit, stop)?,
+                    None => None,
+                },
+            };
+            e.insert(ls.filter(|ls| !ls.is_empty()))
+        }
+    };
+    let Some(ls) = ls else {
+        return Ok(false);
+    };
+    // a test for each pair of a label and a top or told property, polling the stop
+    let mut work = 0usize;
+    let mut tick = || {
+        work += 1;
+        if work.is_multiple_of(POLL_WORK) && stop() {
+            Err(Halt::Stopped)
+        } else {
+            Ok(())
+        }
+    };
+    for &l in ls.iter() {
+        let mut top = false;
+        for &t in tops {
+            tick()?;
+            top |= t == l;
+        }
+        if top {
+            return Ok(false);
+        }
+        let mut found = false;
+        for &l2 in told {
+            tick()?;
+            if rb.sub(l, l2) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+    }
+    if work >= POLL_WORK && stop() {
+        return Err(Halt::Stopped);
+    }
+    Ok(true)
+}
+
 /// How far a run reduces the automata that unfold its universals (roadmap item 693):
 /// 0 leaves them as the ε-closure gives them, 1 merges the states that accept the same
 /// words by the same transitions, 2 also drops a transition that another from the same
@@ -329,6 +545,23 @@ pub fn reduction() -> u8 {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3)
+    })
+}
+
+/// How far a run of Tier D reduces the automata that unfold its universals (roadmap
+/// item 712), when [`Limits::dl_automata`](super::Limits::dl_automata) does not say: 0
+/// leaves them as the ε-closure gives them, 1 merges the states that accept the same words
+/// by the same transitions, and 2, the default, also drops a transition that another from
+/// the same state to the same target covers by a superrole. `SPARKLES_DL_AUTOMATA` sets
+/// it, for the comparison of the forms, and a value above 2 is 2. Tier D does not drop the
+/// transitions by dead roles, the Horn rules' third reduction.
+pub fn dl_reduction() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("SPARKLES_DL_AUTOMATA")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .map_or(2, |l| l.min(2))
     })
 }
 
@@ -631,7 +864,13 @@ pub(super) struct RoleBox {
 }
 
 impl RoleBox {
-    fn sub(&self, r: Role, s: Role) -> bool {
+    /// The steps one call of [`RoleBox::sub`] takes at most, a search in the longest
+    /// superrole list, for the bound of [`EpsFree::reduce`].
+    pub(super) fn sub_cost(&self) -> usize {
+        log_steps(self.sup.iter().map(Vec::len).max().unwrap_or(0))
+    }
+
+    pub(super) fn sub(&self, r: Role, s: Role) -> bool {
         r == s
             || self
                 .sup
@@ -810,9 +1049,39 @@ struct Out {
     reflexive: Vec<Role>,
     clash: Vec<(Role, Role)>,
     premises: Vec<Ex>,
+    /// the data axioms of checker components, as the EL normalization keeps them
+    dt_ranges: Vec<(Role, super::dtcheck::range::Rid)>,
+    dt_disjoint: Vec<(Role, Role)>,
+    functional: Vec<Role>,
+    individuals: Vec<Ex>,
 }
 
 impl Out {
+    fn bytes(&self) -> usize {
+        self.subs.capacity() * 8
+            + self
+                .disjoint
+                .iter()
+                .map(|d| 24 + d.capacity() * 4)
+                .sum::<usize>()
+            + self.disjoint.capacity() * 24
+            + self.ranges.capacity() * 8
+            + self.role_subs.capacity() * 8
+            + self
+                .chains
+                .iter()
+                .map(|(c, _)| 32 + c.capacity() * 4)
+                .sum::<usize>()
+            + self.chains.capacity() * 32
+            + self.reflexive.capacity() * 4
+            + self.clash.capacity() * 8
+            + self.premises.capacity() * 4
+            + self.dt_ranges.capacity() * 8
+            + self.dt_disjoint.capacity() * 8
+            + self.functional.capacity() * 4
+            + self.individuals.capacity() * 4
+    }
+
     fn commit(self, ax: &mut Axioms, h: &mut HornAx) {
         ax.subs.extend(self.subs);
         ax.disjoint.extend(self.disjoint);
@@ -820,45 +1089,269 @@ impl Out {
         ax.role_subs.extend(self.role_subs);
         ax.chains.extend(self.chains);
         ax.reflexive.extend(self.reflexive);
-        h.clash.extend(self.clash);
+        if h.clash.is_empty() && h.clash.capacity() == 0 {
+            h.clash = self.clash;
+        } else {
+            h.clash.extend(self.clash);
+        }
         h.premises.extend(self.premises);
+        ax.dt_ranges.extend(self.dt_ranges);
+        if ax.dt_disjoint.is_empty() && ax.dt_disjoint.capacity() == 0 {
+            ax.dt_disjoint = self.dt_disjoint;
+        } else {
+            ax.dt_disjoint.extend(self.dt_disjoint);
+        }
+        ax.functional.extend(self.functional);
+        ax.individuals.extend(self.individuals);
     }
 }
 
-struct Norm<'a> {
+/// Lazily initialized memory budget tracker for role-pair generation.
+///
+/// When `limit` is `None` or no candidate emits role pairs, neither `ax.bytes()` nor
+/// `it.dt_run_static_bytes()` is walked. Once a bounded pair-emitting path first checks
+/// the budget, both immutable baselines are cached so every subsequent check is O(1)
+/// using the live interner size and incrementally tracked output bytes.
+pub(super) struct PairBudget<'a> {
+    limit: Option<usize>,
+    ax: &'a Axioms,
+    ax_bytes: Option<usize>,
+    dt_static_bytes: Option<usize>,
+    accum_bytes: usize,
+}
+
+impl<'a> PairBudget<'a> {
+    pub(super) fn new(limit: Option<usize>, ax: &'a Axioms) -> Self {
+        Self {
+            limit,
+            ax,
+            ax_bytes: None,
+            dt_static_bytes: None,
+            accum_bytes: 0,
+        }
+    }
+
+    pub(super) fn is_bounded(&self) -> bool {
+        self.limit.is_some()
+    }
+
+    pub(super) fn add_accum(&mut self, bytes: usize) {
+        if self.limit.is_some() {
+            self.accum_bytes = self.accum_bytes.saturating_add(bytes);
+        }
+    }
+
+    pub(super) fn set_accum(&mut self, bytes: usize) {
+        if self.limit.is_some() {
+            self.accum_bytes = bytes;
+        }
+    }
+
+    pub(super) fn check(&mut self, it: &Interner, extra_bytes: usize) -> Result<(), Halt> {
+        let Some(limit) = self.limit else {
+            return Ok(());
+        };
+        let ax_bytes = *self.ax_bytes.get_or_insert_with(|| self.ax.bytes());
+        let dt_static = *self
+            .dt_static_bytes
+            .get_or_insert_with(|| it.dt_run_static_bytes());
+        let it_bytes = it
+            .core_bytes()
+            .saturating_add(dt_static)
+            .saturating_add(it.dt_run_memo_bytes());
+        let total = it_bytes
+            .saturating_add(ax_bytes)
+            .saturating_add(self.accum_bytes)
+            .saturating_add(extra_bytes);
+        if total > limit {
+            return Err(Halt::Memory(total));
+        }
+        Ok(())
+    }
+}
+
+struct Norm<'a, 'b> {
     it: &'a mut Interner,
     rb: Option<&'a RoleBox>,
     out: Out,
-    /// whether the ontology has individuals, which leaves at-least restrictions above
-    /// one out (F24, "The Horn rules with individuals")
-    individuals: bool,
+    budget: Option<&'a mut PairBudget<'b>>,
+    stop: &'a dyn Fn() -> bool,
+    halt: Option<Halt>,
 }
 
-impl Norm<'_> {
+/// Scans a sorted multiset slice of property operands, resolves each distinct operand
+/// once into a [`Role`], emits self-pairs once per repeated role and pairwise disjoint
+/// pairs over distinct roles, checks the live post-interning memory budget (including
+/// temporary pair-building buffers) before growing or reserving, and polls cancellation
+/// during operand scanning, before reserve, and throughout pair emission.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_role_pairs<T: Eq>(
+    ps: &[T],
+    symmetric: bool,
+    it: &mut Interner,
+    mut resolve: impl FnMut(&mut Interner, &T) -> Result<Role, Why>,
+    out: &mut Vec<(Role, Role)>,
+    out_other_bytes: usize,
+    mut budget: Option<&mut PairBudget<'_>>,
+    stop: &dyn Fn() -> bool,
+    halt: &mut Option<Halt>,
+) -> Result<(), Why> {
+    let mut entries: Vec<(Role, bool)> = Vec::new();
+    let mut work = 0usize;
+    let mut i = 0usize;
+    while i < ps.len() {
+        work += 1;
+        if work.is_multiple_of(POLL_WORK) && stop() {
+            *halt = Some(Halt::Stopped);
+            return Err("cancelled");
+        }
+        let mut j = i + 1;
+        while j < ps.len() && ps[j] == ps[i] {
+            work += 1;
+            if work.is_multiple_of(POLL_WORK) && stop() {
+                *halt = Some(Halt::Stopped);
+                return Err("cancelled");
+            }
+            j += 1;
+        }
+        let r = resolve(it, &ps[i])?;
+        if entries.len() == entries.capacity()
+            && let Some(b) = budget.as_deref_mut()
+        {
+            let next_cap = entries.capacity().saturating_mul(2).max(4);
+            let extra = out_other_bytes
+                .saturating_add(
+                    out.capacity()
+                        .saturating_mul(std::mem::size_of::<(Role, Role)>()),
+                )
+                .saturating_add(next_cap.saturating_mul(std::mem::size_of::<(Role, bool)>()));
+            if let Err(h) = b.check(it, extra) {
+                *halt = Some(h);
+                return Err("memory budget exceeded");
+            }
+        }
+        entries.push((r, j - i >= 2));
+        i = j;
+    }
+
+    if stop() {
+        *halt = Some(Halt::Stopped);
+        return Err("cancelled");
+    }
+
+    entries.sort_unstable_by_key(|&(r, _)| r);
+    let mut write = 0usize;
+    let mut read = 0usize;
+    let mut repeated_count = 0usize;
+    while read < entries.len() {
+        let r = entries[read].0;
+        let mut rep = entries[read].1;
+        let mut next = read + 1;
+        while next < entries.len() && entries[next].0 == r {
+            rep = true;
+            next += 1;
+        }
+        if rep {
+            repeated_count += 1;
+        }
+        entries[write] = (r, rep);
+        write += 1;
+        read = next;
+    }
+    entries.truncate(write);
+
+    let d = entries.len();
+    let distinct_pairs = if symmetric {
+        d.saturating_mul(d.saturating_sub(1))
+    } else {
+        d.saturating_mul(d.saturating_sub(1)) / 2
+    };
+    let pair_count = repeated_count.saturating_add(distinct_pairs);
+
+    if stop() {
+        *halt = Some(Halt::Stopped);
+        return Err("cancelled");
+    }
+
+    if let Some(b) = budget {
+        let scratch_bytes = entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(Role, bool)>());
+        let target_out_cap = out.len().saturating_add(pair_count).max(out.capacity());
+        let target_out_bytes = target_out_cap.saturating_mul(std::mem::size_of::<(Role, Role)>());
+        let extra = out_other_bytes
+            .saturating_add(scratch_bytes)
+            .saturating_add(target_out_bytes);
+        if let Err(h) = b.check(it, extra) {
+            *halt = Some(h);
+            return Err("memory budget exceeded");
+        }
+    }
+
+    out.reserve_exact(pair_count);
+    for &(a, rep) in &entries {
+        if rep {
+            work += 1;
+            if work.is_multiple_of(POLL_WORK) && stop() {
+                *halt = Some(Halt::Stopped);
+                return Err("cancelled");
+            }
+            out.push((a, a));
+        }
+    }
+    for (idx, &(a, _)) in entries.iter().enumerate() {
+        for &(b, _) in &entries[idx + 1..] {
+            work += 1;
+            if work.is_multiple_of(POLL_WORK) && stop() {
+                *halt = Some(Halt::Stopped);
+                return Err("cancelled");
+            }
+            out.push((a, b));
+            if symmetric {
+                out.push((b, a));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn role_in(it: &mut Interner, p: &ObjectPropertyExpression) -> Result<Role, Why> {
+    let named = p.named();
+    if named.as_str() == vocab::OWL_BOTTOM_OBJECT_PROPERTY {
+        return Err("the bottom object property");
+    }
+    let r = it.role(RoleName::Object(named.clone()));
+    let i = it.role(RoleName::Inverse(named.clone()));
+    Ok(match p {
+        ObjectPropertyExpression::Property(_) => r,
+        ObjectPropertyExpression::InverseOf(_) => i,
+    })
+}
+
+fn simple_role_in(
+    it: &mut Interner,
+    rb: Option<&RoleBox>,
+    p: &ObjectPropertyExpression,
+) -> Result<Role, Why> {
+    if is_top(p) {
+        return Err("the top object property where OWL 2 DL needs a simple one");
+    }
+    let r = role_in(it, p)?;
+    match rb {
+        Some(rb) if !rb.simple(r) => Err("a role that is not simple where OWL 2 DL needs one"),
+        _ => Ok(r),
+    }
+}
+
+impl Norm<'_, '_> {
     /// The role of an object property expression, with its inverse interned beside it.
     fn role(&mut self, p: &ObjectPropertyExpression) -> Result<Role, Why> {
-        let named = p.named();
-        if named.as_str() == vocab::OWL_BOTTOM_OBJECT_PROPERTY {
-            return Err("the bottom object property");
-        }
-        let r = self.it.role(RoleName::Object(named.clone()));
-        let i = self.it.role(RoleName::Inverse(named.clone()));
-        Ok(match p {
-            ObjectPropertyExpression::Property(_) => r,
-            ObjectPropertyExpression::InverseOf(_) => i,
-        })
+        role_in(self.it, p)
     }
 
     /// The role of an expression that OWL 2 DL requires to be simple.
     fn simple_role(&mut self, p: &ObjectPropertyExpression) -> Result<Role, Why> {
-        if is_top(p) {
-            return Err("the top object property where OWL 2 DL needs a simple one");
-        }
-        let r = self.role(p)?;
-        match self.rb {
-            Some(rb) if !rb.simple(r) => Err("a role that is not simple where OWL 2 DL needs one"),
-            _ => Ok(r),
-        }
+        simple_role_in(self.it, self.rb, p)
     }
 
     fn conj(&mut self, mut es: Vec<Ex>) -> Ex {
@@ -887,6 +1380,48 @@ impl Norm<'_> {
             (e, None) => Ok(e),
             (_, Some(why)) => Err(why),
         }
+    }
+
+    /// Whether the run's checker takes the property of a data restriction.
+    fn dt_checker(&self, c: &ClassExpression) -> bool {
+        use ClassExpression as C;
+        match c {
+            C::DataAllValuesFrom(ps, _) if ps.len() == 1 => self.it.dt_checker(&ps[0]),
+            C::DataMinCardinality(_, d, _)
+            | C::DataMaxCardinality(_, d, _)
+            | C::DataExactCardinality(_, d, _) => self.it.dt_checker(d),
+            _ => false,
+        }
+    }
+
+    /// The checker's atom of a universal or cardinality data restriction, in a positive
+    /// position or, for a minimum, in a negative one. A universal or a maximum in a
+    /// negative position is not Horn, and is left out with its axiom.
+    fn dt(&mut self, c: &ClassExpression, positive: bool) -> Result<Ex, Why> {
+        use ClassExpression as C;
+        let range = |it: &mut Interner, r: &Option<DataRange>| match r {
+            Some(r) => it.dt_range(r),
+            None => Ok(super::dtcheck::range::Ranges::FULL),
+        };
+        let e = match c {
+            C::DataAllValuesFrom(ps, r) if positive => self.it.dt_universal(&ps[0], r)?,
+            C::DataMinCardinality(n, d, r) => {
+                let x = range(self.it, r)?;
+                self.it.dt_node(d, true, u64::from(*n), x)
+            }
+            C::DataMaxCardinality(n, d, r) if positive => {
+                let x = range(self.it, r)?;
+                self.it.dt_node(d, false, u64::from(*n), x)
+            }
+            C::DataExactCardinality(n, d, r) if positive => {
+                let x = range(self.it, r)?;
+                let a = self.it.dt_node(d, true, u64::from(*n), x);
+                let b = self.it.dt_node(d, false, u64::from(*n), x);
+                self.conj(vec![a, b])
+            }
+            _ => return Err("a universal or maximum data restriction in a negative position"),
+        };
+        Ok(e)
     }
 
     /// `x` with `x ⊑ c`.
@@ -971,6 +1506,14 @@ impl Norm<'_> {
             }
             C::ObjectHasValue(p, a) => self.has_value(p, a)?,
             C::DataSomeValuesFrom(..) | C::DataHasValue(..) => self.el(c)?,
+            C::DataAllValuesFrom(..)
+            | C::DataMinCardinality(..)
+            | C::DataMaxCardinality(..)
+            | C::DataExactCardinality(..)
+                if self.dt_checker(c) =>
+            {
+                self.dt(c, true)?
+            }
             _ => return Err("a data restriction outside OWL 2 EL"),
         })
     }
@@ -984,6 +1527,12 @@ impl Norm<'_> {
         Ok(self.it.node(Node::Exist(r, n)))
     }
 
+    /// Unfolds `≥n p.f` into `n` existential restrictions with fresh, pairwise disjoint
+    /// subclasses of `f` (Kazakov's Lemma 2). This preserves satisfiability and named-class
+    /// subsumptions beside individuals in the Horn fragment, as the direct power `I^κ`
+    /// preserves every Horn axiom, nominals and EL data axioms while giving each tuple whose
+    /// coordinates satisfy `≥n p.f` in `I` at least `2^κ` distinct successors to colour
+    /// (F24, "The Horn rules with individuals", roadmap item 867).
     fn at_least(
         &mut self,
         n: u32,
@@ -993,11 +1542,6 @@ impl Norm<'_> {
     ) -> Result<Ex, Why> {
         if n == 0 {
             return Ok(TOP);
-        }
-        if n > 1 && self.individuals {
-            // Lemma 2's fresh disjoint fillers are argued for tree-shaped models, and a
-            // nominal is a shared successor (roadmap item 867)
-            return Err("an at-least restriction above one beside individuals");
         }
         let r = if n == 1 {
             self.role(p)?
@@ -1143,6 +1687,7 @@ impl Norm<'_> {
             }
             C::ObjectHasValue(p, a) => self.has_value(p, a)?,
             C::DataSomeValuesFrom(..) | C::DataHasValue(..) => self.el(c)?,
+            C::DataMinCardinality(..) if self.dt_checker(c) => self.dt(c, false)?,
             C::DataAllValuesFrom(..)
             | C::DataMinCardinality(..)
             | C::DataMaxCardinality(..)
@@ -1318,6 +1863,92 @@ impl Norm<'_> {
         let one = |a: &Individual| C::ObjectOneOf(std::iter::once(a.clone()).collect());
         match ax {
             K::SubClassOf(c, d) => self.sub(vec![c.clone()], vec![d.clone()]),
+            // the data axioms of a checker component that are outside OWL 2 EL, for a
+            // range or a literal of a DL datatype, as the EL normalization takes the
+            // others (F24, "The EL and Horn tiers")
+            K::DataPropertyRange(d, r) if self.it.dt_checker(d) => {
+                let x = self.it.dt_range(r)?;
+                let r = self.it.role(RoleName::Data(d.clone()));
+                self.out.dt_ranges.push((r, x));
+                Ok(())
+            }
+            // the pairs of a disjointness of checker properties, which the pre-pass puts
+            // in one component; one with the top or bottom data property, which have no
+            // component, is left out
+            K::DisjointDataProperties(ps) => {
+                // Verify every distinct property is in a checker component (polling stop
+                // during long duplicate runs) before interning any role.
+                let slice = ps.as_slice();
+                let mut work = 0usize;
+                let mut i = 0usize;
+                while i < slice.len() {
+                    work += 1;
+                    if work.is_multiple_of(POLL_WORK) && (self.stop)() {
+                        self.halt = Some(Halt::Stopped);
+                        return Err("cancelled");
+                    }
+                    if !self.it.dt_checker(&slice[i]) {
+                        return Err("an axiom the Horn rules do not take");
+                    }
+                    let mut j = i + 1;
+                    while j < slice.len() && slice[j] == slice[i] {
+                        work += 1;
+                        if work.is_multiple_of(POLL_WORK) && (self.stop)() {
+                            self.halt = Some(Halt::Stopped);
+                            return Err("cancelled");
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                }
+                let other_bytes = self
+                    .out
+                    .bytes()
+                    .saturating_sub(self.out.dt_disjoint.capacity() * 8);
+                emit_role_pairs(
+                    slice,
+                    false,
+                    self.it,
+                    |it, d| Ok(it.role(RoleName::Data(d.clone()))),
+                    &mut self.out.dt_disjoint,
+                    other_bytes,
+                    self.budget.as_deref_mut(),
+                    self.stop,
+                    &mut self.halt,
+                )
+            }
+            // a definition outside OWL 2 EL makes every property it is used on a checker
+            // property, whose atoms read it in place of its datatype, so the run takes it
+            // when the checker converts it. Another definition of the same datatype, which
+            // the atoms do not read, and one of a reserved name stay out.
+            K::DatatypeDefinition(d, r)
+                if !vocab::is_reserved(d.as_str())
+                    && self.it.dt_run.as_ref().is_some_and(|run| {
+                        run.defs.map().get(d).map(std::sync::Arc::as_ref) == Some(r)
+                    }) =>
+            {
+                self.it.dt_range(&DataRange::Datatype(d.clone()))?;
+                Ok(())
+            }
+            K::FunctionalDataProperty(d) if self.it.dt_checker(d) => {
+                let r = self.it.role(RoleName::Data(d.clone()));
+                self.out.functional.push(r);
+                Ok(())
+            }
+            K::DataPropertyAssertion(d, a, v) | K::NegativeDataPropertyAssertion(d, a, v)
+                if self.it.dt_checker(d) =>
+            {
+                let positive = matches!(ax, K::DataPropertyAssertion(..));
+                let x = self.it.dt_literal(v)?;
+                // ¬d(a, v) is `{a} ⊑ ∀d.¬{v}`, which is `{a} ⊑ ≤ 0 d.{v}`
+                let e = self
+                    .it
+                    .dt_node(d, positive, if positive { 1 } else { 0 }, x);
+                let a = self.it.individual(a);
+                self.out.individuals.push(a);
+                self.out.subs.push((a, e));
+                Ok(())
+            }
             // the assertions with a Horn class expression or an inverse property, as the
             // class axioms they are: `{a} ⊑ C`, `{a} ⊑ ∃p.{b}` and `{a} ⊓ ∃p.{b} ⊑ ⊥`
             K::ClassAssertion(c, a) => self.sub(vec![one(a)], vec![c.clone()]),
@@ -1339,42 +1970,32 @@ impl Norm<'_> {
                 Ok(())
             }
             K::DisjointClasses(cs) => {
-                let cs: Vec<&ClassExpression> = cs.iter().collect();
-                // operands with a negative form make one disjointness set
-                if let Ok(mut es) = cs
-                    .iter()
-                    .map(|c| self.neg(c, 0))
-                    .collect::<Result<Vec<_>, _>>()
-                {
-                    es.sort_unstable();
-                    for w in es.windows(2) {
-                        if w[0] == w[1] {
-                            self.out.subs.push((w[0], BOTTOM));
-                        }
-                    }
-                    es.dedup();
-                    es.retain(|&e| e != BOTTOM);
-                    if es.len() >= 2 {
-                        self.out.disjoint.push(es);
-                    }
-                    return Ok(());
+                let (unique, repeated) = super::dl::split_multiset(cs);
+                for &r in &repeated {
+                    self.empty(r)?;
                 }
-                for i in 0..cs.len() {
-                    for j in i + 1..cs.len() {
-                        self.sub(vec![cs[i].clone(), cs[j].clone()], vec![])?;
-                    }
+                if unique.len() >= 2 {
+                    self.disjoint_distinct(&unique)?;
                 }
                 Ok(())
             }
-            K::DisjointUnion(c, ds) if ds.len() <= 1 => {
-                let d = ds
-                    .iter()
-                    .next()
-                    .cloned()
-                    .unwrap_or(C::Class(Class::nothing()));
+            K::DisjointUnion(c, ds) => {
+                let (unique, repeated) = super::dl::split_multiset(ds);
                 let c = C::Class(c.clone());
-                self.sub(vec![c.clone()], vec![d.clone()])?;
-                self.sub(vec![d], vec![c])
+                self.sub(
+                    vec![c.clone()],
+                    unique.iter().map(|d| (*d).clone()).collect(),
+                )?;
+                for &d in &unique {
+                    self.sub(vec![d.clone()], vec![c.clone()])?;
+                }
+                for &r in &repeated {
+                    self.empty(r)?;
+                }
+                if unique.len() >= 2 {
+                    self.disjoint_distinct(&unique)?;
+                }
+                Ok(())
             }
             K::ObjectPropertyDomain(p, c) => self.sub(
                 vec![C::ObjectSomeValuesFrom(
@@ -1427,39 +2048,93 @@ impl Norm<'_> {
                 Ok(())
             }
             K::DisjointObjectProperties(ps) => {
-                let rs = ps
-                    .iter()
-                    .map(|p| self.simple_role(p))
-                    .collect::<Result<Vec<_>, _>>()?;
-                for &a in &rs {
-                    for &b in &rs {
-                        if a != b {
-                            self.out.clash.push((a, b));
-                        }
-                    }
-                }
-                Ok(())
+                let rb = self.rb;
+                let other_bytes = self
+                    .out
+                    .bytes()
+                    .saturating_sub(self.out.clash.capacity() * 8);
+                emit_role_pairs(
+                    ps.as_slice(),
+                    true,
+                    self.it,
+                    |it, p| simple_role_in(it, rb, p),
+                    &mut self.out.clash,
+                    other_bytes,
+                    self.budget.as_deref_mut(),
+                    self.stop,
+                    &mut self.halt,
+                )
             }
             _ => Err("an axiom the Horn rules do not take"),
         }
     }
-}
 
-/// Whether the axiom is an assertion about an anonymous individual. The rules have no
-/// context for an anonymous individual, so the normalization refuses every such axiom,
-/// and the caller leaves it out and reports it. Finding it here spares the axiom's scope
-/// and the attempt (roadmap item 869).
-fn anonymous(ax: &AxiomKind) -> bool {
-    use AxiomKind as K;
-    let anon = |a: &Individual| matches!(a, Individual::Anonymous(_));
-    match ax {
-        K::ClassAssertion(_, a)
-        | K::DataPropertyAssertion(_, a, _)
-        | K::NegativeDataPropertyAssertion(_, a, _) => anon(a),
-        K::ObjectPropertyAssertion(_, a, b) | K::NegativeObjectPropertyAssertion(_, a, b) => {
-            anon(a) || anon(b)
+    /// `c ⊑ ⊥`, using `neg` directly when it succeeds so wide shallow conjunctions do not
+    /// hit `sub`'s flattening step cap, and falling back to `sub` for expressions that
+    /// need polarity transfer (such as complements).
+    fn empty(&mut self, c: &ClassExpression) -> Result<(), Why> {
+        let subs_len = self.out.subs.len();
+        match self.neg(c, 0) {
+            Ok(e) => {
+                if e != BOTTOM {
+                    self.out.subs.push((e, BOTTOM));
+                }
+                Ok(())
+            }
+            Err(err) => {
+                self.out.subs.truncate(subs_len);
+                if self.it.dt_stopped() || self.it.ranges.check().is_err() {
+                    return Err(err);
+                }
+                self.sub(vec![c.clone()], vec![])
+            }
         }
-        _ => false,
+    }
+
+    /// Pairwise disjointness over distinct surviving operands.
+    fn disjoint_distinct(&mut self, unique: &[&ClassExpression]) -> Result<(), Why> {
+        // operands with a negative form make one disjointness set
+        let subs_len = self.out.subs.len();
+        match unique
+            .iter()
+            .map(|c| self.neg(c, 0))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(mut es) => {
+                es.sort_unstable();
+                let mut last_empty = None;
+                for w in es.windows(2) {
+                    if w[0] == w[1] && w[0] != BOTTOM && last_empty != Some(w[0]) {
+                        self.out.subs.push((w[0], BOTTOM));
+                        last_empty = Some(w[0]);
+                    }
+                }
+                es.dedup();
+                es.retain(|&e| e != BOTTOM);
+                if es.len() >= 2 {
+                    self.out.disjoint.push(es);
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                self.out.subs.truncate(subs_len);
+                if self.it.dt_stopped() || self.it.ranges.check().is_err() {
+                    return Err(err);
+                }
+            }
+        }
+        let mut work = 0usize;
+        for i in 0..unique.len() {
+            for j in i + 1..unique.len() {
+                work += 1;
+                if work.is_multiple_of(POLL_WORK) && (self.stop)() {
+                    self.halt = Some(Halt::Stopped);
+                    return Err("cancelled");
+                }
+                self.sub(vec![unique[i].clone(), unique[j].clone()], vec![])?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1482,15 +2157,6 @@ pub fn normalize(
 ) -> Result<Vec<bool>, Halt> {
     let mut taken = vec![false; axioms.len()];
     let mut h = HornAx::default();
-    // whether the run has individuals: those the EL axioms interned, and those the axioms
-    // here name
-    let individuals = !it.individuals.is_empty()
-        || axioms.iter().any(|k| {
-            Axiom::from((*k).clone())
-                .signature()
-                .iter()
-                .any(|e| matches!(e, Entity::NamedIndividual(_)))
-        });
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles
@@ -1517,10 +2183,16 @@ pub fn normalize(
             it,
             rb: None,
             out: Out::default(),
-            individuals,
+            budget: None,
+            stop,
+            halt: None,
         };
         let accepted = n.role_axiom(k).is_ok();
+        let halted = n.halt;
         n.it.end_scope();
+        if let Some(h) = halted {
+            return Err(h);
+        }
         if accepted {
             let o = n.out;
             roles.role_subs.extend(o.role_subs);
@@ -1581,8 +2253,12 @@ pub fn normalize(
     // the class axioms and the role axioms that need simple roles, which go to `ax` only
     // once one is taken
     let mut class_out: Vec<Out> = Vec::new();
+    let mut budget = PairBudget::new(limit, ax);
+    if budget.is_bounded() {
+        budget.add_accum(roles.bytes());
+    }
     for (i, k) in axioms.iter().enumerate() {
-        if taken[i] || Norm::is_role_axiom(k) || anonymous(k) {
+        if taken[i] || Norm::is_role_axiom(k) {
             continue;
         }
         // the fresh classes of an axiom are those of its last run (roadmap item 753)
@@ -1592,20 +2268,69 @@ pub fn normalize(
             it,
             rb: Some(&rb),
             out: Out::default(),
-            individuals,
+            budget: Some(&mut budget),
+            stop,
+            halt: None,
         };
         let accepted = n.axiom(k).is_ok();
+        let halted = n.halt;
         n.it.end_scope();
+        if let Some(h) = halted {
+            return Err(h);
+        }
         n.it.ranges.check_halt()?;
+        if n.it.dt_stopped() {
+            return Err(Halt::Stopped);
+        }
         if accepted {
-            class_out.push(n.out);
+            let out = n.out;
+            if budget.is_bounded() {
+                budget.add_accum(out.bytes());
+            }
+            class_out.push(out);
             taken[i] = true;
         }
     }
     if !taken.contains(&true) {
         return Ok(taken);
     }
+    let clash_sources = class_out.iter().filter(|o| !o.clash.is_empty()).count();
+    let total_clash: usize = class_out.iter().map(|o| o.clash.len()).sum();
+    let dt_sources = class_out
+        .iter()
+        .filter(|o| !o.dt_disjoint.is_empty())
+        .count();
+    let total_dt_disjoint: usize = class_out.iter().map(|o| o.dt_disjoint.len()).sum();
+    let pair_size = std::mem::size_of::<(Role, Role)>();
+    let clash_extra = if clash_sources > 1 {
+        total_clash.saturating_mul(pair_size)
+    } else {
+        0
+    };
+    let dt_needs_reserve = total_dt_disjoint > 0
+        && (dt_sources > 1 || !ax.dt_disjoint.is_empty() || ax.dt_disjoint.capacity() > 0);
+    let dt_extra = if dt_needs_reserve {
+        let needed = ax.dt_disjoint.len().saturating_add(total_dt_disjoint);
+        if needed > ax.dt_disjoint.capacity() {
+            needed
+                .saturating_sub(ax.dt_disjoint.capacity())
+                .saturating_mul(pair_size)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    if clash_extra > 0 || dt_extra > 0 {
+        budget.check(it, clash_extra.saturating_add(dt_extra))?;
+    }
     ax.role_subs.clear();
+    if clash_sources > 1 {
+        h.clash.reserve_exact(total_clash);
+    }
+    if dt_needs_reserve {
+        ax.dt_disjoint.reserve_exact(total_dt_disjoint);
+    }
     for o in class_out {
         o.commit(ax, &mut h);
     }
@@ -1621,14 +2346,49 @@ pub fn normalize(
         })
         .collect();
     ax.ranges.extend(domains);
-    // a range of a role that a chain reaches holds along the chain's paths too
-    let ranges: Vec<(Role, Ex)> = ax
+    // a range of a role that a chain reaches holds along the chain's paths too, unless the
+    // ranges of the links that end every such path give it already (roadmap item 693)
+    let mut ranges: Vec<(Role, Ex)> = ax
         .ranges
         .iter()
         .copied()
         .filter(|&(r, _)| !rb.simple(r))
         .collect();
-    for (r, c) in ranges {
+    // a range told twice, such as a range of r and a domain of r⁻, is one universal
+    ranges.sort_unstable();
+    ranges.dedup();
+    let mode = range_universals();
+    let tops: Vec<Role> = [
+        RoleName::Object(ObjectProperty::top()),
+        RoleName::Inverse(ObjectProperty::top()),
+    ]
+    .iter()
+    .filter_map(|n| it.role_id(n))
+    .collect();
+    // the roles with each told range, so that a label's test reads only those of its filler
+    let mut by_filler: FxHashMap<Ex, Vec<Role>> = FxHashMap::default();
+    for &(l, c) in &ax.ranges {
+        by_filler.entry(c).or_default().push(l);
+    }
+    let mut labels: FxHashMap<Role, Option<Vec<Role>>> = FxHashMap::default();
+    for (i, (r, c)) in ranges.into_iter().enumerate() {
+        if i % 64 == 63 && stop() {
+            return Err(Halt::Stopped);
+        }
+        let skip = match mode {
+            RangeUniversals::Covered if c != TOP => {
+                let told = by_filler.get(&c).map_or(&[][..], |v| v.as_slice());
+                ends_in_range(&mut rb, &mut labels, told, &tops, r, limit, stop)?
+            }
+            RangeUniversals::Covered => false,
+            RangeUniversals::Keep => false,
+            #[cfg(test)]
+            RangeUniversals::Drop => true,
+        };
+        if skip {
+            h.ranges_covered += 1;
+            continue;
+        }
         let e = it.node(Node::Forall(r, c));
         ax.subs.push((TOP, e));
     }
@@ -1641,6 +2401,105 @@ pub fn normalize(
 #[cfg(test)]
 mod reduction_tests {
     use super::*;
+
+    /// The reading of the final labels stops when the run stops, also after its last scan,
+    /// and refuses scratch past the limit.
+    #[test]
+    fn final_labels_poll_and_count() {
+        let a = Nfa {
+            states: 2,
+            start: 0,
+            end: 1,
+            trans: (0..(4 * POLL_WORK as Role))
+                .map(|l| (0, Some(l), 1))
+                .collect(),
+        };
+        assert_eq!(a.final_labels(None, &|| true), Err(Halt::Stopped));
+        assert!(matches!(
+            a.final_labels(Some(1000), &|| false),
+            Err(Halt::Memory(_))
+        ));
+        // a stop that comes only after the twelve polls of the scans still ends the reading
+        let calls = std::cell::Cell::new(0usize);
+        let late = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 12
+        };
+        assert_eq!(a.final_labels(None, &late), Err(Halt::Stopped));
+        assert_eq!(
+            a.final_labels(None, &|| false).unwrap().map(|v| v.len()),
+            Some(4 * POLL_WORK)
+        );
+    }
+
+    /// The match of cached labels against the told properties stops when the run stops.
+    #[test]
+    fn ends_in_range_polls_over_cached_labels() {
+        let it = Interner::new();
+        let mut rb = RoleBox::new(&it, &[], &[], None, &|| false).unwrap();
+        let n = 400 as Role;
+        let mut labels = FxHashMap::default();
+        labels.insert(n * 2, Some((0..n).collect::<Vec<Role>>()));
+        // every label is told, found after the told properties that no label is
+        let told: Vec<Role> = (n..2 * n).chain(0..n).collect();
+        let go = ends_in_range(&mut rb, &mut labels, &told, &[], n * 2, None, &|| false);
+        assert_eq!(go, Ok(true));
+        let halt = ends_in_range(&mut rb, &mut labels, &told, &[], n * 2, None, &|| true);
+        assert_eq!(halt, Err(Halt::Stopped));
+        // one label found after many told properties, with a stop that comes only after
+        // the first poll
+        let one = POLL_WORK as Role + 3;
+        labels.insert(one + 1, Some(vec![one]));
+        let told: Vec<Role> = (0..=one).collect();
+        let calls = std::cell::Cell::new(0usize);
+        let late = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        };
+        let halt = ends_in_range(&mut rb, &mut labels, &told, &[], one + 1, None, &late);
+        assert_eq!(halt, Err(Halt::Stopped));
+    }
+
+    /// The labels into final states read from the automaton equal those of its closure
+    /// over the ε-transitions, on the automata of random role boxes.
+    #[test]
+    fn final_labels_match_the_closure() {
+        let mut seed = 693u64;
+        let mut next = |m: u32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % m as u64) as u32
+        };
+        for _ in 0..2000 {
+            let states = 2 + next(7);
+            let mut a = Nfa {
+                states,
+                start: 0,
+                end: 1 + next(states - 1),
+                trans: Vec::new(),
+            };
+            for _ in 0..next(14) {
+                let l = if next(3) == 0 { None } else { Some(next(4)) };
+                a.trans.push((next(states), l, next(states)));
+            }
+            let e = a.eps_free();
+            let want = if e.finals[e.start as usize] {
+                None
+            } else {
+                let mut ls: Vec<Role> = e
+                    .trans
+                    .iter()
+                    .filter(|t| e.finals[t.2 as usize])
+                    .map(|t| t.1)
+                    .collect();
+                ls.sort_unstable();
+                ls.dedup();
+                Some(ls)
+            };
+            assert_eq!(a.final_labels(None, &|| false).unwrap(), want, "{a:?}");
+        }
+    }
 
     fn auto(states: u32, finals: &[u32], trans: &[(u32, Role, u32)]) -> EpsFree {
         let mut a = EpsFree {
@@ -1899,5 +2758,315 @@ mod reduction_tests {
             assert_eq!(marked, d);
         }
         assert!(merged > 300 && dropped > 300, "{merged} {dropped}");
+    }
+
+    #[test]
+    fn repeated_property_pairs_do_not_expand_quadratically_in_horn() {
+        let p = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/p"));
+        let q = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/q"));
+        let d = DataProperty::new("http://ex.org/d");
+        let e = DataProperty::new("http://ex.org/e");
+
+        let obj_same = AxiomKind::DisjointObjectProperties(vec![p.clone(); 500].into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let taken = normalize(&[&obj_same], &mut it, &mut ax, None, &|| false).unwrap();
+        assert_eq!(taken, vec![true]);
+        assert_eq!(ax.horn.as_ref().unwrap().clash.len(), 1);
+
+        let mut obj_mix_vec = vec![p; 500];
+        obj_mix_vec.push(q);
+        let obj_mix = AxiomKind::DisjointObjectProperties(obj_mix_vec.into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let taken = normalize(&[&obj_mix], &mut it, &mut ax, None, &|| false).unwrap();
+        assert_eq!(taken, vec![true]);
+        // (p, p), (p, q), (q, p)
+        assert_eq!(ax.horn.as_ref().unwrap().clash.len(), 3);
+
+        let data_same = AxiomKind::DisjointDataProperties(vec![d.clone(); 500].into());
+        let mut it = Interner::new();
+        let defs = super::super::dtcheck::range::Defs::new(FxHashMap::default());
+        let comps =
+            super::super::dtcheck::comp::Comps::of(&[&data_same], &defs, &|| false).unwrap();
+        it.dt_run = Some(Box::new(super::super::dtcheck::atoms::DtRun {
+            comps,
+            defs,
+            stop: super::super::dtcheck::atoms::Stop::default(),
+            budget: None,
+            stopped: None,
+        }));
+        let mut ax = Axioms::default();
+        let taken = normalize(&[&data_same], &mut it, &mut ax, None, &|| false).unwrap();
+        assert_eq!(taken, vec![true]);
+        assert_eq!(ax.dt_disjoint.len(), 1);
+
+        let mut data_mix_vec = vec![d; 500];
+        data_mix_vec.push(e);
+        let data_mix = AxiomKind::DisjointDataProperties(data_mix_vec.into());
+        let mut it = Interner::new();
+        let defs = super::super::dtcheck::range::Defs::new(FxHashMap::default());
+        let comps = super::super::dtcheck::comp::Comps::of(&[&data_mix], &defs, &|| false).unwrap();
+        it.dt_run = Some(Box::new(super::super::dtcheck::atoms::DtRun {
+            comps,
+            defs,
+            stop: super::super::dtcheck::atoms::Stop::default(),
+            budget: None,
+            stopped: None,
+        }));
+        let mut ax = Axioms::default();
+        let taken = normalize(&[&data_mix], &mut it, &mut ax, None, &|| false).unwrap();
+        assert_eq!(taken, vec![true]);
+        // (d, d) and (d, e)
+        assert_eq!(ax.dt_disjoint.len(), 2);
+    }
+
+    #[test]
+    fn role_pair_normalization_enforces_post_interning_budget_and_cancellation() {
+        use std::cell::Cell;
+
+        // 1. Stale pre-interning baseline gap: 400 fresh distinct object properties
+        // produce 400 * 399 = 159,600 symmetric pairs (1,276,800 bytes), while interning
+        // those 400 properties + inverses adds > 38 KiB to the interner. A limit just
+        // above pre-interning baseline + pair bytes must reject rather than admit an
+        // allocation that exceeds the post-normalization budget.
+        let distinct_400: Vec<ObjectPropertyExpression> = (0..400)
+            .map(|i| {
+                ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                    "http://ex.org/prop_{i:04}"
+                )))
+            })
+            .collect();
+        let disjoint_400 = AxiomKind::DisjointObjectProperties(distinct_400.into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        // Pre-register the scope axiom so `pre_baseline` matches the exact pre-interning
+        // baseline that would be observed right before resolving the role operands.
+        it.scope_axiom(&disjoint_400);
+        let pre_baseline = it.bytes() + ax.bytes();
+        let pair_bytes = 400usize * 399 * std::mem::size_of::<(Role, Role)>();
+        let tight_limit = pre_baseline + pair_bytes + 1024;
+        let err = normalize(
+            &[&disjoint_400],
+            &mut it,
+            &mut ax,
+            Some(tight_limit),
+            &|| false,
+        );
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory when post-interning + scratch + pairs exceed limit, got {err:?}"
+        );
+
+        // Verify a limit above post-interning + scratch + pairs succeeds.
+        let mut it_ok = Interner::new();
+        let mut ax_ok = Axioms::default();
+        let taken = normalize(
+            &[&disjoint_400],
+            &mut it_ok,
+            &mut ax_ok,
+            Some(pre_baseline + pair_bytes + 512 * 1024),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(taken, vec![true]);
+        assert_eq!(ax_ok.horn.as_ref().unwrap().clash.len(), 400 * 399);
+
+        // 2. Cancellation before reserve: pre-cancelled stop on a small list of distinct
+        // roles must halt before reserving pairs.
+        let distinct_20: Vec<ObjectPropertyExpression> = (0..20)
+            .map(|i| {
+                ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                    "http://ex.org/cancel_{i}"
+                )))
+            })
+            .collect();
+        let disjoint_20 = AxiomKind::DisjointObjectProperties(distinct_20.into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let err = normalize(&[&disjoint_20], &mut it, &mut ax, None, &|| true);
+        assert!(
+            matches!(err, Err(Halt::Stopped)),
+            "expected Halt::Stopped before reserve, got {err:?}"
+        );
+
+        // 3. Cancellation during operand scan of > POLL_WORK copies of a single object
+        // property (zero cross-pairs).
+        let p = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/dup_p"));
+        let many_same = AxiomKind::DisjointObjectProperties(vec![p; POLL_WORK + 10].into());
+        let polls = Cell::new(0usize);
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let err = normalize(&[&many_same], &mut it, &mut ax, None, &|| {
+            polls.set(polls.get() + 1);
+            true
+        });
+        assert!(
+            matches!(err, Err(Halt::Stopped)),
+            "expected Halt::Stopped during duplicate object-property scan, got {err:?}"
+        );
+        assert!(polls.get() >= 1, "expected stop() to be polled during scan");
+
+        // 4. Same scan cancellation for DisjointDataProperties.
+        let d = DataProperty::new("http://ex.org/dup_d");
+        let many_data = AxiomKind::DisjointDataProperties(vec![d; POLL_WORK + 10].into());
+        let polls = Cell::new(0usize);
+        let mut it = Interner::new();
+        let defs = super::super::dtcheck::range::Defs::new(FxHashMap::default());
+        let comps =
+            super::super::dtcheck::comp::Comps::of(&[&many_data], &defs, &|| false).unwrap();
+        it.dt_run = Some(Box::new(super::super::dtcheck::atoms::DtRun {
+            comps,
+            defs,
+            stop: super::super::dtcheck::atoms::Stop::default(),
+            budget: None,
+            stopped: None,
+        }));
+        let mut ax = Axioms::default();
+        let err = normalize(&[&many_data], &mut it, &mut ax, None, &|| {
+            polls.set(polls.get() + 1);
+            true
+        });
+        assert!(
+            matches!(err, Err(Halt::Stopped)),
+            "expected Halt::Stopped during duplicate data-property scan, got {err:?}"
+        );
+        assert!(polls.get() >= 1, "expected stop() to be polled during scan");
+    }
+
+    #[test]
+    fn pair_budget_stays_lazy_when_unbounded_or_unused_and_caches_once() {
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        for i in 0..200 {
+            let a = it.class(&Class::new(format!("http://ex.org/A{i}")));
+            let b = it.class(&Class::new(format!("http://ex.org/B{i}")));
+            ax.disjoint.push(vec![a, b]);
+        }
+
+        // Unbounded budget never scans ax.bytes() or dt_run_static_bytes().
+        let mut unbounded = PairBudget::new(None, &ax);
+        unbounded.check(&it, 1_000_000).unwrap();
+        assert!(unbounded.ax_bytes.is_none());
+        assert!(unbounded.dt_static_bytes.is_none());
+
+        // Bounded budget stays lazy until check() is actually invoked, then caches once.
+        let mut bounded = PairBudget::new(Some(64 * 1024 * 1024), &ax);
+        assert!(bounded.ax_bytes.is_none());
+        assert!(bounded.dt_static_bytes.is_none());
+        bounded.check(&it, 0).unwrap();
+        let cached_ax = bounded.ax_bytes.expect("cached ax.bytes()");
+        assert_eq!(cached_ax, ax.bytes());
+        assert_eq!(bounded.dt_static_bytes, Some(0));
+    }
+
+    #[test]
+    fn role_pair_aggregate_commit_respects_memory_budget_in_horn() {
+        // 1. Multiple DisjointObjectProperties axioms committing into `h.clash`.
+        let distinct_400: Vec<ObjectPropertyExpression> = (0..400)
+            .map(|i| {
+                ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                    "http://ex.org/horn_agg_{i:04}"
+                )))
+            })
+            .collect();
+        let disjoint_400 = AxiomKind::DisjointObjectProperties(distinct_400.clone().into());
+        let dup_first = AxiomKind::DisjointObjectProperties(
+            vec![distinct_400[0].clone(), distinct_400[0].clone()].into(),
+        );
+        let pair_bytes = 400usize * 399 * std::mem::size_of::<(Role, Role)>();
+
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let pre_baseline = it.bytes() + ax.bytes();
+        // Fits the per-axiom buffers (~1.22 MiB + overhead) but not simultaneous source +
+        // destination buffers (~2.44 MiB) during commit.
+        let tight_commit_limit = pre_baseline + pair_bytes + 512 * 1024;
+        let err = normalize(
+            &[&disjoint_400, &dup_first],
+            &mut it,
+            &mut ax,
+            Some(tight_commit_limit),
+            &|| false,
+        );
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory when Horn clash commit exceeds budget, got {err:?}"
+        );
+        assert!(
+            ax.horn.is_none(),
+            "ax must remain unmodified on Halt::Memory"
+        );
+
+        let mut it_ok = Interner::new();
+        let mut ax_ok = Axioms::default();
+        let taken = normalize(
+            &[&disjoint_400, &dup_first],
+            &mut it_ok,
+            &mut ax_ok,
+            Some(pre_baseline + 2 * pair_bytes + 512 * 1024),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(taken, vec![true, true]);
+        assert_eq!(ax_ok.horn.as_ref().unwrap().clash.len(), 400 * 399 + 1);
+
+        // 2. Multiple DisjointDataProperties axioms committing into `ax.dt_disjoint`.
+        let dt_400_props: Vec<DataProperty> = (0..400)
+            .map(|i| DataProperty::new(format!("http://ex.org/horn_dt_agg_{i:04}")))
+            .collect();
+        let dt_400 = AxiomKind::DisjointDataProperties(dt_400_props.clone().into());
+        let dt_dup = AxiomKind::DisjointDataProperties(
+            vec![dt_400_props[0].clone(), dt_400_props[0].clone()].into(),
+        );
+        let dt_pair_bytes = (400usize * 399 / 2) * std::mem::size_of::<(Role, Role)>();
+
+        let make_dt_interner = || {
+            let mut it = Interner::new();
+            let defs = super::super::dtcheck::range::Defs::new(FxHashMap::default());
+            let comps =
+                super::super::dtcheck::comp::Comps::of(&[&dt_400, &dt_dup], &defs, &|| false)
+                    .unwrap();
+            it.dt_run = Some(Box::new(super::super::dtcheck::atoms::DtRun {
+                comps,
+                defs,
+                stop: super::super::dtcheck::atoms::Stop::default(),
+                budget: None,
+                stopped: None,
+            }));
+            it
+        };
+
+        let mut it_dt = make_dt_interner();
+        let mut ax_dt = Axioms::default();
+        let dt_baseline = it_dt.bytes() + ax_dt.bytes();
+        let err_dt = normalize(
+            &[&dt_400, &dt_dup],
+            &mut it_dt,
+            &mut ax_dt,
+            Some(dt_baseline + dt_pair_bytes + 256 * 1024),
+            &|| false,
+        );
+        assert!(
+            matches!(err_dt, Err(Halt::Memory(_))),
+            "expected Halt::Memory when Horn dt_disjoint commit exceeds budget, got {err_dt:?}"
+        );
+        assert!(
+            ax_dt.dt_disjoint.is_empty(),
+            "ax.dt_disjoint must remain empty on Halt::Memory"
+        );
+
+        let mut it_dt_ok = make_dt_interner();
+        let mut ax_dt_ok = Axioms::default();
+        let taken_dt = normalize(
+            &[&dt_400, &dt_dup],
+            &mut it_dt_ok,
+            &mut ax_dt_ok,
+            Some(dt_baseline + 2 * dt_pair_bytes + 512 * 1024),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(taken_dt, vec![true, true]);
+        assert_eq!(ax_dt_ok.dt_disjoint.len(), 400 * 399 / 2 + 1);
     }
 }

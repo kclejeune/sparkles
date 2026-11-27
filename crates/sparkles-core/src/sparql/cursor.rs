@@ -12,6 +12,7 @@ use crate::id::Id;
 use crate::index::{Key, pad};
 use crate::store::{Chunk, Snapshot};
 use oxrdf::Term;
+use rustc_hash::FxHashSet;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -27,13 +28,20 @@ mod extsort;
 mod filter;
 pub mod graph;
 mod group;
+mod history;
 mod joinspill;
 mod leaf;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 pub(super) use joinspill::row_hash;
 mod merge;
+mod pathsearch;
+mod propertyfn;
 mod ripple;
+mod service;
+mod spatial;
+mod text;
 mod topk;
+mod view;
 mod walk;
 mod whole;
 
@@ -44,6 +52,30 @@ pub enum FallbackPolicy {
     AllowMaterialization,
     /// Reject any unsupported operator before it executes.
     RejectMaterialization,
+}
+
+/// How the strict policy's refusal of an eager fallback begins, so that code that turns
+/// other errors into values, as an EXISTS in an expression does, can tell it apart.
+pub(crate) const REFUSAL: &str = "cursor requires materialization at ";
+
+/// How the strict policy's refusal of a SERVICE response that gives its results before
+/// the variables of its head begins. Every other SERVICE error begins with words of its
+/// own or with the endpoint's URL, which the query names, and puts what an endpoint sent
+/// after them, so an endpoint cannot make its failure read as this refusal.
+pub(crate) const LATE_HEAD: &str = "a strict cursor cannot stream a SERVICE response whose results come before the variables of its head: ";
+
+impl FallbackPolicy {
+    /// The policy for work an operator decides on at its first pull: the strict one when
+    /// either the operator's or its query's cursor is strict. An EXISTS pattern's
+    /// operators are built under the permissive policy, so their own may not be the
+    /// query's.
+    pub(crate) fn at_pull(self, ctx: &Ctx) -> Self {
+        if ctx.strict_cursor.load(std::sync::atomic::Ordering::Relaxed) {
+            Self::RejectMaterialization
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -253,27 +285,45 @@ pub(super) fn arc_backing_bytes<T>(ctx: &Ctx) -> Result<u64> {
 const CHECK_EVERY: usize = 1024;
 
 impl Variables {
-    pub(super) fn new(
-        ctx: &Arc<Ctx>,
-        pattern: &spargebra::algebra::GraphPattern,
+    fn projection(pattern: &spargebra::algebra::GraphPattern) -> Option<&[oxrdf::Variable]> {
+        use spargebra::algebra::GraphPattern;
+        match pattern {
+            GraphPattern::Project { variables, .. } => Some(variables),
+            GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. } => Self::projection(inner),
+            _ => None,
+        }
+    }
+
+    /// Estimate the retained credit and transient `SELECT *` workspace credit that
+    /// [`Variables::new`] will charge for `(pattern, node_vars, query)`.
+    pub(super) fn estimate_bytes(
+        ctx: &Ctx,
+        pattern: Option<&spargebra::algebra::GraphPattern>,
         node_vars: &[VarId],
         query: &str,
-    ) -> Result<Arc<Self>> {
-        use spargebra::algebra::GraphPattern;
-        fn projection(pattern: &GraphPattern) -> Option<&[oxrdf::Variable]> {
-            match pattern {
-                GraphPattern::Project { variables, .. } => Some(variables),
-                GraphPattern::Distinct { inner }
-                | GraphPattern::Reduced { inner }
-                | GraphPattern::Slice { inner, .. } => projection(inner),
-                _ => None,
-            }
-        }
-        let projected = projection(pattern);
+    ) -> Result<(u64, u64)> {
+        Self::estimate(
+            ctx,
+            pattern.and_then(Self::projection),
+            node_vars,
+            query,
+            arc_backing_bytes::<Self>(ctx)?,
+        )
+    }
+
+    fn estimate(
+        ctx: &Ctx,
+        projected: Option<&[oxrdf::Variable]>,
+        node_vars: &[VarId],
+        query: &str,
+        header: u64,
+    ) -> Result<(u64, u64)> {
         let count = projected.map_or(node_vars.len(), <[_]>::len);
         let overflow = || ctx.memory_exceeded(u64::MAX);
         let (text_bytes, longest) = {
-            let names = ctx.var_names.read();
+            let names = projected.is_none().then(|| ctx.var_names.read());
             let mut bytes = 0usize;
             let mut longest = 0usize;
             for index in 0..count {
@@ -283,6 +333,8 @@ impl Variables {
                 let name = match projected {
                     Some(variables) => variables[index].as_str(),
                     None => names
+                        .as_ref()
+                        .expect("unprojected query variables")
                         .get(node_vars[index] as usize)
                         .ok_or_else(|| Error::invalid("invalid cursor output variable"))?
                         .as_str(),
@@ -302,17 +354,62 @@ impl Variables {
                 .and_then(|n| longest.checked_add(64)?.checked_mul(4)?.checked_add(n))
                 .and_then(|n| n.checked_add(256))
                 .ok_or_else(overflow)?;
-            Some(ctx.charge(u64::try_from(bytes).map_err(|_| overflow())?)?)
+            u64::try_from(bytes).map_err(|_| overflow())?
         } else {
-            None
+            0
         };
         let payload = count
             .checked_mul(std::mem::size_of::<String>() + std::mem::size_of::<VarId>())
             .and_then(|n| n.checked_add(text_bytes))
             .ok_or_else(overflow)?;
-        let bytes = arc_backing_bytes::<Self>(ctx)?
+        let retained = header
             .checked_add(u64::try_from(payload).map_err(|_| overflow())?)
             .ok_or_else(overflow)?;
+        Ok((retained, workspace))
+    }
+
+    pub(super) fn new(
+        ctx: &Arc<Ctx>,
+        pattern: &spargebra::algebra::GraphPattern,
+        node_vars: &[VarId],
+        query: &str,
+    ) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self::build(
+            ctx,
+            pattern,
+            node_vars,
+            query,
+            arc_backing_bytes::<Self>(ctx)?,
+        )?))
+    }
+
+    /// An eager result owns the variables inline and pays for that storage when
+    /// it admits its result backing. The variable vectors and names are paid here.
+    pub(super) fn eager(
+        ctx: &Arc<Ctx>,
+        pattern: &spargebra::algebra::GraphPattern,
+        node_vars: &[VarId],
+    ) -> Result<Self> {
+        Self::build(ctx, pattern, node_vars, "", 0)
+    }
+
+    fn build(
+        ctx: &Arc<Ctx>,
+        pattern: &spargebra::algebra::GraphPattern,
+        node_vars: &[VarId],
+        query: &str,
+        header: u64,
+    ) -> Result<Self> {
+        let projected = Self::projection(pattern);
+        let count = projected.map_or(node_vars.len(), <[_]>::len);
+        let overflow = || ctx.memory_exceeded(u64::MAX);
+        let (bytes, workspace_bytes) = Self::estimate(ctx, projected, node_vars, query, header)?;
+        let star = workspace_bytes > 0;
+        let workspace = if star {
+            Some(ctx.charge(workspace_bytes)?)
+        } else {
+            None
+        };
         let charge = ctx.charge(bytes)?;
         #[cfg(test)]
         {
@@ -414,11 +511,11 @@ impl Variables {
                 }
             }
         }
-        let variables = Arc::new(Self {
+        let variables = Self {
             names,
             ids,
             _charge: charge.into_output(ctx),
-        });
+        };
         drop(workspace);
         Ok(variables)
     }
@@ -601,7 +698,7 @@ impl QueryBatch {
 
     /// The terms of [`QueryBatch::decoded`] without the borrow of the batch, so that
     /// another thread can build them while the writer serializes the batch before it.
-    pub(super) fn term_cache(&self) -> Result<Option<TermCache>> {
+    pub(in crate::sparql) fn term_cache(&self) -> Result<Option<TermCache>> {
         match TermCache::new(self) {
             Ok(cache) => Ok(Some(cache)),
             Err(Error::BudgetExceeded(b)) if b.kind == crate::error::BudgetKind::Memory => Ok(None),
@@ -612,14 +709,14 @@ impl QueryBatch {
 
 /// The smallest step in which a decoded batch reserves memory for its terms.
 const TERM_RESERVE: u64 = 64 << 10;
-pub(super) struct DecodedBatch<'a> {
+pub(in crate::sparql) struct DecodedBatch<'a> {
     batch: &'a QueryBatch,
     cache: TermCache,
 }
 
 /// The decoded base-vocabulary terms of one batch, each decoded once in key order, and
 /// the term of each cell. It holds its reservation until it is dropped.
-pub(super) struct TermCache {
+pub(in crate::sparql) struct TermCache {
     terms: Vec<Term>,
     slots: Vec<u32>,
     _charge: OwnedCharge,
@@ -724,8 +821,13 @@ impl TermCache {
 
 impl<'a> DecodedBatch<'a> {
     /// A batch with the terms that [`QueryBatch::term_cache`] built for it.
-    pub(super) fn new(batch: &'a QueryBatch, cache: TermCache) -> Self {
+    pub(in crate::sparql) fn new(batch: &'a QueryBatch, cache: TermCache) -> Self {
         Self { batch, cache }
+    }
+
+    /// Recover the owned term cache so a paused batch can move to another thread.
+    pub(in crate::sparql) fn into_cache(self) -> TermCache {
+        self.cache
     }
 
     fn cached(&self, row: usize, column: usize) -> Option<&Term> {
@@ -775,23 +877,114 @@ fn capacity_bytes(table: &Table) -> u64 {
         .saturating_add(128)
 }
 
+fn capacity_bytes_checked(ctx: &Ctx, table: &Table) -> Result<u64> {
+    let mut columns = 0u64;
+    for (chunk_idx, chunk) in table.cols.chunks(4096).enumerate() {
+        if chunk_idx > 0 {
+            ctx.check()?;
+        }
+        for c in chunk {
+            columns = columns.saturating_add(c.capacity() as u64 * 8);
+        }
+    }
+    Ok(columns
+        .max(table.len as u64 * 8 * u64::from(table.width() == 0))
+        .saturating_add(table.vars.capacity() as u64 * 4)
+        .saturating_add(table.sorted.capacity() as u64 * 4)
+        .saturating_add(table.cols.capacity() as u64 * 24)
+        .saturating_add(128))
+}
+
+/// Materialize the native view reader for eager execution. Rebuilds therefore
+/// spend the same request work budget in both execution modes.
+pub(super) fn eager_view(
+    ctx: &Arc<Ctx>,
+    node: &Node,
+    held: &super::ctx::Charge<'_>,
+) -> Result<Table> {
+    let options = CursorOptions {
+        batch_rows: 256,
+        ..Default::default()
+    };
+    let mut view = view::View::new(node.clone());
+    let mut table = Table::new(node.vars.clone());
+    held.resize(capacity_bytes(&table))?;
+    while let Some(batch) = view.next(ctx, &options, options.batch_rows)? {
+        let rows = table.len.saturating_add(batch.table.len);
+        ctx.check_rows(rows)?;
+        let old = capacity_bytes(&table);
+        let growth = table
+            .cols
+            .iter()
+            .map(|col| {
+                let next = sparkles_budget::sizes::vec_grown(
+                    col.capacity(),
+                    col.len(),
+                    batch.table.len,
+                    8,
+                );
+                if next > col.capacity() {
+                    next as u64 * 8
+                } else {
+                    0
+                }
+            })
+            .sum::<u64>();
+        let empty_width = if table.width() == 0 {
+            rows as u64 * 8
+        } else {
+            0
+        };
+        held.resize(old.saturating_add(growth).saturating_add(empty_width))?;
+        table.append(batch.table);
+        held.resize(capacity_bytes(&table))?;
+    }
+    Ok(table)
+}
+
 impl Buffer {
     fn new(ctx: &Arc<Ctx>, vars: &[VarId], rows: usize) -> Result<Self> {
         let bytes = super::ctx::table_bytes(rows, vars.len())
             .saturating_add(vars.len() as u64 * 40)
             .saturating_add(128);
-        let charge = OwnedCharge::new(ctx, bytes)?;
-        let mut table = Table::new(vars.to_vec());
-        for col in &mut table.cols {
-            col.reserve_exact(rows);
+        let mut charge = OwnedCharge::new(ctx, bytes)?;
+        let mut cols = Vec::with_capacity(vars.len());
+        let mut col_bytes = 0u64;
+        for (chunk_idx, chunk) in vars.chunks(4096).enumerate() {
+            if chunk_idx > 0 {
+                ctx.check()?;
+            }
+            for _ in chunk {
+                let mut col = Vec::new();
+                if rows > 0 {
+                    col.reserve_exact(rows);
+                    col_bytes = col_bytes.saturating_add(col.capacity() as u64 * 8);
+                }
+                cols.push(col);
+            }
         }
-        let mut buffer = Self { table, charge };
-        buffer.reconcile()?;
-        Ok(buffer)
+        let table = Table {
+            vars: vars.to_vec(),
+            cols,
+            len: 0,
+            sorted: Vec::new(),
+        };
+        let exact = col_bytes
+            .saturating_add(table.vars.capacity() as u64 * 4)
+            .saturating_add(table.sorted.capacity() as u64 * 4)
+            .saturating_add(table.cols.capacity() as u64 * 24)
+            .saturating_add(128);
+        charge.resize(exact)?;
+        Ok(Self { table, charge })
     }
 
     fn reconcile(&mut self) -> Result<()> {
         self.charge.resize(capacity_bytes(&self.table))
+    }
+
+    fn reconcile_checked(&mut self, ctx: &Ctx) -> Result<()> {
+        self.charge
+            .resize(capacity_bytes_checked(ctx, &self.table)?)
     }
 
     fn set_order(&mut self, order: &[VarId]) -> Result<()> {
@@ -898,6 +1091,7 @@ pub fn select_source_cursor(
         cursor,
         Some(QueryKind::Select),
         Some(source),
+        None,
     )
     .map(|(cursor, _, _)| cursor)
 }
@@ -909,7 +1103,66 @@ fn open_pattern_cursor(
     cursor: &CursorOptions,
     expected: Option<QueryKind>,
 ) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
-    open_pattern_cursor_input(snapshot, query, options, cursor, expected, None)
+    open_pattern_cursor_input(snapshot, query, options, cursor, expected, None, None)
+}
+
+/// A SELECT cursor for an in-process SERVICE call, whose memory counts against its
+/// caller's query from its first charge as well as against its own limit.
+pub(super) fn call_cursor(
+    snapshot: Arc<Snapshot>,
+    query: &str,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    parent: sparkles_budget::ParentHandle,
+) -> Result<QueryCursor> {
+    open_pattern_cursor_input(
+        snapshot,
+        query,
+        options,
+        cursor,
+        Some(QueryKind::Select),
+        None,
+        Some(parent),
+    )
+    .map(|(cursor, _, _)| cursor)
+}
+
+/// Open a view's saved parsed query with caller-owned accounting and controls.
+fn call_parsed_cursor(
+    snapshot: Arc<Snapshot>,
+    parsed: &spargebra::Query,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    parent: sparkles_budget::ParentHandle,
+    inherited: &super::ViewExecution,
+) -> Result<(QueryCursor, Option<graph::Spec>)> {
+    let (snapshot, source, parent) = if let Some(access) = &options.graphs {
+        let preparation = crate::access::Preparation::for_view_rebuild(
+            options,
+            parent,
+            inherited.preparation.as_ref(),
+        )?;
+        let snapshot = super::with_union_default(snapshot, options);
+        let view = access.prepare_view_rebuild(&snapshot, &preparation)?;
+        let source = view.read_source();
+        (source.query_input().0.clone(), Some(source), None)
+    } else {
+        (snapshot, None, Some(parent))
+    };
+    open_parsed_cursor_input(
+        snapshot,
+        parsed,
+        "",
+        options,
+        cursor,
+        None,
+        source,
+        parent,
+        Instant::now(),
+        0.0,
+        Some(inherited),
+    )
+    .map(|(cursor, graph, _)| (cursor, graph))
 }
 
 fn open_pattern_cursor_input(
@@ -919,6 +1172,7 @@ fn open_pattern_cursor_input(
     cursor: &CursorOptions,
     expected: Option<QueryKind>,
     source: Option<crate::store::BoundReadSource>,
+    parent: Option<sparkles_budget::ParentHandle>,
 ) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
     if cursor.batch_rows == 0 || cursor.batch_bytes == 0 {
         return Err(Error::invalid(
@@ -934,49 +1188,71 @@ fn open_pattern_cursor_input(
         .min(depth::MAX_ALGEBRA_DEPTH);
     depth::with_stack(parser_depth, || {
         let parsed = super::parse_query(query, options.base_iri.as_deref(), &options.prefixes)?;
-        let kind = match &parsed {
-            spargebra::Query::Select { .. } => QueryKind::Select,
-            spargebra::Query::Ask { .. } => QueryKind::Ask,
-            spargebra::Query::Construct { .. } => QueryKind::Construct,
-            spargebra::Query::Describe { .. } => QueryKind::Describe,
-        };
-        if expected.is_some_and(|expected| {
-            kind != expected && !(expected == QueryKind::Construct && kind == QueryKind::Describe)
-        }) {
-            return Err(Error::Unsupported(format!(
-                "a {expected:?} cursor requires a {expected:?} query"
-            )));
-        }
         let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let levels = depth::check_query(&parsed)?;
-        depth::with_stack(levels, || {
-            let planning = Instant::now();
-            // The public strict boundary validated the original invocation Arc.
-            // Pass only its retained already-bound policy internally; guards
-            // must not be rebound against the masked physical snapshot.
-            // This owner is declared before the policy alias, so on a setup
-            // refusal the alias drops before the last source returns its credit.
-            let _retained = source.clone();
-            let bound_policy = source
-                .as_ref()
-                .and_then(|source| source.query_input().1)
-                .cloned();
-            let prepared = super::prepare_query_input_policy(
-                snapshot,
-                &parsed,
-                options,
-                Some(started),
-                None,
-                source,
-                bound_policy.as_ref(),
-                None,
-            )?;
-            let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
-            let levels = levels.max(prepared.plan_depth);
-            from_prepared(
-                prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels, kind,
-            )
-        })
+        open_parsed_cursor_input(
+            snapshot, &parsed, query, options, cursor, expected, source, parent, started, parse_ms,
+            None,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_parsed_cursor_input(
+    snapshot: Arc<Snapshot>,
+    parsed: &spargebra::Query,
+    query: &str,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    expected: Option<QueryKind>,
+    source: Option<crate::store::BoundReadSource>,
+    parent: Option<sparkles_budget::ParentHandle>,
+    started: Instant,
+    parse_ms: f64,
+    inherited: Option<&super::ViewExecution>,
+) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
+    let kind = match parsed {
+        spargebra::Query::Select { .. } => QueryKind::Select,
+        spargebra::Query::Ask { .. } => QueryKind::Ask,
+        spargebra::Query::Construct { .. } => QueryKind::Construct,
+        spargebra::Query::Describe { .. } => QueryKind::Describe,
+    };
+    if expected.is_some_and(|expected| {
+        kind != expected && !(expected == QueryKind::Construct && kind == QueryKind::Describe)
+    }) {
+        return Err(Error::Unsupported(format!(
+            "a {expected:?} cursor requires a {expected:?} query"
+        )));
+    }
+    let levels = depth::check_query(parsed)?;
+    depth::with_stack(levels, || {
+        let planning = Instant::now();
+        // The public strict boundary validated the original invocation Arc.
+        // Pass only its retained already-bound policy internally; guards
+        // must not be rebound against the masked physical snapshot.
+        // This owner is declared before the policy alias, so on a setup
+        // refusal the alias drops before the last source returns its credit.
+        let _retained = source.clone();
+        let bound_policy = source
+            .as_ref()
+            .and_then(|source| source.query_input().1)
+            .cloned();
+        let prepared = super::prepare_query_input_policy(
+            snapshot,
+            parsed,
+            options,
+            Some(started),
+            None,
+            source,
+            bound_policy.as_ref(),
+            parent,
+            None,
+            inherited,
+        )?;
+        let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
+        let levels = levels.max(prepared.plan_depth);
+        from_prepared(
+            prepared, parsed, query, options, cursor, started, parse_ms, plan_ms, levels, kind,
+        )
     })
 }
 
@@ -999,6 +1275,10 @@ fn from_prepared(
     let charge = OwnedCharge::new(&ctx, bytes)?;
     let variables = Variables::new(&ctx, &prepared.pattern, &prepared.node.vars, query)?;
     let spec = graph::Spec::from_parsed(parsed, options)?;
+    if cursor.fallback == FallbackPolicy::RejectMaterialization {
+        ctx.strict_cursor
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let root = Operator::build_for(&ctx, prepared.node, cursor.fallback, false)?;
     let plan = root.describe_with_graph_branches(&ctx)?;
     ctx.check()?;
@@ -1153,12 +1433,24 @@ pub(super) const AUTO_SCAN_ROWS: f64 = 1_000.0;
 /// count is now branch-free and measured 0.79 to 0.88 times eager execution's time at
 /// 1.05M and 10.5M, so it streams as a grouping again. It holds 2.2 MB where eager
 /// execution holds 19.8 MB at 10.5M.
+#[cfg(test)]
 pub(super) fn auto_streaming(
     ctx: &Ctx,
     node: &Node,
     kind: QueryKind,
     options: &CursorOptions,
-) -> bool {
+) -> Result<bool> {
+    Ok(auto_streaming_lease(ctx, node, None, "", kind, options)?.0)
+}
+
+pub(super) fn auto_streaming_lease(
+    ctx: &Ctx,
+    node: &Node,
+    pattern: Option<&spargebra::algebra::GraphPattern>,
+    query: &str,
+    kind: QueryKind,
+    options: &CursorOptions,
+) -> Result<(bool, Option<super::query_memory::QueryMemoryLease>)> {
     fn scan(ctx: &Ctx, node: &Node) -> bool {
         match &node.kind {
             Kind::Scan(spec) => {
@@ -1178,29 +1470,83 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
-    // An ASK pulls one row through the cursor, which stops at it, unless the planner
-    // found its input small enough to run whole (item 827).
+    ctx.check()?;
+    // ASK pulls one row unless the planner runs its input whole (item 827).
     if kind == QueryKind::Ask {
-        return !super::demand::whole_slice(node);
+        // Cursor construction plans and validates EXISTS in operator order, under
+        // the opening charges. Auto can still fall back before pulling its first row.
+        let fits =
+            !super::demand::whole_slice(node) && cursor_open_fits(ctx, node, pattern, query)?;
+        return Ok((fits, None));
     }
-    // A plan expected to pass the row budgets stays eager, so that it fails before the
-    // first byte of output with an error status rather than partway through a stream.
+    // A SELECT expected to exceed the row budgets stays eager so the error precedes output.
     if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
-        return false;
+        return Ok((false, None));
     }
-    if spill_admitted(ctx, node, kind) || memory_admitted(ctx, node, kind, options) {
-        return true;
+    let admission = ctx.charge(0)?;
+    struct ClearOnDrop<'a> {
+        node: &'a Node,
+        keep: bool,
     }
-    let scanned = node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node);
-    if !(scanned || grouped(ctx, node)) {
-        return false;
+    impl Drop for ClearOnDrop<'_> {
+        fn drop(&mut self) {
+            if !self.keep {
+                super::exists::clear_cached_plans(self.node);
+            }
+        }
     }
-    let headroom = cursor_headroom(ctx, node, options, true);
-    kind == QueryKind::Select
-        && ctx.snap.delta.is_empty()
-        && batches_admitted(options)
-        && headroom < u64::MAX
-        && ctx.memory_remaining() >= headroom
+    // Declared after `admission` so on eager fallback, error, or unwind, cached plans
+    // and structural metadata drop before `admission` releases its reservation.
+    let mut clear_guard = ClearOnDrop { node, keep: false };
+    let admitted = if spill_admitted(ctx, node, kind, Some(&admission))?
+        || memory_admitted(ctx, node, pattern, query, kind, options, Some(&admission))?
+    {
+        cursor_open_fits(ctx, node, pattern, query)?
+    } else {
+        let scanned = node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node);
+        if !(scanned || grouped(ctx, node, Some(&admission))?) {
+            false
+        } else if kind == QueryKind::Select
+            && ctx.snap.delta.is_empty()
+            && batches_admitted(options)
+        {
+            match cursor_open_bytes(ctx, node, pattern, query) {
+                Ok((open_retained, open_peak)) => {
+                    let pull_peak =
+                        open_retained.saturating_add(cursor_headroom(ctx, node, options, true));
+                    let peak = open_peak.max(pull_peak);
+                    peak < u64::MAX && admission_room_bytes(ctx) >= peak
+                }
+                Err(Error::BudgetExceeded(_)) => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        }
+    };
+    if !admitted {
+        return Ok((false, None));
+    }
+    let lease = if admission.bytes() > 0 {
+        Some(admission.output_lease(admission.bytes())?)
+    } else {
+        None
+    };
+    clear_guard.keep = true;
+    Ok((true, lease))
+}
+
+fn cursor_open_fits(
+    ctx: &Ctx,
+    node: &Node,
+    pattern: Option<&spargebra::algebra::GraphPattern>,
+    query: &str,
+) -> Result<bool> {
+    match cursor_open_bytes(ctx, node, pattern, query) {
+        Ok((_, open_peak)) => Ok(open_peak <= admission_room_bytes(ctx)),
+        Err(Error::BudgetExceeded(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether the cursor's batches are large enough for automatic admission to pay off.
@@ -1251,7 +1597,7 @@ pub(super) const AUTO_GROUP_ROWS: f64 = 20_000.0;
 /// the cursor aggregates column-wise over an estimated [`AUTO_GROUP_ROWS`] input rows
 /// or more, with a cursor implementation for every operator. This covers counts over
 /// OPTIONAL and MINUS, which the cursor now joins and counts with branch-free kernels.
-fn grouped(ctx: &Ctx, node: &Node) -> bool {
+fn grouped(ctx: &Ctx, node: &Node, admission: Option<&super::ctx::Charge<'_>>) -> Result<bool> {
     let mut group = node;
     while matches!(
         group.kind,
@@ -1267,9 +1613,11 @@ fn grouped(ctx: &Ctx, node: &Node) -> bool {
     let rows = match &group.kind {
         Kind::Group { .. } if group::eligible(ctx, group) => group.children[0].est,
         Kind::GroupCountScan { .. } => group.est,
-        _ => return false,
+        _ => return Ok(false),
     };
-    rows.is_finite() && rows >= AUTO_GROUP_ROWS && streams_natively(ctx, node)
+    Ok(rows.is_finite()
+        && rows >= AUTO_GROUP_ROWS
+        && streams_natively_with_admission(ctx, node, admission)?)
 }
 
 /// Whether automatic execution runs `node` as a cursor because eager execution is
@@ -1277,15 +1625,20 @@ fn grouped(ctx: &Ctx, node: &Node) -> bool {
 /// spill, read an immutable snapshot, and have a cursor implementation for every
 /// operator, and the largest operator output the plan estimates must exceed half of
 /// the memory left.
-fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
-    kind == QueryKind::Select
-        && ctx.spill.is_some()
-        && ctx.snap.delta.is_empty()
-        && streams_natively(ctx, node)
-        && {
-            let bytes = largest_output_bytes(node);
-            bytes.is_finite() && bytes * 2.0 > admission_room(ctx)
-        }
+fn spill_admitted(
+    ctx: &Ctx,
+    node: &Node,
+    kind: QueryKind,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<bool> {
+    if kind != QueryKind::Select || ctx.spill.is_none() || !ctx.snap.delta.is_empty() {
+        return Ok(false);
+    }
+    let bytes = largest_output_bytes(node);
+    if !bytes.is_finite() || bytes * 2.0 <= admission_room(ctx) {
+        return Ok(false);
+    }
+    streams_natively_with_admission(ctx, node, admission)
 }
 
 /// Whether automatic execution runs `node` as a cursor because eager execution is
@@ -1294,16 +1647,26 @@ fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
 /// 96). A `FILTER NOT EXISTS` over a Cartesian product under a grouping is the measured
 /// case: eager execution holds the whole product, and the cursor holds the product's
 /// smaller input, the key set of the NOT EXISTS and one row per group.
-fn memory_admitted(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
+fn memory_admitted(
+    ctx: &Ctx,
+    node: &Node,
+    pattern: Option<&spargebra::algebra::GraphPattern>,
+    query: &str,
+    kind: QueryKind,
+    options: &CursorOptions,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<bool> {
     let eager = largest_output_bytes(node);
-    eager.is_finite()
-        && eager * 2.0 > admission_room(ctx)
-        && cursor_fits(ctx, node, kind, options, true)
+    if !eager.is_finite() || eager * 2.0 <= admission_room(ctx) {
+        return Ok(false);
+    }
+    cursor_fits(ctx, node, pattern, query, kind, options, true, admission)
 }
 
 /// Whether a cursor over `node` can run without spill: the query is a SELECT over an
-/// immutable snapshot, every operator streams natively, and the state the cursor keeps,
-/// with its batch headroom, is expected to fit in half of the memory the query may use.
+/// immutable snapshot, every operator streams natively, and both its opening phase
+/// (plan/query/variable credit plus transient validation clones) and its pull phase
+/// (retained open charges plus operator state and batch headroom) fit the query's budget.
 /// Automatic admission asks this when eager execution is expected not to fit, and the
 /// eager memory retry asks it when eager execution has failed, so both send the plans
 /// that fit to a cursor without spill (roadmap items 91 and 96). Admission counts the
@@ -1311,35 +1674,71 @@ fn memory_admitted(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOpti
 /// every scan charged one, so that it keeps eager the plans it kept eager. The retry
 /// does not, since a scan charges no block (roadmap item 1039) and the cursor copies
 /// rows when a block's charge does not fit, and its alternative is the eager failure.
+#[allow(clippy::too_many_arguments)]
 fn cursor_fits(
     ctx: &Ctx,
     node: &Node,
+    pattern: Option<&spargebra::algebra::GraphPattern>,
+    query: &str,
     kind: QueryKind,
     options: &CursorOptions,
     shared_block: bool,
-) -> bool {
-    kind == QueryKind::Select
-        && ctx.snap.delta.is_empty()
-        && batches_admitted(options)
-        && streams_natively(ctx, node)
-        && {
-            let state = cursor_state_bytes(ctx, node);
-            let headroom = cursor_headroom(ctx, node, options, shared_block) as f64;
-            state.is_finite() && state * 2.0 + headroom <= admission_room(ctx)
-        }
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<bool> {
+    if kind != QueryKind::Select
+        || !ctx.snap.delta.is_empty()
+        || !batches_admitted(options)
+        || !streams_natively_with_admission(ctx, node, admission)?
+    {
+        return Ok(false);
+    }
+    let state = cursor_state_bytes(ctx, node, admission)?;
+    let headroom = cursor_headroom(ctx, node, options, shared_block) as f64;
+    let (open_retained, open_peak) = match cursor_open_bytes(ctx, node, pattern, query) {
+        Ok(bytes) => bytes,
+        Err(Error::BudgetExceeded(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let room_bytes = admission_room_bytes(ctx);
+    Ok(open_peak <= room_bytes
+        && state.is_finite()
+        && (open_retained as f64) + state * 2.0 + headroom <= room_bytes as f64)
+}
+
+/// Fixed and peak opening memory charges that [`from_prepared`] acquires before any
+/// cursor batch is pulled:
+/// - `retained`: `plan_bytes(node) + query.len() * 16 + Variables` credit, held for
+///   both the opening and pull phases.
+/// - `open_peak`: `retained + max(star_workspace, validation_clone_peak(node))`, the
+///   peak during `Variables::new` and `Operator::build_for` (transient validation clones
+///   drop before pulling begins).
+fn cursor_open_bytes(
+    ctx: &Ctx,
+    node: &Node,
+    pattern: Option<&spargebra::algebra::GraphPattern>,
+    query: &str,
+) -> Result<(u64, u64)> {
+    let plan = plan_bytes(node).saturating_add((query.len() as u64).saturating_mul(16));
+    let (var_retained, var_workspace) = Variables::estimate_bytes(ctx, pattern, &node.vars, query)?;
+    let retained = plan.saturating_add(var_retained);
+    let transient = var_workspace.max(validation_clone_peak(node));
+    Ok((retained, retained.saturating_add(transient)))
 }
 
 /// The memory automatic admission compares a plan's estimates with: what the query's
-/// own budget leaves, and never more than the whole query memory pool of its grant. It
-/// does not depend on how much of the pool other queries hold at the moment, so the same
-/// query gets the same plan under load.
-fn admission_room(ctx: &Ctx) -> f64 {
+/// own budget leaves, and never more than the query memory pool capacity minus this
+/// query's own live bytes. It does not depend on how much of the pool other queries hold
+/// at the moment, so the same query gets the same plan under load.
+fn admission_room_bytes(ctx: &Ctx) -> u64 {
     let own = ctx.memory_remaining();
-    let room = match ctx.grant() {
-        Some(grant) => own.min(grant.pool().capacity()),
+    match ctx.grant() {
+        Some(grant) => own.min(grant.pool().capacity().saturating_sub(ctx.live_bytes())),
         None => own,
-    };
-    room as f64
+    }
+}
+
+fn admission_room(ctx: &Ctx) -> f64 {
+    admission_room_bytes(ctx) as f64
 }
 
 /// The bytes the query-local vocabulary is assumed to keep for each term an expression
@@ -1354,7 +1753,12 @@ const GENERATED_TERM_BYTES: f64 = 128.0;
 /// Operators the estimate does not know count their whole output, and state whose size
 /// does not follow from the row estimates, such as the text of a GROUP_CONCAT, makes the
 /// estimate infinite so that the plan is not admitted on it.
-fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
+fn cursor_state_bytes(
+    ctx: &Ctx,
+    node: &Node,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<f64> {
+    ctx.check()?;
     let width = |n: &Node| (n.vars.len().max(1) * 8) as f64;
     // rows kept in a growing vector, which may hold twice their bytes while it grows
     let rows = |n: &Node, est: f64| est.max(0.0) * width(n) * 2.0;
@@ -1390,7 +1794,7 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
                     agg.func,
                     spargebra::algebra::AggregateFunction::GroupConcat { .. }
                 ) {
-                    return f64::INFINITY;
+                    return Ok(f64::INFINITY);
                 }
                 // a DISTINCT aggregate keeps every distinct input row of its group
                 if agg.distinct {
@@ -1403,7 +1807,7 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
         Kind::Sort(_) => rows(node, node.est),
         Kind::OrderBy { limit: Some(k), .. } => rows(node, (*k as f64).min(node.est)),
         Kind::OrderBy { limit: None, .. } => rows(node, node.est),
-        Kind::Filter(_) if node.children.len() == 1 => keyed_exists_bytes(ctx, node),
+        Kind::Filter(_) if node.children.len() == 1 => keyed_exists_bytes(ctx, node, admission)?,
         // a variable or a constant generates no term
         Kind::Extend(_, Expr::Var(_) | Expr::Const(_) | Expr::Lit(..)) => 0.0,
         Kind::Extend(..) => node.est.max(0.0) * GENERATED_TERM_BYTES,
@@ -1414,15 +1818,16 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
     // an OPTIONAL condition, beside the operator's own state
     let keyed = match &node.kind {
         Kind::Filter(_) => 0.0,
-        kind if own_exprs(kind).iter().any(|e| e.has_exists()) => keyed_exists_bytes(ctx, node),
+        kind if own_exprs(kind).iter().any(|e| e.has_exists()) => {
+            keyed_exists_bytes(ctx, node, admission)?
+        }
         _ => 0.0,
     };
-    own + keyed
-        + node
-            .children
-            .iter()
-            .map(|c| cursor_state_bytes(ctx, c))
-            .sum::<f64>()
+    let mut total = own + keyed;
+    for child in &node.children {
+        total += cursor_state_bytes(ctx, child, admission)?;
+    }
+    Ok(total)
 }
 
 /// The estimated bytes of the key sets that answer the EXISTS patterns of `node`, with
@@ -1430,7 +1835,11 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
 /// distinct outer key, and its memo holds one entry per key up to its entry cap and an
 /// eighth of the memory budget. A pattern that shares no variable with the rows it tests
 /// keeps one answer.
-fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
+fn keyed_exists_bytes(
+    ctx: &Ctx,
+    node: &Node,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<f64> {
     let hashed = |n: &Node| {
         let est = n.est.max(0.0);
         let entries = est.min(usize::MAX as f64) as usize;
@@ -1443,15 +1852,16 @@ fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
     for e in own_exprs(&node.kind) {
         e.exists_specs(&mut specs);
     }
-    specs
-        .into_iter()
-        .map(|spec| {
-            keyed_exists(ctx, node, spec).map_or_else(
-                || per_key_exists_bytes(ctx, node, spec),
-                |planned| hashed(&planned) + cursor_state_bytes(ctx, &planned),
-            )
-        })
-        .sum()
+    let mut total = 0.0;
+    for spec in specs {
+        if let Some(planned) = keyed_exists(ctx, node, spec, admission)? {
+            total += hashed(&planned)
+                + super::depth::guard_exists(|| cursor_state_bytes(ctx, &planned, admission))?;
+        } else {
+            total += per_key_exists_bytes(ctx, node, spec);
+        }
+    }
+    Ok(total)
 }
 
 /// The estimated bytes of the memo of an EXISTS that `node` evaluates once per distinct
@@ -1479,7 +1889,12 @@ fn per_key_exists_bytes(ctx: &Ctx, node: &Node, spec: &super::expr::ExistsSpec) 
 /// a FILTER, a BIND, an ORDER BY key, an aggregate argument or an OPTIONAL condition. The
 /// rows the first four test are their input's, and those an OPTIONAL condition tests are
 /// the pairs of its two sides, which bind every variable that either side always binds.
-fn keyed_exists(ctx: &Ctx, node: &Node, spec: &super::expr::ExistsSpec) -> Option<Node> {
+fn keyed_exists(
+    ctx: &Ctx,
+    node: &Node,
+    spec: &super::expr::ExistsSpec,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<Option<Arc<Node>>> {
     match (&node.kind, node.children.as_slice()) {
         (
             Kind::Filter(_)
@@ -1488,15 +1903,15 @@ fn keyed_exists(ctx: &Ctx, node: &Node, spec: &super::expr::ExistsSpec) -> Optio
             | Kind::Sort(_)
             | Kind::Group { .. },
             [input],
-        ) => super::exists::keyed_plan(ctx, spec, &input.vars, &input.certain),
+        ) => super::exists::keyed_plan(ctx, spec, &input.vars, &input.certain, admission),
         (Kind::LeftJoin { .. }, [left, right]) => {
             let mut vars = left.vars.clone();
             vars.extend(right.vars.iter().filter(|v| !left.vars.contains(v)));
             let mut certain = left.certain.clone();
             certain.extend(right.certain.iter().filter(|v| !left.certain.contains(v)));
-            super::exists::keyed_plan(ctx, spec, &vars, &certain)
+            super::exists::keyed_plan(ctx, spec, &vars, &certain, admission)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -1510,62 +1925,123 @@ fn largest_output_bytes(node: &Node) -> f64 {
         .fold(own, f64::max)
 }
 
-/// How deep automatic admission follows EXISTS patterns nested in EXISTS patterns. A
-/// deeper nesting keeps the plan eager.
-const AUTO_EXISTS_DEPTH: usize = 4;
-
 /// Whether every operator of `node` has a cursor implementation, so that a cursor over
 /// it runs no eager subtree. An EXISTS that a FILTER, a BIND, an ORDER BY key or an
 /// aggregate argument evaluates also counts, alone or inside a larger expression such as
-/// IF or OR, when the plan of its pattern counts in turn. Its pattern is answered from a
-/// key set filled by a child cursor under the query's charges where the key set can
-/// answer it, and otherwise evaluated once per distinct outer key with a charged memo,
-/// as eager execution evaluates it. A pattern that calls a SERVICE keeps the plan eager,
-/// and so does an OPTIONAL whose condition holds an EXISTS. The cursor merges such an
-/// OPTIONAL and tests the condition on each batch's pairs, which matches eager execution
-/// where a left row has about one pair. On an Intel host at 1M people, where a left row
-/// has about 2.5 pairs, it took 1.18 to 1.36 times as long as eager execution, which
-/// tests the condition inside the merge. The patterns are planned here only to read
-/// their operators. Planning interns their variables in `ctx` and runs no part of them.
-pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
-    fn pattern(ctx: &Ctx, node: &Node, e: &Expr, depth: usize) -> bool {
+/// IF or OR, when the plan of its pattern counts in turn, to any nesting depth. Its
+/// pattern is answered from a key set filled by a child cursor under the query's charges
+/// where the key set can answer it, and otherwise evaluated once per distinct outer key
+/// with a charged memo, as eager execution evaluates it. A pattern that calls a SERVICE
+/// keeps the plan eager, and so does an OPTIONAL whose condition holds an EXISTS. The
+/// cursor merges such an OPTIONAL and tests the condition on each batch's pairs, which
+/// matches eager execution where a left row has about one pair. On an Intel host at 1M
+/// people, where a left row has about 2.5 pairs, it took 1.18 to 1.36 times as long as
+/// eager execution, which tests the condition inside the merge. Each EXISTS pattern is
+/// planned at most once and cached on its [`super::expr::ExistsSpec`] for reuse by
+/// strict operator construction and key-set building.
+#[allow(dead_code)]
+pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> Result<bool> {
+    streams_natively_with_admission(ctx, node, None)
+}
+
+fn streams_natively_with_admission(
+    ctx: &Ctx,
+    node: &Node,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<bool> {
+    /// `Ok(Some(b))` is a deterministic verdict; `Ok(None)` means planning hit a memory
+    /// budget limit and must stay uncached while keeping the query eager.
+    fn pattern(
+        ctx: &Ctx,
+        e: &Expr,
+        admission: Option<&super::ctx::Charge<'_>>,
+    ) -> Result<Option<bool>> {
         let mut specs = Vec::new();
         e.exists_specs(&mut specs);
-        specs.into_iter().all(|spec| {
-            depth < AUTO_EXISTS_DEPTH
-                && ctx.opt.decorrelate_exists
-                && !spec.calls_service()
-                && keyed_exists(ctx, node, spec)
-                    .or_else(|| {
-                        super::plan::Planner::new(ctx)
-                            .plan(spec.pattern(), &spec.graph, Vec::new())
-                            .ok()
-                    })
-                    .is_some_and(|planned| at(ctx, &planned, depth + 1))
-        })
+        for spec in specs {
+            ctx.check()?;
+            if !ctx.opt.decorrelate_exists || spec.calls_service() {
+                return Ok(Some(false));
+            }
+            if let Some(cached) = spec.plan_cache.native() {
+                if !cached {
+                    return Ok(Some(false));
+                }
+                continue;
+            }
+            let planned = match super::exists::speculative_plan(ctx, spec, admission) {
+                Ok(planned) => planned,
+                Err(e @ (Error::Cancelled | Error::Timeout | Error::Io(_) | Error::Corrupt(_))) => {
+                    return Err(e);
+                }
+                Err(Error::BudgetExceeded(_)) => return Ok(None),
+                Err(_) => {
+                    spec.plan_cache.set_native(false);
+                    return Ok(Some(false));
+                }
+            };
+            match super::depth::guard_exists(|| at(ctx, &planned, admission))? {
+                Some(ok) => {
+                    spec.plan_cache.set_native(ok);
+                    if !ok {
+                        return Ok(Some(false));
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(true))
     }
-    fn at(ctx: &Ctx, node: &Node, depth: usize) -> bool {
+    fn at(
+        ctx: &Ctx,
+        node: &Node,
+        admission: Option<&super::ctx::Charge<'_>>,
+    ) -> Result<Option<bool>> {
+        ctx.check()?;
         let exists = match &node.kind {
             Kind::Filter(_)
             | Kind::Extend(..)
             | Kind::OrderBy { .. }
             | Kind::Sort(_)
-            | Kind::Group { .. } => own_exprs(&node.kind)
-                .into_iter()
-                .all(|e| !e.has_exists() || pattern(ctx, node, e, depth)),
-            kind => !own_exprs(kind).iter().any(|e| e.has_exists()),
+            | Kind::Group { .. } => {
+                let mut verdict = Some(true);
+                for e in own_exprs(&node.kind) {
+                    if e.has_exists() {
+                        match pattern(ctx, e, admission)? {
+                            Some(true) => {}
+                            other => {
+                                verdict = other;
+                                break;
+                            }
+                        }
+                    }
+                }
+                verdict
+            }
+            kind => Some(!own_exprs(kind).iter().any(|e| e.has_exists())),
         };
-        exists
-            && (supported(&node.kind)
-                || binary::eligible(node)
-                || group::eligible(ctx, node)
-                || expand::auto_eligible(node)
-                || walk::eligible(node)
-                || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
-                    && node.children.len() == 1))
-            && node.children.iter().all(|child| at(ctx, child, depth))
+        let Some(true) = exists else {
+            return Ok(exists);
+        };
+        if !(supported(&node.kind)
+            || binary::eligible(node)
+            || group::eligible(ctx, node)
+            || expand::auto_eligible(node)
+            || walk::eligible(node)
+            || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
+                && node.children.len() == 1))
+        {
+            return Ok(Some(false));
+        }
+        for child in &node.children {
+            match at(ctx, child, admission)? {
+                Some(true) => {}
+                other => return Ok(other),
+            }
+        }
+        Ok(Some(true))
     }
-    at(ctx, node, 0)
+    Ok(at(ctx, node, admission)? == Some(true))
 }
 
 /// Whether nothing in `node` has effects that running it twice would repeat or
@@ -1580,10 +2056,35 @@ fn retryable(node: &Node) -> bool {
 /// keeps an EXISTS that it evaluates per row as a pattern, so [`retryable`] does not
 /// see a SERVICE there.
 pub(super) fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
+    pattern_has(pattern, &|_| false)
+}
+
+/// Whether evaluating `pattern` can be observed from outside the query or differs from
+/// one evaluation to the next: it holds a SERVICE or, in any expression, a call of
+/// RAND, UUID, STRUUID or BNODE or of a function named by an IRI other than a supported
+/// XSD cast ([`super::expr::is_cast`]). The pattern is not planned, so every such name
+/// counts, whether it is a built-in extension function or a registration. A registered
+/// aggregate or property function is not a call in an expression, and
+/// [`super::exprcache::observable`] asks the registry for those.
+pub(super) fn pattern_observable(pattern: &spargebra::algebra::GraphPattern) -> bool {
+    use spargebra::algebra::Function as F;
+    pattern_has(pattern, &|function| match function {
+        F::Rand | F::Uuid | F::StrUuid | F::BNode => true,
+        F::Custom(name) => !super::expr::is_cast(name.as_str()),
+        _ => false,
+    })
+}
+
+/// Whether `pattern` holds a SERVICE or a call of a function that `call` accepts,
+/// anywhere.
+fn pattern_has(
+    pattern: &spargebra::algebra::GraphPattern,
+    call: &dyn Fn(&spargebra::algebra::Function) -> bool,
+) -> bool {
     use spargebra::algebra::{AggregateExpression, GraphPattern as P, OrderExpression};
     let order = |keys: &[OrderExpression]| {
         keys.iter().any(|k| match k {
-            OrderExpression::Asc(e) | OrderExpression::Desc(e) => expr_calls_service(e),
+            OrderExpression::Asc(e) | OrderExpression::Desc(e) => expr_has(e, call),
         })
     };
     match pattern {
@@ -1594,17 +2095,17 @@ pub(super) fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool 
         | P::Minus { left, right }
         | P::SemiJoin { left, right }
         | P::AntiJoin { left, right }
-        | P::Lateral { left, right } => calls_service(left) || calls_service(right),
+        | P::Lateral { left, right } => pattern_has(left, call) || pattern_has(right, call),
         P::LeftJoin {
             left,
             right,
             expression,
         } => {
-            calls_service(left)
-                || calls_service(right)
-                || expression.as_ref().is_some_and(expr_calls_service)
+            pattern_has(left, call)
+                || pattern_has(right, call)
+                || expression.as_ref().is_some_and(|e| expr_has(e, call))
         }
-        P::Filter { expr, inner } => expr_calls_service(expr) || calls_service(inner),
+        P::Filter { expr, inner } => expr_has(expr, call) || pattern_has(inner, call),
         P::Extend {
             inner, expression, ..
         }
@@ -1613,23 +2114,23 @@ pub(super) fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool 
         }
         | P::Unfold {
             inner, expression, ..
-        } => expr_calls_service(expression) || calls_service(inner),
-        P::OrderBy { inner, expression } => order(expression) || calls_service(inner),
+        } => expr_has(expression, call) || pattern_has(inner, call),
+        P::OrderBy { inner, expression } => order(expression) || pattern_has(inner, call),
         P::Group {
             inner, aggregates, ..
         } => {
-            calls_service(inner)
+            pattern_has(inner, call)
                 || aggregates.iter().any(|(_, agg)| match agg {
                     AggregateExpression::CountSolutions { .. } => false,
-                    AggregateExpression::FunctionCall { expr, .. } => expr_calls_service(expr),
+                    AggregateExpression::FunctionCall { expr, .. } => expr_has(expr, call),
                     AggregateExpression::Fold {
                         expr,
                         value,
                         order: keys,
                         ..
                     } => {
-                        expr_calls_service(expr)
-                            || value.as_ref().is_some_and(expr_calls_service)
+                        expr_has(expr, call)
+                            || value.as_ref().is_some_and(|e| expr_has(e, call))
                             || order(keys)
                     }
                 })
@@ -1638,15 +2139,19 @@ pub(super) fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool 
         | P::Project { inner, .. }
         | P::Distinct { inner }
         | P::Reduced { inner }
-        | P::Slice { inner, .. } => calls_service(inner),
+        | P::Slice { inner, .. } => pattern_has(inner, call),
     }
 }
 
-/// Whether `expr` holds an EXISTS whose pattern holds a SERVICE.
-fn expr_calls_service(expr: &spargebra::algebra::Expression) -> bool {
+/// Whether `expr` calls a function that `call` accepts, or holds an EXISTS whose pattern
+/// holds a SERVICE or such a call.
+fn expr_has(
+    expr: &spargebra::algebra::Expression,
+    call: &dyn Fn(&spargebra::algebra::Function) -> bool,
+) -> bool {
     use spargebra::algebra::Expression as E;
     match expr {
-        E::Exists(pattern) => calls_service(pattern),
+        E::Exists(pattern) => pattern_has(pattern, call),
         E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => false,
         E::Or(a, b)
         | E::And(a, b)
@@ -1659,11 +2164,12 @@ fn expr_calls_service(expr: &spargebra::algebra::Expression) -> bool {
         | E::Add(a, b)
         | E::Subtract(a, b)
         | E::Multiply(a, b)
-        | E::Divide(a, b) => expr_calls_service(a) || expr_calls_service(b),
-        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr_calls_service(a),
-        E::In(a, list) => expr_calls_service(a) || list.iter().any(expr_calls_service),
-        E::If(a, b, c) => expr_calls_service(a) || expr_calls_service(b) || expr_calls_service(c),
-        E::Coalesce(list) | E::FunctionCall(_, list) => list.iter().any(expr_calls_service),
+        | E::Divide(a, b) => expr_has(a, call) || expr_has(b, call),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr_has(a, call),
+        E::In(a, list) => expr_has(a, call) || list.iter().any(|e| expr_has(e, call)),
+        E::If(a, b, c) => expr_has(a, call) || expr_has(b, call) || expr_has(c, call),
+        E::Coalesce(list) => list.iter().any(|e| expr_has(e, call)),
+        E::FunctionCall(function, list) => call(function) || list.iter().any(|e| expr_has(e, call)),
     }
 }
 
@@ -1732,8 +2238,13 @@ pub fn query_execution_with_plan(
                 return Err(Error::invalid("cursor batch rows and bytes must be positive").into());
             }
             let planning = Instant::now();
-            let prepared =
-                super::prepare_query(snapshot, &parsed, options, Some(started), Some(cursor))?;
+            let prepared = super::prepare_query(
+                snapshot,
+                &parsed,
+                options,
+                Some(started),
+                Some((cursor, query)),
+            )?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let kind = prepared.kind;
             let levels = levels.max(prepared.plan_depth);
@@ -1749,19 +2260,45 @@ pub fn query_execution_with_plan(
                 && retryable(&prepared.node)
                 && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
             if prepared.ctx.streams() {
-                let (cursor, _, _) = from_prepared(
+                match from_prepared(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,
                     kind,
-                )?;
-                if kind == QueryKind::Ask {
-                    let depth = cursor.depth;
-                    let result = finish_ask_with_plan(cursor)?;
-                    Ok(QueryExecution::Ask(Box::new(AskResult {
-                        result: Some(result),
-                        depth,
-                    })))
-                } else {
-                    Ok(QueryExecution::Select(Box::new(cursor)))
+                ) {
+                    Ok((cursor, _, _)) => {
+                        if kind == QueryKind::Ask {
+                            let depth = cursor.depth;
+                            let result = finish_ask_with_plan(cursor)?;
+                            Ok(QueryExecution::Ask(Box::new(AskResult {
+                                result: Some(result),
+                                depth,
+                            })))
+                        } else {
+                            Ok(QueryExecution::Select(Box::new(cursor)))
+                        }
+                    }
+                    Err(Error::BudgetExceeded(ref b))
+                        if matches!(
+                            b.kind,
+                            crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
+                        ) =>
+                    {
+                        let fallback_opts = within_first_deadline(options, started);
+                        let mut result = super::execute_query_with_plan(
+                            retry_snapshot,
+                            &parsed,
+                            &fallback_opts,
+                            parse_ms,
+                        )?;
+                        if result.kind == QueryKind::Select {
+                            super::select_star_order(query, &mut result)?;
+                        }
+                        let depth = levels.max(result.plan().depth());
+                        Ok(QueryExecution::Eager(Box::new(MaterializedResult {
+                            result: Some(result),
+                            depth,
+                        })))
+                    }
+                    Err(error) => Err(error.into()),
                 }
             } else {
                 let ran = depth::with_stack(levels, || {
@@ -1781,10 +2318,11 @@ pub fn query_execution_with_plan(
                                 || fits_without_spill(
                                     &retry_snapshot,
                                     &parsed,
+                                    query,
                                     options,
                                     cursor,
                                     started,
-                                )) =>
+                                )?) =>
                     {
                         return retry_as_cursor(retry_snapshot, query, options, cursor, started);
                     }
@@ -1809,13 +2347,29 @@ pub fn query_execution_with_plan(
 fn fits_without_spill(
     snapshot: &Arc<Snapshot>,
     parsed: &spargebra::Query,
+    query: &str,
     options: &QueryOptions,
     cursor: &CursorOptions,
     started: Instant,
-) -> bool {
+) -> Result<bool> {
     let options = within_first_deadline(options, started);
-    super::prepare_query(snapshot.clone(), parsed, &options, None, None)
-        .is_ok_and(|p| cursor_fits(&p.ctx, &p.node, p.kind, cursor, false))
+    let p = match super::prepare_query(snapshot.clone(), parsed, &options, None, None) {
+        Ok(p) => p,
+        Err(e @ (Error::Cancelled | Error::Timeout | Error::Io(_) | Error::Corrupt(_))) => {
+            return Err(e);
+        }
+        Err(_) => return Ok(false),
+    };
+    cursor_fits(
+        &p.ctx,
+        &p.node,
+        Some(&p.pattern),
+        query,
+        p.kind,
+        cursor,
+        false,
+        None,
+    )
 }
 
 /// `options` with a relative timeout turned into the deadline of the run that started
@@ -1894,6 +2448,14 @@ impl QueryExecution {
             Self::Select(c) => c.reasoning(),
             Self::Graph(c) => c.reasoning(),
             Self::Eager(r) | Self::Ask(r) => r.result().inner.ctx.reasoning.clone(),
+        }
+    }
+    /// Whether this execution's query calls a graph algorithm.
+    pub fn uses_algorithms(&self) -> bool {
+        match self {
+            Self::Select(c) => c.uses_algorithms(),
+            Self::Graph(c) => c.uses_algorithms(),
+            Self::Eager(r) | Self::Ask(r) => r.result().uses_algorithms(),
         }
     }
     pub fn cancellation_token(&self) -> Arc<std::sync::atomic::AtomicBool> {
@@ -1990,6 +2552,10 @@ impl QueryCursor {
     pub fn reasoning(&self) -> Option<Arc<super::reasoning::Applied>> {
         self.ctx.reasoning.clone()
     }
+    /// Whether this cursor's query calls a graph algorithm.
+    pub fn uses_algorithms(&self) -> bool {
+        self.ctx.calls_algorithm()
+    }
     pub fn deadline(&self) -> Option<Instant> {
         self.ctx.deadline
     }
@@ -2004,6 +2570,10 @@ impl QueryCursor {
     }
     pub(super) fn charge(&self, bytes: u64) -> Result<OwnedCharge> {
         OwnedCharge::new(&self.ctx, bytes)
+    }
+    /// The query context that the output writer charges its buffer to.
+    pub(super) fn output_ctx(&self) -> Arc<Ctx> {
+        self.ctx.clone()
     }
 
     pub(super) fn stack_depth(&self) -> usize {
@@ -2052,7 +2622,7 @@ impl QueryCursor {
     /// rows of `send` left over, which without `send` count down from `usize::MAX`, so that
     /// 0 means the writer stopped at `send`.
     ///
-    /// With `decode_ahead` and more than one Rayon worker, every batch after the first is
+    /// With more than one Rayon worker, every batch after the first can be
     /// pulled before `each` handles the one before it, and its terms are decoded on the pool
     /// while `each` runs. Two batches and their terms are then live at once, both charged.
     /// The first batch goes to `each` before the second is pulled, so the first rows of an
@@ -2137,7 +2707,10 @@ impl QueryCursor {
         Ok(remaining)
     }
 
-    pub(super) fn next_batch_at_most(&mut self, rows: usize) -> Result<Option<QueryBatch>> {
+    pub(in crate::sparql) fn next_batch_at_most(
+        &mut self,
+        rows: usize,
+    ) -> Result<Option<QueryBatch>> {
         let previous_emitted = self.emitted;
         if self.shared && self.status == CursorStatus::Open {
             let began = Instant::now();
@@ -2307,7 +2880,7 @@ impl QueryCursor {
             .into_retained(&self.ctx)?;
         super::ResultParts {
             kind: QueryKind::Select,
-            variables: Some(self.variables.clone()),
+            variables: Some(super::ResultVariables::Shared(self.variables.clone())),
             table: output.table,
             boolean: false,
             triples: Vec::new(),
@@ -2488,7 +3061,13 @@ fn pull_planned<'ctx>(
     // The operators keep a copy of the plan, such as its tables of values, until they
     // drop, which they do before this charge.
     let _plan = OwnedCharge::new(&shared, plan_bytes(node))?;
-    let mut root = Operator::build(&shared, node.clone(), FallbackPolicy::AllowMaterialization)?;
+    let mut root = Operator::build_for_internal(
+        &shared,
+        node.clone(),
+        FallbackPolicy::AllowMaterialization,
+        true,
+        planned,
+    )?;
     let mut out = Buffer::new(&shared, &root.vars, 0)?;
     let ran = (|| {
         while out.table.len < want {
@@ -2579,15 +3158,309 @@ fn pull_planned<'ctx>(
 }
 
 pub(super) fn plan_bytes(node: &Node) -> u64 {
-    let values = match &node.kind {
-        Kind::Values(t) => capacity_bytes(t),
-        _ => 0,
-    };
-    (node.desc.len() as u64)
-        .saturating_add(node.vars.len() as u64 * 32)
-        .saturating_add(1024)
-        .saturating_add(values)
-        .saturating_add(node.children.iter().map(plan_bytes).sum::<u64>())
+    fn expr_extra_bytes(
+        expr: &Expr,
+        charge_node: bool,
+        seen_specs: &mut FxHashSet<usize>,
+        seen_patterns: &mut FxHashSet<usize>,
+        seen_view_patterns: &mut FxHashSet<usize>,
+    ) -> u64 {
+        match expr {
+            Expr::Exists(spec) => {
+                if seen_specs.insert(Arc::as_ptr(spec) as usize) {
+                    spec.uncharged_retained_bytes(seen_patterns, seen_view_patterns)
+                } else {
+                    0
+                }
+            }
+            Expr::Lit(_, value) if charge_node => super::checked_layout::value_heap_bytes(value),
+            Expr::Or(a, b)
+            | Expr::And(a, b)
+            | Expr::Eq(a, b)
+            | Expr::SameTerm(a, b)
+            | Expr::Cmp(a, b, _)
+            | Expr::Arith(a, b, _) => expr_extra_bytes(
+                a,
+                charge_node,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            )
+            .saturating_add(expr_extra_bytes(
+                b,
+                charge_node,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            )),
+            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => expr_extra_bytes(
+                a,
+                charge_node,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            ),
+            Expr::If(a, b, c) => expr_extra_bytes(
+                a,
+                charge_node,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            )
+            .saturating_add(expr_extra_bytes(
+                b,
+                charge_node,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            ))
+            .saturating_add(expr_extra_bytes(
+                c,
+                charge_node,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            )),
+            Expr::In(a, list) => list.iter().fold(
+                expr_extra_bytes(
+                    a,
+                    charge_node,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ),
+                |acc, e| {
+                    acc.saturating_add(expr_extra_bytes(
+                        e,
+                        charge_node,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                },
+            ),
+            Expr::Coalesce(list) | Expr::Call(_, list) => list.iter().fold(0u64, |acc, e| {
+                acc.saturating_add(expr_extra_bytes(
+                    e,
+                    charge_node,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => 0,
+        }
+    }
+
+    fn walk_node(
+        node: &Node,
+        charge_node: bool,
+        include_root: bool,
+        seen_specs: &mut FxHashSet<usize>,
+        seen_patterns: &mut FxHashSet<usize>,
+        seen_view_patterns: &mut FxHashSet<usize>,
+    ) -> u64 {
+        let mut extra = match &node.kind {
+            Kind::Filter(exprs) | Kind::CountFilterScan { filter: exprs, .. } => {
+                exprs.iter().fold(0u64, |acc, e| {
+                    acc.saturating_add(expr_extra_bytes(
+                        e,
+                        charge_node,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                })
+            }
+            Kind::Extend(_, e)
+            | Kind::Assign(_, e)
+            | Kind::Unfold { expr: e, .. }
+            | Kind::KeyedLeftJoin { expr: e, .. }
+            | Kind::KeyedJoin { expr: e, .. } => expr_extra_bytes(
+                e,
+                charge_node,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            ),
+            Kind::LeftJoin { expr: Some(e) } => expr_extra_bytes(
+                e,
+                charge_node,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            ),
+            Kind::RangeScan(_, range) => range.filter.iter().fold(0u64, |acc, e| {
+                acc.saturating_add(expr_extra_bytes(
+                    e,
+                    charge_node,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            Kind::OrderedTopK(top) => top
+                .filter
+                .iter()
+                .chain(&top.range_filter)
+                .fold(0u64, |acc, e| {
+                    acc.saturating_add(expr_extra_bytes(
+                        e,
+                        charge_node,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                })
+                .saturating_add(walk_node(
+                    &top.fallback,
+                    charge_node,
+                    true,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                )),
+            Kind::OrderBy { keys, .. } => keys.iter().fold(0u64, |acc, (e, _)| {
+                acc.saturating_add(expr_extra_bytes(
+                    e,
+                    charge_node,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            Kind::Group { aggs, .. } => aggs.iter().fold(0u64, |acc, (_, agg)| {
+                let mut total = acc;
+                if let Some(e) = &agg.expr {
+                    total = total.saturating_add(expr_extra_bytes(
+                        e,
+                        charge_node,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ));
+                }
+                if let Some(fold) = &agg.fold {
+                    if let Some(v) = &fold.value {
+                        total = total.saturating_add(expr_extra_bytes(
+                            v,
+                            charge_node,
+                            seen_specs,
+                            seen_patterns,
+                            seen_view_patterns,
+                        ));
+                    }
+                    for (e, _) in &fold.order {
+                        total = total.saturating_add(expr_extra_bytes(
+                            e,
+                            charge_node,
+                            seen_specs,
+                            seen_patterns,
+                            seen_view_patterns,
+                        ));
+                    }
+                }
+                total
+            }),
+            // PreparedGraphBranches already reserves retained branch nodes and VALUES tables
+            // inside `_held`; walk branch plans only to cover any uncharged EXISTS backing.
+            Kind::GraphBranches(branches) => branches.inputs.iter().fold(0u64, |acc, branch| {
+                acc.saturating_add(walk_node(
+                    branch,
+                    false,
+                    true,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            _ => 0,
+        };
+        for child in &node.children {
+            extra = extra.saturating_add(walk_node(
+                child,
+                charge_node,
+                false,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            ));
+        }
+        if charge_node {
+            let actual = super::checked_layout::node_shallow_retained_bytes(node, include_root);
+            let floor = (node.desc.len() as u64)
+                .saturating_add(node.vars.len() as u64 * 32)
+                .saturating_add(1024);
+            actual.max(floor).saturating_add(extra)
+        } else {
+            extra
+        }
+    }
+
+    let mut seen_specs = FxHashSet::default();
+    let mut seen_patterns = FxHashSet::default();
+    let mut seen_view_patterns = FxHashSet::default();
+    walk_node(
+        node,
+        true,
+        true,
+        &mut seen_specs,
+        &mut seen_patterns,
+        &mut seen_view_patterns,
+    )
+}
+
+/// Bytes copied when cloning a cached [`Node`] into a cursor (`exists_streams`, `drain`).
+/// Counts all owned node, table, expression, and `Kind` storage via [`super::checked_layout`],
+/// while excluding `Arc`-shared `ExistsSpec`, `PreparedGraphNames`, `PreparedGraphBranches`,
+/// and `Value` backing that `Node::clone` shares.
+fn cloned_plan_bytes(node: &Node) -> u64 {
+    fn node_count(node: &Node) -> u64 {
+        let extra = match &node.kind {
+            Kind::OrderedTopK(top) => node_count(&top.fallback),
+            _ => 0,
+        };
+        1u64.saturating_add(extra).saturating_add(
+            node.children
+                .iter()
+                .fold(0u64, |acc, child| acc.saturating_add(node_count(child))),
+        )
+    }
+    super::checked_layout::node_copy_bytes(node)
+        .saturating_add(node_count(node).saturating_mul(1024))
+}
+
+/// Peak temporary bytes `exists_streams` can reserve for plans cached during
+/// admission, accounting for nested clones live together on the stack.
+fn validation_clone_peak(node: &Node) -> u64 {
+    fn at(node: &Node, seen: &mut FxHashSet<usize>) -> u64 {
+        let mut peak = 0u64;
+        let mut specs = Vec::new();
+        for expr in own_exprs(&node.kind) {
+            expr.exists_specs(&mut specs);
+        }
+        for spec in specs {
+            if spec.plan_cache.strict().is_some() || !seen.insert(Arc::as_ptr(spec) as usize) {
+                continue;
+            }
+            if let Some(inner) = spec.plan_cache.cached_plan() {
+                let nested = super::depth::guard_exists(|| at(&inner, seen));
+                peak = peak.max(cloned_plan_bytes(&inner).saturating_add(nested));
+            }
+        }
+        match &node.kind {
+            Kind::OrderedTopK(top) => peak = peak.max(at(&top.fallback, seen)),
+            Kind::GraphBranches(branches) if let [branch] = branches.inputs.as_slice() => {
+                peak = peak.max(at(branch, seen));
+            }
+            _ => {}
+        }
+        for child in &node.children {
+            peak = peak.max(at(child, seen));
+        }
+        peak
+    }
+    at(node, &mut FxHashSet::default())
 }
 
 enum State {
@@ -2636,18 +3509,21 @@ enum State {
     Union {
         at: usize,
     },
-    /// An operator without a cursor implementation. With `inputs`, its children are
-    /// cursors whose output it collects before running. Otherwise its whole subtree
-    /// runs eagerly.
+    /// An operator without a cursor implementation whose children are cursors, whose
+    /// output it collects before its eager kernel runs.
     Fallback {
-        node: Node,
-        loaded: Option<Buffer>,
-        at: usize,
-        inputs: bool,
+        eager: Eager,
         /// Scans among the inputs, which an eager scan reads straight into a table of
         /// the right size. The fallback holds its whole input either way.
         scans: Vec<Option<Node>>,
     },
+    /// A kernel that reads no children, run once into a charged answer that it serves
+    /// batch by batch. A bounded one is native under decision 2 of the X14 plan, and an
+    /// unbounded one runs only under `AllowMaterialization`.
+    Leaf(Eager),
+    /// An operator that is not a leaf and does not read its children as input tables,
+    /// so its whole subtree runs eagerly. The strict policy refuses it.
+    EagerSubtree(Eager),
     Blocking {
         node: Node,
         loaded: Option<Buffer>,
@@ -2657,6 +3533,125 @@ enum State {
     },
     TopK(Box<topk::TopK>),
     IndexTopK(Box<topk::IndexTopK>),
+    /// A vector search below ORDER BY DESC(...) LIMIT k, with a generic scan fallback.
+    VectorOrder(Box<topk::VectorOrder>),
+    /// A SERVICE leaf (both streaming non-SILENT and budget-buffered SILENT).
+    Service(Box<service::Service>),
+    /// A leaf ARQ property function (`Kind::PropertyFn` without plan inputs), streamed
+    /// under the memory budget.
+    PropertyFn(Box<propertyfn::PropertyFn>),
+    /// A text search without a limit, which holds its hits and decodes rows from them.
+    Text(Box<text::Text>),
+    /// A history query without a limit or input, read a page of whole commits at a time.
+    History(Box<history::History>),
+    /// A path search without a limit or input: shortest/kShortest between constants, or
+    /// `path:all` with at least one constant endpoint.
+    PathSearch(Box<pathsearch::PathSearch>),
+    /// A streaming GeoSPARQL leaf (`SpatialScan`, unlimited `SpatialPf`, or `SpatialRelate`).
+    SpatialLeaf(Box<spatial::SpatialLeaf>),
+    /// A streaming GeoSPARQL join over 0, 1, or 2 plan children.
+    SpatialJoin(Box<spatial::SpatialJoin>),
+    /// A streaming k-nearest-neighbour search with cursor-executed template batches.
+    SpatialKnn(Box<spatial::SpatialKnn>),
+    /// A `SERVICE view:read` leaf, streamed from an immutable shared view version.
+    View(Box<view::View>),
+}
+
+/// An eager kernel's node, its answer once it has run, and how far its consumer has
+/// read that answer.
+struct Eager {
+    node: Node,
+    loaded: Option<Buffer>,
+    at: usize,
+}
+
+impl Eager {
+    fn new(node: Node) -> Self {
+        Self {
+            node,
+            loaded: None,
+            at: 0,
+        }
+    }
+
+    /// The next batch of at most `cap` rows of the loaded answer.
+    fn serve(&mut self, ctx: &Arc<Ctx>, cap: usize) -> Result<Option<Buffer>> {
+        let table = &self.loaded.as_ref().expect("a loaded eager answer").table;
+        let batch = copy_rows(ctx, table, self.at, cap)?;
+        if let Some(batch) = &batch {
+            self.at += batch.table.len;
+        }
+        Ok(batch)
+    }
+
+    /// Whether the consumer has read the whole loaded answer.
+    fn served(&self) -> bool {
+        self.loaded
+            .as_ref()
+            .is_some_and(|loaded| self.at == loaded.table.len)
+    }
+}
+
+/// The charged answer of an eager kernel that has just run, in the order its parents
+/// rely on. The kernel's plan, with its counters and `materializedRows`, becomes the
+/// operator's `info`, keeping the operator's time and the rows it has emitted.
+fn load_eager(
+    ctx: &Arc<Ctx>,
+    mut output: super::table::Materialized<'_>,
+    mut info: PlanInfo,
+    current: &mut PlanInfo,
+    rows: usize,
+    vars: &[VarId],
+    order: &[VarId],
+) -> Result<Buffer> {
+    if ctx.graphs.is_some() {
+        info.redact();
+    }
+    info.time_ms = current.time_ms;
+    let mut counters = info.counters.take().unwrap_or_default();
+    counters.insert("materializedRows".into(), output.table.len.into());
+    info.counters = Some(counters);
+    info.actual_rows = rows.min(i64::MAX as usize) as i64;
+    *current = info;
+    #[cfg(feature = "failpoints")]
+    if output.lease.is_some() {
+        crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+            "algorithm-fallback-transfer",
+            capacity_bytes(&output.table) as usize,
+        ));
+    }
+    let charge = if output.lease.is_some() {
+        OwnedCharge::adopt(ctx, &mut output.lease)?
+    } else {
+        OwnedCharge::new(ctx, capacity_bytes(&output.table))?
+    };
+    let mut buffer = Buffer {
+        table: output.table,
+        charge,
+    };
+    // A kernel may answer without some of the node's variables, as a failed SILENT
+    // SERVICE answers one solution of none, and the parents read the node's columns.
+    if buffer.table.vars != vars {
+        buffer.project(vars)?;
+    }
+    let Buffer {
+        mut table,
+        mut charge,
+    } = buffer;
+    // Parents rely on the planner's order, which the eager result reports only when its
+    // rows hold it.
+    if !table.sorted.starts_with(order) {
+        // Row indices and the reordered copy coexist with the input.
+        charge.resize(
+            capacity_bytes(&table)
+                .saturating_mul(2)
+                .saturating_add(table.len as u64 * 8),
+        )?;
+        table.sort_by_vars(order);
+        ctx.check()?;
+        charge.resize(capacity_bytes(&table))?;
+    }
+    Ok(Buffer { table, charge })
 }
 
 struct Operator {
@@ -2864,7 +3859,7 @@ fn supported(kind: &Kind) -> bool {
 }
 
 /// The expressions an operator evaluates itself, not those of its inputs.
-fn own_exprs(kind: &Kind) -> Vec<&Expr> {
+pub(super) fn own_exprs(kind: &Kind) -> Vec<&Expr> {
     match kind {
         Kind::Filter(exprs)
         | Kind::RangeScan(_, RangeSpec { filter: exprs, .. })
@@ -2893,30 +3888,55 @@ fn own_exprs(kind: &Kind) -> Vec<&Expr> {
 }
 
 /// Whether every EXISTS that an operator evaluates itself runs without an eager
-/// fallback. Each pattern is planned as the key set plans it, and that plan is built as
-/// cursor operators under the strict policy. A row evaluated on its own runs the same
-/// pattern with its values substituted and a limit of one solution.
+/// fallback. Each pattern is planned once (reusing its cached unsubstituted plan) and
+/// built once as cursor operators under the strict policy, memoizing the verdict on its
+/// [`super::expr::ExistsSpec`] so nested key-set drains do not repeat strict checks.
 fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
     let mut specs = Vec::new();
     for expr in own_exprs(kind) {
         expr.exists_specs(&mut specs);
     }
     for spec in specs {
-        let planned = super::plan::Planner::new(ctx).plan(spec.pattern(), &spec.graph, Vec::new());
+        ctx.check()?;
+        if let Some(cached) = spec.plan_cache.strict() {
+            if !cached {
+                return Ok(false);
+            }
+            continue;
+        }
+        let planned = super::exists::unsubstituted_plan(ctx, spec);
         if let Err(error) = &planned
             && super::extensions::is_unconfigured(error)
         {
             // This pattern needs no materialization. Its refusal matters only if it is evaluated.
+            spec.plan_cache.set_strict(true);
             continue;
         }
-        let built = planned
-            .and_then(|node| Operator::build(ctx, node, FallbackPolicy::RejectMaterialization));
+        let built = planned.and_then(|node| {
+            // Reserve the cloned plan's owned storage (including `Kind::Values` tables)
+            // before cloning while `CachedPlan` keeps the original `Arc<Node>` live.
+            let _plan = OwnedCharge::new(ctx, cloned_plan_bytes(&node))?;
+            super::depth::guard_exists(|| {
+                let _op =
+                    Operator::build(ctx, (*node).clone(), FallbackPolicy::RejectMaterialization)?;
+                Ok(())
+            })
+        });
         match built {
-            Ok(_) => {}
-            Err(error @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
+            Ok(()) => spec.plan_cache.set_strict(true),
+            Err(
+                error @ (Error::Cancelled
+                | Error::Timeout
+                | Error::BudgetExceeded(_)
+                | Error::Io(_)
+                | Error::Corrupt(_)),
+            ) => {
                 return Err(error);
             }
-            Err(_) => return Ok(false),
+            Err(_) => {
+                spec.plan_cache.set_strict(false);
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -2926,11 +3946,14 @@ fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
 /// it to read their pattern without materializing its solutions.
 pub(super) fn drain(
     ctx: &Arc<Ctx>,
-    node: Node,
+    node: &Node,
     each: &mut dyn FnMut(&Table) -> Result<()>,
 ) -> Result<()> {
     let options = CursorOptions::default();
-    let mut root = Operator::build(ctx, node, FallbackPolicy::AllowMaterialization)?;
+    // Reserve the cloned plan's owned storage before cloning while the cached `Arc<Node>`
+    // remains live; `root` drops before `_plan`, matching `pull_planned`.
+    let _plan = OwnedCharge::new(ctx, cloned_plan_bytes(node))?;
+    let mut root = Operator::build(ctx, node.clone(), FallbackPolicy::AllowMaterialization)?;
     while let Some(batch) = root.next(ctx, &options, options.batch_rows)? {
         each(&batch.table)?;
     }
@@ -2959,6 +3982,7 @@ fn ranked(kind: &Kind) -> bool {
             | Kind::HybridSearch(_)
             | Kind::SpatialKnn(_)
             | Kind::Service { .. }
+            | Kind::ViewRead(_)
             | Kind::PathSearch(_)
             | Kind::AlgoCall(_)
     )
@@ -3097,12 +4121,24 @@ impl Operator {
         fallback: FallbackPolicy,
         needed: bool,
     ) -> Result<Self> {
+        Self::build_for_internal(ctx, node, fallback, needed, true)
+    }
+
+    fn build_for_internal(
+        ctx: &Arc<Ctx>,
+        node: Node,
+        fallback: FallbackPolicy,
+        needed: bool,
+        check_exists: bool,
+    ) -> Result<Self> {
+        debug_assert!(check_exists || fallback == FallbackPolicy::AllowMaterialization);
         ctx.check()?;
         if let Kind::GraphBranches(plans) = &node.kind
             && let [branch] = plans.inputs.as_slice()
         {
             let charge = reserve_graph_branch_copy(ctx, branch, size_of::<SingletonGraph>())?;
-            let mut operator = Self::build_for(ctx, branch.clone(), fallback, needed)?;
+            let mut operator =
+                Self::build_for_internal(ctx, branch.clone(), fallback, needed, check_exists)?;
             let inner = operator.singleton_graph.take();
             operator.singleton_graph = Some(Box::new(SingletonGraph {
                 _inner: inner,
@@ -3121,7 +4157,7 @@ impl Operator {
         // materializes does not depend on the order its children turn out to have.
         // An operator that evaluates EXISTS streams when every EXISTS pattern does.
         let exists = own_exprs(&node.kind).iter().any(|e| e.has_exists());
-        let exists_streams = !exists || exists_streams(ctx, &node.kind)?;
+        let exists_streams = !exists || !check_exists || exists_streams(ctx, &node.kind)?;
         let joins = exists_streams && binary::eligible(&node);
         let incremental_group = exists_streams && group::eligible(ctx, &node);
         // FOLD and registered aggregates read each group's rows from key runs.
@@ -3140,7 +4176,25 @@ impl Operator {
         // predicate, as a grouped count scan does.
         let pattern_counts = matches!(node.kind, Kind::PatternCount(_)) && node.children.is_empty();
         // An ordered top-k keeps a heap of its best rows, as a streaming top-k does.
-        let index_topk = matches!(node.kind, Kind::OrderedTopK(_)) && exec::heap_eligible(ctx);
+        let index_topk = matches!(node.kind, Kind::OrderedTopK(_));
+        // A vector ORDER BY search serves top-k from the vector index or falls back to its scan child.
+        let vector_order = topk::vector_order_eligible(&node);
+        // A SERVICE leaf (streaming when non-SILENT, budget-buffered when SILENT).
+        let service_reader = service::eligible(&node);
+        // A leaf ARQ property function streams its rows under the memory budget.
+        let propertyfn_reader = propertyfn::eligible(&node);
+        // A text search without a limit holds its hits and decodes rows as they are read.
+        let text_reader = text::eligible(&node);
+        // A history query without a limit holds a page of its changes at a time.
+        let history_reader = history::eligible(&node);
+        // A path search without `path:limit` streams matching paths under the memory budget.
+        let path_reader = pathsearch::eligible(&node);
+        // Streaming GeoSPARQL operators (scan, unlimited property function, relate, join, kNN).
+        let spatial_leaf = spatial::leaf_eligible(&node);
+        let spatial_join = spatial::join_eligible(&node);
+        let spatial_knn = spatial::knn_eligible(&node);
+        // A view read streams from an immutable shared view version without copying.
+        let view_reader = view::eligible(ctx, &node);
         // A native sort consumes cursor batches into charged state. It blocks before
         // its first output but is not an eager fallback, so strict policy admits it.
         let materializes = !(exists_streams && supported(&node.kind))
@@ -3151,6 +4205,16 @@ impl Operator {
             && !walking
             && !whole_input
             && !index_topk
+            && !vector_order
+            && !service_reader
+            && !propertyfn_reader
+            && !text_reader
+            && !history_reader
+            && !path_reader
+            && !spatial_leaf
+            && !spatial_join
+            && !spatial_knn
+            && !view_reader
             && !pattern_counts
             && (!native_blocking || !exists_streams);
         // A kernel that answers whole tables runs as a native operator when its form is
@@ -3164,7 +4228,7 @@ impl Operator {
             });
         if materializes && !native && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
-                "cursor requires materialization at {}; use AllowMaterialization or eager execution",
+                "{REFUSAL}{}; use AllowMaterialization or eager execution",
                 node.operator()
             )));
         }
@@ -3178,6 +4242,10 @@ impl Operator {
                 let _charge = reserve_graph_branch_copy(ctx, plan, 0)?;
                 Operator::build(ctx, plan.clone(), fallback)?;
             }
+        }
+        if fallback == FallbackPolicy::RejectMaterialization && spatial_knn {
+            // Validate the kNN template strictly before emitting any output.
+            Operator::build(ctx, node.children[0].clone(), fallback)?;
         }
         let mut info = exec::describe_node(ctx, &node);
         if count_join && matches!(node.kind, Kind::Group { .. }) {
@@ -3259,8 +4327,12 @@ impl Operator {
         };
         // A count over the key runs of two scans reads those scans itself.
         let reads_scans = matches!(node.kind, Kind::CountJoinRuns { .. });
-        // An ordered top-k builds its generic plan only when it needs it.
-        let children = if (materializes && !native_blocking && !inputs) || reads_scans || index_topk
+        // An ordered top-k builds its generic plan only when it needs it, and SpatialKnn
+        // instantiates its template per candidate batch.
+        let children = if (materializes && !native_blocking && !inputs)
+            || reads_scans
+            || index_topk
+            || spatial_knn
         {
             Vec::new()
         } else {
@@ -3274,7 +4346,8 @@ impl Operator {
                         child.est,
                         child.cost,
                     );
-                    Self::build_for(ctx, child, fallback, needed).map(|op| (shell, op))
+                    Self::build_for_internal(ctx, child, fallback, needed, check_exists)
+                        .map(|op| (shell, op))
                 })
                 .collect::<Result<Vec<_>>>()?;
             // Join operators read their children's shape from the node. Leave each
@@ -3324,6 +4397,7 @@ impl Operator {
         ) || materializes
             || native_blocking
             || index_topk
+            || vector_order
             || incremental_merge
             || incremental_binary
             || incremental_group
@@ -3331,7 +4405,16 @@ impl Operator {
             || expanding
             || walking
             || whole_input
-            || exists;
+            || exists
+            || service_reader
+            || propertyfn_reader
+            || text_reader
+            || history_reader
+            || path_reader
+            || spatial_leaf
+            || spatial_join
+            || spatial_knn
+            || view_reader;
         let mut order = output_order(
             &node,
             &children,
@@ -3391,51 +4474,140 @@ impl Operator {
             }
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input).then(|| {
-            if let Kind::OrderedTopK(spec) = &node.kind {
-                format!(
-                    "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
-                    node.operator(),
-                    spec.k
-                )
-            } else if let (true, Kind::OrderBy { limit: Some(k), .. }) = (heap, &node.kind) {
-                format!(
-                    "{} reads all input but keeps only its best {k} rows under the memory budget before output",
-                    node.operator()
-                )
-            } else if native_blocking {
-                format!(
-                    "{} consumes all input under the memory budget before output",
-                    node.operator()
-                )
-            } else if run_group && !exists {
-                format!(
-                    "{} reads its input in key order and holds the rows of the groups it has not finished, so each aggregate sees its group's rows in input order",
-                    node.operator()
-                )
-            } else if whole_input {
-                let reads = whole::reads(&node);
-                match whole::bound(&node) {
-                    Some(bound) => format!(
-                        "{} reads {reads} under the memory budget, runs once and serves its answer of {bound}",
+        let silent_service =
+            service_reader && matches!(node.kind, Kind::Service { silent: true, .. });
+        let reason = (materializes
+            || native_blocking
+            || exists
+            || index_topk
+            || vector_order
+            || run_group
+            || whole_input
+            || silent_service
+            || propertyfn_reader
+            || text_reader
+            || history_reader
+            || path_reader
+            || spatial_leaf
+            || spatial_join
+            || spatial_knn
+            || view_reader)
+            .then(|| {
+                if view_reader {
+                    format!(
+                        "{} reads the view's immutable shared version a batch at a time under the memory budget",
                         node.operator()
-                    ),
-                    None => format!(
-                        "{} reads {reads} under the memory budget, runs once and serves its charged answer",
+                    )
+                } else if silent_service {
+                    service::SILENT_REASON.to_string()
+                } else if propertyfn_reader {
+                    format!(
+                        "{} streams solutions from its arguments or the index under the memory budget",
                         node.operator()
-                    ),
+                    )
+                } else if history_reader {
+                    format!(
+                        "{} reads the change log a page of whole commits at a time under the memory budget, pinning the commits it has still to read",
+                        node.operator()
+                    )
+                } else if text_reader {
+                    format!(
+                        "{} counts its hits, at most maxHits, holds them under the memory budget and decodes their rows a page at a time",
+                        node.operator()
+                    )
+                } else if path_reader {
+                    if node.children.is_empty() {
+                        format!(
+                            "{} streams matching paths under the memory budget and emits rows a batch at a time",
+                            node.operator()
+                        )
+                    } else {
+                        let reads = whole::reads(&node);
+                        format!(
+                            "{} reads {reads} under the memory budget and streams matching paths a batch at a time",
+                            node.operator()
+                        )
+                    }
+                } else if spatial_leaf {
+                    format!(
+                        "{} streams matching spatial rows from the index or predicate scan under the memory budget",
+                        node.operator()
+                    )
+                } else if spatial_join {
+                    if spatial::join_full_input(&node) {
+                        format!(
+                            "{} builds a spatial index over its smaller input under the memory budget and streams its probe input",
+                            node.operator()
+                        )
+                    } else {
+                        format!(
+                            "{} streams spatial join pairs under the memory budget",
+                            node.operator()
+                        )
+                    }
+                } else if spatial_knn {
+                    format!(
+                        "{} streams nearest-neighbour candidate batches through its template cursor under the memory budget",
+                        node.operator()
+                    )
+                } else if vector_order {
+                    let k = match &node.kind {
+                        Kind::VectorSearch(spec) => spec.k,
+                        _ => 0,
+                    };
+                    format!(
+                        "{} answers at most {k} rows from the vector index under the memory budget, or streams its generic scan child",
+                        node.operator()
+                    )
+                } else if let Kind::OrderedTopK(spec) = &node.kind {
+                    format!(
+                        "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
+                        node.operator(),
+                        spec.k
+                    )
+                } else if let (true, Kind::OrderBy { limit: Some(k), .. }) = (heap, &node.kind) {
+                    format!(
+                        "{} reads all input but keeps only its best {k} rows under the memory budget before output",
+                        node.operator()
+                    )
+                } else if native_blocking {
+                    format!(
+                        "{} consumes all input under the memory budget before output",
+                        node.operator()
+                    )
+                } else if run_group && !exists {
+                    format!(
+                        "{} reads its input in key order and holds the rows of the groups it has not finished, so each aggregate sees its group's rows in input order",
+                        node.operator()
+                    )
+                } else if whole_input {
+                    let reads = whole::reads(&node);
+                    match whole::bound(&node) {
+                        Some(bound) => format!(
+                            "{} reads {reads} under the memory budget, runs once and serves its answer of {bound}",
+                            node.operator()
+                        ),
+                        None => format!(
+                            "{} reads {reads} under the memory budget, runs once and serves its charged answer",
+                            node.operator()
+                        ),
+                    }
+                } else if native {
+                    leaf::reason(&node, leaf::form(&node).expect("a native form"))
+                } else if !materializes {
+                    format!(
+                        "{} answers EXISTS from a key set of its pattern, built under the memory budget on first demand, or evaluates it once per distinct outer key",
+                        node.operator()
+                    )
+                } else if !inputs && !node.children.is_empty() {
+                    format!(
+                        "{} has no resumable cursor implementation and runs its whole subtree eagerly",
+                        node.operator()
+                    )
+                } else {
+                    format!("{} has no resumable cursor implementation", node.operator())
                 }
-            } else if native {
-                leaf::reason(&node, leaf::form(&node).expect("a native form"))
-            } else if !materializes {
-                format!(
-                    "{} answers EXISTS from a key set of its pattern, built under the memory budget on first demand, or evaluates it once per distinct outer key",
-                    node.operator()
-                )
-            } else {
-                format!("{} has no resumable cursor implementation", node.operator())
-            }
-        });
+            });
         let bind_reuse = bind_reuse_admission
             .and_then(|admission| bind::Reuse::new(ctx, admission))
             .map(Box::new);
@@ -3451,6 +4623,27 @@ impl Operator {
             State::RunGroup(Box::new(group::RunGroup::new(&node, &children[0].vars)))
         } else if filter::eligible(&node, &children) {
             State::Filter(Box::new(filter::Filter::new(node)))
+        } else if service_reader {
+            State::Service(Box::new(service::Service::new(ctx, &node, fallback)))
+        } else if propertyfn_reader {
+            State::PropertyFn(Box::new(propertyfn::PropertyFn::new(node)))
+        } else if text_reader {
+            State::Text(Box::new(text::Text::new(node)))
+        } else if history_reader {
+            State::History(Box::new(history::History::new(node)))
+        } else if path_reader {
+            State::PathSearch(Box::new(pathsearch::PathSearch::new(node)))
+        } else if spatial_leaf {
+            State::SpatialLeaf(Box::new(spatial::SpatialLeaf::new(node)))
+        } else if spatial_join {
+            State::SpatialJoin(Box::new(spatial::SpatialJoin::new(node)))
+        } else if spatial_knn {
+            let template = node.children.pop().expect("SpatialKnn template child");
+            State::SpatialKnn(Box::new(spatial::SpatialKnn::new(node, template, fallback)))
+        } else if vector_order {
+            State::VectorOrder(Box::new(topk::VectorOrder::new(node)))
+        } else if view_reader {
+            State::View(Box::new(view::View::new(node)))
         } else if index_topk {
             State::IndexTopK(Box::new(topk::IndexTopK::new(node, fallback)))
         } else if heap {
@@ -3468,14 +4661,20 @@ impl Operator {
                 at: 0,
                 external: None,
             }
-        } else if materializes {
+        } else if materializes && inputs {
             State::Fallback {
-                node,
-                loaded: None,
-                at: 0,
-                inputs,
+                eager: Eager::new(node),
                 scans,
             }
+        } else if materializes && node.children.is_empty() {
+            State::Leaf(Eager::new(node))
+        } else if materializes {
+            debug_assert!(
+                !native,
+                "{} is native but runs its subtree",
+                node.operator()
+            );
+            State::EagerSubtree(Eager::new(node))
         } else {
             match &node.kind {
                 Kind::Scan(spec) => State::Scan(Scan::new(spec.clone(), None)),
@@ -3642,6 +4841,17 @@ impl Operator {
             }
             State::Binary(binary) => binary.release_working_sets(),
             State::Ripple(ripple) => ripple.release_working_sets(),
+            State::Service(service) => service.release(),
+            State::PropertyFn(pf) => pf.release(),
+            State::Text(text) => text.release(),
+            State::History(history) => history.release(),
+            State::IndexTopK(topk) => topk.release(),
+            State::VectorOrder(vo) => vo.release(),
+            State::PathSearch(ps) => ps.release(),
+            State::SpatialLeaf(sl) => sl.release(),
+            State::SpatialJoin(sj) => sj.release(),
+            State::SpatialKnn(sk) => sk.release(),
+            State::View(view) => view.release(),
             _ => {}
         }
         if let Some(ahead) = &mut self.ahead {
@@ -3723,11 +4933,7 @@ impl Operator {
             d.children
         };
         let children = match &self.state {
-            State::Fallback {
-                node,
-                inputs: false,
-                ..
-            } => described(node)
+            State::EagerSubtree(Eager { node, .. }) => described(node)
                 .into_iter()
                 .map(|c| eager(c, "inside an eager fallback subtree", true))
                 .collect(),
@@ -3735,6 +4941,13 @@ impl Operator {
                 .into_iter()
                 .map(|c| eager(c, "read by its parent", false))
                 .collect(),
+            State::SpatialKnn(knn) => {
+                let mut d = exec::describe(ctx, knn.template());
+                if ctx.graphs.is_some() {
+                    d.redact();
+                }
+                vec![eager(d, "template run per candidate batch", false)]
+            }
             _ => self.children.iter().map(|c| c.describe(ctx)).collect(),
         };
         CursorPlan {
@@ -3795,6 +5008,8 @@ impl Operator {
             || matches!(
                 self.state,
                 State::Fallback { .. }
+                    | State::Leaf(_)
+                    | State::EagerSubtree(_)
                     | State::Binary(_)
                     | State::Group(_)
                     | State::Scalar(_)
@@ -3803,12 +5018,23 @@ impl Operator {
                     | State::Whole(_)
                     | State::TopK(_)
                     | State::IndexTopK(_)
+                    | State::VectorOrder(_)
+                    | State::Text(_)
             )
+            || matches!(&self.state, State::SpatialJoin(_) if self.children.len() == 2)
+            || matches!(&self.state, State::PathSearch(_) if !self.children.is_empty())
+            || matches!(&self.state, State::Service(service) if service.full_input_before_output())
     }
 
     fn update_plan(&mut self, plan: &mut CursorPlan) {
         plan.materializes = self.materializes;
         plan.full_input_before_output = self.full_input_before_output();
+        if let State::Service(service) = &self.state
+            && service.full_input_before_output()
+            && plan.reason.is_none()
+        {
+            plan.reason = Some(service::BUFFERED_REASON.to_string());
+        }
         plan.growing_state = self.growing;
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;
@@ -3831,9 +5057,11 @@ impl Operator {
         if self.info.counters.is_some() {
             plan.operator.counters.clone_from(&self.info.counters);
         }
-        // An expanding or whole-input kernel notes its runs in its description.
-        if matches!(self.state, State::Expand(_) | State::Whole(_))
-            && plan.operator.description != self.info.description
+        // An expanding, whole-input, or fallback-switching kernel notes its runs in its description.
+        if matches!(
+            self.state,
+            State::Expand(_) | State::Whole(_) | State::VectorOrder(_) | State::IndexTopK(_)
+        ) && plan.operator.description != self.info.description
         {
             plan.operator.description.clone_from(&self.info.description);
         }
@@ -3853,8 +5081,17 @@ impl Operator {
         }
         match &self.state {
             State::Fallback {
+                eager: Eager {
+                    loaded: Some(_), ..
+                },
+                ..
+            }
+            | State::Leaf(Eager {
                 loaded: Some(_), ..
-            } => update(&self.info, plan),
+            })
+            | State::EagerSubtree(Eager {
+                loaded: Some(_), ..
+            }) => update(&self.info, plan),
             State::Scalar(_) if self.done => {
                 for (info, plan) in self.info.children.iter().zip(&mut plan.children) {
                     update(info, plan);
@@ -3869,8 +5106,19 @@ impl Operator {
         {
             plan.children.push(generic.clone());
         }
+        if let State::SpatialKnn(knn) = &self.state
+            && let Some(tp) = &knn.template_plan
+        {
+            plan.children = vec![(**tp).clone()];
+        }
         if let State::GraphBranches(branches) = &mut self.state {
             branches.update_plan(plan);
+        }
+        if let State::View(view) = &self.state
+            && let Some(child) = view.rebuild_plan()
+        {
+            plan.children.clear();
+            plan.children.push(child.clone());
         }
         for (child, plan) in self.children.iter_mut().zip(&mut plan.children) {
             child.update_plan(plan);
@@ -3972,6 +5220,11 @@ impl Operator {
                         *remaining -= batch.end - batch.start;
                     }
                     self.done = *remaining == Some(0) || self.children[0].done;
+                    // A slice that has all of its rows reads no more, so its input lets go
+                    // of what it holds now, not when the query ends.
+                    if *remaining == Some(0) {
+                        self.children[0].release_finished();
+                    }
                     result
                 }
             }
@@ -4051,6 +5304,8 @@ impl Operator {
                     && !matches!(
                         self.state,
                         State::Fallback { .. }
+                            | State::Leaf(_)
+                            | State::EagerSubtree(_)
                             | State::Scalar(_)
                             | State::Counts { .. }
                             | State::Expand(_)
@@ -4299,6 +5554,31 @@ impl Operator {
                     b.reconcile()?;
                     Some(b)
                 }
+                State::Service(service) => {
+                    let b = service.next(ctx, options, cap)?;
+                    self.done = service.done();
+                    b
+                }
+                State::PropertyFn(pf) => {
+                    let b = pf.next(ctx, cap)?;
+                    self.done = pf.done();
+                    b
+                }
+                State::Text(text) => {
+                    let b = text.next(ctx, cap)?;
+                    self.done = text.done();
+                    b
+                }
+                State::History(history) => {
+                    let b = history.next(ctx, cap)?;
+                    self.done = history.done();
+                    b
+                }
+                State::View(view) => {
+                    let b = view.next(ctx, options, cap)?;
+                    self.done = view.done();
+                    b
+                }
                 State::TopK(topk) => {
                     let b = topk.next(ctx, &mut self.children[0], options, cap)?;
                     self.done = topk.done();
@@ -4307,6 +5587,50 @@ impl Operator {
                 State::IndexTopK(topk) => {
                     let b = topk.next(ctx, &mut self.children, options, &mut self.info, cap)?;
                     self.done = topk.done(&self.children);
+                    b
+                }
+                State::VectorOrder(vo) => {
+                    let b = vo.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if let Some(counters) = &vo.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    if let Some(desc) = vo.description() {
+                        self.info.description = desc;
+                    }
+                    self.done = vo.done(&self.children);
+                    b
+                }
+                State::PathSearch(ps) => {
+                    let b = ps.next(ctx, &mut self.children, options, cap);
+                    if let Some(counters) = &ps.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    let b = b?;
+                    self.done = ps.done();
+                    b
+                }
+                State::SpatialLeaf(sl) => {
+                    let b = sl.next(ctx, cap)?;
+                    if let Some(counters) = &sl.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    self.done = sl.done();
+                    b
+                }
+                State::SpatialJoin(sj) => {
+                    let b = sj.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if let Some(counters) = &sj.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    self.done = sj.done();
+                    b
+                }
+                State::SpatialKnn(sk) => {
+                    let b = sk.next(ctx, options, &self.vars, cap)?;
+                    if let Some(counters) = &sk.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    self.done = sk.done();
                     b
                 }
                 State::Blocking {
@@ -4389,83 +5713,58 @@ impl Operator {
                     self.done = *at == table.len;
                     batch
                 }
-                State::Fallback {
-                    node,
-                    loaded,
-                    at,
-                    inputs,
-                    scans,
-                } => {
-                    if loaded.is_none() {
-                        let (mut output, mut info) = if *inputs {
-                            let children = &mut self.children;
-                            let mut collect = |i: usize| match &scans[i] {
-                                Some(scan) => {
-                                    let (output, info) = exec::execute_owned(ctx, scan)?;
-                                    let table = &output.table;
-                                    let child = &mut children[i];
-                                    child.rows = table.len;
-                                    child.info.actual_rows = info.actual_rows;
-                                    child.info.time_ms = info.time_ms;
-                                    child.done = true;
-                                    Ok((output, info))
-                                }
-                                None => collect_input(ctx, &mut children[i], options),
-                            };
-                            exec::execute_with_inputs(ctx, node, &mut collect)?
-                        } else {
-                            exec::execute_owned(ctx, node)?
+                State::Fallback { eager, scans } => {
+                    if eager.loaded.is_none() {
+                        let children = &mut self.children;
+                        let mut collect = |i: usize| match &scans[i] {
+                            Some(scan) => {
+                                let (output, info) = exec::execute_owned(ctx, scan)?;
+                                let table = &output.table;
+                                let child = &mut children[i];
+                                child.rows = table.len;
+                                child.info.actual_rows = info.actual_rows;
+                                child.info.time_ms = info.time_ms;
+                                child.done = true;
+                                Ok((output, info))
+                            }
+                            None => collect_input(ctx, &mut children[i], options),
                         };
-                        if *inputs {
-                            // The child operators describe themselves.
-                            info.children.clear();
-                        }
-                        if ctx.graphs.is_some() {
-                            info.redact();
-                        }
-                        info.time_ms = self.info.time_ms;
-                        let mut counters = info.counters.take().unwrap_or_default();
-                        counters.insert("materializedRows".into(), output.table.len.into());
-                        info.counters = Some(counters);
-                        info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
-                        self.info = info;
-                        #[cfg(feature = "failpoints")]
-                        if output.lease.is_some() {
-                            crate::algo::observe_projection(
-                                crate::algo::ProjectionEvent::Materialized(
-                                    "algorithm-fallback-transfer",
-                                    capacity_bytes(&output.table) as usize,
-                                ),
-                            );
-                        }
-                        let mut charge = if output.lease.is_some() {
-                            OwnedCharge::adopt(ctx, &mut output.lease)?
-                        } else {
-                            OwnedCharge::new(ctx, capacity_bytes(&output.table))?
-                        };
-                        let mut table = output.table;
-                        // Parents rely on the planner's order, which the eager result
-                        // reports only when its rows hold it.
-                        if !table.sorted.starts_with(&self.order) {
-                            // Row indices and the reordered copy coexist with the input.
-                            charge.resize(
-                                capacity_bytes(&table)
-                                    .saturating_mul(2)
-                                    .saturating_add(table.len as u64 * 8),
-                            )?;
-                            table.sort_by_vars(&self.order);
-                            ctx.check()?;
-                            charge.resize(capacity_bytes(&table))?;
-                        }
-                        *loaded = Some(Buffer { table, charge });
+                        let (output, mut info) =
+                            exec::execute_with_inputs(ctx, &eager.node, &mut collect)?;
+                        // The child operators describe themselves.
+                        info.children.clear();
+                        let buffer = load_eager(
+                            ctx,
+                            output,
+                            info,
+                            &mut self.info,
+                            self.rows,
+                            &self.vars,
+                            &self.order,
+                        )?;
+                        eager.loaded = Some(buffer);
                     }
-                    let table = &loaded.as_ref().expect("loaded fallback").table;
-                    let b = copy_rows(ctx, table, *at, cap)?;
-                    if let Some(b) = &b {
-                        *at += b.table.len;
+                    let batch = eager.serve(ctx, cap)?;
+                    self.done = eager.served();
+                    batch
+                }
+                State::Leaf(eager) | State::EagerSubtree(eager) => {
+                    if eager.loaded.is_none() {
+                        let (output, info) = exec::execute_owned(ctx, &eager.node)?;
+                        let buffer = load_eager(
+                            ctx,
+                            output,
+                            info,
+                            &mut self.info,
+                            self.rows,
+                            &self.vars,
+                            &self.order,
+                        )?;
+                        eager.loaded = Some(buffer);
                     }
-                    self.done = *at == table.len;
-                    b
+                    let batch = eager.serve(ctx, cap)?;
+                    self.done = eager.served();
+                    batch
                 }
                 State::Unary(_)
                     if self
@@ -4611,6 +5910,11 @@ impl Operator {
                         *r -= n;
                     }
                     self.done = *remaining == Some(0) || self.children[0].done;
+                    // A slice that has all of its rows reads no more, so its input lets go
+                    // of what it holds now, not when the query ends.
+                    if *remaining == Some(0) {
+                        self.children[0].release_finished();
+                    }
                     Some(b)
                 }
                 State::Union { at } => {
@@ -5167,7 +6471,6 @@ impl Scan {
             }
         }
         if !exact && !out.table.is_empty() {
-            let _scratch = ctx.charge(out.table.len as u64 * 16 + ctx.nvars() as u64 * 16)?;
             exec::apply_range_filter(ctx, &mut out.table, self.var, &self.filter)?;
         }
         out.reconcile()?;
@@ -5246,9 +6549,7 @@ impl Scan {
             self.position = None;
         }
         if !exact && !b.table.is_empty() {
-            let scratch = ctx.charge(b.table.len as u64 * 16 + ctx.nvars() as u64 * 16)?;
             exec::apply_range_filter(ctx, &mut b.table, self.var, &self.filter)?;
-            drop(scratch);
         }
         ctx.check()?;
         b.reconcile()?;
@@ -5367,14 +6668,42 @@ mod tests {
 
     #[test]
     fn callback_guard_cursor_still_checks_other_exists_patterns_for_materialization() {
-        let (cursor, opens) = unconfigured_cursor(
-            "SELECT ?b WHERE {
-                BIND(COALESCE(
-                    EXISTS { <urn:s> <urn:callback> ?x },
-                    EXISTS { SERVICE <urn:remote> { ?s <urn:p> ?o } }
-                ) AS ?b)
-            }",
-            None,
+        use super::super::callback_guard_tests::{prepare_unconfigured, unconfigured};
+        #[derive(Debug)]
+        struct LegacyViews;
+        impl super::super::viewsvc::ViewSource for LegacyViews {
+            fn read_view(
+                &self,
+                _: &super::super::viewsvc::ViewRead<'_>,
+            ) -> Result<super::super::viewsvc::ViewRows> {
+                unreachable!("the strict cursor refuses the legacy view before reading it")
+            }
+        }
+        let query = "SELECT ?b WHERE {
+            BIND(COALESCE(
+                EXISTS { <urn:s> <urn:callback> ?x },
+                EXISTS { SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"v\" ; <urn:x-sparkles:view#bind> ?y } }
+            ) AS ?b)
+        }";
+        let parsed = super::super::parse_query(query, None, &[]).unwrap();
+        let (mut ctx, opens) = unconfigured();
+        ctx.views = Some(Arc::new(LegacyViews));
+        let prepared = prepare_unconfigured(&parsed, ctx, true);
+        let levels = prepared.plan_depth;
+        let cursor = from_prepared(
+            prepared,
+            &parsed,
+            query,
+            &QueryOptions::default(),
+            &CursorOptions {
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            },
+            Instant::now(),
+            0.0,
+            0.0,
+            levels,
+            QueryKind::Select,
         );
         assert!(
             matches!(cursor, Err(Error::Unsupported(message)) if message.starts_with("cursor requires materialization at Bind"))
@@ -6248,7 +7577,7 @@ mod tests {
             ),
             (
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER EXISTS {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c FILTER EXISTS {?c <urn:p> ?d FILTER EXISTS {?d <urn:p> ?e FILTER EXISTS {?e <urn:p> ?f}}}}}}",
-                false,
+                true,
             ),
         ];
         for (q, streams) in cases {
@@ -6281,7 +7610,7 @@ mod tests {
                     scale(&mut group.children[0], est);
                     group.est = 10.0;
                     assert_eq!(
-                        auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()),
+                        auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap(),
                         streams && large,
                         "{q}: no_cache {no_cache}, {est} rows"
                     );
@@ -6312,58 +7641,52 @@ mod tests {
         };
         let p = prepare(store.snapshot(), &Default::default());
         let options = CursorOptions::default();
-        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &options));
+        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &options).unwrap());
         // a scan streams from the measured size on
         let mut small = prepare(store.snapshot(), &Default::default());
         small.node.est = AUTO_SCAN_ROWS;
-        assert!(auto_streaming(
-            &small.ctx,
-            &small.node,
-            small.kind,
-            &options
-        ));
+        assert!(auto_streaming(&small.ctx, &small.node, small.kind, &options).unwrap());
         small.node.est = AUTO_SCAN_ROWS - 1.0;
-        assert!(!auto_streaming(
-            &small.ctx,
-            &small.node,
-            small.kind,
-            &options
-        ));
+        assert!(!auto_streaming(&small.ctx, &small.node, small.kind, &options).unwrap());
         small.node.est = f64::INFINITY;
-        assert!(!auto_streaming(
-            &small.ctx,
-            &small.node,
-            small.kind,
-            &options
-        ));
-        assert!(!auto_streaming(
-            &p.ctx,
-            &p.node,
-            p.kind,
-            &CursorOptions {
-                batch_rows: 1,
-                ..options.clone()
-            }
-        ));
-        assert!(!auto_streaming(
-            &p.ctx,
-            &p.node,
-            p.kind,
-            &CursorOptions {
-                batch_bytes: 8,
-                ..options.clone()
-            }
-        ));
-        assert!(!auto_streaming(
-            &p.ctx,
-            &p.node,
-            p.kind,
-            &CursorOptions {
-                batch_rows: usize::MAX,
-                batch_bytes: usize::MAX,
-                ..options
-            }
-        ));
+        assert!(!auto_streaming(&small.ctx, &small.node, small.kind, &options).unwrap());
+        assert!(
+            !auto_streaming(
+                &p.ctx,
+                &p.node,
+                p.kind,
+                &CursorOptions {
+                    batch_rows: 1,
+                    ..options.clone()
+                }
+            )
+            .unwrap()
+        );
+        assert!(
+            !auto_streaming(
+                &p.ctx,
+                &p.node,
+                p.kind,
+                &CursorOptions {
+                    batch_bytes: 8,
+                    ..options.clone()
+                }
+            )
+            .unwrap()
+        );
+        assert!(
+            !auto_streaming(
+                &p.ctx,
+                &p.node,
+                p.kind,
+                &CursorOptions {
+                    batch_rows: usize::MAX,
+                    batch_bytes: usize::MAX,
+                    ..options
+                }
+            )
+            .unwrap()
+        );
         let low = prepare(
             store.snapshot(),
             &QueryOptions {
@@ -6371,12 +7694,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!auto_streaming(
-            &low.ctx,
-            &low.node,
-            low.kind,
-            &Default::default()
-        ));
+        assert!(!auto_streaming(&low.ctx, &low.node, low.kind, &Default::default()).unwrap());
         // A scan expected to pass a row budget stays eager, so that the budget fails it
         // before any output.
         for budget in [
@@ -6390,12 +7708,10 @@ mod tests {
             },
         ] {
             let capped = prepare(store.snapshot(), &budget);
-            assert!(!auto_streaming(
-                &capped.ctx,
-                &capped.node,
-                capped.kind,
-                &Default::default()
-            ));
+            assert!(
+                !auto_streaming(&capped.ctx, &capped.node, capped.kind, &Default::default())
+                    .unwrap()
+            );
         }
         let roomy = prepare(
             store.snapshot(),
@@ -6405,12 +7721,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(auto_streaming(
-            &roomy.ctx,
-            &roomy.node,
-            roomy.kind,
-            &Default::default()
-        ));
+        assert!(auto_streaming(&roomy.ctx, &roomy.node, roomy.kind, &Default::default()).unwrap());
         super::super::update::update(
             &store,
             "INSERT DATA {<urn:new> <urn:p> 2}",
@@ -6418,14 +7729,17 @@ mod tests {
         )
         .unwrap();
         let changed = prepare(store.snapshot(), &Default::default());
-        assert!(!auto_streaming(
-            &changed.ctx,
-            &changed.node,
-            changed.kind,
-            &Default::default()
-        ));
+        assert!(
+            !auto_streaming(
+                &changed.ctx,
+                &changed.node,
+                changed.kind,
+                &Default::default()
+            )
+            .unwrap()
+        );
         // A retained immutable context stays admissible after a concurrent write.
-        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()));
+        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap());
     }
 
     /// The decision table of spill admission (X08 §6.8): a query streams when it may
@@ -6476,7 +7790,7 @@ mod tests {
             let mut p =
                 super::super::prepare_query(store.snapshot(), &q, &options, None, None).unwrap();
             estimate(&mut p.node);
-            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default())
+            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap()
         };
         // a product of a million rows is about 24 MB eagerly, more than half of 32 MiB,
         // while the cursor keeps a thousand features, the key set and the groups
@@ -6498,7 +7812,16 @@ mod tests {
             let mut p =
                 super::super::prepare_query(store.snapshot(), &q, &options, None, None).unwrap();
             estimate(&mut p.node);
-            memory_admitted(&p.ctx, &p.node, p.kind, &Default::default())
+            memory_admitted(
+                &p.ctx,
+                &p.node,
+                Some(&p.pattern),
+                "",
+                p.kind,
+                &Default::default(),
+                None,
+            )
+            .unwrap()
         };
         let counted = "SELECT ?f (COUNT(?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f } GROUP BY ?f";
         assert!(memory(counted));
@@ -6560,7 +7883,7 @@ mod tests {
                 }
             }
             scale(&mut p.node, est);
-            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default())
+            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap()
         };
         let sort = "SELECT ?s ?o { ?s <urn:p> ?o } ORDER BY ?o";
         let group = "SELECT ?o (COUNT(?s) AS ?n) { ?s <urn:p> ?o } GROUP BY ?o";
@@ -6785,6 +8108,80 @@ mod tests {
         assert_eq!(successor([u64::MAX; 4]), None);
     }
 
+    /// The cases of the integration test
+    /// `a_refused_decode_mid_answer_keeps_the_budget_error_in_every_writer`, on its data and
+    /// budget: with batches of 1 and 64 rows the batches before the long literal are written
+    /// from their term caches and the batch that holds it declines its cache, and the one
+    /// batch of 4,096 rows declines its cache.
+    #[test]
+    fn the_refused_decode_cases_cover_cached_and_declined_batches() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..1000)
+            .map(|i| {
+                if i == 600 {
+                    format!(
+                        "<urn:s:{i}> <urn:p> \"v{i:04}{}\" .\n",
+                        "x".repeat(256 << 10)
+                    )
+                } else {
+                    format!("<urn:s:{i}> <urn:p> \"v{i:04}\" .\n")
+                }
+            })
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let options = QueryOptions {
+            max_memory_bytes: Some(128 << 10),
+            ..Default::default()
+        };
+        for batch_rows in [1, 64, 4096] {
+            let mut cursor = select_cursor(
+                store.snapshot(),
+                "SELECT ?o ?s WHERE { ?s <urn:p> ?o }",
+                &options,
+                &CursorOptions {
+                    batch_rows,
+                    fallback: FallbackPolicy::RejectMaterialization,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // the rows before each batch whose cache was declined, and the cached rows
+            let mut declined = Vec::new();
+            let (mut rows, mut cached) = (0, 0);
+            cursor
+                .for_each_decoded(None, |_, batch, decoded| {
+                    if decoded.is_some() {
+                        cached += batch.len();
+                    } else {
+                        declined.push(rows);
+                    }
+                    rows += batch.len();
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(rows, 1000, "{batch_rows}");
+            if batch_rows == 4096 {
+                assert_eq!(declined, vec![0], "{batch_rows}");
+            } else {
+                // the long literal is row 558 in object order
+                assert_eq!(
+                    declined,
+                    vec![558 / batch_rows * batch_rows],
+                    "{batch_rows}"
+                );
+                assert_eq!(cached, 1000 - batch_rows, "{batch_rows}");
+            }
+        }
+    }
+
     /// A writer that decodes ahead pulls each batch after the first before it writes the
     /// one before, and it writes the first batch before it pulls the second, so that the
     /// first rows wait for one batch only. Its batches and term caches go back to the
@@ -6809,12 +8206,11 @@ mod tests {
             .build()
             .unwrap();
         let run = |ahead: bool, send: Option<usize>| {
-            let mut opt = crate::sparql::Optimizations::default();
-            if !ahead {
-                opt = opt.disable("decode_ahead").unwrap();
-            }
             let options = QueryOptions {
-                optimizations: Some(opt),
+                optimizations: Some(crate::sparql::Optimizations {
+                    decode_ahead: ahead,
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             let mut cursor = select_cursor(
@@ -6936,6 +8332,36 @@ mod retained_variable_tests {
         )
         .unwrap();
         (pool, cursor)
+    }
+
+    #[test]
+    fn eager_projection_avoids_the_shared_variable_allocation() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let context = Ctx::new(store.snapshot());
+        let id = context.var("x");
+        let ctx = Arc::new(context);
+        let pattern = spargebra::algebra::GraphPattern::Bgp {
+            patterns: Vec::new(),
+        };
+        let (shared, shared_stats) = crate::test_alloc::record_alloc_stats(|| {
+            Variables::new(&ctx, &pattern, &[id], "").unwrap()
+        });
+        let header = arc_backing_bytes::<Variables>(&ctx).unwrap();
+        let shared_bytes = ctx.live_bytes();
+        drop(shared);
+
+        let (eager, eager_stats) = crate::test_alloc::record_alloc_stats(|| {
+            Variables::eager(&ctx, &pattern, &[id]).unwrap()
+        });
+        assert_eq!(eager.names, ["x"]);
+        assert_eq!(eager.ids, [id]);
+        assert_eq!(ctx.live_bytes(), shared_bytes - header);
+        assert_eq!(
+            shared_stats.total_alloc - eager_stats.total_alloc,
+            header as usize
+        );
+        drop(eager);
+        assert_eq!(ctx.live_bytes(), 0);
     }
 
     #[test]
@@ -7198,5 +8624,2774 @@ mod retained_variable_tests {
         assert!(retained.variables().is_empty());
         drop(retained);
         assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn r4_wide_pathsearch_cursor_initial_reservation_and_reconcile_poll() {
+        use super::super::pathsearch::{Algorithm, Direction, PathSearchSpec};
+        use super::super::plan::{GraphFilter, PathEnd};
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+        use std::cell::Cell;
+        use std::sync::atomic::Ordering;
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:w:s> <urn:w:p> <urn:w:t1> .\n<urn:w:s> <urn:w:p> <urn:w:t2> .\n".to_vec(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let s = snap.lookup_iri("urn:w:s").unwrap();
+        let p = snap.lookup_iri("urn:w:p").unwrap();
+        let t1 = snap.lookup_iri("urn:w:t1").unwrap();
+        let width = 9_000usize;
+        let wide_vars: Vec<VarId> = (0..width as u32).collect();
+
+        // 1. Direct `Buffer::new` and `reconcile_checked` poll every 4,096 columns,
+        //    preserve exact byte accounting, refuse tight budgets before allocation,
+        //    and abort cleanly on cancellation.
+        let ctx = Arc::new(Ctx::new(snap.clone()));
+        let before = super::super::ctx::CHECKS.with(Cell::get);
+        let mut buf = Buffer::new(&ctx, &wide_vars, 16).unwrap();
+        let new_checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+        assert!(
+            new_checks >= 2,
+            "Buffer::new must poll across width={width} columns, got {new_checks}"
+        );
+        assert_eq!(buf.charge.bytes(), capacity_bytes(&buf.table));
+
+        let before = super::super::ctx::CHECKS.with(Cell::get);
+        buf.reconcile_checked(&ctx).unwrap();
+        let rec_checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+        assert!(
+            rec_checks >= 2,
+            "Buffer::reconcile_checked must poll across width={width} columns, got {rec_checks}"
+        );
+
+        ctx.cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(buf.reconcile_checked(&ctx), Err(Error::Cancelled)));
+        drop(buf);
+        assert_eq!(ctx.live_bytes(), 0);
+        assert!(matches!(
+            Buffer::new(&ctx, &wide_vars, 16),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(ctx.live_bytes(), 0);
+
+        let mut tight = Ctx::new(snap.clone());
+        tight.mem_limit = 64 * 1024;
+        let tight = Arc::new(tight);
+        assert!(matches!(
+            Buffer::new(&tight, &wide_vars, 16),
+            Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+        ));
+        assert_eq!(tight.live_bytes(), 0);
+
+        // 2. Cursor-boundary `PathSearch` pull under default 1 MiB `batch_bytes`:
+        //    for width = 9,000, `Operator::next` caps `cap = (1 MiB / (9,000 * 8)) = 14 <= 64`,
+        //    so initial `Buffer::new` covers the whole batch and the growth loop never runs.
+        //    An empty search isolates initial reservation + final reconciliation polling.
+        let make_spec = |source: PathEnd, target: PathEnd, max_visited: u64| {
+            Box::new(PathSearchSpec {
+                algorithm: Algorithm::Shortest,
+                source,
+                target,
+                predicates: Some(vec![p.0]),
+                directions: vec![Direction::Forward],
+                direction: Direction::Forward,
+                exclude: Vec::new(),
+                max_degree: None,
+                edge_pattern: None,
+                min_len: 1,
+                max_len: None,
+                k: 1,
+                limit: None,
+                max_visited,
+                weight: None,
+                default_weight: 1.0,
+                reifies: None,
+                path_index: None,
+                edge_index: None,
+                edge_s: None,
+                edge_p: None,
+                edge_o: None,
+                edge: None,
+                length: Some(1),
+                cost: None,
+                graph: GraphFilter::Default,
+            })
+        };
+        let options = CursorOptions::default();
+
+        let run_empty_cursor = |w: usize| -> usize {
+            let gctx = Arc::new(Ctx::new(snap.clone()));
+            let vars: Vec<VarId> = (0..w).map(|i| gctx.var(&format!("v{i}"))).collect();
+            // Start at `t1` (no outgoing edges) so `reader.next` emits 0 rows and returns `true`.
+            let node = Node::leaf(
+                Kind::PathSearch(make_spec(PathEnd::Const(t1), PathEnd::Var(2), 100)),
+                vars,
+                1.0,
+                "PathSearch".into(),
+            );
+            let mut op =
+                Operator::build(&gctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+            let before = super::super::ctx::CHECKS.with(Cell::get);
+            let batch = op.next(&gctx, &options, options.batch_rows).unwrap();
+            let checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+            assert!(batch.is_none());
+            assert!(op.done);
+            assert_eq!(gctx.live_bytes(), 0);
+            checks
+        };
+        let narrow_empty = run_empty_cursor(4);
+        let wide_empty = run_empty_cursor(width);
+        assert!(
+            wide_empty >= narrow_empty + 4,
+            "wide PathSearch cursor pull (cap <= 64) must poll during initial Buffer::new and final reconcile_checked: wide={wide_empty}, narrow={narrow_empty}"
+        );
+
+        // 3. Grouped 1-row wide emission through `Operator::next` under default 1 MiB `batch_bytes`.
+        let run_grouped_cursor = |w: usize| -> usize {
+            let gctx = Arc::new(Ctx::new(snap.clone()));
+            let vars: Vec<VarId> = (0..w).map(|i| gctx.var(&format!("v{i}"))).collect();
+            let mut in_table = Table::new(vars.clone());
+            let mut row = vec![Id::from_i64(7).unwrap(); w];
+            row[0] = s;
+            row[1] = Id::from_i64(1).unwrap();
+            row[2] = t1;
+            in_table.push_row(&row);
+            let values_node =
+                Node::leaf(Kind::Values(in_table), vars.clone(), 1.0, "Values".into());
+            let mut ps_node = Node::leaf(
+                Kind::PathSearch(make_spec(PathEnd::Var(0), PathEnd::Var(2), 100)),
+                vars,
+                1.0,
+                "PathSearch".into(),
+            );
+            ps_node.children.push(values_node);
+            let mut op =
+                Operator::build(&gctx, ps_node, FallbackPolicy::RejectMaterialization).unwrap();
+            let before = super::super::ctx::CHECKS.with(Cell::get);
+            let batch = op
+                .next(&gctx, &options, options.batch_rows)
+                .unwrap()
+                .expect("one grouped row");
+            let checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+            assert_eq!(batch.table.len(), 1);
+            assert_eq!(batch.table.width(), w);
+            assert_eq!(batch.charge.bytes(), capacity_bytes(&batch.table));
+            drop(batch);
+            assert!(
+                op.next(&gctx, &options, options.batch_rows)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(op.done);
+            assert_eq!(gctx.live_bytes(), 0);
+            checks
+        };
+        let narrow_grouped = run_grouped_cursor(4);
+        let wide_grouped = run_grouped_cursor(width);
+        assert!(
+            wide_grouped >= narrow_grouped + 4,
+            "wide grouped PathSearch cursor pull must poll across initial reservation, emission and reconciliation: wide={wide_grouped}, narrow={narrow_grouped}"
+        );
+
+        // 4. Direct `Operator::next_inner` failure on `State::PathSearch` keeps `op.done == false`
+        //    (without relying on `Operator::next`'s outer error guard) while preserving counters.
+        let err_ctx = Arc::new(Ctx::new(snap.clone()));
+        let err_vars: Vec<VarId> = (0..3).map(|i| err_ctx.var(&format!("v{i}"))).collect();
+        let err_node = Node::leaf(
+            Kind::PathSearch(make_spec(PathEnd::Const(s), PathEnd::Var(2), 1)),
+            err_vars,
+            1.0,
+            "PathSearch".into(),
+        );
+        let mut err_op =
+            Operator::build(&err_ctx, err_node, FallbackPolicy::RejectMaterialization).unwrap();
+        let err_res = err_op.next_inner(&err_ctx, &options, 16);
+        assert!(err_res.is_err(), "maxVisited=1 must fail on 2-edge graph");
+        assert!(
+            !err_op.done,
+            "failed PathSearch must not mark Operator::done = true inside next_inner"
+        );
+        assert!(err_op.info.counters.is_some());
+        drop(err_op);
+        assert_eq!(err_ctx.live_bytes(), 0);
+
+        // 5. Tight-budget pre-allocation refusal on wide `PathSearch::next` and pull-#2
+        //    cancellation inside `Buffer::new` on a wide pull (`cap = 14 <= 64`).
+        let mut mem_ctx = Ctx::new(snap.clone());
+        mem_ctx.mem_limit = 350 * 1024;
+        let mem_ctx = Arc::new(mem_ctx);
+        let mem_vars: Vec<VarId> = (0..width).map(|i| mem_ctx.var(&format!("v{i}"))).collect();
+        let wide_node = Node::leaf(
+            Kind::PathSearch(make_spec(PathEnd::Const(s), PathEnd::Var(2), 100)),
+            mem_vars,
+            2.0,
+            "PathSearch".into(),
+        );
+        let mut mem_op = Operator::build(
+            &mem_ctx,
+            wide_node.clone(),
+            FallbackPolicy::RejectMaterialization,
+        )
+        .unwrap();
+        let mem_res = mem_op
+            .next(&mem_ctx, &options, options.batch_rows)
+            .map(|b| b.is_some());
+        assert!(
+            matches!(mem_res, Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory),
+            "expected pre-allocation budget refusal on wide PathSearch output buffer: {mem_res:?}"
+        );
+        assert!(!mem_op.done);
+        drop(mem_op);
+        assert_eq!(mem_ctx.live_bytes(), 0);
+
+        // Pull #1 opens the reader and yields 1 of 2 paths (`cap = 1`); pull #2 cancels
+        // directly inside `PathSearch::pull`'s `Buffer::new` on width = 9,000, cap = 14.
+        let c_ctx = Arc::new(Ctx::new(snap));
+        let mut ps = pathsearch::PathSearch::new(wide_node);
+        let first = ps
+            .next(&c_ctx, &mut [], &options, 1)
+            .unwrap()
+            .expect("first of two paths");
+        assert_eq!(first.table.len(), 1);
+        assert!(!ps.done());
+        drop(first);
+        c_ctx.cancel.store(true, Ordering::Relaxed);
+        let second = ps.next(&c_ctx, &mut [], &options, 14).map(|b| b.is_some());
+        assert!(
+            matches!(second, Err(Error::Cancelled)),
+            "second pull must cancel inside Buffer::new on width={width}: {second:?}"
+        );
+        drop(ps);
+        assert_eq!(c_ctx.live_bytes(), 0);
+    }
+
+    fn nested_exists_body(depth: usize, alternating: bool, inner_tail: &str) -> String {
+        let mut s = String::new();
+        for level in 0..depth {
+            let kw = if alternating && level % 2 == 1 {
+                "FILTER NOT EXISTS"
+            } else {
+                "FILTER EXISTS"
+            };
+            s.push_str(&format!(
+                " {kw} {{ ?v{level} <urn:e{}> ?v{}",
+                level + 1,
+                level + 1
+            ));
+        }
+        if !inner_tail.is_empty() {
+            s.push(' ');
+            s.push_str(inner_tail);
+        }
+        for _ in 0..depth {
+            s.push_str(" }");
+        }
+        s
+    }
+
+    #[test]
+    fn deep_exists_admission_and_exclusions() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::from("<urn:s0> <urn:e0> <urn:n0> .\n");
+        for level in 0..17 {
+            ttl.push_str(&format!(
+                "<urn:n{level}> <urn:e{}> <urn:n{}> .\n",
+                level + 1,
+                level + 1
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let decide = |q: &str, opts: &QueryOptions| -> bool {
+            let parsed = super::super::parse_query(q, None, &[]).unwrap();
+            let mut p =
+                super::super::prepare_query(store.snapshot(), &parsed, opts, None, None).unwrap();
+            let mut group = &mut p.node;
+            while !matches!(group.kind, Kind::Group { .. } | Kind::GroupCountScan { .. }) {
+                group = &mut group.children[0];
+            }
+            fn scale(node: &mut Node, est: f64) {
+                node.est = est;
+                for child in &mut node.children {
+                    scale(child, est);
+                }
+            }
+            if matches!(group.kind, Kind::GroupCountScan { .. }) {
+                group.est = AUTO_GROUP_ROWS;
+            } else {
+                scale(&mut group.children[0], AUTO_GROUP_ROWS);
+                group.est = 10.0;
+            }
+            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap()
+        };
+        let default_opts = QueryOptions::default();
+        for depth in [5, 8, 16] {
+            let chain = nested_exists_body(depth, false, "");
+            let alt = nested_exists_body(depth, true, "");
+            assert!(
+                decide(
+                    &format!("SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{chain} }}"),
+                    &default_opts
+                ),
+                "depth {depth} FILTER EXISTS should admit streaming"
+            );
+            assert!(
+                decide(
+                    &format!("SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{alt} }}"),
+                    &default_opts
+                ),
+                "depth {depth} alternating NOT EXISTS should admit streaming"
+            );
+        }
+        // Depth 8 inside IF, OR, BIND, SUM, ORDER BY.
+        let inner8 = nested_exists_body(7, false, "");
+        let exists8 = format!("EXISTS {{ ?v0 <urn:e1> ?v1{inner8} }}");
+        for q in [
+            format!(
+                "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER(?s = <urn:s0> || {exists8}) }}"
+            ),
+            format!(
+                "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER(IF({exists8}, true, false)) }}"
+            ),
+            format!(
+                "SELECT ?b (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 BIND({exists8} AS ?b) }} GROUP BY ?b"
+            ),
+            format!("SELECT (SUM(IF({exists8}, 1, 0)) AS ?n) {{ ?s <urn:e0> ?v0 }}"),
+            format!(
+                "SELECT ?v0 (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 }} GROUP BY ?v0 ORDER BY DESC({exists8})"
+            ),
+        ] {
+            assert!(
+                decide(&q, &default_opts),
+                "expected streaming admission: {q}"
+            );
+        }
+        // Preserved exclusions at depth 8: SERVICE, OPTIONAL condition (item 570), and decorrelate_exists=false.
+        let service8 = nested_exists_body(
+            8,
+            false,
+            "FILTER EXISTS { SERVICE <http://example.org/sparql> { ?v8 ?p ?o } }",
+        );
+        assert!(
+            !decide(
+                &format!("SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{service8} }}"),
+                &default_opts
+            ),
+            "depth-8 SERVICE inside EXISTS must stay eager"
+        );
+        let opt8 = nested_exists_body(8, false, "");
+        assert!(
+            !decide(
+                &format!(
+                    "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 OPTIONAL {{ ?s <urn:e1> ?v1{opt8} }} }}"
+                ),
+                &default_opts
+            ),
+            "OPTIONAL condition holding depth-8 EXISTS must stay eager"
+        );
+        let no_decor = QueryOptions {
+            optimizations: Some(super::super::Optimizations {
+                decorrelate_exists: false,
+                ..super::super::Optimizations::ALL
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !decide(
+                &format!(
+                    "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+                    nested_exists_body(8, false, "")
+                ),
+                &no_decor
+            ),
+            "decorrelate_exists=false must keep depth-8 EXISTS eager"
+        );
+    }
+
+    #[test]
+    fn deep_exists_reuses_plans_linearly_and_releases_charges() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::new();
+        for i in 0..75_000 {
+            ttl.push_str(&format!("<urn:s:{i}> <urn:e0> <urn:n0:{}> .\n", i % 16));
+        }
+        for level in 0..16 {
+            for j in 0..16 {
+                if level < 15 || j % 2 == 0 {
+                    ttl.push_str(&format!(
+                        "<urn:n{level}:{j}> <urn:e{}> <urn:n{}:{j}> .\n",
+                        level + 1,
+                        level + 1
+                    ));
+                }
+            }
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        for depth in [8usize, 12, 16] {
+            let q = format!(
+                "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+                nested_exists_body(depth, false, "")
+            );
+            let pool = super::super::pool::QueryPool::new(64 << 20);
+            let opts = QueryOptions {
+                pool: Some(pool.clone()),
+                ..Default::default()
+            };
+            super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
+            let exec = query_execution(
+                store.snapshot(),
+                &q,
+                &opts,
+                &CursorOptions::default(),
+                ExecutionMode::Auto,
+            )
+            .unwrap();
+            let QueryExecution::Select(mut c) = exec else {
+                panic!("depth {depth}: expected automatic streaming");
+            };
+            assert!(
+                !c.plan().has_materialization(),
+                "depth {depth}: streamed plan must not materialize"
+            );
+            let ctx = c.ctx.clone();
+            let mut rows = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                for row in 0..batch.len() {
+                    rows.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            let plans_built = super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get());
+            assert_eq!(
+                plans_built, depth as u64,
+                "depth {depth}: each ExistsSpec must be planned at most once (got {plans_built})"
+            );
+            let expected_count = if depth == 16 { 75_000 / 2 } else { 75_000 };
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0][0],
+                Some(Term::Literal(oxrdf::Literal::from(expected_count as i64)))
+            );
+            drop(rows);
+            drop(c);
+            assert_eq!(ctx.live_bytes(), 0, "depth {depth}: live bytes leaked");
+            drop(ctx);
+            assert_eq!(pool.granted(), 0, "depth {depth}: pool grant leaked");
+        }
+    }
+
+    #[test]
+    fn deep_exists_admission_propagates_cancellation() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::from("<urn:s0> <urn:e0> <urn:n0> .\n");
+        for level in 0..16 {
+            ttl.push_str(&format!(
+                "<urn:n{level}> <urn:e{}> <urn:n{}> .\n",
+                level + 1,
+                level + 1
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+            nested_exists_body(16, false, "")
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let opts = QueryOptions {
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let mut p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let mut group = &mut p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        cancel.store(true, Ordering::SeqCst);
+        let err = auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap_err();
+        assert!(
+            matches!(err, Error::Cancelled),
+            "expected Cancelled, got {err}"
+        );
+        let err = query_execution(
+            store.snapshot(),
+            &q,
+            &opts,
+            &CursorOptions::default(),
+            ExecutionMode::Auto,
+        )
+        .err()
+        .expect("cancelled query_execution must fail");
+        assert!(
+            matches!(err, Error::Cancelled),
+            "expected Cancelled, got {err}"
+        );
+    }
+
+    #[test]
+    fn deep_exists_preplanning_refuses_large_values_under_low_budget() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> 0 .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        // Use inline integer literals so VALUES exercises pure column-table reservation
+        // without allocating query-local vocabulary entries.
+        let mut values = String::from("VALUES ?v1 { ");
+        for i in 0..20_000 {
+            values.push_str(&format!("{i} "));
+        }
+        values.push('}');
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let limit = 32 << 10;
+        let pool = super::super::pool::QueryPool::new(limit);
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let mut p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let mut group = &mut p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        // Find the top-level ExistsSpec and verify unsubstituted_plan refuses before
+        // allocating the 20,000-row VALUES table (~160 KiB > 32 KiB limit).
+        let mut specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        assert_eq!(specs.len(), 1);
+        let spec = specs[0].clone();
+        let err = super::super::exists::unsubstituted_plan(&p.ctx, &spec)
+            .err()
+            .expect("large VALUES inside EXISTS must fail under 32 KiB budget");
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded, got {err}"
+        );
+        assert!(!spec.plan_cache.has_cached_plan());
+        assert!(!spec.plan_cache.has_cached_admit());
+        assert!(
+            p.ctx.mem_peak() <= limit,
+            "peak {} exceeded limit {limit}",
+            p.ctx.mem_peak()
+        );
+        // Under auto_streaming, the budget refusal keeps the query eager with zero leaks.
+        assert!(!auto_streaming(&p.ctx, &p.node, p.kind, &CursorOptions::default()).unwrap());
+        assert!(!spec.plan_cache.has_cached_plan());
+        assert!(!spec.plan_cache.has_cached_admit());
+        let ctx = p.ctx.clone();
+        drop(spec);
+        drop(p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_admission_handoff_preserves_pool_reservation_across_cursor_mode() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> 0 .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let mut values = String::from("VALUES ?v1 { ");
+        for i in 0..16_000 {
+            values.push_str(&format!("{i} "));
+        }
+        values.push('}');
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let pool = super::super::pool::QueryPool::new(8 << 20);
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        // Build an unattached Ctx + plan mirroring prepare_query_input_policy before
+        // auto_streaming_lease runs.
+        let mut ctx = super::super::Ctx::new(store.snapshot());
+        ctx.set_grant(opts.query_grant());
+        let mut ctx = Arc::new(ctx);
+        let mut planner = super::super::plan::Planner::new(&ctx);
+        let pattern = match &parsed {
+            spargebra::Query::Select { pattern, .. } => pattern,
+            _ => unreachable!(),
+        };
+        let mut node = planner
+            .plan(
+                pattern,
+                &super::super::plan::ActiveGraph::Default,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut group = &mut node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+
+        let (streamed, mut lease) = auto_streaming_lease(
+            &ctx,
+            &node,
+            Some(pattern),
+            &q,
+            QueryKind::Select,
+            &CursorOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            streamed,
+            "expected grouped query with VALUES EXISTS to stream"
+        );
+        let lease_bytes = lease
+            .as_ref()
+            .expect("unattached admission must return a live lease")
+            .bytes;
+        assert!(
+            lease_bytes >= 128_000,
+            "expected >= 128 KiB cached VALUES plan lease, got {lease_bytes}"
+        );
+        // Occupy every remaining byte in the shared pool with a concurrent query so any
+        // release during `enable_cursor_accounting` would be immediately stolen.
+        let free = pool.capacity().saturating_sub(pool.granted());
+        let competitor = pool.empty_grant();
+        competitor.charge(free).unwrap();
+        assert_eq!(pool.granted(), pool.capacity());
+
+        let mutable = Arc::get_mut(&mut ctx).expect("ctx must remain uniquely owned");
+        mutable.enable_cursor_accounting().unwrap();
+        assert!(
+            ctx.granted_bytes() >= lease_bytes,
+            "cursor_mode must keep cached-plan reservation backed ({} < {lease_bytes})",
+            ctx.granted_bytes()
+        );
+        ctx.attach_owner();
+        super::super::exists::charge_cached_plans(&ctx, &node, lease.as_mut())
+            .expect("handoff into RetainedCharge must succeed with zero free pool bytes");
+        assert_eq!(
+            lease.as_ref().unwrap().bytes,
+            0,
+            "entire admission lease must be transferred to cached plans"
+        );
+        drop(lease);
+        assert!(ctx.live_bytes() >= lease_bytes);
+        drop(node);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        drop(competitor);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_charges_cloned_plan_in_strict_validation_and_drain() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> 0 .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let mut values = String::from("VALUES ?v1 { ");
+        for i in 0..20_000 {
+            values.push_str(&format!("{i} "));
+        }
+        values.push('}');
+        let q = format!(
+            "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+
+        // Measure the exact bytes of one cached plan copy.
+        let probe_p = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &QueryOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut probe_specs = Vec::new();
+        for e in own_exprs(&probe_p.node.children[0].kind) {
+            e.exists_specs(&mut probe_specs);
+        }
+        let probe_cached =
+            super::super::exists::unsubstituted_plan(&probe_p.ctx, probe_specs[0]).unwrap();
+        let one_copy = cloned_plan_bytes(&probe_cached);
+        assert!(
+            one_copy >= 160_000,
+            "expected >= 160 KiB VALUES plan, got {one_copy}"
+        );
+        drop(probe_cached);
+        drop(probe_p);
+
+        // Budget strictly between 1x and 2x the VALUES plan size: first cached plan fits,
+        // cloning a second copy in `exists_streams` or `drain` must fail with BudgetExceeded.
+        let tight_limit = one_copy + one_copy / 2;
+        let pool = super::super::pool::QueryPool::new(tight_limit);
+        let tight_opts = QueryOptions {
+            max_memory_bytes: Some(tight_limit),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let tight_p =
+            super::super::prepare_query(store.snapshot(), &parsed, &tight_opts, None, None)
+                .unwrap();
+        let filter_node = &tight_p.node.children[0];
+        let mut specs = Vec::new();
+        for e in own_exprs(&filter_node.kind) {
+            e.exists_specs(&mut specs);
+        }
+        let spec = specs[0].clone();
+        let cached = super::super::exists::unsubstituted_plan(&tight_p.ctx, &spec)
+            .expect("single cached copy must fit in 1.5x budget");
+        let err = exists_streams(&tight_p.ctx, &filter_node.kind)
+            .expect_err("strict validation clone must fail between 1x and 2x budget");
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded from exists_streams, got {err}"
+        );
+        assert_eq!(
+            spec.plan_cache.strict(),
+            None,
+            "BudgetExceeded must not cache strict=false"
+        );
+        let err = drain(&tight_p.ctx, &cached, &mut |_| Ok(()))
+            .expect_err("drain clone must fail between 1x and 2x budget");
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded from drain, got {err}"
+        );
+        let ctx = tight_p.ctx.clone();
+        drop(cached);
+        drop(spec);
+        drop(tight_p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+
+        // With >= 3x budget, both strict validation and drain succeed and release the copy.
+        let roomy_limit = one_copy * 4;
+        let roomy_pool = super::super::pool::QueryPool::new(roomy_limit);
+        let roomy_opts = QueryOptions {
+            max_memory_bytes: Some(roomy_limit),
+            pool: Some(roomy_pool.clone()),
+            ..Default::default()
+        };
+        let roomy_p =
+            super::super::prepare_query(store.snapshot(), &parsed, &roomy_opts, None, None)
+                .unwrap();
+        let filter_node = &roomy_p.node.children[0];
+        let mut specs = Vec::new();
+        for e in own_exprs(&filter_node.kind) {
+            e.exists_specs(&mut specs);
+        }
+        let cached = super::super::exists::unsubstituted_plan(&roomy_p.ctx, specs[0]).unwrap();
+        let live_after_cache = roomy_p.ctx.live_bytes();
+        assert!(exists_streams(&roomy_p.ctx, &filter_node.kind).unwrap());
+        assert_eq!(roomy_p.ctx.live_bytes(), live_after_cache);
+        let mut rows = 0usize;
+        drain(&roomy_p.ctx, &cached, &mut |t| {
+            rows += t.len();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(roomy_p.ctx.live_bytes(), live_after_cache);
+        let ctx = roomy_p.ctx.clone();
+        drop(cached);
+        drop(roomy_p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(roomy_pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_clears_speculative_admit_metadata_on_eager_fallback() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::new();
+        for i in 0..2_000 {
+            ttl.push_str(&format!("<urn:s{i}> <urn:p> <urn:o{i}> .\n"));
+            ttl.push_str(&format!("<urn:o{i}> <urn:q> <urn:k{i}> .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        // Query with ORDER BY + correlated EXISTS: `largest_output_bytes` exceeds half of a
+        // small budget so `memory_admitted` -> `cursor_fits` runs `streams_natively` AND
+        // `cursor_state_bytes` -> `keyed_exists_bytes` (populating `PlanCache::admit`),
+        // then declines streaming because ORDER BY + key-set state does not fit in half room.
+        let q = "SELECT ?s ?o { ?s <urn:p> ?o FILTER EXISTS { ?o <urn:q> ?k } } ORDER BY ?o";
+        let parsed = super::super::parse_query(q, None, &[]).unwrap();
+        let pool = super::super::pool::QueryPool::new(512 << 10);
+        let opts = QueryOptions {
+            max_memory_bytes: Some(512 << 10),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let mut p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        // Raise estimates so `memory_admitted` triggers `cursor_fits` -> `keyed_exists_bytes`,
+        // then `cursor_fits` declines because state * 2 + headroom > admission_room.
+        p.node.est = 25_000.0;
+        p.node.children[0].est = 25_000.0;
+        p.node.children[0].children[0].est = 25_000.0;
+        let mut specs = Vec::new();
+        fn collect_specs<'a>(n: &'a Node, out: &mut Vec<&'a Arc<super::super::expr::ExistsSpec>>) {
+            for e in own_exprs(&n.kind) {
+                e.exists_specs(out);
+            }
+            for c in &n.children {
+                collect_specs(c, out);
+            }
+        }
+        collect_specs(&p.node, &mut specs);
+        assert_eq!(specs.len(), 1);
+        let spec = specs[0].clone();
+
+        // Confirm `cursor_state_bytes` populates `admit` when called directly.
+        let _ = cursor_state_bytes(&p.ctx, &p.node, None).unwrap();
+        assert!(
+            spec.plan_cache.has_cached_admit(),
+            "cursor_state_bytes should populate structural admit metadata"
+        );
+        super::super::exists::clear_cached_plans(&p.node);
+        assert!(!spec.plan_cache.has_cached_admit());
+        assert!(!spec.plan_cache.has_cached_plan());
+
+        // Now run full `auto_streaming`, which declines streaming and must clear both
+        // cached plans and structural admit metadata before returning.
+        assert!(
+            !auto_streaming(&p.ctx, &p.node, p.kind, &CursorOptions::default()).unwrap(),
+            "expected cursor_fits to decline streaming"
+        );
+        assert!(
+            !spec.plan_cache.has_cached_plan(),
+            "eager fallback must clear cached plan"
+        );
+        assert!(
+            !spec.plan_cache.has_cached_admit(),
+            "eager fallback must clear cached admit metadata"
+        );
+        let ctx = p.ctx.clone();
+        drop(spec);
+        drop(p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_original_deadline_and_mid_admission_abort_cleanup() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                super::super::exists::AFTER_CACHE_PLAN_HOOK.with(|h| *h.borrow_mut() = None);
+            }
+        }
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::from("<urn:s0> <urn:e0> <urn:n0> .\n");
+        for level in 0..16 {
+            ttl.push_str(&format!(
+                "<urn:n{level}> <urn:e{}> <urn:n{}> .\n",
+                level + 1,
+                level + 1
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+            nested_exists_body(16, false, "")
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+
+        // 1. A relative timeout already expired relative to `started` (before parsing) must
+        // fail in `prepare_query` before automatic admission builds any EXISTS plan.
+        super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        let expired_start = Instant::now() - Duration::from_secs(2);
+        let err = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &QueryOptions {
+                timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            Some(expired_start),
+            Some((&CursorOptions::default(), &q)),
+        )
+        .err()
+        .expect("already-expired relative timeout from started must fail");
+        assert!(matches!(err, Error::Timeout), "expected Timeout, got {err}");
+        assert_eq!(
+            super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get()),
+            0,
+            "expired query must not plan EXISTS during admission"
+        );
+
+        // 2. Deterministic mid-admission cancellation after caching the 1st nested plan:
+        // must stop immediately, return Cancelled, and clean up the partially populated cache.
+        let pool = super::super::pool::QueryPool::new(16 << 20);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let opts = QueryOptions {
+            cancel: Some(cancel.clone()),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let mut p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let mut group = &mut p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        let mut specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        let outer_spec = specs[0].clone();
+        super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        {
+            let _reset = ResetHook;
+            let cancel_hook = cancel.clone();
+            super::super::exists::AFTER_CACHE_PLAN_HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |count| {
+                    if count == 1 {
+                        cancel_hook.store(true, Ordering::SeqCst);
+                    }
+                }));
+            });
+            let err =
+                auto_streaming(&p.ctx, &p.node, p.kind, &CursorOptions::default()).unwrap_err();
+            assert!(
+                matches!(err, Error::Cancelled),
+                "expected Cancelled, got {err}"
+            );
+        }
+        assert_eq!(
+            super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get()),
+            1,
+            "cancellation after 1st cached plan must stop before planning deeper levels"
+        );
+        assert!(
+            !outer_spec.plan_cache.has_cached_plan() && !outer_spec.plan_cache.has_cached_admit(),
+            "partially populated cache must be cleaned up on cancellation"
+        );
+        let ctx = p.ctx.clone();
+        drop(outer_spec);
+        drop(p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+
+        // 3. Deterministic mid-admission timeout after caching the 1st nested plan.
+        struct ResetDeadline;
+        impl Drop for ResetDeadline {
+            fn drop(&mut self) {
+                super::super::ctx::TEST_DEADLINE_EXPIRED.with(|f| f.set(false));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let opts = QueryOptions {
+            deadline: Some(deadline),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let mut p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let mut group = &mut p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        let mut specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        let outer_spec = specs[0].clone();
+        super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        {
+            let _reset = ResetHook;
+            let _reset_deadline = ResetDeadline;
+            super::super::exists::AFTER_CACHE_PLAN_HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |count| {
+                    if count == 1 {
+                        super::super::ctx::TEST_DEADLINE_EXPIRED.with(|f| f.set(true));
+                    }
+                }));
+            });
+            let err =
+                auto_streaming(&p.ctx, &p.node, p.kind, &CursorOptions::default()).unwrap_err();
+            assert!(matches!(err, Error::Timeout), "expected Timeout, got {err}");
+        }
+        assert_eq!(
+            super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get()),
+            1,
+            "timeout after 1st cached plan must stop before planning deeper levels"
+        );
+        assert!(
+            !outer_spec.plan_cache.has_cached_plan() && !outer_spec.plan_cache.has_cached_admit(),
+            "partially populated cache must be cleaned up on timeout"
+        );
+        let ctx = p.ctx.clone();
+        drop(outer_spec);
+        drop(p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_small_spill_query_skips_speculative_planning() {
+        use crate::io::Source;
+        use crate::spill::{Spill, SpillOptions};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::from("<urn:s0> <urn:e0> <urn:n0> .\n");
+        for level in 0..8 {
+            ttl.push_str(&format!(
+                "<urn:n{level}> <urn:e{}> <urn:n{}> .\n",
+                level + 1,
+                level + 1
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let q = format!(
+            "SELECT ?s {{ ?s <urn:e0> ?v0{} }}",
+            nested_exists_body(8, false, "")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = Spill::open(&SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        let prepared = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &QueryOptions {
+                spill: Some(spill),
+                ..Default::default()
+            },
+            Some(Instant::now()),
+            Some((&CursorOptions::default(), &q)),
+        )
+        .unwrap();
+        assert!(
+            !prepared.ctx.streams(),
+            "small query with spill enabled should stay eager"
+        );
+        assert_eq!(
+            super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get()),
+            0,
+            "small eager query with spill enabled must not speculatively plan EXISTS in spill_admitted"
+        );
+    }
+
+    #[test]
+    fn deep_exists_wide_expression_preplanning_and_clone_accounting() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> <urn:n1> .\n<urn:n2> <urn:e1> <urn:n1> .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let list_len = 20_000usize;
+        let mut in_list = String::with_capacity(list_len * 4);
+        for i in 0..list_len {
+            if i > 0 {
+                in_list.push_str(", ");
+            }
+            in_list.push_str("?v1");
+        }
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 FILTER(?v1 IN ({in_list})) }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+
+        // Measure one cached plan's retained and cloned bytes: must cover the full Vec<Expr>.
+        let probe_p = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &QueryOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut group = &probe_p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &group.children[0];
+        }
+        let mut probe_specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut probe_specs);
+        }
+        assert_eq!(probe_specs.len(), 1);
+        let probe_cached =
+            super::super::exists::unsubstituted_plan(&probe_p.ctx, probe_specs[0]).unwrap();
+        let min_vec_bytes = (list_len * std::mem::size_of::<Expr>()) as u64;
+        let retained_bytes = plan_bytes(&probe_cached);
+        let one_copy = cloned_plan_bytes(&probe_cached);
+        assert!(
+            retained_bytes >= min_vec_bytes,
+            "plan_bytes ({retained_bytes}) must include wide Expr::In Vec<Expr> (>= {min_vec_bytes})"
+        );
+        assert!(
+            one_copy >= min_vec_bytes,
+            "cloned_plan_bytes ({one_copy}) must include wide Expr::In Vec<Expr> (>= {min_vec_bytes})"
+        );
+        drop(probe_cached);
+        drop(probe_p);
+
+        // 1. Pre-planning: budget above shallow node estimate (64 KiB) and well below
+        //    the wide Expr::In Vec<Expr> allocation must refuse before allocating.
+        let low_limit = 64 << 10;
+        assert!(low_limit < min_vec_bytes);
+        let low_pool = super::super::pool::QueryPool::new(low_limit);
+        let low_opts = QueryOptions {
+            max_memory_bytes: Some(low_limit),
+            pool: Some(low_pool.clone()),
+            ..Default::default()
+        };
+        let mut low_p =
+            super::super::prepare_query(store.snapshot(), &parsed, &low_opts, None, None).unwrap();
+        let mut group = &mut low_p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        let mut specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        let spec = specs[0].clone();
+        let err = super::super::exists::unsubstituted_plan(&low_p.ctx, &spec)
+            .err()
+            .expect("wide expression inside EXISTS must fail under low budget before allocating");
+        assert!(matches!(err, Error::BudgetExceeded(_)), "got {err}");
+        assert!(!spec.plan_cache.has_cached_plan());
+        assert!(
+            low_p.ctx.mem_peak() <= low_limit,
+            "peak {} exceeded low limit {low_limit}",
+            low_p.ctx.mem_peak()
+        );
+        assert!(
+            !auto_streaming(
+                &low_p.ctx,
+                &low_p.node,
+                low_p.kind,
+                &CursorOptions::default()
+            )
+            .unwrap()
+        );
+        assert!(!spec.plan_cache.has_cached_plan());
+        let ctx = low_p.ctx.clone();
+        drop(spec);
+        drop(low_p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(low_pool.granted(), 0);
+
+        // 2. Planning-time overlap for multi-option scan (?v0 <urn:e1> ?v1 has Pso and Pos):
+        //    under 1.5x one copy, scan option selection clones the wide filter while the
+        //    original is live and must refuse before allocating the second copy.
+        let tight_limit = retained_bytes + one_copy / 2;
+        let tight_pool = super::super::pool::QueryPool::new(tight_limit);
+        let tight_opts = QueryOptions {
+            max_memory_bytes: Some(tight_limit),
+            pool: Some(tight_pool.clone()),
+            optimizations: Some(super::super::ctx::Optimizations {
+                sampled_filters: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let tight_p =
+            super::super::prepare_query(store.snapshot(), &parsed, &tight_opts, None, None)
+                .unwrap();
+        let mut group = &tight_p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &group.children[0];
+        }
+        let filter_node = &group.children[0];
+        let mut specs = Vec::new();
+        for e in own_exprs(&filter_node.kind) {
+            e.exists_specs(&mut specs);
+        }
+        let spec = specs[0].clone();
+        let err = super::super::exists::unsubstituted_plan(&tight_p.ctx, &spec)
+            .err()
+            .expect("multi-option scan filter clone must fail under 1.5x budget");
+        assert!(matches!(err, Error::BudgetExceeded(_)), "got {err}");
+        assert!(!spec.plan_cache.has_cached_plan());
+        assert!(
+            tight_p.ctx.mem_peak() <= tight_limit,
+            "peak {} exceeded tight limit {tight_limit}",
+            tight_p.ctx.mem_peak()
+        );
+        let ctx = tight_p.ctx.clone();
+        drop(spec);
+        drop(tight_p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(tight_pool.granted(), 0);
+
+        // 3. Single-option scan (?v0 <urn:e1> <urn:n1> has only Pos, so planning makes no
+        //    filter copy): 1.5x budget fits the cached plan, while cloning in exists_streams
+        //    and drain fails with BudgetExceeded.
+        let mut v0_list = String::with_capacity(list_len * 4);
+        for i in 0..list_len {
+            if i > 0 {
+                v0_list.push_str(", ");
+            }
+            v0_list.push_str("?v0");
+        }
+        let single_q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> <urn:n1> FILTER(?v0 IN ({v0_list})) }} }}"
+        );
+        let single_parsed = super::super::parse_query(&single_q, None, &[]).unwrap();
+        let single_pool = super::super::pool::QueryPool::new(tight_limit);
+        let single_opts = QueryOptions {
+            max_memory_bytes: Some(tight_limit),
+            pool: Some(single_pool.clone()),
+            optimizations: Some(super::super::ctx::Optimizations {
+                sampled_filters: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let single_p =
+            super::super::prepare_query(store.snapshot(), &single_parsed, &single_opts, None, None)
+                .unwrap();
+        let mut group = &single_p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &group.children[0];
+        }
+        let filter_node = &group.children[0];
+        let mut specs = Vec::new();
+        for e in own_exprs(&filter_node.kind) {
+            e.exists_specs(&mut specs);
+        }
+        let spec = specs[0].clone();
+        let cached = super::super::exists::unsubstituted_plan(&single_p.ctx, &spec)
+            .expect("single-option scan must plan without cloning wide filter in 1.5x budget");
+        let err = exists_streams(&single_p.ctx, &filter_node.kind)
+            .expect_err("strict validation clone of wide Expr must fail between 1x and 2x budget");
+        assert!(matches!(err, Error::BudgetExceeded(_)), "got {err}");
+        assert_eq!(spec.plan_cache.strict(), None);
+        let err = drain(&single_p.ctx, &cached, &mut |_| Ok(()))
+            .expect_err("drain clone of wide Expr must fail between 1x and 2x budget");
+        assert!(matches!(err, Error::BudgetExceeded(_)), "got {err}");
+        let ctx = single_p.ctx.clone();
+        drop(cached);
+        drop(spec);
+        drop(single_p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(single_pool.granted(), 0);
+
+        let roomy_limit = retained_bytes.saturating_add(one_copy).saturating_mul(2);
+        let roomy_pool = super::super::pool::QueryPool::new(roomy_limit);
+        let roomy_opts = QueryOptions {
+            max_memory_bytes: Some(roomy_limit),
+            pool: Some(roomy_pool.clone()),
+            optimizations: Some(super::super::ctx::Optimizations {
+                sampled_filters: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let roomy_p =
+            super::super::prepare_query(store.snapshot(), &parsed, &roomy_opts, None, None)
+                .unwrap();
+        let mut group = &roomy_p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &group.children[0];
+        }
+        let filter_node = &group.children[0];
+        let mut specs = Vec::new();
+        for e in own_exprs(&filter_node.kind) {
+            e.exists_specs(&mut specs);
+        }
+        let cached = super::super::exists::unsubstituted_plan(&roomy_p.ctx, specs[0]).unwrap();
+        let live_after_cache = roomy_p.ctx.live_bytes();
+        assert!(exists_streams(&roomy_p.ctx, &filter_node.kind).unwrap());
+        assert_eq!(roomy_p.ctx.live_bytes(), live_after_cache);
+        let mut rows = 0usize;
+        drain(&roomy_p.ctx, &cached, &mut |t| {
+            rows += t.len();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(roomy_p.ctx.live_bytes(), live_after_cache);
+        let ctx = roomy_p.ctx.clone();
+        drop(cached);
+        drop(roomy_p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(roomy_pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_values_dedup_rehash_respects_tight_budget() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> 0 .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        // 4,096 distinct inline integers: VALUES column table is ~32 KiB, while a full
+        // dedup map rehash (old + new buckets) needs > 200 KiB. Under a 96 KiB budget,
+        // VALUES must fall back to uncached interning instead of exceeding the budget.
+        let mut values = String::from("VALUES ?v1 { ");
+        for i in 0..4_096 {
+            values.push_str(&format!("{i} "));
+        }
+        values.push('}');
+        let q = format!(
+            "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let limit = 96 << 10;
+        let pool = super::super::pool::QueryPool::new(limit);
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let p = super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let mut specs = Vec::new();
+        for e in own_exprs(&p.node.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        let cached = super::super::exists::unsubstituted_plan(&p.ctx, specs[0])
+            .expect("VALUES must fall back to uncached interning when dedup rehash does not fit");
+        assert!(
+            p.ctx.mem_peak() <= limit,
+            "peak {} exceeded limit {limit}",
+            p.ctx.mem_peak()
+        );
+        let ctx = p.ctx.clone();
+        drop(cached);
+        drop(p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_auto_entrypoint_handles_tight_validation_clone_budget() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        // Enough outer rows so after single-conjunct FILTER_SELECTIVITY (0.3) the group
+        // input still exceeds AUTO_GROUP_ROWS (20,000) naturally.
+        let mut ttl = String::with_capacity(70_000 * 32);
+        for i in 0..70_000 {
+            ttl.push_str(&format!("<urn:s0> <urn:e0> <urn:n{i}> .\n"));
+        }
+        ttl.push_str("<urn:n0> <urn:e1> 0 .\n");
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let mut values = String::from("VALUES ?v1 { ");
+        for i in 0..20_000 {
+            values.push_str(&format!("{i} "));
+        }
+        values.push('}');
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ <urn:s0> <urn:e0> ?v0 FILTER (IF(false, EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }}, false)) }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+
+        // Measure one cached VALUES plan copy, open costs, and cursor headroom.
+        let probe_p = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &QueryOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut group = &probe_p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &group.children[0];
+        }
+        assert!(
+            group.children[0].est >= AUTO_GROUP_ROWS,
+            "expected grouped input est ({}) >= AUTO_GROUP_ROWS",
+            group.children[0].est
+        );
+        assert!(
+            auto_streaming_lease(
+                &probe_p.ctx,
+                &probe_p.node,
+                Some(&probe_p.pattern),
+                &q,
+                probe_p.kind,
+                &CursorOptions::default(),
+            )
+            .unwrap()
+            .0,
+            "roomy budget must admit grouped query to streaming"
+        );
+        let mut specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        let cached = super::super::exists::unsubstituted_plan(&probe_p.ctx, specs[0]).unwrap();
+        let one_copy = cloned_plan_bytes(&cached);
+        let cached_bytes = plan_bytes(&cached);
+        let base_headroom =
+            cursor_headroom(&probe_p.ctx, &probe_p.node, &CursorOptions::default(), true);
+        let outer_plan = plan_bytes(&probe_p.node);
+        let (open_retained, open_peak) =
+            cursor_open_bytes(&probe_p.ctx, &probe_p.node, Some(&probe_p.pattern), &q).unwrap();
+        assert!(
+            open_retained > outer_plan.saturating_add((q.len() as u64) * 16),
+            "open_retained ({open_retained}) must include query text * 16 + Variables credit"
+        );
+        assert!(
+            open_peak >= open_retained.saturating_add(one_copy),
+            "open_peak ({open_peak}) must include validation_clone_peak"
+        );
+        drop(cached);
+        drop(probe_p);
+
+        // 1. Large query text + opening charges: budget that fits cached plan + outer
+        //    plan_bytes + validation_clone_peak + headroom, but NOT query.len() * 16 +
+        //    Variables credit, must refuse in auto_streaming_lease.
+        let text_limit = cached_bytes
+            .saturating_add(outer_plan)
+            .saturating_add(one_copy)
+            .saturating_add(base_headroom);
+        assert!(
+            text_limit < cached_bytes.saturating_add(open_peak),
+            "expected query text * 16 to push open_peak past text_limit"
+        );
+        let pool = super::super::pool::QueryPool::new(text_limit);
+        let opts = QueryOptions {
+            max_memory_bytes: Some(text_limit),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+
+        let p = super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let (streamed, lease) = auto_streaming_lease(
+            &p.ctx,
+            &p.node,
+            Some(&p.pattern),
+            &q,
+            p.kind,
+            &CursorOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            !streamed && lease.is_none(),
+            "auto_streaming_lease must refuse when full open_peak (including query text) exceeds budget"
+        );
+        drop(p);
+        assert_eq!(pool.granted(), 0);
+
+        // Real Auto entry point: succeeds and returns COUNT = 0 instead of failing with
+        // BudgetExceeded at cursor open.
+        let exec = query_execution(
+            store.snapshot(),
+            &q,
+            &opts,
+            &CursorOptions::default(),
+            ExecutionMode::Auto,
+        )
+        .expect("Auto execution must answer short-circuited grouped EXISTS under tight budget");
+        let count_term = match exec {
+            QueryExecution::Eager(r) => {
+                let res = r.into_result();
+                let rows = res.rows().unwrap();
+                assert_eq!(rows.len(), 1);
+                rows.row(0).unwrap().values()[0].clone()
+            }
+            QueryExecution::Select(mut c) => {
+                let mut found = None;
+                let mut n = 0;
+                while let Some(b) = c.next_batch().unwrap() {
+                    n += b.len();
+                    if !b.is_empty() {
+                        found = b.term(0, 0).unwrap().map(|t| t.as_term().clone());
+                    }
+                }
+                assert_eq!(n, 1);
+                found
+            }
+            _ => panic!("expected SELECT execution"),
+        };
+        assert_eq!(
+            count_term,
+            Some(oxrdf::Term::Literal(oxrdf::Literal::from(0i64))),
+            "expected COUNT(*) = 0"
+        );
+        assert_eq!(pool.granted(), 0);
+
+        // Use the same query text and plan shape both times. The charged cached
+        // plan reduces the room available for the two phases.
+        let cursor = CursorOptions::default();
+        let prepare = |opts: &QueryOptions| {
+            let mut p =
+                super::super::prepare_query(store.snapshot(), &parsed, opts, None, None).unwrap();
+            let mut g = &mut p.node;
+            while !matches!(g.kind, Kind::Group { .. }) {
+                g = &mut g.children[0];
+            }
+            g.est = 2_000.0;
+            p
+        };
+        let phases = |p: &super::super::PreparedQuery,
+                      admission: &super::super::ctx::Charge<'_>| {
+            assert!(streams_natively_with_admission(&p.ctx, &p.node, Some(admission)).unwrap());
+            let (retained, open) =
+                cursor_open_bytes(&p.ctx, &p.node, Some(&p.pattern), "").unwrap();
+            let state = cursor_state_bytes(&p.ctx, &p.node, Some(admission)).unwrap();
+            let headroom = cursor_headroom(&p.ctx, &p.node, &cursor, false) as f64;
+            assert!(state.is_finite());
+            (open, state * 2.0 + headroom, retained)
+        };
+        let fixed_limit = 16 << 20;
+        let roomy = prepare(&QueryOptions {
+            max_memory_bytes: Some(fixed_limit),
+            ..Default::default()
+        });
+        let admission = roomy.ctx.charge(0).unwrap();
+        let (open, pull, retained) = phases(&roomy, &admission);
+        let tight_phase =
+            roomy.ctx.live_bytes() + open.max(retained + pull.ceil() as u64) + (16 << 10);
+        drop(admission);
+        drop(roomy);
+        let pool = super::super::pool::QueryPool::new(tight_phase);
+        let split = prepare(&QueryOptions {
+            max_memory_bytes: Some(fixed_limit),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        });
+        let admission = split.ctx.charge(0).unwrap();
+        let (open, pull, retained) = phases(&split, &admission);
+        let room = admission_room_bytes(&split.ctx);
+        assert!(split.ctx.live_bytes() >= cached_bytes);
+        assert!(open <= room, "opening needs {open}, room {room}");
+        assert!(retained as f64 + pull <= room as f64, "pull does not fit");
+        assert!(
+            open as f64 + pull > room as f64,
+            "summed phases still fit: open={open}, pull={pull}, room={room}"
+        );
+        assert!(
+            cursor_fits(
+                &split.ctx,
+                &split.node,
+                Some(&split.pattern),
+                "",
+                split.kind,
+                &cursor,
+                false,
+                Some(&admission),
+            )
+            .unwrap()
+        );
+        drop(admission);
+        drop(split);
+        assert_eq!(pool.granted(), 0);
+
+        // An ASK uses the same opening reservation. Its short-circuit means the
+        // inner VALUES are never executed, but strict cursor validation clones them.
+        let ask = format!(
+            "ASK {{ <urn:s0> <urn:e0> ?v0 FILTER(IF(false, EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }}, false)) }}"
+        );
+        let ask_parsed = super::super::parse_query(&ask, None, &[]).unwrap();
+        let roomy = super::super::prepare_query(
+            store.snapshot(),
+            &ask_parsed,
+            &QueryOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!super::super::demand::whole_slice(&roomy.node));
+        let mut filter = &roomy.node;
+        while !matches!(filter.kind, Kind::Filter(_)) {
+            filter = &filter.children[0];
+        }
+        let mut specs = Vec::new();
+        for expr in own_exprs(&filter.kind) {
+            expr.exists_specs(&mut specs);
+        }
+        assert_eq!(specs.len(), 1);
+        super::super::exists::unsubstituted_plan(&roomy.ctx, specs[0]).unwrap();
+        let (retained, opening) =
+            cursor_open_bytes(&roomy.ctx, &roomy.node, Some(&roomy.pattern), &ask).unwrap();
+        assert!(opening > retained);
+        let clone_limit = roomy.ctx.live_bytes() + retained + (opening - retained) / 2;
+        let opts = QueryOptions {
+            max_memory_bytes: Some(clone_limit),
+            ..Default::default()
+        };
+        let prepare_ask = |query| {
+            super::super::prepare_query(
+                store.snapshot(),
+                &ask_parsed,
+                &opts,
+                Some(Instant::now()),
+                Some((&cursor, query)),
+            )
+            .unwrap()
+        };
+        let tight = prepare_ask(&ask);
+        assert!(tight.ctx.streams(), "the fixed opening costs fit");
+        let levels = tight.plan_depth;
+        let error = from_prepared(
+            tight,
+            &ask_parsed,
+            &ask,
+            &opts,
+            &cursor,
+            Instant::now(),
+            0.0,
+            0.0,
+            levels,
+            QueryKind::Ask,
+        )
+        .err()
+        .expect("the EXISTS validation plan and its clone cannot fit together");
+        assert!(matches!(error, Error::BudgetExceeded(_)), "{error}");
+        let result = query_execution(store.snapshot(), &ask, &opts, &cursor, ExecutionMode::Auto)
+            .expect("Auto ASK must retry a memory refusal before pulling");
+        let QueryExecution::Eager(result) = result else {
+            panic!("expected eager ASK fallback");
+        };
+        assert!(!result.value());
+
+        let padded = format!("{ask}\n#{}", "padding".repeat(1 << 16));
+        let tight = prepare_ask(&padded);
+        assert!((padded.len() as u64) * 16 > clone_limit);
+        assert!(!tight.ctx.streams(), "the fixed opening costs do not fit");
+    }
+
+    #[test]
+    fn deep_exists_retains_admit_metadata_charge_across_planned_batches() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::new();
+        // Enough inner triples so `cost / ROW_EVAL_COST > 2` and the first two single-key
+        // outer batches stay in `State::Planned` without building the key set yet.
+        for i in 0..3_000 {
+            ttl.push_str(&format!("<urn:n0> <urn:e1> <urn:y{i}> .\n"));
+        }
+        ttl.push_str("<urn:s0> <urn:e0> <urn:n0> .\n<urn:s1> <urn:e0> <urn:n1> .\n");
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+
+        // 2,000 filter-only (`risky`) variables alongside 1 key variable `?v0` (flat IN list
+        // keeps parser depth shallow while populating a large `risky` vector).
+        let risky_count = 2_000usize;
+        let mut cond = String::with_capacity(risky_count * 8);
+        for i in 0..risky_count {
+            if i > 0 {
+                cond.push_str(", ");
+            }
+            cond.push_str(&format!("?r{i}"));
+        }
+        let q = format!(
+            "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?y FILTER(?v0 IN ({cond})) }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let pool = super::super::pool::QueryPool::new(64 << 20);
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let p = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &opts,
+            Some(Instant::now()),
+            None,
+        )
+        .unwrap();
+        let filter_node = &p.node.children[0];
+        let mut specs = Vec::new();
+        for e in own_exprs(&filter_node.kind) {
+            e.exists_specs(&mut specs);
+        }
+        let spec = specs[0].clone();
+        let input_vars = filter_node.children[0].vars.clone();
+        let input_certain = filter_node.children[0].certain.clone();
+
+        // 1. Populate PlanCache::admit via keyed_plan and confirm a second lookup does not
+        //    allocate or change live bytes.
+        let planned =
+            super::super::exists::keyed_plan(&p.ctx, &spec, &input_vars, &input_certain, None)
+                .unwrap()
+                .expect("expected admitted keyed plan");
+        assert!(spec.plan_cache.has_cached_admit());
+        let live_after_cache = p.ctx.live_bytes();
+        let min_risky_bytes = (risky_count * std::mem::size_of::<VarId>()) as u64;
+        let _ = super::super::exists::keyed_plan(&p.ctx, &spec, &input_vars, &input_certain, None)
+            .unwrap();
+        assert_eq!(p.ctx.live_bytes(), live_after_cache);
+
+        // 2. Drive two single-row batches through `filter_mask` so `admit` consumes the
+        //    cached entry into `State::Planned` and remains in `State::Planned` across
+        //    both pulls. The retained charge for `AdmitMeta` must remain live.
+        let v0 = p.ctx.var("v0");
+        let n0 = p
+            .ctx
+            .intern_term(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                "urn:n0",
+            )));
+        let n1 = p
+            .ctx
+            .intern_term(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                "urn:n1",
+            )));
+        let mut batch1 = Table::new(vec![v0]);
+        batch1.push_row(&[n0]);
+        let mut batch2 = Table::new(vec![v0]);
+        batch2.push_row(&[n1]);
+        let filter_expr = match &filter_node.kind {
+            Kind::Filter(exprs) => &exprs[0],
+            _ => panic!("expected Filter"),
+        };
+
+        let _ = super::super::exists::mask(&p.ctx, &batch1, filter_expr).unwrap();
+        assert!(
+            !spec.plan_cache.has_cached_admit(),
+            "admit must consume cached metadata on first batch"
+        );
+        assert!(
+            spec.decor.is_planned(),
+            "first batch must leave Decor in State::Planned"
+        );
+        assert!(
+            p.ctx.live_bytes() >= live_after_cache,
+            "live bytes ({}) must retain AdmitMeta charge (>= {live_after_cache}, risky >= {min_risky_bytes}) in State::Planned",
+            p.ctx.live_bytes()
+        );
+
+        let _ = super::super::exists::mask(&p.ctx, &batch2, filter_expr).unwrap();
+        assert!(
+            spec.decor.is_planned(),
+            "second batch must remain in State::Planned"
+        );
+        assert!(
+            p.ctx.live_bytes() >= live_after_cache,
+            "live bytes ({}) must keep AdmitMeta charge across batches in State::Planned",
+            p.ctx.live_bytes()
+        );
+
+        let ctx = p.ctx.clone();
+        drop(planned);
+        drop(spec);
+        drop(p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_failed_transition_clears_caches_before_lease_release() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> 0 .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let mut values = String::from("VALUES ?v1 { ");
+        for i in 0..16_000 {
+            values.push_str(&format!("{i} "));
+        }
+        values.push('}');
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let pool = super::super::pool::QueryPool::new(8 << 20);
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let mut ctx = super::super::Ctx::new(store.snapshot());
+        ctx.set_grant(opts.query_grant());
+        let mut ctx = Arc::new(ctx);
+        let mut planner = super::super::plan::Planner::new(&ctx);
+        let pattern = match &parsed {
+            spargebra::Query::Select { pattern, .. } => pattern,
+            _ => unreachable!(),
+        };
+        let mut node = planner
+            .plan(
+                pattern,
+                &super::super::plan::ActiveGraph::Default,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut group = &mut node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        let mut specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        let spec = specs[0].clone();
+
+        let (streamed, lease) = auto_streaming_lease(
+            &ctx,
+            &node,
+            Some(pattern),
+            &q,
+            QueryKind::Select,
+            &CursorOptions::default(),
+        )
+        .unwrap();
+        assert!(streamed);
+        assert!(spec.plan_cache.has_cached_plan());
+        assert!(lease.as_ref().is_some_and(|l| l.bytes >= 128_000));
+
+        // Hold an extra Arc clone so finalize_auto_streaming fails at Arc::get_mut before
+        // enable_cursor_accounting; ClearOnDrop must clear speculative caches before the
+        // lease drops and releases its pool bytes.
+        let extra_ref = ctx.clone();
+        let err = super::super::finalize_auto_streaming(&mut ctx, &node, lease)
+            .expect_err("shared ctx must fail transition");
+        assert!(matches!(err, Error::Invalid(_)), "got {err}");
+        assert!(
+            !spec.plan_cache.has_cached_plan() && !spec.plan_cache.has_cached_admit(),
+            "failed transition must clear speculative caches before dropping lease"
+        );
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(spec);
+        drop(node);
+        drop(extra_ref);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_wide_filter_over_union_and_nested_var_scratch() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> <urn:n1> .\n<urn:n1> <urn:e2> <urn:n2> .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+
+        let width = 20_000;
+        let repeated = vec!["?v0"; width].join(", ");
+        let plan = |q: &str, limit| {
+            let parsed = super::super::parse_query(q, None, &[]).unwrap();
+            let opts = QueryOptions {
+                max_memory_bytes: limit,
+                ..Default::default()
+            };
+            let prepared =
+                super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+            let mut specs = Vec::new();
+            for expr in own_exprs(&prepared.node.children[0].kind) {
+                expr.exists_specs(&mut specs);
+            }
+            let spec = specs[0].clone();
+            (prepared, spec)
+        };
+        // Precompile the original expression outside the allocation observer so a
+        // refusal at final reconciliation cannot hide a clone in an arm or join.
+        for (pattern, needle) in [
+            (
+                "{ { ?v0 <urn:absent> ?v1 } UNION { ?v0 <urn:e1> ?v1 } }",
+                "?v0",
+            ),
+            ("?v0 <urn:e1> ?v1 . ?v1 <urn:e2> ?v2", "?v0"),
+            ("?v0 <urn:e1> ?v1 . ?v1 <urn:e2> ?v2", "?v2"),
+        ] {
+            let q = format!(
+                "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ {pattern} FILTER({needle} IN ({repeated})) }} }}"
+            );
+            let expr_copy = width * size_of::<Expr>();
+            let limit = (expr_copy + expr_copy / 2) as u64;
+            let (tight, spec) = plan(&q, Some(limit));
+            let spargebra::algebra::GraphPattern::Filter { expr, inner } = spec.pattern() else {
+                panic!("expected inner filter");
+            };
+            let compiled = super::super::plan::Planner::new(&tight.ctx)
+                .compile(expr, &spec.graph)
+                .unwrap();
+            let filters = vec![compiled];
+            let bytes = super::super::checked_layout::expressions_copy_bytes(&filters);
+            let held = tight.ctx.charge(bytes).unwrap();
+            let mut planner =
+                super::super::plan::Planner::for_exists_with_charge(&tight.ctx, &spec, Some(&held));
+            let largest = crate::test_alloc::record_largest(|| {
+                let err = planner
+                    .plan(inner, &spec.graph, filters)
+                    .err()
+                    .expect("planning must refuse the filter copy");
+                assert!(matches!(err, Error::BudgetExceeded(_)), "{pattern}: {err}");
+            });
+            assert!(largest < expr_copy, "{pattern}: copied {largest} bytes");
+            assert!(tight.ctx.mem_peak() <= limit);
+        }
+
+        // With long names the rendered strings dwarf the copied compact IDs. The
+        // final plan fits but the diagnostic rendering workspace does not.
+        let variable = format!("?v{}", "x".repeat(255));
+        let values = vec![variable.as_str(); 2_000].join(", ");
+        for pattern in [
+            format!("{variable} <urn:e1> ?v1"),
+            format!("{{ {{ {variable} <urn:e1> ?v1 }} UNION {{ {variable} <urn:e1> ?v1 }} }}"),
+        ] {
+            let q = format!(
+                "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ {pattern} FILTER({variable} IN ({values})) }} }}"
+            );
+            let limit = 1536 << 10;
+            let (roomy, spec) = plan(&q, None);
+            let cached = super::super::exists::unsubstituted_plan(&roomy.ctx, &spec).unwrap();
+            assert!(
+                plan_bytes(&cached) <= limit,
+                "{pattern}: retained plan needs {}, limit {limit}",
+                plan_bytes(&cached)
+            );
+            let (tight, spec) = plan(&q, Some(limit));
+            let largest = crate::test_alloc::record_largest(|| {
+                let err = super::super::exists::unsubstituted_plan(&tight.ctx, &spec)
+                    .err()
+                    .expect("rendering must be refused");
+                assert!(matches!(err, Error::BudgetExceeded(_)), "{err}");
+            });
+            assert!(
+                largest < values.len(),
+                "rendered filter allocated {largest} bytes"
+            );
+            assert!(!spec.plan_cache.has_cached_plan());
+            assert_eq!(tight.ctx.live_bytes(), 0);
+        }
+
+        // Structural key-set admission (admit_meta / certain) with 4,000 distinct
+        //    filter-only variables under a tight 32 KiB budget must refuse scratch growth
+        //    within the budget and leak nothing.
+        let mut risky_list = String::new();
+        for i in 0..4_000 {
+            if i > 0 {
+                risky_list.push_str(", ");
+            }
+            risky_list.push_str(&format!("?r{i}"));
+        }
+        let risky_q = format!(
+            "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 FILTER(?v0 IN ({risky_list})) }} }}"
+        );
+        let risky_parsed = super::super::parse_query(&risky_q, None, &[]).unwrap();
+        let admit_limit = 32 << 10;
+        let admit_pool = super::super::pool::QueryPool::new(admit_limit);
+        let admit_opts = QueryOptions {
+            max_memory_bytes: Some(admit_limit),
+            pool: Some(admit_pool.clone()),
+            ..Default::default()
+        };
+        let admit_p =
+            super::super::prepare_query(store.snapshot(), &risky_parsed, &admit_opts, None, None)
+                .unwrap();
+        let filter_node = &admit_p.node.children[0];
+        let mut specs = Vec::new();
+        for e in own_exprs(&filter_node.kind) {
+            e.exists_specs(&mut specs);
+        }
+        let spec = specs[0].clone();
+        let input_vars = filter_node.children[0].vars.clone();
+        let input_certain = filter_node.children[0].certain.clone();
+        let planned = super::super::exists::keyed_plan(
+            &admit_p.ctx,
+            &spec,
+            &input_vars,
+            &input_certain,
+            None,
+        )
+        .unwrap();
+        assert!(
+            planned.is_none(),
+            "structural admission with 4,000 risky vars must decline under 32 KiB budget"
+        );
+        assert!(!spec.plan_cache.has_cached_admit());
+        assert!(
+            admit_p.ctx.mem_peak() <= admit_limit,
+            "peak {} exceeded admit limit {admit_limit}",
+            admit_p.ctx.mem_peak()
+        );
+        let ctx = admit_p.ctx.clone();
+        drop(spec);
+        drop(admit_p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(admit_pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_filter_preflight_refuses_wide_stored_term_before_decoding() {
+        use crate::id::Tag;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let literal = "x".repeat(512 << 10);
+        store
+            .load(&[Source::from_bytes(
+                format!("<urn:s> <urn:p> \"{literal}\" .").into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let limit = 64 << 10;
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            ..Default::default()
+        };
+        let parsed = super::super::parse_query(
+            "SELECT ?s { ?s <urn:p> ?o FILTER EXISTS { ?s <urn:p> ?o } }",
+            None,
+            &[],
+        )
+        .unwrap();
+        let prepared =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let filter_node = &prepared.node.children[0];
+        let mut specs = Vec::new();
+        for expr in own_exprs(&filter_node.kind) {
+            expr.exists_specs(&mut specs);
+        }
+        let spec = specs[0];
+        let id = prepared
+            .ctx
+            .intern_term(&oxrdf::Literal::new_simple_literal(literal.as_str()).into());
+        assert!(matches!(id.tag(), Tag::Vocab | Tag::Delta));
+        assert!(!prepared.ctx.streams());
+        assert!(prepared.ctx.memory_remaining() < literal.len() as u64);
+        let expr = Expr::SameTerm(
+            Box::new(Expr::Var(prepared.ctx.var("o"))),
+            Box::new(Expr::Const(id)),
+        );
+        let held = prepared.ctx.charge(0).unwrap();
+        let planner =
+            super::super::plan::Planner::for_exists_with_charge(&prepared.ctx, spec, Some(&held));
+        let largest = crate::test_alloc::record_largest(|| {
+            let error = planner
+                .plan_filter_scratch(&filter_node.children[0], std::iter::once(&expr), false)
+                .err()
+                .expect("admission must refuse the wide stored term");
+            assert!(matches!(error, Error::BudgetExceeded(_)), "{error}");
+        });
+        assert!(
+            largest < literal.len(),
+            "preflight allocated {largest} bytes while sizing the description"
+        );
+        assert!(prepared.ctx.mem_peak() <= limit);
+    }
+
+    #[test]
+    fn deep_exists_filter_preflight_refuses_compact_triple_before_decoding() {
+        use crate::id::{Tag, term_key};
+        use crate::store::{Store, StoreOptions};
+        use oxrdf::{NamedNode, Term, Triple};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let levels = 32;
+        let mut term = Term::NamedNode(NamedNode::new_unchecked("x:o"));
+        for _ in 0..levels {
+            term = Triple::new(
+                NamedNode::new_unchecked("x:s"),
+                NamedNode::new_unchecked("x:p"),
+                term,
+            )
+            .into();
+        }
+        let mut txn = store.write();
+        let id = txn.intern(&term).unwrap();
+        let s = txn.intern(&NamedNode::new_unchecked("x:s").into()).unwrap();
+        let p = txn.intern(&NamedNode::new_unchecked("x:p").into()).unwrap();
+        assert!(txn.insert([s, p, id, Id::DEFAULT_GRAPH]).unwrap());
+        txn.commit().unwrap();
+        assert_eq!(id.tag(), Tag::Delta);
+
+        let limit = 64 << 10;
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            ..Default::default()
+        };
+        let parsed = super::super::parse_query("SELECT ?o { <x:s> <x:p> ?o }", None, &[]).unwrap();
+        let prepared =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let ctx = &prepared.ctx;
+        let component_vec = (3 * std::mem::size_of::<Term>()) as u64;
+        let old_decode = (term_key(&term).len() as u64) * 8 + 128;
+        let live_vectors = levels * component_vec;
+        assert!(old_decode < live_vectors);
+        let room = (old_decode + live_vectors) / 2;
+        let held = ctx.charge(ctx.memory_remaining() - room).unwrap();
+        let expr = Expr::Const(id);
+        let mut sized = Ok(0);
+        let largest = crate::test_alloc::record_largest(|| {
+            sized = expr.description_bytes(ctx);
+        });
+        assert!(
+            (largest as u64) < component_vec,
+            "description sizing allocated {largest} bytes with only {room} bytes left"
+        );
+        assert!(matches!(sized, Err(Error::BudgetExceeded(_))), "{sized:?}");
+        assert!(ctx.mem_peak() <= limit);
+        drop(held);
+        assert_eq!(
+            expr.description_bytes(ctx).unwrap(),
+            expr.display(ctx).len()
+        );
+    }
+
+    #[test]
+    fn deep_exists_auto_ask_open_skips_specs_after_strict_refusal() {
+        use super::super::exists::EXISTS_PLANS_BUILT;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+
+        #[derive(Debug)]
+        struct LegacyViews;
+        impl super::super::viewsvc::ViewSource for LegacyViews {
+            fn read_view(
+                &self,
+                _: &super::super::viewsvc::ViewRead<'_>,
+            ) -> Result<super::super::viewsvc::ViewRows> {
+                unreachable!("the untaken legacy view EXISTS is never evaluated")
+            }
+        }
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> <urn:o> .".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let query = "ASK { ?s <urn:p> ?o
+            FILTER(IF(true, true,
+                EXISTS { SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"v\" ; <urn:x-sparkles:view#bind> ?v } }
+                || EXISTS { { ?s <urn:p> ?y FILTER(isIRI(?y)) } UNION { ?s <urn:q> ?y } }
+            )) }";
+        let opts = QueryOptions {
+            views: Some(Arc::new(LegacyViews)),
+            ..Default::default()
+        };
+        for mode in [ExecutionMode::Streaming, ExecutionMode::Auto] {
+            EXISTS_PLANS_BUILT.with(|n| n.set(0));
+            let execution = query_execution_with_plan(
+                store.snapshot(),
+                query,
+                &opts,
+                &CursorOptions::default(),
+                mode,
+            )
+            .unwrap_or_else(|err| panic!("{mode:?}: {}", err.error));
+            let QueryExecution::Ask(result) = execution else {
+                panic!("{mode:?} should use the permissive ASK cursor");
+            };
+            assert!(result.value());
+            assert_eq!(
+                EXISTS_PLANS_BUILT.with(|n| n.get()),
+                1,
+                "{mode:?} planned another EXISTS after the first strict refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_exists_auto_refusal_releases_sample_workspace() {
+        use super::super::exists::EXISTS_PLANS_BUILT;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> <urn:o> .\n<urn:o> <urn:q> 7 .".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let var = format!("?v{}", "x".repeat(2_048));
+        let query = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:p> ?o FILTER EXISTS {{
+                ?o <urn:q> {var} FILTER(isLITERAL({var}))
+            }} }}"
+        );
+        let parsed = super::super::parse_query(&query, None, &[]).unwrap();
+        let limit = 2 << 20;
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            ..Default::default()
+        };
+        let prepare =
+            || super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let control = prepare();
+        fn spec(node: &Node) -> &super::super::expr::ExistsSpec {
+            let mut specs = Vec::new();
+            for expr in own_exprs(&node.kind) {
+                expr.exists_specs(&mut specs);
+            }
+            match specs.as_slice() {
+                [spec] => spec,
+                [] if node.children.len() == 1 => spec(&node.children[0]),
+                _ => panic!("expected one EXISTS"),
+            }
+        }
+        super::super::exists::unsubstituted_plan(&control.ctx, spec(&control.node)).unwrap();
+        assert!(
+            control.ctx.has_sampled(),
+            "ordinary planning must sample the FILTER"
+        );
+        drop(control);
+
+        let mut prepared = prepare();
+        let mut group = &mut prepared.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        let padded = format!("{query}\n#{}", "padding".repeat(32_000));
+        assert!(padded.len() as u64 * 16 > limit);
+        assert!(!prepared.ctx.has_sampled());
+        let baseline = prepared.ctx.live_bytes();
+        EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        let (streamed, lease) = auto_streaming_lease(
+            &prepared.ctx,
+            &prepared.node,
+            Some(&prepared.pattern),
+            &padded,
+            prepared.kind,
+            &CursorOptions::default(),
+        )
+        .unwrap();
+        assert!(!streamed && lease.is_none());
+        assert_eq!(EXISTS_PLANS_BUILT.with(|n| n.get()), 1);
+        assert!(!spec(&prepared.node).plan_cache.has_cached_plan());
+        assert_eq!(prepared.ctx.live_bytes(), baseline);
+        assert!(!prepared.ctx.has_sampled());
+    }
+
+    #[test]
+    fn deep_exists_memory_retry_refusal_does_not_sample() {
+        use super::super::exists::EXISTS_PLANS_BUILT;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> <urn:o> .\n<urn:o> <urn:q> 7 .".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snapshot = store.snapshot();
+        assert!(snapshot.delta.is_empty());
+        let query = "SELECT ?s { ?s <urn:p> ?o
+            FILTER EXISTS { ?o <urn:q> ?y FILTER(isLITERAL(?y)) } }";
+        let padded = format!("{query}\n#{}", "padding".repeat(32_000));
+        let parsed = super::super::parse_query(&padded, None, &[]).unwrap();
+        let limit = 2 << 20;
+        assert!(padded.len() as u64 * 16 > limit);
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            ..Default::default()
+        };
+        let cursor = CursorOptions::default();
+        assert!(!snapshot.counts.has_samples());
+        EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        assert!(
+            !fits_without_spill(&snapshot, &parsed, &padded, &opts, &cursor, Instant::now())
+                .unwrap()
+        );
+        assert_eq!(EXISTS_PLANS_BUILT.with(|n| n.get()), 1);
+        assert!(
+            !snapshot.counts.has_samples(),
+            "the refused retry populated the snapshot's sample cache"
+        );
+
+        query_execution_with_plan(
+            snapshot.clone(),
+            query,
+            &opts,
+            &cursor,
+            ExecutionMode::Streaming,
+        )
+        .unwrap_or_else(|err| panic!("{}", err.error));
+        assert!(
+            snapshot.counts.has_samples(),
+            "the filter must be sampleable"
+        );
+    }
+
+    #[test]
+    fn deep_exists_auto_entrypoint_pool_contention_falls_back_to_eager() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::with_capacity(70_000 * 32);
+        for i in 0..70_000 {
+            ttl.push_str(&format!("<urn:s0> <urn:e0> <urn:n{i}> .\n"));
+        }
+        ttl.push_str("<urn:n0> <urn:e1> 0 .\n");
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let mut values = String::from("VALUES ?v1 { ");
+        for i in 0..50_000 {
+            values.push_str(&format!("{i} "));
+        }
+        values.push('}');
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ <urn:s0> <urn:e0> ?v0 FILTER (IF(false, EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }}, false)) }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+
+        // Measure opening peak and cached plan size.
+        let probe_p = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &QueryOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut group = &probe_p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &group.children[0];
+        }
+        assert!(group.children[0].est >= AUTO_GROUP_ROWS);
+        let mut specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        let cached = super::super::exists::unsubstituted_plan(&probe_p.ctx, specs[0]).unwrap();
+        let cached_bytes = plan_bytes(&cached);
+        let (open_retained, open_peak) =
+            cursor_open_bytes(&probe_p.ctx, &probe_p.node, Some(&probe_p.pattern), &q).unwrap();
+        let pull_peak = open_retained.saturating_add(cursor_headroom(
+            &probe_p.ctx,
+            &probe_p.node,
+            &CursorOptions::default(),
+            true,
+        ));
+        drop(cached);
+        drop(probe_p);
+
+        // Pool-only (no per-query max_memory_bytes) with capacity aligned to QueryPool's
+        // 4 MiB GRANULE so a concurrent holder leaves exactly 1 granule (4 MiB) free:
+        // enough for speculative admission (~480 KiB) and short-circuited eager execution
+        // (~560 KiB), but NOT cursor open (from_prepared > 4.6 MiB).
+        let granule = super::super::pool::GRANULE;
+        assert!(
+            cached_bytes.saturating_add(open_peak) > granule,
+            "expected cached + open_peak ({}) > 1 granule ({granule})",
+            cached_bytes.saturating_add(open_peak)
+        );
+        let capacity = cached_bytes
+            .saturating_add(open_peak.max(pull_peak))
+            .saturating_add(granule)
+            .div_ceil(granule)
+            .saturating_mul(granule);
+        let pool = super::super::pool::QueryPool::new(capacity);
+        let opts = QueryOptions {
+            max_memory_bytes: None,
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+
+        // Confirm auto_streaming_lease admits streaming under this pool capacity.
+        let check_p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let (streamed, _) = auto_streaming_lease(
+            &check_p.ctx,
+            &check_p.node,
+            Some(&check_p.pattern),
+            &q,
+            check_p.kind,
+            &CursorOptions::default(),
+        )
+        .unwrap();
+        assert!(streamed, "pool capacity must admit cursor streaming");
+        drop(check_p);
+        assert_eq!(pool.granted(), 0);
+
+        // Occupy all but one 4 MiB granule so prepare_query + auto_streaming_lease
+        // commits prepared.ctx.streams() = true, from_prepared fails with ServerMemory,
+        // and query_execution falls back to eager execution.
+        let competitor_bytes = capacity.saturating_sub(granule);
+        let competitor = pool.empty_grant();
+        competitor.charge(competitor_bytes).unwrap();
+        assert_eq!(pool.granted(), competitor_bytes);
+
+        let cursor = CursorOptions::default();
+        let started = Instant::now();
+        let prepared = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &opts,
+            Some(started),
+            Some((&cursor, &q)),
+        )
+        .unwrap();
+        assert!(prepared.ctx.streams());
+        let kind = prepared.kind;
+        let depth = prepared.plan_depth;
+        let error = from_prepared(
+            prepared, &parsed, &q, &opts, &cursor, started, 0.0, 0.0, depth, kind,
+        )
+        .err()
+        .expect("held grant must prevent cursor opening");
+        assert!(
+            matches!(error, Error::BudgetExceeded(b) if b.kind == crate::error::BudgetKind::ServerMemory),
+            "{error:?}"
+        );
+        assert_eq!(pool.granted(), competitor_bytes);
+
+        let exec = query_execution(
+            store.snapshot(),
+            &q,
+            &opts,
+            &CursorOptions::default(),
+            ExecutionMode::Auto,
+        )
+        .expect("from_prepared ServerMemory failure must fall back to eager execution");
+        match exec {
+            QueryExecution::Eager(r) => {
+                let res = r.into_result();
+                let rows = res.rows().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows.row(0).unwrap().values()[0],
+                    Some(oxrdf::Term::Literal(oxrdf::Literal::from(0i64)))
+                );
+            }
+            QueryExecution::Select(_) => {
+                panic!(
+                    "expected pre-output eager fallback after from_prepared ServerMemory failure"
+                )
+            }
+            _ => panic!("expected SELECT execution"),
+        }
+        assert_eq!(
+            pool.granted(),
+            competitor_bytes,
+            "query must release all pool bytes after eager fallback"
+        );
+        drop(competitor);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_planned_to_built_transfers_metadata_charge_without_double_charge() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> <urn:y0> .\n<urn:n1> <urn:e1> <urn:y0> .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+
+        // 16,000 filter-only (`risky`) variables => 64 KiB for `Vec<VarId>`.
+        let risky_count = 16_000usize;
+        let mut cond = String::with_capacity(risky_count * 8);
+        for i in 0..risky_count {
+            if i > 0 {
+                cond.push_str(", ");
+            }
+            cond.push_str(&format!("?r{i}"));
+        }
+        let q = format!(
+            "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> <urn:y0> FILTER(?v0 IN ({cond})) }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+
+        // Measure the exact live bytes in State::Planned (AdmitMeta + cached plan) and the
+        // metadata vector size.
+        let probe_p = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &QueryOptions::default(),
+            Some(Instant::now()),
+            None,
+        )
+        .unwrap();
+        let probe_filter = &probe_p.node.children[0];
+        let mut probe_specs = Vec::new();
+        for e in own_exprs(&probe_filter.kind) {
+            e.exists_specs(&mut probe_specs);
+        }
+        let probe_spec = probe_specs[0].clone();
+        let probe_in_vars = probe_filter.children[0].vars.clone();
+        let probe_in_cert = probe_filter.children[0].certain.clone();
+        let probe_plan = super::super::exists::keyed_plan(
+            &probe_p.ctx,
+            &probe_spec,
+            &probe_in_vars,
+            &probe_in_cert,
+            None,
+        )
+        .unwrap()
+        .expect("expected admitted keyed plan");
+        let cached_plan_bytes = plan_bytes(&probe_plan);
+        let clone_bytes = cloned_plan_bytes(&probe_plan);
+        drop(probe_plan);
+        drop(probe_spec);
+        drop(probe_p);
+
+        let risky_vec_bytes = (risky_count * std::mem::size_of::<VarId>()) as u64;
+        assert!(risky_vec_bytes >= 64_000);
+
+        // Test both cursor (`build_streaming`) and attached eager (`build`) transitions:
+        // pre-populate `PlanCache` (plan + admit) as automatic admission does, then cap
+        // `ctx.mem_limit` to fit `State::Planned` (cached plan + 1x AdmitMeta) + 1x
+        // transferred `(keyed, risky)` + build/drain overhead, while strictly below 3x
+        // `risky_vec_bytes` so a double-charge in `prepare` + `build`/`build_streaming`
+        // would reject the key set.
+        let pattern = match &parsed {
+            spargebra::Query::Select { pattern, .. } => pattern,
+            _ => unreachable!(),
+        };
+        for streaming in [true, false] {
+            let pool = super::super::pool::QueryPool::new(16 << 20);
+            let opts = QueryOptions {
+                pool: Some(pool.clone()),
+                ..Default::default()
+            };
+            let mut ctx = super::super::Ctx::new(store.snapshot());
+            ctx.set_grant(opts.query_grant());
+            let mut ctx = Arc::new(ctx);
+            let mut planner = super::super::plan::Planner::new(&ctx);
+            let node = planner
+                .plan(
+                    pattern,
+                    &super::super::plan::ActiveGraph::Default,
+                    Vec::new(),
+                )
+                .unwrap();
+            let filter_node = &node.children[0];
+            let mut specs = Vec::new();
+            for e in own_exprs(&filter_node.kind) {
+                e.exists_specs(&mut specs);
+            }
+            let spec = specs[0].clone();
+            let in_vars = filter_node.children[0].vars.clone();
+            let in_cert = filter_node.children[0].certain.clone();
+            // Populate speculative caches (uncharged while unattached) using a temporary
+            // admission guard so `unsubstituted_plan`'s shallow pre-estimate does not
+            // inflate `mem_peak` before we test `State::Planned -> State::Built`.
+            {
+                let admission = ctx.charge(0).unwrap();
+                let planned = super::super::exists::keyed_plan(
+                    &ctx,
+                    &spec,
+                    &in_vars,
+                    &in_cert,
+                    Some(&admission),
+                )
+                .unwrap()
+                .expect("expected admitted keyed plan");
+                drop(planned);
+                drop(admission);
+            }
+            // In streaming mode, `Filter::next` also reserves `ctx.nvars() * 16` scratch
+            // alongside the drain clone while `State::Planned` and `Build` coexist.
+            let overhead = if streaming {
+                cached_plan_bytes
+                    .saturating_add(clone_bytes)
+                    .saturating_add((ctx.nvars() as u64).saturating_mul(16))
+                    .saturating_add(16 << 10)
+            } else {
+                cached_plan_bytes.saturating_add(16 << 10)
+            };
+            // `2 * risky_vec_bytes + overhead` fits `plan.meta` (1x) + transferred
+            // `(keyed, risky)` (1x), plus `risky_vec_bytes / 2` slack (< 3x).
+            let limit = overhead
+                .saturating_add(risky_vec_bytes.saturating_mul(2))
+                .saturating_add(risky_vec_bytes / 2);
+            // Now install the tight byte-exact limit and attach the context with charged
+            // cached plan + AdmitMeta (matching post-admission State::Planned).
+            {
+                let mutable = Arc::get_mut(&mut ctx).expect("unique ctx before attach");
+                mutable.mem_limit = limit;
+                if streaming {
+                    mutable.enable_cursor_accounting().unwrap();
+                }
+            }
+            ctx.attach_owner();
+            super::super::exists::charge_cached_plans(&ctx, &node, None).unwrap();
+
+            let filter_expr = match &filter_node.kind {
+                Kind::Filter(exprs) => &exprs[0],
+                _ => panic!("expected Filter"),
+            };
+            let v0 = ctx.var("v0");
+            let n0 = ctx.intern_term(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                "urn:n0",
+            )));
+            let mut batch = Table::new(vec![v0]);
+            batch.push_row(&[n0]);
+
+            // Force decorrelation so the single-row batch transitions State::Untried ->
+            // State::Planned (consuming cached AdmitMeta) -> State::Built immediately.
+            struct ResetForce(bool);
+            impl Drop for ResetForce {
+                fn drop(&mut self) {
+                    super::super::exists::FORCE.with(|f| f.set(self.0));
+                }
+            }
+            let _reset_force = ResetForce(super::super::exists::FORCE.with(|f| f.replace(true)));
+            let before_peak = ctx.mem_peak();
+            assert_eq!(
+                super::super::exists::mask(&ctx, &batch, filter_expr).unwrap(),
+                Some(vec![false]),
+            );
+            assert!(ctx.mem_peak() <= limit.max(before_peak));
+            drop(_reset_force);
+            assert!(
+                spec.decor.is_built(),
+                "streaming={streaming}: State::Planned -> State::Built must succeed without double-charging risky metadata"
+            );
+            assert!(
+                ctx.live_bytes() >= risky_vec_bytes,
+                "streaming={streaming}: Build must retain metadata charge (>= {risky_vec_bytes}), got {}",
+                ctx.live_bytes()
+            );
+            assert!(
+                ctx.live_bytes() < risky_vec_bytes.saturating_mul(2),
+                "streaming={streaming}: Build must release State::Planned charge after transition, got {}",
+                ctx.live_bytes()
+            );
+
+            drop(spec);
+            drop(node);
+            // Cursor-mode vocabulary prefetch retains idle optional headroom on the
+            // decode envelope until cursor work teardown releases it.
+            ctx.release_work();
+            assert_eq!(ctx.live_bytes(), 0);
+            drop(ctx);
+            assert_eq!(pool.granted(), 0);
+        }
     }
 }

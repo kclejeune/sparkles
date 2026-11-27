@@ -230,8 +230,8 @@ fn accounts_for_root(kind: &AxiomKind) -> bool {
     }
     match kind {
         AxiomKind::Declaration(_) | AxiomKind::AnnotationAssertion(..) => false,
-        // a set that collapsed, as `owl:members ( A A )` does, has lost its meaning
         AxiomKind::DisjointClasses(s) => s.len() >= 2,
+        AxiomKind::DisjointUnion(_, s) => s.len() >= 2,
         AxiomKind::DisjointObjectProperties(s) => s.len() >= 2,
         AxiomKind::DisjointDataProperties(s) => s.len() >= 2,
         _ => true,
@@ -558,14 +558,10 @@ impl Ontology {
             v::OWL_SAME_AS | v::OWL_DIFFERENT_FROM => {
                 let o = term_individual(&t.object)?;
                 let s = subject_individual();
-                if p != v::OWL_SAME_AS && s == o {
-                    return None;
-                }
-                let set: BTreeSet<Individual> = [s, o].into_iter().collect();
                 if p == v::OWL_SAME_AS {
-                    AxiomKind::SameIndividual(set)
+                    AxiomKind::SameIndividual([s, o].into_iter().collect())
                 } else {
-                    AxiomKind::DifferentIndividuals(set)
+                    AxiomKind::DifferentIndividuals([s, o].into())
                 }
             }
             p if v::is_reserved(p) && builtin_kind(p).is_none() => return None,
@@ -2452,10 +2448,7 @@ impl<'a> Parser<'a> {
             }
             v::OWL_DISJOINT_WITH => {
                 let (a, b) = ce2(self, &mut ts)?;
-                if a == b {
-                    return None;
-                }
-                AxiomKind::DisjointClasses([a, b].into_iter().collect())
+                AxiomKind::DisjointClasses([a, b].into())
             }
             v::OWL_DISJOINT_UNION_OF => {
                 let Term::NamedNode(c) = &s else { return None };
@@ -2464,16 +2457,16 @@ impl<'a> Parser<'a> {
                 }
                 let list = self.list(&o)?;
                 ts.extend(list.triples);
-                let mut set = BTreeSet::new();
+                let mut items = Vec::with_capacity(list.value.len());
                 for item in &list.value {
                     let ce = self.class_expression(item)?;
                     ts.extend(ce.triples);
-                    set.insert(ce.value);
+                    items.push(ce.value);
                 }
-                if set.len() < 2 {
+                if items.len() < 2 {
                     return None;
                 }
-                AxiomKind::DisjointUnion(Class(c.clone()), set)
+                AxiomKind::DisjointUnion(Class(c.clone()), items.into())
             }
             v::RDFS_SUB_PROPERTY_OF => {
                 if let (Some(a), Some(b)) = (self.ope(&s), self.ope(&o)) {
@@ -2518,24 +2511,18 @@ impl<'a> Parser<'a> {
                 if let (Some(a), Some(b)) = (self.ope(&s), self.ope(&o)) {
                     ts.extend(a.triples);
                     ts.extend(b.triples);
-                    if !eq && a.value == b.value {
-                        return None;
-                    }
-                    let set = [a.value, b.value].into_iter().collect();
                     if eq {
-                        AxiomKind::EquivalentObjectProperties(set)
+                        AxiomKind::EquivalentObjectProperties(
+                            [a.value, b.value].into_iter().collect(),
+                        )
                     } else {
-                        AxiomKind::DisjointObjectProperties(set)
+                        AxiomKind::DisjointObjectProperties([a.value, b.value].into())
                     }
                 } else if let (Some(a), Some(b)) = (self.dpe(&s), self.dpe(&o)) {
-                    if !eq && a == b {
-                        return None;
-                    }
-                    let set = [a, b].into_iter().collect();
                     if eq {
-                        AxiomKind::EquivalentDataProperties(set)
+                        AxiomKind::EquivalentDataProperties([a, b].into_iter().collect())
                     } else {
-                        AxiomKind::DisjointDataProperties(set)
+                        AxiomKind::DisjointDataProperties([a, b].into())
                     }
                 } else {
                     return None;
@@ -2611,14 +2598,10 @@ impl<'a> Parser<'a> {
                 }
                 let a = self.individual(&s)?;
                 let b = self.individual(&o)?;
-                if p != v::OWL_SAME_AS && a == b {
-                    return None;
-                }
-                let set = [a, b].into_iter().collect();
                 if p == v::OWL_SAME_AS {
-                    AxiomKind::SameIndividual(set)
+                    AxiomKind::SameIndividual([a, b].into_iter().collect())
                 } else {
-                    AxiomKind::DifferentIndividuals(set)
+                    AxiomKind::DifferentIndividuals([a, b].into())
                 }
             }
             v::OWL_COMPLEMENT_OF | v::OWL_UNION_OF | v::OWL_INTERSECTION_OF | v::OWL_ONE_OF => {
@@ -2960,43 +2943,43 @@ impl<'a> Parser<'a> {
         ts.extend(list.triples);
         let kind = match ty {
             v::OWL_ALL_DISJOINT_CLASSES => {
-                let mut set = BTreeSet::new();
+                let mut items = Vec::with_capacity(list.value.len());
                 for item in &list.value {
                     let c = self.class_expression(item)?;
                     ts.extend(c.triples);
-                    set.insert(c.value);
+                    items.push(c.value);
                 }
-                AxiomKind::DisjointClasses(set)
+                AxiomKind::DisjointClasses(items.into())
             }
             v::OWL_ALL_DISJOINT_PROPERTIES => {
-                let mut ops = BTreeSet::new();
+                let mut ops = Vec::with_capacity(list.value.len());
                 let mut opts = Vec::new();
                 for item in &list.value {
                     match self.ope(item) {
                         Some(e) => {
                             opts.extend(e.triples);
-                            ops.insert(e.value);
+                            ops.push(e.value);
                         }
                         None => break,
                     }
                 }
                 if ops.len() == list.value.len() {
                     ts.extend(opts);
-                    AxiomKind::DisjointObjectProperties(ops)
+                    AxiomKind::DisjointObjectProperties(ops.into())
                 } else {
-                    let mut dps = BTreeSet::new();
+                    let mut dps = Vec::with_capacity(list.value.len());
                     for item in &list.value {
-                        dps.insert(self.dpe(item)?);
+                        dps.push(self.dpe(item)?);
                     }
-                    AxiomKind::DisjointDataProperties(dps)
+                    AxiomKind::DisjointDataProperties(dps.into())
                 }
             }
             _ => {
-                let mut set = BTreeSet::new();
+                let mut items = Vec::with_capacity(list.value.len());
                 for item in &list.value {
-                    set.insert(self.individual(item)?);
+                    items.push(self.individual(item)?);
                 }
-                AxiomKind::DifferentIndividuals(set)
+                AxiomKind::DifferentIndividuals(items.into())
             }
         };
         Some((kind, ts))

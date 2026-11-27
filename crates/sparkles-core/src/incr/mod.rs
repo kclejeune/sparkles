@@ -10,6 +10,7 @@
 //! that ask the same question with the same access, keeps the [`views`] defined in the
 //! dataset, and checkpoints their state ([`persist`]).
 
+pub(crate) mod budget;
 pub mod circuit;
 pub mod compile;
 pub mod fixpoint;
@@ -40,6 +41,8 @@ mod prov_tests;
 mod runtime_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window_tests;
 
 pub use circuit::{Circuit, DeltaSet};
 pub use compile::{Compiled, Kind, compile};

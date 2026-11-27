@@ -1,103 +1,66 @@
-# Querying capabilities
+# Querying
 
-This page describes the available capabilities and their current limits. The
-[capability matrix](../FEATURES.md#capability-status) records delivery status within
-each stated scope.
+Sparkles evaluates SPARQL 1.1 and 1.2 queries and updates over compressed quad indexes, adding Apache Jena ARQ extensions, federated `SERVICE` calls, automatic streaming with disk spill, incremental views, and formatting and linting tools. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+
+| Section | What it covers |
+|---|---|
+| [Standards conformance](#standards-conformance) | W3C, Jena, SHACL, ShEx, and GeoSPARQL test suite coverage. |
+| [SPARQL queries and updates](#sparql-queries-and-updates) | Language support, aggregate error modes, ARQ extensions, federation, execution, explain, and incremental views. |
+| [Command line](#command-line) | Database subcommands and Jena-compatible file tools in the `sparkles` binary. |
+| [Formatter and editor support](#formatter-and-editor-support) | `sparkles fmt`, `sparkles lint`, `sparkles lsp`, and browser formatting. |
+| [Configuration and usage](#configuration-and-usage) | Links to CLI, HTTP API, and editor configuration guides. |
+| [Known gaps](#known-gaps) | Unsupported ARQ features, numeric and string edge cases, and execution or view limits. |
 
 ## Standards conformance
 
-Sparkles runs the W3C and community test suites in its own harness. `mise run test:w3c`,
-`test:shacl` and `test:shex` run them, as [DEVELOPMENT.md](../DEVELOPMENT.md) describes.
+Sparkles runs the W3C and community conformance suites in its own harness through `mise run test:w3c`, `mise run test:shacl`, and `mise run test:shex` ([DEVELOPMENT.md](../DEVELOPMENT.md)). The parser is a vendored, patched `spargebra` ([`vendor/spargebra/PATCHED.md`](../../vendor/spargebra/PATCHED.md)).
 
-| Standard | Result |
+| Standard | Coverage |
 |---|---|
 | SPARQL 1.1 Query | All 328 W3C tests pass. |
 | SPARQL 1.1 Update | All 157 W3C tests pass. |
 | SPARQL 1.0 | All 482 W3C tests pass. |
 | SPARQL 1.2 | All 269 tests pass. |
 | Jena SPARQL-CDTs | All 655 tests of Jena's composite datatype suite pass. |
-| Jena ARQ property functions | All of ARQ's PropertyFunctions tests pass. |
+| Jena ARQ property functions | All of ARQ's `PropertyFunctions` tests pass. |
 | SHACL Core and SHACL-SPARQL | All 98 Core tests and all 20 SPARQL tests of the W3C suites pass. |
-| SHACL 1.2 | The eight list constraint tests and all 146 node expression tests pass. |
-| SHACL Compact Syntax | Every test pair of the Working Group's suite reads and writes back to the expected graph. |
-| ShEx 2.2 | Every syntax, structure and representation test of shexTest passes, and 99.9% of the validation tests. The 42 tests that check blank-node labels are skipped. |
-| GeoSPARQL 1.1 | 37 of Oxigraph's 44 tests pass, and the other 7 are listed with reasons. Tests derived from Jena's also pass. |
-| Apache Jena | Jena's contract tests pass on the `sparkles-jena` dataset, and Jena's HTTP clients are tested against the server. |
+| SHACL 1.2 | All 8 list constraint tests and all 146 node expression tests pass. |
+| SHACL Compact Syntax | Every Working Group test pair reads and writes back to the expected graph. |
+| ShEx 2.2 | All syntax, structure, and representation tests of `shexTest` pass, along with 99.9% of validation tests; 42 tests that check blank-node labels are skipped. |
+| GeoSPARQL 1.1 | 37 of Oxigraph's 44 tests pass, and the remaining 7 are documented with reasons. Tests derived from Jena also pass. |
+| Apache Jena | Jena's contract tests pass on `sparkles-jena`, and Jena's HTTP clients are tested against the server. |
 
-The query evaluation tests of these SPARQL, CDT, property function and GeoSPARQL suites
-also pass with `execution=streaming`, through the cursors that a streamed query uses.
-`mise run test:w3c:streaming` runs that pass alone and reports, for each suite, the
-queries that fall back to eager execution for an operator the cursors do not stream.
+Query evaluation tests for SPARQL, CDTs, property functions, and GeoSPARQL also pass under `execution=streaming`. Running `mise run test:w3c:streaming` executes that pass alone and reports which queries fall back to eager execution for operators that cursors do not stream.
 
-A test-only reference evaluator that follows the SPARQL algebra literally, with no part
-of the engine but the parser, answers every SPARQL 1.0, 1.1 and 1.2 query evaluation
-test. The seeded differential queries and the optimizer tests compare the engine's
-answers with it, in eager and streaming execution.
+A test-only reference evaluator that interprets the parsed SPARQL algebra directly answers every SPARQL 1.0, 1.1, and 1.2 evaluation test. Seeded differential queries and optimizer tests check both eager and streaming execution against this reference.
 
-The SPARQL parser is a vendored, patched `spargebra`
-([`vendor/spargebra/PATCHED.md`](../../vendor/spargebra/PATCHED.md)).
-
+The comparison keeps constants and copied terms exact. When STR, STRDT, STRLANG or STRLANGDIR carries a computed number's spelling, another spelling of the same value can compare partially. The source numeric datatype determines which spellings are valid, and the result's datatype, language tag and base direction must match. Ordering uses the engine's spelling when the returned bindings establish the sort key. When a key depends on an unobserved spelling, the comparison checks the preceding constraints and reports the order or slice as unchecked. String transformations and expressions that choose rows or aggregate values are evaluated using the reference's spelling.
 
 ## SPARQL queries and updates
 
-Queries and updates follow the W3C recommendations and Jena ARQ's extensions, and tests
-check them against the W3C suites and Jena's own answers.
+Queries and updates follow the W3C recommendations and selected Apache Jena ARQ extensions.
 
 ### Query and update language
 
-* SPARQL 1.1 Query covers BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries,
-  GROUP BY and aggregates, ORDER BY, DISTINCT, LIMIT and OFFSET, and EXISTS.
-* SPARQL 1.1 Update covers INSERT DATA, DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR,
-  DROP, CREATE, ADD, COPY and MOVE.
-* RDF 1.2 and SPARQL 1.2 work in every RDF syntax. This covers triple terms
-  (`<<( s p o )>>`), the reification syntax `<< >>`, annotations, base-direction literals
-  such as `"x"@en--rtl`, and the functions `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`,
-  `isTRIPLE`, `LANGDIR`, `hasLANG`, `hasLANGDIR` and `STRLANGDIR`.
-* The property paths `p*`, `p+` and `p?` run as a breadth-first search over the index,
-  starting from the side the join input binds.
-* The value space follows the specification for numeric promotion, comparisons, effective
-  boolean values and the total order of ORDER BY.
-* Pure BIND expressions that read one variable can reuse their results across cursor
-  batches. The query owns and budgets the cache, preserving RDF term identity and
-  expression errors. Admission uses observed repetition and bounded snapshot statistics.
-  Sparse reuse can remain rowwise. Volatile expressions and application callbacks run per
-  row. Roadmap [item 293](../ROADMAP.md).
-* The function library has the SPARQL 1.1 built-ins, the XSD casts, including the
-  derived integer types with their ranges, `anyURI` and the Gregorian types, and ARQ's
-  `fn:`, `afn:` and `math:` functions ([API.md](../API.md#extension-functions-and-aggregates)).
-  Examples are `fn:round-half-to-even`, `fn:format-number`, `fn:apply`, the duration
-  accessors, timezone adjustment, `fn:normalize-unicode`, `afn:sprintf` and
-  `afn:sha1sum`, as well as ARQ's arithmetic on dates, times and durations. Tests compare
-  them with Jena's answers.
-* Jena ARQ's statistical aggregates `MEDIAN`, `MODE`, `STDEV`, `STDEV_SAMP`, `STDEV_POP`,
-  `VARIANCE`, `VAR_SAMP` and `VAR_POP` work with `DISTINCT`, as keywords, by their `agg:`
-  and `afn:` IRIs and through `AGG <iri>(…)`. Their results, types, empty groups and errors
-  match ARQ's.
-* Results come as JSON, XML, CSV, TSV and `x-sparkles+json`, which includes the executed
-  plan. Graphs come as Turtle, N-Triples, N-Quads, TriG, JSON-LD and RDF/XML, and as
-  Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
+* **SPARQL 1.1 Query and Update.** Query evaluation covers basic graph patterns, `OPTIONAL`, `UNION`, `MINUS`, `FILTER`, `BIND`, `VALUES`, subqueries, `GROUP BY` with aggregates, `ORDER BY`, `DISTINCT`, `LIMIT` and `OFFSET`, and `EXISTS`. Updates cover `INSERT DATA`, `DELETE DATA`, `DELETE/INSERT WHERE`, `LOAD`, `CLEAR`, `DROP`, `CREATE`, `ADD`, `COPY`, and `MOVE`.
+* **RDF 1.2 and SPARQL 1.2.** Triple terms (`<<( s p o )>>`), reification syntax (`<< >>`), annotations, base-direction literals such as `"x"@en--rtl`, and the functions `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, `LANGDIR`, `hasLANG`, `hasLANGDIR`, and `STRLANGDIR` work across every RDF syntax.
+* **Property paths and value semantics.** The path operators `p*`, `p+`, and `p?` run as breadth-first searches over the indexes starting from whichever side the join input binds. Numeric promotion, comparisons, effective boolean values, and the total order of `ORDER BY` follow the specification.
+* **Built-in and ARQ functions.** The function library includes all SPARQL 1.1 built-ins, XSD casts (including derived integer ranges, `anyURI`, and Gregorian types), and ARQ's `fn:`, `afn:`, and `math:` libraries ([API.md](../API.md#extension-functions-and-aggregates)). Examples include `fn:round-half-to-even`, `fn:format-number`, `fn:apply`, duration accessors, timezone adjustment, `fn:normalize-unicode`, `afn:sprintf`, `afn:sha1sum`, and ARQ arithmetic on dates, times, and durations.
+* **Statistical aggregates.** ARQ's `MEDIAN`, `MODE`, `STDEV`, `STDEV_SAMP`, `STDEV_POP`, `VARIANCE`, `VAR_SAMP`, and `VAR_POP` support `DISTINCT` and can be called as keywords, by their `agg:` and `afn:` IRIs, or through `AGG <iri>(…)`. Results, return types, empty groups, and error behavior match ARQ.
+* **Single-variable `BIND` memoization.** Pure `BIND` expressions reading one variable can reuse results across cursor batches inside a query-owned, budgeted cache while preserving RDF term identity and expression errors. Admission uses observed repetition and bounded snapshot statistics so sparse inputs remain rowwise; volatile expressions and application callbacks always run per row (roadmap [item 293](../ROADMAP.md)).
+* **Result and graph formats.** Solution sets serialize as JSON, XML, CSV, TSV, SPARQL Results Thrift, and `x-sparkles+json` (which embeds the executed plan). Graphs serialize as Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML, TriX, RDF Thrift, RDF Protobuf, and RDF/JSON.
 
 ### Aggregate errors
 
-SPARQL leaves room for more than one answer when an argument of MIN, MAX, AVG or
-GROUP_CONCAT is an error, such as a variable that OPTIONAL leaves unbound. Each query
-runs under one of three readings, and `jena` is the default on every surface.
+SPARQL permits different answers when an argument to `MIN`, `MAX`, `AVG`, or `GROUP_CONCAT` evaluates to an error, such as an unbound variable produced by `OPTIONAL`. Every query runs under one of three modes, with `jena` as the default across all interfaces.
 
-| Reading | `MIN(?v)` and `MAX(?v)` with an unbound `?v` | AVG when every argument is an error | `GROUP_CONCAT` over an IRI or a number |
+| Mode | `MIN(?v)` and `MAX(?v)` with an unbound `?v` | `AVG` when every argument is an error | `GROUP_CONCAT` over an IRI or number |
 |---|---|---|---|
-| `jena` | Unbound, as in Apache Jena. | Unbound. | The lexical form. |
-| `sparkles` | The bound values decide. | Unbound. | The lexical form. |
-| `spec` | MIN is unbound and the bound values decide MAX. | `0`. | Unbound. |
+| `jena` | Unbound, matching Apache Jena ARQ. | Unbound. | Uses the lexical form. |
+| `sparkles` | Bound values decide the result. | Unbound. | Uses the lexical form. |
+| `spec` | `MIN` is unbound; bound values decide `MAX`. | Returns `0`. | Unbound. |
 
-The `jena` reading matches ARQ on every aggregate over unbound values, type errors,
-groups of errors alone and empty groups, which a fixture of ARQ's own answers checks. It
-also makes `GROUP_CONCAT(DISTINCT …)` over no rows unbound, as ARQ does, where the other
-readings give `""`. The `sparkles` reading is how the engine answered before the setting
-existed. The `spec` reading takes the text of SPARQL 1.1 and 1.2 literally. MIN and MAX
-order the values as ORDER BY does, which puts errors first. AVG divides Sum by Count, and
-Count leaves errors out. GROUP_CONCAT applies CONCAT, which takes only strings. Under
-every reading an error makes SUM, AVG and GROUP_CONCAT unbound, while COUNT and SAMPLE
-pass over it.
+The `jena` mode matches ARQ on unbound values, type errors, all-error groups, and empty groups, including making `GROUP_CONCAT(DISTINCT …)` over zero rows unbound rather than `""`. The `sparkles` mode skips unbound inputs in `MIN` and `MAX`. The `spec` mode follows the literal SPARQL 1.1 and 1.2 algebra, where `ORDER BY` places errors before values, `AVG` divides `SUM` by a count that ignores errors, and `GROUP_CONCAT` requires string inputs. Under all three modes, an error makes `SUM`, `AVG`, and `GROUP_CONCAT` unbound, while `COUNT` and `SAMPLE` ignore errors.
 
 ```sparql
 SELECT ?person (MAX(?age) AS ?oldest)
@@ -105,532 +68,130 @@ WHERE { ?person :child ?c . OPTIONAL { ?c :age ?age } }
 GROUP BY ?person
 ```
 
-For a parent with one child of unknown age, `?oldest` is unbound under `jena`, while
-`sparkles` and `spec` give the greatest age present. `MIN(?age)` would be unbound under
-`spec` too. A query that wants the values present can ask for the `sparkles` reading,
-or compute the aggregate in a subquery that matches `:age` outside OPTIONAL and join
-that subquery with OPTIONAL, which gives the same answer under every reading.
+For a parent with one child whose age is unknown, `?oldest` is unbound under `jena`, while `sparkles` and `spec` return the greatest known age (`MIN(?age)` is unbound under `spec` as well). To obtain the bound maximum regardless of mode, either request `sparkles` or compute the aggregate in a subquery outside `OPTIONAL` and join the subquery optionally.
 
-A query chooses its reading with the `aggregate-errors` request parameter, the library's
-`QueryOptions::aggregate_errors`, the Python keyword `aggregate_errors`, the Node.js
-option `aggregateErrors`, the JVM context symbol `Sparkles.AGGREGATE_ERRORS`, the MCP
-argument `aggregateErrors` or the command line's `--aggregate-errors`. Without one it takes
-the dataset's setting at `/$/aggregate-errors/{ds}`, and a dataset without a setting
-takes the server's default, which `sparkles serve --aggregate-errors` sets. A Fuseki
-configuration sets both with the context symbol `aggregateErrors`
-(`urn:x-sparkles:symbol#aggregateErrors`), in the server's context or a dataset's, and
-the JVM assembler sets a dataset's with `sparkles:aggregateErrors`. Materialized
-views and live queries follow the dataset's reading and evaluate again when it changes. A
-query that names another reading evaluates a view's query from the data and does not
-read the view's maintained state, and its plan says so. [Aggregate
-errors](../API.md#aggregate-errors) in the API reference gives the routes.
+Select a mode per request with the HTTP parameter `aggregate-errors`, Rust `QueryOptions::aggregate_errors`, Python `aggregate_errors`, Node.js `aggregateErrors`, JVM context symbol `Sparkles.AGGREGATE_ERRORS`, MCP argument `aggregateErrors`, or CLI `--aggregate-errors`. When omitted, queries inherit the dataset setting at `/$/aggregate-errors/{ds}`, which falls back to `sparkles serve --aggregate-errors`. Fuseki configurations set both levels through `urn:x-sparkles:symbol#aggregateErrors`, and the JVM assembler uses `sparkles:aggregateErrors`. Materialized views and live queries follow the dataset setting and recompute when it changes; a query specifying a different mode bypasses a view's maintained state and notes that in its plan ([API.md](../API.md#aggregate-errors)).
 
-The engine's own queries choose the `sparkles` reading where a group mixes rows with and
-without a value, so their answers do not change with the dataset's setting. These are the
-MCP memory tools' queries, the GraphRAG build's choice of a fact's reifier, and the web
-UI's list of memory agents and its nearby-features panel.
-
-Fuseki users get the answers they had from Jena. Users of earlier Sparkles releases see
-MIN and MAX become unbound where an argument was unbound or an error, and can set
-`sparkles` on a dataset or on the server to keep the earlier answers.
+Internal engine queries that aggregate over optional fields explicitly select `sparkles` so their behavior is independent of dataset settings. This applies to MCP memory queries, GraphRAG reifier selection, the web UI's memory-agent list, and the nearby-features panel.
 
 ### Jena ARQ extensions
 
-* ARQ's syntax extensions are accepted by default, as Fuseki accepts them
-  ([API.md](../API.md#arq-syntax-extensions), [G06](../specs/G06-arq-query-extensions.md)).
-  `LATERAL` substitutes each outer solution into its group and runs as a join when
-  substitution cannot change the result. Path ranges such as `p{n,m}` count each way
-  through the graph, as ARQ does. CONSTRUCT templates with `GRAPH` blocks return quads.
-  `LET`, `SEMIJOIN`, `ANTIJOIN` and the paths `distinct(…)`, `multi(…)` and `:p^:q` follow
-  ARQ's evaluation, and Jena 6.2.0's answers check them.
-* Jena's composite datatypes `cdt:List` and `cdt:Map` follow Jena 5 and 6, with their
-  literals, equality and order, the 16 `cdt:` functions, the `FOLD` aggregate and the
-  `UNFOLD` operator. A blank node label inside a literal names the same node as that label
-  in the literal's file or query.
-* ARQ's property function library is supported ([API.md](../API.md#arqs-property-functions)).
-  It has `list:member`, `list:index` and `list:length` over RDF collections, `apf:container`,
-  `apf:bag`, `apf:seq`, `apf:alt` and `rdfs:member` over RDF containers, and `apf:strSplit`,
-  `apf:concat`, `apf:str`, `apf:splitIRI`, `apf:assign`, `apf:bnode` and
-  `apf:versionARQ`. A call reads the variables that earlier patterns bind, as in ARQ.
-  `rdfs:member` acts as an ordinary triple pattern while the store holds no container.
-* DESCRIBE is configurable ([API.md](../API.md#describe)). The default is the W3C concise
-  bounded description, read from each graph as Jena's default handler reads them and
-  extended with the reifiers that annotate the described triples. `scbd` adds the triples that point at
-  the resource, and `outgoing` keeps only the resource's own triples. Options add labels
-  of linked IRIs and limit the size and depth. A dataset keeps its setting through
-  `/$/describe/{ds}` and `sparkles describe-settings`, and a request can choose another.
-  A streamed DESCRIBE describes the new resources of each batch of solutions as the
-  batch arrives, so its first triples come before the WHERE clause has finished. The
-  resources, triples and nodes it has seen stay in memory under the query's budget, and
-  the labels of linked IRIs come last. When `maxTriples` cuts a streamed description
-  short, the triples kept can differ from the eager ones, because the resources are
-  described in the order the batches name them.
+* **Syntax extensions.** ARQ syntax extensions are enabled by default ([API.md](../API.md#arq-syntax-extensions), [G06](../specs/G06-arq-query-extensions.md)). `LATERAL` substitutes each outer solution into its inner group and runs as a join when substitution cannot alter the result. Path ranges such as `p{n,m}` count distinct walks as ARQ does. `CONSTRUCT` templates with `GRAPH` blocks produce quads. `LET`, `SEMIJOIN`, `ANTIJOIN`, `distinct(…)`, `multi(…)`, and `:p^:q` follow ARQ evaluation and are checked against Jena 6.2.0.
+* **Composite datatypes.** `cdt:List` and `cdt:Map` follow Jena 5 and 6, including literal equality and ordering, all 16 `cdt:` functions, the `FOLD` aggregate, and the `UNFOLD` operator. Blank node labels inside composite literals resolve to the same blank node as labels in the enclosing file or query.
+* **Property functions.** Supported ARQ property functions ([API.md](../API.md#arqs-property-functions)) include `list:member`, `list:index`, and `list:length` for RDF collections; `apf:container`, `apf:bag`, `apf:seq`, `apf:alt`, and `rdfs:member` for RDF containers; and `apf:strSplit`, `apf:concat`, `apf:str`, `apf:splitIRI`, `apf:assign`, `apf:bnode`, and `apf:versionARQ`. Calls read variables bound by preceding patterns, and `rdfs:member` acts as an ordinary triple pattern when no container exists in the store.
+* **Configurable `DESCRIBE`.** The default mode returns a W3C concise bounded description read per graph (matching Jena's default handler) extended with reifiers annotating described triples ([API.md](../API.md#describe)). Alternative modes are `scbd` (adding incoming triples) and `outgoing` (direct outgoing triples only), with options to include labels of linked IRIs and cap triple count or depth. Configure dataset defaults at `/$/describe/{ds}` or with `sparkles describe-settings`, or override per request. Streamed `DESCRIBE` emits triples per input batch as solutions arrive while keeping seen resources, triples, and nodes within the query memory budget and emitting linked-IRI labels last; if `maxTriples` truncates a streamed description, the retained triples can differ from eager execution because resources arrive in batch order.
 
 ### Federated queries
 
-* SERVICE, with SILENT, runs under an outbound network policy
-  ([USAGE.md](../USAGE.md#outbound-requests-service-and-load)). A server allows only public
-  destinations by default, while the local `query` and `update` commands can also reach
-  private ones. The policy has allowlists, DNS pinning, checked redirects, timeouts and a
-  response ceiling.
-* Jena's service enhancer options work on SERVICE
-  ([API.md](../API.md#service-options-loop-bulk-and-cache),
-  [G10](../specs/G10-service-enhancer.md)). `loop:` runs a SERVICE once per solution of the
-  patterns before it. `bulk+n:` sends `n` solutions per request and retries one at a time
-  when an endpoint cuts a response short. `cache:` keeps each solution's remote result in a
-  per-dataset cache with a memory budget, separate for each caller, with `cache+clear` and
-  `cache+off`. `urn:x-arq:self` reads the dataset itself.
+`SERVICE` and `SERVICE SILENT` run through the server's outbound network policy ([USAGE.md](../USAGE.md#outbound-requests-service-and-load)). By default, `sparkles serve` permits only public network destinations, whereas local `sparkles query` and `sparkles update` commands may also contact private addresses. The policy enforces host allowlists, DNS pinning, validated redirects, request timeouts, and response size ceilings.
+
+Jena's service enhancer options work on `SERVICE` clauses ([API.md](../API.md#service-options-loop-bulk-and-cache), [G10](../specs/G10-service-enhancer.md)):
+
+* `loop:` invokes the remote endpoint once per incoming solution.
+* `bulk+n:` batches `n` solutions per remote request and retries individual solutions if the endpoint truncates a batch response.
+* `cache:` stores per-solution results in a budgeted, per-dataset cache partitioned by caller, with `cache+clear` and `cache+off` controls.
+* `urn:x-arq:self` queries the local dataset itself.
 
 ### Planning and execution
 
-* The planner estimates joins from statistics that a bulk load or compaction counts:
-  the characteristic sets of subjects and of nodes over both directions, each with a
-  remainder for the nodes outside the 32,768 sets kept, and key probes of small inputs.
-  It uses them for stars, joins on an object, the links of chains and joins on several
-  keys, and estimates other joins from distinct values
-  ([internals](../internals/OPTIMIZATIONS.md#further-scan-and-filter-optimizations)).
-  Statistics written before node sets existed keep the earlier estimates until the next
-  bulk load or full compaction.
-* The planner can move a small basic graph pattern into the branches of a pure UNION, so
-  that each branch uses its bindings to choose a join order. It keeps duplicates and
-  FILTER scope, and it keeps the ordinary plan when that plan is estimated to be cheaper.
-  This avoids enumerating unrelated coauthor walks in SP²Bench `q8` and `q12b`.
-* A VALUES table joined with a UNION moves into each branch, so that each branch looks up
-  the table's rows by index instead of reading its whole pattern. The table also moves
-  into a `GRAPH` that holds a UNION and through a BIND or FILTER whose expression reads
-  none of its variables or only variables that the pattern under it always binds. A table
-  stays outside a BIND or FILTER that reads a variable an OPTIONAL, a MINUS or one UNION
-  branch may leave unbound, outside a `GRAPH ?g` when it binds `?g`, and outside a FILTER
-  that reads one of its UNDEF cells. It also stays outside a BIND or FILTER that calls
-  `RAND`, `UUID`, `STRUUID`, `BNODE` or a custom function, and outside a UNION that holds
-  a SERVICE, a LATERAL or a property function call. At most 10,000 rows move, and at most
-  20,000 over all the copies made for the branches and for the named graphs of a
-  `GRAPH ?g`.
-* A LIMIT without OFFSET passes through projections and BINDs into a SERVICE that reads
-  no input, whose remote query is then sent with that limit. It also reaches a full-text
-  search with a constant query string, which keeps only that many of its best hits, so
-  the LIMIT is answered even when the search matches more than `maxHits`.
-* An EXISTS or NOT EXISTS that is a FILTER conjunct, a BIND expression or an OPTIONAL
-  condition is answered from a key set of its pattern, built once per query, when the
-  pattern costs less than evaluating it for each distinct outer key. A row is evaluated
-  on its own when it binds a variable that a FILTER inside the pattern reads and the
-  pattern under that FILTER may leave unbound. An EXISTS inside a larger expression, such
-  as IF or OR, an aggregate argument or an ORDER BY key, is answered from the same key
-  set. Every row is probed before the expression is evaluated, also a row on which the
-  expression does not reach the EXISTS. Under the ordinary admission of a SELECT,
-  automatic execution may stream a plan with an EXISTS in a FILTER, a BIND, an aggregate
-  argument or an ORDER BY key unless the pattern calls a SERVICE or the EXISTS is nested
-  more than four levels deep. It keeps an OPTIONAL whose condition holds an EXISTS eager,
-  because the cursor's conditional merge is slower than the eager one at higher fan-out,
-  which roadmap item 570 covers. A strict cursor runs such an OPTIONAL.
-* An ASK and a LIMIT without ORDER BY pull their input through cursor operators in
-  every execution mode, so each operator reads its inputs a batch at a time and stops
-  once the query has the rows it asks for. A LIMIT over a single scan, a `spk:hasPredicate`
-  scan or a table of values reads the rows directly. The planner runs a small input whole instead, as a SELECT
-  does, when exact index counts show that none of its operators gives more rows than a
-  cursor batch of 4,096, it evaluates no FILTER, BIND or keyed join condition, the
-  query has no budget of produced rows and its estimated cost past the first rows is below what building the
-  cursor operators costs, which is about eight microseconds. A whole run that a row or
-  memory budget refuses pulls the input instead. Automatic execution then
-  keeps such an ASK eager, and an EXISTS pattern evaluated per row runs whole by the same
-  test. A UNION under such a LIMIT, or under an ASK, reads its branch
-  with the lowest estimated cost to the first rows first, unless a branch evaluates an
-  EXISTS, an extension or application function, RAND, UUID or BNODE, or holds an
-  operator such as SERVICE whose effects could observe the order. An ASK or a `LIMIT 1`
-  over a keyed join reads both inputs a few rows at a time, and over a product it streams
-  the larger input against the smaller one, which it holds. A FILTER without effects
-  whose rows do not pass asks its input for four times as many rows each time, up to
-  eight cursor batches, when the query has no budget of produced rows. It evaluates its
-  condition on rows past the first solutions, so a memory budget that one of those rows
-  exceeds refuses the query, and the `grow_input` optimization switch turns this
-  read-ahead off. Pulled first rows still cost more than the eager path in some shapes,
-  such as a `LIMIT 10` over a join of two 3,000-row patterns at about 1.17 times, which
-  [roadmap item 952](../ROADMAP.md) follows up.
-* A LIMIT over an inner hash join builds the hash index of one whole input before its
-  first row, so a `LIMIT 1` over the join of two inputs of 65,537 rows needs about 7 MB.
-  A join that reads both inputs a few rows at a time for a small LIMIT is
-  [roadmap item 947](../ROADMAP.md). A pulled LIMIT charges its operators' batches to the
-  query's memory ledger, as a streaming query does, and each charge takes the ledger's
-  lock. A small LIMIT over a join takes 50 to 100 of them.
-* A query has one plan whatever its execution mode, which EXPLAIN shows. A DISTINCT over
-  an ORDER BY deduplicates below the sort in every mode when the query may spill, and
-  `spk:hasPredicate` reads the predicate patterns a block of subjects at a time in every
-  mode.
-* A cursor DISTINCT keeps its set in buffers whose memory charge is their allocation
-  ([X19](../specs/X19-charged-buffers/README.md)), so the set is admitted before it grows
-  and a set that may spill stops growing while the operators above it still have room.
-  It fits every budget it fitted when the set was charged by formulas, and some smaller
-  ones. Two streamed DISTINCT queries of two columns take 0.8% and 3.3% longer than
-  before, which [roadmap item 1237](../ROADMAP.md) holds.
-* An OPTIONAL whose sides share no variable, but whose condition contains `?a = ?b` with
-  one variable from each side, pairs its rows through that equality instead of forming
-  their product ([internals](../internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4
-  million candidate pairs where the product had 1.6 × 10¹² rows.
-* Groups linked only by a FILTER equality also join through candidate keys and test the
-  full condition on those pairs. Large ASK queries read the inputs alternately and stop
-  at the first qualifying pair. They retain prefixes of both inputs while both can
-  produce rows, then discard obsolete history when either input ends.
-* A triple pattern with one free variable can bind it during planning when a bounded
-  snapshot read proves that the pattern has exactly one row. This makes other patterns
-  and numeric FILTER bounds constant while preserving the result variables. Volatile
-  filters, application callbacks and algebra boundaries retain the ordinary plan.
-* An index join can use a bound second variable to skip incompatible rows within an
-  already-read key range. It preserves input order, duplicate solutions and unbound
-  matches, and retains all compatibility checks when the secondary ordering cannot be used.
-* Queries can run eagerly or as streaming cursors
-  ([X05](../specs/X05-streaming-query-execution.md)). Automatic execution, the default over
-  HTTP, in the CLI, in Node and in the JVM library, streams scans expected to return at
-  least a thousand rows, groupings of an estimated 20,000 input rows or more and every
-  ASK without initial bindings. Other plans run eagerly, and
-  `execution=eager` or `execution=streaming` overrides the choice. Both modes join
-  through the same hash, keyed and merge primitives, so an OPTIONAL over two inputs
-  sorted on their one shared variable, which both bind, merges in both when
-  `merge_left_join` is on and hashes in both when it is off, a hash join's OPTIONAL
-  condition is tested once over each chunk of candidate pairs rather than over the
-  whole product, and EXPLAIN names the algorithm that ran in either mode. The cursor
-  also merges on a leading variable that is certainly bound when the inputs share
-  further variables. The two modes test a merge OPTIONAL's condition in separate
-  implementations, eager execution over all of the matched pairs at once and the cursor
-  over each batch's pairs. In the measured OPTIONALs over `foaf:knows`, with about 2.5
-  pairs per left row, the cursor took 1.18 to 1.36 times the eager time.
-* Both modes group through one operator. COUNT, SUM, AVG, MIN, MAX, SAMPLE,
-  GROUP_CONCAT, ARQ's variance and standard-deviation aggregates and their DISTINCT forms
-  keep one running state per group, on one key or several and with expression arguments,
-  and EXPLAIN marks a grouping whose aggregates all do so `[incremental]` in either mode.
-  FOLD, registered aggregates, `MEDIAN`, `MODE` and the other custom aggregates read the
-  whole rows of each group.
-* Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
-  library pulls SELECT results. Result writers use bounded buffers with backpressure and
-  stop when the client disconnects.
-* Native SELECT output and standard JSON, XML, CSV and TSV solution responses of at
-  most 65,536 rows check a complete decoded row before writing its cells. Row storage
-  and decoded terms retain query memory credit while they are written. A required
-  memory refusal stops output with its original local or shared-pool budget error and
-  preserves the count of earlier complete rows. Native output holds one decoded row
-  rather than one cell, so a tight budget can refuse the additional live storage.
-  Ownership across public results, native buffers, reasoners and views remains in
-  [roadmap item 675](../ROADMAP.md).
-* Streaming joins run batch by batch with column kernels. ORDER BY with LIMIT keeps only
-  its best rows in a bounded heap. A cursor filter over an index scan filters whole blocks
-  in parallel, and a range top-k ranks its range a part at a time. FOLD and registered
-  aggregates read their input in group-key order, through a stable sort on the keys that
-  can spill when the input does not arrive that way. They hold the rows of the group
-  they have not finished and at most a batch more. A full sort and the
-  shapes the cursor does not support materialize within the budget and fail explicitly
-  when they exceed it.
-* Under `execution=streaming`, text, hybrid, history and spatial searches whose
-  arguments come from their input, vector searches with a variable query and remote
-  LATERAL loops run over each input batch and keep their caps, their requests and their
-  cache across batches as one eager call does. A vector or hybrid search whose
-  candidates come from its input, a path search under a limit and an algorithm call over
-  their group or a nested edge pattern read that input under the memory budget, run
-  once and serve their answer batch by batch. Searches bounded by `k`, `maxHits` or a
-  limit argument, constant algorithm calls and count joins answer once into a charged
-  table. EXPLAIN states for each such operator
-  that it reads its whole input or what bounds its answer. A SERVICE, a view read, a
-  spatial scan or relation over constants, a spatial join, a search without a bound and
-  a property function over constants and a registered property function without
-  prefix output still need materialization, so
-  the strict policy refuses them and automatic execution runs them eagerly, as
-  [roadmap item 829](../ROADMAP.md) tracks. Automatic execution runs every kind in this
-  list eagerly until a same-host measurement admits it.
-* A cursor scan keeps its place inside an index block between batches without charging
-  the block to the query, since the block cache holds its decoded columns, and it
-  decodes the block again when the cache has dropped it. A scan inside a plan therefore
-  takes the same memory under every budget. A cursor whose root is a scan hands out a
-  block's rows without copying them when the budget leaves room for a whole block, and
-  those batches are charged the block's decoded columns while the scan reads the block
-  or any of them is held, so a cursor stopped inside such a block keeps it charged until
-  it is closed. The
-  decoding of a large term beside such a batch can be refused under a budget at which a
-  copy would answer, which [roadmap item 1051](../ROADMAP.md) holds.
-* `FILTER(?x < ?y)` and the other order comparisons of two columns of stored simple
-  literals, over a table or cursor batch of at least 4,096 rows, read the strings' order
-  from their vocabulary ids and each string's floor in both modes, so neither column is
-  decoded. The workers keep the floors they compute in one shared table of a cache that
-  lasts the query and grows when repeated strings evict each other, charged to its
-  budget and capped at 64 MiB or a sixteenth of the budget, which trades that memory for
-  not computing a repeated string's floor again. Once the cache is full, the floors it
-  lacks are computed each time. The comparison covers simple literals of the base
-  vocabulary. When one of the first 64 rows holds another value, the whole table or
-  batch takes the generic comparison, and a later row with another value takes it alone.
-  In streaming execution, the measured `str-pair-colleague`, whose strings rarely
-  repeat, runs 4.2% slower than before roadmap item 1069 with one thread and 6.5% slower
-  with 12, which [roadmap item 1088](../ROADMAP.md) recovers.
-* Property path closures run within the query's memory budget and timeout in both
-  executors. A closure counts its visited set, its frontier and the edge relation of a
-  sequence or alternative path against the budget, and the walk checks the deadline while
-  it scans and between index lookups. A path with two unbound ends reads its start nodes a
-  few thousand at a time from the indexes, and under an `ASK` or a `LIMIT` it stops once
-  it has the rows it needs. A closure over an alternative of predicates and inverse
-  predicates, such as `(ex:p|^ex:q)*`, walks from a bound or constant end by index
-  lookups. With two unbound ends, such an alternative still reads its whole edge relation
-  first, and the full closure of a large graph exceeds the budget or the timeout with the
-  usual error rather than finishing.
-* Disk spill lets large queries finish within their memory budget
-  ([X08](../specs/X08-disk-spill-and-server-memory.md)). `serve` spills by default,
-  `--spill off` turns it off, and `--spill encrypted` encrypts the files. An embedded
-  store spills when `QueryOptions::spill` holds a spill directory.
-  * A streamed sort without LIMIT writes sorted runs and merges them. A grouping or a
-    DISTINCT keeps what fits and handles the rest in later passes over hash-partitioned
-    files. Every row of a group lands in the same pass, so one group's own state, such
-    as a large DISTINCT set or GROUP_CONCAT text, must fit the budget by itself.
-  * A hash join whose build input outgrows its share partitions both inputs by key, up to
-    three levels, and joins a heavy key as a block nested loop. A merge join spools a long
-    run of equal keys to a file. A spilled join restores its probe input's order only for
-    an operator above that relies on it, which a grouping of COUNT, SUM, AVG, MIN and MAX
-    does not.
-  * A DISTINCT over input ordered on some of its columns holds the rows of one run of the
-    first order column at a time, with or without spill.
-  * `--spill encrypted` seals every frame with AES-256-GCM under a per-file key held only
-    in memory. Spill files are versioned, CRC-checked, unnamed while written and removed
-    with their query or process.
-  * Disk is reserved per query with `--query-spill-mb` or `spill-mb=`, and for the server
-    with `--spill-max-mb`. With spill on, an eager hash join, OPTIONAL, semi join, anti
-    join or MINUS whose hash table does not fit the budget partitions its two inputs to
-    disk through the cursor's join and gives the same answer, an eager `[incremental]`
-    grouping whose groups do not fit runs as the cursor's grouping and spills in
-    partitions, automatic execution streams
-    a query that eager execution would hold in more than half its budget, and it reruns
-    an eager query that exceeds its budget as a cursor unless it calls SERVICE.
-  * With `--spill on` or `encrypted`, the server refuses to start with an unusable spill
-    directory, one on tmpfs or ramfs, or one that other users can write. With the default,
-    it logs a warning and runs without spill.
+#### Cost estimation and algebraic rewrites
+
+* **Strict vocabulary decoding.** Eager and streaming operators charge for decoding vocabulary values. A refused decode fails the request with its memory budget error. An optional `FILTER` selectivity sample that cannot fit releases its working memory and leaves the planner to estimate the filter from its usual defaults.
+* **Join cardinality estimation.** Bulk loads and compactions record subject and bidirectional node characteristic sets (up to 32,768 sets plus a remainder) alongside key probes for small inputs. The planner uses these statistics for star joins, object joins, chain links, and multi-key joins, falling back to distinct-value estimates elsewhere ([OPTIMIZATIONS.md](../internals/OPTIMIZATIONS.md#further-scan-and-filter-optimizations)). Datasets built before node sets were stored keep earlier estimates until the next bulk load or compaction.
+* **Single-row constant binding.** When a bounded snapshot read proves that a single-variable triple pattern has exactly one matching row, the planner binds that value during planning so downstream patterns and numeric filters become constant while preserving projected variables. Volatile filters, callbacks, and algebra boundaries keep the standard plan.
+* **Pushdown into `UNION` and `VALUES`.** A small basic graph pattern can be pushed into the branches of a pure `UNION` when cheaper, preserving duplicates and `FILTER` scope (avoiding large coauthor scans in SP²Bench `q8` and `q12b`). `VALUES` tables joined with a `UNION` also push into branches, into `GRAPH` blocks wrapping a `UNION`, and through safe `BIND` or `FILTER` layers, subject to limits of 10,000 rows per table and 20,000 total copied rows. Pushdown is skipped when a `FILTER` or `BIND` reads potentially unbound or `UNDEF` values, calls volatile or custom functions (`RAND`, `UUID`, `STRUUID`, `BNODE`), binds `?g` in `GRAPH ?g`, or when the `UNION` contains `SERVICE`, `LATERAL`, or property functions.
+* **`LIMIT` pushdown.** A `LIMIT` without `OFFSET` pushes through projections and `BIND` into an input-free `SERVICE` query and into constant-string full-text searches, so `LIMIT` is satisfied even when a search matches more than `maxHits`.
+* **Equality-linked `OPTIONAL` and `FILTER` joins.** An `OPTIONAL` whose sides share no variable but whose condition includes `?a = ?b` joins on that equality instead of forming a cross product (reducing SP²Bench `q6` at 10M from 1.6 × 10¹² product rows to 7.4 million candidate pairs). Groups connected only by a `FILTER` equality similarly join through candidate keys, and large `ASK` queries read both sides alternately to stop at the first matching pair.
+* **`EXISTS` and `NOT EXISTS`.** `EXISTS` in `FILTER` conjuncts, `BIND`, `OPTIONAL` conditions, larger expressions (`IF`, `OR`), aggregate arguments, or `ORDER BY` keys can be answered from a per-query key set when cheaper than probing per outer key. Rows binding variables read by an inner `FILTER` over a potentially unbound inner pattern fall back to per-row evaluation. Probing precedes short-circuit expression evaluation, so rows that do not reach `EXISTS` in an `IF` or `OR` are still probed. Automatic execution streams plans containing `EXISTS` in filters, `BIND`, aggregates, or `ORDER BY` at any supported nesting depth when no nested pattern calls `SERVICE`, while keeping `OPTIONAL` conditions containing `EXISTS` eager until conditional merge fan-out costs improve (roadmap [item 570](../ROADMAP.md)).
+* **Secondary index-key skipping and string comparisons.** Index joins can use a bound second variable to skip incompatible rows within an already-read key range without changing order or duplicate semantics. Order comparisons such as `FILTER(?x < ?y)` between two columns of base-vocabulary simple literals for batches of at least 4,096 rows compare vocabulary ids and floor values without decoding strings. Floor lookups use the vocabulary's stored shared prefix length within a block. A query-scoped shared floor table validates an initial sample left to right before reserving memory, sizes its initial capacity from a stratified sample of the first eligible mask within the vocabulary clamp, cache cap and remaining memory budget, and copies live entries directly into the replacement table when it grows so lookups probe only the current table. The cache uses at most 64 MiB or one-sixteenth of the query memory budget, and [item 1088](../ROADMAP.md) follows the cost of lookups on strings that rarely repeat.
+* **Property path budgets.** Closure walks charge their visited set, frontier, and edge relations to the query memory budget and check deadlines continuously. Two-unbound-end paths stream start nodes in batches and stop early under `ASK` or `LIMIT`. Predicate/inverse alternatives such as `(ex:p|^ex:q)*` walk by index lookups from any bound end; with both ends unbound they materialize their edge relation within the budget and timeout.
+
+#### Eager execution, streaming cursors, and early-stop queries
+
+Queries compile to a single plan shape regardless of execution mode ([X05](../specs/X05-streaming-query-execution.md)). Automatic execution, the default across HTTP, CLI, Node.js, and the JVM, streams scans estimated at 1,000 rows or more, groupings estimated at 20,000 input rows or more, plans expected to exceed half the query memory budget when spill is enabled, and every `ASK` without initial bindings. Smaller plans run eagerly. Pass `execution=eager` or `execution=streaming` to override automatic selection.
+
+* **Early-stop `ASK` and unordered `LIMIT`.** `ASK` and `LIMIT` without `ORDER BY` pull batches through cursor operators in every execution mode and stop once enough rows are produced. A `LIMIT` over a single scan, `spk:hasPredicate`, or `VALUES` reads rows directly. Small plans (at most 4,096 rows per operator, no `FILTER`, `BIND`, or keyed join condition, no produced-row budget, and lower estimated cost than cursor setup) run eagerly instead, falling back to pull if a budget refuses eager execution. Under `ASK` or unordered `LIMIT`, a pure `UNION` runs its cheapest branch first, keyed joins read both sides incrementally, and side-effect-free `FILTER`s ramp their input batch size by 4× up to 8 batches (disable with the `grow_input` switch). Note that a `LIMIT` above an inner hash join still builds one whole hash side first (about 7 MB for 65,537 rows; roadmap [item 947](../ROADMAP.md)), and pulled small `LIMIT`s over medium joins can cost slightly more than eager evaluation due to memory-ledger locking (roadmap [item 952](../ROADMAP.md)).
+* **Shared join and grouping operators.** Both eager and cursor modes share the same hash, keyed, and merge join kernels and the same grouping operator. `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `SAMPLE`, `GROUP_CONCAT`, and ARQ variance/standard-deviation aggregates (including `DISTINCT` forms) maintain incremental per-group state and appear as `[incremental]` in `EXPLAIN`. `FOLD`, `MEDIAN`, `MODE`, and registered custom aggregates sort their input by group key (spilling if needed) and process one group at a time.
+* **Conditional merge `OPTIONAL`.** When `merge_pair_conditions` is enabled (the default), eligible single-key conditional merge `OPTIONAL` cursors evaluate the condition over right-batch pairs before copying output rows, excluding queries with registered callbacks, volatile or timezone-sensitive expressions, `SERVICE`, or unknown functions inside `EXISTS`. This reduces streamed `OPTIONAL` runtime by roughly 6% to 26% on measured workloads at the cost of up to one output batch plus pair-testing scratch memory.
+* **Block-cache scans and charged buffers.** Cursor scans track their position inside cached index blocks without charging the block to the query; a root scan may hand out zero-copy batches while holding the block's decoded columns charged until the cursor closes (roadmap [item 1051](../ROADMAP.md)). Cursor `DISTINCT` stores its set in allocation-charged buffers ([X19](../specs/X19-charged-buffers/README.md)) so spilling triggers before hitting the memory ceiling; two-column streamed `DISTINCT` queries pay a 0.8% to 3.3% overhead (roadmap [item 1237](../ROADMAP.md)).
+* **Streamed path searches.** Under `execution=streaming`, `SERVICE path:search` without `path:limit` streams through a resumable reader for all four algorithms, with constant or variable endpoints, group inputs and nested edge patterns. The reader charges its search state and any group or edge-pattern input to the memory budget. Plans report `fullInputBeforeOutput` when the reader consumes a group or nested edge pattern. Over a group input, the reader emits each discovered path across matching rows as it finds the path. Results preserve the eager multiset, `pathIndex` numbering and search counters. Without `ORDER BY`, row order can vary among group rows that share an endpoint.
+* **Streamed service, text, history, spatial, and property-function readers.** Under `execution=streaming`, non-`SILENT` `SERVICE` streams remote rows as they arrive, while `SILENT SERVICE` buffers answers under the memory budget so endpoint failures become one empty solution while control, policy, and budget errors still propagate. Unbounded constant-query text searches decode hits page by page, and unbounded history queries page whole commits while pinning commit retention until the cursor closes. GeoSPARQL scans, joins, relations, and nearest-neighbour queries run natively, vector `ORDER BY` queries fall back to streaming scans when fewer than `k` rows have scores, and leaf ARQ property functions stream collections, containers, `rdfs:member`, and `apf:strSplit` tokens under the memory budget. Input-driven extension operators run batch by batch across input rows, while bounded searches, constant graph algorithms, and count joins materialize once within the budget. Strict streaming refuses only late-head non-`SILENT` `SERVICE` responses (roadmap [item 1125](../ROADMAP.md)), user-registered property functions without `prefix_output`, and legacy `ViewSource` implementations without versioned streaming.
+* **Result streaming and backpressure.** Rust, Python, and Node.js expose snapshot-owning `SELECT` and graph cursors, and the JVM pulls `SELECT` batches. All result formats use shared columnar writers across eager and cursor paths (including streamed SPARQL Results Thrift) and cancel when the client disconnects. On HTTP, pool-routed cursors open and serialize in one blocking task, eligible automatic cursors drain in place up to 1 MiB before handing off the cursor and buffered prefix to a streaming task, and explicit `execution=streaming` stays on the blocking pool for early first-batch commit and immediate cancellation on disconnect. Each active streamed HTTP response uses a bounded 16-entry channel (up to 64 KiB per post-switch chunk, trading up to 768 KiB of queued bytes per stream to avoid stalling the producer). Standard `SELECT` responses up to 65,536 rows validate each complete decoded row under query memory credit before writing, preserving exact row counts on budget refusal (roadmap [item 675](../ROADMAP.md)). Rust callers using `sparql::results::write_with_completion` can run a post-write completion check (such as `LimitedWriter::check_completion`) without extra I/O, noting that cursor streams and Jena graph/Thrift formats flush the underlying writer before the callback runs.
+
+#### Disk spill
+
+Disk spill lets large queries finish within their memory budget ([X08](../specs/X08-disk-spill-and-server-memory.md)). `sparkles serve` enables spill by default; `--spill off` disables it, and `--spill encrypted` seals every spill frame with AES-256-GCM under a per-file in-memory key. Embedded stores enable spill by setting a directory on `QueryOptions::spill`. Spill files are versioned, CRC-checked, unnamed while open, and deleted when the query or process ends.
+
+* **Spilling operators.** Streamed full sorts write and merge sorted runs. `GROUP BY` and `DISTINCT` spill overflow rows into hash-partitioned passes, though a single group's own state (such as a large `DISTINCT` set or `GROUP_CONCAT` string) must still fit the memory budget. Hash joins whose build side exceeds its share partition both inputs up to three levels deep and fall back to block nested loops for heavy keys; merge joins spool long equal-key runs. `DISTINCT` over partially ordered input holds one run of the leading order column at a time, and `DISTINCT` over `ORDER BY` pushes below the sort when spilling is enabled.
+* A spilling hash grouping charges SUM and AVG subtotals as they grow. When a subtotal cannot grow within the pass's memory share, the grouping writes the remaining arguments for that subtotal to disk and folds them in order before emitting the result.
+* **Eager fallback and disk budgets.** With spill on, an eager hash join, `OPTIONAL`, semi-join, anti-join, `MINUS`, or `[incremental]` grouping that outgrows memory falls back to the spilling cursor operator, and automatic execution retries an over-budget eager query as a cursor unless it calls `SERVICE`. Cap per-query disk usage with `--query-spill-mb` or `spill-mb=`, and server-wide spill with `--spill-max-mb`.
+* **Startup safety.** With explicit `--spill on` or `--spill encrypted`, the server refuses to start if the spill directory is unusable, sits on `tmpfs` or `ramfs`, or is world-writable. With the default setting, the server logs a warning and runs without spill.
 
 ### Explaining queries
 
-* Every node of a returned plan has an id and its path from the root, and the estimated,
-  eager and streamed plans have the same shape
-  ([USAGE.md](../USAGE.md#explaining-a-query), [API.md](../API.md#explaining-a-query)). Nodes
-  say when they did not run and why, when a `LIMIT` stopped them, how often they reran,
-  which filters a scan applied itself, and when a result came from the cache.
-* Finite HTTP response bodies have a separate 60-second idle limit, configured with
-  `serve --stream-idle-timeout`. It runs while application output or its final end is
-  ready but unread, and pauses while the engine has nothing ready. An optional
-  `--stream-transfer-timeout` bounds the whole transfer, even when it keeps progressing.
-  These limits observe uncompressed application chunks rather than remote receipt.
-  Expiry aborts the transfer and requests cancellation. Actual producer owners remain
-  until work stops, and only a successful transfer is a complete answer. The settings
-  also cover finite Graph Store, diff and changes bodies. See [server settings](../USAGE.md).
-* A response that the result-size budget stops after its first bytes, eager or streamed,
-  first sends what its writer had buffered and then aborts the transfer. The access log
-  and the metrics count the rows whose bytes the response writer accepted, which are the
-  rows a client that keeps reading receives. When the client has stopped reading, that
-  last send waits only as long as the idle limit, and if it fails the report leaves out
-  its bytes but still counts the rows of that last chunk.
-* A query that a budget or its timeout stopped keeps its plan in the error body of the
-  `application/x-sparkles+json` format.
-* `POST /{ds}/sparql/explain` explains an estimated plan, a read-only run or a plan the
-  client gives. Its notes cover the slowest operator, misestimates, blowups, late filters,
-  large sorts, open paths, skipped nodes and the budget, together with a description of
-  what the query asks, all computed without a model. A configured `explain` model role can
-  rewrite them as prose, which the server checks against the plan. MCP's `explain_query`
-  takes `profile`, `notes` and `useServerModel`, which needs the `serverModels` grant.
+* **Unified plan output.** Every plan node carries an id and a path from the root, with identical shapes across estimated, eager, and streamed plans ([USAGE.md](../USAGE.md#explaining-a-query), [API.md](../API.md#explaining-a-query)). The Rust estimator applies initial bindings from `QueryOptions` before planning scans and joins. Nodes report skipped execution, `LIMIT` stops, re-execution counts, pushed-down scan filters, and cache hits. A query stopped by a budget or timeout includes its partial plan in the `application/x-sparkles+json` error body.
+* **Automated plan diagnostics.** `POST /{ds}/sparql/explain` inspects an estimated plan, a read-only run, or a client-supplied plan without calling a language model. Its notes identify the slowest operator, cardinality misestimates, join blowups, late filters, large sorts, open property paths, skipped nodes, and budget pressure, plus a summary of what the query asks. When an `explain` model role is configured, the server can rewrite those notes into prose and check the result against the plan. The MCP `explain_query` tool accepts `profile`, `notes`, and `useServerModel` (requiring the `serverModels` grant).
+* **HTTP stream timeouts and result-size truncation.** Finite streamed query, Graph Store, diff, and change responses enforce a 60-second idle timeout (`--stream-idle-timeout`), which ticks only while ready output goes unread, and an optional total transfer ceiling (`--stream-transfer-timeout`). Expiry aborts the transfer and requests query cancellation. If the response-size budget halts output after the first bytes are sent, the server flushes buffered bytes before aborting and records only the rows handed to the transport in access logs and metrics.
 
 ### Incremental views and live queries
 
-* Incremental views and live queries ([API.md](../API.md#incremental-views), spec [F13](../specs/F13-incremental-views-and-provenance.md) Phase 1). A `table` view keeps a SELECT or CONSTRUCT query's result current after every commit, through a circuit of Z-set operators compiled from the query that joins each commit's net changes against the store's own indexes. Basic graph patterns, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, `EXISTS` with and without correlation, `VALUES`, `DISTINCT`, subqueries, `GROUP BY` with `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE`, `HAVING` and property paths are maintained, and other operators are evaluated again as `recompute` nodes. `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE` keep each group's values as an ordered multiset, 16 bytes per distinct value, so removing a value costs one search. A view's `GROUP_CONCAT` lists a group's values in their `ORDER BY` order, where a one-off query lists them in the order its rows arrive, and its `SAMPLE` keeps its value while the group holds it. A correlated `EXISTS` is evaluated by the query engine for the rows a change can touch, found by matching the changed quads against the condition's triple patterns, and for every row when the condition has a pattern without an outer variable or a property path. A commit that misses a view's patterns skips it. Queries read a view with `SERVICE view:read`, and `GET /{ds}/live` streams a query's result and then its changes as server-sent events, resuming after a commit with `Last-Event-ID`. Views and live queries with the same query and access share one circuit. On a dataset with RDFS on read or materialized inferences in the default graph, a view or live query evaluates its whole query again with them at each commit that touches it, so it answers as the one-off query does, and the view's state reports `evaluation: recompute`. Turning either setting on or off switches existing views and live queries between the two modes without detaching them. View state is checkpointed and recovered from the change log, views read as their principal, and `Dataset::views`, `Dataset::live`, `sparkles views`, `sparkles query --live` and Python's `Dataset.views` and `Dataset.live` expose them.
-* Property paths in views ([F13 §4.3](../specs/F13-incremental-views-and-provenance.md#fixed-point-operator)). A path with `+` or `*` over a step of IRIs, inverses, sequences and alternatives is maintained by a fixed-point operator that keeps each reachable pair with the one derivation that first reached it. After a commit only the walks that reach a changed step are followed again. A deleted step removes exactly the pairs that no other path still reaches, so cycles and self-loops need no recomputation, and the zero-length rows of `*` follow the active graph's nodes without state. Paths with constant ends, inverses, `GRAPH` with a constant or a variable, and paths inside `EXISTS`, `NOT EXISTS`, `MINUS` and `OPTIONAL` are covered. The operator's state takes about 40 bytes for each reachable pair on top of the view's rows, and a view with a path checkpoints in `VIEW_STATE` format 2. With a provenance setting a path row reports one real witness, the quads of the path that reached it first. Paths with `?`, negated property sets, nested closures or a closure inside a sequence are still `recompute` nodes ([measurements](../benchmarks/writes/RESULTS.md#property-path-views)).
-* Internal circuits ([F13 §3.6](../specs/F13-incremental-views-and-provenance.md#internal-circuits)). Server code, or an embedding application through `Dataset::attach_internal`, can attach a circuit that no user defined. It keeps a query's rows, or counts the changed facts per key in each commit, so that a fact added and removed later counts 2, a replacement within one commit counts 2 and a deletion counts 1, as the change feed lists them. The counts after any commit they cover are exact, and a commit whose changes are not known is reported as unknown. An internal circuit has no definition file, no entry in the list of views, no rows in `SERVICE view:read` and no route, binding or MCP tool, and it is checkpointed under `circuits/` and recovered from the change log like a view.
-* Provenance annotations
-  ([F13 §5](../specs/F13-incremental-views-and-provenance.md#provenance-annotations)). A
-  circuit that keeps rows can annotate each row with `count`, `lineage` or `why`, the
-  images of the row's provenance polynomial over the input quads. `count` is the number of
-  derivations. `lineage` lists every input quad, or condition, that some derivation uses.
-  `why` keeps the row's witnesses, each a set of quads that derives it, bounded by
-  `maxWitnesses` (8 by default) and reported minimal and smallest first. Joins multiply
-  annotations, and unions, projections, `DISTINCT` and groups add them. A row that
-  `MINUS`, `NOT EXISTS` or an unmatched `OPTIONAL` keeps has a negative condition in its
-  witnesses, which names the operator and the bindings that must have no match. Quads are
-  named by a 128-bit `FactKey` over their terms' vocabulary keys, which survives
-  compaction and resolves back to the quad through the circuit's snapshot. Deletions are
-  exact, since every coefficient is a signed count. A `why` row whose witnesses did not
-  fit in the bound is reported as truncated. Its witnesses are then real but may not be
-  all. The row is exact again once the extra derivations are removed, or after a rebuild
-  when its supports fit the bound. Rows of a `recompute` node, and triples of a CONSTRUCT
-  template with blank nodes, are truncated with no known witnesses. Internal circuits take
-  the setting through `InternalSpec::with_provenance` and read the rows with
-  `annotated_rows()`. An annotated pass costs little more than a plain one, but `lineage`
-  can make a state up to 80 times larger and `why` up to 8 times, and an annotated build
-  matches its patterns with index probes, which takes seconds for a large join
-  ([measurements](../benchmarks/writes/RESULTS.md#provenance-annotations)). Views do not
-  take it, and `view:witness` and `view:why` are planned. Roadmap item 429.
+Incremental views and live queries keep query results up to date after commits ([API.md](../API.md#incremental-views), [F13](../specs/F13-incremental-views-and-provenance.md)).
 
+* **Maintained table views and SSE live queries.** A `table` view compiles a `SELECT` or `CONSTRUCT` query into a Z-set operator circuit that joins each commit's net changes against the store indexes. Supported incremental operators include BGPs, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, correlated and uncorrelated `EXISTS`, `VALUES`, `DISTINCT`, subqueries, `GROUP BY` (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`), `HAVING`, and supported property paths; unsupported operators run as `recompute` nodes. `MIN`, `MAX`, `GROUP_CONCAT`, and `SAMPLE` store per-group values in an ordered multiset (16 bytes per distinct value), so `GROUP_CONCAT` orders values by `ORDER BY` order and `SAMPLE` keeps a value while it remains present. Commits that touch none of a view's patterns skip the view. Queries read views with `SERVICE view:read`, and `GET /{ds}/live` streams initial results and incremental diffs over server-sent events with `Last-Event-ID` resume. Identical queries under identical caller access share one circuit, and view state checkpoints and recovers from the change log. On datasets with RDFS on read or materialized inferences in the default graph, views automatically switch to whole-query `recompute` evaluation on relevant commits and switch back when inference is turned off. Exposed through `Dataset::views`, `Dataset::live`, `sparkles views`, `sparkles query --live`, and Python `Dataset.views` and `Dataset.live`.
+* **Streamed view reads.** `SERVICE view:read` streams current and stale versions of maintained table views and can rewind within retained history. Paused readers keep their version charged to the view memory pool. Versions that share a local term key share its charge. If the reader needs to rerun the view query, the child uses the request's budgets and controls from permission mask preparation through execution. A strict cursor can rerun the view when the child plan supports strict execution. Reads across a change of the dataset's inference or aggregate error mode honor their deadline and cancellation without holding the view registry lock across unrelated passes.
+* **Live query event budgets.** Each live query's memory limit also bounds its queue of decoded events. When the queue would exceed the limit, the next read requests a fresh reset. If the circuit cannot admit initial snapshot decoding, the request fails with `over-budget`. A subscriber joining a shared circuit can open a stream even if the decoded snapshot exceeds its queue limit. The first read then requests a reset. If a later diff or a reset exceeds its budget, the stream ends with `over-budget`. Unread rows hold server pool credit until delivery, overflow, or close.
+* **Maintained property paths.** Paths with `+` or `*` over IRIs, inverses, sequences, and alternatives run inside a fixed-point operator that tracks each reachable pair and its first derivation (about 40 bytes per reachable pair, checkpointed in `VIEW_STATE` format 2). Commits revisit only walks touching changed edges, and deletions remove only pairs with no alternative path, handling cycles without full recomputation. Zero-length `*` rows follow active graph nodes without extra state. Paths with `?`, negated property sets, nested closures, or closures inside sequences remain `recompute` nodes ([measurements](../benchmarks/writes/RESULTS.md#property-path-views)).
+* **Ordered windows.** `SELECT` queries with `ORDER BY` and `LIMIT k OFFSET m` maintain the top `k + m + max(k, 100)` rows in order, refilling from the input only when front deletions exhaust the reserve. Ties preserve insertion order across checkpoints, and order expressions stay maintained as hidden variables even when unprojected. Live queries emit each row with its `position`, and `view:read` returns the window in order ([measurements](../benchmarks/writes/RESULTS.md#ordered-windows-in-views)).
+* **Internal circuits.** Server code and Rust embeddings (`Dataset::attach_internal`) can attach hidden circuits that maintain rows or count changed facts per key per commit. Internal circuits have no HTTP routes, view listings, or `view:read` access, and checkpoint under `circuits/`.
+* **Provenance annotations.** Internal circuits (`InternalSpec::with_provenance` and `annotated_rows()`) can annotate rows with `count` (derivation multiplicity), `lineage` (all contributing quads and negative conditions), or `why` (minimal witness quad sets, bounded by `maxWitnesses`, default 8). Quads are tracked by compaction-safe 128-bit `FactKey` values, and deletions stay exact via signed counts. Rows exceeding the witness bound are marked truncated until extra derivations disappear or the circuit rebuilds; `recompute` nodes and `CONSTRUCT` blank nodes always report truncated unknown witnesses. While incremental passes add little time, `lineage` can increase state size up to 80× and `why` up to 8×, and initial builds take seconds on large joins ([measurements](../benchmarks/writes/RESULTS.md#provenance-annotations)). Named views and `view:witness`/`view:why` remain planned (roadmap [item 429](../ROADMAP.md)).
 
 ## Command line
 
-One `sparkles` binary carries the server, Jena-style database commands and Jena's file
-tools.
+The single `sparkles` binary ships the server, TDB2-style database commands, and Jena-compatible file tools ([G05](../specs/G05-command-line-tools.md), [USAGE.md](../USAGE.md#file-tools)).
 
-* The database commands work on the database directory. They are `load`, `query`,
-  `update`, `patch`, `dump`, `compact`, `compaction`, `clone`, `stats`, `log`, `check`,
-  `diff`, `snapshot`, `backup`, `repo`, `infer`, `shacl`, `shex`, `validation`, `schema`,
-  `queries`, `graphql`, `text-index`, `vector`, `geo-index`, `quota`, `describe-settings`
-  and `vocab-index`. `load`, `query`, `update`, `patch`, `vector`, `compaction`, `quota`
-  and `describe-settings` also work on a remote server with `--server`.
-* Jena's file tools are built in ([G05](../specs/G05-command-line-tools.md),
-  [USAGE.md](../USAGE.md#file-tools)). `convert`, alias `riot`, parses, validates, counts and
-  converts RDF files as a stream with exact error positions. `qparse` and `uparse` print a
-  query or update formatted, as SPARQL algebra in SSE, or as the physical plan. `compare`,
-  alias `rdfdiff`, compares two files up to blank-node isomorphism with RDFC-1.0.
-  `rsparql` and `rupdate` query and update any SPARQL 1.1 Protocol endpoint, `rset`
-  converts result sets, and `rdfpatch` prints the rows and counts of RDF Patch files.
-* `iri` and `langtag` show components, normal forms, canonical case and problems. Their
-  rules give warnings in `convert --check`, `load --check` and `/$/validate/iri`, and
-  `--strict` turns the warnings into failures.
-* `sparkles completions` prints shell completions for bash, zsh, fish, elvish and
-  PowerShell, and `sparkles man` prints man pages for every subcommand
-  ([USAGE.md](../USAGE.md#shell-completions-and-man-pages)).
-
+* **Database subcommands.** Operate on a local database directory with `load`, `query`, `update`, `patch`, `dump`, `compact`, `compaction`, `clone`, `stats`, `log`, `check`, `diff`, `snapshot`, `backup`, `repo`, `infer`, `shacl`, `shex`, `validation`, `schema`, `queries`, `graphql`, `text-index`, `vector`, `geo-index`, `quota`, `describe-settings`, and `vocab-index`. Of these, `load`, `query`, `update`, `patch`, `vector`, `compaction`, `quota`, and `describe-settings` also target a remote server with `--server`.
+* **File and protocol tools.** `convert` (alias `riot`) streams, validates, counts, and converts RDF with exact error positions. `qparse` and `uparse` format queries and updates and print SSE algebra or physical plans. `compare` (alias `rdfdiff`) tests graph isomorphism with RDFC-1.0. `rsparql` and `rupdate` talk to any SPARQL 1.1 endpoint, `rset` converts result formats, and `rdfpatch` inspects RDF Patch files.
+* **IRI and language-tag checkers.** `iri` and `langtag` inspect components, normal forms, canonical case, and scheme warnings. Their checks also run under `convert --check`, `load --check`, and `/$/validate/iri`, with `--strict` promoting warnings to errors.
+* **Completions and manual pages.** `sparkles completions` generates shell completions for bash, zsh, fish, elvish, and PowerShell, and `sparkles man` generates man pages for every subcommand ([USAGE.md](../USAGE.md#shell-completions-and-man-pages)).
 
 ## Formatter and editor support
 
-The formatter and linter check their own output and serve the command line, the server,
-the UI and editors.
+The formatter, linter, and language server share one engine across the CLI, HTTP API, web UI, and text editors.
 
-* `sparkles-fmt` formats SPARQL queries and updates, Turtle, TriG, N-Triples, N-Quads,
-  JSON-LD and SHACL Compact Syntax, through `sparkles fmt` and `POST /$/format` with the `fmt` cargo feature, on by
-  default ([USAGE.md](../USAGE.md#formatting), [API.md](../API.md#formatting)). It keeps
-  comments, and its output must parse to the same SPARQL algebra, RDF dataset or JSON and
-  format to itself. Style options cover line width, indentation, prefix groups, the `a`
-  shorthand, IRI compaction, quote style, operator position, aligned `VALUES`,
-  `prune-prefixes` and directive style. The command line walks directories with ignore
-  files, discovers config files, and has `--check`, `--write`, `--diff` and Prettier's
-  exit codes.
-* Turtle and TriG support `sort`, `prune-prefixes`, `turtle-layout = "conventional"` next
-  to the default diff-friendly layout, and the ignore pragma. Files over `--max-bytes`
-  format statement by statement in bounded memory, unless they are sorted.
-* N-Triples and N-Quads get canonical term spelling with comments kept, in bounded memory
-  on every core. `--sort` merges identical statements with an external sort past
-  `--sort-memory`, and `--canonicalize` writes RDFC-1.0 blank node labels.
-* JSON-LD uses Prettier's JSON layout with keywords first, and `--sort` sorts terms.
-* SHACL Compact Syntax keeps directives as written, separates shapes with one blank line,
-  and puts one property on each line. A property's constraints wrap at `line-width`.
-  `prune-prefixes` and `align-values` apply, and the sort keys do not. The shapes editor
-  in the UI formats and lints SHACLC as well.
-* `sparkles lint` checks SPARQL, Turtle, TriG, N-Triples, N-Quads, JSON-LD and SHACL
-  Compact Syntax with nineteen rules ([X04](../specs/X04-linter.md),
-  [USAGE.md](../USAGE.md#linting)). They cover undefined and unused prefixes, unused,
-  single-use and unbound variables, cartesian products, `SELECT *` with grouping,
-  ungrouped variables, FILTER scope and equality, IRIs with spaces, language tags,
-  suspicious and redundant datatypes, and deprecated names. The term rules apply to every
-  language, and JSON-LD adds two rules for context terms that nothing uses and keys that no
-  context maps. In Turtle, TriG and JSON-LD shapes, the SPARQL of `sh:select`, `sh:ask`,
-  `sh:construct` and `sh:update` literals is linted with the prefixes of `sh:declare` and
-  the pre-bound variables of SHACL, and findings are placed inside the literal. Severities
-  are set in `.sparklesfmt.toml` or with `--rule`, and `--fix` applies safe fixes after
-  checking that the meaning is unchanged. The linter also runs as `POST /$/lint`, as the
-  MCP `lint` tool, in the query editor and in the shapes editor.
-* `sparkles lsp` is a language server for every language the formatter handles. It
-  formats documents and ranges, reports syntax errors and lint findings, and offers safe
-  fixes as quick fixes. [editors.md](../editors.md) has setups for Neovim, Helix, Emacs and
-  VS Code.
-* The UI's editors use a WebAssembly build of the formatter, `sparkles-fmt-wasm`, and fall
-  back to `POST /$/format` when it is missing
-  ([ui/README.md](../../ui/README.md#formatting-in-the-browser)). The Nix `sparkles` and
-  `sparkles-ui` packages always include it.
-
-## Known gaps
-
-These limits name the roadmap items that address them. Current priorities and
-dependencies are recorded in the [central roadmap](../ROADMAP.md).
-
-### SPARQL and formats
-
-* Sparkles lacks ARQ's JavaScript functions, `afn:context`, the Leviathan `lfn:` library
-  the `JSON` query form, ARQ's `EXISTS { … }` group element and `AGG` with more than one
-  argument. `afn:print` and `afn:execTime` print nothing, and `afn:collation` orders by
-  code point instead of by locale. This is a lower-priority extension. Roadmap item 69.
-* The linter reads a document whole, so a file over `--max-bytes` is refused even in a line
-  format. It does not lint SHACL query literals in N-Triples and N-Quads or JSON-LD queries
-  under `@index` maps, and a JSON-LD document over 8 MiB gets no query findings and no
-  fixes. Each JSON-LD query and fix is checked by expanding the document again, within a
-  budget of four times the document, so a large document with many queries lints only
-  some of them. It skips an embedded query whose holder is ambiguous, such as the
-  same query text on two blank nodes, rather than risk another node's findings. Roadmap
-  item 444.
-* An `xsd:integer` or `xsd:decimal` with more digits than the engine's decimal type
-  holds, about 20 before the point, is not read as a number, so comparisons, arithmetic
-  and range filters treat it as an unknown literal. XSD allows a limit of 16 digits, while
-  Jena reads any length. Roadmap item 1065.
-* STRSTARTS, STRENDS, CONTAINS, STRBEFORE and STRAFTER compare only the language tags of
-  two language-tagged arguments, so a directional string and a string of the same language
-  without that direction are compatible arguments. SPARQL 1.2 and Jena also require the
-  same base direction. Roadmap item 1071.
-* `isNumeric("inf"^^xsd:double)` is true, though XSD spells infinity `INF`, and a cast of a
-  double to `xsd:string` gives `"1000000"` for `1e6`, where XPath gives `"1.0E6"`. In
-  REGEX, `.` matches a carriage return, which XPath excludes without the `s` flag. Roadmap
-  item 1077.
-* AVG over decimals divides to 18 digits where Jena divides to 24, so the last digits
-  of such an average can differ from ARQ's. Roadmap item 1084.
-* Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
-  Roadmap item 51.
-* Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`
-  functions. Roadmap item 38.
-* There is no openCypher frontend and no JSON query language. Roadmap items 20 and 72.
-* Mappings read no PostgreSQL or DuckDB database and no Parquet file in an object store.
-  Roadmap items 230 and 237.
-* Function maps call 20 of SPARQL's functions. Roadmap item 236.
-* Stored mapping runs are not tasks, and the web UI has no Mappings page.
-  Roadmap items 233 and 234.
-* The command line and the upload parameters read CSVW metadata and cells strictly,
-  where the library can also warn and use the default. Roadmap item 450.
-* A template lookup that binds a blank node of the dataset writes a new node, and a JSON
-  number with a fraction or an exponent loses its source form. Roadmap items 238 and 239.
-* Tables and databases are imported, not queried in place. Roadmap item 43.
-* Joins on a link whose far end is restricted, the object of `?x a ?c` and large inputs
-  that no statistic covers are estimated from distinct values. Roadmap items 454 and
-  697 to 699.
-
-* Incremental views are `table` views on `main`, maintained after the commit. There are
-  no `graph` views, no maintenance inside the commit, no WebSocket or MCP access, no Node
-  or JVM API, no UI, no views per branch, no ordered windows and no provenance per fact.
-  A stored definition that asks for one of these, including `onFailure: reject` and
-  `declassify: true`, is listed as failed with `unsupported-option` and does not run,
-  while the dataset's other views keep running. Roadmap item 17.
-* A view maintains a property path with `+` or `*` only when its step is made of IRIs,
-  inverses, sequences and alternatives, and recomputes paths with `?`, negated property
-  sets, nested closures or a closure inside a sequence. Roadmap item 544. A path
-  row reports one witness, not all of them, under a provenance setting. Roadmap
-  item 543. A path with two variable ends walks from every subject of its step, even
-  when a joined pattern binds one end. Roadmap item 546.
-* A zero-length `*` row with a constant end over the union default graph can stay stale
-  for a reader who cannot read a named graph that gains its first quad or loses its last,
-  until the next commit the reader sees. Roadmap item 545.
-* Backups and persistent clones carry view definitions, which come back suspended until
-  they are resumed. In-memory clones carry no views. Roadmap item 401.
-* Views and live queries on a dataset with RDFS on read or materialized inferences
-  evaluate the whole query again at each commit that touches them, rather than
-  maintaining it incrementally. Roadmap item 221.
-* A caller reads a view only with full access or the principal's exact access. Roadmap
-  item 222.
-* View passes run on one thread per dataset, and the live query limits count per
-  dataset. Roadmap items 223 and 224.
-* GraphRAG's automatic refresh still counts changed facts from the change feed rather
-  than from an internal circuit. Roadmap item 12.
-* Views and live queries never read the graphs that a disclosure guard protects. Roadmap
-  item 227.
+* **Formatter (`sparkles-fmt`).** Available through `sparkles fmt` and `POST /$/format` (cargo feature `fmt`, on by default), the formatter handles SPARQL queries and updates, Turtle, TriG, N-Triples, N-Quads, JSON-LD, and SHACL Compact Syntax ([USAGE.md](../USAGE.md#formatting), [API.md](../API.md#formatting)). It preserves comments and verifies that every formatted output parses to the identical algebra, dataset, or JSON and is idempotent. Configuration in `.sparklesfmt.toml` covers line width, indentation, prefix grouping and pruning, `a` shorthand, IRI compaction, quote style, operator placement, aligned `VALUES`, directive style, and `turtle-layout = "conventional"` alongside the default diff-friendly layout. The CLI traverses directories respecting ignore files and provides `--check`, `--write`, `--diff`, and Prettier-style exit codes. Files over `--max-bytes` format statement by statement in bounded memory unless sorting is enabled; N-Triples and N-Quads also support parallel canonical formatting, external `--sort`, and RDFC-1.0 `--canonicalize`.
+* **Linter (`sparkles lint`).** Nineteen rules check SPARQL, Turtle, TriG, N-Triples, N-Quads, JSON-LD, and SHACLC for undefined or unused prefixes, unused/single-use/unbound variables, cartesian products, `SELECT *` with grouping, ungrouped variables, `FILTER` scope and equality issues, IRIs with spaces, language tags, redundant or suspicious datatypes, deprecated names, and unused or unmapped JSON-LD terms ([X04](../specs/X04-linter.md), [USAGE.md](../USAGE.md#linting)). Inside Turtle, TriG, and JSON-LD shapes graphs, the linter checks embedded SPARQL in `sh:select`, `sh:ask`, `sh:construct`, and `sh:update` using `sh:declare` prefixes and SHACL pre-bound variables. Configure severities in `.sparklesfmt.toml` or via `--rule`, and apply verified safe fixes with `--fix`. Also exposed via `POST /$/lint`, the MCP `lint` tool, and the UI query and shapes editors.
+* **Language server and browser WASM.** `sparkles lsp` speaks LSP over stdio for all formatted languages, providing formatting, live syntax and lint diagnostics, prefix completion, and safe quick fixes; see [editors.md](../editors.md) for Neovim, Helix, Emacs, and VS Code configurations. The web UI embeds a WebAssembly build (`sparkles-fmt-wasm`) and falls back to `POST /$/format` when absent ([ui/README.md](../../ui/README.md#formatting-in-the-browser)).
 
 ## Configuration and usage
 
-The following guides describe configuration and supported UI, command-line, HTTP
-or library workflows. Exact HTTP contracts remain in the API reference.
+Exact HTTP parameters and payload schemas live in the API reference; CLI and workflow guides live in `USAGE.md`.
 
-* Read [Outbound requests (SERVICE and LOAD)](../USAGE.md#outbound-requests-service-and-load).
-* Read [Explaining a query](../USAGE.md#explaining-a-query).
-* Read [File tools](../USAGE.md#file-tools).
-* Read [Shell completions and man pages](../USAGE.md#shell-completions-and-man-pages).
-* Read [Formatting](../USAGE.md#formatting).
-* Read [Linting](../USAGE.md#linting).
-* Read [Extension functions and aggregates](../API.md#extension-functions-and-aggregates).
-* Read [ARQ syntax extensions](../API.md#arq-syntax-extensions).
-* Read [ARQ's property functions](../API.md#arqs-property-functions).
-* Read [DESCRIBE](../API.md#describe).
-* Read [Aggregate errors](../API.md#aggregate-errors).
+| Topic | Reference |
+|---|---|
+| Outbound `SERVICE` and `LOAD` policy | [USAGE.md](../USAGE.md#outbound-requests-service-and-load) |
+| Explaining queries and plans | [USAGE.md](../USAGE.md#explaining-a-query), [API.md](../API.md#explaining-a-query) |
+| ARQ syntax, functions, aggregates, and property functions | [API.md](../API.md#extension-functions-and-aggregates), [ARQ syntax](../API.md#arq-syntax-extensions), [Property functions](../API.md#arqs-property-functions) |
+| `DESCRIBE` modes and aggregate error settings | [DESCRIBE](../API.md#describe), [Aggregate errors](../API.md#aggregate-errors) |
+| Incremental views and live queries | [API.md](../API.md#incremental-views) |
+| CLI file tools, shell completions, and man pages | [File tools](../USAGE.md#file-tools), [Completions and man pages](../USAGE.md#shell-completions-and-man-pages) |
+| Formatting, linting, and editor setup | [Formatting](../USAGE.md#formatting), [Linting](../USAGE.md#linting), [editors.md](../editors.md) |
+
+## Known gaps
+
+Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
+
+### SPARQL and formats
+
+* **ARQ and SPARQL language edges.** Sparkles does not implement ARQ JavaScript functions (`js:`), `afn:context`, Leviathan `lfn:` functions, the `JSON` query form, ARQ's `EXISTS { … }` group element, or multi-argument `AGG`. `afn:print` and `afn:execTime` are no-ops, and `afn:collation` orders by Unicode code point rather than locale (roadmap [item 69](../ROADMAP.md)). `shortest(…)` path syntax is not evaluated, matching ARQ (roadmap [item 51](../ROADMAP.md)). Jena's service enhancer lacks a slice-aware cache and `se:cacheRm`/`se:cacheLs` functions (roadmap [item 38](../ROADMAP.md)).
+* **Numeric edge cases.** `xsd:integer`, derived integer types, and `xsd:decimal` literals beyond fixed-width `i64` and `Decimal` ranges are evaluated at exact precision up to 4,096 significant digits and 4,096 fractional digits. Terminating decimal quotients keep their exact value whenever they fit those bounds. Ordinary non-terminating decimal division truncates towards zero to 18 fractional digits on the fixed-width path. The arbitrary-precision division path retains at least 18 fractional digits, or 18 significant digits on sub-10^-18 quotients and up to the dividend's scale, within the same bounds. For `AVG` of integer and decimal inputs, eager queries, cursors and maintained views follow ARQ. They divide the exact sum by the count, preserve terminating quotients and round repeating quotients to 24 fractional digits using half-even rounding. An average outside the numeric bounds is unbound.
+* **Additional query languages.** openCypher and JSON query languages are not available (roadmap [items 20 and 72](../ROADMAP.md)).
+* **Linter limits.** `sparkles lint` reads files whole and refuses files above `--max-bytes` even in line-oriented formats. It skips embedded SHACL queries in N-Triples, N-Quads, JSON-LD `@index` maps, JSON-LD documents over 8 MiB, ambiguous blank-node holders, or JSON-LD documents whose expansion budget exceeds 4× document size (roadmap [item 444](../ROADMAP.md)).
+* **Tabular and mapping limits.** Mappings do not read PostgreSQL, DuckDB, or object-store Parquet files (roadmap [items 230 and 237](../ROADMAP.md)), and data is imported rather than queried in place as virtual graphs (roadmap [item 43](../ROADMAP.md)). Function maps cover 20 SPARQL functions (roadmap [item 236](../ROADMAP.md)), stored mapping runs are not background tasks and have no web UI page (roadmap [items 233 and 234](../ROADMAP.md)), CLI/upload CSVW checks run strictly only (roadmap [item 450](../ROADMAP.md)), template lookups mint fresh blank nodes for bound dataset blank nodes, and JSON numbers with fractions or exponents lose their source lexical form (roadmap [items 238 and 239](../ROADMAP.md)).
+* **Join estimation and streaming execution.** Joins over restricted far-end links, `?x a ?c` objects, and unprofiled large inputs fall back to distinct-value estimates (roadmap [items 454 and 697–699](../ROADMAP.md)). Remaining streaming operator gaps, zero-copy scan block retention, `LIMIT` hash-build costs, and floor-cache overhead are tracked in roadmap [items 570, 947, 952, 1051, 1088, 1125, and 1237](../ROADMAP.md).
+* **Incremental view limits.** Only post-commit `table` views on `main` are available; `graph` views, commit-time maintenance, WebSocket/MCP/Node/JVM/UI surfaces, per-branch views, and per-fact provenance on named views remain planned, and stored definitions requesting unsupported options (`onFailure: reject`, `declassify: true`) are listed as failed with `unsupported-option` (roadmap [items 17 and 429](../ROADMAP.md)). Ordered windows use a sorted vector whose insertions shift trailing elements (costly at large offsets; roadmap [item 1294](../ROADMAP.md)), emit unknown witnesses under provenance, fall back to `recompute` for unordered `LIMIT`, unlimited `ORDER BY`, and `DISTINCT` over unprojected order keys, and return unordered rows at past commits (roadmap [item 1295](../ROADMAP.md)); recomputed live windows omit positions, skip `coalesceMs` diff merging, and resume with a `reset` (roadmap [item 1296](../ROADMAP.md)). Named view builds check `memoryBytes` only after a pass and shared circuits inherit their creator's budget (roadmap [item 1298](../ROADMAP.md)). Property path views recompute `?`, negated property sets, nested closures, and closures inside sequences (roadmap [item 544](../ROADMAP.md)), report one witness rather than all (roadmap [item 543](../ROADMAP.md)), walk all step subjects when both ends are unbound (roadmap [item 546](../ROADMAP.md)), and can briefly show a stale zero-length `*` row over the union default graph for graph-restricted readers (roadmap [item 545](../ROADMAP.md)). Backups and persistent clones carry view definitions suspended until resumed, while in-memory clones drop views (roadmap [item 401](../ROADMAP.md)). Views on datasets with RDFS on read or materialized inferences recompute on relevant commits (roadmap [item 221](../ROADMAP.md)), require full access or the exact principal's access to read (roadmap [item 222](../ROADMAP.md)), run single-threaded per dataset with per-dataset live limits (roadmap [items 223 and 224](../ROADMAP.md)), and never read disclosure-guarded graphs (roadmap [item 227](../ROADMAP.md)).
 
 ## Roadmap
 
-The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 450](../ROADMAP.md), [item 454](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md), [item 1084](../ROADMAP.md).
-The central roadmap owns priority and dependencies. Its
-[completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
-link partially complete specs to their remaining work and acceptance criteria.
+Core design specifications for this area are [G05](../specs/G05-command-line-tools.md), [G06](../specs/G06-arq-query-extensions.md), [G10](../specs/G10-service-enhancer.md), [X04](../specs/X04-linter.md), [X05](../specs/X05-streaming-query-execution.md), [X08](../specs/X08-disk-spill-and-server-memory.md), [X19](../specs/X19-charged-buffers/README.md), and [F13](../specs/F13-incremental-views-and-provenance.md). Write and view measurements live in [docs/benchmarks/writes/RESULTS.md](../benchmarks/writes/RESULTS.md).
+
+The central [roadmap](../ROADMAP.md) owns priorities and dependencies, and its [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs) track the remaining acceptance criteria for items 17, 20, 38, 43, 51, 69, 72, 221–224, 227, 230, 233, 234, 236–239, 293, 401, 429, 444, 450, 454, 543–546, 570, 675, 697–699, 947, 952, 1051, 1088, 1125, 1237, 1294, 1295, 1296, and 1298.

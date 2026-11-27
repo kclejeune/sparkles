@@ -56,7 +56,14 @@ enum Key {
     /// The value of the id in this column.
     Column(usize),
     /// A pure expression over the run's columns.
-    Expr(Expr),
+    Expr { expr: Expr, exact: bool },
+}
+
+impl Key {
+    fn expression(expr: Expr) -> Self {
+        let exact = cfg!(feature = "geo") && !expr.parallel_order_key();
+        Self::Expr { expr, exact }
+    }
 }
 
 pub(super) struct External {
@@ -106,7 +113,7 @@ impl External {
                             Key::Column(input.iter().position(|x| x == v).expect("an input column"))
                         }
                         _ if crate::sparql::exprcache::impurity(expr).is_none() => {
-                            Key::Expr(expr.clone())
+                            Key::expression(expr.clone())
                         }
                         _ => {
                             let var = ctx.var(&format!("\u{1}spill key {i}"));
@@ -117,7 +124,7 @@ impl External {
                     };
                     rewritten.push(match &key {
                         Key::Column(c) => (Expr::Var(columns[*c]), *asc),
-                        Key::Expr(e) => (e.clone(), *asc),
+                        Key::Expr { expr, .. } => (expr.clone(), *asc),
                     });
                     sorted.push((key, *asc));
                 }
@@ -353,6 +360,7 @@ impl External {
 }
 
 /// One run's place in the merge: its current frame and the frame's key values.
+/// `_charge` is declared last so `reader`, `columns`, and `keys` all drop before credit.
 struct Head {
     reader: SpillReader,
     columns: Vec<Vec<Id>>,
@@ -362,55 +370,170 @@ struct Head {
     _charge: Option<OwnedCharge>,
 }
 
+type HeadFrame = (Vec<Vec<Id>>, Vec<Vec<SortKey>>, usize, u64);
+
 impl Head {
     /// Read the next frame, or return false at the end of the run.
     fn load(&mut self, ctx: &Arc<Ctx>, keys: &Keys) -> Result<bool> {
-        self._charge = None;
-        let Some((columns, len)) = self.reader.next_frame()? else {
-            self.columns.clear();
-            self.keys.clear();
-            self.len = 0;
-            self.at = 0;
-            return Ok(false);
-        };
-        let mut bytes = columns.len() as u64 * len as u64 * 8 + 256;
-        let (columns, decoded) = match keys {
-            Keys::Raw(_) => (columns, Vec::new()),
-            Keys::Values { keys, vars } => {
-                let mut decoded = Vec::with_capacity(keys.len());
-                let mut columns = Some(columns);
-                for (key, _) in keys {
-                    let column: Vec<SortKey> = match key {
-                        Key::Column(c) => columns.as_ref().expect("frame columns")[*c]
-                            .iter()
-                            .map(|&id| SortKey::new(ctx.value(id)))
-                            .collect(),
-                        Key::Expr(e) => {
-                            let mut table = crate::sparql::table::Table::new(vars.clone());
-                            table.cols = columns.take().expect("frame columns");
-                            table.len = len;
-                            let values = exec::key_values(ctx, &table, e);
-                            columns = Some(std::mem::take(&mut table.cols));
-                            values?.into_iter().map(SortKey::new).collect()
-                        }
-                    };
-                    bytes = bytes.saturating_add(
-                        column
-                            .iter()
-                            .map(|k| k.payload_bytes() + size_of::<SortKey>() as u64)
-                            .sum::<u64>(),
-                    );
-                    decoded.push(column);
-                }
-                (columns.expect("frame columns"), decoded)
-            }
-        };
-        self._charge = Some(OwnedCharge::new(ctx, bytes)?);
-        self.columns = columns;
-        self.keys = decoded;
-        self.len = len;
+        // Free both outer and inner frame/key vectors before shrinking credit.
+        self.keys = Vec::new();
+        self.columns = Vec::new();
+        self.len = 0;
         self.at = 0;
-        Ok(true)
+        // Retain persistent reader buffer credit across frame reloads.
+        let reader_cap = self.reader.buffer_capacity();
+        let mut charge = match self._charge.take() {
+            Some(mut c) => {
+                if c.bytes() > reader_cap {
+                    c.resize(reader_cap)?;
+                }
+                c
+            }
+            None => OwnedCharge::new(ctx, reader_cap)?,
+        };
+        // Keep the persistent reader buffer credited even if `check()` or `next_frame_with`
+        // fails before installing a new frame.
+        let result = (|| -> Result<Option<HeadFrame>> {
+            ctx.check()?;
+            let Some((frame_cols, len)) = self
+                .reader
+                .next_frame_with(|need| charge.resize(need.max(charge.bytes())))?
+            else {
+                return Ok(None);
+            };
+            let step = ctx.reservation_step();
+            let col_meta =
+                (frame_cols.len() as u64).saturating_mul(std::mem::size_of::<Vec<Id>>() as u64);
+            let mut bytes = self
+                .reader
+                .buffer_capacity()
+                .saturating_add(col_meta)
+                .saturating_add(
+                    (frame_cols.len() as u64)
+                        .saturating_mul(len as u64)
+                        .saturating_mul(8),
+                )
+                .saturating_add(256);
+            // `columns` is bound inside this closure AFTER `charge` so on any unwind
+            // `columns` and `decoded` drop before `charge` is shrunk back to `reader_cap`.
+            let mut columns = Some(frame_cols);
+            let decoded = match keys {
+                Keys::Raw(_) => Vec::new(),
+                Keys::Values { keys, vars } => {
+                    let keys_meta = (keys.len() as u64)
+                        .saturating_mul(std::mem::size_of::<Vec<SortKey>>() as u64);
+                    bytes = bytes.saturating_add(keys_meta);
+                    charge.cover(bytes, step)?;
+                    let mut decoded = Vec::with_capacity(keys.len());
+                    for (key, _) in keys {
+                        let key_step = if matches!(key, Key::Expr { exact: true, .. }) {
+                            // Geometry serialization may need all the unused credit,
+                            // including the slack held by earlier keys.
+                            if charge.bytes() > bytes {
+                                charge.resize(bytes)?;
+                            }
+                            0
+                        } else {
+                            step
+                        };
+                        let slots_bytes = (len as u64).saturating_mul(size_of::<SortKey>() as u64);
+                        bytes = bytes.saturating_add(slots_bytes);
+                        if bytes > charge.bytes()
+                            && (key_step == 0
+                                || charge.resize(bytes.saturating_add(key_step)).is_err())
+                        {
+                            charge.resize(bytes)?;
+                        }
+                        let column: Vec<SortKey> = match key {
+                            Key::Column(c) => {
+                                let mut col = Vec::with_capacity(len);
+                                let col_ids = &columns.as_ref().expect("frame columns")[*c];
+                                for (row, &id) in col_ids.iter().enumerate() {
+                                    if row.is_multiple_of(1024) {
+                                        ctx.check()?;
+                                    }
+                                    match id.tag() {
+                                        crate::id::Tag::Vocab
+                                        | crate::id::Tag::Delta
+                                        | crate::id::Tag::Local => {
+                                            let decode = ctx.charge(0)?;
+                                            let val = ctx.value_checked_into(id, &decode)?;
+                                            let sk = SortKey::new(val);
+                                            bytes = bytes.saturating_add(sk.payload_bytes());
+                                            charge.cover(bytes, key_step)?;
+                                            col.push(sk);
+                                            drop(decode);
+                                        }
+                                        _ => {
+                                            let sk = SortKey::new(ctx.value(id));
+                                            bytes = bytes.saturating_add(sk.payload_bytes());
+                                            charge.cover(bytes, key_step)?;
+                                            col.push(sk);
+                                        }
+                                    }
+                                }
+                                col
+                            }
+                            Key::Expr { expr, .. } => {
+                                let mut table = crate::sparql::table::Table::new(vars.clone());
+                                table.cols = columns.take().expect("frame columns");
+                                table.len = len;
+                                let mut admit = |payload: u64| {
+                                    bytes = bytes.saturating_add(payload);
+                                    if bytes > charge.bytes()
+                                        && (key_step == 0
+                                            || charge
+                                                .resize(bytes.saturating_add(key_step))
+                                                .is_err())
+                                    {
+                                        charge.resize(bytes)?;
+                                    }
+                                    Ok(())
+                                };
+                                let evaluated =
+                                    exec::spill_order_keys(ctx, &table, expr, &mut admit);
+                                columns = Some(std::mem::take(&mut table.cols));
+                                evaluated?
+                            }
+                        };
+                        decoded.push(column);
+                    }
+                    decoded
+                }
+            };
+            ctx.check()?;
+            Ok(Some((columns.expect("frame columns"), decoded, len, bytes)))
+        })();
+        match result {
+            Ok(Some((cols, decoded, len, bytes))) => {
+                if charge.bytes() > bytes {
+                    charge.resize(bytes)?;
+                }
+                self.columns = cols;
+                self.keys = decoded;
+                self.len = len;
+                self.at = 0;
+                self._charge = Some(charge);
+                Ok(true)
+            }
+            Ok(None) => {
+                // Free the reader's payload buffer before releasing its credit at EOF.
+                self.reader.release_buffer();
+                drop(charge);
+                self._charge = None;
+                Ok(false)
+            }
+            Err(err) => {
+                // Frame columns and decoded keys have already dropped inside the closure;
+                // shrink back to whatever reader buffer remains allocated and retain credit.
+                let keep = self.reader.buffer_capacity();
+                if charge.bytes() > keep {
+                    let _ = charge.resize(keep);
+                }
+                self._charge = Some(charge);
+                Err(err)
+            }
+        }
     }
 }
 
@@ -597,4 +720,372 @@ pub(super) fn load(
     external.write_run(ctx, input)?;
     external.finish(ctx)?;
     Ok(None)
+}
+
+#[cfg(test)]
+mod head_reload_tests {
+    use super::*;
+    use crate::spill::{Spill, SpillOptions};
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn raw_head_refuses_wide_frame_before_allocating() {
+        const ROWS: usize = 1024;
+        const WIDTH: usize = 24;
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Spill::open(&SpillOptions {
+            dir: dir.path().to_path_buf(),
+            max_bytes: 64 << 20,
+            query_bytes: 64 << 20,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let qspill = Arc::new(spill.query(None));
+        let mut writer = qspill.create(SpillKind::SortRun, WIDTH).unwrap();
+        writer.set_frame_rows(ROWS);
+        let ids: Vec<Id> = (0..ROWS as u64)
+            .map(|i| Id::vocab(i.wrapping_mul(0x9e37_79b9) & 0xffff_ffff))
+            .collect();
+        writer.write(&[ids.as_slice(); WIDTH], ROWS).unwrap();
+        let run = Arc::new(writer.finish().unwrap());
+        let mut head = Head {
+            reader: run.reader().unwrap(),
+            columns: Vec::new(),
+            keys: Vec::new(),
+            at: 0,
+            len: 0,
+            _charge: None,
+        };
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut target = Ctx::new(store.snapshot());
+        target.mem_limit = 512 * 1024;
+        target.enable_cursor_accounting().unwrap();
+        let target = target.into_shared();
+        let hold = target.charge(target.mem_limit - 4096).unwrap();
+        let baseline = target.live_bytes();
+        let keys = Keys::Raw(vec![0]);
+        let mut result = None;
+        let peak = crate::test_alloc::record_peak_live(|| {
+            result = Some(head.load(&target, &keys));
+        });
+        assert!(matches!(
+            result.unwrap(),
+            Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+        ));
+        assert_eq!(head.reader.buffer_capacity(), 0);
+        assert_eq!(target.live_bytes(), baseline);
+        assert!(
+            peak < ROWS * 8,
+            "frame allocated {peak} bytes before refusal"
+        );
+        drop(hold);
+        assert!(head.load(&target, &keys).unwrap(), "same frame fits");
+        assert_eq!(head.len, ROWS);
+        assert_eq!(head.columns.len(), WIDTH);
+        assert_eq!(head.columns[0], ids);
+        assert!(head.reader.buffer_capacity() > 0);
+        assert!(!head.load(&target, &keys).unwrap());
+        assert_eq!(target.live_bytes(), 0);
+    }
+
+    #[test]
+    fn head_load_retains_reader_credit_across_reloads_refuses_before_decode_and_releases_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Spill::open(&SpillOptions {
+            dir: dir.path().to_path_buf(),
+            max_bytes: 64 << 20,
+            query_bytes: 64 << 20,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+
+        let store = Store::in_memory(StoreOptions::default());
+        let pad = "z".repeat(4096);
+        let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+        for i in 0..8 {
+            ttl.push_str(&format!(
+                "ex:s{i} ex:small \"s{i}\" ; ex:big \"b{i}-{pad}\" .\n"
+            ));
+        }
+        store
+            .load(&[crate::io::Source::from_bytes(
+                ttl.into_bytes(),
+                crate::io::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        let small_ids: Vec<Id> = (0..8)
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                    format!("s{i}"),
+                )))
+                .unwrap()
+            })
+            .collect();
+        let big_ids: Vec<Id> = (0..8)
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                    format!("b{i}-{pad}"),
+                )))
+                .unwrap()
+            })
+            .collect();
+
+        // Write one SpillRun containing two frames: frame 1 has short literals, frame 2
+        // has 8 × 4 KiB literals.
+        let qspill = Arc::new(spill.query(None));
+        let mut writer = qspill.create(SpillKind::SortRun, 1).unwrap();
+        writer.set_frame_rows(8);
+        writer.write(&[small_ids.as_slice()], 8).unwrap();
+        writer.write(&[big_ids.as_slice()], 8).unwrap();
+        let run = Arc::new(writer.finish().unwrap());
+
+        let mut ctx = Ctx::new(snap);
+        ctx.mem_limit = 512 * 1024;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = ctx.into_shared();
+        let keys = Keys::Values {
+            keys: vec![(Key::Column(0), true)],
+            vars: vec![0],
+        };
+
+        let mut head = Head {
+            reader: run.reader().unwrap(),
+            columns: Vec::new(),
+            keys: Vec::new(),
+            at: 0,
+            len: 0,
+            _charge: None,
+        };
+        assert!(head.load(&ctx, &keys).unwrap(), "frame 1 loads");
+        assert_eq!(head.len, 8);
+        let live_after_f1 = ctx.live_bytes();
+        assert!(live_after_f1 > 0, "frame 1 holds live credit");
+
+        // Hold almost all remaining budget so frame 1 releases cleanly during reload,
+        // while frame 2's 8 × 4 KiB literals exceed the budget during Head::load.
+        let room = ctx.memory_remaining();
+        let hold = ctx.charge(room.saturating_sub(4096)).unwrap();
+        let err = head
+            .load(&ctx, &keys)
+            .expect_err("frame 2 must refuse under tight budget");
+        assert!(
+            matches!(
+                err,
+                Error::BudgetExceeded(b)
+                    if matches!(b.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory)
+            ),
+            "expected Memory BudgetExceeded on frame 2 reload, got {err:?}"
+        );
+        assert_eq!(head.len, 0);
+        assert!(head.columns.is_empty() && head.keys.is_empty());
+        assert_eq!(
+            head._charge.as_ref().map_or(0, OwnedCharge::bytes),
+            head.reader.buffer_capacity(),
+            "after refusal only persistent reader buffer credit remains"
+        );
+        drop(hold);
+
+        // Fresh reader: load both frames cleanly, then hit EOF and verify reader buffer
+        // and all live credit are released back to 0.
+        let mut head_ok = Head {
+            reader: run.reader().unwrap(),
+            columns: Vec::new(),
+            keys: Vec::new(),
+            at: 0,
+            len: 0,
+            _charge: None,
+        };
+        assert!(head_ok.load(&ctx, &keys).unwrap(), "frame 1 loads");
+        assert!(head_ok.load(&ctx, &keys).unwrap(), "frame 2 loads");
+        let charged_before_eof = head_ok._charge.as_ref().map_or(0, OwnedCharge::bytes);
+        let live_before_eof = ctx.live_bytes();
+        assert!(charged_before_eof > 0, "frame 2 holds live credit");
+        assert!(!head_ok.load(&ctx, &keys).unwrap(), "EOF returns false");
+        assert_eq!(
+            head_ok.reader.buffer_capacity(),
+            0,
+            "EOF must release reader payload buffer"
+        );
+        assert!(head_ok._charge.is_none());
+        let live_after_eof = ctx.live_bytes();
+        assert_eq!(
+            live_before_eof - live_after_eof,
+            charged_before_eof,
+            "EOF must release exactly Head's entire live credit (reader + frame + keys)"
+        );
+        drop(head);
+        drop(head_ok);
+        ctx.release_work();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn spill_merge_head_admits_wide_order_keys_incrementally() {
+    use crate::sparql::expr::ArithOp;
+    use crate::sparql::value::Value;
+    use crate::spill::{Spill, SpillOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let spill = Spill::open(&SpillOptions {
+        dir: dir.path().to_path_buf(),
+        max_bytes: 1 << 30,
+        query_bytes: 1 << 30,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.mem_limit = 768 << 10;
+    let var = ctx.var("value");
+    let ctx = Arc::new(ctx);
+    ctx.attach_owner();
+
+    let mut writer = Arc::new(spill.query(None))
+        .create(SpillKind::SortRun, 1)
+        .unwrap();
+    let rows = vec![Id::from_i64(2).unwrap(); 1024];
+    writer.write(&[&rows], rows.len()).unwrap();
+    let run = Arc::new(writer.finish().unwrap());
+    let factor = Value::from_typed(&"9".repeat(4000), oxrdf::vocab::xsd::INTEGER.as_str());
+    let expr = Expr::Arith(
+        Box::new(Expr::Var(var)),
+        Box::new(Expr::Lit(Id::UNDEF, factor)),
+        ArithOp::Mul,
+    );
+    let keys = Keys::Values {
+        keys: vec![(Key::expression(expr), true)],
+        vars: vec![var],
+    };
+    assert!(matches!(
+        Merger::new(&ctx, vec![run], &keys, 1),
+        Err(Error::BudgetExceeded(_))
+    ));
+    assert!(ctx.mem_peak() >= 640 << 10, "peak {}", ctx.mem_peak());
+    assert_eq!(ctx.live_bytes(), 0);
+    assert_eq!(spill.reserved_bytes(), 0);
+}
+
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn spill_merge_keeps_credit_between_rows_of_geometry_key() {
+    assert_spill_merge_keeps_geometry_key(false);
+}
+
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn spill_merge_releases_column_slack_before_geometry_key() {
+    assert_spill_merge_keeps_geometry_key(true);
+}
+
+#[cfg(all(test, feature = "geo"))]
+fn assert_spill_merge_keeps_geometry_key(column_key: bool) {
+    use crate::geo::{WKT_LITERAL, memo::GeoMemo};
+    use crate::sparql::{expr::Func, value::Value};
+    use crate::spill::{Spill, SpillOptions};
+    use spargebra::algebra::Function;
+
+    let dir = tempfile::tempdir().unwrap();
+    let spill = Spill::open(&SpillOptions {
+        dir: dir.path().to_path_buf(),
+        max_bytes: 1 << 30,
+        query_bytes: 1 << 30,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+    let query = Arc::new(spill.query(None));
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.geo = GeoMemo::with_budget(0);
+    let row = ctx.var("row");
+    let column = ctx.var("column");
+    let first = Id::from_i64(1).unwrap();
+    let geometry_row = Id::from_i64(2).unwrap();
+    let competing = Id::from_i64(3).unwrap();
+    let blank = Id::bnode(42);
+    let write_run = |rows: &[Id], values: &[Id]| {
+        let mut writer = query.create(SpillKind::SortRun, 2).unwrap();
+        writer.write(&[rows, values], rows.len()).unwrap();
+        Arc::new(writer.finish().unwrap())
+    };
+    let runs = vec![
+        write_run(&[competing], &[blank]),
+        write_run(&[first, geometry_row], &[Id::UNDEF, blank]),
+    ];
+
+    let wkt = format!("LINESTRING({}0 0)", "0 0, 1 1, ".repeat(7000));
+    let geometry = crate::geo::parse(&wkt, WKT_LITERAL).unwrap();
+    let geometry_bytes = crate::geo::to_wkt(&geometry).len() as u64 + 64;
+    let literal =
+        oxrdf::Literal::new_typed_literal(wkt, oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL));
+    let id = ctx.intern_term(&oxrdf::Term::Literal(literal.clone()));
+    let as_wkt = Expr::Call(
+        Func::Ext(format!("{}asWKT", crate::geo::vocab::GEOF)),
+        vec![Expr::Lit(id, Value::from_literal(&literal))],
+    );
+    let length = Expr::Call(
+        Func::Builtin(Function::StrLen),
+        vec![Expr::Call(Func::Builtin(Function::Str), vec![as_wkt])],
+    );
+    let is_row = |id| {
+        Box::new(Expr::SameTerm(
+            Box::new(Expr::Var(row)),
+            Box::new(Expr::Const(id)),
+        ))
+    };
+    let zero = Expr::Const(Id::from_i64(0).unwrap());
+    let mut keys = Vec::new();
+    let (other_rows, payload) = if column_key {
+        keys.push((Key::Column(1), true));
+        (zero, 2 * SortKey::new(ctx.value(blank)).payload_bytes())
+    } else {
+        let text = Value::Str("x".repeat(20_000).into());
+        let payload = SortKey::new(Some(text.clone())).payload_bytes();
+        (
+            Expr::If(
+                is_row(first),
+                Box::new(Expr::Lit(Id::UNDEF, text)),
+                Box::new(zero),
+            ),
+            payload,
+        )
+    };
+    let expr = Expr::If(is_row(geometry_row), Box::new(length), Box::new(other_rows));
+    keys.push((Key::expression(expr), true));
+    let reader_bytes: u64 = runs
+        .iter()
+        .map(|run| {
+            let mut reader = run.reader().unwrap();
+            assert!(reader.next_frame().unwrap().is_some());
+            reader.buffer_capacity()
+        })
+        .sum();
+    let vec_meta = 2 * (2 * size_of::<Vec<Id>>() + keys.len() * size_of::<Vec<SortKey>>()) as u64;
+    let frame_bytes = reader_bytes
+        + vec_meta
+        + 2 * 256
+        + 3 * (2 * 8 + (keys.len() * size_of::<SortKey>()) as u64);
+    let keys = Keys::Values {
+        keys,
+        vars: vec![row, column],
+    };
+    let evaluator = ctx.nvars() as u64 * 16 + 128;
+    let setup = ctx.live_bytes();
+    // The first head is already live when the second head evaluates its WKT.
+    ctx.mem_limit = setup + frame_bytes + evaluator + payload + geometry_bytes;
+    assert!(ctx.reservation_step() < geometry_bytes);
+    let ctx = ctx.into_shared();
+    let mut merge = Merger::new(&ctx, runs, &keys, 2).unwrap();
+    let mut out = [Vec::new(), Vec::new()];
+    assert_eq!(merge.next(&ctx, &keys, &mut out, 3).unwrap(), 3);
+    assert_eq!(out[0], [first, competing, geometry_row]);
+    assert_eq!(ctx.live_bytes(), setup + geometry_bytes);
 }

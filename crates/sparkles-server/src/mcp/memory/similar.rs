@@ -116,7 +116,7 @@ impl Tools<'_> {
         if let Some(predicate) = &index
             && !docs.is_empty()
         {
-            let deadline = self.call.arrived + timeout;
+            let deadline = self.deadline(timeout);
             let snap = self.snapshot(&ds, None, None, deadline)?;
             let question = crate::ask::profile::nested(
                 crate::ask::profile::Stage::ExampleQueryEmbedding,

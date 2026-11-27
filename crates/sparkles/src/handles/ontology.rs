@@ -217,6 +217,9 @@ struct Inner {
     /// the main triples of reified axioms whose predicate is not terminological, read
     /// eagerly with their `owl:Axiom` node and left out of the assertion stream
     mains: FxHashSet<[Id; 4]>,
+    /// the blank nodes whose class assertions `x rdf:type _:c` were read eagerly, as
+    /// the class expressions of the terminology
+    class_nodes: FxHashSet<Id>,
 }
 
 /// One kept ontology.
@@ -709,9 +712,12 @@ impl Opened {
         use AxiomKind as K;
         let opts = &*crate::overview::one_deadline(opts)?;
         for (ax, origins) in &self.ontology.axioms {
-            if let K::SameIndividual(set) | K::DifferentIndividuals(set) = &ax.kind
-                && set.contains(i)
-            {
+            let matches_i = match &ax.kind {
+                K::SameIndividual(set) => set.contains(i),
+                K::DifferentIndividuals(bag) => bag.contains(i),
+                _ => false,
+            };
+            if matches_i {
                 for g in origin_graphs(origins) {
                     if !f(ax.clone(), g)? {
                         return Ok(());
@@ -802,15 +808,23 @@ struct Stream<'a> {
 impl Stream<'_> {
     /// The triple of a stored quad when it is an assertion the read left in the store:
     /// not terminological, not the main triple of an annotated axiom the read holds, and
-    /// not a class assertion of a structural type or a class expression.
+    /// not a class assertion of a structural type or of a class expression the read
+    /// collected. A class assertion whose blank-node class the read did not collect
+    /// stays in the stream, where it maps to no axiom.
     fn assertion(o: &Opened, rdf_type: Option<Id>, q: &[Id; 4]) -> Option<Triple> {
         let inner = &o.inner;
         if inner.terminological.contains(&q[1]) || inner.mains.contains(q) {
             return None;
         }
         let t = triple_of(&o.snapshot, q)?;
-        // class assertions with a structural type or a class expression were read
-        if Some(q[1]) == rdf_type && read::is_terminological(&t, &|_| false) {
+        // class assertions with a structural type or a collected class expression were
+        // read
+        if Some(q[1]) == rdf_type
+            && match &t.object {
+                Term::BlankNode(_) => inner.class_nodes.contains(&q[2]),
+                _ => read::is_terminological(&t, &|_| false),
+            }
+        {
             return None;
         }
         Some(t)
@@ -1326,11 +1340,23 @@ impl Ontologies {
         o: &Opened,
         record: Option<&crate::reasoning::ReasoningRecord>,
     ) -> Option<Inferences> {
+        self.inferences_of(&o.graphs, &o.inner.graph_ids, o.snapshot.commit, record)
+    }
+
+    /// [`inferences`](Self::inferences) of a read of `graphs`, with their store ids, at
+    /// `commit`.
+    fn inferences_of(
+        &self,
+        graphs: &[GraphRef],
+        graph_ids: &[Option<Id>],
+        commit: u64,
+        record: Option<&crate::reasoning::ReasoningRecord>,
+    ) -> Option<Inferences> {
         let record = record?;
         let inferred = GraphRef::Named(INFERRED_GRAPH.to_string());
-        let n = o.graphs.iter().position(|g| *g == inferred)?;
-        o.inner.graph_ids.get(n).copied().flatten()?;
-        let f = crate::reasoning::freshness(record, self.ds.store(), o.snapshot.commit);
+        let n = graphs.iter().position(|g| *g == inferred)?;
+        graph_ids.get(n).copied().flatten()?;
+        let f = crate::reasoning::freshness(record, self.ds.store(), commit);
         Some(Inferences {
             profile: record.profile.clone(),
             graph: n as u32,
@@ -1388,6 +1414,112 @@ impl Ontologies {
         self.edit_with(req, edit, None, opts, Extra::default())
     }
 
+    /// Acquire the writer lock, check preconditions, protected-branch status and target
+    /// graph write permissions, let `prepare_req` populate the head-bound request
+    /// (such as import targets captured under the writer lock), open the ontology from
+    /// the writer head snapshot, run `build` against that opened ontology to produce the
+    /// [`EditRequest`] and an extra return value, and commit the edit on that exact
+    /// snapshot.
+    ///
+    /// For dry runs (`opts.write.dry_run.is_some()`), any failing precondition is checked
+    /// before `build` runs and immediately reported through `txn.commit()` as a coherent
+    /// [`Error::DryRun`] preview with `Outcome::PreconditionFailed`.
+    pub fn edit_from_head<T, E, P, F>(
+        &self,
+        base_req: &OntologyRequest,
+        target_graph: Option<&GraphRef>,
+        message: Option<&str>,
+        opts: &QueryOptions,
+        prepare_req: P,
+        build: F,
+    ) -> std::result::Result<(EditOutcome, T), EditFromHeadError<E>>
+    where
+        P: FnOnce(&Arc<Snapshot>, &mut OntologyRequest),
+        F: FnOnce(&Opened) -> std::result::Result<(EditRequest, T), E>,
+    {
+        base_req.validate().map_err(EditFromHeadError::Store)?;
+        if base_req.at.is_some() {
+            return Err(EditFromHeadError::Store(Error::invalid(
+                "an edit starts from the head: leave out 'at'",
+            )));
+        }
+        if base_req.inferences {
+            return Err(EditFromHeadError::Store(Error::invalid(
+                "an edit changes the asserted axioms: leave out 'inferences'",
+            )));
+        }
+        let opts = self.anchored(opts).map_err(EditFromHeadError::Store)?;
+        let store = self.ds.store();
+        let mut wopts = opts.write.clone();
+        if wopts.graphs.is_none() {
+            wopts.graphs = opts.graphs.clone();
+        }
+        if let Some(m) = message {
+            wopts.message = Some(Arc::from(m));
+        }
+        if wopts.deadline.is_none() {
+            wopts.deadline = opts.deadline;
+        }
+        if wopts.cancel.is_none() {
+            wopts.cancel = opts.cancel.clone();
+        }
+        let mut txn = store
+            .try_write_with(CommitKind::Update, wopts)
+            .map_err(EditFromHeadError::Store)?;
+        txn.check_protected().map_err(EditFromHeadError::Store)?;
+        let target = target_graph
+            .cloned()
+            .unwrap_or_else(|| base_req.graphs()[0].clone());
+        let target_id = match &target {
+            GraphRef::Default => Id::DEFAULT_GRAPH,
+            GraphRef::Named(g) => txn
+                .intern(&Term::NamedNode(
+                    oxrdf::NamedNode::new(g.as_str()).map_err(|e| {
+                        EditFromHeadError::Store(Error::invalid(format!("graph <{g}>: {e}")))
+                    })?,
+                ))
+                .map_err(EditFromHeadError::Store)?,
+        };
+        txn.check_graph_writable(target_id)
+            .map_err(EditFromHeadError::Store)?;
+        if txn.is_dry_run()
+            && let Err(pre_err) = txn.check_precondition()
+        {
+            // Report stale preconditions through the normal dry-run commit preview so the
+            // response carries dry-run headers and `outcome: "precondition-failed"` (412)
+            // instead of running `build` against a stale snapshot.
+            return match txn.commit() {
+                Err(e) => Err(EditFromHeadError::Store(e)),
+                Ok(_) => Err(EditFromHeadError::Store(pre_err)),
+            };
+        }
+        let head = txn.base().clone();
+        let mut req = base_req.clone();
+        prepare_req(&head, &mut req);
+        let o = self
+            .open_at(&head, &req, &opts)
+            .map_err(EditFromHeadError::Store)?;
+        let (edit, extra_val) = build(&o).map_err(EditFromHeadError::Build)?;
+        for ax in edit.add.iter().chain(&edit.remove) {
+            sparkles_owl::validate::axiom(ax)
+                .map_err(|e| EditFromHeadError::Store(Error::invalid(e.0)))?;
+        }
+        let outcome = self
+            .apply_edit_in_txn(
+                txn,
+                head,
+                o,
+                &req,
+                &edit,
+                target_id,
+                None,
+                &opts,
+                Extra::default(),
+            )
+            .map_err(EditFromHeadError::Store)?;
+        Ok((outcome, extra_val))
+    }
+
     /// [`edit`](Self::edit), also removing what mentions `entity`, selected from the
     /// head under the writer lock.
     fn edit_with(
@@ -1396,7 +1528,7 @@ impl Ontologies {
         edit: &EditRequest,
         entity: Option<&str>,
         opts: &QueryOptions,
-        mut extra: Extra<'_>,
+        extra: Extra<'_>,
     ) -> Result<EditOutcome> {
         req.validate()?;
         if req.at.is_some() {
@@ -1441,6 +1573,22 @@ impl Ontologies {
                     .map_err(|e| Error::invalid(format!("graph <{g}>: {e}")))?,
             ))?,
         };
+        self.apply_edit_in_txn(txn, head, o, req, edit, target_id, entity, &opts, extra)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_edit_in_txn(
+        &self,
+        mut txn: crate::store::WriteTxn<'_>,
+        head: Arc<Snapshot>,
+        o: Opened,
+        req: &OntologyRequest,
+        edit: &EditRequest,
+        target_id: Id,
+        entity: Option<&str>,
+        opts: &QueryOptions,
+        mut extra: Extra<'_>,
+    ) -> Result<EditOutcome> {
         let mut outcome = Plan::default();
         // removals edit the graphs the request names and the target it names (§5.4):
         // an axiom read from an imported graph is removed there only when the edit
@@ -1490,7 +1638,7 @@ impl Ontologies {
                     })
                     .map(|(a, _)| a.clone()),
             );
-            o.assertions(&opts, |ax, _, g| {
+            o.assertions(opts, |ax, _, g| {
                 if let Some(ax) = ax
                     && scope.contains(&g)
                     && ax.mentions(iri)
@@ -1596,7 +1744,7 @@ impl Ontologies {
         }
         let mut count_deleted = 0;
         for q in deleted {
-            check(&opts)?;
+            check(opts)?;
             if txn.delete(q)? {
                 count_deleted += 1;
             }
@@ -1610,24 +1758,20 @@ impl Ontologies {
                 continue;
             }
             // present after the removals above: a form this edit removed is not
-            let mut present = true;
-            for form in ax.normal_forms() {
+            let present = ax.for_each_normal_form(|form| -> Result<bool> {
                 let kept =
-                    if done.get(&form) == Some(&true) {
+                    if done.get(form.as_ref()) == Some(&true) {
                         // removed here, but it may still be read from a graph outside the
                         // scope, or as an assertion this transaction left
-                        o.ontology.axioms.get(&form).is_some_and(|origins| {
+                        o.ontology.axioms.get(form.as_ref()).is_some_and(|origins| {
                             origins.iter().any(|x| !scope.contains(&x.graph))
-                        }) || assertion_quads(&o, &form, &txn, &all_graphs)?.is_some()
+                        }) || assertion_quads(&o, form.as_ref(), &txn, &all_graphs)?.is_some()
                     } else {
-                        o.ontology.contains(&form)
-                            || assertion_quads(&o, &form, &txn, &all_graphs)?.is_some()
+                        o.ontology.contains(form.as_ref())
+                            || assertion_quads(&o, form.as_ref(), &txn, &all_graphs)?.is_some()
                     };
-                if !kept {
-                    present = false;
-                    break;
-                }
-            }
+                Ok(kept)
+            })?;
             if present {
                 outcome.present += 1;
                 continue;
@@ -1676,7 +1820,7 @@ impl Ontologies {
         let mut labels: FxHashMap<String, Id> = FxHashMap::default();
         let mut inserted = 0;
         for ax in &adding {
-            check(&opts)?;
+            check(opts)?;
             for t in write::axiom_triples(ax, &mut fresh) {
                 let s = subject_term(&t.subject);
                 let q = [
@@ -1758,6 +1902,25 @@ fn encode(
     })
 }
 
+/// Error returned by [`Ontologies::edit_from_head`].
+pub enum EditFromHeadError<E> {
+    Store(Error),
+    Build(E),
+}
+
+impl Opened {
+    /// Whether `ax` is already present in this opened ontology, checking both the loaded
+    /// terminology (`self.ontology`) and store-resident ABox assertions on `self.snapshot`
+    /// across all graphs read — matching [`Ontologies::edit`].
+    pub fn contains_axiom(&self, ax: &Axiom) -> Result<bool> {
+        let all_graphs: BTreeSet<u32> = (0..self.graphs.len() as u32).collect();
+        ax.for_each_normal_form(|form| {
+            Ok(self.ontology.contains(form.as_ref())
+                || snapshot_assertion_quads(self, form.as_ref(), &all_graphs, None)?.is_some())
+        })
+    }
+}
+
 /// The stored quads of an assertion that the open read left in the store, in every
 /// graph read; `None` when it has none. Such an assertion is one triple: the one the
 /// forward mapping writes, or for an equality or inequality of two individuals, that
@@ -1768,8 +1931,17 @@ fn assertion_quads(
     txn: &crate::store::WriteTxn<'_>,
     graphs: &BTreeSet<u32>,
 ) -> Result<Option<Vec<[Id; 4]>>> {
+    snapshot_assertion_quads(o, ax, graphs, Some(txn))
+}
+
+fn snapshot_assertion_quads(
+    o: &Opened,
+    ax: &Axiom,
+    graphs: &BTreeSet<u32>,
+    txn: Option<&crate::store::WriteTxn<'_>>,
+) -> Result<Option<Vec<[Id; 4]>>> {
     use sparkles_owl::AxiomKind as K;
-    if !ax.annotations.is_empty() {
+    if !ax.annotations.is_empty() || write::axiom_triple_count(ax) != 1 {
         return Ok(None);
     }
     let mut fresh = || oxrdf::BlankNode::new_unchecked(format!("{FRESH}x"));
@@ -1803,8 +1975,13 @@ fn assertion_quads(
             }
             let q = [s, p, obj, *g];
             // through the caller's view, so a protected triple is absent, and as this
-            // transaction leaves it
-            if snap.contains(&q)? && txn.contains(&q)? {
+            // transaction leaves it (when inside a write transaction)
+            if snap.contains(&q)?
+                && match txn {
+                    Some(tx) => tx.contains(&q)?,
+                    None => true,
+                }
+            {
                 out.push(q);
             }
         }
@@ -1910,6 +2087,7 @@ fn read_store(
         opts,
     };
     let mut terminological: FxHashSet<Id> = FxHashSet::default();
+    let mut class_nodes: FxHashSet<Id> = FxHashSet::default();
     let predicates = vocab::STRUCTURAL_PREDICATES
         .iter()
         .chain(vocab::FACETS.iter())
@@ -1954,6 +2132,7 @@ fn read_store(
         for b in bnodes {
             check(opts)?;
             c.prefix(&[rdf_type.0, b.0])?;
+            class_nodes.insert(b);
         }
     }
     // the main triples of reified axioms whose predicate was not read: an annotated
@@ -2001,7 +2180,7 @@ fn read_store(
         graph_ids.len(),
         requested,
         mode,
-        (terminological, mains),
+        (terminological, mains, class_nodes),
     )
 }
 
@@ -2049,7 +2228,7 @@ fn finish(
     graphs: usize,
     requested: usize,
     mode: Mode,
-    (terminological, mains): (FxHashSet<Id>, FxHashSet<[Id; 4]>),
+    (terminological, mains, class_nodes): (FxHashSet<Id>, FxHashSet<[Id; 4]>, FxHashSet<Id>),
 ) -> Result<(read::Ontology, Inner)> {
     let mut triples = Vec::with_capacity(quads.len());
     let mut graph_of = Vec::with_capacity(quads.len());
@@ -2086,6 +2265,7 @@ fn finish(
             graph_ids,
             terminological,
             mains,
+            class_nodes,
         },
     ))
 }
@@ -2539,6 +2719,7 @@ pub mod browse;
 pub mod classify;
 pub mod dl_query;
 pub mod file;
+pub mod head;
 pub mod kept;
 pub mod metrics;
 pub mod search;
@@ -2550,3 +2731,9 @@ mod tests;
 
 #[cfg(test)]
 mod individual_lookup_tests;
+
+#[cfg(test)]
+mod head_tests;
+
+#[cfg(test)]
+mod head_gen_tests;

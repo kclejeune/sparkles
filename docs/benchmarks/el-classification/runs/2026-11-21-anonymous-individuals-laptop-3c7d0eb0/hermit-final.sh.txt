@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# the tip's taxonomies on the files with HermiT references, judged by ours-compare.py
+set -u
+R=/home/kclejeune/repositories/github.com/kclejeune/sparkles
+L=$R/.artifacts/lanes/outside-ab
+H=$R/.artifacts/archived-worktrees/horn-individuals-692/.artifacts/lanes/horn-individuals-692/data/hermit
+mkdir -p $L/hermit-final; : > $L/hermit-final.jsonl
+while IFS=$'\t' read -r s f; do
+  n=$(basename "$f" .owl)
+  [ -s $H/$n.txt ] || continue
+  for mode in default rooted; do
+    flag=; [ $mode = rooted ] && flag=--rooted
+    o=$L/hermit-final/$n-$mode
+    timeout -k 10 900 $L/bin/el_classify-final --threads 4 $flag --taxonomy $o.txt "$f" > $o.json 2> $o.err; st=$?
+    python3 $R/worktrees/outside-ab/scripts/elk-compare/ours-compare.py --status $st --name $n-$mode --hermit $H/$n.txt --report $o.json --stderr $o.err --taxonomy $o.txt >> $L/hermit-final.jsonl
+  done
+done < $L/anon-inputs-final.tsv
+echo HERMIT-DONE

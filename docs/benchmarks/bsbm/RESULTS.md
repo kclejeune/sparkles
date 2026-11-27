@@ -5,15 +5,16 @@ This is a [manual report](../README.md#evidence-and-generated-reports). Read the
 
 ## Comparison summary
 
-In the 10M Explore comparison, the paired `q5` pooled median is 4.65 ms against
-  Fluree's 5.59 ms, with the closest instance within 4%. The paired `q7` and `q8`
-  medians are 3.78 and 3.75 ms against Oxigraph's 4.09 and 3.96 ms. Fluree's driver throughput is two to three times Sparkles' in both
-  mixes, but it is not ranked because its q8, q11 and q12 answers differ.
+In the 10M Explore comparison, the paired `q5` pooled median is 4.65 ms against Fluree's
+5.59 ms, with the closest instance within 4%. The paired `q7` and `q8` medians are 3.78
+and 3.75 ms against Oxigraph's 4.09 and 3.96 ms. Fluree's driver throughput is two to
+three times Sparkles' in both mixes, but it is not ranked because its `q8`, `q11` and
+`q12` answers differ.
 
-In the 10M BI comparison, every engine's q4 and q5 averages pass an exact oracle
-  within float rounding. The paired `q2` median is 20.54 ms against QLever's 162.30 ms.
-  The paired `q3` median is 25.41 ms against QLever's 27.62 ms. No engine completes a
-  driver throughput run with answers qualified against the others.
+In the 10M BI comparison, every engine's `q4` and `q5` averages pass an exact oracle
+within float rounding. The paired `q2` median is 20.54 ms against QLever's 162.30 ms, and
+the paired `q3` median is 25.41 ms against QLever's 27.62 ms. No engine completes a driver
+throughput run with answers qualified against the others.
 
 ## BSBM
 

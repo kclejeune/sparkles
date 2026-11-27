@@ -5,9 +5,9 @@ This is a [manual report](../README.md#evidence-and-generated-reports). Read the
 
 ## Comparison summary
 
-Over the 24.3M triples of the OWL 2 RL closure, which Sparkles
-  materializes in 17.8 s, paired `q2` means are 26.8 ms for Sparkles and 60.6 ms for
-  QLever. The query guard preserves all fourteen answers.
+Over the 24.3M triples of the OWL 2 RL closure, which Sparkles materializes in 17.8 s,
+paired `q2` means are 26.8 ms for Sparkles and 60.6 ms for QLever. The query guard
+preserves all fourteen answers.
 
 ## LUBM and reasoning
 
@@ -522,6 +522,38 @@ reasoning step alone. Twenty threads reduce the elapsed time by 9 to 36% against
 except on the smallest RDFS input, OWL2Bench(1), where they give no gain. Sparkles at 20
 threads holds 1.3 to 9.8 times Nemo's peak memory on every row but LUBM(100) under OWL 2
 RL, where it holds less than Nemo.
+
+## Derived-table cache calibration
+
+The cache calibration recorded these results on Linux x86_64. The calibrated estimate
+equals live requested heap plus 16 bytes per allocation in each case. [Methodology](README.md#derived-table-cache-calibration)
+
+| Cache shape | Live requested heap | Allocations | Calibrated estimate | Legacy estimate |
+|---|--:|--:|--:|--:|
+| Empty table with long cache-key strings | 2,120 B | 5 | 2,200 B | 64 B |
+| Spare fact-vector and local-key capacity | 58,231 B | 26 | 58,647 B | 7,280 B |
+| Hash-table growth across 64 entries | 28,848 B | 387 | 35,040 B | 9,728 B |
+| Shared chunks across three progressive session tables | 43,041 B | 21 | 43,377 B | 102,576 B |
+| One shared table across five cache keys | 13,272 B | 19 | 13,576 B | 60,960 B |
+
+The one-university LUBM diagnostic on Boat worker `bx_4utxt2gu` compared `db6a34da`
+with the initial calibration documented at `9fb52238`. Both builds retained 80
+tables, reported 528 hits and 80 misses, and matched materialized answers to all
+14 queries for both `rdfs` and `owl-rl`. The reported cache estimate was 15,036,648
+bytes with the legacy estimator and 8,136,068 bytes with the calibrated estimator.
+The LUBM diagnostic checks a small cache without sustained eviction.
+
+On the Intel Core i5-13500 worker Atlas, a synthetic resize removed 256 borrowed
+entries while three readers looked up a hot entry. The values are medians of 48
+trials. The reader metric is the slowest lookup observed per trial. Every arm
+retained 768 entries and recorded zero reader misses.
+[Run record](runs/derived-table-cache-resize-atlas/record.json)
+
+| Implementation | Resize | Slowest reader lookup |
+|---|--:|--:|
+| Legacy cache at `db6a34da` | 1,249 µs | 1,281 µs |
+| Initial calibration at `9fb52238` | 3,010 µs | 3,042 µs |
+| Calibration with incremental caller-hold accounting | 239 µs | 244 µs |
 
 ## Query-time reasoning latency
 

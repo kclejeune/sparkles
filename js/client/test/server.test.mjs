@@ -1,77 +1,62 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { createServer } from 'node:net';
+import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
+import * as http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fetchLocal, startServer, stopServer } from '../../../ui/scripts/server-process.mjs';
 import { SparklesClient, factory, BudgetExceededError, ConflictError } from '../dist/index.js';
 
 const binary = process.env.SPARKLES_CLIENT_TEST_SERVER_BIN;
-async function freePort() {
-  const socket = createServer();
-  await new Promise((resolve, reject) =>
-    socket.listen(0, '127.0.0.1', resolve).once('error', reject),
-  );
-  const port = socket.address().port;
-  await new Promise((resolve, reject) =>
-    socket.close((error) => (error ? reject(error) : resolve())),
-  );
-  return port;
-}
-
 test(
   'real Sparkles server: memory branch isolation, streaming queries, snapshots, GSP ETags, history and typed administration',
   { skip: !binary, timeout: 30_000 },
   async () => {
     const directory = await mkdtemp(join(tmpdir(), 'sparkles-client-server-'));
+    const proxyRequests = [];
+    const proxy = http.createServer((request, response) => {
+      proxyRequests.push(request.url);
+      response.writeHead(502).end();
+    });
+    proxy.on('connect', (request, socket) => {
+      proxyRequests.push(request.url);
+      socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+    });
+    proxy.listen(0, '127.0.0.1');
+    await once(proxy, 'listening');
+    const restoreProxy = http.setGlobalProxyFromEnv?.({
+      http_proxy: `http://127.0.0.1:${proxy.address().port}`,
+      no_proxy: 'localhost',
+    });
     let server;
-    let output = '';
     try {
-      const port = await freePort();
-      server = spawn(binary, [
-        'serve',
-        '--data',
-        directory,
-        '--host',
-        '127.0.0.1',
-        '--port',
-        String(port),
-        '--mem',
-        'wiki',
-        '--cache-mb',
-        '16',
-        '--result-cache-mb',
-        '0',
-        '--history-cache-mb',
-        '16',
-        '--service-cache-mb',
-        '0',
-      ]);
-      server.stderr.on('data', (data) => {
-        output += data;
-      });
-      server.stdout.on('data', (data) => {
-        output += data;
-      });
-      let startupError;
-      server.once('error', (error) => {
-        startupError = error;
-      });
-      const base = `http://127.0.0.1:${port}`;
-      const startupDeadline = Date.now() + 15_000;
-      for (;;) {
-        try {
-          if ((await fetch(base + '/$/datasets')).ok) break;
-        } catch {
-          /* Await startup. */
-        }
-        if (startupError) throw startupError;
-        if (server.exitCode !== null || server.signalCode !== null || Date.now() >= startupDeadline)
-          throw new Error('Server did not start: ' + output);
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      const client = new SparklesClient(base),
+      const { child, url: base } = await startServer(
+        binary,
+        [
+          'serve',
+          '--data',
+          directory,
+          '--host',
+          '127.0.0.1',
+          '--port',
+          '0',
+          '--mem',
+          'wiki',
+          '--cache-mb',
+          '16',
+          '--result-cache-mb',
+          '0',
+          '--history-cache-mb',
+          '16',
+          '--service-cache-mb',
+          '0',
+        ],
+        join(directory, 'server.log'),
+        { timeout: 15_000 },
+      );
+      server = child;
+      const client = new SparklesClient(base, { fetch: fetchLocal }),
         main = client.dataset('wiki');
       const inserted = await main.update('INSERT DATA { ex:s ex:p "héllo"@fr }', {
         prefixes: { ex: 'urn:' },
@@ -141,12 +126,11 @@ test(
       assert.equal(renamed.response.status, 200);
       assert(await client.dataset('wiki', 'renamed').ask('ASK { <urn:t> <urn:p> 2 }'));
     } finally {
-      if (server && server.exitCode === null) {
-        const exited = new Promise((resolve) => server.once('exit', resolve));
-        server.kill('SIGTERM');
-        await exited;
-      }
+      if (server) await stopServer(server);
+      restoreProxy?.();
+      proxy.close();
       await rm(directory, { recursive: true, force: true });
+      assert.deepEqual(proxyRequests, []);
     }
   },
 );

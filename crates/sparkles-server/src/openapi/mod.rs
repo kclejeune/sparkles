@@ -8,7 +8,7 @@
 //! document with its checked-in copy, `docs/openapi.json`.
 
 #[cfg(test)]
-mod contract_tests;
+pub(crate) mod contract_tests;
 mod paths;
 mod schemas;
 #[cfg(test)]
@@ -544,6 +544,17 @@ fn parameters() -> Map<String, J> {
     );
     put("task", path("task", "The id of the ingestion task."));
     put("version", path("version", "A version of the resource."));
+    put(
+        "prefix",
+        path("prefix", "A hosted vocabulary namespace prefix."),
+    );
+    put(
+        "local",
+        path(
+            "local",
+            "The local path appended to the hosted namespace IRI.",
+        ),
+    );
     put("repo", path("repo", "The backup repository."));
     put("backup", path("backup", "The backup's id."));
     put("policy", path("policy", "The backup policy."));
@@ -706,7 +717,7 @@ fn parameters() -> Map<String, J> {
         q(
             "execution",
             json!({ "type": "string", "enum": ["eager", "streaming", "auto"], "default": "auto" }),
-            "Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams.",
+            "Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for initial bindings. A streamed answer's query deadline counts computation and excludes waiting for its reader. Finite HTTP bodies separately enforce `--stream-idle-timeout`, defaulting to 60 seconds while application output or its final end is ready but unread, plus an optional absolute `--stream-transfer-timeout`. These limits observe downstream application progress rather than remote socket receipt. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out of cursor execution; finite-body limits still apply when its response streams.",
         ),
     );
     put(

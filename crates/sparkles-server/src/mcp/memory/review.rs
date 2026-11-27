@@ -173,6 +173,8 @@ impl Tools<'_> {
                 Ok(v)
             }
             Outcome::Text(t) => Ok(serde_json::from_str(&t).unwrap_or(Value::String(t))),
+            Outcome::Retained(p) => Ok(serde_json::from_str(p.as_str())
+                .unwrap_or_else(|_| Value::String(p.as_str().into()))),
         }
     }
 

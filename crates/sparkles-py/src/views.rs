@@ -127,6 +127,15 @@ fn rows_py<'py>(py: Python<'py>, rows: &[LiveRow]) -> PyResult<Bound<'py, PyList
     Ok(out)
 }
 
+/// The positions of an ordered window's rows, parallel to the rows, or `None` for rows
+/// without positions.
+fn positions(rows: &[LiveRow]) -> Option<Vec<u64>> {
+    if rows.is_empty() {
+        return None;
+    }
+    rows.iter().map(|r| r.position).collect()
+}
+
 /// An event as a dict: `event` is `snapshot`, `reset`, `diff` or `error`.
 fn event_py<'py>(py: Python<'py>, e: &LiveEvent) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
@@ -143,7 +152,12 @@ fn event_py<'py>(py: Python<'py>, e: &LiveEvent) -> PyResult<Bound<'py, PyDict>>
             d.set_item("vars", vars.to_vec())?;
             match value {
                 Some(v) => d.set_item("value", v)?,
-                None => d.set_item("rows", rows_py(py, rows)?)?,
+                None => {
+                    d.set_item("rows", rows_py(py, rows)?)?;
+                    if let Some(p) = positions(rows) {
+                        d.set_item("positions", p)?;
+                    }
+                }
             }
         }
         LiveEvent::Diff {
@@ -157,6 +171,11 @@ fn event_py<'py>(py: Python<'py>, e: &LiveEvent) -> PyResult<Bound<'py, PyDict>>
             d.set_item("from", from)?;
             d.set_item("removed", rows_py(py, removed)?)?;
             d.set_item("added", rows_py(py, added)?)?;
+            let (r, a) = (positions(removed), positions(added));
+            if r.is_some() || a.is_some() {
+                d.set_item("removed_positions", r.unwrap_or_default())?;
+                d.set_item("added_positions", a.unwrap_or_default())?;
+            }
         }
         LiveEvent::Value {
             commit,

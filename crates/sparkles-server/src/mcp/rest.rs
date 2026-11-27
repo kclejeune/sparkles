@@ -350,5 +350,10 @@ async fn run(
         Ok(Ok(Outcome::Text(t))) => {
             Ok(([(header::CONTENT_TYPE, "application/json")], t).into_response())
         }
+        Ok(Ok(Outcome::Retained(p))) => Ok((
+            [(header::CONTENT_TYPE, "application/json")],
+            p.as_str().to_string(),
+        )
+            .into_response()),
     }
 }

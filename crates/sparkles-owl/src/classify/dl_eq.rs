@@ -27,10 +27,12 @@
 //! of its subsumers, and the role atom and core of a unit existential restriction over its
 //! successor term.
 
-use super::dl_clause::{Lit, Lits, Made, RTerm, Rooted, XLit, rank, terms_of};
-use super::dl_rules::{DlIx, Found, Side, dl, local, merge, no_xy, restricted, side, unit, with};
+use super::dl_clause::{Lit, Lits, Made, RTerm, Rooted, XLit, admit_lit, rank, terms_of};
+use super::dl_rules::{
+    DlIx, Found, Side, dl, local, merge_parts, no_xy, side_exact_bytes, side_parts_bytes, unit,
+};
 use super::index::{Ex, Index, Role, TOP};
-use super::saturate::State;
+use super::saturate::{Guard, Sink, State};
 use std::sync::OnceLock;
 
 /// Whether `x ≈ u` rewrites only in the two forms of a query context, item 804's third
@@ -76,15 +78,22 @@ fn shape(rule: &'static str, s1: RTerm, t1: RTerm) -> &'static str {
     if rule == "eq" { EQ[i] } else { INTO[i] }
 }
 
-/// What the equality rules read beside a context's state: the index, the run's literals,
-/// whether the context is the root, and the named class of a query context, which is its
-/// core atom.
+/// What the equality rules read beside a context's state: the index, whether the context
+/// is the root, and the named class of a query context, which is its core atom.
 pub(super) struct Eqs<'a> {
     pub ix: &'a Index,
     pub dx: &'a DlIx,
-    pub lits: &'a Lits,
     pub root: bool,
     pub query: Option<Ex>,
+}
+
+fn side_eq(prem: &Side, body: &[Lit], head: &[Lit], without: Option<Lit>) -> bool {
+    prem.0 == body
+        && prem
+            .1
+            .iter()
+            .copied()
+            .eq(head.iter().copied().filter(|&l| Some(l) != without))
 }
 
 impl Eqs<'_> {
@@ -92,12 +101,12 @@ impl Eqs<'_> {
         move |r| self.dx.inv(self.ix, r)
     }
 
-    fn view(&self, l: Lit) -> XLit {
-        self.lits.view(l, self.inv())
+    fn view(&self, lits: &Lits, l: Lit) -> XLit {
+        lits.view(l, self.inv())
     }
 
-    fn lit(&self, l: XLit) -> Made {
-        self.lits.lit(l, self.inv())
+    fn lit<S: Sink>(&self, out: &mut Guard<'_, S>, l: XLit) -> Option<Made> {
+        admit_lit(l, self.inv(), out)
     }
 
     /// Whether `s₁ ≈ t₁` may rewrite `s₁`: `t₁` is not above it, and it is not `x ≈ y` or
@@ -107,17 +116,27 @@ impl Eqs<'_> {
         !Rooted::a_gt(t1, s1) && !matches!((s1, t1), (X, Y) | (Y, X) | (Y, C(_)) | (C(_), Y))
     }
 
-    /// Whether Eq with `s₁ ↦ t₁` may rewrite the literal `v` of the premise `prem` (the
-    /// premise without v). An equality other than `x ≈ u` always may. `x ↦ u` rewrites the
-    /// unit of a query context's core atom, and `u ↦ x` a named-class atom over u in a
+    /// Whether Eq with `s₁ ↦ t₁` may rewrite the literal `v` of the premise `(body, head)`
+    /// (excluding `without`). An equality other than `x ≈ u` always may. `x ↦ u` rewrites
+    /// the unit of a query context's core atom, and `u ↦ x` a named-class atom over u in a
     /// query context, and nothing else when the blocking is on.
-    fn admits(&self, s1: RTerm, t1: RTerm, v: XLit, prem: &Side) -> bool {
+    fn admits_parts(
+        &self,
+        s1: RTerm,
+        t1: RTerm,
+        v: XLit,
+        body: &[Lit],
+        head: &[Lit],
+        without: Option<Lit>,
+    ) -> bool {
         use RTerm::*;
         match (s1, t1) {
             (X, C(_)) => {
                 !eq_block()
                     || self.query.is_some_and(|me| {
-                        prem.0.is_empty() && prem.1.is_empty() && v == XLit::Atom(me, X)
+                        body.is_empty()
+                            && !head.iter().any(|&l| Some(l) != without)
+                            && v == XLit::Atom(me, X)
                     })
             }
             (C(u), X) => {
@@ -130,7 +149,15 @@ impl Eqs<'_> {
     }
 
     /// The literals `v` rewrites to with `s₁ ↦ t₁`, one for each position the rule allows.
-    fn rewrites(&self, v: XLit, s1: RTerm, t1: RTerm, out: &mut Vec<Made>) {
+    /// Returns `false` if literal admission failed.
+    fn rewrites<S: Sink>(
+        &self,
+        v: XLit,
+        s1: RTerm,
+        t1: RTerm,
+        out: &mut Vec<Made>,
+        guard: &mut Guard<'_, S>,
+    ) -> bool {
         use RTerm::*;
         // a constant everywhere in the side, inside f(u) too, in every context
         let everywhere = matches!(s1, C(_));
@@ -148,24 +175,36 @@ impl Eqs<'_> {
         match v {
             XLit::Atom(b, a) => {
                 if holds(a) && (s1 != X || plain(&[a])) {
-                    out.push(self.lit(XLit::Atom(b, sub(a))));
+                    let Some(m) = self.lit(guard, XLit::Atom(b, sub(a))) else {
+                        return false;
+                    };
+                    out.push(m);
                 }
             }
             XLit::Role(r, a, b) => {
                 if s1 == X && !plain(&[a, b]) {
-                    return;
+                    return true;
                 }
                 if everywhere {
                     if holds(a) || holds(b) {
-                        out.push(self.lit(XLit::Role(r, sub(a), sub(b))));
+                        let Some(m) = self.lit(guard, XLit::Role(r, sub(a), sub(b))) else {
+                            return false;
+                        };
+                        out.push(m);
                     }
-                    return;
+                    return true;
                 }
                 if a == s1 {
-                    out.push(self.lit(XLit::Role(r, t1, b)));
+                    let Some(m) = self.lit(guard, XLit::Role(r, t1, b)) else {
+                        return false;
+                    };
+                    out.push(m);
                 }
                 if b == s1 {
-                    out.push(self.lit(XLit::Role(r, a, t1)));
+                    let Some(m) = self.lit(guard, XLit::Role(r, a, t1)) else {
+                        return false;
+                    };
+                    out.push(m);
                 }
             }
             XLit::Eq(a, b) | XLit::Ne(a, b) => {
@@ -181,159 +220,299 @@ impl Eqs<'_> {
                     if s1 == X && !plain(&[s2]) {
                         continue;
                     }
-                    out.push(self.lit(make(sub(s2), t2)));
+                    let Some(m) = self.lit(guard, make(sub(s2), t2)) else {
+                        return false;
+                    };
+                    out.push(m);
                     if a == b {
                         break;
                     }
                 }
             }
         }
-    }
-
-    /// The premises whose maximal literals mention `t`, each with its literal and whether
-    /// its clause is selected: the stored clauses, and the units in place of a context
-    /// other than the root.
-    fn targets(&self, st: &State, t: RTerm, out: &mut Vec<(Side, XLit, bool)>) {
-        out.clear();
-        if !self.root {
-            match t {
-                RTerm::X => {
-                    for &a in &st.subs {
-                        if a != TOP {
-                            out.push((unit(), XLit::Atom(a, RTerm::X), false));
-                        }
-                    }
-                }
-                RTerm::Fx(e) => {
-                    let mut us = Vec::new();
-                    unit_lits(self, st, e, &mut us);
-                    out.extend(us.into_iter().map(|l| (unit(), l, false)));
-                }
-                _ => {}
-            }
-        }
-        let Some(d) = dl(st) else { return };
-        let Some(by) = d.store.terms.as_deref() else {
-            return;
-        };
-        for &i in by.any.get(&t).into_iter().flatten() {
-            let s = &d.store.clauses[i as usize];
-            if s.dead {
-                continue;
-            }
-            for &l in d.store.maxima(i) {
-                out.push((side(&s.c, l), self.view(l), s.sel));
-            }
-        }
+        true
     }
 
     /// The rules on a new premise `prem` whose maximal literal is `l`: as an equality it
     /// rewrites the premises that mention its side and factors with its own head, and as
-    /// any literal it is rewritten by the stored equalities of its terms. A selected
-    /// premise, `sel`, takes only the inferences local to its context, those on a literal
-    /// that [`super::dl_rules::local`] admits, and so does a selected stored premise.
-    pub fn on_max(&self, st: &State, l: Lit, prem: &Side, found: &mut Found, sel: bool) {
+    /// any literal it is rewritten by the stored equalities of its terms. A fully selected
+    /// premise (`sel`) takes only local inferences ([`super::dl_rules::local`]); a premise
+    /// cut only by `gbody` (item 1250) is blocked from purely `no_xy` Eq and Factor pairs
+    /// while remaining eligible for mixed non-local pairs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_max<S: Sink>(
+        &self,
+        st: &State,
+        l: Lit,
+        prem: &Side,
+        found: &mut Found,
+        guard: &mut Guard<'_, S>,
+        sel: bool,
+        gbody: bool,
+    ) -> bool {
         found.rule = "eqmax";
-        let v = self.view(l);
+        let v = self.view(&guard.dl().lits, l);
         let mut made = Vec::new();
-        let mut ts = Vec::new();
         if let XLit::Eq(a, b) = v {
             for (s1, t1) in [(a, b), (b, a)] {
                 if Rooted::a_gt(t1, s1) {
                     continue;
                 }
-                // Factor has no exclusions of x ≈ y and y ≈ u, which only Eq has
-                if !sel || local(v) {
-                    self.factor(prem, l, s1, t1, found);
+                // Factor has no exclusions of x ≈ y and y ≈ u, which only Eq has.
+                // Preserve full selection's asymmetry (testing locality on the maximal
+                // equality `v` alone) while checking `gbody` per pair inside `factor`.
+                if (!sel || local(v)) && !self.factor(prem, l, s1, t1, found, guard, gbody) {
+                    return false;
                 }
                 found.rule = "eq";
                 if !Eqs::orients(s1, t1) {
                     continue;
                 }
-                self.targets(st, s1, &mut ts);
-                for (c2, v2, sel2) in &ts {
-                    if *v2 == v && c2 == prem || !self.admits(s1, t1, *v2, c2) {
-                        continue;
+                // Targets read `st` immutably while `guard` may admit literals and `Found::one`.
+                let ok = if !self.root {
+                    match s1 {
+                        RTerm::X => {
+                            let mut ok = true;
+                            for &a in &st.subs {
+                                if a != TOP {
+                                    let v2 = XLit::Atom(a, RTerm::X);
+                                    if (v2 == v && prem.0.is_empty() && prem.1.is_empty())
+                                        || !self.admits_parts(s1, t1, v2, &[], &[], None)
+                                        || (sel && !(local(v) || local(v2)))
+                                    {
+                                        continue;
+                                    }
+                                    made.clear();
+                                    if !self.rewrites(v2, s1, t1, &mut made, guard) {
+                                        ok = false;
+                                        break;
+                                    }
+                                    found.rule = shape("eq", s1, t1);
+                                    if !self.push_parts(
+                                        st,
+                                        found,
+                                        prem,
+                                        &[],
+                                        &[],
+                                        None,
+                                        &made,
+                                        no_xy(v) && no_xy(v2),
+                                        false,
+                                        guard,
+                                    ) {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            ok
+                        }
+                        RTerm::Fx(e) => {
+                            let mut us = Vec::new();
+                            unit_lits(self, st, e, &mut us);
+                            let mut ok = true;
+                            for v2 in us {
+                                if (v2 == v && prem.0.is_empty() && prem.1.is_empty())
+                                    || !self.admits_parts(s1, t1, v2, &[], &[], None)
+                                    || (sel && !(local(v) || local(v2)))
+                                {
+                                    continue;
+                                }
+                                made.clear();
+                                if !self.rewrites(v2, s1, t1, &mut made, guard) {
+                                    ok = false;
+                                    break;
+                                }
+                                found.rule = shape("eq", s1, t1);
+                                if !self.push_parts(
+                                    st,
+                                    found,
+                                    prem,
+                                    &[],
+                                    &[],
+                                    None,
+                                    &made,
+                                    no_xy(v) && no_xy(v2),
+                                    false,
+                                    guard,
+                                ) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            ok
+                        }
+                        _ => true,
                     }
-                    if (sel || *sel2) && !(local(v) || local(*v2)) {
-                        continue;
+                } else {
+                    true
+                };
+                if !ok {
+                    return false;
+                }
+                if let Some(d) = dl(st)
+                    && let Some(by) = d.store.terms.as_deref()
+                {
+                    for &i in by.any.get(&s1).into_iter().flatten() {
+                        let s = &d.store.clauses[i as usize];
+                        if s.dead {
+                            continue;
+                        }
+                        for &l2 in d.store.maxima(i) {
+                            let v2 = self.view(&guard.dl().lits, l2);
+                            if (v2 == v && side_eq(prem, s.c.body(), s.c.head(), Some(l2)))
+                                || !self.admits_parts(s1, t1, v2, s.c.body(), s.c.head(), Some(l2))
+                            {
+                                continue;
+                            }
+                            let pure = no_xy(v) && no_xy(v2);
+                            if (sel || s.sel || (pure && (gbody || s.gbody)))
+                                && !(local(v) || local(v2))
+                            {
+                                continue;
+                            }
+                            made.clear();
+                            if !self.rewrites(v2, s1, t1, &mut made, guard) {
+                                return false;
+                            }
+                            found.rule = shape("eq", s1, t1);
+                            if !self.push_parts(
+                                st,
+                                found,
+                                prem,
+                                s.c.body(),
+                                s.c.head(),
+                                Some(l2),
+                                &made,
+                                pure,
+                                s.fact,
+                                guard,
+                            ) {
+                                return false;
+                            }
+                        }
                     }
-                    made.clear();
-                    self.rewrites(*v2, s1, t1, &mut made);
-                    found.rule = shape("eq", s1, t1);
-                    self.push(found, prem, c2, &made, no_xy(v) && no_xy(*v2));
                 }
             }
         }
-        self.into(st, v, prem, found, sel);
+        self.into(st, v, prem, found, guard, sel, gbody)
     }
 
     /// A new premise in place `prem` of `v`, a unit of a context other than the root: the
     /// stored equalities of its terms rewrite it.
-    pub fn on_unit(&self, st: &State, v: XLit, found: &mut Found) {
+    pub fn on_unit<S: Sink>(
+        &self,
+        st: &State,
+        v: XLit,
+        found: &mut Found,
+        guard: &mut Guard<'_, S>,
+    ) -> bool {
         found.rule = "equnit";
-        self.into(st, v, &unit(), found, false);
+        self.into(st, v, &unit(), found, guard, false, false)
     }
 
     /// The stored equalities whose side is a term of `v` rewrite `prem`'s `v`.
-    fn into(&self, st: &State, v: XLit, prem: &Side, found: &mut Found, sel: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn into<S: Sink>(
+        &self,
+        st: &State,
+        v: XLit,
+        prem: &Side,
+        found: &mut Found,
+        guard: &mut Guard<'_, S>,
+        sel: bool,
+        gbody: bool,
+    ) -> bool {
         found.rule = "eqinto";
-        let Some(d) = dl(st) else { return };
+        let Some(d) = dl(st) else { return true };
         let Some(by) = d.store.terms.as_deref() else {
-            return;
+            return true;
         };
         let (ts, n) = terms_of(v);
-        let mut seen: Vec<RTerm> = Vec::with_capacity(4);
+        let mut seen = [RTerm::X; 4];
+        let mut seen_len = 0usize;
         let mut made = Vec::new();
         for &t in &ts[..n] {
-            let mut look = vec![t];
+            let mut look = [t, RTerm::X];
+            let mut look_len = 1usize;
             if let RTerm::Fc(_, u) = t {
-                look.push(RTerm::C(u));
+                look[1] = RTerm::C(u);
+                look_len = 2;
             }
-            for s1 in look {
-                if seen.contains(&s1) {
+            for &s1 in &look[..look_len] {
+                if seen[..seen_len].contains(&s1) {
                     continue;
                 }
-                seen.push(s1);
+                seen[seen_len] = s1;
+                seen_len += 1;
                 for &i in by.eqs.get(&s1).into_iter().flatten() {
                     let s = &d.store.clauses[i as usize];
                     if s.dead {
                         continue;
                     }
                     for &e in d.store.maxima(i) {
-                        let XLit::Eq(a, b) = self.view(e) else {
+                        let ve = self.view(&guard.dl().lits, e);
+                        let XLit::Eq(a, b) = ve else {
                             continue;
                         };
                         let t1 = if a == s1 { b } else { a };
                         if (a != s1 && b != s1) || !Eqs::orients(s1, t1) {
                             continue;
                         }
-                        if !self.admits(s1, t1, v, prem) {
+                        if !self.admits_parts(s1, t1, v, &prem.0, &prem.1, None) {
                             continue;
                         }
-                        if (sel || s.sel) && !(local(v) || local(self.view(e))) {
+                        let pure = no_xy(ve) && no_xy(v);
+                        if (sel || s.sel || (pure && (gbody || s.gbody)))
+                            && !(local(v) || local(ve))
+                        {
                             continue;
                         }
-                        let c1 = side(&s.c, e);
-                        if self.view(e) == v && &c1 == prem {
+                        if ve == v && side_eq(prem, s.c.body(), s.c.head(), Some(e)) {
                             continue;
                         }
                         made.clear();
-                        self.rewrites(v, s1, t1, &mut made);
+                        if !self.rewrites(v, s1, t1, &mut made, guard) {
+                            return false;
+                        }
                         found.rule = shape("eqinto", s1, t1);
-                        self.push(found, &c1, prem, &made, no_xy(self.view(e)) && no_xy(v));
+                        if !self.push_parts(
+                            st,
+                            found,
+                            prem,
+                            s.c.body(),
+                            s.c.head(),
+                            Some(e),
+                            &made,
+                            pure,
+                            s.fact,
+                            guard,
+                        ) {
+                            return false;
+                        }
                     }
                 }
             }
         }
+        true
     }
 
     /// Factor: `Γ → Δ ∨ s ≈ t₀ ∨ s ≈ t₁`, with `s ≈ t₁` maximal and read as `s ↦ t₁`,
     /// gives `Γ → Δ ∨ t₀ ≉ t₁ ∨ s ≈ t₁`.
-    fn factor(&self, prem: &Side, l: Lit, s: RTerm, t1: RTerm, found: &mut Found) {
+    #[allow(clippy::too_many_arguments)]
+    fn factor<S: Sink>(
+        &self,
+        prem: &Side,
+        l: Lit,
+        s: RTerm,
+        t1: RTerm,
+        found: &mut Found,
+        guard: &mut Guard<'_, S>,
+        gbody: bool,
+    ) -> bool {
         found.rule = "factor";
         for &o in &prem.1 {
-            let XLit::Eq(a, b) = self.view(o) else {
+            let XLit::Eq(a, b) = self.view(&guard.dl().lits, o) else {
                 continue;
             };
             let t0 = if a == s {
@@ -343,40 +522,123 @@ impl Eqs<'_> {
             } else {
                 continue;
             };
-            let mut c: Side = (
-                prem.0.clone(),
-                prem.1.iter().copied().filter(|&m| m != o).collect(),
-            );
-            c.1.push(l);
-            match self.lit(XLit::Ne(t0, t1)) {
-                Made::Lit(n) => c.1.push(n),
-                Made::False => {}
-                Made::True => continue,
+            let is_ground = no_xy(XLit::Eq(s, t1)) && no_xy(XLit::Eq(s, t0));
+            if is_ground && gbody {
+                continue;
             }
-            if !(no_xy(XLit::Eq(s, t1)) && no_xy(XLit::Eq(s, t0)))
-                || !restricted(self.lits, self.inv(), &c)
+            let Some(ne_made) = self.lit(guard, XLit::Ne(t0, t1)) else {
+                return false;
+            };
+            let ne_lit = match ne_made {
+                Made::Lit(n) => Some(n),
+                Made::False => None,
+                Made::True => continue,
+            };
+            if is_ground
+                && super::dl_root::restricted_parts(
+                    &guard.dl().lits,
+                    self.inv(),
+                    &prem.0,
+                    &[],
+                    &[l],
+                    &prem.1,
+                    Some(o),
+                    ne_lit,
+                )
             {
-                found.push(c);
+                continue;
+            }
+            let h_len =
+                prem.1.iter().filter(|&&m| m != o).count() + 1 + usize::from(ne_lit.is_some());
+            let Some(bytes) = side_exact_bytes(prem.0.len(), h_len) else {
+                guard.speculative_overflow();
+                return false;
+            };
+            if !found.push_admitted(
+                bytes,
+                || {
+                    let mut h = Vec::with_capacity(h_len);
+                    h.extend(prem.1.iter().copied().filter(|&m| m != o));
+                    h.push(l);
+                    if let Some(n) = ne_lit {
+                        h.push(n);
+                    }
+                    (prem.0.clone(), h)
+                },
+                guard,
+            ) {
+                return false;
             }
         }
+        true
     }
 
-    /// The conclusions of rewriting `c2` with `c1`, one for each literal made: a false
-    /// literal leaves the clause without it, and a true one makes no conclusion. The
-    /// restriction on ground inferences applies when `ground`.
-    fn push(&self, found: &mut Found, c1: &Side, c2: &Side, made: &[Made], ground: bool) {
-        let mut add = |c: Side| {
-            if !ground || !restricted(self.lits, self.inv(), &c) {
-                found.push(c);
-            }
-        };
+    /// The conclusions of rewriting with `prem` and borrowed `(part_body, part_head, without)`,
+    /// one for each literal made: a false literal leaves the clause without it, and a true
+    /// one makes no conclusion. The restriction on ground inferences applies when `ground`,
+    /// and unit-only root-fact suppression applies when both premises are certified root units.
+    #[allow(clippy::too_many_arguments)]
+    fn push_parts<S: Sink>(
+        &self,
+        st: &State,
+        found: &mut Found,
+        prem: &Side,
+        part_body: &[Lit],
+        part_head: &[Lit],
+        without: Option<Lit>,
+        made: &[Made],
+        ground: bool,
+        fact: bool,
+        guard: &mut Guard<'_, S>,
+    ) -> bool {
+        let given_fact = !self.root && fact && dl(st).is_some_and(|x| x.given_fact);
         for &m in made {
-            match m {
-                Made::Lit(l) => add(with(&merge(c1, c2), l)),
-                Made::False => add(merge(c1, c2)),
-                Made::True => {}
+            let add = match m {
+                Made::Lit(l) => Some(l),
+                Made::False => None,
+                Made::True => continue,
+            };
+            let lits = &guard.dl().lits;
+            if ground
+                && super::dl_root::restricted_parts(
+                    lits,
+                    self.inv(),
+                    &prem.0,
+                    part_body,
+                    &prem.1,
+                    part_head,
+                    without,
+                    add,
+                )
+            {
+                continue;
+            }
+            if given_fact
+                && super::dl_root::routable_unit_parts(
+                    self.ix, st, lits, &prem.0, part_body, &prem.1, part_head, without, add,
+                )
+            {
+                if super::dl_rules::tracing() {
+                    super::dl_root::trace_shared_parts(
+                        self.ix, st, lits, found.rule, &prem.0, part_body, &prem.1, part_head,
+                        without, add,
+                    );
+                }
+                continue;
+            }
+            let Some(bytes) = side_parts_bytes(prem, part_body, part_head, without, add) else {
+                guard.speculative_overflow();
+                return false;
+            };
+            if !found.push_admitted(
+                bytes,
+                || merge_parts(prem, part_body, part_head, without, add),
+                guard,
+            ) {
+                return false;
             }
         }
+        true
     }
 }
 

@@ -1,0 +1,1 @@
+{"head":{"vars":["s","p","o"]},"results":{"bindings":[{"s":{"type":"bnode","value":"b0"},"p":{"type":"uri","value":"urn:ex:q"},"o":{"type":"uri","value":"urn:ex:s1"}},{"s":{"type":"uri","value":"urn:ex:o"},"p":{"type":"uri","value":"urn:ex:q"},"o":{"type":"literal","value":"after\no"}}]}}

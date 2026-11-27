@@ -34,7 +34,8 @@ pub struct Io {
     #[arg(long, conflicts_with = "input")]
     pub loc: Option<PathBuf>,
     /// Write the ontology to this file after the command, in the syntax its extension
-    /// names: .ofn, .owl (RDF/XML), .ttl or .nt, each optionally .gz (repeatable)
+    /// names: .ofn, .owl (RDF/XML), .ttl, .nt, .owx (OWL/XML), .omn (Manchester),
+    /// .obo (OBO 1.4) or .json (OBO Graphs JSON), each optionally .gz (repeatable)
     #[arg(short = 'o', long)]
     pub output: Vec<PathBuf>,
     #[command(flatten)]
@@ -99,6 +100,12 @@ pub struct ReasonArgs {
     /// true is not supported: the invalid reference check is not implemented
     #[arg(long, default_value = "false")]
     pub prevent_invalid_references: String,
+    /// true: refuse with an error naming the axioms when the classifier would leave an
+    /// axiom out or use one only in part, as HermiT and the OWL API refuse what they do
+    /// not support, so that the output is complete for the whole ontology. The default
+    /// is true with --reasoner hermit or jfact and false otherwise
+    #[arg(long)]
+    pub strict: Option<String>,
     #[command(flatten)]
     pub io: Io,
 }
@@ -118,6 +125,12 @@ pub struct ReduceArgs {
     /// true: take subproperties and property chains into account
     #[arg(short = 's', long, default_value = "false")]
     pub include_subproperties: String,
+    /// true: refuse with an error naming the axioms when the classifier would leave an
+    /// axiom out or use one only in part, as HermiT and the OWL API refuse what they do
+    /// not support, so that the output is complete for the whole ontology. The default
+    /// is true with --reasoner hermit or jfact and false otherwise
+    #[arg(long)]
+    pub strict: Option<String>,
     #[command(flatten)]
     pub io: Io,
 }
@@ -160,6 +173,12 @@ pub struct MaterializeArgs {
     /// Accepted and ignored, as ROBOT's materialize ignores it
     #[arg(short = 'a', long, default_value = "false")]
     pub annotate_inferred_axioms: String,
+    /// true: refuse with an error naming the axioms when the classifier would leave an
+    /// axiom out or use one only in part, as HermiT and the OWL API refuse what they do
+    /// not support, so that the output is complete for the whole ontology. The default
+    /// is true with --reasoner hermit or jfact and false otherwise
+    #[arg(long)]
+    pub strict: Option<String>,
     #[command(flatten)]
     pub io: Io,
 }
@@ -170,13 +189,20 @@ pub struct ClassifyStep {
     /// Classify the assertions too: the types of each individual
     #[arg(long)]
     pub assertions: bool,
+    /// Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom
+    /// outside OWL 2 EL
+    #[arg(long)]
+    pub el_only: bool,
     /// Describe this class
     #[arg(long)]
     pub about: Option<String>,
     /// Exit with status 0 when classes are unsatisfiable but the ontology is consistent
     #[arg(long)]
     pub allow_unsatisfiable: bool,
-    /// ofn (the taxonomy as a functional-style document), json or text
+    /// Refuse when the classifier would leave an axiom out, as `classify --strict`
+    #[arg(long)]
+    pub strict: bool,
+    /// ofn, owx, omn, obo, obographs, json or text
     #[arg(long, default_value = "ofn")]
     pub format: String,
     #[command(flatten)]
@@ -265,8 +291,7 @@ pub fn resume(
     let w = WorkingOntology::read(file, &read.request()?, threads, &q)
         .with_context(|| format!("cannot read {}", file.display()))?;
     for o in &output {
-        w.write(o)
-            .with_context(|| format!("cannot write {}", o.display()))?;
+        write_working(&w, o)?;
     }
     follow(Some(w), rest, &opts)
 }
@@ -298,6 +323,21 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
     for o in &io.output {
         OutputFormat::of(o)?;
     }
+    match &step {
+        Step::Classify(a)
+            if !["ofn", "owx", "omn", "obo", "obographs", "json", "text"]
+                .contains(&a.format.as_str()) =>
+        {
+            bail!(
+                "unknown --format {}: ofn, owx, omn, obo, obographs, json or text",
+                a.format
+            );
+        }
+        Step::Check(a) if !["json", "text"].contains(&a.format.as_str()) => {
+            bail!("unknown --format {}: json or text", a.format);
+        }
+        _ => {}
+    }
     let q = QueryOptions::default();
     let mut w = match state.take() {
         Some(w) => {
@@ -319,16 +359,18 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
             let o = reason_options(&a)?;
             let c = ClassifyRequest {
                 el_only: reasoner(a.reasoner.as_deref(), true)?,
+                strict: strict(a.strict.as_deref(), a.reasoner.as_deref())?,
                 ..c.clone()
             };
             match w.reason(&o, &c, &q) {
-                Ok(r) => log(&r),
+                Ok(r) => log(&r, &w.unmapped),
                 Err(e) => return Err(failed(e, a.dump_unsatisfiable.as_deref(), &w)),
             }
         }
         Step::Reduce(a) => {
             let c = ClassifyRequest {
                 el_only: reasoner(a.reasoner.as_deref(), false)?,
+                strict: strict(a.strict.as_deref(), a.reasoner.as_deref())?,
                 ..c.clone()
             };
             let o = ReduceOptions {
@@ -337,7 +379,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 include_subproperties: is_true(&a.include_subproperties),
             };
             match w.reduce(&o, &c, &q) {
-                Ok(r) => log(&r),
+                Ok(r) => log(&r, &w.unmapped),
                 Err(e) => return Err(failed(e, None, &w)),
             }
         }
@@ -347,17 +389,18 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 exclude_named_classes: boolean(&a.exclude_named_classes, "exclude-named-classes")?,
                 enforce_obo_format: boolean(&a.enforce_obo_format, "enforce-obo-format")?,
             };
-            log(&w.relax(&o));
+            log(&w.relax(&o), &Default::default());
         }
         Step::Materialize(a) => {
             // ELK by default, as ROBOT's materialize, so the EL rules alone
             let c = ClassifyRequest {
                 el_only: reasoner(Some(&a.reasoner), false)?,
+                strict: strict(a.strict.as_deref(), Some(&a.reasoner))?,
                 ..c.clone()
             };
             let o = materialize_options(&a)?;
             match w.materialize(&o, &c, &q) {
-                Ok(r) => log(&r),
+                Ok(r) => log(&r, &w.unmapped),
                 Err(e) => return Err(failed(e, None, &w)),
             }
         }
@@ -369,12 +412,14 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
             let c = ClassifyRequest {
                 about: about.clone(),
                 assertions: a.assertions,
+                el_only: a.el_only,
+                strict: a.strict,
                 ..c.clone()
             };
             let file = w.to_file()?;
-            let (j, doc) = classify_body_of_file(&file, &c, &io.read, about, &q)?;
+            let (j, doc) = classify_body_of_file(&file, &c, &io.read, about, &a.format, &q)?;
             for o in &io.output {
-                w.write(o)?;
+                write_working(&w, o)?;
             }
             ok = finish_classify(&j, &doc, &a.format, a.allow_unsatisfiable)?;
             *state = Some(w);
@@ -402,7 +447,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 check.assertions,
             );
             for o in &io.output {
-                w.write(o)?;
+                write_working(&w, o)?;
             }
             ok = finish_check(&j, &a.format)?;
             *state = Some(w);
@@ -410,11 +455,61 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
         }
     }
     for o in &io.output {
-        w.write(o)
-            .with_context(|| format!("cannot write {}", o.display()))?;
+        write_working(&w, o)?;
     }
     *state = Some(w);
     Ok(ok)
+}
+
+fn write_working(w: &WorkingOntology, path: &Path) -> Result<()> {
+    let report = w
+        .write_reported(path)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    log_write_report(path, &w.renderer(), &report);
+    Ok(())
+}
+
+fn log_write_report(
+    path: &Path,
+    renderer: &sparkles::owl::ofn::Renderer,
+    report: &sparkles::owl::WriteReport,
+) {
+    if report.skipped_count > 0 {
+        eprintln!(
+            "WARN {}: {} axioms could not be represented in the target syntax and were omitted",
+            path.display(),
+            report.skipped_count
+        );
+        for s in report.skipped.iter().take(UNMAPPED_LOGGED) {
+            eprintln!(
+                "WARN   omitted ({}): {}",
+                s.reason,
+                renderer.axiom(&s.axiom)
+            );
+        }
+        if report.skipped_count > UNMAPPED_LOGGED {
+            eprintln!(
+                "WARN   and {} more",
+                report.skipped_count - UNMAPPED_LOGGED.min(report.skipped.len())
+            );
+        }
+    }
+    if report.skipped_header_count > 0 {
+        eprintln!(
+            "WARN {}: {} header annotations could not be represented in the target syntax and were omitted",
+            path.display(),
+            report.skipped_header_count
+        );
+        for reason in report.skipped_header.iter().take(UNMAPPED_LOGGED) {
+            eprintln!("WARN   omitted header: {reason}");
+        }
+        if report.skipped_header_count > UNMAPPED_LOGGED {
+            eprintln!(
+                "WARN   and {} more header annotations",
+                report.skipped_header_count - UNMAPPED_LOGGED.min(report.skipped_header.len())
+            );
+        }
+    }
 }
 
 fn read_input(io: &Io, opts: &StoreOptions, q: &QueryOptions) -> Result<WorkingOntology> {
@@ -450,6 +545,17 @@ fn boolean(s: &str, name: &str) -> Result<bool> {
     }
 }
 
+/// Whether a run refuses an answer that is not complete for the whole ontology: the
+/// value of `--strict`, or without one, whether the reasoner named is HermiT or JFact,
+/// whose users expect a complete answer or an error, as the OWL API gives.
+fn strict(value: Option<&str>, reasoner: Option<&str>) -> Result<bool> {
+    match value {
+        Some(v) => boolean(v, "strict"),
+        None => Ok(reasoner
+            .is_some_and(|r| matches!(r.trim().to_lowercase().as_str(), "hermit" | "jfact"))),
+    }
+}
+
 /// ROBOT's reasoner names, and whether the run takes the OWL 2 EL rules alone. ELK and
 /// emr, which ROBOT builds on ELK, do, so that the output is ROBOT's with ELK. Without a
 /// name the classifier also takes the Horn axioms outside OWL 2 EL, and the DL
@@ -461,7 +567,13 @@ fn reasoner(name: Option<&str>, emr: bool) -> Result<bool> {
     let n = name.trim().to_lowercase();
     match n.as_str() {
         "elk" => Ok(true),
-        "hermit" | "jfact" | "whelk" | "structural" => {
+        "hermit" | "jfact" => {
+            eprintln!(
+                "WARN --reasoner {name} is ignored: the classifier runs with its Horn rules in its place, and refuses an incomplete answer unless --strict false is given"
+            );
+            Ok(false)
+        }
+        "whelk" | "structural" => {
             eprintln!(
                 "WARN --reasoner {name} is ignored: the classifier runs with its Horn rules in its place"
             );
@@ -545,16 +657,35 @@ fn materialize_options(a: &MaterializeArgs) -> Result<MaterializeOptions> {
     })
 }
 
-/// The warnings of a run, on standard error.
-fn log(r: &Report) {
+/// The most unmapped triples a warning names.
+const UNMAPPED_LOGGED: usize = 5;
+
+/// The warnings of a run, on standard error, with the `unmapped` triples of the input,
+/// which a classification counts as left out.
+fn log(r: &Report, unmapped: &sparkles::owl::classify::Unmapped) {
     for w in &r.warnings {
         eprintln!("WARN {w}");
     }
     if !r.excluded.is_empty() {
         eprintln!(
-            "WARN the classifier left out {} axioms outside OWL 2 EL or used them only in part",
+            "WARN the classifier left out {} axioms outside OWL 2 EL or used them only in part, so the inferred axioms may be incomplete; --strict true refuses instead",
             r.excluded.len()
         );
+    }
+    if unmapped.count > 0 {
+        eprintln!(
+            "WARN {} triples of the input map to no axiom, so the inferred axioms may be incomplete; --strict true refuses instead",
+            unmapped.count
+        );
+        for t in unmapped.triples.iter().take(UNMAPPED_LOGGED) {
+            eprintln!("WARN   unmapped: {t} .");
+        }
+        if unmapped.count > UNMAPPED_LOGGED {
+            eprintln!(
+                "WARN   and {} more",
+                unmapped.count - UNMAPPED_LOGGED.min(unmapped.triples.len())
+            );
+        }
     }
 }
 
@@ -571,7 +702,7 @@ fn failed(e: TransformError, dump: Option<&Path>, w: &WorkingOntology) -> anyhow
         let written = OutputFormat::of(path)
             .map_err(anyhow::Error::from)
             .and_then(|(f, gz)| {
-                sparkles::handles::ontology::transform::write_axioms(
+                let rep = sparkles::handles::ontology::transform::write_axioms_reported(
                     path,
                     f,
                     gz,
@@ -579,7 +710,9 @@ fn failed(e: TransformError, dump: Option<&Path>, w: &WorkingOntology) -> anyhow
                     &Default::default(),
                     m.iter(),
                 )
-                .map_err(anyhow::Error::from)
+                .map_err(anyhow::Error::from)?;
+                log_write_report(path, &w.renderer(), &rep);
+                Ok(())
             });
         if let Err(x) = written {
             eprintln!(
@@ -589,6 +722,12 @@ fn failed(e: TransformError, dump: Option<&Path>, w: &WorkingOntology) -> anyhow
         }
     }
     match e {
+        // ROBOT's style of error for a strict run's refusal
+        TError::Classifier(sparkles::Error::Component(c))
+            if c.code == sparkles::handles::ontology::classify::STRICT_CODE =>
+        {
+            anyhow!("INCOMPLETE REASONING ERROR {}", c.message)
+        }
         TError::Classifier(e) => anyhow::Error::from(e),
         e => anyhow!("{e}"),
     }

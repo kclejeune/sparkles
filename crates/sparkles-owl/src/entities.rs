@@ -39,6 +39,26 @@ fn sorted<T: Ord>(items: impl IntoIterator<Item = T>) -> Vec<T> {
         .collect()
 }
 
+/// The other operands of a multiset that holds `x`: every element except one occurrence
+/// of `x`, so a repeated `x` remains visible as disjoint with itself.
+fn other_operands<T: Clone + Ord>(xs: &Multiset<T>, x: &T) -> Vec<T> {
+    if !xs.contains(x) {
+        return Vec::new();
+    }
+    let mut skipped = false;
+    xs.iter()
+        .filter(|e| {
+            if !skipped && *e == x {
+                skipped = true;
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 /// The characteristics an object property can have, by the type of their axiom.
 pub const OBJECT_PROPERTY_CHARACTERISTICS: [AxiomType; 7] = [
     AxiomType::FunctionalObjectProperty,
@@ -251,15 +271,15 @@ impl Ontology {
     pub fn disjoint_classes(&self, c: impl Into<ClassExpression>) -> Vec<ClassExpression> {
         let c = c.into();
         sorted(self.axiom_set().flat_map(|ax| match &ax.kind {
-            AxiomKind::DisjointClasses(cs) | AxiomKind::DisjointUnion(_, cs) if cs.contains(&c) => {
-                cs.iter().filter(|x| **x != c).cloned().collect()
+            AxiomKind::DisjointClasses(cs) | AxiomKind::DisjointUnion(_, cs) => {
+                other_operands(cs, &c)
             }
             _ => Vec::new(),
         }))
     }
 
     /// The operands of the `DisjointUnion` axioms that define the class `c`.
-    pub fn disjoint_unions(&self, c: &Class) -> Vec<BTreeSet<ClassExpression>> {
+    pub fn disjoint_unions(&self, c: &Class) -> Vec<Multiset<ClassExpression>> {
         sorted(self.axiom_set().filter_map(|ax| match &ax.kind {
             AxiomKind::DisjointUnion(x, cs) if x == c => Some(cs.clone()),
             _ => None,
@@ -335,9 +355,7 @@ impl Ontology {
     pub fn disjoint_object_properties(&self, p: impl Into<Ope>) -> Vec<Ope> {
         let p = p.into();
         sorted(self.axiom_set().flat_map(|ax| match &ax.kind {
-            AxiomKind::DisjointObjectProperties(ps) if ps.contains(&p) => {
-                ps.iter().filter(|x| **x != p).cloned().collect()
-            }
+            AxiomKind::DisjointObjectProperties(ps) => other_operands(ps, &p),
             _ => Vec::new(),
         }))
     }
@@ -420,9 +438,7 @@ impl Ontology {
     /// The other operands of the `DisjointDataProperties` axioms that hold `p`.
     pub fn disjoint_data_properties(&self, p: &DataProperty) -> Vec<DataProperty> {
         sorted(self.axiom_set().flat_map(|ax| match &ax.kind {
-            AxiomKind::DisjointDataProperties(ps) if ps.contains(p) => {
-                ps.iter().filter(|x| *x != p).cloned().collect()
-            }
+            AxiomKind::DisjointDataProperties(ps) => other_operands(ps, p),
             _ => Vec::new(),
         }))
     }
@@ -511,9 +527,7 @@ impl Ontology {
     /// The other operands of the `DifferentIndividuals` axioms that hold `i`.
     pub fn different_individuals(&self, i: &Individual) -> Vec<Individual> {
         sorted(self.axiom_set().flat_map(|ax| match &ax.kind {
-            AxiomKind::DifferentIndividuals(is) if is.contains(i) => {
-                is.iter().filter(|x| *x != i).cloned().collect()
-            }
+            AxiomKind::DifferentIndividuals(is) => other_operands(is, i),
             _ => Vec::new(),
         }))
     }

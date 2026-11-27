@@ -586,15 +586,31 @@ fn dp(s: &str) -> DataProperty {
 }
 
 #[test]
-fn a_change_to_a_data_axiom_runs_everything_again() {
+fn a_change_to_a_data_domain_updates_incrementally() {
     let has = ClassExpression::DataHasValue(dp("p"), Literal::simple("x"));
-    let mut k = Classifier::of(&[sub(c("A"), has)]);
+    let mut k = Classifier::of(&[sub(c("A"), has), sub(c("K"), ce("L"))]);
     k.classify(&Limits::default()).unwrap();
     let domain = ax(AxiomKind::DataPropertyDomain(dp("p"), ce("D")));
     k.add([&domain]);
     let out = k.classify(&Limits::default()).unwrap();
-    assert!(!out.stats.incremental);
+    assert!(out.stats.incremental);
     assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    assert!(out.taxonomy.is_subclass(&c("K"), &c("L")));
+}
+
+#[test]
+fn a_change_to_a_data_range_runs_everything_again() {
+    let has = ClassExpression::DataHasValue(dp("p"), Literal::simple("x"));
+    let mut k = Classifier::of(&[sub(c("A"), has)]);
+    k.classify(&Limits::default()).unwrap();
+    let range = ax(AxiomKind::DataPropertyRange(
+        dp("p"),
+        DataRange::Datatype(Datatype::new("http://www.w3.org/2001/XMLSchema#integer")),
+    ));
+    k.add([&range]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
 }
 
 #[test]
@@ -1181,16 +1197,35 @@ fn opaque_literals_are_used_in_part() {
 }
 
 #[test]
-fn a_change_with_an_individual_runs_everything_again() {
-    let mut k = Classifier::of(&[sub(c("Y"), value("r", "b")), range("r", "C")]);
+fn a_change_with_an_individual_updates_incrementally() {
+    let mut axioms = vec![
+        sub(c("Y"), value("r", "b")),
+        range("r", "C"),
+        sub(c("U1"), c("U2")),
+        sub(c("U2"), c("U3")),
+    ];
+    let mut k = Classifier::of(&axioms);
     k.classify(&Limits::default()).unwrap();
-    k.add([&is_a("D", "b")]);
+    let added1 = is_a("D", "b");
+    k.add([&added1]);
+    axioms.push(added1);
     let out = k.classify(&Limits::default()).unwrap();
-    assert!(!out.stats.incremental);
-    k.add([&sub(c("Z"), c("Y"))]);
+    let fresh = Classifier::of(&axioms)
+        .classify(&Limits::default())
+        .unwrap();
+    assert!(out.stats.incremental);
+    assert_eq!(out.taxonomy, fresh.taxonomy);
+    assert_eq!(out.consistent, fresh.consistent);
+    let added2 = sub(c("Z"), c("Y"));
+    k.add([&added2]);
+    axioms.push(added2);
     let out = k.classify(&Limits::default()).unwrap();
-    // the previous run merged a context with b, which the invalidation does not follow
-    assert!(!out.stats.incremental);
+    let fresh = Classifier::of(&axioms)
+        .classify(&Limits::default())
+        .unwrap();
+    assert!(out.stats.incremental);
+    assert_eq!(out.taxonomy, fresh.taxonomy);
+    assert_eq!(out.consistent, fresh.consistent);
     assert!(out.taxonomy.is_subclass(&c("Z"), &c("Y")));
 }
 
@@ -2661,15 +2696,22 @@ fn a_range_on_links_that_are_not_loops() {
                     ..Limits::default()
                 };
                 let o = Classifier::of(&ofn(body)).classify(&limits).unwrap();
-                // a datatype restriction with a facet is outside OWL 2 EL, and no tier
-                // takes it: the run leaves it out and reports it
+                // The Horn tier takes these facets through the datatype checker.
+                // The EL-only run is complete for the axioms it takes.
+                let ok = o.taxonomy.is_subclass(&c(a), &c(g));
                 if name == "data told" || name == "data range exist" {
                     let out = &o.stats.outside_el;
-                    if !(o.complete && out.horn == 1 && out.taken == 0) {
-                        bad.push(format!("{name} el_only={el_only}: not left out"));
+                    let fine = if el_only {
+                        !o.complete && out.horn == 1 && out.taken == 0 && !ok
+                    } else {
+                        o.complete && out.horn == 1 && out.taken == 1 && ok
+                    };
+                    if !(o.complete_for_taken && fine) {
+                        bad.push(format!(
+                            "{name} el_only={el_only} threads={threads}: {out:?}"
+                        ));
                     }
                 }
-                let ok = o.taxonomy.is_subclass(&c(a), &c(g));
                 if took_all(&o) && !ok {
                     bad.push(format!("{name} el_only={el_only} threads={threads}"));
                 }

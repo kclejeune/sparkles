@@ -12,6 +12,10 @@ import sys
 from pathlib import Path
 
 VERSION = 1
+REUSE_VERSION = 2
+ORIGIN = re.compile(
+    r"sparkles-gate-junit-v1 ([A-Za-z0-9_-][A-Za-z0-9._-]*) ([0-9a-f]{64})"
+)
 
 
 def atomic_json(path, value):
@@ -90,10 +94,18 @@ def inventory(root):
 
 
 def load_manifest(out):
-    value = json.loads((out / "manifest.json").read_text())
+    data, _ = read_regular(out / "manifest.json")
+    return parse_manifest(data)
+
+
+def parse_manifest(data):
+    value = json.loads(data)
     if not isinstance(value, dict):
         raise TypeError("JUnit retention manifest is not an object")
-    if type(value.get("version")) is not int or value["version"] != VERSION:
+    if type(value.get("version")) is not int or value["version"] not in (
+        VERSION,
+        REUSE_VERSION,
+    ):
         raise ValueError("unsupported JUnit retention version")
     return value
 
@@ -189,8 +201,109 @@ def after(root, out, task_exit):
     atomic_json(out / "manifest.json", manifest)
 
 
-def verify(out):
+def cache_origin(root, out, run):
+    if load_manifest(out)["selection_packages"] == "none":
+        return
+    # This is the last command of the test task, so the XML is still in its original
+    # target and only a successful task can have its origin replayed by mise.
+    after(root, out, 0)
+    _, identity = read_regular(out / "manifest.json")
+    line = f"sparkles-gate-junit-v1 {run} {identity['sha256']}"
+    if not ORIGIN.fullmatch(line):
+        raise ValueError("invalid gate run name")
+    print(line)
+
+
+def replay_origin(out):
+    logs = out.parent / "logs"
+    if logs.is_symlink():
+        raise ValueError("test log directory is a symlink")
+    log, _ = read_regular(logs / "test.log")
+    origins = [
+        match.groups()
+        for line in log.decode(errors="replace").splitlines()
+        if (match := ORIGIN.fullmatch(line))
+    ]
+    if len(origins) != 1:
+        raise ValueError("test log must name one JUnit origin")
+    run, digest = origins[0]
+    return {"run": run, "manifest_sha256": digest}
+
+
+def finish_test(root, out, task_exit, gate_run):
     manifest = load_manifest(out)
+    if gate_run and manifest["status"] == "error":
+        # An earlier capture attempt already recorded its diagnostic.
+        manifest["task_exit"] = task_exit
+        atomic_json(out / "manifest.json", manifest)
+    elif not gate_run or task_exit != 0 or manifest["selection_packages"] == "none":
+        after(root, out, task_exit)
+    elif manifest["status"] == "running":
+        # A cache hit replays the log without running cache-origin. The current
+        # manifest is still in the state written before mise started.
+        manifest.update(
+            version=REUSE_VERSION,
+            status="reused",
+            task_exit=0,
+            reused_from=replay_origin(out),
+        )
+        atomic_json(out / "manifest.json", manifest)
+
+
+def verify_reused(out, manifest, gate_runs):
+    if (
+        not manifest["selected"]
+        or type(manifest["task_exit"]) is not int
+        or manifest["task_exit"] != 0
+        or manifest["selection_packages"] == "none"
+        or manifest["reports"] != []
+        or manifest["metadata"] is not None
+    ):
+        raise ValueError("inconsistent reused task")
+    origin = replay_origin(out)
+    if manifest["reused_from"] != origin:
+        raise ValueError("JUnit origin differs from the test log")
+    if gate_runs is None:
+        raise ValueError("gate results directory is required for reused JUnit evidence")
+    run = origin["run"]
+    # A rerun of the same gate name archives the earlier output. The digest identifies
+    # the original manifest even when several runs used that name.
+    for directory in [gate_runs / run, *sorted(gate_runs.glob(f"{run}.old-[0-9]*"))]:
+        receipts = directory / "ci-receipts"
+        source = receipts / "junit"
+        if any(path.is_symlink() for path in (directory, receipts, source)):
+            continue
+        try:
+            data, identity = read_regular(source / "manifest.json")
+        except FileNotFoundError:
+            continue
+        if identity["sha256"] != origin["manifest_sha256"]:
+            continue
+        original = parse_manifest(data)
+        if (
+            original["version"] != VERSION
+            or original["status"] != "retained"
+            or type(original["task_exit"]) is not int
+            or original["task_exit"] != 0
+            or original["selection_packages"] != manifest["selection_packages"]
+        ):
+            raise ValueError(f"gate {run} has no matching passing JUnit evidence")
+        verify_manifest(source, original)
+        if not any(
+            report["freshness"] == "new-or-changed-since-task-start"
+            for report in original["reports"]
+        ):
+            raise ValueError(f"gate {run} has no fresh JUnit report")
+        return
+    raise ValueError(f"JUnit origin manifest is missing or differs for gate {run}")
+
+
+def verify(out, gate_runs=None):
+    manifest = load_manifest(out)
+    verify_manifest(out, manifest, gate_runs)
+
+
+def verify_manifest(out, manifest, gate_runs=None):
     if manifest["task"] != "test" or not re.fullmatch(
         r"[0-9a-f]{40,64}", manifest["source_commit"]
     ):
@@ -205,6 +318,11 @@ def verify(out):
     ):
         raise ValueError("invalid package selection context")
     status = manifest["status"]
+    if manifest["version"] == REUSE_VERSION:
+        if status != "reused":
+            raise ValueError("invalid status for reused JUnit manifest version")
+        verify_reused(out, manifest, gate_runs)
+        return
     if status == "not-selected" and (
         manifest["selected"] or manifest["task_exit"] is not None
     ):
@@ -289,7 +407,9 @@ def verify(out):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("init", "before", "after", "verify"))
+    parser.add_argument(
+        "mode", choices=("init", "before", "after", "cache-origin", "verify")
+    )
     parser.add_argument("--directory", type=Path, default=Path(".artifacts/ci/junit"))
     parser.add_argument("--selected", action="store_true")
     parser.add_argument("--base", default="")
@@ -305,9 +425,14 @@ def main():
         elif args.mode == "after":
             if args.task_exit is None:
                 raise ValueError("after requires original task exit")
-            after(Path.cwd(), out, args.task_exit)
+            finish_test(
+                Path.cwd(), out, args.task_exit, os.environ.get("SPARKLES_CI_GATE_RUN")
+            )
+        elif args.mode == "cache-origin":
+            cache_origin(Path.cwd(), out, os.environ["SPARKLES_CI_GATE_RUN"])
         else:
-            verify(out)
+            gate_runs = os.environ.get("SPARKLES_CI_GATE_RUNS")
+            verify(out, Path(gate_runs) if gate_runs else None)
     except (
         OSError,
         ValueError,
@@ -322,6 +447,8 @@ def main():
                 manifest.update(status="error", error=str(error))
                 if args.mode == "after":
                     manifest["task_exit"] = args.task_exit
+                elif args.mode == "cache-origin":
+                    manifest["task_exit"] = 0
                 atomic_json(out / "manifest.json", manifest)
             except (OSError, ValueError, KeyError, TypeError):
                 pass

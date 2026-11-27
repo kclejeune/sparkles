@@ -191,14 +191,13 @@ impl TableFile {
 
     /// A listed or a retired branch.
     fn any_by_id(&self, id: uuid::Uuid) -> Option<&Entry> {
-        self.by_id(id)
-            .or_else(|| self.retired.iter().find(|e| e.id == id))
+        crate::history::uncontrolled(self.any_by_id_with(id, &crate::budgeted::Unlimited))
     }
 
-    fn any_by_id_limited(
+    fn any_by_id_with<C: crate::budgeted::Control>(
         &self,
         id: uuid::Uuid,
-        limit: &crate::history::ReadLimit<'_>,
+        limit: &C,
     ) -> Result<Option<&Entry>> {
         for entry in self.branches.iter().chain(&self.retired) {
             limit.check(0)?;
@@ -398,7 +397,7 @@ pub(crate) const MERGE_FAST_FORWARD: u32 = 1;
 /// A commit that replays the source commit, in a replayed fast-forward.
 pub(crate) const MERGE_REPLAYED: u32 = 2;
 
-const MERGE_REC: usize = 48;
+pub(super) const MERGE_REC: usize = 48;
 
 impl MergeRec {
     fn encode(&self) -> [u8; MERGE_REC] {
@@ -588,7 +587,10 @@ pub struct BranchSet {
     opts: StoreOptions,
     cache: Arc<BlockCache>,
     quota: Arc<quota::Quota>,
-    table: Mutex<TableFile>,
+    table: Arc<Mutex<TableFile>>,
+    // A fork may have captured a base that retention no longer lists. Reconciliation
+    // excludes in-flight captures while releasing holds based on retained history.
+    forks: Arc<parking_lot::RwLock<()>>,
     /// open branch stores (not `main`)
     pub(super) stores: Mutex<HashMap<uuid::Uuid, Arc<Store>>>,
     pub(super) openings: Mutex<HashMap<usize, Opening>>,
@@ -690,7 +692,8 @@ impl BranchSet {
             opts: opts.clone(),
             cache,
             quota,
-            table: Mutex::new(TableFile::new(dataset_id)),
+            table: Arc::new(Mutex::new(TableFile::new(dataset_id))),
+            forks: Arc::default(),
             stores: Default::default(),
             openings: Default::default(),
             opening: Mutex::new(()),
@@ -794,7 +797,8 @@ impl BranchSet {
             opts: opts.clone(),
             cache,
             quota,
-            table: Mutex::new(table),
+            table: Arc::new(Mutex::new(table)),
+            forks: Arc::default(),
             stores: Default::default(),
             openings: Default::default(),
             opening: Mutex::new(()),
@@ -1010,6 +1014,15 @@ impl BranchSet {
             .collect()
     }
 
+    /// The IDs of all listed branches when none are broken, or `None` if any listed
+    /// branch is broken (fail-safe for family-wide inspections).
+    pub(super) fn listed_branch_ids_if_healthy(&self) -> Option<Vec<uuid::Uuid>> {
+        if !self.broken.lock().is_empty() {
+            return None;
+        }
+        Some(self.table.lock().branches.iter().map(|e| e.id).collect())
+    }
+
     /// The nearest listed branch that branch `id` descends from through starting
     /// points: its upstream, or the upstream of a retired branch it started from (the
     /// dataset id for `main`; `None` for `main` itself and unknown branches).
@@ -1101,21 +1114,13 @@ impl BranchSet {
     /// The commit `c` names, on the branch that made it: a seq at or below a branch's
     /// starting commit is a commit of its upstream.
     pub(crate) fn normalize(&self, c: CommitRef) -> CommitRef {
-        let t = self.table.lock();
-        let mut c = c;
-        for _ in 0..1024 {
-            match self.start_of(&t, c.branch_id) {
-                Some(f) if c.seq <= f.seq => c.branch_id = f.branch_id,
-                _ => break,
-            }
-        }
-        c
+        crate::history::uncontrolled(self.normalize_with(c, &crate::budgeted::Unlimited))
     }
 
-    pub(super) fn normalize_limited(
+    pub(super) fn normalize_with<C: crate::budgeted::Control>(
         &self,
         mut commit: CommitRef,
-        limit: &crate::history::ReadLimit<'_>,
+        limit: &C,
     ) -> Result<CommitRef> {
         let table = limit.lock(&self.table)?;
         for _ in 0..1024 {
@@ -1124,7 +1129,7 @@ impl BranchSet {
                 None
             } else {
                 table
-                    .any_by_id_limited(commit.branch_id, limit)?
+                    .any_by_id_with(commit.branch_id, limit)?
                     .map(|entry| entry.from.into())
             };
             if from.is_none() && commit.branch_id != self.dataset_id {
@@ -1447,6 +1452,12 @@ impl BranchStore<'_> {
     }
 }
 
+/// Keeps the listed branch identities stable during operation-hold reconciliation.
+pub struct ListedBranches {
+    _table: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, TableFile>>,
+    _forks: Option<parking_lot::ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>>,
+}
+
 impl Store {
     /// The name of this store's branch (`main` for a dataset's own store).
     pub fn branch_name(&self) -> String {
@@ -1468,6 +1479,12 @@ impl Store {
             .ident
             .as_ref()
             .map_or(self.dataset_id, |i| i.dataset_id)
+    }
+
+    /// Whether both handles belong to the same open dataset family. A separately
+    /// opened copy can have the same persisted UUID without sharing the family.
+    pub fn shares_family_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.family, &other.family)
     }
 
     /// Whether this is a branch store (not a dataset's own store).
@@ -1537,7 +1554,7 @@ impl Store {
         let set = match &self.branching.set {
             SetRef::None => None,
             SetRef::Owner(set) => Some(set.clone()),
-            SetRef::Member(link) => link.upgrade_controlled(options)?,
+            SetRef::Member(link) => link.upgrade_with(options)?,
         };
         options.check()?;
         Ok(set)
@@ -1573,11 +1590,11 @@ impl Store {
                 Err(error) => return Err(error),
             }
         };
-        let table = controlled_lock(&set.table, options)?;
+        let table = crate::budgeted::Control::lock(options, &set.table)?;
         if table.by_id(id).is_none() {
             return Ok(None);
         }
-        let stores = controlled_lock(&set.stores, options)?;
+        let stores = crate::budgeted::Control::lock(options, &set.stores)?;
         let store = stores
             .get(&id)
             .filter(|store| !store.branching.retired.load(Ordering::Acquire))
@@ -1640,6 +1657,12 @@ impl Store {
         Ok(BranchStore::Other(set.open_store(id)?))
     }
 
+    /// Open an upstream store whose history can still be selected through a listed
+    /// branch, including an upstream that was retired when its name was removed.
+    pub fn upstream_store(&self, id: uuid::Uuid) -> Result<BranchStore<'_>> {
+        self.branch_by_id(id)
+    }
+
     /// The id of branch `name`.
     pub fn branch_id_of(&self, name: &str) -> Result<uuid::Uuid> {
         if name == MAIN {
@@ -1648,11 +1671,27 @@ impl Store {
         Ok(self.owned_set()?.entry(name)?.id)
     }
 
-    /// The current name of the listed branch whose identity is `id`, `main` for the
-    /// dataset id, through the dataset's main store. `None` for a deleted, retired or
-    /// unknown identity. Reads only the branch table, so no branch store is opened, and
-    /// waits for the table under the cancellation, deadline and no-wait choice of
-    /// `options`.
+    /// The name of branch `name`'s nearest listed upstream branch, read from the
+    /// branch table without opening any branch store or taking any writer lock (`None`
+    /// for `main` or when no listed upstream remains).
+    pub fn branch_upstream_name(&self, name: &str) -> Result<Option<String>> {
+        if name == MAIN {
+            return Ok(None);
+        }
+        let set = self.owned_set()?;
+        let t = set.table.lock();
+        let e = t
+            .by_name(name)
+            .ok_or_else(|| branch::no_such_branch(name))?;
+        let Some(upstream_id) = set.upstream_in(&t, e.id) else {
+            return Ok(None);
+        };
+        if upstream_id == set.dataset_id {
+            return Ok(Some(MAIN.to_string()));
+        }
+        Ok(t.by_id(upstream_id).map(|u| u.name.clone()))
+    }
+
     /// The ids of the listed branches, read from the branch table without taking any
     /// writer. Empty for a store without branches.
     pub fn listed_branch_ids(&self) -> Vec<uuid::Uuid> {
@@ -1662,6 +1701,96 @@ impl Store {
         set.table.lock().branches.iter().map(|b| b.id).collect()
     }
 
+    /// The ids and current names of `main` and every listed branch, read from the
+    /// branch table without opening any branch store or taking any writer lock.
+    pub fn listed_branch_names(&self) -> HashMap<uuid::Uuid, String> {
+        let mut names = HashMap::new();
+        names.insert(self.owner_dataset_id(), MAIN.to_string());
+        if let SetRef::Owner(set) = &self.branching.set {
+            for b in &set.table.lock().branches {
+                names.insert(b.id, b.name.clone());
+            }
+        }
+        names
+    }
+
+    /// Enumerate the listed branch IDs under reconciliation's lock-wait policy.
+    #[doc(hidden)]
+    pub fn reconciliation_branch_ids(
+        &self,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Vec<uuid::Uuid>> {
+        let SetRef::Owner(set) = &self.branching.set else {
+            return Ok(Vec::new());
+        };
+        let table = controlled_lock(&set.table, options)?;
+        let mut ids = Vec::with_capacity(table.branches.len());
+        for branch in &table.branches {
+            options.check()?;
+            ids.push(branch.id);
+        }
+        Ok(ids)
+    }
+
+    /// Read a listed branch or a reachable retired upstream for reconciliation. A
+    /// no-wait scan uses only resident stores because reopening can do lengthy I/O.
+    #[doc(hidden)]
+    pub fn reconciliation_branch_store(
+        &self,
+        id: uuid::Uuid,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Option<Arc<Store>>> {
+        options.check()?;
+        if !options.no_wait {
+            return self.upstream_store(id).map(|store| store.shared());
+        }
+        let set = self.owned_set()?;
+        Ok(controlled_lock(&set.stores, options)?.get(&id).cloned())
+    }
+
+    /// Check that the listed branch identities still match a previous enumeration.
+    /// Returns false if the branch table is busy, so this can be used under a source
+    /// hold's publication lock without waiting for another dataset's branch table.
+    pub fn matches_listed_branch_ids(&self, ids: &[uuid::Uuid]) -> bool {
+        let SetRef::Owner(set) = &self.branching.set else {
+            return ids.is_empty();
+        };
+        set.table.try_lock().is_some_and(|table| {
+            table
+                .branches
+                .iter()
+                .map(|branch| branch.id)
+                .eq(ids.iter().copied())
+        })
+    }
+
+    /// Keep the previously enumerated branches listed during a durable hold release.
+    /// A busy branch table or a different list leaves the release unconfirmed.
+    pub fn pin_listed_branch_ids(&self, ids: &[uuid::Uuid]) -> Option<ListedBranches> {
+        let SetRef::Owner(set) = &self.branching.set else {
+            return ids.is_empty().then_some(ListedBranches {
+                _table: None,
+                _forks: None,
+            });
+        };
+        let forks = set.forks.try_write_arc()?;
+        let table = set.table.try_lock_arc()?;
+        table
+            .branches
+            .iter()
+            .map(|branch| branch.id)
+            .eq(ids.iter().copied())
+            .then_some(ListedBranches {
+                _table: Some(table),
+                _forks: Some(forks),
+            })
+    }
+
+    /// The current name of the listed branch whose identity is `id`, `main` for the
+    /// dataset id, through the dataset's main store. `None` for a deleted, retired or
+    /// unknown identity. Reads only the branch table, so no branch store is opened, and
+    /// waits for the table under the cancellation, deadline and no-wait choice of
+    /// `options`.
     pub fn listed_branch_name(
         &self,
         id: uuid::Uuid,
@@ -1674,7 +1803,7 @@ impl Store {
         let SetRef::Owner(set) = &self.branching.set else {
             return Ok(None);
         };
-        let table = controlled_lock(&set.table, options)?;
+        let table = crate::budgeted::Control::lock(options, &set.table)?;
         for (n, entry) in table.branches.iter().enumerate() {
             if n % 1024 == 0 {
                 options.check()?;
@@ -1741,10 +1870,10 @@ impl Store {
     }
 
     /// Fail with `no-such-branch` unless `branch` is a listed branch of this main.
-    pub(super) fn listed_limited(
+    pub(super) fn listed_with<C: crate::budgeted::Control>(
         &self,
         branch: uuid::Uuid,
-        limit: &crate::history::ReadLimit<'_>,
+        limit: &C,
     ) -> Result<()> {
         let missing = || crate::branch::no_such_branch(&branch.to_string());
         let set = match &self.branching.set {
@@ -2108,6 +2237,7 @@ impl Store {
             return Err(branch::invalid_branch("the note is longer than 1024 bytes"));
         }
         let set = self.owned_set()?.clone();
+        let _fork = set.forks.read();
         if set.memory {
             return self.create_memory_branch(name, o, &set);
         }
@@ -2347,10 +2477,21 @@ impl Store {
             .store(up.guard_required.load(Ordering::Relaxed), Ordering::Relaxed);
         let mut state = (*store.snapshot()).clone();
         state.dataset_id = self.owner_dataset_id();
+        state.branch_id = store.branch_id();
         state.delta = snap.delta.clone();
         state.version = snap.version;
         state.commit = root.seq;
         state.cache = set.cache.clone();
+        store.history_origin = Arc::new(evidence_view::HistoryOrigin::new_memory(
+            self.owner_dataset_id(),
+            store.branch_id(),
+            store.mem_history.clone(),
+            store.family.managed.clone(),
+            Arc::downgrade(&store.current),
+        ));
+        state.history_origin = Some(evidence_view::HistoryOriginHandle::Resident(
+            Arc::downgrade(&store.history_origin),
+        ));
         store.current.store(Arc::new(state));
         self.failpoint("memory-branch-indexes");
         up.configure_indexes(&store)?;
@@ -3027,9 +3168,35 @@ impl Store {
         range: CommitRange,
         limit: usize,
     ) -> Result<Vec<BranchCommit>> {
-        let set = self.owned_set()?;
         let id = self.branch_id_of(name)?;
         let head = self.branch(name)?.head_commit().seq;
+        self.branch_commits_for_id(id, head, range, limit)
+    }
+
+    /// [`branch_commits`](Self::branch_commits) for an already-retained branch store in
+    /// this dataset family, pinned by UUID rather than resolved again by branch name.
+    pub fn branch_commits_pinned(
+        &self,
+        store: &Store,
+        range: CommitRange,
+        limit: usize,
+    ) -> Result<Vec<BranchCommit>> {
+        if self.owner_dataset_id() != store.owner_dataset_id() {
+            return Err(Error::invalid(
+                "the pinned branch belongs to a different dataset family",
+            ));
+        }
+        self.branch_commits_for_id(store.branch_id(), store.head_commit().seq, range, limit)
+    }
+
+    fn branch_commits_for_id(
+        &self,
+        id: uuid::Uuid,
+        head: u64,
+        range: CommitRange,
+        limit: usize,
+    ) -> Result<Vec<BranchCommit>> {
+        let set = self.owned_set()?;
         let chain = set.chain(CommitRef {
             branch_id: id,
             seq: head,
@@ -3083,6 +3250,20 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Read `(author, message)` commit metadata for `seqs` from the change log of branch
+    /// `branch_id` (covering `main`, listed branches, and retired ancestor branches).
+    pub fn branch_commit_change_metas(
+        &self,
+        branch_id: uuid::Uuid,
+        seqs: &[u64],
+    ) -> Result<HashMap<u64, super::changelog::CommitChangeMeta>> {
+        if seqs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let store = self.branch_by_id(branch_id)?;
+        store.commit_change_metas(seqs)
     }
 
     /// The state of branch `name` at `at`, following the branch's history into its
@@ -3147,10 +3328,29 @@ impl Store {
                     }
                     let owner = self.owned_set()?.normalize(commit);
                     let upstream = self.branch_by_id(owner.branch_id)?;
-                    match at {
-                        At::Time(_) => self.snapshot_pinned(&upstream, at, options),
-                        _ => self.snapshot_pinned(&upstream, &At::Commit(commit.seq), options),
-                    }
+                    let (snapshot, resolved, origin) = match at {
+                        At::Time(_) => self.snapshot_pinned(&upstream, at, options)?,
+                        _ => self.snapshot_pinned(&upstream, &At::Commit(commit.seq), options)?,
+                    };
+                    // A historical selector on `store` (named snapshot, commit, or time)
+                    // may carry a semantic configuration distinct from the inherited RDF
+                    // commit's own binding (via `PinnedConfiguration` or `BranchConfigurationOrigin`):
+                    // re-pin it using `store` before returning.
+                    let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+                        use crate::history::ReadControl;
+                        let prep = options.temporary(crate::evidence::resolve::MEMORY_BYTES)?;
+                        let (pinned, _held) = self.pin_historical_evidence(
+                            store,
+                            at,
+                            resolved.commit.seq,
+                            snapshot,
+                            &prep,
+                        )?;
+                        pinned
+                    } else {
+                        snapshot
+                    };
+                    Ok((snapshot, resolved, origin))
                 }
                 None => Err(error),
             },
@@ -3317,10 +3517,77 @@ mod source_tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn normalize_with_and_listed_with_match_unlimited_and_honor_uncapped_controls() {
+        use crate::history::{HistoryOptions, ReadLimit};
+        use std::sync::atomic::AtomicBool;
+
+        let main = Store::in_memory(Default::default());
+        let dev = main.create_branch("dev", &Default::default()).unwrap();
+        let set = main.owned_set().unwrap();
+        let commit = CommitRef {
+            branch_id: dev.id,
+            seq: dev.from.unwrap().seq,
+        };
+        let options = HistoryOptions::default();
+        let uncapped = ReadLimit {
+            options: &options,
+            memory: None,
+            held: 0,
+        };
+        assert_eq!(
+            set.normalize(commit),
+            set.normalize_with(commit, &uncapped).unwrap()
+        );
+        assert!(
+            main.listed_with(dev.id, &crate::budgeted::Unlimited)
+                .is_ok()
+        );
+        assert!(main.listed_with(dev.id, &uncapped).is_ok());
+        assert!(main.listed_with(uuid::Uuid::new_v4(), &uncapped).is_err());
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let cancel_opts = HistoryOptions {
+            cancel: Some(cancel),
+            deadline: None,
+        };
+        let cancelled = ReadLimit {
+            options: &cancel_opts,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(
+            set.normalize_with(commit, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            main.listed_with(dev.id, &cancelled),
+            Err(Error::Cancelled)
+        ));
+
+        let expired_opts = HistoryOptions {
+            cancel: None,
+            deadline: Some(Instant::now() - std::time::Duration::from_secs(1)),
+        };
+        let timed_out = ReadLimit {
+            options: &expired_opts,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(
+            set.normalize_with(commit, &timed_out),
+            Err(Error::Timeout)
+        ));
+        assert!(matches!(
+            main.listed_with(dev.id, &timed_out),
+            Err(Error::Timeout)
+        ));
+    }
 }
 
 /// Take `mutex` under the cancellation, deadline and no-wait choice of `options`.
-fn controlled_lock<'a, T>(
+pub(super) fn controlled_lock<'a, T>(
     mutex: &'a parking_lot::Mutex<T>,
     options: &crate::guard::WriteOptions,
 ) -> Result<parking_lot::MutexGuard<'a, T>> {

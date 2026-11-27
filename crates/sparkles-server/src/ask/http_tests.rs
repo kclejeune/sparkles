@@ -719,7 +719,7 @@ async fn threads_store_answers_and_group_follow_ups() {
             .unwrap()
     });
     let raw = raw.unwrap();
-    assert_eq!(raw["format"], 2);
+    assert_eq!(raw["format"], 3);
     assert!(!raw.to_string().contains("\"rows\""), "no rows are stored");
     assert!(raw["asks"][0]["access"]["footprint"].is_object(), "{raw}");
     // bad threads and resources are refused
@@ -794,7 +794,7 @@ async fn format_1_history_round_trips() {
     let t = t["asks"].as_array().unwrap();
     assert_eq!(t.len(), 2);
     assert_eq!(t[0]["outcome"], "accepted");
-    assert_eq!(raw_history(&st)["format"], 2);
+    assert_eq!(raw_history(&st)["format"], 3);
 }
 
 /// A history of a newer format, or one this release cannot parse, is refused on every
@@ -809,11 +809,11 @@ async fn newer_or_damaged_history_is_refused_and_kept() {
     put_settings(&app, json!({ "enabled": true })).await;
     for (file, code) in [
         (
-            json!({ "format": 3, "asks": [{ "id": "future", "shape": "unknown" }] }),
+            json!({ "format": 4, "asks": [{ "id": "future", "shape": "unknown" }] }),
             "unsupported-format",
         ),
         (
-            json!({ "format": 2, "asks": "not a list" }),
+            json!({ "format": 3, "asks": "not a list" }),
             "unreadable-history",
         ),
     ] {

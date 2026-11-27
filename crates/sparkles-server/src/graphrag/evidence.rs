@@ -15,7 +15,7 @@
 use super::build::RunError;
 use sparkles::access::GraphAccess;
 use sparkles::evidence::{self, ClaimState, Settings};
-use sparkles::store::{BoundEvidenceView, Snapshot};
+use sparkles::store::{BoundEvidenceView, BoundReadSource};
 use sparkles::task::Control;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -174,6 +174,7 @@ impl Evidence {
         access: Option<Arc<GraphAccess>>,
         cancel: Arc<AtomicBool>,
         limits: Limits,
+        query_opts: &sparkles::sparql::QueryOptions,
     ) -> Result<Option<Evidence>, RunError> {
         let Some(name) = name else {
             return Ok(None);
@@ -181,8 +182,33 @@ impl Evidence {
         let control = Control::with_cancel(cancel);
         let main = ds.main();
         let main: &crate::state::Dataset = main.as_deref().unwrap_or(ds);
-        let preparation =
-            sparkles::access::Preparation::new(control.clone(), VIEW_BYTES).map_err(engine)?;
+        let grant = query_opts
+            .grant
+            .clone()
+            .or_else(|| {
+                query_opts
+                    .pool
+                    .as_ref()
+                    .map(|pool| Arc::new(pool.empty_grant()))
+            })
+            .or_else(|| {
+                ds.dataset
+                    .query_options()
+                    .pool
+                    .map(|pool| Arc::new(pool.empty_grant()))
+            });
+        // Keep the evidence-selection ceiling (VIEW_BYTES) distinct from the
+        // configured query execution cap (including unbounded None) while
+        // charging both against the same pool grant.
+        let query_limit = query_opts.max_memory_bytes.unwrap_or(u64::MAX);
+        let preparation = match grant {
+            Some(grant) => {
+                sparkles::access::Preparation::with_grant(control.clone(), query_limit, grant)
+            }
+            None => sparkles::access::Preparation::new(control.clone(), query_limit),
+        }
+        .and_then(|prep| prep.with_selection_limit(VIEW_BYTES))
+        .map_err(engine)?;
         let view = main
             .dataset
             .store()
@@ -252,9 +278,29 @@ impl Evidence {
         }))
     }
 
-    /// The snapshot the run reads throughout.
-    pub fn snapshot(&self) -> Arc<Snapshot> {
-        self.view.shared_snapshot().clone()
+    /// Opaque bound read source retaining the evidence view and its reservation.
+    pub fn read_source(&self) -> BoundReadSource {
+        self.view.read_source()
+    }
+
+    /// Commit sequence of the evidence view this run reads throughout.
+    pub fn commit(&self) -> u64 {
+        self.view.commit().seq
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preparation_limit(&self) -> u64 {
+        self.view.preparation_limit()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selection_limit(&self) -> u64 {
+        self.view.selection_limit()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_execution_bytes(&self) -> u64 {
+        self.view.available_execution_bytes()
     }
 
     /// The check a recheck repeats.

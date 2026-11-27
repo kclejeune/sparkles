@@ -70,11 +70,10 @@ pub(super) fn has_desc(p: &PlanInfo, needle: &str) -> bool {
 /// allows. The reference reads no text, spatial or extension indexes, so a query that
 /// uses them is one it does not evaluate, and neither is a query whose nested loops pass
 /// the work limit. A query that reads a number of more than 16 digits is not compared,
-/// since XSD lets the engine limit those (roadmap item 1065). Where the query meets a
+/// since the test-only reference evaluator uses fixed-width `i128` and `Decimal`. Where the query meets a
 /// question that the engine reads otherwise than the specification's text, such as an
-/// error in MIN or MAX under the default of item 1064's setting or string arguments that
-/// differ only in base direction (item 1071), it is compared exactly under the engine's
-/// reading.
+/// error in MIN or MAX under the default of item 1064's setting, it is compared exactly
+/// under the engine's reading.
 pub(super) fn same_as_reference(s: &Store, text: &str, r: &QueryResult) {
     same_as_reference_on(&s.snapshot(), &format!("{PREFIXES}{text}"), r);
 }
@@ -695,6 +694,64 @@ fn optimizations_can_be_disabled_by_name() {
         Optimizations::NONE
     );
     assert!(Optimizations::ALL.disable("nope").is_err());
+    for name in [
+        "prefetch_blocks",
+        "prefetch_constants",
+        "prefetch_terms",
+        "prefetch_first_scan",
+        "parallel_decode",
+        "decode_ahead",
+    ] {
+        assert!(!Optimizations::NAMES.contains(&name), "{name}");
+        assert!(Optimizations::ALL.disable(name).is_err(), "{name}");
+    }
+    let generic = Optimizations::NONE;
+    assert!(
+        generic.prefetch_blocks
+            && generic.prefetch_constants
+            && generic.prefetch_terms
+            && generic.prefetch_first_scan
+            && generic.parallel_decode
+            && generic.decode_ahead
+    );
+}
+
+#[test]
+fn disabled_optimizations_from_env_survive_unrecognized_names() {
+    const CHILD: &str = "SPARKLES_DISABLE_OPTIMIZATIONS_TEST_CHILD";
+    if let Ok(expected) = std::env::var(CHILD) {
+        assert_eq!(
+            Optimizations::default(),
+            Optimizations::ALL.disable(&expected).unwrap()
+        );
+        return;
+    }
+
+    for (configured, expected) in [
+        (
+            "decode_ahead, text_subject_pushdown, typo, range_pushdown, prefetch_blocks",
+            "text_subject_pushdown, range_pushdown",
+        ),
+        ("typo, all, decode_ahead", "all"),
+    ] {
+        // Each process reads the environment once.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sparql::opt_tests::disabled_optimizations_from_env_survive_unrecognized_names",
+                "--nocapture",
+            ])
+            .env("SPARKLES_DISABLE_OPTIMIZATIONS", configured)
+            .env(CHILD, expected)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{configured}: {stdout}\n{stderr}"
+        );
+    }
 }
 
 // ------------------------------------------------------------ top-k prefilter ------
@@ -2165,9 +2222,13 @@ mod cold_reads {
         let off = run(
             &s,
             q,
-            Optimizations::ALL
-                .disable("prefetch_constants,prefetch_terms,prefetch_first_scan,parallel_decode")
-                .unwrap(),
+            Optimizations {
+                prefetch_constants: false,
+                prefetch_terms: false,
+                prefetch_first_scan: false,
+                parallel_decode: false,
+                ..Optimizations::ALL
+            },
         );
         assert_eq!(solutions(&on), solutions(&off));
         assert_eq!(on.len(), 600);
@@ -2190,7 +2251,10 @@ mod cold_reads {
         let q = "SELECT ?s WHERE { ?s ex:w ?v FILTER(?v * 2 > 100) }";
         let calls = || crate::vocab::numeric::GET_MANY_CALLS.with(|n| n.get());
         // the expression itself reads the values (once, then from its cache), prefetch or not
-        let off = Optimizations::ALL.disable("prefetch_terms").unwrap();
+        let off = Optimizations {
+            prefetch_terms: false,
+            ..Optimizations::ALL
+        };
         let before = calls();
         assert_eq!(run(&s, q, off).len(), 50);
         let without = calls() - before;
@@ -2509,4 +2573,39 @@ fn order_keys_skip_a_bind_whose_variable_is_initially_bound() {
     };
     assert_eq!(rows(&a), rows(&b));
     assert!(rows(&a)[0].contains("\"2\""), "{:?}", rows(&a));
+}
+
+#[test]
+fn numeric_top_k_prefilter_keeps_the_exact_decimal_winner() {
+    let with = Optimizations {
+        ordered_topk: false,
+        topk_heap: false,
+        ..Optimizations::ALL
+    };
+    let without = Optimizations {
+        topk_prefilter: false,
+        ..with
+    };
+    for (sign, order) in [("", "DESC(?v)"), ("-", "ASC(?v)")] {
+        let s = Store::in_memory(StoreOptions::default());
+        update(
+            &s,
+            &format!(
+                "INSERT DATA {{ ex:double ex:v \"{sign}26772049.014582634\"^^<http://www.w3.org/2001/XMLSchema#double> .
+                 ex:decimal ex:v {sign}26772049.014582634 .
+                 ex:z1 ex:v 0 . ex:z2 ex:v 0 . ex:z3 ex:v 0 .
+                 ex:z4 ex:v 0 . ex:z5 ex:v 0 . ex:z6 ex:v 0 }}"
+            ),
+        );
+        let q = format!("SELECT ?s WHERE {{ ?s ex:v ?v }} ORDER BY {order} LIMIT 1");
+        let fast = run(&s, &q, with);
+        let slow = run(&s, &q, without);
+        assert!(has_desc(fast.plan(), "numeric prefilter"), "{q}");
+        assert_eq!(
+            fast.test_application_rows(),
+            slow.test_application_rows(),
+            "{q}"
+        );
+        assert_eq!(solutions(&fast), ["<http://ex.org/decimal>"]);
+    }
 }

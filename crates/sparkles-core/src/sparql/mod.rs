@@ -5,6 +5,7 @@ pub mod aggext;
 pub mod algorun;
 pub mod algosvc;
 pub mod arqpf;
+pub mod bignum;
 pub mod cache;
 pub mod catalog;
 pub mod cdt;
@@ -30,7 +31,7 @@ mod fnlib;
 pub mod geojoin;
 pub mod geopf;
 pub mod georewrite;
-mod group;
+pub(crate) mod group;
 pub mod history_svc;
 pub mod hybrid;
 pub mod indexjoin;
@@ -54,9 +55,10 @@ pub mod reasoning;
 mod registeredagg;
 pub mod results;
 mod sample;
-mod sortkey;
+pub(crate) mod sortkey;
 pub mod stats;
 pub mod svccache;
+mod svcread;
 pub mod table;
 pub mod textpf;
 mod unionpush;
@@ -401,8 +403,13 @@ pub struct QueryResult {
     inner: Arc<ResultBacking>,
 }
 
+enum ResultVariables {
+    Eager(cursor::Variables),
+    Shared(Arc<cursor::Variables>),
+}
+
 struct ResultBacking {
-    variables: Option<Arc<cursor::Variables>>,
+    variables: Option<ResultVariables>,
     table: Table,
     triples: Vec<Triple>,
     quads: Vec<Quad>,
@@ -427,7 +434,7 @@ impl Drop for ResultBacking {
 // callers or detach a credited payload, even when the public handle is cloned.
 struct ResultParts {
     kind: QueryKind,
-    variables: Option<Arc<cursor::Variables>>,
+    variables: Option<ResultVariables>,
     table: Table,
     boolean: bool,
     triples: Vec<Triple>,
@@ -524,10 +531,11 @@ impl QueryResult {
     }
 
     pub fn variables(&self) -> &[String] {
-        self.inner
-            .variables
-            .as_ref()
-            .map_or(&[], |variables| &variables.names)
+        match &self.inner.variables {
+            Some(ResultVariables::Eager(variables)) => &variables.names,
+            Some(ResultVariables::Shared(variables)) => &variables.names,
+            None => &[],
+        }
     }
     pub fn table(&self) -> table::TableView<'_> {
         table::TableView::new(&self.inner.table)
@@ -617,7 +625,31 @@ impl QueryResult {
 }
 
 pub fn parse_query(q: &str, base: Option<&str>, prefixes: &[(String, String)]) -> Result<Query> {
+    parse_query_inner(q, base, prefixes, None)
+}
+
+/// Like [`parse_query`], while bounding cumulative resolved IRI bytes materialized by
+/// `spargebra` during parsing (`BASE` / `PREFIX` declarations, `IRIREF`s, and
+/// `PrefixedName` expansions).
+pub fn parse_query_with_max_resolved_iri_bytes(
+    q: &str,
+    base: Option<&str>,
+    prefixes: &[(String, String)],
+    max_resolved_iri_bytes: usize,
+) -> Result<Query> {
+    parse_query_inner(q, base, prefixes, Some(max_resolved_iri_bytes))
+}
+
+fn parse_query_inner(
+    q: &str,
+    base: Option<&str>,
+    prefixes: &[(String, String)],
+    max_resolved_iri_bytes: Option<usize>,
+) -> Result<Query> {
     let mut p = aggext::register(SparqlParser::new());
+    if let Some(limit) = max_resolved_iri_bytes {
+        p = p.with_max_resolved_iri_bytes(limit);
+    }
     if let Some(b) = base {
         p = p
             .with_base_iri(b)
@@ -697,11 +729,23 @@ fn make_ctx_input(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<Ctx> {
-    make_ctx_input_policy(snap, opts, dataset, base, source, None, None)
+    make_ctx_input_policy(snap, opts, dataset, base, source, None, None, None, None)
+}
+
+pub(super) enum DefaultDatasetOverride<'a> {
+    /// Validation/selector query: default graph is the selected graph IDs and
+    /// named graphs are empty (`selector_default_only = true`).
+    Selector(&'a GraphSel),
+    /// Protection pattern query (C12b §2.3): default graph is the union of the
+    /// default graph and every physical named graph (including blank-node-named
+    /// graphs) resolved by graph ID, using the controlled distinct-graph iterator
+    /// when a preparation is active, while `GRAPH` reaches all named graphs.
+    AllGraphsWithNamed,
 }
 
 // Only the application root which just prepared this policy supplies the override.
 // Checked public sources retain the existing exact-policy replacement refusal.
+#[allow(clippy::too_many_arguments)]
 fn make_ctx_input_policy(
     snap: Arc<Snapshot>,
     opts: &QueryOptions,
@@ -709,7 +753,9 @@ fn make_ctx_input_policy(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
-    selector_graphs: Option<&GraphSel>,
+    parent: Option<sparkles_budget::ParentHandle>,
+    default_override: Option<DefaultDatasetOverride<'_>>,
+    inherited: Option<&ViewExecution>,
 ) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
@@ -729,6 +775,10 @@ fn make_ctx_input_policy(
     // the store's limit on one geometry operation
     #[cfg(feature = "geo")]
     ctx.geo.set_op_vertices(op_vertices);
+    if let Some(inherited) = inherited {
+        ctx.view_source_controls = inherited.preparation.clone();
+        ctx.check()?;
+    }
     if ctx.read_source.is_none() {
         ctx.deadline = match opts.timeout {
             Some(_) => opts.effective_deadline(Instant::now())?,
@@ -745,12 +795,18 @@ fn make_ctx_input_policy(
     if let Some(m) = opts.max_memory_bytes {
         ctx.mem_limit = m;
     }
-    ctx.spill = opts
-        .spill
-        .as_ref()
-        .map(|spill| Arc::new(spill.query(opts.max_spill_bytes)));
+    ctx.spill = inherited.and_then(|view| view.spill.clone()).or_else(|| {
+        opts.spill
+            .as_ref()
+            .map(|spill| Arc::new(spill.query(opts.max_spill_bytes)))
+    });
     if ctx.read_source.is_none() {
         ctx.set_grant(opts.query_grant());
+    }
+    // an in-process SERVICE call charges its caller's query too, from its first charge,
+    // once its grant is set
+    if let Some(parent) = parent {
+        ctx.set_memory_parent(parent)?;
     }
     if let Some(m) = opts.max_rows_produced {
         ctx.max_rows_produced = m;
@@ -766,10 +822,10 @@ fn make_ctx_input_policy(
         .clone()
         .unwrap_or_else(|| crate::outbound::RequestBudget::new(&opts.outbound));
     ctx.rdfs = match &opts.rdfs {
-        Some(r) => Some(r.schema_controlled(&ctx.snap, &mut || ctx.check())?),
+        Some(r) => Some(r.schema_in_ctx(&ctx)?),
         None => None,
     };
-    ctx.use_cache = !opts.no_cache && selector_graphs.is_none();
+    ctx.use_cache = !opts.no_cache && default_override.is_none();
     ctx.plan_patterns = !opts.no_plan_patterns;
     ctx.algo_projections = opts.algo_projections.clone();
     ctx.views = opts.views.clone();
@@ -785,10 +841,17 @@ fn make_ctx_input_policy(
     ctx.aggregate_errors = opts.aggregate_errors.unwrap_or(ctx.snap.aggregate_errors);
     ctx.base_iri = base.cloned();
     let mut ds = DatasetSpec::default();
-    if let Some(graphs) = selector_graphs {
-        ds.default = Some(resolve_selector_graphs(&mut ctx, graphs)?);
-        ds.named = Some(Vec::new());
-        ctx.selector_default_only = true;
+    if let Some(override_mode) = default_override {
+        match override_mode {
+            DefaultDatasetOverride::Selector(graphs) => {
+                ds.default = Some(resolve_selector_graphs(&mut ctx, graphs)?);
+                ds.named = Some(Vec::new());
+                ctx.selector_default_only = true;
+            }
+            DefaultDatasetOverride::AllGraphsWithNamed => {
+                ds.default = Some(resolve_all_graphs(&mut ctx)?);
+            }
+        }
     } else if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {
         if opts
             .default_graph_uris
@@ -910,10 +973,11 @@ fn make_source_ctx_policy(
 ) -> Result<(Ctx, Option<Arc<crate::access::GraphAccess>>)> {
     let deadline = opts.effective_deadline(Instant::now())?;
     let (snapshot, _, preparation) = source.query_input();
+    let view_pause = preparation.view_rebuild_pause();
     let preparation = preparation.with_query_controls(
         opts.cancel.clone(),
         opts.cancellation.clone(),
-        deadline,
+        if view_pause.is_some() { None } else { deadline },
     )?;
     let snapshot = snapshot.clone();
     // Covers the actual Ctx Arc, snapshot header, lazy ledger/owner bookkeeping,
@@ -930,6 +994,9 @@ fn make_source_ctx_policy(
     let setup = preparation.reserve(setup_bytes)?;
     let parent = preparation.memory_parent()?;
     let mut ctx = Ctx::new(snapshot);
+    if let Some(pause) = view_pause {
+        ctx.deadline_pause = pause;
+    }
     ctx.read_source = Some(source);
     ctx.source_setup = Some(setup);
     ctx.source_preparation = Some(preparation.clone());
@@ -1016,6 +1083,17 @@ fn resolve_graphs<'a>(
         .as_mut()
         .expect("source setup owner")
         .merge(held);
+    Ok(ids)
+}
+
+fn resolve_all_graphs(ctx: &mut Ctx) -> Result<Vec<Id>> {
+    if ctx.source_preparation.is_some() {
+        return resolve_selector_graphs(ctx, &GraphSel::All);
+    }
+    let named = ctx.snap.graph_ids()?;
+    let mut ids = Vec::with_capacity(named.len().saturating_add(1));
+    ids.push(Id::DEFAULT_GRAPH);
+    ids.extend(named);
     Ok(ids)
 }
 
@@ -1225,8 +1303,8 @@ pub(crate) fn restrict_ctx(
     let snap = ctx.snap.clone();
     // a view not bound yet is decided against the context's snapshot
     let a = &a.bound(&snap);
-    let mut ds = std::mem::take(&mut ctx.dataset);
-    ds.restrict(&snap, a, &|id| ctx.term(id))?;
+    let mut ds = ctx.dataset.clone();
+    ds.restrict_checked(&snap, a, &|id| ctx.term_checked(id))?;
     ctx.dataset = ds;
     ctx.graphs = Some(a.clone());
     Ok(())
@@ -1338,8 +1416,8 @@ pub fn query_snapshot_prepared(
 }
 
 /// Run query text over a source that this crate has just prepared, without the store
-/// instance check of [`query_source`]. Permission preparation evaluates the patterns of
-/// protections this way, so that their work is charged to the same preparation.
+/// instance check of [`query_source`].
+#[cfg(test)]
 pub(crate) fn query_prepared_source(
     source: crate::store::BoundReadSource,
     q: &str,
@@ -1348,6 +1426,56 @@ pub(crate) fn query_prepared_source(
     source.query_input().2.check()?;
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     execute_retained_source(source, &parsed, opts, 0.0, None)
+}
+
+/// Run a protection pattern query (C12b §2.3) over an unmasked snapshot with every
+/// physical graph of the snapshot (default, IRI-named and blank-node-named) merged
+/// into the default dataset by graph ID, while `GRAPH` still reaches all named graphs.
+pub(crate) fn query_pattern(
+    snap: Arc<Snapshot>,
+    q: &str,
+    opts: &QueryOptions,
+) -> Result<QueryResult> {
+    let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
+    let stack = depth::check_query(&parsed)?;
+    depth::with_stack(stack, || {
+        let start = Instant::now();
+        let prepared = prepare_query_input_policy(
+            snap,
+            &parsed,
+            opts,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(DefaultDatasetOverride::AllGraphsWithNamed),
+            None,
+        )?;
+        let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
+        depth::with_stack(prepared.plan_depth, || {
+            execute_prepared(&parsed, opts, 0.0, plan_ms, prepared).map_err(|failed| failed.error)
+        })
+    })
+}
+
+/// Run a protection pattern query (C12b §2.3) over an unmasked prepared source with
+/// every physical graph of the snapshot merged into the default dataset by graph ID,
+/// while `GRAPH` still reaches all named graphs.
+pub(crate) fn query_prepared_pattern_source(
+    source: crate::store::BoundReadSource,
+    q: &str,
+    opts: &QueryOptions,
+) -> Result<QueryResult> {
+    source.query_input().2.check()?;
+    let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
+    execute_retained_source(
+        source,
+        &parsed,
+        opts,
+        0.0,
+        Some(DefaultDatasetOverride::AllGraphsWithNamed),
+    )
 }
 
 /// Execute an already parsed query using a genuine physical source and the
@@ -1370,7 +1498,7 @@ fn execute_retained_source(
     parsed: &Query,
     opts: &QueryOptions,
     parse_ms: f64,
-    selector_graphs: Option<&GraphSel>,
+    default_override: Option<DefaultDatasetOverride<'_>>,
 ) -> Result<QueryResult> {
     source.query_input().2.check()?;
     let stack = depth::check_query(parsed)?;
@@ -1385,7 +1513,9 @@ fn execute_retained_source(
             None,
             Some(source),
             None,
-            selector_graphs,
+            None,
+            default_override,
+            None,
         )?;
         let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
         depth::with_stack(prepared.plan_depth, || {
@@ -1435,10 +1565,7 @@ pub fn select_star_order(q: &str, r: &mut QueryResult) -> Result<()> {
     }
     r.inner.ctx.check()?;
     if Arc::strong_count(&r.inner) != 1
-        || r.inner
-            .variables
-            .as_ref()
-            .is_some_and(|variables| Arc::strong_count(variables) != 1)
+        || matches!(&r.inner.variables, Some(ResultVariables::Shared(vars)) if Arc::strong_count(vars) != 1)
     {
         return Err(Error::invalid("cannot reorder a shared query result"));
     }
@@ -1460,12 +1587,12 @@ pub fn select_star_order(q: &str, r: &mut QueryResult) -> Result<()> {
     r.inner.ctx.check()?;
     // No fallible operation remains once the first visible permutation starts.
     let backing = Arc::get_mut(&mut r.inner).expect("unique query result");
-    let variables = backing
-        .variables
-        .as_mut()
-        .map(|variables| Arc::get_mut(variables).expect("unique query variables"));
-    let Some(variables) = variables else {
-        return Ok(());
+    let variables = match &mut backing.variables {
+        Some(ResultVariables::Eager(variables)) => variables,
+        Some(ResultVariables::Shared(variables)) => {
+            Arc::get_mut(variables).expect("unique query variables")
+        }
+        None => return Ok(()),
     };
     for first in 0..order.len() {
         let mut at = first;
@@ -1564,6 +1691,29 @@ pub fn execute_query(
     execute_query_with_plan(snap, parsed, opts, parse_ms).map_err(|f| f.error)
 }
 
+/// [`execute_query`] charging an upstream [`sparkles_budget::ParentHandle`] (used by
+/// incremental view `recompute` evaluation).
+pub(crate) fn execute_query_with_parent(
+    snap: Arc<Snapshot>,
+    parsed: &Query,
+    opts: &QueryOptions,
+    parse_ms: f64,
+    parent: Option<sparkles_budget::ParentHandle>,
+) -> Result<QueryResult> {
+    let depth = depth::check_query(parsed)?;
+    depth::with_stack(depth, || {
+        let t1 = Instant::now();
+        let prepared = prepare_query_input_policy(
+            snap, parsed, opts, None, None, None, None, parent, None, None,
+        )?;
+        let plan_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        depth::with_stack(prepared.plan_depth, || {
+            execute_prepared(parsed, opts, parse_ms, plan_ms, prepared)
+        })
+        .map_err(|f| f.error)
+    })
+}
+
 /// [`execute_query`], with the plan of a query that failed while it ran.
 pub fn execute_query_with_plan(
     snap: Arc<Snapshot>,
@@ -1583,6 +1733,8 @@ struct PreparedQuery {
     kind: QueryKind,
     /// the depth of `node`, which the evaluation and the drop of the plan need stack for
     plan_depth: usize,
+    /// Keeps rewritten algebra credit charged until `node` and `pattern` drop.
+    _rewrite_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// With query-time reasoning, the options the context is made with: without the inferred
@@ -1612,7 +1764,7 @@ fn prepare_query(
     parsed: &Query,
     opts: &QueryOptions,
     cursor_started: Option<Instant>,
-    automatic: Option<&CursorOptions>,
+    automatic: Option<(&CursorOptions, &str)>,
 ) -> Result<PreparedQuery> {
     prepare_query_input(snap, parsed, opts, cursor_started, automatic, None)
 }
@@ -1622,7 +1774,7 @@ fn prepare_query_input(
     parsed: &Query,
     opts: &QueryOptions,
     cursor_started: Option<Instant>,
-    automatic: Option<&CursorOptions>,
+    automatic: Option<(&CursorOptions, &str)>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<PreparedQuery> {
     prepare_query_input_policy(
@@ -1634,7 +1786,15 @@ fn prepare_query_input(
         source,
         None,
         None,
+        None,
+        None,
     )
+}
+
+struct ViewExecution {
+    preparation: Option<crate::access::Preparation>,
+    spill: Option<Arc<crate::spill::QuerySpill>>,
+    patterns: Option<Arc<viewsvc::ViewPatterns>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1643,11 +1803,16 @@ fn prepare_query_input_policy(
     parsed: &Query,
     opts: &QueryOptions,
     cursor_started: Option<Instant>,
-    automatic: Option<&CursorOptions>,
+    automatic: Option<(&CursorOptions, &str)>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
-    selector_graphs: Option<&GraphSel>,
+    parent: Option<sparkles_budget::ParentHandle>,
+    default_override: Option<DefaultDatasetOverride<'_>>,
+    inherited: Option<&ViewExecution>,
 ) -> Result<PreparedQuery> {
+    if let Some(preparation) = inherited.and_then(|view| view.preparation.as_ref()) {
+        preparation.check()?;
+    }
     let (_, dataset, base) = split(parsed);
     extensions::check_family(snap.dataset_id)?;
     let (demand_opts, rdfs_skipped) = demand_options(opts);
@@ -1658,13 +1823,27 @@ fn prepare_query_input_policy(
         base,
         source,
         prepared_policy,
-        selector_graphs,
+        parent,
+        default_override,
+        inherited,
     )?;
-    if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
-        ctx.enable_cursor_accounting()?;
+    if let Some(started) = cursor_started {
+        if automatic.is_none() {
+            ctx.enable_cursor_accounting()?;
+        }
         ctx.deadline = opts.effective_deadline(started)?;
     }
     // a provider that rewrites the query (OWL 2 QL, spec F17 §7) plans the rewritten one
+    if opts.reasoning.is_some()
+        && ctx
+            .read_source
+            .as_ref()
+            .is_some_and(crate::store::BoundReadSource::is_txn)
+    {
+        return Err(Error::Unsupported(
+            "query-time reasoning is not supported on a scoped transaction view".into(),
+        ));
+    }
     let rewritten = match &opts.reasoning {
         Some(provider) => {
             reasoning::check_form(parsed)?;
@@ -1672,7 +1851,7 @@ fn prepare_query_input_policy(
         }
         None => None,
     };
-    let parsed = rewritten.as_ref().map_or(parsed, |r| &r.query);
+    let parsed = rewritten.as_ref().map_or(parsed, |r| &r.rewritten.query);
     let (pattern, _, _) = split(parsed);
     ctx.configure_extensions(pattern);
     if let Some(provider) = &opts.reasoning {
@@ -1680,7 +1859,9 @@ fn prepare_query_input_policy(
             &mut ctx,
             provider,
             pattern,
-            rewritten.as_ref(),
+            rewritten
+                .as_ref()
+                .map(reasoning::GuardedRewritten::rewritten),
             opts,
             dataset,
             base,
@@ -1698,21 +1879,22 @@ fn prepare_query_input_policy(
     }
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     // the keys are visited only when asking for their groups can do something
-    if ctx.opt.prefetch_constants
-        && let Some(mut prefetch) = ctx.snap.generation.vocab.key_prefetch()
-    {
+    #[cfg(not(test))]
+    let prefetch_constants = true;
+    #[cfg(test)]
+    let prefetch_constants = ctx.opt.prefetch_constants;
+    if prefetch_constants && let Some(mut prefetch) = ctx.snap.generation.vocab.key_prefetch() {
         constkeys::for_each_key(pattern, &mut |key| prefetch.add(key));
         prefetch.finish();
     }
     let mut planner = Planner::new(&ctx);
     planner.source = Some(parsed);
-    let mut bound: Vec<(table::VarId, Id)> = Vec::new();
-    for (name, term) in &opts.initial_bindings {
-        let v = ctx.var(name.trim_start_matches(['?', '$']));
-        let id = ctx.intern_outside_term(term);
-        planner.subst.insert(v, id);
-        bound.push((v, id));
-    }
+    let bound: Vec<_> = opts
+        .initial_bindings
+        .iter()
+        .map(|(name, term)| planner.bind_initial(name, term))
+        .collect();
+    let saved_pattern = pattern;
     let (kind, pattern) = match parsed {
         Query::Select { .. } => (QueryKind::Select, pattern.clone()),
         Query::Ask { .. } => (
@@ -1726,28 +1908,37 @@ fn prepare_query_input_policy(
         Query::Construct { .. } => (QueryKind::Construct, pattern.clone()),
         Query::Describe { .. } => (QueryKind::Describe, pattern.clone()),
     };
-    let planned = rdfs::apply(&ctx, &pattern);
+    planner.view_patterns = inherited.and_then(|view| view.patterns.as_deref());
+    let input = if planner.view_patterns.is_some() {
+        debug_assert!(matches!(kind, QueryKind::Select | QueryKind::Construct));
+        saved_pattern
+    } else {
+        &pattern
+    };
+    let planned = rdfs::apply(&ctx, input);
     ioacct::mark("plan");
     let node = planner.plan(&planned, &ActiveGraph::Default, Vec::new())?;
     // the count of the parsed query bounds the plan, and this makes it true of the plan
     let plan_depth = depth::check_plan(node.depth())?;
     ioacct::mark("planned");
     exec::prefetch_scans(&ctx, &node);
-    if let Some(automatic) = automatic
+    let (streamed, admission_lease) = if let Some((automatic, query)) = automatic
         && bound.is_empty()
-        && cursor::auto_streaming(&ctx, &node, kind, automatic)
     {
-        let started = cursor_started.expect("automatic preparation start");
-        let mutable = Arc::get_mut(&mut ctx)
-            .ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
-        mutable.enable_cursor_accounting()?;
-        mutable.deadline = opts.effective_deadline(started)?;
+        cursor::auto_streaming_lease(&ctx, &node, Some(&pattern), query, kind, automatic)?
+    } else {
+        (false, None)
+    };
+    if streamed {
+        finalize_auto_streaming(&mut ctx, &node, admission_lease)?;
+    } else {
+        // Retained charges release through the shared context in both accounting modes.
+        // An eager context is attached once the automatic choice no longer needs it alone,
+        // so its planning keeps what it retains uncharged, as before.
+        ctx.attach_owner();
     }
-    // Retained charges release through the shared context in both accounting modes.
-    // An eager context is attached once the automatic choice no longer needs it alone,
-    // so its planning keeps what it retains uncharged, as before.
-    ctx.attach_owner();
     ctx.check()?;
+    let rewrite_guard = rewritten.and_then(|r| r.memory_guard);
     Ok(PreparedQuery {
         ctx,
         node,
@@ -1755,7 +1946,43 @@ fn prepare_query_input_policy(
         bound,
         kind,
         plan_depth,
+        _rewrite_guard: rewrite_guard,
     })
+}
+
+/// Complete the automatic-streaming transition after `auto_streaming_lease`: switch
+/// `ctx` into cursor accounting, attach its owner, and transfer `admission_lease` into
+/// `RetainedCharge`s on cached `EXISTS` plans and metadata.
+///
+/// Clears speculative caches before `admission_lease` drops on any error or unwind so a
+/// concurrent query cannot claim the released pool bytes while cached plans are still live.
+pub(super) fn finalize_auto_streaming(
+    ctx: &mut Arc<Ctx>,
+    node: &plan::Node,
+    mut admission_lease: Option<query_memory::QueryMemoryLease>,
+) -> Result<()> {
+    struct ClearOnDrop<'a> {
+        node: &'a plan::Node,
+        keep: bool,
+    }
+    impl Drop for ClearOnDrop<'_> {
+        fn drop(&mut self) {
+            if !self.keep {
+                exists::clear_cached_plans(self.node);
+            }
+        }
+    }
+    // Declared after `admission_lease` so on error or unwind, speculative caches drop
+    // before `admission_lease` releases its pool bytes.
+    let mut clear_guard = ClearOnDrop { node, keep: false };
+    let mutable =
+        Arc::get_mut(ctx).ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
+    mutable.enable_cursor_accounting()?;
+    ctx.attach_owner();
+    exists::charge_cached_plans(ctx, node, admission_lease.as_mut())?;
+    clear_guard.keep = true;
+    drop(admission_lease);
+    Ok(())
 }
 
 fn execute_parsed(
@@ -1790,7 +2017,7 @@ fn execute_prepared(
 #[inline(never)]
 fn select_output(
     ctx: &Arc<Ctx>,
-    variables: Arc<cursor::Variables>,
+    variables: cursor::Variables,
     bound: &[(table::VarId, Id)],
     materialized: table::Materialized<'_>,
     result: &mut ResultParts,
@@ -1802,7 +2029,7 @@ fn select_output(
         materialized.project(ctx, &variables.ids)?
     };
     let retained = projected.into_retained(ctx)?;
-    result.variables = Some(variables);
+    result.variables = Some(ResultVariables::Eager(variables));
     result.table = retained.table;
     result._table_credit = retained.credit;
     // substituted variables report their bound value
@@ -1822,6 +2049,7 @@ fn execute_prepared_parts(
     prepared: PreparedQuery,
 ) -> std::result::Result<ResultParts, Box<Failed>> {
     let PreparedQuery {
+        _rewrite_guard,
         ctx,
         node,
         pattern,
@@ -1838,7 +2066,7 @@ fn execute_prepared_parts(
         Query::Select { .. } => {
             let started = Instant::now();
             let variables =
-                cursor::Variables::new(&ctx, &pattern, &node.vars, "").map_err(|error| {
+                cursor::Variables::eager(&ctx, &pattern, &node.vars).map_err(|error| {
                     let mut plan = ctx.failed_plan();
                     if let Some(p) = &mut plan {
                         p.warnings = ctx.warnings();
@@ -2007,7 +2235,8 @@ fn graph_root(kind: QueryKind, mut where_plan: PlanInfo, stage: Instant) -> Plan
     }
 }
 
-/// EXPLAIN: algebra (SSE) and the plan without executing it.
+/// EXPLAIN: source algebra (SSE) and the plan with the request's bindings applied,
+/// without executing it.
 pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(String, PlanInfo)> {
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     let depth = depth::check_query(&parsed)?;
@@ -2023,7 +2252,7 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
             }
             None => None,
         };
-        let parsed = rewritten.as_ref().map_or(&parsed, |r| &r.query);
+        let parsed = rewritten.as_ref().map_or(&parsed, |r| &r.rewritten.query);
         let (pattern, _, _) = split(parsed);
         ctx.configure_extensions(pattern);
         if let Some(provider) = &opts.reasoning {
@@ -2031,7 +2260,9 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
                 &mut ctx,
                 provider,
                 pattern,
-                rewritten.as_ref(),
+                rewritten
+                    .as_ref()
+                    .map(reasoning::GuardedRewritten::rewritten),
                 opts,
                 dataset,
                 base,
@@ -2042,6 +2273,9 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
         let mut planner = Planner::new(&ctx);
         planner.source = Some(parsed);
+        for (name, term) in &opts.initial_bindings {
+            planner.bind_initial(name, term);
+        }
         // the shape that execution plans: ASK as a slice of one solution
         let kind = match parsed {
             Query::Select { .. } => QueryKind::Select,
@@ -2303,6 +2537,7 @@ fn construct(
             i,
             template,
             graphs,
+            None,
             &mut work,
             &mut |q, incoming| {
                 let held = out.credit.as_ref().expect("live graph credit");
@@ -2391,6 +2626,7 @@ struct ConstructRow<'a> {
     bnodes: FxHashMap<String, BlankNode>,
     storage: u64,
     held: ctx::Charge<'a>,
+    mint: Option<&'a dyn Fn(&str) -> BlankNode>,
 }
 
 /// Shared eager/cursor instantiation hands the emitter each quad together with
@@ -2403,6 +2639,7 @@ fn construct_row<'a>(
     row: usize,
     template: &[TriplePattern],
     graphs: &[GraphTemplate],
+    mint: Option<&'a dyn Fn(&str) -> BlankNode>,
     work: &mut usize,
     emit: &mut dyn FnMut(Quad, &mut Option<ctx::Charge<'a>>) -> Result<()>,
 ) -> Result<()> {
@@ -2415,6 +2652,7 @@ fn construct_row<'a>(
         bnodes: FxHashMap::default(),
         storage: 0,
         held: ctx.charge(0)?,
+        mint,
     };
     for tp in template {
         check()?;
@@ -2561,7 +2799,10 @@ fn template_term(
                     }
                     state.bnodes.insert(
                         b.as_str().to_owned(),
-                        crate::store::bnode_for(ctx.fresh_bnode()),
+                        state.mint.map_or_else(
+                            || crate::store::bnode_for(ctx.fresh_bnode()),
+                            |mint| mint(b.as_str()),
+                        ),
                     );
                 }
                 let node = state.bnodes.get(b.as_str()).expect("row blank node");
@@ -2693,6 +2934,10 @@ mod sample_tests;
 mod stats_tests;
 #[cfg(test)]
 mod strfilter_tests;
+#[cfg(test)]
+mod strict_decode_tests;
+#[cfg(test)]
+mod strict_decode_w2_tests;
 #[cfg(test)]
 mod tests;
 
@@ -2847,6 +3092,83 @@ mod result_backing_tests {
                 assert!(matches!(result, Err(Error::Invalid(_))));
             }
             assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
+
+    const SMALL_SELECT: &str = "SELECT ?x WHERE { VALUES ?x { 1 } }";
+
+    #[test]
+    fn small_eager_queries_share_the_pool_cap_until_the_last_result_drops() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let cap = 64 << 10;
+        let pool = pool::QueryPool::new(cap);
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let snapshot = store.snapshot();
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| query(snapshot.clone(), SMALL_SELECT, &opts));
+            let second = scope.spawn(|| query(snapshot.clone(), SMALL_SELECT, &opts));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let (result, refusal) = match (first, second) {
+            (Ok(result), Err(refusal)) | (Err(refusal), Ok(result)) => (result, refusal),
+            _ => panic!("one small query must take the pool's only grant"),
+        };
+        assert!(matches!(refusal, Error::BudgetExceeded(b)
+            if b.kind == crate::BudgetKind::ServerMemory && b.limit == cap));
+        assert!(matches!(
+            &result.inner.variables,
+            Some(ResultVariables::Eager(_))
+        ));
+        assert_eq!(result.variables(), ["x"]);
+        assert_eq!(pool.granted(), cap);
+        let last = result.clone();
+        drop(result);
+        assert_eq!(pool.granted(), cap);
+        drop(last);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn eager_variable_credit_returns_after_result_cancellation_and_unwind() {
+        struct InjectedPanic;
+        let store = crate::store::Store::in_memory(Default::default());
+        for unwind in [false, true] {
+            let pool = pool::QueryPool::new(64 << 10);
+            let grant = Arc::new(pool.empty_grant());
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let opts = QueryOptions {
+                grant: Some(grant.clone()),
+                cancel: Some(cancel.clone()),
+                ..Default::default()
+            };
+            let observed_grant = grant.clone();
+            let hook = probe::install(
+                move |point| {
+                    if let probe::Point::Allocation("query-result-backing", 1) = point {
+                        assert!(observed_grant.used() > 0);
+                        if unwind {
+                            std::panic::panic_any(InjectedPanic);
+                        }
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                },
+                None,
+            );
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                query(store.snapshot(), SMALL_SELECT, &opts)
+            }));
+            drop(hook);
+            if unwind {
+                assert!(matches!(outcome, Err(payload) if payload.is::<InjectedPanic>()));
+            } else {
+                assert!(matches!(outcome.unwrap(), Err(Error::Cancelled)));
+            }
+            assert_eq!(grant.used(), 0);
+            drop((opts, grant));
+            assert_eq!(pool.granted(), 0);
         }
     }
 

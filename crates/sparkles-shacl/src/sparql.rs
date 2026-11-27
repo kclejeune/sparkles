@@ -664,20 +664,38 @@ impl SparqlComponent {
     }
 }
 
+/// Replace `{$var}` / `{?var}` in message templates, propagating fallible lookups.
+fn try_fill_template(
+    msgs: &[Literal],
+    lookup: &dyn Fn(&str) -> Result<Option<String>>,
+) -> Result<Vec<Literal>> {
+    let re = regex::Regex::new(r"\{[\$\?]([A-Za-z_][A-Za-z0-9_]*)\}").expect("valid regex");
+    let mut out = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        let text = m.value();
+        let mut rendered = String::with_capacity(text.len());
+        let mut last = 0;
+        for cap in re.captures_iter(text) {
+            let full = cap.get(0).expect("full match");
+            rendered.push_str(&text[last..full.start()]);
+            match lookup(&cap[1])? {
+                Some(val) => rendered.push_str(&val),
+                None => rendered.push_str(full.as_str()),
+            }
+            last = full.end();
+        }
+        rendered.push_str(&text[last..]);
+        out.push(match m.language() {
+            Some(l) => Literal::new_language_tagged_literal_unchecked(rendered, l),
+            None => Literal::new_simple_literal(rendered),
+        });
+    }
+    Ok(out)
+}
+
 /// Replace `{$var}` / `{?var}` in message templates.
 fn fill_template(msgs: &[Literal], lookup: &dyn Fn(&str) -> Option<String>) -> Vec<Literal> {
-    let re = regex::Regex::new(r"\{[\$\?]([A-Za-z_][A-Za-z0-9_]*)\}").expect("valid regex");
-    msgs.iter()
-        .map(|m| {
-            let s = re.replace_all(m.value(), |c: &regex::Captures<'_>| {
-                lookup(&c[1]).unwrap_or_else(|| c[0].to_string())
-            });
-            match m.language() {
-                Some(l) => Literal::new_language_tagged_literal_unchecked(s, l),
-                None => Literal::new_simple_literal(s),
-            }
-        })
-        .collect()
+    try_fill_template(msgs, &|v| Ok(lookup(v))).expect("infallible template lookup")
 }
 
 fn display(t: &Term) -> String {
@@ -781,17 +799,17 @@ impl Engine<'_> {
     /// the query made, rather than one of the store or one it was given, gets a label
     /// that starts with `tag`, which the caller makes unique per query. Blank nodes inside
     /// triple terms are renamed the same way.
-    pub(crate) fn fresh_result_term(ctx: &Ctx, id: Id, tag: &str) -> Option<Term> {
-        Some(fresh_blank_nodes(ctx, Self::result_term(ctx, id)?, tag))
+    pub(crate) fn fresh_result_term(ctx: &Ctx, id: Id, tag: &str) -> Result<Option<Term>> {
+        Ok(Self::result_term(ctx, id)?.map(|t| fresh_blank_nodes(ctx, t, tag)))
     }
 
-    pub(crate) fn result_term(ctx: &Ctx, id: Id) -> Option<Term> {
+    pub(crate) fn result_term(ctx: &Ctx, id: Id) -> Result<Option<Term>> {
         if id.is_undef() {
-            return None;
+            return Ok(None);
         }
         match id.tag() {
-            Tag::Undef | Tag::Special => None,
-            _ => ctx.term(id),
+            Tag::Undef | Tag::Special => Ok(None),
+            _ => Ok(ctx.term_checked(id)?),
         }
     }
 
@@ -844,8 +862,13 @@ impl Engine<'_> {
         );
         let focus_term = self.term(focus)?;
         for row in 0..table.len() {
-            let get = |c: Option<usize>| c.and_then(|c| Self::result_term(ctx, table.get(row, c)));
-            if let Some(Term::Literal(l)) = get(c_fail)
+            let get = |c: Option<usize>| -> Result<Option<Term>> {
+                match c {
+                    Some(c) => Self::result_term(ctx, table.get(row, c)),
+                    None => Ok(None),
+                }
+            };
+            if let Some(Term::Literal(l)) = get(c_fail)?
                 && l.value() == "true"
             {
                 bail!(
@@ -853,25 +876,27 @@ impl Engine<'_> {
                     shape.node
                 );
             }
-            let this = get(c_this).unwrap_or_else(|| focus_term.clone());
-            let value = get(c_value).or_else(|| shape.path.is_none().then(|| focus_term.clone()));
+            let this = get(c_this)?.unwrap_or_else(|| focus_term.clone());
+            let value = get(c_value)?.or_else(|| shape.path.is_none().then(|| focus_term.clone()));
             let path = if shape.path.is_some() {
                 RPath::Shape
             } else {
-                match get(c_path) {
+                match get(c_path)? {
                     Some(Term::NamedNode(p)) => RPath::Path(PropertyPath::Predicate(p)),
                     _ => RPath::None,
                 }
             };
-            let msgs = match get(c_msg) {
+            let msgs = match get(c_msg)? {
                 Some(Term::Literal(l)) => vec![l],
-                _ => fill_template(messages, &|v| {
+                _ => try_fill_template(messages, &|v| {
                     if let Some((_, t)) = params.iter().find(|(n, _)| n == v) {
-                        return Some(display(t));
+                        return Ok(Some(display(t)));
                     }
-                    let c = table.col_of(ctx.var(v))?;
-                    Self::result_term(ctx, table.get(row, c)).map(|t| display(&t))
-                }),
+                    let Some(c) = table.col_of(ctx.var(v)) else {
+                        return Ok(None);
+                    };
+                    Ok(Self::result_term(ctx, table.get(row, c))?.map(|t| display(&t)))
+                })?,
             };
             self.push(
                 out,
@@ -1273,7 +1298,9 @@ mod tests {
                 .unwrap()
         };
         let term = |c: usize| {
-            crate::validate::Engine::fresh_result_term(&ctx, table.get(0, c), "q9").unwrap()
+            crate::validate::Engine::fresh_result_term(&ctx, table.get(0, c), "q9")
+                .unwrap()
+                .unwrap()
         };
         assert_eq!(term(col("given")), given);
         let oxrdf::Term::BlankNode(made) = term(col("made")) else {
@@ -1301,7 +1328,9 @@ mod tests {
                 .unwrap()
         };
         let term = |c: usize| {
-            crate::validate::Engine::fresh_result_term(&ctx, table.get(0, c), "q9").unwrap()
+            crate::validate::Engine::fresh_result_term(&ctx, table.get(0, c), "q9")
+                .unwrap()
+                .unwrap()
         };
         assert_eq!(term(col("given")), triple);
         let oxrdf::Term::Triple(made) = term(col("made")) else {
@@ -1389,5 +1418,121 @@ mod tests {
         );
         assert_eq!(rows, 1);
         assert!(produced < PULLED, "{produced}");
+    }
+
+    #[test]
+    fn shacl_sparql_constraint_and_rule_propagate_result_decode_refusal() {
+        use crate::vocab::SH_NS;
+        use oxrdf::{Literal, Term};
+        use sparkles_core::io::{RdfFormat, Source};
+
+        let big = "s".repeat(16 * 1024);
+        let data_ttl = format!(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:s ex:big \"{big}\" ; ex:small \"ok\" .\n"
+        );
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        store
+            .load(&[Source::from_bytes(
+                data_ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+
+        // 1. SHACL-SPARQL SELECT constraint projecting an oversized literal without decoding
+        //    it during the query itself; result_term hits the budget first and must fail
+        //    instead of substituting fallback focus node or unsubstituted template message.
+        let constraint_shapes_ttl = format!(
+            "@prefix sh: <{SH_NS}> .\n\
+             @prefix ex: <http://example.org/> .\n\
+             ex:Shape a sh:NodeShape ;\n\
+               sh:targetNode ex:s ;\n\
+               sh:sparql [\n\
+                 sh:message \"bad {{$value}}\" ;\n\
+                 sh:select \"PREFIX ex: <http://example.org/> SELECT $this ?value WHERE {{ $this ex:big ?value }}\" ;\n\
+               ] .\n"
+        );
+        let constraint_shapes =
+            crate::Shapes::parse(&constraint_shapes_ttl, RdfFormat::Turtle, None).unwrap();
+
+        let ok_opts = crate::ValidateOptions {
+            query_memory: Some(1 << 20),
+            ..Default::default()
+        };
+        let report_ok = crate::validate(&store.snapshot(), &constraint_shapes, &ok_opts).unwrap();
+        assert!(!report_ok.conforms);
+        assert_eq!(report_ok.results.len(), 1);
+        assert_eq!(
+            report_ok.results[0].value,
+            Some(Term::Literal(Literal::new_simple_literal(&big)))
+        );
+        assert!(
+            report_ok.results[0]
+                .messages
+                .iter()
+                .any(|m| m.value().starts_with("bad ssss")),
+            "positive control substitutes $value into message"
+        );
+
+        let tight_opts = crate::ValidateOptions {
+            query_memory: Some(32 * 1024),
+            ..Default::default()
+        };
+        let err = crate::validate(&store.snapshot(), &constraint_shapes, &tight_opts).expect_err(
+            "tight query_memory must fail result_term decode instead of substituting fallbacks",
+        );
+        assert!(
+            matches!(
+                err.downcast_ref::<sparkles_core::Error>(),
+                Some(sparkles_core::Error::BudgetExceeded(b))
+                    if matches!(b.kind, sparkles_core::BudgetKind::Memory | sparkles_core::BudgetKind::ServerMemory)
+            ),
+            "expected Memory BudgetExceeded, got {err:#}"
+        );
+
+        // 2. SHACL-SPARQL rule template emitting an oversized literal; fresh_result_term
+        //    must propagate the decode refusal instead of silently skipping the triple.
+        let rule_shapes_ttl = format!(
+            "@prefix sh: <{SH_NS}> .\n\
+             @prefix ex: <http://example.org/> .\n\
+             ex:RuleShape a sh:NodeShape ;\n\
+               sh:targetNode ex:s ;\n\
+               sh:rule [\n\
+                 a sh:SPARQLRule ;\n\
+                 sh:construct \"PREFIX ex: <http://example.org/> CONSTRUCT {{ $this ex:copy ?v }} WHERE {{ $this ex:big ?v }}\" ;\n\
+               ] .\n"
+        );
+        let rule_shapes = crate::Shapes::parse(&rule_shapes_ttl, RdfFormat::Turtle, None).unwrap();
+        let [rule] = rule_shapes.rules().unwrap() else {
+            panic!("expected one active SPARQL rule");
+        };
+        let run_rule = |opts: &crate::ValidateOptions, emitted: &mut Vec<_>| {
+            crate::rules::RuleData::new(store.snapshot(), &rule_shapes, None, &[], opts)?.run(
+                &rule_shapes,
+                rule,
+                &mut |triple| {
+                    emitted.push(triple);
+                    Ok(())
+                },
+            )
+        };
+        let mut inferred = Vec::new();
+        run_rule(&ok_opts, &mut inferred).unwrap();
+        assert_eq!(inferred.len(), 1);
+
+        let mut inferred = Vec::new();
+        let rule_err = run_rule(&tight_opts, &mut inferred)
+            .expect_err("tight query memory must refuse decoding the rule result");
+        assert!(inferred.is_empty());
+        assert!(
+            matches!(
+                rule_err.downcast_ref::<sparkles_core::Error>(),
+                Some(sparkles_core::Error::BudgetExceeded(b))
+                    if matches!(b.kind, sparkles_core::BudgetKind::Memory | sparkles_core::BudgetKind::ServerMemory)
+            ),
+            "expected Memory BudgetExceeded from SHACL rule, got {rule_err:#}"
+        );
     }
 }

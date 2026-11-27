@@ -1,53 +1,51 @@
 # Benchmarks
 
-Sparkles benchmarks cover query latency, loading, durable writes, memory and language
-bindings. Start with the [benchmark summary](../BENCHMARKS.md) for representative
-results and tradeoffs. Each workload below has a methodology page and a result report.
-The summary also records measurement coverage and the full loss table. The
-[reference setup](reference/README.md) explains timing and answer rules.
+This directory holds the methodology pages, result reports, charts and immutable run
+catalogs for Sparkles. Start with the [benchmark summary](../BENCHMARKS.md) for headline
+results, measurement coverage and the full list of
+[where Sparkles loses](../BENCHMARKS.md#where-sparkles-loses). The
+[reference setup](reference/README.md) defines the shared hardware, engine versions,
+timing rules and answer checks.
 
-| Workload | Methodology | Results |
-|---|---|---|
-| Synthetic suite | [Read](synthetic/README.md) | [Read](synthetic/RESULTS.md) |
-| WatDiv | [Read](watdiv/README.md) | [Read](watdiv/RESULTS.md) |
-| SP²Bench | [Read](sp2bench/README.md) | [Read](sp2bench/RESULTS.md) |
-| LUBM and reasoning | [Read](reasoning/README.md) | [Read](reasoning/RESULTS.md) |
-| OWL 2 EL classification | [Read](el-classification/README.md) | [All results](el-classification/RESULTS.md) and [Horn rules with individuals](el-classification/RESULTS.md#guarded-horn-rules-with-individuals) |
-| DBpedia | [Read](dbpedia/README.md) | [Read](dbpedia/RESULTS.md) |
-| BSBM | [Read](bsbm/README.md) | [Read](bsbm/RESULTS.md) |
-| Full-text search | [Read](full-text/README.md) | [Read](full-text/RESULTS.md) |
-| Ontology entity search | [Read](entity-search/README.md) | [Read](entity-search/RESULTS.md) |
-| Vector search | [Read](vector/README.md) | [Read](vector/RESULTS.md) |
-| Spatial queries | [Read](spatial/README.md) | [Read](spatial/RESULTS.md) |
-| Paths and graph algorithms | [Read](graph/README.md) | [Read](graph/RESULTS.md) |
-| Engine features and overheads | [Read](engine/README.md) | [Read](engine/RESULTS.md) |
-| Loading and index builds | [Read](loading/README.md) | [Read](loading/RESULTS.md) |
-| Writes and updates | [Read](writes/README.md) | [Read](writes/RESULTS.md) |
-| Language bindings | [Read](bindings/README.md) | [Read](bindings/RESULTS.md) |
-| Natural-language questions | [Read](natural-language/README.md) | [Read](natural-language/RESULTS.md) |
-| Memory and disk | [Read](memory/README.md) | [Read](memory/RESULTS.md) |
-| Web UI at scale | [Read](web-ui-scale/README.md) | [Read](web-ui-scale/RESULTS.md) |
+## Workloads
+
+| Workload | Scope | Methodology | Results |
+|---|---|---|---|
+| Synthetic suite | 28 HTTP SPARQL queries at 1.05M and 10.5M triples, warm, cold, changed-store and mixed-load | [Methodology](synthetic/README.md) | [Results](synthetic/RESULTS.md) |
+| WatDiv | 20 basic templates (88 instances) at 10.97M triples | [Methodology](watdiv/README.md) | [Results](watdiv/RESULTS.md) |
+| SP²Bench | Bibliographic queries at 10M triples under a 12 GiB server cap | [Methodology](sp2bench/README.md) | [Results](sp2bench/RESULTS.md) |
+| LUBM and reasoning | Materialized OWL 2 RL query times, Nemo materialization comparisons and query-time reasoning | [Methodology](reasoning/README.md) | [Results](reasoning/RESULTS.md) and [derived-table cache calibration](reasoning/RESULTS.md#derived-table-cache-calibration) |
+| OWL 2 EL classification | GO, ChEBI lite and ORE 2015 against ELK, Konclude, Whelk, HermiT and ROBOT | [Methodology](el-classification/README.md) | [All results](el-classification/RESULTS.md) and [Horn rules with individuals](el-classification/RESULTS.md#guarded-horn-rules-with-individuals) |
+| DBpedia | 50M slice and full 1.24B-triple English DBpedia loads and queries | [Methodology](dbpedia/README.md) | [Results](dbpedia/RESULTS.md) |
+| BSBM | Explore and Business Intelligence queries and driver mixes at 10M triples | [Methodology](bsbm/README.md) | [Results](bsbm/RESULTS.md) |
+| Full-text search | BM25 `text:query` comparisons against Fuseki jena-text and QLever | [Methodology](full-text/README.md) | [Results](full-text/RESULTS.md) |
+| Ontology entity search | Typeahead prefix and typo-tolerant search over GO and ChEBI lite | [Methodology](entity-search/README.md) | [Results](entity-search/RESULTS.md) |
+| Vector search | Exact and HNSW approximate recall and latency | [Methodology](vector/README.md) | [Results](vector/RESULTS.md) |
+| Spatial queries | Indexed GeoSPARQL queries and GeoSPARQL compliance coverage | [Methodology](spatial/README.md) | [Results](spatial/RESULTS.md) |
+| Paths and graph algorithms | Shortest-path, weighted-pair and graph algorithm timings | [Methodology](graph/README.md) | [Results](graph/README.md) |
+| Engine features and overheads | Focused execution, planning, serialization and rewrite-gate baselines | [Methodology](engine/README.md) | [Results](engine/RESULTS.md) |
+| Loading and index builds | Bulk loads across suites, compressed inputs and compaction | [Methodology](loading/README.md) | [Results](loading/RESULTS.md) |
+| Writes and updates | Durable commits, group commit, mixed read/write load and incremental views | [Methodology](writes/README.md) | [Results](writes/RESULTS.md) |
+| Language bindings | Embedded JVM (Jena), Python and Node.js API comparisons | [Methodology](bindings/README.md) | [Results](bindings/RESULTS.md) |
+| Natural-language questions | Offline and model-assisted SPARQL generation accuracy and latency | [Methodology](natural-language/README.md) | [Results](natural-language/RESULTS.md) |
+| Memory and disk | Server RSS, index sizes, block-cache tradeoffs and spill records | [Methodology](memory/README.md) | [Results](memory/RESULTS.md) |
+| Web UI at scale | Browser startup, tree scrolling, Explore graph growth and individuals paging | [Methodology](web-ui-scale/README.md) | [Results](web-ui-scale/RESULTS.md) |
 
 ## Evidence and generated reports
 
-RESULTS.md files contain imported, manually maintained reports unless they explicitly say
-they are generated. Their tables retain the original timing statistics, footnotes and
-qualifications. A report can mix multiple runs and timing contracts. It must not be
-reconstructed by selecting the newest JSON file alone. A raw record supports only the
-measurements and metadata it contains, so a claim that needs a missing build revision,
-host detail, durability setting or answer evidence needs a new run.
+`RESULTS.md` files are manually maintained unless marked as generated. Their tables retain
+original statistics, footnotes and qualifications across distinct timing contracts, and
+claims needing a missing build revision, host detail, durability setting or answer check
+require a new run.
 
-Each workload has a RUNS.json catalog. A run ID is the SHA-256 of the raw record bytes,
-so several runs on the same day remain distinct. Existing JSON records retain their
-original paths. New runs belong in `<workload>/runs/<run-id>/record.json`, with their
-original manifest and raw outputs alongside them. Never edit a retained run to refresh a
-result. Add a new run and select it explicitly.
+Each workload tracks immutable runs in `RUNS.json`, keyed by the SHA-256 of the raw record
+bytes. Legacy records stay at their existing paths, while new runs live under
+`<workload>/runs/<run-id>/record.json` beside their manifest and raw outputs; refresh a
+result by adding and selecting a new run.
 
-The [synthetic record tables](synthetic/RECORDS.md) and charts are generated from selected
-common records. Their source hashes, eligibility rules and carried-over measurements are
-visible in the report and its selection manifest. They supplement the manual report and
-do not replace its mean timings or establish current performance of a different build.
-
-Run `python3 scripts/bench-docs.py --check` from the repository root to verify source
-hashes and generated output. Run it without `--check` to update only the selected
-generated tables and charts. A hash mismatch stops both modes.
+The generated [synthetic record tables](synthetic/RECORDS.md) and charts cite their source
+hashes, eligibility rules and carried-over measurements in [report.json](synthetic/report.json).
+They supplement the manual report without replacing its timing contract or standing for a
+different build. Run `python3 scripts/bench-docs.py --check` to verify hashes and generated
+output, or run it without `--check` to regenerate selected tables and charts; a hash
+mismatch stops both modes.

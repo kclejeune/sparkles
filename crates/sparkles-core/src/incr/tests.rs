@@ -272,10 +272,8 @@ fn plans_mark_their_modes() {
         .filter(|q| compile(&parse(q), None).unwrap().root.has_recompute())
         .copied()
         .collect();
-    assert_eq!(
-        recomputed,
-        vec!["SELECT ?t ?n WHERE { ?p :memberOf ?t } ORDER BY ?t LIMIT 1"]
-    );
+    // ORDER BY with LIMIT is an ordered window (item 419)
+    assert_eq!(recomputed, Vec::<&str>::new());
 }
 
 #[test]
@@ -1072,6 +1070,30 @@ fn edge_cases_follow_the_oracle() {
     assert_eq!(result(&c).len(), 2);
 }
 
+/// The inner node of a path takes a hidden name that no query variable can take, so a
+/// query variable named like the compiler's old prefix keeps its own binding.
+#[test]
+fn a_path_node_never_meets_a_query_variable() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        &format!("{PREFIX}INSERT DATA {{ :a :p :m . :m :q :o . :a :r :z }}"),
+    )
+    .expect("update");
+    // the parser turns a plain sequence into triples, so an alternative keeps it a path
+    let q = "SELECT ?s ?__incr1 WHERE { ?s (:p/:q)|:none ?o . ?s :r ?__incr1 }";
+    let mut c = circuit(&s, q);
+    check(&s, &c, q, "build");
+    assert_eq!(result(&c), ["<http://ex/a> <http://ex/z>"]);
+    upd(
+        &s,
+        &format!("{PREFIX}INSERT DATA {{ :b :p :n . :n :q :o . :b :r :y }}"),
+    )
+    .expect("update");
+    step(&s, &mut c);
+    check(&s, &c, q, "after an insert");
+}
+
 /// A zero-length path from a term an outer pattern binds matches that term, even when
 /// it is no node of the active graph. `EXISTS` substitutes the outer row, so its
 /// answer differs from a join of the pattern evaluated alone. `OPTIONAL` joins, so a
@@ -1278,4 +1300,760 @@ fn a_view_asks_a_correlated_exists_for_its_first_solution() {
     .unwrap();
     step(&s, &mut c);
     assert_eq!(result(&c).len(), 2);
+}
+
+#[test]
+fn exists_with_ordered_reduced_slice_on_shared_var_matches_oracle() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, &format!("{PREFIX}INSERT DATA {{ :a :p 1 . :b :p 2 }}")).unwrap();
+    for q in [
+        "SELECT ?x WHERE { ?s :p ?x FILTER EXISTS { { SELECT REDUCED ?x WHERE { VALUES ?x { 1 2 2 } } ORDER BY ?x LIMIT 1 OFFSET 1 } } }",
+        "SELECT ?x WHERE { ?s :p ?x FILTER NOT EXISTS { { SELECT REDUCED ?x WHERE { VALUES ?x { 1 2 2 } } ORDER BY ?x LIMIT 1 OFFSET 1 } } }",
+        "SELECT ?x WHERE { ?s :p ?x FILTER EXISTS { { SELECT DISTINCT ?x WHERE { VALUES ?x { 1 2 2 } } ORDER BY ?x LIMIT 1 OFFSET 1 } } }",
+    ] {
+        let mut c = circuit(&s, q);
+        check(&s, &c, q, "after build");
+        upd(&s, &format!("{PREFIX}INSERT DATA {{ :c :p 3 }}")).unwrap();
+        step(&s, &mut c);
+        check(&s, &c, q, "after insert");
+        upd(&s, &format!("{PREFIX}DELETE DATA {{ :b :p 2 }}")).unwrap();
+        step(&s, &mut c);
+        check(&s, &c, q, "after delete");
+    }
+}
+
+/// Incremental views using the shared `Accumulator` trait agree with fresh SPARQL queries
+/// across inserts, updates, deletes, retractions to zero, numeric promotions and demotions,
+/// `DISTINCT`, `MIN`/`MAX`/`SAMPLE` retractions, `BIND`-computed local arguments, all
+/// `AggregateErrors` readings, compactions, and checkpoint round-trips (item 1073).
+#[test]
+fn view_aggregates_agree_with_fresh_queries_across_inserts_updates_and_deletes() {
+    use crate::sparql::AggregateErrors;
+
+    const XSD: &str = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+
+    let oracle_with_mode = |store: &Store, q: &str, cols: &[String], mode: AggregateErrors| {
+        let r = sparql::query(
+            store.snapshot(),
+            &format!("{PREFIX}{XSD}{q}"),
+            &QueryOptions {
+                no_cache: true,
+                aggregate_errors: Some(mode),
+                ..Default::default()
+            },
+        )
+        .expect("oracle query");
+        let idx: Vec<usize> = cols
+            .iter()
+            .map(|c| r.variables().iter().position(|v| v == c).expect("column"))
+            .collect();
+        let mut out: Vec<String> = r
+            .test_application_rows()
+            .iter()
+            .map(|row| {
+                idx.iter()
+                    .map(|&i| canon(&row[i]))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        out.sort();
+        out
+    };
+
+    let build_with_mode = |store: &Store, q: &str, mode: AggregateErrors| -> Circuit {
+        let parsed = sparql::parse_query(&format!("{PREFIX}{XSD}{q}"), None, &[]).expect("parse");
+        let mut c = Circuit::new(compile(&parsed, None).expect("compile"), None);
+        c.aggregate_errors = Some(mode);
+        c.build(store.snapshot(), &Control::none()).expect("build");
+        c
+    };
+
+    let check_mode = |store: &Store, c: &Circuit, q: &str, mode: AggregateErrors, what: &str| {
+        let got = result(c);
+        let want = oracle_with_mode(store, q, &c.columns(), mode);
+        assert_eq!(got, want, "{mode} {what}: {q}");
+    };
+
+    // 1. Grouped & implicit COUNT, COUNT(DISTINCT *), COUNT(DISTINCT ?v), SUM, SUM(DISTINCT),
+    //    AVG, AVG(DISTINCT), MIN, MAX across inserts, updates, deletes, retractions to zero,
+    //    group removal/re-insertion (slot swap_remove), and numeric type promotions/demotions.
+    let queries = [
+        "SELECT ?g (COUNT(*) AS ?c) (COUNT(DISTINCT *) AS ?cd) (COUNT(?v) AS ?cv) (COUNT(DISTINCT ?v) AS ?cvd) (SUM(?v) AS ?s) (SUM(DISTINCT ?v) AS ?sd) (AVG(?v) AS ?a) (AVG(DISTINCT ?v) AS ?ad) (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?x :g ?g OPTIONAL { ?x :v ?v } } GROUP BY ?g",
+        "SELECT (COUNT(*) AS ?c) (COUNT(DISTINCT *) AS ?cd) (COUNT(?v) AS ?cv) (COUNT(DISTINCT ?v) AS ?cvd) (SUM(?v) AS ?s) (SUM(DISTINCT ?v) AS ?sd) (AVG(?v) AS ?a) (AVG(DISTINCT ?v) AS ?ad) (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?x :g ?g OPTIONAL { ?x :v ?v } }",
+        // BIND-computed Tag::Local aggregate argument
+        "SELECT ?g (SUM(?w) AS ?s) (AVG(?w) AS ?a) (MIN(?lbl) AS ?lo) (MAX(?lbl) AS ?hi) WHERE { ?x :g ?g . ?x :v ?v BIND(?v + 0.25 AS ?w) BIND(CONCAT(\"k-\", STR(?v)) AS ?lbl) } GROUP BY ?g",
+    ];
+    let updates = [
+        "INSERT DATA { :a :g :g1 ; :v 10 . :b :g :g1 ; :v 10 . :c :g :g1 ; :v 20 . :d :g :g2 ; :v 5 }",
+        // promote g1 to decimal, then float, then double
+        "INSERT DATA { :e :g :g1 ; :v 2.5 }",
+        "INSERT DATA { :f :g :g1 ; :v \"1.5\"^^xsd:float }",
+        "INSERT DATA { :h :g :g1 ; :v 0.5e0 }",
+        // demote g1 back through float -> decimal -> integer
+        "DELETE DATA { :h :g :g1 ; :v 0.5e0 }",
+        "DELETE DATA { :f :g :g1 ; :v \"1.5\"^^xsd:float }",
+        "DELETE DATA { :e :g :g1 ; :v 2.5 }",
+        // retract g1's max (20) and duplicate min (10)
+        "DELETE DATA { :c :g :g1 ; :v 20 }",
+        "DELETE DATA { :a :g :g1 ; :v 10 }",
+        // remove g2 completely (slot swap_remove), add g3, then remove g1 completely
+        "DELETE DATA { :d :g :g2 ; :v 5 }",
+        "INSERT DATA { :i :g :g3 ; :v 100 . :j :g :g3 ; :v 200 }",
+        "DELETE DATA { :b :g :g1 ; :v 10 }",
+        // re-insert g1 and then retract everything to zero (empty implicit group!)
+        "INSERT DATA { :k :g :g1 ; :v 7 }",
+        "DELETE DATA { :i :g :g3 ; :v 100 . :j :g :g3 ; :v 200 . :k :g :g1 ; :v 7 }",
+    ];
+    fn has_group(n: &super::ops::PlanNode) -> bool {
+        n.operator == "Group" || n.children.iter().any(has_group)
+    }
+    for q in queries {
+        let s = Store::in_memory(StoreOptions::default());
+        let mut c = build_with_mode(&s, q, AggregateErrors::Jena);
+        assert!(
+            has_group(&c.plan()),
+            "expected Group operator in plan for {q}"
+        );
+        check_mode(&s, &c, q, AggregateErrors::Jena, "empty build");
+        let mut peak_bytes = 0u64;
+        for (idx, u) in updates.iter().enumerate() {
+            upd(&s, &format!("{PREFIX}{XSD}{u}")).unwrap();
+            step(&s, &mut c);
+            peak_bytes = peak_bytes.max(c.root.bytes());
+            check_mode(&s, &c, q, AggregateErrors::Jena, u);
+            // Mid-sequence checkpoint round-trip and compaction
+            if idx == 3 || idx == 7 {
+                let snap = s.snapshot();
+                let encoded = c.encode(&snap).expect("encode");
+                let parsed = sparql::parse_query(&format!("{PREFIX}{XSD}{q}"), None, &[]).unwrap();
+                let mut restored = Circuit::new(compile(&parsed, None).unwrap(), None);
+                restored.aggregate_errors = Some(AggregateErrors::Jena);
+                restored.decode(&encoded, &snap).expect("decode");
+                restored.set_applied(c.applied);
+                assert_eq!(
+                    result(&restored),
+                    result(&c),
+                    "checkpoint round-trip at {idx}"
+                );
+                c = restored;
+                s.compact().unwrap();
+                step(&s, &mut c);
+                check_mode(&s, &c, q, AggregateErrors::Jena, "after compact");
+            }
+        }
+        assert!(peak_bytes > 0);
+        // After all rows are deleted, non-implicit grouped state drops to 0 bytes.
+        if q.contains("GROUP BY") {
+            assert_eq!(c.root.bytes(), 0, "deleted groups release retained bytes");
+        }
+    }
+
+    // 2. Integer sum overflowing i64 promoted by a double, then double retracted back to
+    //    unbound overflowing integer sum, then one integer retracted back to i64::MAX.
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        let q = "SELECT (SUM(?v) AS ?s) (AVG(?v) AS ?a) WHERE { ?x :v ?v }";
+        let mut c = build_with_mode(&s, q, AggregateErrors::Jena);
+        for u in [
+            "INSERT DATA { :a :v 9223372036854775807 . :b :v 9223372036854775807 }",
+            "INSERT DATA { :c :v 1.0e0 }",
+            "DELETE DATA { :c :v 1.0e0 }",
+            "DELETE DATA { :b :v 9223372036854775807 }",
+        ] {
+            upd(&s, &format!("{PREFIX}{XSD}{u}")).unwrap();
+            step(&s, &mut c);
+            check_mode(&s, &c, q, AggregateErrors::Jena, u);
+        }
+    }
+
+    // 3. Error propagation & retraction across all three AggregateErrors readings.
+    for mode in AggregateErrors::ALL {
+        let s = Store::in_memory(StoreOptions::default());
+        let q = "SELECT ?g (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) (SUM(?v) AS ?s) (AVG(?v) AS ?a) (AVG(DISTINCT ?v) AS ?ad) (GROUP_CONCAT(?v; SEPARATOR=\"|\") AS ?gc) (GROUP_CONCAT(DISTINCT ?v; SEPARATOR=\"|\") AS ?gcd) WHERE { ?x :g ?g OPTIONAL { ?x :v ?v } } GROUP BY ?g";
+        let q_impl = "SELECT (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) (AVG(?v) AS ?a) (AVG(DISTINCT ?v) AS ?ad) (GROUP_CONCAT(DISTINCT ?v; SEPARATOR=\"|\") AS ?gcd) WHERE { ?x :g ?g OPTIONAL { ?x :v ?v } }";
+        let mut c = build_with_mode(&s, q, mode);
+        let mut ci = build_with_mode(&s, q_impl, mode);
+        check_mode(&s, &ci, q_impl, mode, "implicit empty");
+
+        let steps = [
+            // group with only unbound errors
+            "INSERT DATA { :e1 :g :g1 . :e2 :g :g1 }",
+            // add non-numeric string alongside errors
+            "INSERT DATA { :s1 :g :g1 ; :v \"bad\" }",
+            // retract the string -> back to only errors (Spec AVG -> 0)
+            "DELETE DATA { :s1 :g :g1 ; :v \"bad\" }",
+            // add valid numbers alongside errors
+            "INSERT DATA { :n1 :g :g1 ; :v 2 . :n2 :g :g1 ; :v 6 }",
+            // retract one error (still one error left)
+            "DELETE DATA { :e1 :g :g1 }",
+            // retract last error -> MIN/MAX/SUM/AVG/GROUP_CONCAT recover!
+            "DELETE DATA { :e2 :g :g1 }",
+            // retract all remaining rows -> implicit group returns to empty
+            "DELETE DATA { :n1 :g :g1 ; :v 2 . :n2 :g :g1 ; :v 6 }",
+        ];
+        let norm_concat = |rows: Vec<String>, concat_cols: &[usize]| -> Vec<String> {
+            let mut out: Vec<String> = rows
+                .into_iter()
+                .map(|row| {
+                    let mut cols: Vec<String> = row.split(' ').map(String::from).collect();
+                    for &ci_col in concat_cols {
+                        if let Some(cell) = cols.get_mut(ci_col)
+                            && let Some(inner) =
+                                cell.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                        {
+                            let mut parts: Vec<&str> = inner.split('|').collect();
+                            parts.sort();
+                            *cell = format!("\"{}\"", parts.join("|"));
+                        }
+                    }
+                    cols.join(" ")
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        for u in steps {
+            upd(&s, &format!("{PREFIX}{XSD}{u}")).unwrap();
+            step(&s, &mut c);
+            step(&s, &mut ci);
+            assert_eq!(
+                norm_concat(result(&c), &[6, 7]),
+                norm_concat(oracle_with_mode(&s, q, &c.columns(), mode), &[6, 7]),
+                "{mode} grouped {u}"
+            );
+            assert_eq!(
+                norm_concat(result(&ci), &[4]),
+                norm_concat(oracle_with_mode(&s, q_impl, &ci.columns(), mode), &[4]),
+                "{mode} implicit {u}"
+            );
+        }
+    }
+
+    // 4. SAMPLE stability and fallback when the sampled value is deleted.
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        upd(
+            &s,
+            &format!("{PREFIX}INSERT DATA {{ :a :g :g1 ; :v 2 . :b :g :g1 ; :v 1 }}"),
+        )
+        .unwrap();
+        let q = "SELECT ?g (SAMPLE(?v) AS ?sv) WHERE { ?x :g ?g . ?x :v ?v } GROUP BY ?g";
+        let mut c = build_with_mode(&s, q, AggregateErrors::Jena);
+        let first = result(&c);
+        assert_eq!(first.len(), 1);
+        // Delete whichever value was sampled; the remaining value must be reported.
+        let sampled_is_1 = first[0].contains("\"1\"");
+        if sampled_is_1 {
+            upd(&s, &format!("{PREFIX}DELETE DATA {{ :b :g :g1 ; :v 1 }}")).unwrap();
+        } else {
+            upd(&s, &format!("{PREFIX}DELETE DATA {{ :a :g :g1 ; :v 2 }}")).unwrap();
+        }
+        step(&s, &mut c);
+        check_mode(
+            &s,
+            &c,
+            q,
+            AggregateErrors::Jena,
+            "after deleting sampled value",
+        );
+    }
+
+    // 5. Unknown Group checkpoint state version is cleanly refused with Error::Unsupported.
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        upd(&s, &format!("{PREFIX}INSERT DATA {{ :a :g :g1 ; :v 1 }}")).unwrap();
+        let q = "SELECT ?g (COUNT(?v) AS ?n) WHERE { ?x :g ?g . ?x :v ?v } GROUP BY ?g";
+        let c = build_with_mode(&s, q, AggregateErrors::Jena);
+        let snap = s.snapshot();
+        let mut w = super::persist::Writer::new(&snap, &c.terms);
+        w.zset(&c.result).unwrap();
+        w.u64(super::ops::group::GROUP_STATE_VERSION + 1);
+        let bad_body = w.finish();
+        let parsed = sparql::parse_query(&format!("{PREFIX}{XSD}{q}"), None, &[]).unwrap();
+        let mut target = Circuit::new(compile(&parsed, None).unwrap(), None);
+        let err = target.decode(&bad_body, &snap).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "expected Unsupported for unknown group checkpoint version, got {err:?}"
+        );
+    }
+}
+
+/// Deleting many groups reclaims backing allocations in `Group` and its accumulators,
+/// `clear_state` drops them on rebuild, and `Group::bytes()` charges actual capacity
+/// (including `Vec<AggState>` for `COUNT`).
+#[test]
+fn view_group_budget_reclaims_backing_allocations_after_deletions() {
+    fn find_group(n: &super::ops::Node) -> Option<&super::ops::group::Group> {
+        match &n.op {
+            super::ops::Op::Group(g) => Some(g),
+            _ => n.children().into_iter().find_map(find_group),
+        }
+    }
+
+    let queries = [
+        "SELECT ?g (COUNT(*) AS ?c) WHERE { ?x :g ?g } GROUP BY ?g",
+        "SELECT ?g (SUM(?v) AS ?s) (MIN(?v) AS ?lo) (COUNT(DISTINCT ?v) AS ?cd) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g",
+    ];
+    for prov in [
+        super::prov::Provenance::None,
+        super::prov::Provenance::Count,
+    ] {
+        for q in queries {
+            let s = Store::in_memory(StoreOptions::default());
+            let parsed = sparql::parse_query(&format!("{PREFIX}{q}"), None, &[]).expect("parse");
+            let mut c = Circuit::new(compile(&parsed, None).expect("compile"), None);
+            c.set_provenance(prov).expect("set provenance");
+            c.build(s.snapshot(), &Control::none()).expect("build");
+
+            let mut ins = String::from(PREFIX);
+            ins.push_str("INSERT DATA { ");
+            for i in 0..1000 {
+                ins.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+            }
+            ins.push('}');
+            upd(&s, &ins).unwrap();
+            step(&s, &mut c);
+            let group = find_group(&c.root).expect("Group operator");
+            let peak_bytes = group.bytes();
+            let (peak_slots_alloc, peak_idx_alloc) = group.backing_allocations();
+            let peak_gann_alloc = group.gann_allocation_size();
+            assert!(peak_slots_alloc > 0 && peak_idx_alloc > 0);
+            if !prov.is_none() {
+                assert!(
+                    peak_gann_alloc >= 1000 * 16,
+                    "expected provenance gann backing allocation for 1000 groups, got {peak_gann_alloc}: {q}"
+                );
+                assert!(
+                    peak_bytes >= peak_gann_alloc as u64 + peak_idx_alloc as u64,
+                    "group.bytes() ({peak_bytes}) must include full index and gann backing allocations"
+                );
+            }
+            // COUNT stores Vec<AggState> per slot; Group::bytes() must not undercount at 8 B/group.
+            assert!(
+                peak_bytes >= 1000 * 64,
+                "peak_bytes={peak_bytes} too small for 1000 groups ({prov:?}): {q}"
+            );
+
+            // Delete 850 groups -> backing buffers (and gann) shrink well below peak.
+            let mut del = String::from(PREFIX);
+            del.push_str("DELETE DATA { ");
+            for i in 0..850 {
+                del.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+            }
+            del.push('}');
+            upd(&s, &del).unwrap();
+            step(&s, &mut c);
+            let group = find_group(&c.root).expect("Group operator");
+            let shrunk_bytes = group.bytes();
+            let (shrunk_slots_alloc, shrunk_idx_alloc) = group.backing_allocations();
+            let shrunk_gann_alloc = group.gann_allocation_size();
+            assert!(
+                shrunk_bytes < peak_bytes / 2,
+                "expected shrunk bytes {shrunk_bytes} < peak/2 ({}) ({prov:?}): {q}",
+                peak_bytes / 2
+            );
+            assert!(shrunk_slots_alloc < peak_slots_alloc && shrunk_idx_alloc < peak_idx_alloc);
+            if !prov.is_none() {
+                assert!(
+                    shrunk_gann_alloc < peak_gann_alloc,
+                    "expected gann backing allocation {shrunk_gann_alloc} < peak {peak_gann_alloc}: {q}"
+                );
+            }
+            check(&s, &c, q, "after partial drain");
+
+            // Drain the remaining 150 groups -> 0 bytes and 0 retained backing allocation.
+            let mut del2 = String::from(PREFIX);
+            del2.push_str("DELETE DATA { ");
+            for i in 850..1000 {
+                del2.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+            }
+            del2.push('}');
+            upd(&s, &del2).unwrap();
+            step(&s, &mut c);
+            let group = find_group(&c.root).expect("Group operator");
+            assert_eq!(
+                group.bytes(),
+                0,
+                "drained group must report 0 bytes ({prov:?}): {q}"
+            );
+            assert_eq!(
+                group.backing_allocations(),
+                (0, 0),
+                "drained group must release backing allocations ({prov:?}): {q}"
+            );
+            assert_eq!(
+                group.gann_allocation_size(),
+                0,
+                "drained group must release gann backing allocation ({prov:?}): {q}"
+            );
+            check(&s, &c, q, "after full drain");
+
+            // Tombstone-heavy partial drain: 224 groups -> delete 100 (124 live, 256-bucket
+            // table kept and fully charged) -> delete 74 more (50 live, backing shrinks).
+            if !prov.is_none() {
+                let mut ins224 = String::from(PREFIX);
+                ins224.push_str("INSERT DATA { ");
+                for i in 0..224 {
+                    ins224.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+                }
+                ins224.push('}');
+                upd(&s, &ins224).unwrap();
+                step(&s, &mut c);
+                let g224 = find_group(&c.root).expect("Group operator");
+                let alloc224 = g224.gann_allocation_size();
+                assert!(alloc224 > 0);
+
+                let mut del100 = String::from(PREFIX);
+                del100.push_str("DELETE DATA { ");
+                for i in 0..100 {
+                    del100.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+                }
+                del100.push('}');
+                upd(&s, &del100).unwrap();
+                step(&s, &mut c);
+                let g124 = find_group(&c.root).expect("Group operator");
+                assert_eq!(g124.gann_allocation_size(), alloc224);
+                assert!(
+                    g124.bytes() >= alloc224 as u64,
+                    "group.bytes() must charge full tombstone-bearing gann allocation"
+                );
+
+                let mut del74 = String::from(PREFIX);
+                del74.push_str("DELETE DATA { ");
+                for i in 100..174 {
+                    del74.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+                }
+                del74.push('}');
+                upd(&s, &del74).unwrap();
+                step(&s, &mut c);
+                let g50 = find_group(&c.root).expect("Group operator");
+                assert!(
+                    g50.gann_allocation_size() < alloc224,
+                    "tombstone-heavy gann must shrink below {alloc224}, got {}",
+                    g50.gann_allocation_size()
+                );
+
+                let mut del_rest = String::from(PREFIX);
+                del_rest.push_str("DELETE DATA { ");
+                for i in 174..224 {
+                    del_rest.push_str(&format!(":s{i} :g :g{i} ; :v {i} . "));
+                }
+                del_rest.push('}');
+                upd(&s, &del_rest).unwrap();
+                step(&s, &mut c);
+            }
+
+            // Re-populate and rebuild on an empty store -> clear_state drops allocations too.
+            upd(&s, &ins).unwrap();
+            step(&s, &mut c);
+            assert!(find_group(&c.root).unwrap().bytes() >= 1000 * 64);
+            let empty = Store::in_memory(StoreOptions::default());
+            c.build(empty.snapshot(), &Control::none()).unwrap();
+            let group = find_group(&c.root).expect("Group operator");
+            assert_eq!(group.bytes(), 0);
+            assert_eq!(group.backing_allocations(), (0, 0));
+            assert_eq!(group.gann_allocation_size(), 0);
+        }
+    }
+}
+
+/// `Pass::with_agg_ctx` shares `Circuit::terms` directly without copying historical local
+/// keys into a separate vocabulary, and enforces `max_memory_bytes` when an aggregate
+/// interns new local terms.
+#[test]
+fn view_group_agg_ctx_zero_copy_and_memory_limit() {
+    let s = Store::in_memory(StoreOptions::default());
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { ?s :p ?v BIND(CONCAT(\"payload-\", STR(?v), \"-0123456789abcdef0123456789abcdef0123456789abcdef\") AS ?key) }";
+    let mut c = circuit(&s, q);
+
+    // Accumulate many historical local keys in `c.terms`, then delete those rows.
+    let mut ins = String::from(PREFIX);
+    ins.push_str("INSERT DATA { ");
+    for i in 0..200 {
+        ins.push_str(&format!(":s{i} :p {i} . "));
+    }
+    ins.push('}');
+    upd(&s, &ins).unwrap();
+    step(&s, &mut c);
+    let mut del = String::from(PREFIX);
+    del.push_str("DELETE DATA { ");
+    for i in 0..199 {
+        del.push_str(&format!(":s{i} :p {i} . "));
+    }
+    del.push('}');
+    upd(&s, &del).unwrap();
+    step(&s, &mut c);
+    assert!(c.terms.key_count() >= 200);
+    assert!(c.terms.bytes() > 16_384);
+
+    // Directly observe that `Pass::with_agg_ctx` moves `c.terms`'s exact backing into
+    // `agg_ctx` with zero copies and zero memory charge for historical keys, and restores
+    // the exact same backing on return.
+    let ptrs_before = c.terms.backing_ptrs();
+    {
+        let snap = s.snapshot();
+        let vis = super::pass::Vis::new(None, &snap);
+        let ctl = Control::none();
+        let mut pass = super::pass::Pass::new(
+            snap,
+            None,
+            &[],
+            &[],
+            &mut c.terms,
+            &vis,
+            None,
+            &ctl,
+            &c.vars,
+        );
+        pass.max_memory_bytes = Some(4096);
+        pass.with_agg_ctx(|ctx| {
+            assert_eq!(
+                ctx.circuit_terms_backing_ptrs(),
+                Some(ptrs_before),
+                "agg_ctx must borrow Circuit::terms backing directly without copying"
+            );
+            assert_eq!(
+                ctx.mem_peak(),
+                0,
+                "attaching historical Circuit::terms must charge 0 bytes"
+            );
+            assert!(
+                ctx.value(crate::id::Id::local(0)).is_some(),
+                "historical local term must resolve through moved Terms"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+    assert_eq!(
+        c.terms.backing_ptrs(),
+        ptrs_before,
+        "Restore guard must return the exact Circuit::terms backing"
+    );
+
+    // Apply a 1-row change with headroom smaller than `c.terms.bytes()` on top of the
+    // circuit's already-retained state: copying `c.terms` would exceed the budget.
+    let before_bytes = c.bytes();
+    assert!(c.terms.bytes() > 8192 * 2);
+    c.max_memory_bytes = Some(before_bytes + 8192);
+    upd(&s, &format!("{PREFIX}INSERT DATA {{ :s999 :p 999 }}")).unwrap();
+    step(&s, &mut c);
+    check(&s, &c, q, "1-row change under tight memory budget");
+
+    // When GROUP_CONCAT expands a single distinct string with large multiplicity past
+    // `max_memory_bytes`, `Ordered::read` refuses it before allocating past the limit.
+    let s2 = Store::in_memory(StoreOptions::default());
+    let q2 = "SELECT ?g (GROUP_CONCAT(?v; SEPARATOR=\",\") AS ?gc) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
+    let mut c2 = circuit(&s2, q2);
+    let mut rep_ins = String::from(PREFIX);
+    rep_ins.push_str("INSERT DATA { ");
+    for i in 0..500 {
+        rep_ins.push_str(&format!(":r{i} :g :g1 ; :v \"0123456789abcdef\" . "));
+    }
+    rep_ins.push('}');
+    upd(&s2, &rep_ins).unwrap();
+    c2.max_memory_bytes = Some(2048);
+    let d2 = DeltaSet::read(&s2, c2.applied, &Control::none());
+    let err = c2
+        .advance(&d2, &Control::none())
+        .err()
+        .expect("expected BudgetExceeded error");
+    assert!(
+        matches!(err, crate::Error::BudgetExceeded(_)),
+        "expected BudgetExceeded from repeated GROUP_CONCAT, got {err:?}"
+    );
+}
+
+/// Incremental views handle the decimal-range boundary with floats/doubles, cancellation in
+/// `Group::apply`, `MIN`/`MAX` lexical ties across retraction/compaction, and `SAMPLE`
+/// stability on single-commit replacements.
+#[test]
+fn view_group_decimal_boundary_ties_sample_and_cancel() {
+    const XSD: &str = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+
+    // 1. Decimal-range boundary with double promotion and demotion back to UNDEF / decimal.
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        let q = "SELECT (SUM(?v) AS ?s) (AVG(?v) AS ?a) WHERE { ?x :v ?v }";
+        let mut c = circuit(&s, q);
+        upd(
+            &s,
+            &format!(
+                "{PREFIX}{XSD}INSERT DATA {{ :a :v 100000000000000000000.0 . :b :v 100000000000000000000.0 }}"
+            ),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        check(&s, &c, q, "pure decimal overflow");
+
+        upd(&s, &format!("{PREFIX}{XSD}INSERT DATA {{ :c :v 0.0e0 }}")).unwrap();
+        step(&s, &mut c);
+        let with_double = result(&c);
+        assert_eq!(with_double.len(), 1);
+        assert!(
+            !with_double[0].contains("UNDEF"),
+            "expected finite double SUM and AVG, got {:?}",
+            with_double
+        );
+
+        // Adding two copies of 2e38f stages float arithmetic before promoting to double,
+        // producing double INF while 0.0e0 is present and demoting to float INF when
+        // 0.0e0 is retracted.
+        upd(
+            &s,
+            &format!(
+                "{PREFIX}{XSD}INSERT DATA {{ :f1 :v \"2.0e38\"^^xsd:float . :f2 :v \"2.0e38\"^^xsd:float }}"
+            ),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        let with_mixed = result(&c);
+        assert_eq!(with_mixed.len(), 1);
+        assert!(
+            with_mixed[0].contains("\"INF\"^^<http://www.w3.org/2001/XMLSchema#double>"),
+            "expected staged float overflow promoted to double INF, got {:?}",
+            with_mixed
+        );
+
+        upd(&s, &format!("{PREFIX}{XSD}DELETE DATA {{ :c :v 0.0e0 }}")).unwrap();
+        step(&s, &mut c);
+        let without_double = result(&c);
+        assert_eq!(without_double.len(), 1);
+        assert!(
+            without_double[0].contains("\"INF\"^^<http://www.w3.org/2001/XMLSchema#float>"),
+            "retracting 0.0e0 with two 2e38f floats should demote to float INF, got {:?}",
+            without_double
+        );
+
+        upd(
+            &s,
+            &format!(
+                "{PREFIX}{XSD}DELETE DATA {{ :f1 :v \"2.0e38\"^^xsd:float . :f2 :v \"2.0e38\"^^xsd:float }}"
+            ),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        check(
+            &s,
+            &c,
+            q,
+            "after retracting double and floats back to overflow",
+        );
+
+        upd(
+            &s,
+            &format!("{PREFIX}{XSD}DELETE DATA {{ :b :v 100000000000000000000.0 }}"),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        check(&s, &c, q, "after retracting one large decimal");
+    }
+
+    // 2. MIN/MAX lexical ties ("01"^^xsd:integer vs "001"^^xsd:integer) across retraction
+    //    and compaction, asserting BOTH projected cells.
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        let q =
+            "SELECT ?g (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
+        let mut c = circuit(&s, q);
+        assert_eq!(c.columns(), ["g", "lo", "hi"]);
+        upd(
+            &s,
+            &format!("{PREFIX}{XSD}INSERT DATA {{ :a :g :g1 ; :v \"01\"^^xsd:integer }}"),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        upd(
+            &s,
+            &format!("{PREFIX}{XSD}INSERT DATA {{ :b :g :g1 ; :v \"001\"^^xsd:integer }}"),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        let expected_tied = vec![
+            "<http://ex/g1> \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> \"01\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+                .to_string(),
+        ];
+        assert_eq!(
+            result(&c),
+            expected_tied,
+            "first-seen lexical tie must win for both MIN and MAX before compaction"
+        );
+        // Compaction keeps the tie-run order for both MIN and MAX.
+        s.compact().unwrap();
+        step(&s, &mut c);
+        assert_eq!(
+            result(&c),
+            expected_tied,
+            "compaction preserves lexical tie order for both MIN and MAX"
+        );
+
+        // Retracting "01" switches both MIN and MAX to "001".
+        upd(
+            &s,
+            &format!("{PREFIX}{XSD}DELETE DATA {{ :a :g :g1 ; :v \"01\"^^xsd:integer }}"),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        let expected_after = vec![
+            "<http://ex/g1> \"001\"^^<http://www.w3.org/2001/XMLSchema#integer> \"001\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+                .to_string(),
+        ];
+        assert_eq!(
+            result(&c),
+            expected_after,
+            "retracting first tie must reveal second for both MIN and MAX"
+        );
+        check(&s, &c, q, "after retracting lexical tie");
+    }
+
+    // 3. SAMPLE stability when a single commit replaces one row holding the sampled value
+    //    with another row holding the same value while a smaller value exists in the group.
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        let q = "SELECT ?g (SAMPLE(?v) AS ?sv) WHERE { ?x :g ?g ; :v ?v } GROUP BY ?g";
+        let mut c = circuit(&s, q);
+        upd(&s, &format!("{PREFIX}INSERT DATA {{ :a :g :g1 ; :v 2 }}")).unwrap();
+        step(&s, &mut c);
+        let initial = result(&c);
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].contains("\"2\""));
+
+        // Add a smaller value: SAMPLE stays 2.
+        upd(&s, &format!("{PREFIX}INSERT DATA {{ :b :g :g1 ; :v 1 }}")).unwrap();
+        step(&s, &mut c);
+        assert_eq!(result(&c), initial, "SAMPLE stays stable on smaller insert");
+
+        // Replace :a (value 2) with :c (value 2) in one commit: SAMPLE must stay 2, not flip to 1.
+        upd(
+            &s,
+            &format!(
+                "{PREFIX}DELETE DATA {{ :a :g :g1 ; :v 2 }} ; INSERT DATA {{ :c :g :g1 ; :v 2 }}"
+            ),
+        )
+        .unwrap();
+        step(&s, &mut c);
+        assert_eq!(
+            result(&c),
+            initial,
+            "SAMPLE stays stable across single-commit replacement"
+        );
+    }
+
+    // 4. Pre-cancelled Control aborts Group::apply cleanly.
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        let q = "SELECT ?g (COUNT(*) AS ?n) WHERE { ?x :g ?g } GROUP BY ?g";
+        let mut c = circuit(&s, q);
+        upd(&s, &format!("{PREFIX}INSERT DATA {{ :a :g :g1 }}")).unwrap();
+        let d = DeltaSet::read(&s, c.applied, &Control::none());
+        let ctl = Control::none();
+        ctl.cancel.cancel();
+        let err = c.advance(&d, &ctl).err().expect("expected Cancelled error");
+        assert!(
+            matches!(err, crate::Error::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+    }
 }

@@ -34,10 +34,8 @@ pub(super) fn select_catalog(
             At::Time(ms) => commit.timestamp_ms <= *ms,
             _ => wanted == Some(commit.seq),
         };
-        let catalog = commit::walk_catalog_controlled(
-            &root.join("commits.bin"),
-            budget,
-            |commit, budget| {
+        let catalog =
+            commit::walk_catalog_with(&root.join("commits.bin"), budget, |commit, budget| {
                 budget.check()?;
                 if commit.seq > head {
                     return Ok(());
@@ -54,8 +52,7 @@ pub(super) fn select_catalog(
                     selected = Some(commit);
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         if catalog.is_some_and(|(found, _, _)| found != id) {
             return Err(Error::Corrupt(
                 "retained catalog belongs to another branch".into(),
@@ -107,7 +104,7 @@ pub(super) fn reconcile_tail(
     let start = budget.used();
     let result = (|| {
         let vocab = crate::store::cold::head_vocabulary_controlled(&current.dir, root, budget)?;
-        let terms = vocab.value.len_limited(&budget.owned_limit()?)?;
+        let terms = vocab.value.len_with(&*budget)?;
         let mut previous_time = current.base.timestamp_ms;
         prove_file_with(
             root,

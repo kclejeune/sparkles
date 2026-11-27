@@ -81,11 +81,7 @@ pub(super) fn form(node: &Node) -> Option<Form> {
         Kind::HistoryChanges(spec) => spec.limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
         // Decision 2 of the plan counts an algorithm call as bounded.
         Kind::AlgoCall(_) => Some(usize::MAX),
-        Kind::SpatialScan(_)
-        | Kind::SpatialRelate(_)
-        | Kind::ViewRead(_)
-        | Kind::Service { .. }
-        | Kind::PropertyFn(_) => None,
+        Kind::SpatialScan(_) | Kind::SpatialRelate(_) => None,
         // These read their input whatever their arguments.
         Kind::RegisteredProperty(_)
         | Kind::SpatialJoin(_)

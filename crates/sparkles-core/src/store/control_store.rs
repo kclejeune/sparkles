@@ -326,9 +326,9 @@ impl Store {
 
     /// Upgrade the current log's header to version 3 through the writer's own handle
     /// (spec C26 §7): the group is drained (the caller holds the writer through
-    /// `lock_writer`), the buffered writer flushed, the direct writer's cached block
-    /// dropped, the header written and synchronized, and the writer's length and
-    /// allocation kept. A failure poisons the writer.
+    /// `lock_writer`), the direct writer's cached block dropped, the header written and
+    /// synchronized, and the writer's length and allocation kept. A failure poisons the
+    /// writer.
     fn upgrade_wal_header(&self, w: &mut WriterState) -> Result<()> {
         if w.wal.is_none() {
             return Ok(());
@@ -352,11 +352,10 @@ impl Store {
         let mut io = tail.lock();
         w.poisoned = true;
         let r = (|| -> Result<()> {
-            w.wal.as_mut().expect("checked").flush()?;
             if let wal::Direct::Open(d) = &mut io.direct {
                 d.invalidate();
             }
-            let file = w.wal.as_ref().expect("checked").get_ref();
+            let file = w.wal.as_ref().expect("checked");
             wal::write_all_at(
                 file,
                 &wal::header_record_of(crate::formats::WAL_CONTROL_VERSION),
@@ -636,7 +635,7 @@ impl WriteTxn<'_> {
     /// About the bytes the transaction's frame adds to the write-ahead log, for the
     /// storage checks.
     pub(super) fn control_wal_bytes(&self) -> u64 {
-        let Some(c) = self.control.as_ref() else {
+        let Some(c) = self.control.as_ref().filter(|c| !c.changes.is_empty()) else {
             return 0;
         };
         let frame: usize = 64
@@ -702,21 +701,68 @@ impl WriteTxn<'_> {
             .as_ref()
             .is_some_and(|c| c.base.get(control::ORIGIN_KEY).is_some())
             && state.get(control::ORIGIN_KEY).is_none();
+        let staged_prefixes = std::mem::take(&mut self.staged_prefixes);
+        let store = self.store;
+        let mut prep = if !staged_prefixes.is_empty() {
+            Some(store.prepare_added_prefixes(&staged_prefixes)?)
+        } else {
+            None
+        };
+        let pending_next = prep.as_mut().and_then(|p| p.next.take());
+        if let Some(ref next) = pending_next {
+            if let Some(prep) = prep.as_mut() {
+                prep.arm_staged_fence(store);
+            }
+            if let Err(e) = store.stage_prefixes_for_commit(head.seq, Some(frame.seq), next) {
+                if store.clear_staged_prefixes().is_ok() {
+                    if let Some(prep) = prep.as_mut() {
+                        prep.disarm_staged_fence();
+                    }
+                } else {
+                    self.guard.poisoned = true;
+                }
+                return Err(e);
+            }
+        }
         let w = &mut **self.guard;
-        self.store.append_control(w, &frame, state)?;
+        if let Err(e) = store.append_control(w, &frame, state) {
+            if pending_next.is_some() && !w.poisoned {
+                if store.clear_staged_prefixes().is_ok() {
+                    if let Some(prep) = prep.as_mut() {
+                        prep.disarm_staged_fence();
+                    }
+                } else {
+                    w.poisoned = true;
+                }
+            }
+            return Err(e);
+        }
         if consumes_origin {
             // the origin leaves the checkpoint before the writer is released, so a lost
             // log is never recreated empty after a transition was acknowledged
             w.poisoned = true;
-            self.store.checkpoint_control(w)?;
+            store.checkpoint_control(w)?;
             w.poisoned = false;
         }
+        if let Some(mut prep) = prep {
+            if let Some(next) = pending_next {
+                if let Err(e) = store.install_staged_prefixes(&next) {
+                    w.poisoned = true;
+                    return Err(e);
+                }
+                prep.disarm_staged_fence();
+                *prep.cur = next;
+            }
+            let skipped = prep.skipped;
+            drop(prep);
+            store.warn_skipped_prefixes(skipped);
+        }
         Ok(Receipt {
-            dataset_id: self.store.owner_dataset_id(),
+            dataset_id: store.owner_dataset_id(),
             committed: false,
             commit: head,
             validation: None,
-            annotation: self.store.annotation(head.seq).unwrap_or_default(),
+            annotation: store.annotation(head.seq).unwrap_or_default(),
         })
     }
 }

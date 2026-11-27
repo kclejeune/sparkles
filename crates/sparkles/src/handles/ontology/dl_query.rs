@@ -202,6 +202,9 @@ pub struct DlQueryRequest {
     pub threads: usize,
     /// the most facts demand reasoning derives for one pattern, or its default
     pub max_derived: Option<usize>,
+    /// classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom
+    /// outside OWL 2 EL and using the dataset's EL-only kept saturation
+    pub el_only: bool,
 }
 
 impl DlQueryRequest {
@@ -213,6 +216,7 @@ impl DlQueryRequest {
             answers: DlAnswers::default(),
             threads: 0,
             max_derived: None,
+            el_only: false,
         }
     }
 }
@@ -236,6 +240,8 @@ pub struct DlReasoningUsed {
     pub engine: DlEngine,
     /// why automatic reasoning chose the engine, or that the caller named it
     pub why: String,
+    /// whether the classifier ran in EL-only (ELK) mode
+    pub el_only: bool,
     /// whether the class answers are every entailed one
     pub complete: bool,
     /// whether the instances are every entailed one, when they were asked for
@@ -439,22 +445,49 @@ impl Ontologies {
         }
         let ax = defining(&q.expression);
         let expression_el = profiles::axiom_violations(&ax, Profile::El);
+        if q.el_only && q.reasoning == DlReasoning::Rl {
+            return Err(Error::invalid(
+                "elOnly applies to the classifier, not reasoning=rl",
+            ));
+        }
         let (engine, why) = match q.reasoning {
             DlReasoning::El => {
                 if let Some((rule, message)) = expression_el.first() {
-                    return Err(Error::invalid(format!(
-                        "the expression is outside OWL 2 EL ({rule}: {message}); ask for reasoning=rl or auto"
-                    )));
+                    return Err(Error::invalid(if q.el_only {
+                        format!(
+                            "the expression is outside OWL 2 EL ({rule}: {message}); leave out elOnly and use reasoning=auto or rl"
+                        )
+                    } else {
+                        format!(
+                            "the expression is outside OWL 2 EL ({rule}: {message}); ask for reasoning=rl or auto"
+                        )
+                    }));
                 }
                 (
                     DlEngine::El,
-                    "the caller asked for the EL classifier".to_string(),
+                    if q.el_only {
+                        "the caller asked for the EL classifier in EL-only mode"
+                    } else {
+                        "the caller asked for the EL classifier"
+                    }
+                    .to_string(),
                 )
             }
             DlReasoning::Rl => (
                 DlEngine::Rl,
                 "the caller asked for the OWL 2 RL rules".to_string(),
             ),
+            DlReasoning::Auto if q.el_only => {
+                if let Some((rule, message)) = expression_el.first() {
+                    return Err(Error::invalid(format!(
+                        "the expression is outside OWL 2 EL ({rule}: {message}); leave out elOnly and use reasoning=auto or rl"
+                    )));
+                }
+                (
+                    DlEngine::El,
+                    "the caller asked for EL-only mode".to_string(),
+                )
+            }
             DlReasoning::Auto => {
                 if let Some((rule, message)) = expression_el.first() {
                     (
@@ -510,6 +543,7 @@ impl Ontologies {
             reasoning: DlReasoningUsed {
                 engine: DlEngine::El,
                 why,
+                el_only: q.el_only,
                 complete: true,
                 instances_complete: None,
                 gaps: Vec::new(),
@@ -533,7 +567,7 @@ impl Ontologies {
                         changes: Option<Changes<'_>>,
                         par: Par|
          -> Result<(bool, Description, Vec<Excluded>, u64)> {
-            let r = saturate(s, axioms, changes, par, opts)?;
+            let r = saturate(s, axioms, changes, par, q.el_only, opts)?;
             let d = s.describe(&qc).ok_or_else(|| {
                 Error::invalid("the classifier holds no saturation of the query class")
             })?;
@@ -550,7 +584,7 @@ impl Ontologies {
                 answer.incremental = true;
                 // the kept saturation reads the defining axiom beside the ontology's, and
                 // the next run over it lets the axiom go
-                self.with_kept(o, req, opts, "dlQuery", |e| {
+                self.with_kept(o, req, q.el_only, opts, "dlQuery", |e| {
                     // the threads come first: a wait that ends at the deadline leaves the
                     // kept state as it was
                     let par = admit(q.threads, opts)?;
@@ -945,6 +979,7 @@ fn rl(
         reasoning: DlReasoningUsed {
             engine: DlEngine::Rl,
             why,
+            el_only: false,
             complete: false,
             instances_complete,
             gaps,

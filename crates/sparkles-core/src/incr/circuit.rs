@@ -1,22 +1,27 @@
 //! A compiled circuit with its state: the result it keeps current, the commit it
 //! reflects, and the passes that move it (spec F13 §3.3, §3.4).
 
+use super::budget::ViewBudget;
 use super::compile::{Compiled, Kind};
-use super::footprint::{Footprint, Resolved};
-use super::inference::{Inference, InferredFootprint};
-use super::ops::{Node, PlanNode};
+use super::footprint::{FGraph, Footprint, Resolved};
+use super::inference::Inference;
+use super::ops::{Node, Op, PlanNode};
 use super::pass::{Pass, PassStats, Vis};
 use super::persist::{Reader, Writer};
 use super::prov::{self, AChanges, AnnMap, Annotation, FactCache, FactKey, Provenance};
 use super::terms::Terms;
-use super::zset::{Changes, Row, ZSet, consolidate};
+use super::zset::{Changes, Row, ZSet};
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::sparql::pool::QueryPool;
+use crate::sparql::viewsvc::{PublishedBytes, ViewPatterns, ViewTable, ViewVersion};
 use crate::store::{ChangesOptions, Snapshot, Store};
 use crate::task::Control;
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
+use sparkles_budget::{MemoryLease, ParentHandle};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 
 /// The most net changes a pass applies; more are cheaper to evaluate from scratch.
@@ -256,10 +261,19 @@ pub enum Advance {
     Reset(Changes),
 }
 
-#[derive(Clone)]
+/// Like [`Advance`], carrying the [`ScratchLease`](super::budget::ScratchLease) that
+/// covers the returned [`Changes`] vector until the caller consumes and drops it.
+pub(crate) enum ChargedAdvance {
+    Skipped,
+    Changed(Changes, super::budget::ScratchLease),
+    Reset(Changes, super::budget::ScratchLease),
+}
+
 pub struct Circuit {
     pub kind: Kind,
     pub vars: Vec<String>,
+    pub(crate) template_columns: Option<Arc<[String]>>,
+    pub(crate) rebuild_patterns: Option<Arc<ViewPatterns>>,
     pub root: Node,
     pub footprint: Footprint,
     resolved: Option<Resolved>,
@@ -270,6 +284,10 @@ pub struct Circuit {
     pub applied: u64,
     /// the snapshot of the latest pass
     pub snap: Option<Arc<Snapshot>>,
+    /// evidence projection visibility key of the latest pass
+    evidence_key: Option<String>,
+    /// managed publication generation paired with `evidence_key` on the latest pass
+    managed_generation: u64,
     /// whose view of the dataset the circuit reads
     pub access: Option<Arc<GraphAccess>>,
     /// counters of the latest pass
@@ -286,11 +304,16 @@ pub struct Circuit {
     /// the query's pattern and dataset clause
     pub pattern: spargebra::algebra::GraphPattern,
     pub dataset: Option<spargebra::algebra::QueryDataset>,
-    inferred: InferredFootprint,
+    /// resolved schema footprint when `inference` is set
+    schema_resolved: Option<Resolved>,
     /// Whether the circuit keeps its result. A sink that consumes only the changes,
     /// such as an internal circuit's accumulator, sets it to `false`: the result then
     /// stays empty, and the operators keep only the state they need.
     pub keep_result: bool,
+    /// The latest immutable shared view version, replaced whenever a pass updates the
+    /// result so streaming cursors read without holding the circuit's lock.
+    pub(crate) version: Option<Arc<ViewVersion>>,
+    pub(crate) version_pool: Option<Arc<AtomicU64>>,
     /// the annotation the circuit keeps besides the weights (spec F13 §5)
     prov: Provenance,
     /// the annotations of the result's rows
@@ -302,13 +325,170 @@ pub struct Circuit {
     /// the index estimates the latest build computed, which tests read
     #[cfg(test)]
     pub(crate) build_estimated: u64,
+    /// number of times `publish_version_budgeted` checked admission for a published version
+    #[cfg(test)]
+    pub(crate) version_publish_attempts: usize,
+    /// number of times `publish_version_with_rows` allocated a published version
+    #[cfg(test)]
+    pub(crate) version_allocs: usize,
+    /// query pool backing this circuit's accounting domain, when attached
+    pool: Option<Arc<QueryPool>>,
+    /// hierarchical budget for operator state, result, terms, provenance, history/tally,
+    /// pass scratch, and nested SPARQL evaluation. Declared last so all payloads drop
+    /// strictly before parent credit returns.
+    budget: ViewBudget,
 }
 
-/// Annotated changes split into the weights' changes, consolidated, and the changes
-/// themselves.
-fn split(c: AChanges) -> (Changes, AChanges) {
-    let w = consolidate(c.iter().map(|(r, w, _)| (r.clone(), *w)).collect());
-    (w, c)
+type LiveDiffRows = (
+    Arc<[super::live::LiveRow]>,
+    Arc<[super::live::LiveRow]>,
+    super::budget::ScratchLease,
+);
+
+pub(crate) fn reserve_vec_slot<T>(
+    rows: &Vec<T>,
+    lease: &mut super::budget::ScratchLease,
+) -> Result<()> {
+    let slot = std::mem::size_of::<T>();
+    let cap = sparkles_budget::sizes::vec_grown(rows.capacity(), rows.len(), 1, slot);
+    lease.try_reserve((cap.saturating_sub(rows.capacity()) * slot) as u64)
+}
+
+pub(crate) fn into_arc_rows<T>(
+    rows: Vec<T>,
+    lease: &mut super::budget::ScratchLease,
+) -> Result<Arc<[T]>> {
+    let slot = std::mem::size_of::<T>() as u64;
+    let old_bytes = rows.capacity() as u64 * slot;
+    lease.try_reserve(rows.len() as u64 * slot)?;
+    let rows = rows.into();
+    lease.release(old_bytes);
+    Ok(rows)
+}
+
+/// Approximate heap bytes of one decoded term row.
+pub(crate) fn decoded_row_bytes(row: &[Option<Term>]) -> u64 {
+    fn term_bytes(t: &Term) -> u64 {
+        match t {
+            Term::NamedNode(n) => n.as_str().len() as u64,
+            Term::BlankNode(b) => b.as_str().len() as u64,
+            Term::Literal(l) => {
+                let lang_or_datatype = match l.language() {
+                    Some(lang) => lang.len(),
+                    None if l.datatype() == oxrdf::vocab::xsd::STRING => 0,
+                    None => l.datatype().as_str().len(),
+                };
+                (l.value().len() + lang_or_datatype) as u64
+            }
+            Term::Triple(tr) => {
+                let subject = match &tr.subject {
+                    oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+                    oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+                };
+                (std::mem::size_of::<oxrdf::Triple>() + subject + tr.predicate.as_str().len())
+                    as u64
+                    + term_bytes(&tr.object)
+            }
+        }
+    }
+    let slots = std::mem::size_of_val(row) as u64;
+    slots.saturating_add(row.iter().flatten().map(term_bytes).sum())
+}
+
+/// Consolidate `c` while pre-admitting the intermediate `ZSet` and compacted output
+/// buffer, and reconcile `out_lease` to the returned `Changes` vector's exact size.
+pub(crate) fn consolidate_budgeted(
+    c: Changes,
+    width: usize,
+    budget: Option<super::budget::BudgetHandle>,
+    out_lease: &mut super::budget::ScratchLease,
+) -> Result<Changes> {
+    let slot = std::mem::size_of::<(Row, i64)>() as u64;
+    let row = (width as u64) * 8;
+    let mut c = c;
+    if c.len() <= 1 {
+        c.retain(|(_, w)| *w != 0);
+        if c.is_empty() {
+            drop(c);
+            out_lease.release(out_lease.bytes());
+            return Ok(Changes::new());
+        }
+        out_lease.try_set(c.capacity() as u64 * slot + row)?;
+        return Ok(c);
+    }
+
+    out_lease.try_set(c.capacity() as u64 * slot + c.len() as u64 * row)?;
+    let mut map_lease = super::budget::ScratchLease::new(budget);
+    let mut z = ZSet::new();
+    let mut map_slots = 0u64;
+    for (r, w) in c {
+        if w != 0 && z.get(&r) == 0 {
+            let slots = (z.len() as u64 + 1) * (super::zset::row_bytes(width) - row);
+            if slots > map_slots {
+                map_lease.try_reserve(slots - map_slots)?;
+                map_slots = slots;
+            }
+            out_lease.transfer_to(&mut map_lease, row);
+            z.add(r, w);
+        } else {
+            let (old, new) = z.add(r, w);
+            out_lease.release(row);
+            if old != 0 && new == 0 {
+                map_lease.release(row);
+            }
+        }
+    }
+    // The source vector is consumed. Only new vector slots need admission; the map
+    // moves its existing row payloads into them.
+    out_lease.release(out_lease.bytes());
+    finish_consolidation(z, row, &mut map_lease, out_lease)
+}
+
+fn finish_consolidation(
+    z: ZSet,
+    row_bytes: u64,
+    map_lease: &mut super::budget::ScratchLease,
+    out_lease: &mut super::budget::ScratchLease,
+) -> Result<Changes> {
+    let n = z.len() as u64;
+    out_lease.try_reserve(n * std::mem::size_of::<(Row, i64)>() as u64)?;
+    map_lease.transfer_to(out_lease, n * row_bytes);
+    let out = z.into_changes();
+    Ok(out)
+}
+
+/// Split annotated changes into consolidated `(Changes, w_lease)` and `(AChanges, a_lease)`
+/// without unbudgeted cloning or consolidation.
+fn split_budgeted(
+    c: AChanges,
+    width: usize,
+    budget: Option<super::budget::BudgetHandle>,
+    a_lease: super::budget::ScratchLease,
+) -> Result<(
+    Changes,
+    super::budget::ScratchLease,
+    AChanges,
+    super::budget::ScratchLease,
+)> {
+    let row_sz = (width as u64) * 8;
+    let r_bytes = super::zset::row_bytes(width);
+    let mut map_lease = super::budget::ScratchLease::new(budget.clone());
+    let mut z = ZSet::new();
+    for (r, w, _) in &c {
+        if *w == 0 {
+            continue;
+        }
+        if z.get(r) == 0 {
+            let need = (z.len() as u64 + 1).saturating_mul(r_bytes);
+            if need > map_lease.bytes() {
+                map_lease.try_set(need)?;
+            }
+        }
+        z.add_borrowed(r, *w);
+    }
+    let mut w_lease = super::budget::ScratchLease::new(budget);
+    let out = finish_consolidation(z, row_sz, &mut map_lease, &mut w_lease)?;
+    Ok((out, w_lease, c, a_lease))
 }
 
 impl Circuit {
@@ -317,8 +497,26 @@ impl Circuit {
     /// commit.
     pub fn new(c: Compiled, access: Option<Arc<GraphAccess>>) -> Circuit {
         let access = access.map(|a| a.settled());
+        let template_columns = if let Op::Distinct(distinct) = &c.root.op
+            && let Op::Template(template) = &distinct.inner.op
+            && template.has_blanks()
+        {
+            Some(
+                template
+                    .inner
+                    .schema
+                    .iter()
+                    .map(|&i| c.vars[i as usize].clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
         Circuit {
             kind: c.kind,
+            template_columns,
+            rebuild_patterns: (!c.rebuild_patterns.native.is_empty())
+                .then(|| Arc::new(c.rebuild_patterns)),
             vars: c.vars,
             root: c.root,
             footprint: c.footprint,
@@ -327,6 +525,8 @@ impl Circuit {
             result: ZSet::new(),
             applied: 0,
             snap: None,
+            evidence_key: None,
+            managed_generation: 0,
             access,
             last: PassStats::default(),
             max_memory_bytes: None,
@@ -335,8 +535,10 @@ impl Circuit {
             aggregate_errors: None,
             pattern: c.pattern,
             dataset: c.dataset,
-            inferred: InferredFootprint::default(),
+            schema_resolved: None,
             keep_result: true,
+            version: None,
+            version_pool: None,
             prov: Provenance::None,
             ann: AnnMap::default(),
             facts: FactCache::default(),
@@ -344,7 +546,106 @@ impl Circuit {
             build_scanned: 0,
             #[cfg(test)]
             build_estimated: 0,
+            #[cfg(test)]
+            version_publish_attempts: 0,
+            #[cfg(test)]
+            version_allocs: 0,
+            pool: None,
+            budget: ViewBudget::new(None, None),
         }
+    }
+
+    /// Bind this circuit's accounting to `pool` and `parent` before any state is built.
+    pub fn set_pool(&mut self, pool: Option<Arc<QueryPool>>, parent: Option<ParentHandle>) {
+        self.pool = pool;
+        self.budget.set_parent(parent);
+    }
+
+    /// Set the circuit's local byte limit (`None`: unlimited locally).
+    pub(crate) fn set_local_limit(&mut self, limit: Option<u64>) {
+        self.max_memory_bytes = limit;
+        self.budget.set_local_limit(limit);
+    }
+
+    pub(crate) fn local_limit(&self) -> Option<u64> {
+        self.budget.local_limit()
+    }
+
+    pub(crate) fn budget_handle(&self) -> super::budget::BudgetHandle {
+        self.budget.handle()
+    }
+
+    pub(crate) fn scratch_lease(&self) -> super::budget::ScratchLease {
+        self.budget.scratch_lease()
+    }
+
+    pub(crate) fn detach_scratch_lease(
+        &self,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Option<MemoryLease> {
+        self.budget.detach_scratch_lease(lease)
+    }
+
+    pub(crate) fn set_reclaim_external(&self, hook: Option<super::budget::ReclaimHook>) {
+        self.budget.set_reclaim_external(hook);
+    }
+
+    /// Drain excess [`MemoryLease`]s split during shrinks so the caller can drop them
+    /// outside runtime and cell locks.
+    pub(crate) fn drain_retired(&self) -> Vec<MemoryLease> {
+        self.budget.drain_retired()
+    }
+
+    /// Free all operator, result, term, provenance and snapshot state and detach all
+    /// persistent state credit down to zero (when no external/scratch bytes remain).
+    pub(crate) fn clear_state(&mut self) {
+        self.root.clear();
+        self.result = ZSet::new();
+        self.terms = Terms::default();
+        self.ann = AnnMap::default();
+        self.facts.clear();
+        self.resolved = None;
+        self.schema_resolved = None;
+        self.snap = None;
+        self.version = None;
+        self.budget.clear_state();
+    }
+
+    /// Transfer this circuit's pool and live budget to a replacement circuit during an
+    /// inference switch without a transient 2× reservation peak.
+    pub(crate) fn take_budget(&mut self) -> (Option<Arc<QueryPool>>, ViewBudget) {
+        (self.pool.take(), std::mem::take(&mut self.budget))
+    }
+
+    /// Install a transferred pool and budget onto a fresh replacement circuit.
+    pub(crate) fn install_budget(&mut self, pool: Option<Arc<QueryPool>>, budget: ViewBudget) {
+        self.pool = pool;
+        self.budget = budget;
+        self.budget.set_local_limit(self.max_memory_bytes);
+    }
+
+    /// Reconcile a transferred budget downward after the old circuit's operators were
+    /// detached (caller drops the old circuit strictly before dropping retired leases).
+    pub(crate) fn shrink_budget_state(&self) {
+        self.budget.shrink_state_to(self.bytes());
+    }
+
+    pub(crate) fn try_set_external(&self, bytes: u64) -> Result<()> {
+        self.budget.set_local_limit(self.max_memory_bytes);
+        self.budget.try_set_external(bytes)
+    }
+
+    pub(crate) fn commit_external_from_scratch(
+        &self,
+        bytes: u64,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<()> {
+        self.budget.set_local_limit(self.max_memory_bytes);
+        self.budget.commit_external_from_scratch(bytes, lease)
+    }
+
+    pub(crate) fn set_external_best_effort(&self, bytes: u64) {
+        self.budget.set_external_best_effort(bytes);
     }
 
     /// Keep annotation `mode` from the next build on (spec F13 §5). The circuit must
@@ -541,13 +842,353 @@ impl Circuit {
         self.root.plan(&self.vars)
     }
 
+    /// Approximate retained bytes of the published immutable view version (excluding
+    /// local term key bytes already accounted in [`Terms::bytes`]).
+    pub fn version_bytes(&self) -> u64 {
+        self.version.as_ref().map_or(0, |v| {
+            v.retained_bytes()
+                .saturating_sub(v.terms.key_storage_bytes())
+        })
+    }
+
     /// The approximate memory of the state and the result.
     pub fn bytes(&self) -> u64 {
-        self.root.bytes()
-            + self.result.bytes(self.root.schema.len())
+        self.root.bytes() + self.non_operator_bytes()
+    }
+
+    fn non_operator_bytes(&self) -> u64 {
+        self.result.bytes(self.root.schema.len())
             + self.terms.bytes()
+            + self.version_bytes()
             + prov::map_bytes(&self.ann, self.root.schema.len())
             + self.facts.bytes()
+    }
+
+    fn version_row_count(&self) -> usize {
+        if let Some((w, _)) = self.root.result_window()
+            && w.positions
+        {
+            w.row_count()
+        } else {
+            self.result.len()
+        }
+    }
+
+    /// Projected new allocation bytes needed to publish a [`ViewVersion`] (matching
+    /// [`Self::version_bytes`] for newly allocated pieces), paired with the row count.
+    fn projected_version_alloc_bytes(&self, reuse_terms: bool) -> Result<(usize, u64)> {
+        let overflow = || super::budget::budget_error(sparkles_budget::ParentRefused::Overflow);
+        let row_count = self.version_row_count();
+        let width = self.root.schema.len();
+        let rows_u64 = u64::try_from(row_count).map_err(|_| overflow())?;
+        let width_u64 = u64::try_from(width).map_err(|_| overflow())?;
+        let ids_bytes = rows_u64
+            .checked_mul(width_u64)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<Id>() as u64))
+            .ok_or_else(overflow)?;
+        let weights_bytes = rows_u64
+            .checked_mul(std::mem::size_of::<i64>() as u64)
+            .ok_or_else(overflow)?;
+        let table_bytes = (std::mem::size_of::<ViewTable>() as u64)
+            .checked_add(ids_bytes)
+            .and_then(|n| n.checked_add(weights_bytes))
+            .ok_or_else(overflow)?;
+        let has_pool = self.version_pool.is_some();
+        let table_total = if has_pool {
+            table_bytes.checked_add(16).ok_or_else(overflow)?
+        } else {
+            table_bytes
+        };
+        let cols_bytes = if self.version.is_some() {
+            0
+        } else {
+            let names: u64 = self.root.schema.iter().try_fold(0u64, |acc, &v| {
+                let len = u64::try_from(self.vars[v as usize].len()).map_err(|_| overflow())?;
+                acc.checked_add(len).ok_or_else(overflow)
+            })?;
+            let slots = width_u64
+                .checked_mul(std::mem::size_of::<String>() as u64)
+                .ok_or_else(overflow)?;
+            let base = slots.checked_add(names).ok_or_else(overflow)?;
+            if has_pool {
+                base.checked_add((32 + std::mem::size_of::<PublishedBytes>()) as u64)
+                    .ok_or_else(overflow)?
+            } else {
+                base
+            }
+        };
+        let reusing_terms = self
+            .version
+            .as_ref()
+            .is_some_and(|prev| reuse_terms && prev.terms.len() == self.terms.key_count());
+        let terms_bytes = if reusing_terms {
+            0
+        } else {
+            self.terms.projected_frozen_bytes(has_pool)?
+        };
+        let version_hdr = if has_pool {
+            (std::mem::size_of::<ViewVersion>() + 16 + std::mem::size_of::<PublishedBytes>() + 16)
+                as u64
+        } else {
+            (std::mem::size_of::<ViewVersion>() + 64) as u64
+        };
+        let total = version_hdr
+            .checked_add(cols_bytes)
+            .and_then(|n| n.checked_add(terms_bytes))
+            .and_then(|n| n.checked_add(table_total))
+            .ok_or_else(overflow)?;
+        Ok((row_count, total))
+    }
+
+    /// Build a flat immutable [`ViewTable`] from the current result (in window order when
+    /// the query orders it) without materializing temporary window rows.
+    fn build_view_table(&self, row_count: usize) -> ViewTable {
+        let width = self.root.schema.len();
+        let mut ids = Vec::with_capacity(row_count * width);
+        let mut weights = Vec::with_capacity(row_count);
+        let mut total_rows = 0u64;
+        if let Some((w, cols)) = self.root.result_window()
+            && w.positions
+        {
+            let _ = w.for_each_row(
+                |r, n| -> std::result::Result<(), std::convert::Infallible> {
+                    if n > 0 {
+                        match cols {
+                            None => ids.extend_from_slice(r),
+                            Some(cols) => {
+                                ids.extend(cols.iter().map(|c| c.map_or(Id::UNDEF, |i| r[i])));
+                            }
+                        }
+                        weights.push(n);
+                        total_rows = total_rows.saturating_add(n as u64);
+                    }
+                    Ok(())
+                },
+            );
+            return ViewTable {
+                width,
+                ids,
+                weights,
+                total_rows,
+                published: None,
+            };
+        }
+        for (r, w) in self.result.iter() {
+            if w > 0 {
+                ids.extend_from_slice(r);
+                weights.push(w);
+                total_rows = total_rows.saturating_add(w as u64);
+            }
+        }
+        ViewTable {
+            width,
+            ids,
+            weights,
+            total_rows,
+            published: None,
+        }
+    }
+
+    fn publish_fresh_version(&mut self) {
+        self.publish_version(false);
+    }
+
+    fn publish_fresh_version_budgeted(&mut self) -> Result<()> {
+        self.publish_version_budgeted(false)
+    }
+
+    fn publish_updated_version_budgeted(&mut self, remapped: bool) -> Result<()> {
+        self.publish_version_budgeted(!remapped)
+    }
+
+    fn publish_version_budgeted(&mut self, reuse_terms: bool) -> Result<()> {
+        if !self.keep_result || self.snap.is_none() {
+            self.version = None;
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            self.version_publish_attempts += 1;
+        }
+        let (row_count, alloc_bytes) = self.projected_version_alloc_bytes(reuse_terms)?;
+        let target = self
+            .bytes()
+            .checked_add(alloc_bytes)
+            .ok_or_else(|| super::budget::budget_error(sparkles_budget::ParentRefused::Overflow))?;
+        self.budget.try_reserve_pass_to_cover(target)?;
+        self.publish_version_with_rows(reuse_terms, row_count);
+        Ok(())
+    }
+
+    fn publish_version(&mut self, reuse_terms: bool) {
+        let row_count = self.version_row_count();
+        self.publish_version_with_rows(reuse_terms, row_count);
+    }
+
+    fn publish_version_with_rows(&mut self, reuse_terms: bool, row_count: usize) {
+        let Some(snap) = self.snap.clone().filter(|_| self.keep_result) else {
+            self.version = None;
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.version_allocs += 1;
+        }
+        let pool = self.version_pool.as_ref();
+        let (columns, published_columns) = if let Some(prev) = &self.version {
+            (prev.columns.clone(), prev.published_columns.clone())
+        } else {
+            let columns: Arc<[String]> = Arc::from_iter(
+                self.root
+                    .schema
+                    .iter()
+                    .map(|&v| self.vars[v as usize].clone()),
+            );
+            let bytes = columns.len() * std::mem::size_of::<String>()
+                + columns.iter().map(String::capacity).sum::<usize>()
+                + 32
+                + std::mem::size_of::<PublishedBytes>();
+            (
+                columns,
+                pool.map(|p| Arc::new(PublishedBytes::new(p, bytes as u64))),
+            )
+        };
+        let terms = match self.version.as_ref() {
+            Some(prev) if reuse_terms && prev.terms.len() == self.terms.key_count() => {
+                prev.terms.clone()
+            }
+            _ => {
+                let mut terms = self.terms.snapshot_in(pool);
+                terms.published = pool.map(|p| PublishedBytes::new(p, terms.table_bytes() + 16));
+                Arc::new(terms)
+            }
+        };
+        let mut table = self.build_view_table(row_count);
+        table.published = pool.map(|p| PublishedBytes::new(p, table.retained_bytes() + 16));
+        let published = self.version_charge();
+        self.version = Some(Arc::new(ViewVersion {
+            columns,
+            commit: self.applied,
+            snap,
+            terms,
+            table: Arc::new(table),
+            evaluated_under: None,
+            published,
+            published_columns,
+        }));
+    }
+
+    fn version_charge(&self) -> Option<Arc<PublishedBytes>> {
+        self.version_pool.as_ref().map(|p| {
+            Arc::new(PublishedBytes::new(
+                p,
+                (std::mem::size_of::<ViewVersion>()
+                    + 16
+                    + std::mem::size_of::<PublishedBytes>()
+                    + 16) as u64,
+            ))
+        })
+    }
+
+    pub(crate) fn set_version_pool(&mut self, pool: Option<Arc<AtomicU64>>) {
+        self.version_pool = pool;
+        self.version = None;
+        if self.version_pool.is_some() && self.snap.is_some() {
+            self.publish_fresh_version();
+        }
+    }
+
+    /// Advance the version's commit and snapshot without copying rows or terms,
+    /// pre-admitting any newly allocated version state against `self.budget`.
+    fn bump_version_budgeted(&mut self, commit: u64, snap: Arc<Snapshot>) -> Result<()> {
+        if !self.keep_result {
+            self.version = None;
+            return Ok(());
+        }
+        if let Some(prev) = self.version.as_ref() {
+            let hdr = if self.version_pool.is_some() {
+                (std::mem::size_of::<ViewVersion>()
+                    + 16
+                    + std::mem::size_of::<PublishedBytes>()
+                    + 16) as u64
+            } else {
+                (std::mem::size_of::<ViewVersion>() + 64) as u64
+            };
+            let target = self.bytes().checked_add(hdr).ok_or_else(|| {
+                super::budget::budget_error(sparkles_budget::ParentRefused::Overflow)
+            })?;
+            self.budget.try_reserve_pass_to_cover(target)?;
+            let mut version = (**prev).clone();
+            version.commit = commit;
+            version.snap = snap;
+            version.published = self.version_charge();
+            self.version = Some(Arc::new(version));
+            Ok(())
+        } else {
+            self.publish_fresh_version_budgeted()
+        }
+    }
+
+    /// Advance the version's commit and snapshot without copying rows or terms.
+    fn bump_version(&mut self, commit: u64, snap: Arc<Snapshot>) {
+        if !self.keep_result {
+            self.version = None;
+            return;
+        }
+        if let Some(prev) = self.version.as_ref() {
+            let mut version = (**prev).clone();
+            version.commit = commit;
+            version.snap = snap;
+            version.published = self.version_charge();
+            self.version = Some(Arc::new(version));
+        } else {
+            self.publish_fresh_version();
+        }
+    }
+
+    /// Update the published commit after checkpoint recovery.
+    pub(crate) fn set_applied(&mut self, commit: u64) {
+        self.applied = commit;
+        if let Some(snap) = &self.snap
+            && self
+                .version
+                .as_ref()
+                .is_none_or(|version| version.commit != commit)
+        {
+            self.bump_version(commit, snap.clone());
+        }
+    }
+
+    /// Active support-aware evidence visibility key when this circuit was last evaluated.
+    pub(crate) fn evidence_key(&self) -> Option<&str> {
+        self.evidence_key.as_deref()
+    }
+
+    /// Managed publication generation when this circuit was last evaluated.
+    pub(crate) fn managed_generation(&self) -> u64 {
+        self.managed_generation
+    }
+
+    /// Coherent `(managed_generation, evidence_key)` stamp from the latest evaluation.
+    pub(crate) fn evidence_stamp(&self) -> super::live::EvidenceStamp {
+        super::live::EvidenceStamp {
+            managed_gen: self.managed_generation,
+            key: self.evidence_key.clone(),
+        }
+    }
+
+    /// Record the evidence stamp restored alongside a recovered checkpoint or rebased result.
+    pub(crate) fn set_evidence_stamp(&mut self, stamp: super::live::EvidenceStamp) {
+        self.managed_generation = stamp.managed_gen;
+        self.evidence_key = stamp.key;
+    }
+
+    /// Move the evidence stamp out alongside a rebased circuit's retained result.
+    pub(crate) fn take_evidence_stamp(&mut self) -> super::live::EvidenceStamp {
+        super::live::EvidenceStamp {
+            managed_gen: std::mem::take(&mut self.managed_generation),
+            key: self.evidence_key.take(),
+        }
     }
 
     fn pass<'a>(
@@ -559,6 +1200,9 @@ impl Circuit {
         vis: &'a Vis,
         control: &'a Control,
     ) -> (Pass<'a>, &'a mut Node) {
+        self.budget.set_local_limit(self.max_memory_bytes);
+        let budget_handle = self.budget.handle();
+        let pool = self.pool.clone();
         let mut p = Pass::new(
             snap,
             old,
@@ -571,6 +1215,8 @@ impl Circuit {
             &self.vars,
         );
         p.max_memory_bytes = self.max_memory_bytes;
+        p.budget = Some(budget_handle);
+        p.pool = pool;
         p.base = self.base.clone();
         p.inference = self.inference.clone();
         if let Some(m) = self.aggregate_errors {
@@ -583,61 +1229,332 @@ impl Circuit {
         (p, &mut self.root)
     }
 
-    /// Run the root's delta, with annotations when the circuit keeps them.
-    fn run_delta(root: &mut Node, p: &mut Pass) -> Result<(Changes, Option<AChanges>)> {
+    /// Run the root's delta, with annotations when the circuit keeps them, pre-admitting
+    /// consolidation and returning leases reconciled to the returned buffers.
+    #[allow(clippy::type_complexity)]
+    fn run_delta(
+        root: &mut Node,
+        p: &mut Pass,
+    ) -> Result<(
+        Changes,
+        super::budget::ScratchLease,
+        Option<(AChanges, super::budget::ScratchLease)>,
+    )> {
+        let width = root.schema.len();
+        let budget = p.budget_handle();
         if p.prov.is_none() {
-            return Ok((consolidate(root.delta(p)?), None));
+            let raw = root.delta(p)?;
+            let mut out_lease = p.take_output_lease();
+            let out = consolidate_budgeted(raw, width, budget, &mut out_lease)?;
+            return Ok((out, out_lease, None));
         }
-        let (w, a) = split(root.delta_a(p)?);
-        Ok((w, Some(a)))
+        let raw = root.delta_a(p)?;
+        let raw_lease = p.take_output_lease();
+        let (w, w_lease, a, a_lease) = split_budgeted(raw, width, budget, raw_lease)?;
+        Ok((w, w_lease, Some((a, a_lease))))
     }
 
-    /// Add the annotations' changes to the result's.
-    fn absorb(&mut self, a: Option<AChanges>) {
+    /// Apply `out` into `self.result` while pre-admitting persistent Z-set growth via
+    /// per-owner `pass_bytes` before cloning new rows.
+    fn apply_result_budgeted(&mut self, out: &Changes) -> Result<()> {
+        if !self.keep_result {
+            return Ok(());
+        }
+        let width = self.root.schema.len();
+        let r_bytes = super::zset::row_bytes(width);
+        let base = self.result.bytes(width);
+        let mut pass_reserved = 0u64;
+        let handle = self.budget.handle();
+        for (r, w) in out {
+            if *w == 0 {
+                continue;
+            }
+            if self.result.get(r) == 0 {
+                let target = (self.result.len() as u64 + 1).saturating_mul(r_bytes);
+                let needed = target.saturating_sub(base);
+                if needed > pass_reserved {
+                    handle.try_reserve_pass(needed - pass_reserved)?;
+                    pass_reserved = needed;
+                }
+            }
+            self.result.add_borrowed(r, *w);
+            let needed = self.result.bytes(width).saturating_sub(base);
+            if needed < pass_reserved {
+                handle.release_pass(pass_reserved - needed);
+                pass_reserved = needed;
+            }
+        }
+        Ok(())
+    }
+
+    /// Move build output rows into `self.result`, transferring moved row payload credit
+    /// from `out_lease` into `pass_bytes` and pre-admitting hash-table slot growth.
+    fn install_build_result_budgeted(
+        &mut self,
+        out: Changes,
+        out_lease: &mut super::budget::ScratchLease,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if !self.keep_result {
+            drop(out);
+            return Ok(());
+        }
+        let width = self.root.schema.len();
+        let r_bytes = super::zset::row_bytes(width);
+        let row_payload = (width as u64) * 8;
+        let handle = self.budget.handle();
+        let mut pass_reserved = 0u64;
+        let mut z = ZSet::new();
+        for (i, (r, w)) in out.into_iter().enumerate() {
+            if i.is_multiple_of(256) {
+                check()?;
+            }
+            if w == 0 {
+                continue;
+            }
+            if z.get(&r) == 0 {
+                let needed = (z.len() as u64 + 1).saturating_mul(r_bytes);
+                if needed > pass_reserved {
+                    let delta = needed - pass_reserved;
+                    let moved = handle.move_scratch_to_pass(out_lease, delta.min(row_payload));
+                    let rem = delta - moved;
+                    if rem > 0 {
+                        handle.try_reserve_pass(rem)?;
+                    }
+                    pass_reserved = needed;
+                }
+            }
+            z.add(r, w);
+            let cur = z.bytes(width);
+            if cur < pass_reserved {
+                handle.release_pass(pass_reserved - cur);
+                pass_reserved = cur;
+            }
+        }
+        check()?;
+        self.result = z;
+        Ok(())
+    }
+
+    /// Add the annotations' changes to the result's, pre-admitting retained annotation
+    /// map growth before mutating `self.ann`.
+    fn absorb_budgeted(&mut self, a: Option<AChanges>) -> Result<()> {
         let Some(a) = a else {
-            return;
+            return Ok(());
         };
         if !self.keep_result {
-            return;
+            return Ok(());
         }
+        let width = self.root.schema.len();
+        let r_bytes = super::zset::row_bytes(width);
+        let base = prov::map_bytes(&self.ann, width);
+        let mut pass_reserved = 0u64;
+        let handle = self.budget.handle();
         for (r, _, d) in a {
-            prov::absorb_row(&mut self.ann, &r, d, self.prov);
+            let extra = d.bytes().saturating_add(if self.ann.contains_key(&r) {
+                0
+            } else {
+                r_bytes
+            });
+            let target = prov::map_bytes(&self.ann, width).saturating_add(extra);
+            let needed = target.saturating_sub(base);
+            if needed > pass_reserved {
+                handle.try_reserve_pass(needed - pass_reserved)?;
+                pass_reserved = needed;
+            }
+            prov::absorb_row_state(&mut self.ann, &r, d, self.prov);
+            let needed = prov::map_bytes(&self.ann, width).saturating_sub(base);
+            if needed < pass_reserved {
+                handle.release_pass(pass_reserved - needed);
+                pass_reserved = needed;
+            }
         }
+        Ok(())
     }
 
     /// Evaluate the circuit from scratch at `snap`.
     pub fn build(&mut self, snap: Arc<Snapshot>, control: &Control) -> Result<()> {
+        self.build_inner(snap, control, None)
+    }
+
+    /// Build a transient circuit for eager row decoding. Only shared views need an
+    /// immutable version, so a fallback keeps the installed result and term dictionary.
+    pub(super) fn build_for_read(
+        &mut self,
+        snap: Arc<Snapshot>,
+        control: &Control,
+        checks: super::pass::BuildChecks<'_>,
+    ) -> Result<()> {
+        self.build_inner(snap, control, Some(checks))
+    }
+
+    fn build_inner(
+        &mut self,
+        snap: Arc<Snapshot>,
+        control: &Control,
+        read_checks: Option<super::pass::BuildChecks<'_>>,
+    ) -> Result<()> {
+        self.clear_moves();
+        self.root.clear();
+        self.result = ZSet::new();
         self.terms = Terms::default();
-        // the schema may have changed in changes no pass saw
-        self.inferred = InferredFootprint::default();
-        let vis = Vis::new(self.access.as_ref(), &snap);
+        self.ann = AnnMap::default();
         self.facts.clear();
-        let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
-        let (out, ann) = if p.prov.is_none() {
-            (root.init(&mut p)?, None)
+        self.version = None;
+        // the schema may have changed in changes no pass saw
+        self.resolved = None;
+        self.schema_resolved = None;
+        self.budget.shrink_state_to(0);
+        // An accumulator over stateless operators keeps neither result rows nor
+        // operator state, so building it needs no full scan of the store.
+        if !self.keep_result && self.prov.is_none() && self.root.is_stateless() {
+            if let Err(e) = control.check() {
+                self.clear_state();
+                return Err(e);
+            }
+            if self.access.as_ref().is_some_and(|a| !a.reads_everything()) {
+                (self.managed_generation, self.evidence_key) = snap.evidence_visibility_stamp();
+            }
+            self.applied = snap.commit;
+            self.snap = Some(snap);
+            self.last = PassStats::default();
+            return Ok(());
+        }
+        // Freeze the live evidence configuration and its managed generation once before
+        // deciding whether to mask so `evidence_key`, `managed_generation`, and every
+        // downstream evaluation (including `Pass::ctx` expression masking and
+        // `Pass::evaluate` recomputes on the no-policy path) observe the exact same
+        // `ManagedVersion`. Unrestricted circuits skip pinning so they add zero overhead.
+        // Keep the original unpinned `snap` in `self.snap` for subsequent drift detection.
+        let mut _prepared_mask: Option<crate::access::PreparedView> = None;
+        let (ev_gen, ev_key, eval_snap) =
+            match self.access.as_ref().filter(|a| !a.reads_everything()) {
+                Some(a) => {
+                    let frozen_snap = snap.pin_live_evidence();
+                    let ev_gen = frozen_snap.managed_generation();
+                    let ev_key = frozen_snap.evidence_visibility_key();
+                    let eval_snap = if frozen_snap.has_evidence_projection_or_unavailable() {
+                        self.budget.set_local_limit(self.max_memory_bytes);
+                        let local_limit = self
+                            .budget
+                            .handle()
+                            .remaining_local()
+                            .or(self.max_memory_bytes)
+                            .unwrap_or(u64::MAX);
+                        let (parent, grant) = self
+                            .budget
+                            .handle()
+                            .preparation_parent(self.pool.as_ref())?;
+                        let prep = crate::access::Preparation::with_parent(
+                            control.clone(),
+                            local_limit,
+                            parent,
+                            grant,
+                        )?;
+                        let prep = if let Some(checks) = read_checks {
+                            (checks.check)()?;
+                            prep.with_query_controls(
+                                None,
+                                Some(checks.cancellation.clone()),
+                                control.deadline,
+                            )?
+                        } else {
+                            prep
+                        };
+                        let prepared = a.masked_controlled(&frozen_snap, &prep)?;
+                        let masked = prepared.snapshot_arc();
+                        _prepared_mask = Some(prepared);
+                        masked
+                    } else {
+                        frozen_snap
+                    };
+                    (ev_gen, ev_key, eval_snap)
+                }
+                None => (0, None, snap.clone()),
+            };
+        #[cfg(test)]
+        circuit_test_hook(CircuitTestPhase::AfterBuildSample);
+        let vis = Vis::new(self.access.as_ref(), &eval_snap);
+        let (mut p, root) = self.pass(eval_snap, None, &[], &[], &vis, control);
+        p.build_checks = read_checks;
+        let width = root.schema.len();
+        let budget = p.budget_handle();
+        let res = if p.prov.is_none() {
+            root.init(&mut p).map(|out| {
+                let out_lease = p.take_output_lease();
+                (out, out_lease, None)
+            })
         } else {
-            let (w, a) = split(root.init_a(&mut p)?);
-            (w, Some(a))
+            root.init_a(&mut p).and_then(|a| {
+                let raw_lease = p.take_output_lease();
+                let (w, w_lease, a, a_lease) = split_budgeted(a, width, budget, raw_lease)?;
+                Ok((w, w_lease, Some((a, a_lease))))
+            })
         };
         let stats = p.stats;
         #[cfg(test)]
         let (scanned, estimated) = (p.scanned.get(), p.estimated.get());
         drop(p);
+        drop(_prepared_mask);
+        let (out, mut out_lease, ann) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                self.clear_state();
+                return Err(e);
+            }
+        };
         #[cfg(test)]
         {
             self.build_scanned = scanned;
             self.build_estimated = estimated;
         }
-        self.result = if self.keep_result {
-            out.into_iter().collect()
-        } else {
-            ZSet::new()
+        let mut check = || {
+            if let Some(checks) = read_checks {
+                control.check()?;
+                (checks.check)()?;
+            }
+            Ok(())
         };
+        if let Err(e) = self.install_build_result_budgeted(out, &mut out_lease, &mut check) {
+            drop(ann);
+            self.clear_state();
+            drop(out_lease);
+            return Err(e);
+        }
+        // `out` has been consumed and dropped by `install_build_result_budgeted`.
+        drop(out_lease);
         self.ann.clear();
-        self.absorb(ann);
+        if let Some((a, a_lease)) = ann {
+            let res = self.absorb_budgeted(Some(a));
+            drop(a_lease);
+            if let Err(e) = res {
+                self.clear_state();
+                return Err(e);
+            }
+        }
+        let prev_applied = self.applied;
         self.applied = snap.commit;
         self.snap = Some(snap);
+        self.evidence_key = ev_key;
+        self.managed_generation = ev_gen;
         self.last = stats;
+        let finish = (|| {
+            let bytes = if read_checks.is_some() {
+                check()?;
+                let bytes = self.root.bytes_checked(&mut check)? + self.non_operator_bytes();
+                check()?;
+                bytes
+            } else {
+                self.publish_fresh_version_budgeted()?;
+                self.bytes()
+            };
+            self.budget.commit_pass(bytes)
+        })();
+        if let Err(e) = finish {
+            self.applied = prev_applied;
+            self.clear_state();
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -661,32 +1578,83 @@ impl Circuit {
 
     /// Load a state written by [`encode`](Self::encode) into the id space of `snap`.
     pub fn decode(&mut self, body: &[u8], snap: &Arc<Snapshot>) -> Result<()> {
-        let mut terms = Terms::default();
-        let mut r = Reader::new(body, snap, &mut terms)?;
-        self.result = r.zset()?;
-        self.root.load(&mut r)?;
-        if !self.prov.is_none() {
-            self.ann = prov::load_map(&mut r, self.prov)?;
-        }
-        // ids change with the id space
+        self.budget.set_local_limit(self.max_memory_bytes);
+        let mut body_lease = self.budget.scratch_lease();
+        body_lease.try_reserve(body.len() as u64)?;
+        let res = self.decode_with_input_charged(body, snap);
+        drop(body_lease);
+        res
+    }
+
+    /// Like [`decode`](Self::decode), when the caller already holds a [`ScratchLease`]
+    /// covering `body` for its lifetime (such as a pre-admitted checkpoint file buffer).
+    pub(crate) fn decode_with_input_charged(
+        &mut self,
+        body: &[u8],
+        snap: &Arc<Snapshot>,
+    ) -> Result<()> {
+        self.budget.set_local_limit(self.max_memory_bytes);
+        self.root.clear();
+        self.result = ZSet::new();
+        self.terms = Terms::default();
+        self.ann = AnnMap::default();
         self.facts.clear();
-        if !r.done() {
-            return Err(Error::Corrupt("a view's state has trailing bytes".into()));
+        self.version = None;
+        self.budget.shrink_state_to(0);
+        let budget_handle = self.budget.handle();
+        let decoded = (|| {
+            let mut terms = Terms::default();
+            let mut r = Reader::with_budget(body, snap, &mut terms, Some(budget_handle))?;
+            self.result = r.zset()?;
+            self.root.load(&mut r)?;
+            if !self.prov.is_none() {
+                self.ann = prov::load_map(&mut r, self.prov)?;
+            }
+            // ids change with the id space
+            self.facts.clear();
+            if !r.done() {
+                return Err(Error::Corrupt("a view's state has trailing bytes".into()));
+            }
+            self.terms = terms;
+            Ok(())
+        })();
+        if let Err(e) = decoded {
+            self.clear_state();
+            return Err(e);
         }
-        self.terms = terms;
         self.snap = Some(snap.clone());
         self.resolved = None;
-        self.inferred = InferredFootprint::default();
+        self.schema_resolved = None;
+        if let Err(e) = self.publish_fresh_version_budgeted() {
+            self.clear_state();
+            return Err(e);
+        }
+        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+            self.clear_state();
+            return Err(e);
+        }
         Ok(())
     }
 
     /// Evaluate again at `d.snapshot` and return the change of the result.
     pub fn reset(&mut self, d: &DeltaSet, control: &Control) -> Result<Changes> {
+        let (diff, lease) = self.reset_charged(d, control)?;
+        drop(lease);
+        Ok(diff)
+    }
+
+    /// Like [`reset`](Self::reset), returning the [`ScratchLease`] covering the diff
+    /// vector so the caller keeps it charged while consuming it.
+    pub(crate) fn reset_charged(
+        &mut self,
+        d: &DeltaSet,
+        control: &Control,
+    ) -> Result<(Changes, super::budget::ScratchLease)> {
         let snap = d.snapshot.clone();
         if !self.keep_result {
             // no result to compare with: the change is not known
             self.build(snap, control)?;
-            return Ok(Vec::new());
+            return Ok((Vec::new(), self.budget.scratch_lease()));
         }
         // the old result in the new id space, to compare with
         if let Some(prev) = self.snap.clone()
@@ -694,85 +1662,348 @@ impl Circuit {
         {
             self.remap(&prev, &snap)?;
         }
+        self.budget.set_local_limit(self.max_memory_bytes);
+        let width = self.root.schema.len();
+        let before_bytes = self.result.bytes(width).saturating_add(self.terms.bytes());
+        // Declare `before_lease` before `before` and `old_terms` so Rust drops payloads
+        // strictly before releasing their scratch credit on every exit path.
+        let before_lease = self.budget.move_state_to_scratch(before_bytes)?;
         let before = std::mem::take(&mut self.result);
-        let old_terms = self.terms.clone();
+        let old_terms = std::mem::take(&mut self.terms);
         self.build(snap.clone(), control)?;
-        // local ids of the old result must mean what the new ones mean
-        let mut before_keys: ZSet = ZSet::new();
-        for (r, w) in before.iter() {
-            let row: Row = r
-                .iter()
-                .map(|&i| {
-                    if i.tag() == crate::id::Tag::Local {
-                        old_terms
-                            .term(&snap, i)
-                            .map_or(Id::UNDEF, |t| self.terms.intern(&snap, &t))
-                    } else {
-                        i
-                    }
-                })
-                .collect();
-            before_keys.add(row, w);
+        let mut diff_lease = self.budget.scratch_lease();
+        let diff = if old_terms.is_empty() {
+            let diff = Self::minus_budgeted(&self.result, &before, width, &mut diff_lease)?;
+            drop(old_terms);
+            drop(before);
+            drop(before_lease);
+            diff
+        } else {
+            // local ids of the old result must mean what the new ones mean
+            let mut remapped_lease = self.budget.scratch_lease();
+            let mut before_keys = ZSet::new();
+            for (idx, (r, w)) in before.iter().enumerate() {
+                let row: Row = r
+                    .iter()
+                    .map(|&i| {
+                        if i.tag() == crate::id::Tag::Local {
+                            old_terms
+                                .term(&snap, i)
+                                .map_or(Id::UNDEF, |t| self.terms.intern(&snap, &t))
+                        } else {
+                            i
+                        }
+                    })
+                    .collect();
+                let next_bytes =
+                    (before_keys.len() as u64 + 1).saturating_mul(super::zset::row_bytes(width));
+                if next_bytes > remapped_lease.bytes() {
+                    remapped_lease.try_set(next_bytes)?;
+                }
+                before_keys.add(row, w);
+                if idx % 1024 == 1023 {
+                    self.budget.try_set_state(self.bytes())?;
+                }
+            }
+            self.budget.try_set_state(self.bytes())?;
+            drop(old_terms);
+            drop(before);
+            drop(before_lease);
+            let diff = Self::minus_budgeted(&self.result, &before_keys, width, &mut diff_lease)?;
+            drop(before_keys);
+            drop(remapped_lease);
+            diff
+        };
+        if let Err(e) = self.budget.try_set_state(self.bytes()) {
+            drop(diff);
+            drop(diff_lease);
+            return Err(e);
         }
-        Ok(self.result.minus(&before_keys))
+        Ok((diff, diff_lease))
+    }
+
+    fn minus_budgeted(
+        now: &ZSet,
+        before: &ZSet,
+        width: usize,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<Changes> {
+        let mut out = Changes::new();
+        let row_sz = (width as u64) * 8;
+        let slot_sz = std::mem::size_of::<(Row, i64)>() as u64;
+        let mut push = |out: &mut Changes, row: &Row, w: i64| -> Result<()> {
+            let next_cap = sparkles_budget::sizes::vec_grown(
+                out.capacity(),
+                out.len(),
+                1,
+                std::mem::size_of::<(Row, i64)>(),
+            );
+            let need = (next_cap as u64)
+                .saturating_mul(slot_sz)
+                .saturating_add((out.len() as u64 + 1).saturating_mul(row_sz));
+            if need > lease.bytes() {
+                lease.try_set(need)?;
+            }
+            out.push((row.clone(), w));
+            Ok(())
+        };
+        for (r, w) in now.iter() {
+            let d = w - before.get(r);
+            if d != 0 {
+                push(&mut out, r, d)?;
+            }
+        }
+        for (r, w) in before.iter() {
+            if now.get(r) == 0 {
+                push(&mut out, r, -w)?;
+            }
+        }
+        Ok(out)
     }
 
     /// Apply the net changes `d` (whose `after` must be the circuit's commit).
     pub fn advance(&mut self, d: &DeltaSet, control: &Control) -> Result<Advance> {
+        match self.advance_charged(d, control)? {
+            ChargedAdvance::Skipped => Ok(Advance::Skipped),
+            ChargedAdvance::Changed(out, lease) => {
+                drop(lease);
+                Ok(Advance::Changed(out))
+            }
+            ChargedAdvance::Reset(out, lease) => {
+                drop(lease);
+                Ok(Advance::Reset(out))
+            }
+        }
+    }
+
+    /// Apply the output of a delta pass to persistent result and annotation state while
+    /// pre-admitting growth and keeping `out_lease` attached to the returned `Changes`.
+    #[allow(clippy::type_complexity)]
+    fn finish_delta_pass(
+        &mut self,
+        res: Result<(
+            Changes,
+            super::budget::ScratchLease,
+            Option<(AChanges, super::budget::ScratchLease)>,
+        )>,
+        snap: Arc<Snapshot>,
+        stats: PassStats,
+        remapped: bool,
+    ) -> Result<ChargedAdvance> {
+        let (out, out_lease, ann) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                self.budget.abort_pass(self.bytes());
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.apply_result_budgeted(&out) {
+            drop(ann);
+            drop(out);
+            drop(out_lease);
+            self.budget.abort_pass(self.bytes());
+            return Err(e);
+        }
+        if let Some((a, a_lease)) = ann {
+            let res = self.absorb_budgeted(Some(a));
+            drop(a_lease);
+            if let Err(e) = res {
+                drop(out);
+                drop(out_lease);
+                self.budget.abort_pass(self.bytes());
+                return Err(e);
+            }
+        }
+        let prev_applied = self.applied;
+        let prev_snap = self.snap.clone();
+        let prev_last = self.last;
+        let commit = snap.commit;
+        self.applied = commit;
+        self.snap = Some(snap.clone());
+        self.last = stats;
+        let published = if out.is_empty() && !remapped && !self.ordered() {
+            self.bump_version_budgeted(commit, snap)
+        } else {
+            self.publish_updated_version_budgeted(remapped)
+        };
+        if let Err(e) = published {
+            self.applied = prev_applied;
+            self.snap = prev_snap;
+            self.last = prev_last;
+            drop(out);
+            drop(out_lease);
+            self.budget.abort_pass(self.bytes());
+            return Err(e);
+        }
+        // Keep `out_lease` intact while `out` is returned to the caller.
+        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+            drop(out);
+            drop(out_lease);
+            self.budget.abort_pass(self.bytes());
+            return Err(e);
+        }
+        Ok(ChargedAdvance::Changed(out, out_lease))
+    }
+
+    fn support_gated_footprint(&self, snap: &Snapshot) -> bool {
+        use crate::access::triples::evidence::EvidenceConfig;
+
+        let cfg = match snap.evidence_projection_config() {
+            EvidenceConfig::Active(cfg) => cfg,
+            EvidenceConfig::Unavailable(_) => return true,
+            EvidenceConfig::None => return false,
+        };
+        let access = self.access.as_ref().expect("restricted circuit");
+        let union = snap.union_default_graph
+            || self
+                .snap
+                .as_ref()
+                .is_some_and(|prev| prev.union_default_graph);
+        cfg.settings.policies.values().any(|policy| {
+            access.read.allows_named_iri(&policy.output)
+                && (self.footprint.all
+                    || self.footprint.entries.iter().any(|entry| match &entry.g {
+                        FGraph::Any | FGraph::Named => true,
+                        FGraph::Default => union,
+                        FGraph::Graph(Term::NamedNode(graph)) => graph.as_str() == policy.output,
+                        FGraph::Graph(_) => false,
+                    }))
+        })
+    }
+
+    /// Like [`advance`](Self::advance), keeping the returned [`Changes`] vector covered
+    /// by its [`ScratchLease`] until the caller finishes consuming and drops it.
+    pub(crate) fn advance_charged(
+        &mut self,
+        d: &DeltaSet,
+        control: &Control,
+    ) -> Result<ChargedAdvance> {
+        self.clear_moves();
         let snap = d.snapshot.clone();
         if !d.complete {
-            return Ok(Advance::Reset(self.reset(d, control)?));
+            let (diff, lease) = self.reset_charged(d, control)?;
+            return Ok(ChargedAdvance::Reset(diff, lease));
         }
+        let mut remapped = false;
         if let Some(prev) = self.snap.clone() {
             if prev.generation.uid != snap.generation.uid {
                 self.remap(&prev, &snap)?;
+                remapped = true;
             } else if snap.dvocab_len > prev.dvocab_len
                 && !self.terms.absorbed(&snap, prev.dvocab_len).is_empty()
             {
                 // the store now holds terms the circuit kept as local ids
                 self.remap(&prev, &snap)?;
+                remapped = true;
             }
         }
-        let vis = Vis::new(self.access.as_ref(), &snap);
+        let ev_restricted = self.access.as_ref().is_some_and(|a| !a.reads_everything());
+        let (mut eval_snap, new_gen, new_ev_key) = if ev_restricted {
+            let frozen = snap.pin_live_evidence();
+            let new_gen = frozen.managed_generation();
+            let new_ev_key = frozen.evidence_visibility_key();
+            (frozen, new_gen, new_ev_key)
+        } else {
+            (snap.clone(), 0, None)
+        };
+        let whole = super::runtime::whole_reason(self.access.as_ref()).is_some();
+        // With an unchanged evidence configuration, a stateless accumulator can
+        // count deltas when its footprint excludes policy outputs. A change to the managed stamp
+        // still requires rebuilding, including when an output was just unprotected.
+        let stamp_changed = self.evidence_key != new_ev_key || self.managed_generation != new_gen;
+        let needs_masked_reset = new_ev_key.is_some()
+            && (self.keep_result
+                || !self.prov.is_none()
+                || !self.root.is_stateless()
+                || whole
+                || self.inference.is_some()
+                || self.support_gated_footprint(&eval_snap));
+        if ev_restricted && (stamp_changed || needs_masked_reset) {
+            let (diff, lease) = self.reset_charged(d, control)?;
+            return Ok(ChargedAdvance::Reset(diff, lease));
+        }
+        if new_ev_key.is_some() {
+            // Only this pass has proved its footprint cannot read the policy output.
+            // Expression contexts can then use the ordinary mask without reading it.
+            Arc::make_mut(&mut eval_snap).pinned_evidence =
+                Some(crate::access::triples::evidence::EvidenceConfig::None);
+        }
+        #[cfg(test)]
+        circuit_test_hook(CircuitTestPhase::AfterAdvanceSample);
+        let vis = Vis::new(self.access.as_ref(), &eval_snap);
         // protections that depend on the data make the whole query one `recompute`
         // node, and a change anywhere, even in a graph the principal cannot read, can
         // change what they hide: every change runs the pass. Inference makes the whole
         // query one `recompute` node too, which runs when the changes touch its
         // footprint over the inferred data.
-        let whole = super::runtime::whole_reason(self.access.as_ref()).is_some();
         if whole || self.inference.is_some() {
             let skip = match &self.inference {
-                Some(inf) if !whole => !self.inferred.touches(
-                    inf,
-                    &self.pattern,
-                    self.dataset.is_some(),
-                    &snap,
-                    &d.added,
-                    &d.removed,
-                    &vis,
-                )?,
-                _ => d.added.is_empty() && d.removed.is_empty(),
+                Some(inf) if !whole => {
+                    if d.added.is_empty() && d.removed.is_empty() {
+                        true
+                    } else {
+                        if !self
+                            .schema_resolved
+                            .as_ref()
+                            .is_some_and(|r| r.current(&snap))
+                        {
+                            self.schema_resolved = Some(inf.schema_footprint().resolve(&snap));
+                        }
+                        let schema = self.schema_resolved.as_ref().expect("resolved above");
+                        if schema.touches(d.added.iter().chain(d.removed.iter())) {
+                            // the schema the data's footprint was read with is gone
+                            self.resolved = None;
+                            false
+                        } else if self.dataset.is_some() {
+                            false
+                        } else {
+                            if !self.resolved.as_ref().is_some_and(|r| r.current(&snap)) {
+                                // no schema change: the schema at `snap` is the one before
+                                // the changes
+                                self.resolved = Some(
+                                    inf.data_footprint(&self.pattern, false, &snap)?
+                                        .resolve(&snap),
+                                );
+                            }
+                            let data = self.resolved.as_ref().expect("resolved above");
+                            !data.touches(
+                                d.added
+                                    .iter()
+                                    .chain(d.removed.iter())
+                                    .filter(|q| vis.visible(&eval_snap, q)),
+                            )
+                        }
+                    }
+                }
+                _ => {
+                    d.added.is_empty()
+                        && d.removed.is_empty()
+                        && self.evidence_key == new_ev_key
+                        && (!ev_restricted || self.managed_generation == new_gen)
+                }
             };
             if skip {
-                self.applied = snap.commit;
-                self.snap = Some(snap);
-                return Ok(Advance::Skipped);
+                let commit = snap.commit;
+                self.applied = commit;
+                self.snap = Some(snap.clone());
+                if remapped {
+                    self.set_applied(commit);
+                } else {
+                    self.bump_version(commit, snap);
+                }
+                return Ok(ChargedAdvance::Skipped);
             }
             let old = d.old()?;
             let (mut p, root) =
-                self.pass(snap.clone(), Some(old), &d.added, &d.removed, &vis, control);
+                self.pass(eval_snap, Some(old), &d.added, &d.removed, &vis, control);
             p.full = true;
-            let (out, ann) = Self::run_delta(root, &mut p)?;
+            let res = Self::run_delta(root, &mut p);
             let stats = p.stats;
             drop(p);
-            if self.keep_result {
-                self.result.apply(&out);
-            }
-            self.absorb(ann);
-            self.applied = snap.commit;
-            self.snap = Some(snap);
-            self.last = stats;
-            return Ok(Advance::Changed(out));
+            let out = self.finish_delta_pass(res, snap, stats, remapped)?;
+            self.evidence_key = new_ev_key;
+            self.managed_generation = new_gen;
+            return Ok(out);
         }
         let (added, removed): (Vec<[Id; 4]>, Vec<[Id; 4]>) = if vis.everything() {
             (d.added.clone(), d.removed.clone())
@@ -780,12 +2011,12 @@ impl Circuit {
             (
                 d.added
                     .iter()
-                    .filter(|q| vis.visible(&snap, q))
+                    .filter(|q| vis.visible(&eval_snap, q))
                     .copied()
                     .collect(),
                 d.removed
                     .iter()
-                    .filter(|q| vis.visible(&snap, q))
+                    .filter(|q| vis.visible(&eval_snap, q))
                     .copied()
                     .collect(),
             )
@@ -799,23 +2030,201 @@ impl Circuit {
             .expect("resolved above")
             .touches(added.iter().chain(removed.iter()));
         if !touched {
-            self.applied = snap.commit;
-            self.snap = Some(snap);
-            return Ok(Advance::Skipped);
+            let commit = snap.commit;
+            self.applied = commit;
+            self.snap = Some(snap.clone());
+            if remapped {
+                self.set_applied(commit);
+            } else {
+                self.bump_version(commit, snap);
+            }
+            return Ok(ChargedAdvance::Skipped);
         }
         let old = d.old()?;
-        let (mut p, root) = self.pass(snap.clone(), Some(old), &added, &removed, &vis, control);
-        let (out, ann) = Self::run_delta(root, &mut p)?;
+        let (mut p, root) = self.pass(eval_snap, Some(old), &added, &removed, &vis, control);
+        let res = Self::run_delta(root, &mut p);
         let stats = p.stats;
         drop(p);
-        if self.keep_result {
-            self.result.apply(&out);
+        self.finish_delta_pass(res, snap, stats, remapped)
+    }
+
+    /// Decode `rows` into terms while charging the decoded copy against this circuit's
+    /// budget, and split out a standalone [`MemoryLease`] so the returned rows stay
+    /// charged after this temporary circuit drops.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn rows_budgeted(
+        &self,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, Option<MemoryLease>)> {
+        let (rows, mut lease) = self.rows_charged_checked(check)?;
+        Ok((rows, self.budget.detach_scratch_lease(&mut lease)))
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn rows_charged(
+        &self,
+    ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, super::budget::ScratchLease)> {
+        self.rows_charged_checked(&|| Ok(()))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn rows_charged_checked(
+        &self,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, super::budget::ScratchLease)> {
+        let mut lease = self.budget.scratch_lease();
+        let Some(snap) = &self.snap else {
+            return Ok((Vec::new(), lease));
+        };
+        let mut out = Vec::new();
+        let mut push_decoded = |cols, row: &Row, w: i64| -> Result<()> {
+            if out.len().is_multiple_of(256) {
+                check()?;
+            }
+            reserve_vec_slot(&out, &mut lease)?;
+            let decoded = self.decode_row_budgeted(snap, cols, row, &mut lease)?;
+            out.push((decoded, w));
+            Ok(())
+        };
+        if let Some((w, cols)) = self.root.result_window()
+            && w.positions
+        {
+            w.for_each_row_checked(check, |row, n| push_decoded(cols, row, n))?;
+        } else {
+            for (row, w) in self.result.iter() {
+                push_decoded(None, row, w)?;
+            }
         }
-        self.absorb(ann);
-        self.applied = snap.commit;
-        self.snap = Some(snap);
-        self.last = stats;
-        Ok(Advance::Changed(out))
+        Ok((out, lease))
+    }
+
+    /// Decode one row after admitting each term's owned representation.
+    pub(crate) fn decode_row_budgeted(
+        &self,
+        snap: &Snapshot,
+        cols: Option<&[Option<usize>]>,
+        row: &Row,
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<Vec<Option<Term>>> {
+        let width = cols.map_or(row.len(), <[_]>::len);
+        lease.try_reserve((width * std::mem::size_of::<Option<Term>>()) as u64)?;
+        let mut out = Vec::with_capacity(width);
+        for col in 0..width {
+            let id = cols
+                .map_or(Some(col), |cols| cols[col])
+                .map_or(Id::UNDEF, |i| row[i]);
+            out.push(self.terms.term_budgeted(snap, id, lease)?);
+        }
+        Ok(out)
+    }
+
+    /// Number of rows in the ordered window, when this circuit is an ordered window.
+    pub(crate) fn ordered_row_count(&self) -> Option<usize> {
+        let (w, _) = self.root.result_window()?;
+        w.positions.then(|| w.row_count())
+    }
+
+    /// Total number of removed + added move runs from the latest ordered-window pass.
+    pub(crate) fn moves_row_count(&self) -> Option<usize> {
+        let (w, _) = self.root.result_window()?;
+        let m = w.moves.as_ref()?;
+        Some(m.removed.len().saturating_add(m.added.len()))
+    }
+
+    /// Decode the circuit's current result into [`super::live::LiveRow`]s incrementally
+    /// under a [`super::budget::ScratchLease`].
+    pub(crate) fn live_rows_budgeted(
+        &self,
+    ) -> Result<(Arc<[super::live::LiveRow]>, super::budget::ScratchLease)> {
+        let mut lease = self.budget.scratch_lease();
+        let Some(snap) = &self.snap else {
+            return Ok((Arc::from(Vec::new()), lease));
+        };
+        let mut out = Vec::new();
+        let ordered = self.ordered();
+        let mut at = 0u64;
+        let mut push_row = |cols, row: &Row, w: i64| -> Result<()> {
+            let position = ordered.then_some(at);
+            let count = w.unsigned_abs();
+            at += count;
+            self.push_live_row(&mut out, (snap, cols, row), (count, position), &mut lease)
+        };
+        if let Some((w, cols)) = self.root.result_window()
+            && w.positions
+        {
+            w.for_each_row(|row, n| push_row(cols, row, n))?;
+        } else {
+            for (row, w) in self.result.iter() {
+                push_row(None, row, w)?;
+            }
+        }
+        Ok((into_arc_rows(out, &mut lease)?, lease))
+    }
+
+    fn push_live_row(
+        &self,
+        out: &mut Vec<super::live::LiveRow>,
+        (snap, cols, row): (&Snapshot, Option<&[Option<usize>]>, &Row),
+        (count, position): (u64, Option<u64>),
+        lease: &mut super::budget::ScratchLease,
+    ) -> Result<()> {
+        reserve_vec_slot(out, lease)?;
+        let terms = self.decode_row_budgeted(snap, cols, row, lease)?;
+        out.push(super::live::LiveRow {
+            terms,
+            count,
+            position,
+        });
+        Ok(())
+    }
+
+    /// Decode the ordered window's latest moves with their positions.
+    pub(crate) fn moves_live_budgeted(&self) -> Result<Option<LiveDiffRows>> {
+        let Some(((window, cols), snap)) = self.root.result_window().zip(self.snap.as_ref()) else {
+            return Ok(None);
+        };
+        let Some(moves) = &window.moves else {
+            return Ok(None);
+        };
+        let mut lease = self.budget.scratch_lease();
+        let (mut removed, mut added) = (Vec::new(), Vec::new());
+        for (out, rows) in [(&mut removed, &moves.removed), (&mut added, &moves.added)] {
+            for (pos, row, count) in rows {
+                self.push_live_row(out, (snap, cols, row), (*count, Some(*pos)), &mut lease)?;
+            }
+        }
+        Self::finish_live_diff(removed, added, lease)
+    }
+
+    /// Decode compact unordered changes into the live event's removed and added rows.
+    pub(crate) fn diff_live_budgeted(&self, c: &Changes) -> Result<Option<LiveDiffRows>> {
+        let Some(snap) = &self.snap else {
+            return Ok(None);
+        };
+        let mut lease = self.budget.scratch_lease();
+        let (mut removed, mut added) = (Vec::new(), Vec::new());
+        for (row, w) in c {
+            let out = match w.cmp(&0) {
+                std::cmp::Ordering::Less => &mut removed,
+                std::cmp::Ordering::Greater => &mut added,
+                std::cmp::Ordering::Equal => continue,
+            };
+            self.push_live_row(out, (snap, None, row), (w.unsigned_abs(), None), &mut lease)?;
+        }
+        Self::finish_live_diff(removed, added, lease)
+    }
+
+    fn finish_live_diff(
+        removed: Vec<super::live::LiveRow>,
+        added: Vec<super::live::LiveRow>,
+        mut lease: super::budget::ScratchLease,
+    ) -> Result<Option<LiveDiffRows>> {
+        if removed.is_empty() && added.is_empty() {
+            return Ok(None);
+        }
+        let removed = into_arc_rows(removed, &mut lease)?;
+        let added = into_arc_rows(added, &mut lease)?;
+        Ok(Some((removed, added, lease)))
     }
 
     /// The terms of rows of the result.
@@ -828,9 +2237,915 @@ impl Circuit {
             .collect()
     }
 
-    /// The whole result as terms.
+    /// The whole result as terms, in the window's order when the query orders it.
     pub fn rows(&self) -> Vec<(Vec<Option<Term>>, i64)> {
+        if let Some(rows) = self.ordered_rows() {
+            return rows;
+        }
         let rows: Vec<(Row, i64)> = self.result.iter().map(|(r, w)| (r.clone(), w)).collect();
         self.decode_rows(&rows)
+    }
+
+    /// Whether the result is an ordered window whose rows have positions (spec F13
+    /// §4.4).
+    pub fn ordered(&self) -> bool {
+        self.root.result_window().is_some_and(|(w, _)| w.positions)
+    }
+
+    fn window_row(cols: Option<&[Option<usize>]>, r: &Row) -> Row {
+        match cols {
+            None => r.clone(),
+            Some(cols) => cols.iter().map(|c| c.map_or(Id::UNDEF, |i| r[i])).collect(),
+        }
+    }
+
+    /// The rows of an ordered window in order, each with its copies.
+    pub fn ordered_rows(&self) -> Option<Vec<(Vec<Option<Term>>, i64)>> {
+        let (w, cols) = self.root.result_window()?;
+        if !w.positions {
+            return None;
+        }
+        let rows: Vec<(Row, i64)> = w
+            .rows()
+            .iter()
+            .map(|(r, n)| (Self::window_row(cols, r), *n))
+            .collect();
+        Some(self.decode_rows(&rows))
+    }
+
+    /// The rows that entered and left an ordered window in the latest pass, each with
+    /// its position and copies: `None` when the pass did not reach the window.
+    #[allow(clippy::type_complexity)]
+    pub fn moves(
+        &self,
+    ) -> Option<(
+        Vec<(u64, Vec<Option<Term>>, u64)>,
+        Vec<(u64, Vec<Option<Term>>, u64)>,
+    )> {
+        let (w, cols) = self.root.result_window()?;
+        let m = w.moves.as_ref()?;
+        let side = |v: &[(u64, Row, u64)]| {
+            let rows: Vec<(Row, i64)> = v
+                .iter()
+                .map(|(_, r, n)| (Self::window_row(cols, r), *n as i64))
+                .collect();
+            self.decode_rows(&rows)
+                .into_iter()
+                .zip(v)
+                .map(|((t, _), (pos, _, n))| (*pos, t, *n))
+                .collect()
+        };
+        Some((side(&m.removed), side(&m.added)))
+    }
+
+    fn clear_moves(&mut self) {
+        let had = self
+            .root
+            .result_window_mut()
+            .and_then(|w| w.moves.take())
+            .is_some();
+        if had {
+            self.budget.shrink_state_to(self.bytes());
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CircuitTestPhase {
+    AfterBuildSample,
+    AfterAdvanceSample,
+}
+
+#[cfg(test)]
+type CircuitTestHookFn = Box<dyn FnMut(CircuitTestPhase) + 'static>;
+
+#[cfg(test)]
+thread_local! {
+    static CIRCUIT_TEST_HOOK: std::cell::RefCell<Option<CircuitTestHookFn>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn circuit_test_hook(phase: CircuitTestPhase) {
+    CIRCUIT_TEST_HOOK.with(|slot| {
+        if let Some(cb) = slot.borrow_mut().as_mut() {
+            cb(phase);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sparql::{QueryOptions, parse_query, update};
+
+    struct CircuitHookGuard;
+
+    impl Drop for CircuitHookGuard {
+        fn drop(&mut self) {
+            CIRCUIT_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+    }
+
+    fn set_circuit_test_hook(cb: impl FnMut(CircuitTestPhase) + 'static) -> CircuitHookGuard {
+        CIRCUIT_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(cb));
+        });
+        CircuitHookGuard
+    }
+
+    fn enable_evidence_policy_for_test(store: &Store, output_iri: &str) {
+        use crate::evidence::{ClaimKind, ConflictMode, Policy, Settings};
+        use crate::managed::{OwnerEntry, OwnerKind};
+
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".to_string()],
+            proposals: vec!["urn:ev:proposals".to_string()],
+            decisions: vec!["urn:ev:decisions".to_string()],
+            supports: vec!["urn:ev:supports".to_string()],
+            projections: vec![output_iri.to_string()],
+            policies: [(
+                "p".to_string(),
+                Policy {
+                    version: 1,
+                    admitted_kinds: vec![ClaimKind::Reported],
+                    required_scope: Vec::new(),
+                    conflicts: ConflictMode::AdmitLabelled,
+                    boundary: vec!["urn:ev:sources".to_string(), "urn:ev:proposals".to_string()],
+                    decisions: "urn:ev:decisions".to_string(),
+                    supports: "urn:ev:supports".to_string(),
+                    output: output_iri.to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&Control::none()).unwrap();
+        let bytes = canonical.bytes().to_vec();
+        store
+            .enable_managed(
+                OwnerKind::Evidence,
+                OwnerEntry::for_settings(1, settings.managed_graphs(), &bytes),
+                &bytes,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn no_policy_circuit_build_and_advance_pin_sampled_evidence_across_expression_and_recompute_evaluation()
+     {
+        use crate::access::triples::{Caller, Limits, Protection, Rule, TripleRules};
+        use crate::access::{GraphAccess, GraphRule, Graphs};
+        use crate::incr::compile::compile;
+
+        const PUBLIC: &str = "urn:public";
+        const OUTPUT: &str = "urn:ev:accepted";
+        let query = format!(
+            "SELECT ?k WHERE {{ \
+                GRAPH <{PUBLIC}> {{ ?k <urn:p> ?v }} \
+                FILTER EXISTS {{ GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve-1> }} }} \
+            }}"
+        );
+        let parsed = parse_query(&query, None, &[]).unwrap();
+
+        // 1. `Circuit::build` on the no-policy fast path: publishing an Evidence policy
+        //    between sampling and `Pass::ctx()` expression evaluation must NOT leak the
+        //    newly published policy into `Pass::ctx` (`GraphAccess::masked`), while
+        //    `circuit.snap` stays unpinned for drift detection.
+        {
+            let store = Arc::new(Store::in_memory(crate::store::StoreOptions::default()));
+            update::update(
+                &store,
+                &format!(
+                    "INSERT DATA {{ \
+                        GRAPH <{PUBLIC}> {{ <urn:k1> <urn:p> 1 }} \
+                        GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve-1> }} \
+                    }}"
+                ),
+                &Default::default(),
+            )
+            .unwrap();
+            let access = Arc::new(GraphAccess::graphs(
+                Graphs::Only(GraphRule::new([PUBLIC, OUTPUT], &[])),
+                Graphs::none(),
+            ));
+            let compiled = compile(&parsed, None).unwrap();
+            let mut circuit = Circuit::new(compiled, Some(access));
+            let s = Arc::clone(&store);
+            let mut fired = false;
+            let _guard = set_circuit_test_hook(move |phase| {
+                if phase == CircuitTestPhase::AfterBuildSample && !fired {
+                    fired = true;
+                    enable_evidence_policy_for_test(&s, OUTPUT);
+                }
+            });
+            circuit.build(store.snapshot(), &Control::none()).unwrap();
+            assert_eq!(
+                circuit.result.total(),
+                1,
+                "build must evaluate FILTER EXISTS under its sampled no-policy state"
+            );
+            assert_eq!(circuit.evidence_key(), None);
+            assert_eq!(circuit.managed_generation(), 0);
+            let stored_snap = circuit.snap.as_ref().expect("stored snapshot");
+            assert!(
+                stored_snap.pinned_evidence.is_none(),
+                "stored circuit snapshot must remain unpinned for live drift detection"
+            );
+            let (live_gen, live_key) = stored_snap.evidence_visibility_stamp();
+            assert!(live_gen > 0 && live_key.is_some());
+        }
+
+        // 2. Incremental `Circuit::advance_charged` on the no-policy fast path: publishing
+        //    an Evidence policy between sampling and `Pass::ctx()` must keep the delta
+        //    pass pinned to the sampled no-policy state and leave `circuit.snap` unpinned.
+        {
+            let store = Arc::new(Store::in_memory(crate::store::StoreOptions::default()));
+            update::update(
+                &store,
+                &format!(
+                    "INSERT DATA {{ \
+                        GRAPH <{PUBLIC}> {{ <urn:k1> <urn:p> 1 }} \
+                        GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve-1> }} \
+                    }}"
+                ),
+                &Default::default(),
+            )
+            .unwrap();
+            let access = Arc::new(GraphAccess::graphs(
+                Graphs::Only(GraphRule::new([PUBLIC, OUTPUT], &[])),
+                Graphs::none(),
+            ));
+            let compiled = compile(&parsed, None).unwrap();
+            let mut circuit = Circuit::new(compiled, Some(access));
+            circuit.build(store.snapshot(), &Control::none()).unwrap();
+            let prev_seq = store.head_commit().seq;
+            assert_eq!(circuit.result.total(), 1);
+
+            update::update(
+                &store,
+                &format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:k2> <urn:p> 2 }} }}"),
+                &Default::default(),
+            )
+            .unwrap();
+            let delta = DeltaSet::read(&store, prev_seq, &Control::none());
+            let s = Arc::clone(&store);
+            let mut fired = false;
+            let _guard = set_circuit_test_hook(move |phase| {
+                if phase == CircuitTestPhase::AfterAdvanceSample && !fired {
+                    fired = true;
+                    enable_evidence_policy_for_test(&s, OUTPUT);
+                }
+            });
+            match circuit.advance(&delta, &Control::none()).unwrap() {
+                Advance::Changed(rows) => assert_eq!(rows.len(), 1),
+                Advance::Skipped => {
+                    panic!("incremental advance must emit Changed, got Skipped")
+                }
+                Advance::Reset(_) => {
+                    panic!("incremental advance must retain sampled no-policy state, got Reset")
+                }
+            }
+            assert_eq!(circuit.result.total(), 2);
+            let stored_snap = circuit.snap.as_ref().expect("stored snapshot");
+            assert!(stored_snap.pinned_evidence.is_none());
+            let (live_gen, live_key) = stored_snap.evidence_visibility_stamp();
+            assert!(live_gen > 0 && live_key.is_some());
+        }
+
+        // 3. Whole-query `Circuit::advance_charged` (`whole == true` via data-dependent
+        //    triple protection): publishing an Evidence policy between sampling and
+        //    `Pass::evaluate()` recompute must retain the sampled no-policy state while
+        //    leaving `circuit.snap` unpinned for drift detection.
+        {
+            let store = Arc::new(Store::in_memory(crate::store::StoreOptions::default()));
+            update::update(
+                &store,
+                &format!(
+                    "INSERT DATA {{ \
+                        GRAPH <{PUBLIC}> {{ <urn:k1> <urn:p> 1 }} \
+                        GRAPH <{OUTPUT}> {{ <urn:release> <urn:affectedBy> <urn:cve-1> }} \
+                    }}"
+                ),
+                &Default::default(),
+            )
+            .unwrap();
+            let access = Arc::new(GraphAccess::with_triples(
+                Graphs::Only(GraphRule::new([PUBLIC, OUTPUT], &[])),
+                Graphs::none(),
+                TripleRules {
+                    rules: vec![Rule {
+                        protection: Arc::new(Protection {
+                            name: "hide-other".into(),
+                            predicates: Some(vec!["urn:other".into()]),
+                            classes: None,
+                            subclasses: false,
+                            graphs: Some(Graphs::Only(GraphRule::new([PUBLIC], &[]))),
+                            pattern: Some("?s <urn:neverMatches> ?o".into()),
+                            prefixes: Default::default(),
+                            hide_inferences: false,
+                        }),
+                        read: Graphs::none(),
+                        write: Graphs::none(),
+                    }],
+                    caller: Caller::default(),
+                    limits: Limits::default(),
+                },
+            ));
+            let whole = super::super::runtime::whole_reason(Some(&access));
+            assert!(whole.is_some());
+            let compiled = compile(&parsed, whole).unwrap();
+            let mut circuit = Circuit::new(compiled, Some(access));
+            circuit.build(store.snapshot(), &Control::none()).unwrap();
+            let prev_seq = store.head_commit().seq;
+            assert_eq!(circuit.result.total(), 1);
+
+            update::update(
+                &store,
+                &format!("INSERT DATA {{ GRAPH <{PUBLIC}> {{ <urn:k2> <urn:p> 2 }} }}"),
+                &Default::default(),
+            )
+            .unwrap();
+            let delta = DeltaSet::read(&store, prev_seq, &Control::none());
+            let s = Arc::clone(&store);
+            let mut fired = false;
+            let _guard = set_circuit_test_hook(move |phase| {
+                if phase == CircuitTestPhase::AfterAdvanceSample && !fired {
+                    fired = true;
+                    enable_evidence_policy_for_test(&s, OUTPUT);
+                }
+            });
+            match circuit.advance(&delta, &Control::none()).unwrap() {
+                Advance::Changed(rows) => assert_eq!(rows.len(), 1),
+                Advance::Skipped => {
+                    panic!("whole-query advance must emit Changed, got Skipped")
+                }
+                Advance::Reset(_) => {
+                    panic!("whole-query advance must retain sampled no-policy state, got Reset")
+                }
+            }
+            assert_eq!(circuit.result.total(), 2);
+            let stored_snap = circuit.snap.as_ref().expect("stored snapshot");
+            assert!(stored_snap.pinned_evidence.is_none());
+            let (live_gen, live_key) = stored_snap.evidence_visibility_stamp();
+            assert!(live_gen > 0 && live_key.is_some());
+        }
+    }
+
+    #[test]
+    fn root_absorbs_long_property_path_witness_without_an_effective_copy() {
+        let store = Store::in_memory(crate::store::StoreOptions::default());
+        let mut seed = String::from("INSERT DATA { ");
+        for i in 0..128 {
+            seed.push_str(&format!("<urn:n{i}> <urn:step> <urn:n{}> . ", i + 1));
+        }
+        seed.push('}');
+        update::update(&store, &seed, &QueryOptions::default()).unwrap();
+        let query = parse_query(
+            "SELECT * WHERE { <urn:n0> <urn:step>+ <urn:n128> }",
+            None,
+            &[],
+        )
+        .unwrap();
+        let compiled = || super::super::compile::compile(&query, None).unwrap();
+        let mode = Provenance::why();
+        let mut source = Circuit::new(compiled(), None);
+        source.set_provenance(mode).unwrap();
+        source.build(store.snapshot(), &Control::none()).unwrap();
+        let (_, _, Some(ann)) = source.raw_annotations().pop().unwrap() else {
+            panic!("the property path must produce a WHY annotation");
+        };
+        let witness_bytes = 128 * std::mem::size_of::<prov::Atom>();
+        assert_eq!(ann.report(1).witnesses[0].len(), 128);
+
+        let mut target = Circuit::new(compiled(), None);
+        target.set_provenance(mode).unwrap();
+        let input_bytes = ann.bytes() + std::mem::size_of::<(Row, i64, prov::Ann)>() as u64;
+        target.set_local_limit(Some(
+            input_bytes + ann.bytes() + super::super::zset::row_bytes(0),
+        ));
+        let mut input = target.budget.scratch_lease();
+        input.try_set(input_bytes).unwrap();
+        let row: Row = Box::default();
+        let change = Some(vec![(row.clone(), 1, ann)]);
+        let largest = crate::test_alloc::record_largest(|| {
+            target.absorb_budgeted(change).unwrap();
+        });
+        assert_eq!(target.annotation(&row).unwrap().witnesses[0].len(), 128);
+        assert!(
+            largest < witness_bytes,
+            "absorption allocated a {largest}-byte buffer"
+        );
+    }
+
+    #[test]
+    fn build_and_decode_pre_admit_published_version_before_allocating() {
+        use crate::error::BudgetKind;
+        use std::sync::atomic::Ordering;
+
+        let store = Store::in_memory(crate::store::StoreOptions::default());
+        let mut nt = String::new();
+        for i in 0..2000 {
+            nt.push_str(&format!(
+                "<urn:s{i:04}> <urn:p> \"{i}\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n"
+            ));
+        }
+        store
+            .load(&[crate::io::Source::from_bytes(
+                nt.into_bytes(),
+                crate::io::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+
+        // Project 16 columns so the published flat `ViewTable::ids` buffer (2000 * 16 * 8
+        // = 256 KiB) is strictly larger than every allocation made while building or
+        // decoding the mutable circuit state, and so `self.result + version_bytes` exceeds
+        // the transient mutable-pass peak (including `Window::diff`'s scratch on the
+        // ordered query) allowing `steady - 1` to reach publication admission.
+        let queries = [
+            (
+                "SELECT ?s ?o (?o AS ?c2) (?o AS ?c3) (?o AS ?c4) (?o AS ?c5) (?o AS ?c6) (?o AS ?c7) (?o AS ?c8) (?o AS ?c9) \
+                 ?u10 ?u11 ?u12 ?u13 ?u14 ?u15 \
+                 WHERE { ?s <urn:p> ?o }",
+                false,
+            ),
+            (
+                "SELECT ?s ?o ?u2 ?u3 ?u4 ?u5 ?u6 ?u7 ?u8 ?u9 ?u10 ?u11 ?u12 ?u13 ?u14 ?u15 \
+                 WHERE { ?s <urn:p> ?o } ORDER BY ?o LIMIT 2000",
+                true,
+            ),
+        ];
+        let table_ids_bytes = 2000 * 16 * std::mem::size_of::<Id>();
+
+        for (text, expect_ordered_window) in queries {
+            let parsed = parse_query(text, None, &[]).unwrap();
+            let compiled = || super::super::compile::compile(&parsed, None).unwrap();
+
+            for with_version_pool in [false, true] {
+                let pool = QueryPool::new(16 << 20);
+                let published = with_version_pool.then(|| Arc::new(AtomicU64::new(0)));
+                let mut reference = Circuit::new(compiled(), None);
+                assert_eq!(
+                    reference
+                        .root
+                        .result_window()
+                        .is_some_and(|(w, _)| w.positions),
+                    expect_ordered_window,
+                    "unexpected ordered-window shape for `{text}`"
+                );
+                reference.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                reference.set_version_pool(published.clone());
+                reference.build(snap.clone(), &Control::none()).unwrap();
+                assert_eq!(reference.version_publish_attempts, 1);
+                assert_eq!(reference.version_allocs, 1);
+                let steady = reference.bytes();
+                let version_bytes = reference.version_bytes();
+                assert!(
+                    version_bytes as usize >= table_ids_bytes,
+                    "version_bytes ({version_bytes}) must cover flat ViewTable::ids ({table_ids_bytes})"
+                );
+                if let Some(counter) = &published {
+                    let expected = reference.version.as_ref().unwrap().published_bytes();
+                    assert!(expected >= table_ids_bytes as u64);
+                    assert_eq!(counter.load(Ordering::Relaxed), expected);
+                }
+                let body = reference.encode(&snap).unwrap();
+                drop(reference);
+                assert_eq!(pool.granted(), 0);
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+
+                // Measure decoded steady bytes directly, since ordered checkpoint decode can
+                // retain a different window capacity or omit sort keys compared to build.
+                let mut decoded_ref = Circuit::new(compiled(), None);
+                decoded_ref.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                decoded_ref.set_version_pool(published.clone());
+                decoded_ref.decode(&body, &snap).unwrap();
+                assert_eq!(decoded_ref.version_publish_attempts, 1);
+                assert_eq!(decoded_ref.version_allocs, 1);
+                let decoded_steady = decoded_ref.bytes();
+                let decoded_version_bytes = decoded_ref.version_bytes();
+                assert!(
+                    decoded_version_bytes as usize >= table_ids_bytes,
+                    "decoded version_bytes ({decoded_version_bytes}) must cover flat ViewTable::ids ({table_ids_bytes})"
+                );
+                if let Some(counter) = &published {
+                    let expected = decoded_ref.version.as_ref().unwrap().published_bytes();
+                    assert_eq!(counter.load(Ordering::Relaxed), expected);
+                }
+                drop(decoded_ref);
+                assert_eq!(pool.granted(), 0);
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+
+                // Control: build at the exact steady ceiling succeeds.
+                let mut exact_build = Circuit::new(compiled(), None);
+                exact_build.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                exact_build.set_version_pool(published.clone());
+                exact_build.max_memory_bytes = Some(steady);
+                exact_build.build(snap.clone(), &Control::none()).unwrap();
+                assert_eq!(exact_build.version_publish_attempts, 1);
+                assert_eq!(exact_build.version_allocs, 1);
+                if let Some(counter) = &published {
+                    assert_eq!(
+                        counter.load(Ordering::Relaxed),
+                        exact_build.version.as_ref().unwrap().published_bytes()
+                    );
+                }
+                drop(exact_build);
+                assert_eq!(pool.granted(), 0);
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+
+                // 1. Build 1 byte below steady fits the mutable pass, reaches publication
+                //    admission, and refuses before allocating `ViewTable::ids`.
+                let mut tight_build = Circuit::new(compiled(), None);
+                tight_build.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                tight_build.set_version_pool(published.clone());
+                tight_build.max_memory_bytes = Some(steady - 1);
+                let mut build_res = Ok(());
+                let build_largest = crate::test_alloc::record_largest(|| {
+                    build_res = tight_build.build(snap.clone(), &Control::none());
+                });
+                assert!(
+                    matches!(
+                        build_res,
+                        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                    ),
+                    "build 1 byte below steady must refuse publication with Memory: {build_res:?}"
+                );
+                assert_eq!(
+                    tight_build.version_publish_attempts, 1,
+                    "build must reach publication admission before refusing for `{text}` (version_pool={with_version_pool})"
+                );
+                assert_eq!(
+                    tight_build.version_allocs, 0,
+                    "build must refuse publication before entering version allocation for `{text}`"
+                );
+                assert!(
+                    build_largest < table_ids_bytes,
+                    "build allocated {build_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+                );
+                assert!(tight_build.version.is_none());
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+                drop(tight_build);
+                assert_eq!(pool.granted(), 0);
+
+                // Control: decode at the exact publication ceiling succeeds.
+                let exact_decode_limit = body.len() as u64 + decoded_steady;
+                let mut exact_decode = Circuit::new(compiled(), None);
+                exact_decode.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                exact_decode.set_version_pool(published.clone());
+                exact_decode.max_memory_bytes = Some(exact_decode_limit);
+                exact_decode.decode(&body, &snap).unwrap();
+                assert_eq!(exact_decode.version_publish_attempts, 1);
+                assert_eq!(exact_decode.version_allocs, 1);
+                if let Some(counter) = &published {
+                    assert_eq!(
+                        counter.load(Ordering::Relaxed),
+                        exact_decode.version.as_ref().unwrap().published_bytes()
+                    );
+                }
+                drop(exact_decode);
+                assert_eq!(pool.granted(), 0);
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+
+                // 2. Decode 1 byte below publication total fits `body` + mutable state +
+                //    reader IDs, reaches publication admission, and refuses before allocating
+                //    `ViewTable::ids`.
+                let decode_limit = exact_decode_limit - 1;
+                let mut tight_decode = Circuit::new(compiled(), None);
+                tight_decode.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                tight_decode.set_version_pool(published.clone());
+                tight_decode.max_memory_bytes = Some(decode_limit);
+                let mut decode_res = Ok(());
+                let decode_largest = crate::test_alloc::record_largest(|| {
+                    decode_res = tight_decode.decode(&body, &snap);
+                });
+                assert!(
+                    matches!(
+                        decode_res,
+                        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                    ),
+                    "decode 1 byte below publication total must refuse with Memory: {decode_res:?}"
+                );
+                assert_eq!(
+                    tight_decode.version_publish_attempts, 1,
+                    "decode must reach publication admission before refusing for `{text}` (version_pool={with_version_pool})"
+                );
+                assert_eq!(
+                    tight_decode.version_allocs, 0,
+                    "decode must refuse publication before entering version allocation for `{text}`"
+                );
+                assert!(
+                    decode_largest < table_ids_bytes,
+                    "decode allocated {decode_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+                );
+                assert!(tight_decode.version.is_none());
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+                drop(tight_decode);
+                assert_eq!(pool.granted(), 0);
+
+                // 3. Shared QueryPool ceiling 1 byte below steady fits mutable state + pass
+                //    scratch, reaches publication admission, and refuses with ServerMemory
+                //    before allocating `ViewTable::ids`.
+                let tight_pool = QueryPool::new(steady - 1);
+                let mut pool_build = Circuit::new(compiled(), None);
+                pool_build.set_pool(Some(tight_pool.clone()), Some(tight_pool.work_parent()));
+                pool_build.set_version_pool(published.clone());
+                let mut pool_res = Ok(());
+                let pool_largest = crate::test_alloc::record_largest(|| {
+                    pool_res = pool_build.build(snap.clone(), &Control::none());
+                });
+                assert!(
+                    matches!(
+                        pool_res,
+                        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
+                    ),
+                    "build against tight QueryPool must refuse publication with ServerMemory: {pool_res:?}"
+                );
+                assert_eq!(
+                    pool_build.version_publish_attempts, 1,
+                    "pooled build must reach publication admission before refusing for `{text}` (version_pool={with_version_pool})"
+                );
+                assert_eq!(
+                    pool_build.version_allocs, 0,
+                    "pooled build must refuse publication before entering version allocation for `{text}`"
+                );
+                assert!(
+                    pool_largest < table_ids_bytes,
+                    "pooled build allocated {pool_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+                );
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+                drop(pool_build);
+                assert_eq!(tight_pool.granted(), 0);
+
+                // 4. Shared QueryPool ceiling 1 byte below decoded publication total reaches
+                //    publication admission and refuses with ServerMemory before allocating.
+                let tight_decode_pool = QueryPool::new(decode_limit);
+                let mut pool_decode = Circuit::new(compiled(), None);
+                pool_decode.set_pool(
+                    Some(tight_decode_pool.clone()),
+                    Some(tight_decode_pool.work_parent()),
+                );
+                pool_decode.set_version_pool(published.clone());
+                let mut pool_decode_res = Ok(());
+                let pool_decode_largest = crate::test_alloc::record_largest(|| {
+                    pool_decode_res = pool_decode.decode(&body, &snap);
+                });
+                assert!(
+                    matches!(
+                        pool_decode_res,
+                        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
+                    ),
+                    "decode against tight QueryPool must refuse publication with ServerMemory: {pool_decode_res:?}"
+                );
+                assert_eq!(
+                    pool_decode.version_publish_attempts, 1,
+                    "pooled decode must reach publication admission before refusing for `{text}` (version_pool={with_version_pool})"
+                );
+                assert_eq!(
+                    pool_decode.version_allocs, 0,
+                    "pooled decode must refuse publication before entering version allocation for `{text}`"
+                );
+                assert!(
+                    pool_decode_largest < table_ids_bytes,
+                    "pooled decode allocated {pool_decode_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+                );
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+                drop(pool_decode);
+                assert_eq!(tight_decode_pool.granted(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_empty_projection_stays_within_publication_ceiling() {
+        use crate::error::BudgetKind;
+        use std::fmt::Write;
+        use std::sync::atomic::Ordering;
+
+        const WIDTH: usize = 2048;
+        let mut text = String::from("SELECT");
+        for i in 0..WIDTH {
+            write!(&mut text, " ?c{i:04}").unwrap();
+        }
+        text.push_str(" WHERE { <urn:missing> <urn:p> ?c0000 }");
+
+        let store = Store::in_memory(crate::store::StoreOptions::default());
+        let snap = store.snapshot();
+        let parsed = parse_query(&text, None, &[]).unwrap();
+        let compiled = || super::super::compile::compile(&parsed, None).unwrap();
+        let col_slots_bytes = WIDTH * std::mem::size_of::<String>();
+
+        for with_version_pool in [false, true] {
+            let wide_pool = QueryPool::new(16 << 20);
+            let published = with_version_pool.then(|| Arc::new(AtomicU64::new(0)));
+
+            let mut reference = Circuit::new(compiled(), None);
+            reference.set_pool(Some(wide_pool.clone()), Some(wide_pool.work_parent()));
+            reference.set_version_pool(published.clone());
+            reference.build(snap.clone(), &Control::none()).unwrap();
+            assert_eq!(reference.version_publish_attempts, 1);
+            assert_eq!(reference.version_allocs, 1);
+            assert!(reference.result.is_empty());
+            assert!(reference.terms.is_empty());
+            assert_eq!(reference.root.schema.len(), WIDTH);
+            let steady = reference.bytes();
+            let version_bytes = reference.version_bytes();
+            assert_eq!(
+                steady, version_bytes,
+                "wide empty projection must have no mutable row or term bytes"
+            );
+            assert!(
+                version_bytes as usize >= col_slots_bytes,
+                "version_bytes ({version_bytes}) must cover column slots ({col_slots_bytes})"
+            );
+            if let Some(counter) = &published {
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    reference.version.as_ref().unwrap().published_bytes()
+                );
+            }
+            let body = reference.encode(&snap).unwrap();
+            drop(reference);
+            assert_eq!(wide_pool.granted(), 0);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
+
+            // Build at the exact publication ceiling: only one column slot array is allocated,
+            // so live heap peak stays within a small fixed overhead of the admitted ceiling
+            // rather than spiking by a second `WIDTH * size_of::<String>()` slot array (~48 KiB).
+            const FIXED_OVERHEAD: usize = 512;
+            assert!(col_slots_bytes > FIXED_OVERHEAD * 32);
+            let build_pool = QueryPool::new(steady);
+            let mut ceil_build = Circuit::new(compiled(), None);
+            ceil_build.set_pool(Some(build_pool.clone()), Some(build_pool.work_parent()));
+            ceil_build.set_version_pool(published.clone());
+            ceil_build.max_memory_bytes = Some(steady);
+            let mut build_res = Ok(());
+            let build_peak = crate::test_alloc::record_peak_live(|| {
+                build_res = ceil_build.build(snap.clone(), &Control::none());
+            });
+            build_res.unwrap();
+            assert_eq!(ceil_build.version_publish_attempts, 1);
+            assert_eq!(ceil_build.version_allocs, 1);
+            assert!(
+                build_peak <= steady as usize + FIXED_OVERHEAD,
+                "wide empty build peak live bytes ({build_peak}) exceeded admitted ceiling ({steady}) + {FIXED_OVERHEAD} (version_pool={with_version_pool})"
+            );
+            if let Some(counter) = &published {
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    ceil_build.version.as_ref().unwrap().published_bytes()
+                );
+            }
+            drop(ceil_build);
+            assert_eq!(build_pool.granted(), 0);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
+
+            // Checkpoint decode at the exact publication ceiling stays within the admitted
+            // publication bytes as well.
+            let decode_ceiling = body.len() as u64 + steady;
+            let decode_pool = QueryPool::new(decode_ceiling);
+            let mut ceil_decode = Circuit::new(compiled(), None);
+            ceil_decode.set_pool(Some(decode_pool.clone()), Some(decode_pool.work_parent()));
+            ceil_decode.set_version_pool(published.clone());
+            ceil_decode.max_memory_bytes = Some(decode_ceiling);
+            let mut decode_res = Ok(());
+            let decode_peak = crate::test_alloc::record_peak_live(|| {
+                decode_res = ceil_decode.decode(&body, &snap);
+            });
+            decode_res.unwrap();
+            assert_eq!(ceil_decode.version_publish_attempts, 1);
+            assert_eq!(ceil_decode.version_allocs, 1);
+            assert!(
+                decode_peak <= steady as usize + FIXED_OVERHEAD,
+                "wide empty decode peak live bytes ({decode_peak}) exceeded admitted ceiling ({steady}) + {FIXED_OVERHEAD} (version_pool={with_version_pool})"
+            );
+            if let Some(counter) = &published {
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    ceil_decode.version.as_ref().unwrap().published_bytes()
+                );
+            }
+            drop(ceil_decode);
+            assert_eq!(decode_pool.granted(), 0);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
+
+            // 1 byte below the ceiling refuses at publication admission before allocating the
+            // column slot array (both local limit and shared QueryPool, for build and decode).
+            let mut tight_build = Circuit::new(compiled(), None);
+            tight_build.set_pool(Some(wide_pool.clone()), Some(wide_pool.work_parent()));
+            tight_build.set_version_pool(published.clone());
+            tight_build.max_memory_bytes = Some(steady - 1);
+            let mut tight_build_res = Ok(());
+            let tight_build_largest = crate::test_alloc::record_largest(|| {
+                tight_build_res = tight_build.build(snap.clone(), &Control::none());
+            });
+            assert!(matches!(
+                tight_build_res,
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+            ));
+            assert_eq!(tight_build.version_publish_attempts, 1);
+            assert_eq!(tight_build.version_allocs, 0);
+            assert!(tight_build_largest < col_slots_bytes);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
+            drop(tight_build);
+            assert_eq!(wide_pool.granted(), 0);
+
+            let mut tight_decode = Circuit::new(compiled(), None);
+            tight_decode.set_pool(Some(wide_pool.clone()), Some(wide_pool.work_parent()));
+            tight_decode.set_version_pool(published.clone());
+            tight_decode.max_memory_bytes = Some(decode_ceiling - 1);
+            let mut tight_decode_res = Ok(());
+            let tight_decode_largest = crate::test_alloc::record_largest(|| {
+                tight_decode_res = tight_decode.decode(&body, &snap);
+            });
+            assert!(matches!(
+                tight_decode_res,
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+            ));
+            assert_eq!(tight_decode.version_publish_attempts, 1);
+            assert_eq!(tight_decode.version_allocs, 0);
+            assert!(tight_decode_largest < col_slots_bytes);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
+            drop(tight_decode);
+            assert_eq!(wide_pool.granted(), 0);
+
+            let tight_pool = QueryPool::new(steady - 1);
+            let mut pool_build = Circuit::new(compiled(), None);
+            pool_build.set_pool(Some(tight_pool.clone()), Some(tight_pool.work_parent()));
+            pool_build.set_version_pool(published.clone());
+            let mut pool_build_res = Ok(());
+            let pool_build_largest = crate::test_alloc::record_largest(|| {
+                pool_build_res = pool_build.build(snap.clone(), &Control::none());
+            });
+            assert!(matches!(
+                pool_build_res,
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
+            ));
+            assert_eq!(pool_build.version_publish_attempts, 1);
+            assert_eq!(pool_build.version_allocs, 0);
+            assert!(pool_build_largest < col_slots_bytes);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
+            drop(pool_build);
+            assert_eq!(tight_pool.granted(), 0);
+
+            let tight_decode_pool = QueryPool::new(decode_ceiling - 1);
+            let mut pool_decode = Circuit::new(compiled(), None);
+            pool_decode.set_pool(
+                Some(tight_decode_pool.clone()),
+                Some(tight_decode_pool.work_parent()),
+            );
+            pool_decode.set_version_pool(published.clone());
+            let mut pool_decode_res = Ok(());
+            let pool_decode_largest = crate::test_alloc::record_largest(|| {
+                pool_decode_res = pool_decode.decode(&body, &snap);
+            });
+            assert!(matches!(
+                pool_decode_res,
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
+            ));
+            assert_eq!(pool_decode.version_publish_attempts, 1);
+            assert_eq!(pool_decode.version_allocs, 0);
+            assert!(pool_decode_largest < col_slots_bytes);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
+            drop(pool_decode);
+            assert_eq!(tight_decode_pool.granted(), 0);
+        }
     }
 }

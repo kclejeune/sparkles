@@ -1,6 +1,6 @@
 # U04: Live query profiling
 
-> **Status:** partly implemented
+> **Status:** implemented in part (Phase 4)
 >
 > **Phases:** Phase 4 shipped on 2026-10-23, and Phases 1 to 3 are not built. Phase 1 is a
 > progress registry in the engine and server,
@@ -613,6 +613,14 @@ the numbers of a filter on more variables, so a chip now takes an operator on ex
 variables first. A selection made on the second of two join badges fell back to the first
 once the focus left the canvas, and moving between the Plan and Pattern tabs cleared the
 selected operator although the plan was the same.
+
+### Initial bindings in estimated plans
+
+Item 654 applies the request's initial bindings to the estimated SPARQL plan through
+the same substitution used for execution. For the class-and-predicate ASK shape, the
+bound scans use the same index prefixes and row estimates as the scans with the IRIs
+written into the query. The synthetic regression compares the largest estimated row
+table and the charged execution peak for the two forms.
 
 ### Roadmap follow-ups
 

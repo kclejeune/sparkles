@@ -46,6 +46,28 @@ impl ByteBudget {
     }
 }
 
+/// A shared charge against a [`ByteBudget`] that stays accounted until the
+/// last owner holding it drops (for example, both a history cache entry and
+/// any snapshot or derived triple-masked snapshot that shares its delta nodes).
+#[derive(Debug)]
+pub(crate) struct BudgetHold {
+    budget: Arc<ByteBudget>,
+    bytes: u64,
+}
+
+impl BudgetHold {
+    pub(crate) fn new(budget: Arc<ByteBudget>, bytes: u64) -> Arc<Self> {
+        budget.settle(0, bytes);
+        Arc::new(Self { budget, bytes })
+    }
+}
+
+impl Drop for BudgetHold {
+    fn drop(&mut self) {
+        self.budget.settle(self.bytes, 0);
+    }
+}
+
 /// The sizes of the caches a server shares, in bytes. 0 disables the result and SERVICE
 /// caches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

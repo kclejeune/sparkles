@@ -55,7 +55,7 @@ pub enum OntologyCmd {
         limit: usize,
         #[arg(long, default_value_t = 0)]
         offset: usize,
-        /// ofn (a functional-style document) or json
+        /// ofn, owx, omn, obo, obographs or json
         #[arg(long, default_value = "ofn")]
         format: String,
     },
@@ -107,6 +107,10 @@ pub enum OntologyCmd {
         /// Also classify with the assertions the store holds
         #[arg(long)]
         assertions: bool,
+        /// Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom
+        /// outside OWL 2 EL
+        #[arg(long)]
+        el_only: bool,
         /// Write the taxonomy to this named graph in one commit
         #[arg(long)]
         target: Option<String>,
@@ -127,15 +131,21 @@ pub enum OntologyCmd {
         /// Stop the run after this many seconds (fractions allowed)
         #[arg(long)]
         timeout: Option<f64>,
-        /// When the deadline stops a run with the disjunctive rules, answer what it
-        /// proved, with the classes it left open and the consistency it knows, and exit
-        /// with status 2. Not with --target, --format ofn or a chain
+        /// When the deadline, cancellation or memory budget stops a classification after
+        /// saturation begins, answer what the active EL, Horn or disjunctive tier proved,
+        /// with the classes it left open and the consistency it knows, and exit with
+        /// status 2. Not with --target, --format ofn or a chain
         #[arg(long)]
         partial: bool,
+        /// Refuse with an error, as HermiT does, when the classifier would leave an
+        /// axiom out or use one only in part, so that the answer is complete for the
+        /// whole ontology or there is none. The error names the axioms and the rules
+        #[arg(long)]
+        strict: bool,
         /// The expansion strategy of the disjunctive rules: cautious or eager
         #[arg(long, default_value = "cautious")]
         expansion: String,
-        /// ofn (the taxonomy as a functional-style document), json or text
+        /// ofn, owx, omn, obo, obographs, json or text
         #[arg(long, default_value = "ofn")]
         format: String,
         /// The commands that follow in a chain
@@ -285,8 +295,8 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             offset,
             format,
         } => {
-            if format != "ofn" && format != "json" {
-                bail!("unknown --format {format}: ofn or json");
+            if !["ofn", "owx", "omn", "obo", "obographs", "json"].contains(&format.as_str()) {
+                bail!("unknown --format {format}: ofn, owx, omn, obo, obographs or json");
             }
             match local(&at)? {
                 Some(loc) => {
@@ -308,16 +318,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                         bail!("the ontology neither declares nor uses <{a}>");
                     }
                     let r = renderer(&ds);
-                    if format == "ofn" {
-                        print!(
-                            "{}",
-                            owl::ofn::document(
-                                &r,
-                                &o.ontology.header,
-                                page.items.iter().map(|(a, _)| a)
-                            )
-                        );
-                    } else {
+                    if format == "json" {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&page_body(
@@ -328,6 +329,14 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                                 &page
                             ))?
                         );
+                    } else {
+                        let doc = render_ontology_doc(
+                            &format,
+                            &r,
+                            &o.ontology.header,
+                            page.items.iter().map(|(a, _)| a),
+                        )?;
+                        print!("{doc}");
                     }
                 }
                 None => {
@@ -343,13 +352,20 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     }
                     q.push(("limit".into(), limit.to_string()));
                     q.push(("offset".into(), offset.to_string()));
-                    q.push(("format".into(), format.clone()));
+                    let wire_fmt = if format == "json" { "json" } else { "ofn" };
+                    q.push(("format".into(), wire_fmt.to_string()));
                     let text = remote_text(&at, "/axioms", &q)?;
                     if format == "json" {
                         let j: J = serde_json::from_str(&text)?;
                         println!("{}", serde_json::to_string_pretty(&j)?);
-                    } else {
+                    } else if format == "ofn" {
                         print!("{text}");
+                    } else {
+                        let parsed = owl::ofn_read::parse(&text)?;
+                        let r = Renderer::new(parsed.prefixes);
+                        let doc =
+                            render_ontology_doc(&format, &r, &parsed.header, parsed.axioms.iter())?;
+                        print!("{doc}");
                     }
                 }
             }
@@ -426,6 +442,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             at,
             read,
             assertions,
+            el_only,
             target,
             message,
             about,
@@ -433,12 +450,14 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             allow_unsatisfiable,
             timeout,
             partial,
+            strict,
             expansion,
             format,
             rest,
         } => {
-            if !["ofn", "json", "text"].contains(&format.as_str()) {
-                bail!("unknown --format {format}: ofn, json or text");
+            if !["ofn", "owx", "omn", "obo", "obographs", "json", "text"].contains(&format.as_str())
+            {
+                bail!("unknown --format {format}: ofn, owx, omn, obo, obographs, json or text");
             }
             let chain = chain_head(&file, &at, &rest, &output)?;
             if chain.is_some() && target.is_some() {
@@ -449,9 +468,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     "--partial answers in part, which a chain does not transform: leave out --partial"
                 );
             }
-            if partial && format == "ofn" {
+            if partial && is_doc_format(&format) {
                 bail!(
-                    "--format ofn has no place to say that an answer is partial: name --format json or text"
+                    "--format {format} has no place to say that an answer is partial: name --format json or text"
                 );
             }
             if partial && target.is_some() {
@@ -483,8 +502,10 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     .transpose()?,
                 message: message.clone(),
                 about: about.clone(),
-                el_only: false,
+                el_only,
                 partial,
+                strict,
+                skip_coverage: false,
                 expansion,
             };
             let q = ClassifyQuery {
@@ -505,11 +526,16 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 let out = ds.ontology().classify(&req, &c, &qopts)?;
                 let r = renderer(ds);
                 let j = classify_body(name, &out, &req, &r, &q)?;
-                let doc = owl::ofn::document(
-                    &r,
-                    &owl::Header::default(),
-                    out.classification.taxonomy.axioms().iter(),
-                );
+                let doc = if is_doc_format(&format) {
+                    render_ontology_doc(
+                        &format,
+                        &r,
+                        &owl::Header::default(),
+                        out.classification.taxonomy.axioms().iter(),
+                    )?
+                } else {
+                    String::new()
+                };
                 Ok((j, doc))
             };
             let (j, doc) = match (file, loc) {
@@ -528,7 +554,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     match OntologyFile::read(&f, &req, 0)? {
                         // the file's axioms, read without a database
                         Some(file) => {
-                            classify_body_of_file(&file, &c, &read, about.clone(), &qopts)?
+                            classify_body_of_file(&file, &c, &read, about.clone(), &format, &qopts)?
                         }
                         None => {
                             let ds = sparkles::Dataset::memory();
@@ -553,6 +579,12 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     if partial {
                         body["partial"] = json!(true);
                     }
+                    if el_only {
+                        body["elOnly"] = json!(true);
+                    }
+                    if strict {
+                        body["strict"] = json!(true);
+                    }
                     if c.expansion == sparkles::owl::classify::Expansion::Eager {
                         body["expansion"] = json!("eager");
                     }
@@ -570,7 +602,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                         None => "/classify".to_string(),
                     };
                     let j = remote_post(&at, &path, &body)?;
-                    let doc = if format == "ofn" {
+                    let doc = if is_doc_format(&format) {
                         // the kept classification answers the second request
                         if let Some(o) = body.as_object_mut() {
                             o.remove("target");
@@ -578,7 +610,15 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                             o.remove("about");
                         }
                         let sep = if path.contains('?') { '&' } else { '?' };
-                        remote_post_text(&at, &format!("{path}{sep}format=ofn"), &body)?
+                        let ofn_text =
+                            remote_post_text(&at, &format!("{path}{sep}format=ofn"), &body)?;
+                        if format == "ofn" {
+                            ofn_text
+                        } else {
+                            let parsed = owl::ofn_read::parse(&ofn_text)?;
+                            let r = Renderer::new(parsed.prefixes);
+                            render_ontology_doc(&format, &r, &parsed.header, parsed.axioms.iter())?
+                        }
                     } else {
                         String::new()
                     };
@@ -704,13 +744,81 @@ fn not_a_chain(f: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_doc_format(format: &str) -> bool {
+    matches!(format, "ofn" | "owx" | "omn" | "obo" | "obographs")
+}
+
+fn render_ontology_doc<'a>(
+    format: &str,
+    r: &Renderer,
+    header: &owl::Header,
+    axioms: impl IntoIterator<Item = &'a Axiom>,
+) -> Result<String> {
+    match format {
+        "ofn" => Ok(owl::ofn::document(r, header, axioms)),
+        "owx" => Ok(owl::owx::document(r, header, axioms)?),
+        "omn" => {
+            let (s, rep) =
+                owl::manchester::document(r, header, axioms, owl::WriteOptions::default())?;
+            if rep.skipped_count > 0 {
+                eprintln!(
+                    "WARN --format omn omitted {} axioms that Manchester syntax cannot represent",
+                    rep.skipped_count
+                );
+            }
+            if rep.skipped_header_count > 0 {
+                eprintln!(
+                    "WARN --format omn omitted {} header annotations that Manchester syntax cannot represent",
+                    rep.skipped_header_count
+                );
+            }
+            Ok(s)
+        }
+        "obo" => {
+            let (s, rep) = owl::obo::document(r, header, axioms, owl::WriteOptions::default())?;
+            if rep.skipped_count > 0 {
+                eprintln!(
+                    "WARN --format obo omitted {} axioms that OBO 1.4 cannot represent",
+                    rep.skipped_count
+                );
+            }
+            if rep.skipped_header_count > 0 {
+                eprintln!(
+                    "WARN --format obo omitted {} header annotations that OBO 1.4 cannot represent",
+                    rep.skipped_header_count
+                );
+            }
+            Ok(s)
+        }
+        "obographs" => {
+            let (s, rep) =
+                owl::obographs::document(r, header, axioms, owl::WriteOptions::default())?;
+            if rep.skipped_count > 0 {
+                eprintln!(
+                    "WARN --format obographs omitted {} axioms that OBO Graphs JSON cannot represent",
+                    rep.skipped_count
+                );
+            }
+            if rep.skipped_header_count > 0 {
+                eprintln!(
+                    "WARN --format obographs omitted {} header annotations that OBO Graphs JSON cannot represent",
+                    rep.skipped_header_count
+                );
+            }
+            Ok(s)
+        }
+        f => bail!("unknown --format {f}: ofn, owx, omn, obo, obographs, json or text"),
+    }
+}
+
 /// The classification of an ontology file read without a database, as the answer's
-/// JSON body and the taxonomy as a functional-style document.
+/// JSON body and the taxonomy in the requested ontology document syntax.
 pub(crate) fn classify_body_of_file(
     file: &OntologyFile,
     c: &ClassifyRequest,
     read: &Read,
     about: Option<String>,
+    format: &str,
     opts: &sparkles::sparql::QueryOptions,
 ) -> Result<(J, String)> {
     let req = read.request()?;
@@ -738,11 +846,16 @@ pub(crate) fn classify_body_of_file(
         &r,
         &q,
     )?;
-    let doc = owl::ofn::document(
-        &r,
-        &owl::Header::default(),
-        out.classification.taxonomy.axioms().iter(),
-    );
+    let doc = if is_doc_format(format) {
+        render_ontology_doc(
+            format,
+            &r,
+            &owl::Header::default(),
+            out.classification.taxonomy.axioms().iter(),
+        )?
+    } else {
+        String::new()
+    };
     Ok((j, doc))
 }
 
@@ -756,14 +869,28 @@ pub(crate) fn finish_classify(
     allow_unsatisfiable: bool,
 ) -> Result<bool> {
     match format {
-        "ofn" => print!("{doc}"),
+        "ofn" | "owx" | "omn" | "obo" | "obographs" => print!("{doc}"),
         "json" => println!("{}", serde_json::to_string_pretty(j)?),
         "text" => print_classify(j),
-        f => bail!("unknown --format {f}: ofn, json or text"),
+        f => bail!("unknown --format {f}: ofn, owx, omn, obo, obographs, json or text"),
     }
     if j["partial"].as_bool() == Some(true) {
         eprintln!(
             "partial answer: the run stopped before it finished, {} classes may miss superclasses, consistency {}",
+            j["incompleteCount"].as_u64().unwrap_or(0),
+            j["consistency"].as_str().unwrap_or("unknown"),
+        );
+    } else if j["stats"]["coverageStopped"].as_bool() == Some(true) {
+        eprintln!(
+            "incomplete answer: a deadline or cancellation stopped the check of which classes keep their answer, so all {} classes may miss entailments, consistency unknown",
+            j["incompleteCount"].as_u64().unwrap_or(0),
+        );
+    } else if j["complete"].as_bool() == Some(false) {
+        // as ELK warns of the axioms outside its fragment
+        eprintln!(
+            "incomplete answer: {} axioms left out or used in part, {} triples that map to no axiom, {} classes may miss entailments, consistency {}; --strict refuses instead",
+            j["excludedCount"].as_u64().unwrap_or(0),
+            j["stats"]["unmapped"].as_u64().unwrap_or(0),
             j["incompleteCount"].as_u64().unwrap_or(0),
             j["consistency"].as_str().unwrap_or("unknown"),
         );
@@ -1064,14 +1191,48 @@ fn print_classify(j: &J) {
             println!("  {why}\n    {}", e["ofn"].as_str().unwrap_or(""));
         }
     }
+    let unmapped = j["stats"]["unmapped"].as_u64().unwrap_or(0);
+    if j["complete"].as_bool() != Some(true) && unmapped > 0 {
+        println!("incomplete: {unmapped} triples of the input map to no axiom");
+        let listed = j["unmappedTriples"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for t in listed.iter().take(10) {
+            let term = |k: &str| t[k].as_str().unwrap_or("").to_string();
+            println!(
+                "  {} {} {} .",
+                term("subject"),
+                term("predicate"),
+                term("object")
+            );
+        }
+        if unmapped as usize > listed.len().min(10) {
+            println!("  and {} more", unmapped as usize - listed.len().min(10));
+        }
+    }
+    if j["complete"].as_bool() != Some(true)
+        && j["partial"].as_bool() != Some(true)
+        && (n("excludedCount") > 0 || n("incompleteCount") > 0)
+    {
+        println!(
+            "  {} classes may miss entailments, consistency {}",
+            n("incompleteCount"),
+            j["consistency"].as_str().unwrap_or("unknown")
+        );
+        for c in j["incomplete"].as_array().into_iter().flatten() {
+            println!("  incomplete {}", c.as_str().unwrap_or(""));
+        }
+    }
     let s = &j["stats"];
     println!(
-        "{} run on {} threads: index {:.1} ms, saturation {:.1} ms, taxonomy {:.1} ms",
+        "{} {} run on {} threads: index {:.1} ms, saturation {:.1} ms, taxonomy {:.1} ms",
         if s["incremental"].as_bool() == Some(true) {
             "incremental"
         } else {
             "full"
         },
+        j["tier"].as_str().unwrap_or("el"),
         s["threads"],
         s["indexMs"].as_f64().unwrap_or(0.0),
         s["saturationMs"].as_f64().unwrap_or(0.0),
@@ -1088,6 +1249,9 @@ fn print_classify(j: &J) {
                 .join(" ")
         };
         println!("class {}", c["iri"].as_str().unwrap_or(""));
+        if c["incomplete"].as_bool() == Some(true) {
+            println!("  incomplete   yes (superclasses may be missing)");
+        }
         println!("  equivalent   {}", list("classes"));
         println!("  parents      {}", list("parentClasses"));
         println!("  children     {}", list("childClasses"));

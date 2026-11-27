@@ -664,12 +664,105 @@ fn resources(p: &mut Paths) {
             .errors(&[404, 409, 503]),
     );
     p.add(
+        op(GET, "/$/resources/{id}/recipes", "getVocabularyRecipes", tag, "Export PURL or w3id redirection recipes")
+            .doc("Generates Apache `.htaccess` rules (for `w3id.org` or a self-hosted domain) or PURL redirection recipes for a vocabulary resource's hosted namespaces and version IRIs. Representation negotiation is delegated to Sparkles. Returns `text/plain` by default or JSON on `Accept: application/json` or `format=json`. Needs server `admin`.")
+            .see("linked-data-publishing")
+            .query("kind", str_enum(&["w3id", "htaccess", "purl"]), "Recipe target (`w3id` by default).")
+            .query("base", s(), "Public `http(s)` base URL of this Sparkles server.")
+            .query("mount", s(), "Optional `.htaccess` directory mount to strip from `RewriteRule` patterns (defaults to the shared first path segment for `w3id`, or site root for `htaccess`).")
+            .query("format", str_enum(&["text", "json"]), "Response format (`text` by default).")
+            .resp_h("200", "The generated recipe.", Some(json!({
+                "text/plain": text(),
+                "application/json": { "schema": sref("RecipeExport") },
+            })), json!({
+                "Vary": { "description": "`Accept`.", "schema": s() },
+            }))
+            .errors(&[400, 404, 409, 503]),
+    );
+    p.add(
         op(POST, "/$/resources/{id}/install/{ds}", "installVocabularyPrefixes", tag, "Install a vocabulary's prefixes")
             .doc("Binds the namespaces of the vocabulary and of the vocabularies its current version imports as prefixes of the dataset in one settings write, which honours the operator's locks and the prefix limit. A prefix the dataset binds to another IRI is `409 prefix-conflict` unless `replace=true`. Needs `admin` on the dataset.")
             .see("vocabulary-resources")
             .query("replace", boolean(), "Rebind prefixes that the dataset binds to other IRIs.")
             .json("200", "What the write bound.", "PrefixInstall")
             .errors(&[400, 403, 404, 409, 503]),
+    );
+    let ld_content = || {
+        json!({
+            "text/html": text(),
+            "text/turtle": text(),
+            "application/ld+json": text(),
+            "application/rdf+xml": text(),
+            "application/n-triples": text(),
+        })
+    };
+    let ld_headers = json!({
+        "Vary": { "description": "`Accept`.", "schema": s() },
+        "Link": { "description": "Alternate representation links (and `rel=\"original\"` for historical snapshots of live IRIs).", "schema": s() },
+        "Sparkles-Describe-Truncated": { "description": "`true` when the bounded DESCRIBE reached its triple or term limit.", "schema": s() },
+        "Sparkles-At": { "description": "Resolved point-in-time selector when reading a single dataset's pinned snapshot or historical state.", "schema": s() },
+        "Sparkles-Head": { "description": "Current head commit sequence of the resolved dataset when reading a historical state.", "schema": s() },
+        "Memento-Datetime": { "description": "HTTP-date timestamp of the resolved historical commit (RFC 7089).", "schema": s() },
+        "Content-Security-Policy": { "description": "Script-free Content Security Policy sent on `text/html` responses.", "schema": s() },
+    });
+    let ld_redirect_headers = json!({
+        "Location": { "description": "The document URL for the negotiated representation.", "schema": s() },
+        "Vary": { "description": "`Accept`.", "schema": s() },
+    });
+    let ld_format = str_enum(&["html", "turtle", "jsonld", "rdfxml", "ntriples"]);
+    let ld_not_acceptable = json!({ "application/json": { "schema": sref("Error") } });
+    let ld_vary_header = json!({
+        "Vary": { "description": "`Accept`.", "schema": s() },
+    });
+    let ld_common = |o: Op| {
+        o.see("linked-data-publishing")
+            .query("format", ld_format.clone(), "Override `Accept` negotiation (`html`, `turtle`, `jsonld`, `rdfxml` or `ntriples`).")
+            .query("version", s(), "Catalog version name to resolve against its pinned snapshot.")
+            .param("at")
+            .param("describe")
+            .param("describeLabels")
+            .param("describeReifiers")
+            .param("describeMaxTriples")
+            .param("describeMaxDepth")
+            .resp_h("200", "The negotiated HTML or bounded DESCRIBE RDF representation.", Some(ld_content()), ld_headers.clone())
+            .resp_h("406", "No supported representation matches `Accept`.", Some(ld_not_acceptable.clone()), ld_vary_header.clone())
+            .errors(&[400, 404, 408, 410, 503, 507])
+    };
+    p.add(
+        ld_common(
+            op(GET, "/$/ld", "resolveLinkedData", tag, "Resolve a hosted IRI with content negotiation")
+                .doc("Resolves an IRI under a hosted vocabulary namespace or configured version IRI. Slash IRIs answer `303 See Other` with `Vary: Accept` to `/$/ld/doc`; hash IRIs answer `200 OK` directly. Shows only data the caller is permitted to read.")
+                .query_req("iri", s(), "The absolute IRI to resolve.")
+                .resp_h("303", "Redirect from a slash IRI to its negotiated document representation.", None, ld_redirect_headers.clone()),
+        ),
+    );
+    p.add(
+        ld_common(
+            op(GET, "/$/ld/doc", "getLinkedDataDocument", tag, "Get the document representation of a hosted IRI")
+                .doc("Returns the negotiated HTML or bounded `DESCRIBE` RDF representation of a hosted IRI directly with `200 OK` and `Vary: Accept`. Shows only data the caller is permitted to read.")
+                .query_req("iri", s(), "The absolute IRI to describe."),
+        ),
+    );
+    p.add(
+        ld_common(
+            op(GET, "/$/ld/ns/{prefix}", "resolveHostedNamespace", tag, "Resolve a hosted namespace root by prefix")
+                .doc("Resolves the namespace IRI owned by `prefix`. Hash namespaces answer `200 OK` directly; slash namespaces answer `303 See Other` with `Vary: Accept`.")
+                .resp_h("303", "Redirect from a slash namespace IRI to its negotiated document representation.", None, ld_redirect_headers.clone()),
+        ),
+    );
+    p.add(
+        ld_common(
+            op(GET, "/$/ld/ns/{prefix}/", "resolveHostedNamespaceSlash", tag, "Resolve a hosted namespace root by prefix with a trailing slash")
+                .doc("Resolves the namespace IRI owned by `prefix`, matching PURL partial redirects with an empty suffix. Hash namespaces answer `200 OK` directly; slash namespaces answer `303 See Other` with `Vary: Accept`.")
+                .resp_h("303", "Redirect from a slash namespace IRI to its negotiated document representation.", None, ld_redirect_headers.clone()),
+        ),
+    );
+    p.add(
+        ld_common(
+            op(GET, "/$/ld/ns/{prefix}/{*local}", "resolveHostedTerm", tag, "Resolve a term under a hosted namespace prefix")
+                .doc("Resolves `<namespace_iri><local>` for the hosted namespace owned by `prefix`. Slash IRIs answer `303 See Other` with `Vary: Accept`; hash IRIs answer `200 OK` directly.")
+                .resp_h("303", "Redirect from a slash IRI to its negotiated document representation.", None, ld_redirect_headers),
+        ),
     );
 }
 
@@ -713,6 +806,7 @@ fn ontology(p: &mut Paths) {
             .param("at")
             .query("inferences", boolean(), "Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale.")
             .param("ifNoneMatch")
+            .query("view", json!({ "type": "string", "enum": ["full", "head"] }), "`full` (the default) or `head`. The head answers the header, the counts of declared entities, the graphs read, the imports and the imports closure from bounded index reads, without mapping the whole graph into axioms, and leaves out `axioms`, `axiomCount`, `triples`, `unmapped`, `diagnostics` and `cached`. Its entity tag also names the commit for an edit's `If-Match`. It refuses `metrics`.")
             .query("metrics", boolean(), "Also stream assertions and return scoped axiom counts, distinct signature entities, a conservative containing DL and bounded EL, QL, RL and DL reports in metrics. Refuses scopes over 1000000 mapped axioms and assertion triples or signature entities. Ordinary summaries omit this work.")
             .resp("200", "The summary.", Some(object.clone()))
             .resp("304", "The summary is still at the tagged commit.", None)
@@ -802,15 +896,17 @@ fn ontology(p: &mut Paths) {
             .query("offset", json!({"type":"integer","minimum":0}), "The first row, zero by default. Nonzero offsets require an exact commit and resultId.")
             .query("limit", json!({"type":"integer","minimum":1,"maximum":1000}), "At most this many rows, 100 by default.")
             .query("lang", s(), "Comma-separated preferred label languages, otherwise Accept-Language.")
+            .query("elOnly", boolean(), "Read the kept EL-only classification instead of the default classification (false by default).")
             .query("timeout", json!({"type":"number","minimum":0}), "The read deadline in milliseconds.")
             .resp("200", "Availability and an optional bounded page from one immutable result.", Some(json!({"application/json":{"schema":sref("KeptClassification")}})))
             .errors(&[400,403,404,408,410]),
     );
     p.add(
         write_params(op(POST, "/$/ontology/{ds}/classify", "classifyOntology", "Ontology", "Classify an ontology and optionally project a bounded class frame"))
-            .doc("Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. The answer's `complete` is false for such a partial answer, `partial` is true, `incomplete` lists the classes whose superclasses it may miss and `consistency` is `consistent`, `inconsistent` or `unknown`. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.")
+            .doc("Classifies the ontology's terminology using the OWL 2 EL, Horn or disjunctive rules that the axioms need, and answers whether it is consistent, the unsatisfiable classes, the axioms that the classification left out or used only in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses, its equivalent classes and whether it is in the incomplete set, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. With `projection` set to `frame`, `about` returns bounded direct parents, equivalents, source samples and exclusion samples instead of the full taxonomy payload. The dataset keeps the last eligible classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what the active EL, Horn or disjunctive run proved after saturation began. `complete` is false when the run stopped early, left axioms out or used them only in part, left assertions unread or saw unmapped triples, and `incomplete` lists the classes whose superclasses may be missed while `consistency` is `consistent`, `inconsistent` or `unknown`. A finished run has `partial` false and `completeForTaken` true, and still leaves affected classes in `incomplete` when excluded axioms, unread assertions or unmapped triples could affect them. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.")
             .see("ontology")
             .query("format", json!({ "type": "string", "enum": ["json", "ofn"] }), "`json` (the default) or `ofn`.")
+            .query("elOnly", boolean(), "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. Refused if repeated, malformed, or also set in the JSON body.")
             .body(
                 false,
                 "The ontology and what to answer.",
@@ -822,6 +918,7 @@ fn ontology(p: &mut Paths) {
                         "imports": selection["imports"],
                         "mode": selection["mode"],
                         "assertions": { "type": "boolean", "description": "Also classify the assertions the store holds, so that they can make the ontology inconsistent. Such a run is not kept." },
+                        "elOnly": { "type": "boolean", "description": "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL. The dataset keeps EL-only classifications separately from default runs." },
                         "target": { "type": "string", "description": "A named graph outside the graphs read that takes the direct taxonomy." },
                         "message": { "type": "string", "description": "The commit message of the write, also kept as a comment on the header." },
                         "about": { "type": "string", "description": "A class IRI to describe." },
@@ -831,20 +928,22 @@ fn ontology(p: &mut Paths) {
                         "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most nodes, unsatisfiable classes, incomplete classes and excluded axioms listed (100 by default)." },
                         "offset": { "type": "integer", "minimum": 0, "description": "The first node listed." },
                         "threads": { "type": "integer", "minimum": 0, "maximum": 1024, "description": "The worker threads, within the algorithm pool's grant (0 for the grant)." },
-                        "partial": { "type": "boolean", "description": "Answer what a run with the disjunctive rules proved when its deadline, cancellation or memory budget stops it, instead of failing. Runs of the other rules fail as before." },
+                        "partial": { "type": "boolean", "description": "Answer what the active EL, Horn or disjunctive run proved when its deadline, cancellation or memory budget stops it after saturation begins, instead of failing." },
+                        "strict": { "type": "boolean", "description": "Refuse with `422` and code `classification-incomplete` when the classifier would leave an axiom out or use one only in part, or the run stopped, so that an answer is always complete for the whole ontology, as HermiT refuses what it does not support. The message names the axioms and the rules they break." },
                         "expansion": { "type": "string", "enum": ["cautious", "eager"], "description": "The expansion strategy of the disjunctive rules, `cautious` by default. Both give the same answer." }
                     }
                 } } }),
             )
             .resp(
                 "200",
-                "The classification, with the receipt when a write asked for one.",
+                "The classification, or the receipt-bearing classification under `application/x-sparkles+json` when a `target` write asks for a receipt.",
                 Some(json!({
-                    "application/json": { "schema": { "oneOf": [{ "type": "object", "required": ["consistent","complete","classes"], "properties": {"consistent":{"type":"boolean"},"complete":{"type":"boolean"},"classes":{"type":"integer"}} }, sref("OntologyFrameClassification")] } },
+                    "application/json": { "schema": { "oneOf": [sref("OntologyClassification"), sref("OntologyFrameClassification")] } },
+                    "application/x-sparkles+json": { "schema": sref("OntologyClassificationReceipt") },
                     "text/owl-functional": { "schema": { "type": "string" } }
                 })),
             )
-            .errors(&[400, 403, 404, 408, 409, 507]),
+            .errors(&[400, 403, 404, 408, 409, 422, 507]),
     );
     p.add(
         op(POST, "/$/ontology/{ds}/parse", "parseManchester", "Ontology", "Read Manchester syntax")
@@ -890,6 +989,7 @@ fn ontology(p: &mut Paths) {
                         "expression": { "description": "The class expression: Manchester or functional-style text, or the JSON form." },
                         "syntax": { "type": "string", "enum": ["manchester", "functional"], "description": "The syntax of a text expression (`manchester` by default). An object is read as the JSON form." },
                         "reasoning": { "type": "string", "enum": ["auto", "el", "rl"], "description": "The engine (`auto` by default)." },
+                        "elOnly": { "type": "boolean", "description": "Classify by the OWL 2 EL rules alone, as ELK does, leaving out every axiom outside OWL 2 EL and using the dataset's EL-only kept saturation. Refused with `reasoning: \"rl\"` or an expression outside OWL 2 EL." },
                         "answers": { "type": "array", "items": { "type": "string", "enum": ["equivalents", "superclasses", "directSuperclasses", "subclasses", "directSubclasses", "instances"] } },
                         "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "The most IRIs each answer and the gaps list (1,000 by default)." },
                         "threads": { "type": "integer", "minimum": 0, "maximum": 1024, "description": "The worker threads of the EL classifier, within the algorithm pool's grant (0 for the grant)." },
@@ -1314,6 +1414,267 @@ fn ontology(p: &mut Paths) {
             } } } })),
         );
     p.add(write_params(o).errors(&[400, 403, 404, 408, 412, 422]));
+    let pattern_table = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["data"],
+        "properties": {
+            "data": { "type": "string", "description": "CSV or TSV spreadsheet text (at most 2 MiB and 5,000 data rows)." },
+            "format": { "type": "string", "enum": ["auto", "csv", "tsv"], "description": "Delimiter selection (`auto` by default)." }
+        }
+    });
+    let pattern_spec = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mode"],
+        "properties": {
+            "mode": { "type": "string", "enum": ["robot", "pattern"], "description": "`robot` for ROBOT-template column directives, or `pattern` for DOSDP/Cellfie-style parameterized axiom rules." },
+            "baseIri": { "type": ["string", "null"], "description": "Optional base IRI for resolving bare local names." },
+            "prefixes": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra prefix bindings merged on top of the dataset's prefixes." },
+            "headerTemplateRow": { "type": "boolean", "description": "In `robot` mode, whether row 2 carries the directive strings." },
+            "columns": { "type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["column", "directive"],
+                "properties": {
+                    "column": { "type": "string" },
+                    "directive": { "type": "string" },
+                    "split": { "type": ["string", "null"] }
+                }
+            } },
+            "rules": { "type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["template"],
+                "properties": {
+                    "name": { "type": ["string", "null"] },
+                    "template": { "type": "string" },
+                    "syntax": { "type": "string", "enum": ["manchester", "functional"] },
+                    "skipIfEmpty": { "type": "boolean" },
+                    "requiredColumns": { "type": "array", "items": { "type": "string" } },
+                    "split": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "annotations": { "type": "array", "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["property", "value"],
+                        "properties": {
+                            "property": { "type": "string" },
+                            "value": { "type": "string" },
+                            "lang": { "type": ["string", "null"] },
+                            "datatype": { "type": ["string", "null"] },
+                            "iri": { "type": "boolean" }
+                        }
+                    } }
+                }
+            } },
+            "declarations": { "type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["column", "kind"],
+                "properties": {
+                    "column": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["Class", "ObjectProperty", "DataProperty", "AnnotationProperty", "NamedIndividual", "Datatype"] },
+                    "split": { "type": ["string", "null"] }
+                }
+            } }
+        }
+    });
+    let pattern_diag = json!({
+        "type": "object",
+        "properties": {
+            "row": { "type": "integer", "description": "1-based source line number." },
+            "column": { "type": ["string", "null"] },
+            "severity": { "type": "string", "enum": ["error", "warning"] },
+            "code": { "type": "string" },
+            "message": { "type": "string" }
+        }
+    });
+    let mut preview_headers = commit_headers();
+    if let Some(m) = preview_headers.as_object_mut() {
+        m.insert(
+            "ETag".into(),
+            json!({ "description": "A weak entity tag naming the commit, ontology import-target digest, and dataset prefix digest, reusable as `If-Match` on apply.", "schema": { "type": "string" } }),
+        );
+    }
+    let mut apply_headers = commit_headers();
+    if let Some(m) = apply_headers.as_object_mut() {
+        m.insert(
+            "Sparkles-Dry-Run".into(),
+            json!({ "description": "Present and `true` on dry-run responses.", "schema": { "type": "boolean" } }),
+        );
+        m.insert(
+            "Sparkles-Dry-Run-Outcome".into(),
+            json!({ "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.", "schema": { "type": "string", "enum": ["commit", "no-change", "precondition-failed", "rejected", "storage-refused"] } }),
+        );
+    }
+    let dry_run_headers = json!({
+        "Sparkles-Dry-Run": { "description": "Present and `true` on dry-run responses.", "schema": { "type": "boolean" } },
+        "Sparkles-Dry-Run-Outcome": { "description": "The dry-run outcome (`commit`, `no-change`, `precondition-failed`, `rejected`, or `storage-refused`), present on dry-run responses.", "schema": { "type": "string", "enum": ["commit", "no-change", "precondition-failed", "rejected", "storage-refused"] } }
+    });
+    let pattern_apply_ok = json!({
+        "type": "object",
+        "properties": {
+            "added": { "type": "integer" },
+            "present": { "type": "integer" },
+            "removed": { "type": "integer" },
+            "absent": { "type": "array", "items": { "type": "string" } },
+            "declared": { "type": "array", "items": { "type": "string" } },
+            "addedAxioms": edited.clone(),
+            "removedAxioms": edited.clone(),
+            "axiomsTruncated": { "type": "boolean" },
+            "inserted": { "type": "integer" },
+            "deleted": { "type": "integer" },
+            "kept": { "type": "integer" },
+            "committed": { "type": "boolean" },
+            "pattern": { "type": "object", "properties": {
+                "delimiter": { "type": "string" },
+                "headers": { "type": "array", "items": { "type": "string" } },
+                "rowsProcessed": { "type": "integer" },
+                "rowsSkipped": { "type": "integer" },
+                "rowsWithErrors": { "type": "integer" },
+                "generated": { "type": "integer" },
+                "valid": { "type": "boolean" },
+                "diagnostics": { "type": "array", "items": pattern_diag.clone() },
+                "diagnosticsTruncated": { "type": "boolean" }
+            } }
+        }
+    });
+    let pattern_errors = json!({
+        "type": "object",
+        "required": ["error", "code", "rowsProcessed", "rowsSkipped", "rowsWithErrors", "diagnostics", "diagnosticsTruncated"],
+        "properties": {
+            "error": { "type": "string" },
+            "code": { "type": "string", "const": "pattern-errors" },
+            "rowsProcessed": { "type": "integer" },
+            "rowsSkipped": { "type": "integer" },
+            "rowsWithErrors": { "type": "integer" },
+            "diagnostics": { "type": "array", "items": pattern_diag.clone() },
+            "diagnosticsTruncated": { "type": "boolean" }
+        }
+    });
+    p.add(
+        read(op(POST, "/$/ontology/{ds}/patterns/preview", "previewOntologyPatterns", "Ontology", "Preview axioms generated from a table"))
+            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the pattern preview entity tag (encoding the head commit, import-target digest, and dataset prefix binding digest) and commit headers for `If-Match` on apply.")
+            .see("ontology")
+            .param("at")
+            .param("timeout")
+            .body(
+                true,
+                "The table, pattern specification, and preview options.",
+                json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["table", "spec"],
+                    "properties": {
+                        "graph": selection["graph"],
+                        "imports": selection["imports"],
+                        "mode": selection["mode"],
+                        "table": pattern_table.clone(),
+                        "spec": pattern_spec.clone(),
+                        "declare": { "type": "boolean", "description": "Whether missing entity declarations would be added on apply (true by default)." },
+                        "target": { "type": "string", "description": "The graph that would take the added axioms." },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "The most generated axioms listed in `axioms` (200 by default)." }
+                    }
+                } } }),
+            )
+            .resp_h(
+                "200",
+                "The preview of generated axioms, diff summary, and row diagnostics.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "dataset": { "type": "string" },
+                        "commit": { "type": "integer" },
+                        "graphs": { "type": "array", "items": { "type": "string" } },
+                        "target": { "type": "string" },
+                        "delimiter": { "type": "string", "enum": ["csv", "tsv"] },
+                        "headers": { "type": "array", "items": { "type": "string" } },
+                        "valid": { "type": "boolean" },
+                        "rowsProcessed": { "type": "integer" },
+                        "rowsSkipped": { "type": "integer" },
+                        "rowsWithErrors": { "type": "integer" },
+                        "generated": { "type": "integer" },
+                        "newAxioms": { "type": "integer" },
+                        "existingAxioms": { "type": "integer" },
+                        "autoDeclarations": { "type": "array", "items": { "type": "object", "properties": { "iri": { "type": "string" }, "kind": { "type": "string" } } } },
+                        "estimatedTriples": { "type": "integer" },
+                        "axioms": { "type": "array", "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string" },
+                                "ofn": { "type": "string" },
+                                "manchester": { "type": ["string", "null"] },
+                                "axiom": { "type": "object" },
+                                "rows": { "type": "array", "items": { "type": "integer" } },
+                                "status": { "type": "string", "enum": ["new", "existing"] }
+                            }
+                        } },
+                        "axiomsTruncated": { "type": "boolean" },
+                        "diagnostics": { "type": "array", "items": pattern_diag },
+                        "diagnosticsTruncated": { "type": "boolean" }
+                    }
+                } } })),
+                preview_headers,
+            )
+            .errors(&[400, 403, 404, 408, 413, 507]),
+    );
+    p.add(
+        write_params(op(POST, "/$/ontology/{ds}/patterns/apply", "applyOntologyPatterns", "Ontology", "Generate and commit axioms from a table"))
+            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target and dataset prefix binding digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: \"abort\"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: \"skip\"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.")
+            .see("ontology")
+            .param("ifMatch")
+            .body(
+                true,
+                "The table, pattern specification, and commit options.",
+                json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["table", "spec"],
+                    "properties": {
+                        "graph": selection["graph"],
+                        "imports": selection["imports"],
+                        "mode": selection["mode"],
+                        "table": pattern_table,
+                        "spec": pattern_spec,
+                        "declare": { "type": "boolean" },
+                        "target": { "type": "string", "description": "The graph that takes the added axioms." },
+                        "message": { "type": "string" },
+                        "onError": { "type": "string", "enum": ["abort", "skip"], "description": "Whether row errors refuse the commit (`abort`, the default) or skip erroneous rows (`skip`)." }
+                    }
+                } } }),
+            )
+            .resp_h(
+                "200",
+                "What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report (JSON, or RDF Patch when `Accept` prefers `application/rdf-patch`, `text/rdf-patch`, or `application/rdf-patch+thrift`) when `dryRun=true`.",
+                Some(json!({
+                    "application/json": { "schema": { "anyOf": [pattern_apply_ok.clone(), sref("DryRunReport")] } },
+                    "application/x-sparkles+json": { "schema": { "allOf": [sref("Receipt"), pattern_apply_ok] } },
+                    "application/rdf-patch": text(),
+                    "text/rdf-patch": text(),
+                    "application/rdf-patch+thrift": binary()
+                })),
+                apply_headers,
+            )
+            .errors(&[400, 403, 404, 408, 413])
+            .resp_h(
+                "412",
+                "Precondition failed (`If-Match` did not match the current head, import-target digest, or dataset prefix binding digest), or a dry-run precondition failure report.",
+                Some(json!({ "application/json": { "schema": { "anyOf": [sref("DryRunReport"), sref("Error")] } } })),
+                dry_run_headers.clone(),
+            )
+            .resp_h(
+                "422",
+                "Pattern evaluation errors (`pattern-errors`), write validation refusal, or a dry-run validation rejection report.",
+                Some(json!({ "application/json": { "schema": { "anyOf": [pattern_errors, sref("DryRunReport"), sref("Error")] } } })),
+                dry_run_headers.clone(),
+            )
+            .resp_h(
+                "507",
+                "Projected RDF triple or payload budget refusal (`triple-limit`), storage limit refusal, or a dry-run storage refusal report.",
+                Some(json!({ "application/json": { "schema": { "anyOf": [sref("DryRunReport"), sref("Error")] } } })),
+                dry_run_headers,
+            ),
+    );
     p.add(
         write_params(sel(op(DELETE, "/$/ontology/{ds}/entity", "removeOntologyEntity", "Ontology", "Remove an entity")))
             .doc("Removes an entity in one commit: its declarations, the axioms of the graphs read that mention it and the assertions about it that the store holds there. The ontology is read from the head under the writer lock. The answer is an edit's, and `removedAxioms` lists what the removal took. An IRI the ontology does not mention removes nothing and makes no commit.")
@@ -3728,10 +4089,10 @@ fn assist(p: &mut Paths) {
         "/{ds}/recall",
         "recallFacts",
         "Recall facts",
-        "The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact.",
+        "The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact. A request using a review or matching policy returns `409 evidence-settings-drift` while the evidence settings need reconciliation.",
         "RecallRequest",
         "RecallResult",
-    ));
+    ).errors(&[409, 503]));
     p.add(
         op(POST, "/{ds}/facts", "assertFacts", "SPARQL", "Write facts with provenance")
             .doc("The MCP tool `assert_facts` as the caller, with its checks. Needs `write` on the graphs written and counts as an update. `sparkles memory import` and `assert` call it.")
@@ -3742,15 +4103,15 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/claims/resolve", "resolveEvidence", "SPARQL", "Verify evidence references")
-            .doc("Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field.")
+            .doc("Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-resolution")
             .json_body(true, "EvidenceResolveRequest")
             .json("200", "Every reference, verified.", "EvidenceResolveResult")
-            .errors(&[400, 403, 404, 408, 409, 413, 422]),
+            .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
         op(POST, "/{ds}/claims", "proposeClaims", "SPARQL", "Propose claims with their evidence")
-            .doc("Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed` and writes nothing. Refusals write nothing: `400` for a malformed or inconsistent batch, naming its field, `403` for a written graph the caller may not update, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict` for a record identity that holds other content or no authenticated record, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, and `503 authority-changed` when the caller's credential was revoked or the access policy changed before publication.")
+            .doc("Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A foreign stored fact requires `admin` on every branch and graph of the dataset that serves it. The proposal acquires one hold per referenced dataset before publication. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed`. A replay found before reference resolution writes nothing. Competing proposals may acquire holds before one finds the receipt at the writer check. A refusal before publication writes no proposal records. A publication storage failure may leave a receipt that recovers when the origin reopens. The proposal answers `400` for a malformed or inconsistent batch, naming its field, `403` for insufficient update grants or foreign-source admin, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 hold-conflict`, `409 holds-limit`, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, `503 holds-unavailable` when a durable hold cannot be confirmed, and `503 authority-changed` when the caller's credential or access policy changed before publication. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-proposals")
             .json_body(true, "EvidenceProposal")
             .json("200", "The operation and its records, published, replayed or previewed.", "EvidenceProposalResult")
@@ -3758,7 +4119,7 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/claims/review", "reviewClaims", "SPARQL", "Review claims under a policy")
-            .doc("Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.")
+            .doc("Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-reviews")
             .json_body(true, "EvidenceReview")
             .json("200", "The operation and its decisions, published, replayed or previewed.", "EvidenceReviewResult")
@@ -3766,7 +4127,7 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/claims/withdraw", "withdrawClaims", "SPARQL", "Withdraw claim occurrences")
-            .doc("Needs `write` on the dataset or branch through the update endpoint, update grants on each claim's graph, and update and read grants on the output graph and read grants on the decisions and supports graphs of every review policy. Counts as an update. Records a withdrawal with `prov:invalidatedAtTime` in each claim's graph as one commit of the evidence owner, without making a contrary claim. The claims' supports stop being live, and each projected triple left without a live support leaves its output graph. A claim that is already withdrawn is answered as `existing`. Refusals write nothing: `400`, `403`, `409 head-changed`, `409 target-changed`, `409 idempotency-conflict`, `422 evidence-unavailable`, `503 projection-unavailable` and `503 authority-changed`.")
+            .doc("Needs `write` on the dataset or branch through the update endpoint, update grants on each claim's graph, and update and read grants on the output graph and read grants on the decisions and supports graphs of every review policy. Counts as an update. Records a withdrawal with `prov:invalidatedAtTime` in each claim's graph as one commit of the evidence owner, without making a contrary claim. The claims' supports stop being live, and each projected triple left without a live support leaves its output graph. A claim that is already withdrawn is answered as `existing`. Refusals write nothing: `400`, `403`, `409 head-changed`, `409 target-changed`, `409 idempotency-conflict`, `422 evidence-unavailable`, `503 projection-unavailable` and `503 authority-changed`. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-reviews")
             .json_body(true, "EvidenceWithdrawal")
             .json("200", "The operation and its withdrawals, published, replayed or previewed.", "EvidenceWithdrawalResult")
@@ -3774,19 +4135,19 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/claims/identities", "resolveIdentities", "SPARQL", "Resolve entities through a resolution map")
-            .doc("Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary.")
+            .doc("Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-identities")
             .json_body(true, "EvidenceIdentities")
             .json("200", "The map's revision and each entity's resolution.", "EvidenceIdentitiesResult")
-            .errors(&[400, 403, 404, 408, 413, 422, 503]),
+            .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
-        op(POST, "/{ds}/claims/dependents", "listEvidenceDependents", "SPARQL", "Find the assessments that depend on changed records")
-            .doc("Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read.")
+        op(POST, "/{ds}/claims/dependents", "listEvidenceDependents", "SPARQL", "Find the assessments and reports that depend on changed records")
+            .doc("Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and the community reports in guarded reports graphs proven for the caller whose activity recorded `prov:used` for one of them (including person-edited reports via `gr:editOf`), and with `transitive` the assessments and reports that depend on those, each once at its smallest depth. A graph the caller cannot read or cannot prove under the disclosure guard is not searched, and a record any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-dependents")
             .json_body(true, "EvidenceDependents")
-            .json("200", "The dependent assessments.", "EvidenceDependentsResult")
-            .errors(&[400, 403, 404, 408, 413, 422]),
+            .json("200", "The dependent assessments and community reports.", "EvidenceDependentsResult")
+            .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
         op(POST, "/{ds}/sources", "registerSource", "SPARQL", "Register a source document")
@@ -3862,7 +4223,7 @@ fn assist(p: &mut Paths) {
             "Datasets",
             "Set the evidence settings",
         )
-        .doc("Needs `admin` on the dataset. Records complete settings and protects every graph of their roles. A configuration that would stop protecting a graph, or that races with another change, is a `409` that writes nothing.")
+        .doc("Needs `admin` on the dataset. Records complete settings and protects every graph of their roles. A configuration that would stop protecting a graph, change a field locked by `serve --settings` (`locked-by-config`), or race with another change is a `409` that writes nothing.")
         .see("evidence-settings")
         .json_body(true, "EvidenceSettings")
         .json("200", "The settings and their protection.", "EvidenceSettingsStatus")
@@ -3876,11 +4237,63 @@ fn assist(p: &mut Paths) {
             "Datasets",
             "Stop protecting an evidence graph",
         )
-        .doc("Needs `admin` on the dataset. Ordinary writes can change the graph until the settings are recorded again.")
+        .doc("Needs `admin` on the dataset. Ordinary writes can change the graph until the settings are recorded again. Refused with `409 locked-by-config` when `serve --settings` locks evidence enabled and locks a role or policy requiring the graph.")
         .see("evidence-settings")
         .json_body(true, "EvidenceDetach")
         .json("200", "The settings and their protection.", "EvidenceSettingsStatus")
         .errors(&[400, 404, 409, 503]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/evidence/{ds}/identities/rebuild",
+            "rebuildIdentityMap",
+            "Datasets",
+            "Rebuild a resolution map",
+        )
+        .doc("Needs unrestricted `admin` on the dataset or branch. Recomputes the clusters of the matching policy's current authenticated accepted decisions in its current protected identity-graph boundary, rewrites its output graph atomically and records the new protections and boundary in a fresh `ev:ResolutionMap` revision, restoring reviews and reads that answered `503 projection-unavailable`. Refusals write nothing: `400` for a malformed request or unknown matching policy, `403` for a read-only server or missing unrestricted admin grant, `409 policy-changed`, `409 head-changed`, `409 identity-conflict`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile`, `409 evidence-settings-drift`, `422 incomplete-evidence` and `503 authority-changed`.")
+        .see("evidence-identities")
+        .param("branch")
+        .json_body(true, "EvidenceIdentitiesRebuild")
+        .json(
+            "200",
+            "The rebuilt resolution map revision and what changed.",
+            "EvidenceIdentitiesRebuildResult",
+        )
+        .errors(&[400, 403, 404, 409, 422, 503]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/evidence/{ds}/reauthenticate",
+            "reauthenticateEvidence",
+            "Datasets",
+            "Re-authenticate evidence records under a graph's current protection",
+        )
+        .doc("Needs `admin` on the dataset and target branch, and requires activated configuration history (`409 configuration-history-inactive` otherwise). Verifies records written under an earlier protection nonce in a protected evidence record graph against their retained, configuration-bound publication views, recorded digests, retained content, passage spans and receipt lineage, and atomically marks the verified records and their receipt operations under the graph's current protection nonce together with an audit operation. Refuses tampered, unretained or mismatched records without writing (`409 immutable-record-conflict`, `409 target-changed`, `422 origin-not-reproduced`, `422 span-mismatch`, `422 evidence-unavailable`, `422 incomplete-evidence`). Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ, `409 head-changed` for a stale `ifHead`, `409 idempotency-conflict` for a reused key with another payload, `409 unsupported-profile` while the graph is detached or the profile is disabled, and `503 authority-changed` when authorization changes before publication.")
+        .see("evidence-settings")
+        .json_body(true, "EvidenceReauthenticateRequest")
+        .json(
+            "200",
+            "The reconciliation receipt and verified records.",
+            "EvidenceReauthenticateResult",
+        )
+        .errors(&[400, 403, 404, 409, 413, 422, 503]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/evidence/{ds}/projections/reconcile",
+            "reconcileEvidenceProjection",
+            "Datasets",
+            "Reconcile a review policy's accepted projection",
+        )
+        .doc("Needs `admin` on the dataset or selected branch, with update grants on the policy's supports and output graphs and unmasked read grants on its decisions, supports and output graphs and on every configured proposal graph. Rebuilds the review policy's output graph strictly from the live acceptance supports that authenticate under the current protections, or empties it when none vouch, and records the new protection nonces in a fresh `ev:Projection` record that supersedes prior unsuperseded projection records of the policy, or reuses the active projection record when the protections and output are already valid. Restores normal reviews, withdrawals and policy reads after a detach and new protection of the policy's decisions, supports or output graph. Refusals write nothing: `400` for a malformed request, unknown policy or matching policy, `403` for a read-only server or missing or masked grants, `409 evidence-settings-drift`, `409 policy-changed`, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict`, `409 unsupported-profile` when the profile is disabled or a policy graph is still detached, `422 incomplete-evidence`, `503` for `managed-unavailable`, `projection-unavailable` when the supports, output or conflict mode changed without raising the policy version, `authority-changed`, or temporary query memory pool exhaustion (with `Retry-After`), and `507` when the request exceeds the configured query memory pool.")
+        .see("evidence-reviews")
+        .param("branch")
+        .json_body(true, "EvidenceProjectionReconcile")
+        .json("200", "The reconciled projection, vouched supports and output changes.", "EvidenceProjectionReconcileResult")
+        .errors(&[400, 403, 404, 408, 409, 413, 422, 503, 507]),
     );
     p.add(
         op(
@@ -4498,15 +4911,16 @@ fn assist(p: &mut Paths) {
             "Datasets",
             "Get every settings kind",
         )
-        .doc("Each kind's effective object with its layers, sources and locks.")
+        .doc("Each kind's effective object with its layers, sources and locks. The `evidence` kind is included only for callers with `admin` on the dataset.")
         .see("settings")
-        .json("200", "The kinds.", "DatasetSettings"),
+        .json("200", "The kinds.", "DatasetSettings")
+        .errors(&[503]),
     );
     let kind_body = |o: super::Op| {
         o.body(
             true,
-            "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, or for `prefixes` a map from prefix names to IRIs.",
-            json!({ "application/json": { "schema": { "type": "object" } } }),
+            "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs.",
+            json!({ "application/json": { "schema": { "type": "object", "additionalProperties": true } } }),
         )
         .header(
             "If-Match",
@@ -4514,14 +4928,14 @@ fn assist(p: &mut Paths) {
             "The `etag` of the runtime layer the change is based on.",
         )
         .json("200", "The kind after the change.", "SettingsKind")
-        .errors(&[400, 409, 412])
+        .errors(&[400, 409, 412, 503])
     };
     p.add(
         op(GET, "/$/settings/{ds}/{kind}", "getSettings", "Datasets", "Get a settings kind")
-            .doc("The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer.")
+            .doc("The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer. The `evidence` kind needs `admin` on the dataset and includes `recorded`.")
             .see("settings")
             .json("200", "The kind.", "SettingsKind")
-            .errors(&[404]),
+            .errors(&[401, 403, 404, 503]),
     );
     p.add(kind_body(
         op(PATCH, "/$/settings/{ds}/{kind}", "patchSettings", "Datasets", "Change settings fields")
@@ -4540,7 +4954,7 @@ fn assist(p: &mut Paths) {
             .query("field", json!({ "type": "string" }), "A dotted field such as `historyDays` or `budget.perRequest`.")
             .header("If-Match", json!({ "type": "string" }), "The `etag` of the runtime layer the change is based on.")
             .json("200", "The kind after the change.", "SettingsKind")
-            .errors(&[400, 409, 412]),
+            .errors(&[400, 409, 412, 503]),
     );
     let server_body = |o: super::Op| {
         o.body(

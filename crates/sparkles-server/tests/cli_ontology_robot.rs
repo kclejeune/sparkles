@@ -357,10 +357,6 @@ fn robot_errors_and_exit_statuses() {
             "CREATE ONTOLOGY ERROR",
         ),
         (
-            &["reason", "-i", "o.ofn", "-o", "y.owx"],
-            "no writer for .owx",
-        ),
-        (
             &["reason", "-i", "o.ofn", "-o", "y.xyz"],
             "INVALID FORMAT ERROR",
         ),
@@ -409,6 +405,82 @@ fn reason_from_rdf_xml_and_a_database() {
         axioms(&dir.join("r3.ofn"))
             .contains("SubClassOf(<http://ex.org/CerebellarNeuron> <http://ex.org/Neuron>)")
     );
+}
+
+/// ROBOT's warning names the first triples that map to no axiom, and a strict run with
+/// HermiT refuses them.
+#[test]
+fn reason_names_the_triples_that_map_to_no_axiom() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(
+        dir.join("u.ttl"),
+        "@prefix : <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         :A a owl:Class . :B a owl:Class . :B rdfs:subClassOf :A . :p rdfs:domain :A .",
+    )
+    .unwrap();
+    let o = sparkles(dir, &["ontology", "reason", "-i", "u.ttl", "-o", "r.ofn"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let e = err(&o);
+    assert!(e.contains("1 triples of the input map to no axiom"), "{e}");
+    assert!(
+        e.contains(
+            "unmapped: <http://ex.org/p> <http://www.w3.org/2000/01/rdf-schema#domain> <http://ex.org/A> ."
+        ),
+        "{e}"
+    );
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "reason",
+            "--reasoner",
+            "hermit",
+            "-i",
+            "u.ttl",
+            "-o",
+            "s.ofn",
+        ],
+    );
+    assert_ne!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(err(&o).contains("<http://ex.org/p>"), "{}", err(&o));
+    // a classification later in a chain counts the input's unmapped triple as a direct
+    // one does, so it answers incomplete and a strict one refuses
+    let direct = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "u.ttl",
+            "--assertions",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(direct.status.code(), Some(0), "{}", err(&direct));
+    let direct: serde_json::Value = serde_json::from_str(&out(&direct)).unwrap();
+    for chain in [&["relax"][..], &["reason"][..], &["reduce"][..]] {
+        let mut args = vec!["ontology", chain[0], "-i", "u.ttl"];
+        args.extend(&chain[1..]);
+        args.extend(["classify", "--assertions", "--format", "json"]);
+        let o = sparkles(dir, &args);
+        assert_eq!(o.status.code(), Some(0), "{chain:?}: {}", err(&o));
+        let j: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+        assert_eq!(j["complete"], false, "{chain:?}: {j}");
+        assert_eq!(j["complete"], direct["complete"], "{chain:?}");
+        assert_eq!(j["stats"]["unmapped"], 1, "{chain:?}: {j}");
+        assert_eq!(j["unmappedTriples"], direct["unmappedTriples"], "{chain:?}");
+        assert_ne!(j["consistency"], "consistent", "{chain:?}: {j}");
+        args.push("--strict");
+        let o = sparkles(dir, &args);
+        assert_ne!(o.status.code(), Some(0), "{chain:?}: {}", out(&o));
+        assert!(
+            err(&o).contains("map to no axiom"),
+            "{chain:?}: {}",
+            err(&o)
+        );
+    }
 }
 
 #[test]

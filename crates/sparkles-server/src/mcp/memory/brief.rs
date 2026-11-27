@@ -277,6 +277,9 @@ impl Tools<'_> {
                 };
                 let out = match self.recall(rargs)? {
                     Outcome::Text(t) => serde_json::from_str::<Value>(&t).unwrap_or_default(),
+                    Outcome::Retained(p) => {
+                        serde_json::from_str::<Value>(p.as_str()).unwrap_or_default()
+                    }
                     Outcome::Structured(v) => v,
                 };
                 (label, recall_facts(&out, &mut heads, &mut graph_iris))
@@ -400,7 +403,7 @@ impl Tools<'_> {
                 .then_with(|| a.o.cmp(&b.o))
         });
         let matched = merged.len();
-        let commit = r.snap.commit;
+        let commit = r.commit();
         let status_word = if include_unreviewed {
             "with-unreviewed"
         } else {
@@ -637,18 +640,21 @@ impl Tools<'_> {
         }
         let graph = settings.reports_graph;
         let opts = r.timed()?;
-        if !read::readable(&r.snap, &opts, &graph) {
+        if !read::readable(r.snap(), &opts, &graph) {
             return Ok(Vec::new());
         }
-        let filter = read::Filter { reviewed_only };
-        let Some(level) = read::level_counts(&r.snap, &opts, &graph, filter)?
+        let filter = read::Filter {
+            reviewed_only,
+            ..Default::default()
+        };
+        let Some(level) = read::level_counts(r.snap(), &opts, &graph, filter)?
             .keys()
             .next()
             .copied()
         else {
             return Ok(Vec::new());
         };
-        read::reports_at(&r.snap, &opts, &graph, Some(level), filter, MAX_REPORTS)
+        read::reports_at(r.snap(), &opts, &graph, Some(level), filter, MAX_REPORTS)
     }
 
     /// The entity of `--entity`: an IRI, or a label that `link_entities` links `exact`.

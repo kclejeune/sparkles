@@ -473,7 +473,7 @@ C08's Outcome lists the cases that run in full. This spec changes them as follow
 | GeoSPARQL default geometries | Phase 1: compute the default geometries of the changed features only, before the rules run, as an extra delta. |
 | An RDF list changed, or derived, while the rules read lists | Phase 4: keep, per list head, the members the builtins read, and treat a list whose members changed as the deletion and insertion of the rule instances that read it. Lists derived by rules still run in full. |
 | Changed rules, unreachable commit, changed input graphs, store position moved back | Kept. |
-| Removal of more than 1 in 20 explicit triples of 10,000 or more (`LARGE_DELETION`) | The threshold becomes a cost estimate: the run estimates the backward search from the removed triples' predicates and the closure's fan-out and compares it with the last full run's time. The constant stays as a cap until X06 measures the estimate. |
+| Removal of more than 1 in 20 explicit triples of 10,000 or more (`LARGE_DELETION`) | The threshold becomes a cost estimate comparing backward search work against a full run. [F23 Phase 4](F23-reasoner-core/SPEC.md#shared-maintenance-core) replaces the fixed ratio with a pre-deletion visit estimate against item 798's runtime visit bound `Bound::max_visits_for`, keeping the runtime visit and memory bounds as guardrails. |
 
 Each change keeps the differential tests of C08 (random inserts and deletes compared
 with a full run) and adds seeds for the new cases.

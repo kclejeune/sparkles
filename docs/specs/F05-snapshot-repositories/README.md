@@ -1,4 +1,4 @@
-# F05 — Backup repositories: incremental backup and restore, policies, GC
+# F05: Backup repositories (incremental backup, restore, policies, GC)
 
 > **Status:** implemented in part (Phase 1, most of Phase 2)
 

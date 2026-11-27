@@ -2,6 +2,8 @@
 //! (spec F09, A22): branches of a local database, merges with and without conflicts,
 //! and the branch listing of a database a server holds.
 
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -242,17 +244,8 @@ fn item62_audit_local_branch_create_delete_records_actual_branch_identity() {
     }
 }
 
-/// A free port in 5600–5619.
-fn port() -> u16 {
-    (5600..5620)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .expect("a free port in 5600-5619")
-}
-
 #[test]
 fn a22_the_listing_reads_the_files_while_a_server_holds_the_database() {
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
     ok(
@@ -263,24 +256,14 @@ fn a22_the_listing_reads_the_files_while_a_server_holds_the_database() {
         dir,
         &["branch", "create", "--loc", "db", "dev", "--note", "a test"],
     );
-    let port = port();
-    let mut child = Command::new(BIN)
-        .args(["serve", "--port", &port.to_string(), "--loc"])
-        .arg(format!("ds={}", dir.join("db").display()))
-        .arg("--data")
-        .arg(dir.join("data"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let t0 = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(
-            t0.elapsed() < Duration::from_secs(60),
-            "server did not start"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let (mut child, port) = common::ServerProcess::start(
+        common::serve()
+            .arg("--loc")
+            .arg(format!("ds={}", dir.join("db").display()))
+            .arg("--data")
+            .arg(dir.join("data")),
+        &dir.join("server.log"),
+    );
     wait_ready(port);
     let o = run(dir, &["branch", "list", "--loc", "db", "--format", "json"]);
     #[cfg(feature = "auth")]

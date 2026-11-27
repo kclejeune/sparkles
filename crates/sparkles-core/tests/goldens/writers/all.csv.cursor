@@ -1,0 +1,26 @@
+s,p,o
+_:b0,urn:ex:q,urn:ex:s1
+urn:ex:o,urn:ex:q,"after
+o"
+urn:ex:s1,urn:ex:p,_:b0
+urn:ex:s1,urn:ex:p,urn:ex:o
+urn:ex:s1,urn:ex:p,
+urn:ex:s1,urn:ex:p,   
+urn:ex:s1,urn:ex:p,  lead and trail  
+urn:ex:s1,urn:ex:p,"]]> <&> ' ""x"""
+urn:ex:s1,urn:ex:p,ctl
+urn:ex:s1,urn:ex:p,plain
+urn:ex:s1,urn:ex:p,"quote"" back\ nl
+ tab	 cr end"
+urn:ex:s1,urn:ex:p,😀 é ü
+urn:ex:s1,urn:ex:p,en
+urn:ex:s1,urn:ex:p,-0.50
+urn:ex:s1,urn:ex:p,+7
+urn:ex:s1,urn:ex:p,42
+urn:ex:s1,urn:ex:p,1.0E3
+urn:ex:s1,urn:ex:p,true
+urn:ex:s1,urn:ex:p,2024-01-01
+urn:ex:s1,urn:ex:p,abc
+urn:ex:s1,urn:ex:p,rtl
+urn:ex:s1,urn:ex:p,x
+urn:ex:s1,urn:ex:p,urn:ex:a urn:ex:b "t,""q"""

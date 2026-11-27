@@ -19,6 +19,7 @@ mod branch_tests;
 mod branching;
 pub mod caches;
 mod changelog;
+pub(crate) use changelog::HistoryPages;
 mod changes;
 mod clone;
 #[cfg(test)]
@@ -32,7 +33,7 @@ pub use control_store::{ControlOwner, ControlStamp, ControlWrite};
 #[cfg(test)]
 mod compaction_tests;
 pub(crate) mod configuration_history;
-pub use bound_read_source::BoundReadSource;
+pub use bound_read_source::{BoundReadSource, PreparedTxnView, ScopedQueryResult};
 mod evidence_view;
 pub use evidence_view::BoundEvidenceView;
 mod aggregates;
@@ -42,7 +43,7 @@ mod describe;
 mod diff;
 mod diff_groups;
 mod embed;
-mod family;
+pub(crate) mod family;
 #[cfg(test)]
 mod family_tests;
 mod geo;
@@ -52,6 +53,8 @@ mod group_index_tests;
 #[cfg(test)]
 mod group_model;
 mod history_limited;
+mod history_probe;
+pub(crate) use history_limited::SnapshotCharge;
 mod history_query;
 mod holds;
 #[cfg(test)]
@@ -65,7 +68,7 @@ mod lock;
 mod lock_tests;
 mod managed;
 pub(crate) mod managed_history;
-pub use holds::{Acquired, HoldPublication};
+pub use holds::{Acquired, HoldPublication, PublishedWriter};
 pub use managed::ManagedSnapshot;
 #[cfg(test)]
 mod control_tests;
@@ -116,12 +119,15 @@ pub use backup::{
 pub(crate) use branching::BRANCH_FILE as BRANCH_FILE_NAME;
 pub(crate) use branching::write_initial_table;
 pub use branching::{
-    BRANCHES_DIR, BRANCHES_FILE, BranchCommit, BranchSet, BranchStore, read_branch_table,
+    BRANCHES_DIR, BRANCHES_FILE, BranchCommit, BranchSet, BranchStore, ListedBranches,
+    read_branch_table,
 };
 pub use changelog::{
     CHANGE_LOG_FILE, CHANGES_DIR, ChangeCommit, ChangeLog, ChangeLogSettings, ChangeLogStatus,
-    Unrecorded, UnrecordedReason,
+    CommitChangeMeta, Unrecorded, UnrecordedReason,
 };
+#[cfg(feature = "failpoints")]
+pub use changelog::{ChangeLogReadEvent, ChangeLogReadObserver, set_changelog_read_observer};
 pub use changes::{ChangePage, ChangesOptions, CommitChanges};
 pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};
 pub use commit_graph::{CommitGraph, CommitGraphOptions, GraphBranch, GraphCommit, GraphCursor};
@@ -138,6 +144,8 @@ pub use deltas::{CommitDelta, DeltaPage, DeltaSubscription};
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, IdChange, StateMark, key_id};
 pub use diff_groups::{CHANGE_BYTES, ClassGroup, ClassGroups, MAX_GROUPS, ObjectGroup};
+#[doc(hidden)]
+pub use history_probe::HistoryPattern;
 pub use history_query::{HistoryBound, HistoryChange, HistoryQuery, HistoryResult};
 #[cfg(feature = "failpoints")]
 pub use history_query::{HistoryCheckObserver, HistoryCheckOutcome, set_history_check_observer};
@@ -170,6 +178,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+/// Sentinel stored in [`Generation::rdf_reifies`] for cold-opened generations so
+/// `open_base_controlled` avoids touching the base vocabulary until WAL replay
+/// encounters a triple-term quad.
+pub(crate) const RDF_REIFIES_UNRESOLVED: u64 = u64::MAX;
+
 /// Immutable base index generation.
 pub struct Generation {
     /// unique within the process: two openings of one directory differ
@@ -195,6 +208,10 @@ pub struct Generation {
     pub charsets: std::sync::OnceLock<crate::sparql::charsets::CharIndex>,
     /// the predicate patterns of the base index (see [`crate::patterns`])
     pub patterns: crate::patterns::Loaded,
+    /// the reifier proposition-term index of the base index (see [`crate::reifiers`])
+    pub reifiers: crate::reifiers::Loaded,
+    /// cached id of `rdf:reifies` in this generation's vocab or delta vocab (`Id::UNDEF` when absent)
+    pub(crate) rdf_reifies: AtomicU64,
     /// The ids of the base vocabulary's literals that `sparkles-reasoner`'s diagnostics
     /// found ill-typed for their own datatype, in id order, and whether the list is
     /// complete. The diagnostics fill it on first use and bound its length, and it lives
@@ -227,6 +244,8 @@ impl Generation {
             counts: Default::default(),
             charsets: Default::default(),
             patterns: Default::default(),
+            reifiers: crate::reifiers::Loaded::empty(),
+            rdf_reifies: AtomicU64::new(Id::UNDEF.0),
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
@@ -236,6 +255,17 @@ impl Generation {
 
     fn memory_branch(base: &Arc<Generation>, vocab_len: u64) -> Generation {
         let dvocab = base.dvocab.fork_memory(vocab_len);
+        let raw = base.rdf_reifies.load(Ordering::Acquire);
+        let rdf_reifies = if raw == RDF_REIFIES_UNRESOLVED {
+            RDF_REIFIES_UNRESOLVED
+        } else {
+            let base_reifies = Id(raw);
+            match base_reifies.tag() {
+                Tag::Vocab => base_reifies.0,
+                Tag::Delta if base_reifies.payload() < vocab_len => base_reifies.0,
+                _ => Id::UNDEF.0,
+            }
+        };
         Generation {
             uid: crate::index::next_uid(),
             name: "mem".into(),
@@ -252,6 +282,8 @@ impl Generation {
             counts: Default::default(),
             charsets: Default::default(),
             patterns: base.patterns.clone(),
+            reifiers: base.reifiers.clone(),
+            rdf_reifies: AtomicU64::new(rdf_reifies),
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
@@ -261,11 +293,14 @@ impl Generation {
 
     /// A generation no longer written (not `CURRENT`), opened for reading past states.
     pub(crate) fn open_sealed(dir: &Path, name: &str) -> Result<Generation> {
-        Self::open_with(
+        let written_by = dir.parent().and_then(commit::read_written_by);
+        Ok(Self::open_sealed_with(
             dir,
             name,
-            DeltaVocab::open_read_only(&dir.join("delta.vocab"))?,
-        )
+            written_by.as_deref(),
+            &mut crate::budgeted::Unlimited,
+        )?
+        .value)
     }
 
     fn open(dir: &Path, name: &str, persistent: bool) -> Result<Generation> {
@@ -289,40 +324,278 @@ impl Generation {
     fn open_with(dir: &Path, name: &str, dvocab: DeltaVocab) -> Result<Generation> {
         // the database's directory holds the generation (a branch's holds its own)
         let written_by = dir.parent().and_then(commit::read_written_by);
-        let meta: IndexMeta = crate::builder::read_index_meta(dir, written_by.as_deref())?;
-        let stats: Stats = serde_json::from_slice(&std::fs::read(dir.join("stats.json"))?)
-            .map_err(|e| Error::Corrupt(format!("stats.json: {e}")))?;
-        if let Some(why) = stats.correlations.refusal() {
-            tracing::warn!(target: "sparkles::store", "generation {name}: {why}");
+        Ok(Self::open_base_with(
+            dir,
+            name,
+            written_by.as_deref(),
+            Some(cold::Loaded {
+                value: dvocab,
+                charge: 0,
+            }),
+            &mut crate::budgeted::Unlimited,
+        )?
+        .value)
+    }
+
+    /// Whether `id` names a stored triple term, checked cheaply without reconstructing
+    /// base vocabulary keys.
+    fn is_triple_term_with<C: crate::budgeted::Control>(
+        &self,
+        id: Id,
+        limit: &C,
+        held: u64,
+    ) -> Result<bool> {
+        match id.tag() {
+            Tag::Vocab => Ok(self.vocab.is_triple(id.payload())),
+            Tag::Delta => self.dvocab.with_control(limit, held, |d| {
+                Ok(d.get(id.payload())
+                    .is_some_and(|key| key.first() == Some(&b'(')))
+            }),
+            _ => Ok(false),
         }
-        let patterns = crate::patterns::Loaded::open(dir, meta.patterns.as_ref());
-        Ok(Generation {
-            uid: crate::index::next_uid(),
-            name: name.to_string(),
-            dir: Some(dir.to_path_buf()),
-            vocab: Arc::new(Vocab::open_codec(
-                dir,
-                meta.has_feature(crate::builder::FEATURE_FSST_VOCAB),
-            )?),
-            perms: Perm::ALL
-                .iter()
-                .map(|&p| PermIndex::open(dir, p))
-                .collect::<Result<_>>()?,
-            stats,
-            meta,
-            dvocab,
-            _tmp: None,
-            _base: None,
-            vectors: Default::default(),
-            geo: Default::default(),
-            counts: Default::default(),
-            charsets: Default::default(),
-            patterns,
-            ill_typed_literals: Mutex::new(None),
-            wal_index: Mutex::new(None),
-            link: None,
-            cold_bytes: 0,
-        })
+    }
+
+    /// Resolve `rdf:reifies` once on a cold-opened generation, caching either its ID or
+    /// `Id::UNDEF` (cold-opened generations are immutable and read-only).
+    fn resolve_rdf_reifies_with<C: crate::budgeted::Control>(
+        &self,
+        limit: &C,
+        held: u64,
+    ) -> Result<u64> {
+        let found = if C::CHECKS {
+            if let Ok(id) = self
+                .vocab
+                .find_exact_controlled(crate::reifiers::RDF_REIFIES_KEY, |_| limit.check(held))?
+            {
+                Id::vocab(id)
+            } else {
+                self.dvocab
+                    .with_control(limit, held, |d| {
+                        Ok(
+                            d.find_prepared(crate::reifiers::RDF_REIFIES_KEY, d.len(), |_| {
+                                limit.check(held)
+                            })?
+                            .map(Id::delta),
+                        )
+                    })?
+                    .unwrap_or(Id::UNDEF)
+            }
+        } else {
+            self.vocab
+                .find(crate::reifiers::RDF_REIFIES_KEY)
+                .ok()
+                .map(Id::vocab)
+                .or_else(|| {
+                    self.dvocab
+                        .find(crate::reifiers::RDF_REIFIES_KEY)
+                        .map(Id::delta)
+                })
+                .unwrap_or(Id::UNDEF)
+        };
+        self.rdf_reifies.store(found.0, Ordering::Release);
+        Ok(found.0)
+    }
+
+    /// When `pred` is `rdf:reifies` and `obj` is a stored triple term, return the distinct
+    /// 64-bit hashes of its IRI subject and IRI object, respecting replay control `limit`
+    /// with `held` bytes already committed.
+    pub(crate) fn is_rdf_reifies_triple_with<C: crate::budgeted::Control>(
+        &self,
+        pred: Id,
+        obj: Id,
+        limit: &C,
+        held: u64,
+    ) -> Result<Option<crate::reifiers::TermHashes>> {
+        let mut cached = self.rdf_reifies.load(Ordering::Acquire);
+        if cached == RDF_REIFIES_UNRESOLVED {
+            // Cold-opened generation: avoid touching vocab during cold open; resolve
+            // `rdf:reifies` once when replay actually encounters a triple-term object.
+            if !self.is_triple_term_with(obj, limit, held)? {
+                return Ok(None);
+            }
+            cached = self.resolve_rdf_reifies_with(limit, held)?;
+        }
+        if cached == Id::UNDEF.0 || pred.0 != cached {
+            return Ok(None);
+        }
+        self.triple_term_hashes_with(obj, limit, held)
+    }
+
+    /// When `pred` is `rdf:reifies` and `obj` is a stored triple term, return the distinct
+    /// 64-bit hashes of its IRI subject and IRI object.
+    #[inline]
+    pub(crate) fn is_rdf_reifies_triple(
+        &self,
+        pred: Id,
+        obj: Id,
+    ) -> Option<crate::reifiers::TermHashes> {
+        self.is_rdf_reifies_triple_with(pred, obj, &crate::budgeted::Unlimited, 0)
+            .ok()
+            .flatten()
+    }
+
+    /// Controlled variant of [`Self::is_rdf_reifies_triple`] governed by a
+    /// [`crate::access::Preparation`].
+    pub(crate) fn is_rdf_reifies_triple_prepared(
+        &self,
+        pred: Id,
+        obj: Id,
+        preparation: &crate::access::Preparation,
+    ) -> Result<Option<crate::reifiers::TermHashes>> {
+        preparation.check()?;
+        let mut cached = self.rdf_reifies.load(Ordering::Acquire);
+        if cached == RDF_REIFIES_UNRESOLVED {
+            let is_triple = match obj.tag() {
+                Tag::Vocab => self.vocab.is_triple(obj.payload()),
+                Tag::Delta => self.dvocab.with_prepared(preparation, |d| {
+                    Ok(d.get(obj.payload())
+                        .is_some_and(|key| key.first() == Some(&b'(')))
+                })?,
+                _ => false,
+            };
+            if !is_triple {
+                return Ok(None);
+            }
+            let found = if let Ok(id) = self
+                .vocab
+                .find_exact_controlled(crate::reifiers::RDF_REIFIES_KEY, |phase| {
+                    preparation.checkpoint(phase)
+                })? {
+                Id::vocab(id)
+            } else {
+                self.dvocab
+                    .with_prepared(preparation, |d| {
+                        Ok(
+                            d.find_prepared(crate::reifiers::RDF_REIFIES_KEY, d.len(), |_| {
+                                preparation.check()
+                            })?
+                            .map(Id::delta),
+                        )
+                    })?
+                    .unwrap_or(Id::UNDEF)
+            };
+            self.rdf_reifies.store(found.0, Ordering::Release);
+            cached = found.0;
+        }
+        if cached == Id::UNDEF.0 || pred.0 != cached {
+            return Ok(None);
+        }
+        match obj.tag() {
+            Tag::Vocab if self.vocab.is_triple(obj.payload()) => {
+                let mut workspace = preparation.reserve(0)?;
+                Ok(self
+                    .vocab
+                    .get_with_controlled(
+                        obj.payload(),
+                        |bytes| {
+                            workspace.grow_to((bytes as u64).saturating_mul(2).saturating_add(256))
+                        },
+                        |phase| preparation.checkpoint(phase),
+                        |key| {
+                            crate::reifiers::triple_key_term_hashes_controlled(key, || {
+                                preparation.check()
+                            })
+                        },
+                    )?
+                    .transpose()?
+                    .flatten())
+            }
+            Tag::Delta => self.dvocab.with_prepared(preparation, |d| {
+                let Some(key) = d.get(obj.payload()) else {
+                    return Ok(None);
+                };
+                crate::reifiers::triple_key_term_hashes_controlled(key, || preparation.check())
+            }),
+            _ => Ok(None),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn intern_delta_key(&self, key: &[u8]) -> Result<Id> {
+        let id = Id::delta(self.dvocab.insert(key)?);
+        if key == crate::reifiers::RDF_REIFIES_KEY {
+            self.rdf_reifies.store(id.0, Ordering::Release);
+        }
+        Ok(id)
+    }
+
+    /// Roll back delta vocabulary entries added since `mark`, invalidating the cached
+    /// `rdf:reifies` delta ID whenever it falls in the truncated range.
+    pub(crate) fn rollback_dvocab(&self, mark: &crate::vocab::VocabMark) -> Result<()> {
+        let raw = self.rdf_reifies.load(Ordering::Acquire);
+        if raw != RDF_REIFIES_UNRESOLVED {
+            let cached = Id(raw);
+            if cached.tag() == Tag::Delta && cached.payload() >= mark.entries() {
+                self.rdf_reifies.store(Id::UNDEF.0, Ordering::Release);
+            }
+        }
+        self.dvocab.rollback(mark)
+    }
+
+    /// Extract the distinct 64-bit hashes of the IRI subject and IRI object of a stored
+    /// triple-term id, returning `None` when `id` is not a triple term.
+    pub(crate) fn triple_term_hashes_with<C: crate::budgeted::Control>(
+        &self,
+        id: Id,
+        limit: &C,
+        held: u64,
+    ) -> Result<Option<crate::reifiers::TermHashes>> {
+        match id.tag() {
+            Tag::Vocab if self.vocab.is_triple(id.payload()) => {
+                if C::CHECKS {
+                    let scratch = std::cell::Cell::new(0u64);
+                    Ok(self
+                        .vocab
+                        .get_with_controlled_capacity_checked(
+                            id.payload(),
+                            |old, new| {
+                                let peak = (old as u64).saturating_add(new as u64);
+                                limit.check(held.saturating_add(peak))
+                            },
+                            |cap| {
+                                scratch.set(cap as u64);
+                                limit.check(held.saturating_add(scratch.get()))
+                            },
+                            |_| limit.check(held.saturating_add(scratch.get())),
+                            |key| {
+                                crate::reifiers::triple_key_term_hashes_controlled(key, || {
+                                    limit.check(held.saturating_add(scratch.get()))
+                                })
+                            },
+                        )?
+                        .flatten())
+                } else {
+                    Ok(self
+                        .vocab
+                        .get_with_checked(
+                            id.payload(),
+                            |_| Ok::<(), ()>(()),
+                            crate::reifiers::triple_key_term_hashes,
+                        )
+                        .ok()
+                        .flatten()
+                        .flatten())
+                }
+            }
+            Tag::Delta => {
+                if C::CHECKS {
+                    self.dvocab.with_control(limit, held, |d| {
+                        let Some(key) = d.get(id.payload()) else {
+                            return Ok(None);
+                        };
+                        crate::reifiers::triple_key_term_hashes_controlled(key, || {
+                            limit.check(held)
+                        })
+                    })
+                } else {
+                    Ok(self.dvocab.with(|d| {
+                        d.get(id.payload())
+                            .and_then(crate::reifiers::triple_key_term_hashes)
+                    }))
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     #[inline]
@@ -331,7 +604,9 @@ impl Generation {
     }
 
     pub fn disk_bytes(&self) -> u64 {
-        self.vocab.disk_bytes() + self.perms.iter().map(|p| p.disk_bytes()).sum::<u64>()
+        self.vocab.disk_bytes()
+            + self.perms.iter().map(|p| p.disk_bytes()).sum::<u64>()
+            + self.reifiers.disk_bytes()
     }
 }
 
@@ -340,6 +615,8 @@ impl Generation {
 pub struct Delta {
     pub ins: [KeySet; 7],
     pub del: [KeySet; 7],
+    /// Inserted `rdf:reifies` triple-term quads indexed as `[graph, term_hash, reifier, triple_term]`.
+    pub reifiers_ins: KeySet,
     /// the planner's statistics of the inserted quads, by predicate, kept up to date by
     /// each write ([`Delta::insert_quad`], [`Delta::remove_inserted`])
     predicates: imbl::OrdMap<u64, DeltaPredicate>,
@@ -373,8 +650,8 @@ impl Delta {
         self.ins[perm.index()].intersects([a, b, 0, 0]..=[a, b, u64::MAX, u64::MAX])
     }
 
-    /// Add `q`, which is not in the base, to the inserted quads.
-    fn insert_quad(&mut self, q: &[Id; 4]) {
+    /// Add `q`, which is not in the base, to the inserted quads. Returns whether `q` was new.
+    fn insert_quad(&mut self, q: &[Id; 4]) -> bool {
         // whether the (predicate, subject) and (predicate, object) pairs are new, read
         // off the keys next to the quad's in PSO and POS
         let (mut new_s, mut new_o, mut added) = (false, false, false);
@@ -401,6 +678,7 @@ impl Delta {
             e.distinct_subjects += new_s as u64;
             e.distinct_objects += new_o as u64;
         }
+        added
     }
 
     /// The bytes of key-set nodes this delta alone owns, and their number: what writes
@@ -411,7 +689,12 @@ impl Delta {
         mut check: impl FnMut() -> Result<()>,
     ) -> Result<(u64, u64)> {
         let (mut bytes, mut nodes) = (0u64, 0u64);
-        for set in self.ins.iter().chain(&self.del) {
+        for set in self
+            .ins
+            .iter()
+            .chain(&self.del)
+            .chain(std::iter::once(&self.reifiers_ins))
+        {
             let (b, n) = set.unshared_bytes(&mut check)?;
             bytes = bytes.saturating_add(b);
             nodes = nodes.saturating_add(n);
@@ -444,8 +727,8 @@ impl Delta {
         self.forget_with(p, n, subjects, objects, check)
     }
 
-    /// Take `q`, which is not in the base, out of the inserted quads.
-    pub(crate) fn remove_inserted(&mut self, q: &[Id; 4]) {
+    /// Take `q`, which is not in the base, out of the inserted quads. Returns whether `q` was present.
+    pub(crate) fn remove_inserted(&mut self, q: &[Id; 4]) -> bool {
         let mut removed = false;
         for perm in Perm::ALL {
             removed |= self.ins[perm.index()].remove(&perm.to_key(q));
@@ -454,6 +737,7 @@ impl Delta {
             let (s, p, o) = (q[0].0, q[1].0, q[2].0);
             self.forget(p, 1, &[s], &[o]);
         }
+        removed
     }
 
     /// Lower the statistics of predicate `p` by `n` removed quads, and by those of the
@@ -599,10 +883,31 @@ impl Delta {
 }
 
 /// A consistent, immutable view of the store.
+///
+/// Retaining a `Snapshot` (or cloning its `generation` or `delta` fields) pins the
+/// generation and delta storage it references until dropped. Internal count caches and
+/// triple-level access masks are crate-private so callers cannot retain them apart from
+/// the snapshot or forge an uncredited mask:
+///
+/// ```compile_fail
+/// use sparkles_core::store::Snapshot;
+/// fn escape_mask(snap: &Snapshot) {
+///     let _ = snap.mask.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use sparkles_core::store::Snapshot;
+/// fn escape_counts(snap: &Snapshot) {
+///     let _ = snap.counts.clone();
+/// }
+/// ```
 #[derive(Clone)]
 pub struct Snapshot {
     /// Dataset family identity (shared by its branches and derived views).
     pub dataset_id: uuid::Uuid,
+    /// Logical branch identity (dataset id for `main`, branch UUID for a branch).
+    pub branch_id: uuid::Uuid,
     pub generation: Arc<Generation>,
     pub delta: Delta,
     pub version: u64,
@@ -632,12 +937,24 @@ pub struct Snapshot {
     pub historical: bool,
     /// exact counts from the statistics corrected for this snapshot's delta, worked out
     /// once per snapshot
-    pub counts: Arc<crate::sparql::stats::CountCache>,
+    pub(crate) counts: Arc<crate::sparql::stats::CountCache>,
     /// the quads a triple-level access view hides, when this snapshot is such a view's
     /// (they are in the delta as deletions; see [`crate::access::triples`])
-    pub mask: Option<Arc<crate::access::Mask>>,
+    pub(crate) mask: Option<Arc<crate::access::Mask>>,
+    /// shared history-cache budget hold carried by a cached historical snapshot and
+    /// any derived masked snapshot sharing its persistent delta nodes
+    pub(crate) history_charge: Option<Arc<caches::BudgetHold>>,
     /// the store's change log, which history queries read (see [`ChangeLog`])
     pub change_log: Option<Arc<ChangeLog>>,
+    /// Live family managed-graph registry, shared without holding `Family` or its lock.
+    pub(crate) managed: Option<Arc<family::ManagedSlot>>,
+    /// Pinned historical evidence visibility config resolved from configuration history.
+    pub(crate) pinned_evidence: Option<crate::access::triples::evidence::EvidenceConfig>,
+    /// Managed publication generation paired with `pinned_evidence` when pinned from live head.
+    pub(crate) pinned_managed_generation: Option<u64>,
+    /// Non-owning handle to the originating branch's retained history for exact
+    /// same-branch `ev:StoredFact` verification without retaining `Family`.
+    pub(crate) history_origin: Option<evidence_view::HistoryOriginHandle>,
 }
 
 /// The kind of term an id stands for (see [`Snapshot::term_kind`]).
@@ -694,6 +1011,176 @@ pub enum Chunk<'a> {
 }
 
 impl Snapshot {
+    /// Active evidence review-policy configuration governing support-aware visibility of
+    /// accepted projections on this snapshot, or [`EvidenceConfig::Unavailable`] when the
+    /// governing registry or historical configuration cannot be verified.
+    pub(crate) fn evidence_projection_config(
+        &self,
+    ) -> crate::access::triples::evidence::EvidenceConfig {
+        if let Some(pinned) = &self.pinned_evidence {
+            return pinned.clone();
+        }
+        let state = self.managed.as_ref().and_then(|m| m.load_full());
+        Self::evidence_config_of_state(state.as_deref())
+    }
+
+    pub(crate) fn evidence_config_of_state(
+        state: Option<&crate::managed::ManagedState>,
+    ) -> crate::access::triples::evidence::EvidenceConfig {
+        use crate::access::triples::evidence::EvidenceConfig;
+        match state {
+            None => EvidenceConfig::None,
+            Some(crate::managed::ManagedState::Installed(installed)) => {
+                installed.evidence_visibility()
+            }
+            Some(crate::managed::ManagedState::Unavailable { reason, .. }) => {
+                EvidenceConfig::Unavailable(reason.clone())
+            }
+        }
+    }
+
+    pub(crate) fn evidence_key_of_config(
+        cfg: &crate::access::triples::evidence::EvidenceConfig,
+    ) -> Option<String> {
+        use crate::access::triples::evidence::EvidenceConfig;
+        match cfg {
+            EvidenceConfig::None => None,
+            EvidenceConfig::Active(cfg) => Some(cfg.fingerprint.clone()),
+            EvidenceConfig::Unavailable(_) => Some("unavailable".to_string()),
+        }
+    }
+
+    /// Freeze this snapshot's live evidence projection visibility configuration and its
+    /// paired managed publication generation into `pinned_evidence` /
+    /// `pinned_managed_generation` from a single atomic registry load so subsequent reads
+    /// and disclosure captures observe the exact coherent configuration governing the read.
+    pub fn pin_live_evidence(self: &Arc<Self>) -> Arc<Self> {
+        if self.pinned_evidence.is_some() {
+            return Arc::clone(self);
+        }
+        let (generation, config) = match self.managed.as_ref().map(|m| m.load_version()) {
+            Some(version) => (
+                version.generation,
+                Self::evidence_config_of_state(version.state.as_deref()),
+            ),
+            None => (0, crate::access::triples::evidence::EvidenceConfig::None),
+        };
+        Arc::new(Snapshot {
+            pinned_evidence: Some(config),
+            pinned_managed_generation: Some(generation),
+            ..(**self).clone()
+        })
+    }
+
+    /// Managed publication generation pinned on this snapshot, or the live family's current
+    /// managed generation when unpinned.
+    pub fn managed_generation(&self) -> u64 {
+        if let Some(generation) = self.pinned_managed_generation {
+            return generation;
+        }
+        self.managed.as_ref().map_or(0, |m| m.generation())
+    }
+
+    /// Atomically sample `(managed_generation, evidence_visibility_key)` from this
+    /// snapshot's pinned configuration or a single live `ManagedVersion` load.
+    pub fn evidence_visibility_stamp(&self) -> (u64, Option<String>) {
+        if let Some(pinned) = &self.pinned_evidence {
+            let generation = self
+                .pinned_managed_generation
+                .unwrap_or_else(|| self.managed.as_ref().map_or(0, |m| m.generation()));
+            return (generation, Self::evidence_key_of_config(pinned));
+        }
+        let Some(version) = self.managed.as_ref().map(|m| m.load_version()) else {
+            return (0, None);
+        };
+        let cfg = Self::evidence_config_of_state(version.state.as_deref());
+        (version.generation, Self::evidence_key_of_config(&cfg))
+    }
+
+    /// Stable cache-key suffix capturing this snapshot's active support-aware projection
+    /// visibility configuration, if any (or `"unavailable"` when fail-closed).
+    pub fn evidence_visibility_key(&self) -> Option<String> {
+        Self::evidence_key_of_config(&self.evidence_projection_config())
+    }
+
+    /// Whether support-aware projection visibility is active or unavailable (requiring
+    /// masking or fail-closed refusal for restricted callers).
+    pub fn has_evidence_projection_or_unavailable(&self) -> bool {
+        !self.evidence_projection_config().is_none()
+    }
+
+    /// Whether `graph_iri` is a review-policy projection output graph on this snapshot or
+    /// the snapshot's managed evidence configuration is unavailable (fail closed).
+    pub fn is_evidence_output_or_unavailable(&self, graph_iri: &str) -> bool {
+        use crate::access::triples::evidence::EvidenceConfig;
+        match self.evidence_projection_config() {
+            EvidenceConfig::None => false,
+            EvidenceConfig::Active(cfg) => cfg.is_output_graph(graph_iri),
+            EvidenceConfig::Unavailable(_) => true,
+        }
+    }
+
+    /// Whether support-aware projection visibility restricts a caller with `access` on
+    /// this snapshot or across the history range reachable from its dataset family.
+    pub(crate) fn has_evidence_visibility_for_access(
+        &self,
+        access: &crate::access::GraphAccess,
+    ) -> bool {
+        use crate::access::triples::evidence::EvidenceConfig;
+        if access.reads_everything() {
+            return false;
+        }
+        let policy_matches = |cfg: &crate::access::triples::evidence::ProjectionConfig| {
+            cfg.settings.policies.values().any(|p| {
+                oxrdf::NamedNode::new(&p.output).map_or(true, |n| {
+                    access.read.may_allow(Some(&oxrdf::Term::NamedNode(n)))
+                })
+            })
+        };
+        if let Some(pinned) = &self.pinned_evidence {
+            match pinned {
+                EvidenceConfig::Unavailable(_) => return true,
+                EvidenceConfig::Active(cfg) if policy_matches(cfg) => return true,
+                EvidenceConfig::Active(_) | EvidenceConfig::None => {}
+            }
+        }
+        let Some(state) = self.managed.as_ref().and_then(|m| m.load_full()) else {
+            return false;
+        };
+        match state.as_ref() {
+            crate::managed::ManagedState::Unavailable { .. } => true,
+            crate::managed::ManagedState::Installed(installed) => {
+                if installed.may_have_evidence_history() {
+                    return true;
+                }
+                match installed.evidence_visibility() {
+                    EvidenceConfig::Unavailable(_) => true,
+                    EvidenceConfig::Active(cfg) => policy_matches(&cfg),
+                    EvidenceConfig::None => false,
+                }
+            }
+        }
+    }
+    /// Whether this snapshot carries a triple-level access mask.
+    pub fn has_mask(&self) -> bool {
+        self.mask.is_some()
+    }
+
+    /// Process-unique identifier of this snapshot's triple-level access mask, if masked.
+    pub fn mask_id(&self) -> Option<u64> {
+        self.mask.as_ref().map(|m| m.id)
+    }
+
+    /// View key of this snapshot's triple-level access mask, if masked.
+    pub fn mask_key(&self) -> Option<&str> {
+        self.mask.as_ref().map(|m| m.key.as_str())
+    }
+
+    /// Number of quads hidden by this snapshot's triple-level access mask.
+    pub fn hidden_quad_count(&self) -> usize {
+        self.mask.as_ref().map_or(0, |m| m.hidden.len())
+    }
+
     /// The same snapshot, reading through the block cache without filling it: for full
     /// scans such as exports, which would evict the blocks queries use.
     pub fn without_cache_fill(&self) -> Snapshot {
@@ -752,6 +1239,98 @@ impl Snapshot {
         }
     }
 
+    /// Id of a term if it exists in this snapshot, checking live controls and admitting
+    /// the probe before allocating.
+    pub fn lookup_term_controlled(
+        &self,
+        t: &Term,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Id>> {
+        check()?;
+        match t {
+            Term::BlankNode(b) => Ok(parse_bnode_label(b.as_str())),
+            _ => {
+                if let Some(id) = id::inline_id(t) {
+                    return Ok(Some(id));
+                }
+                let Some(len) = id::term_key_len(t.as_ref()) else {
+                    admit(usize::MAX)?;
+                    return Err(Error::invalid("term key length overflow"));
+                };
+                admit(len)?;
+                check()?;
+                let mut key = Vec::with_capacity(len);
+                if key.capacity() > len {
+                    admit(key.capacity())?;
+                }
+                id::write_term_ref_key(t.as_ref(), &mut key);
+                debug_assert_eq!(key.len(), len);
+                self.find_key_controlled(&key, check)
+            }
+        }
+    }
+
+    /// Id of an IRI if it exists in this snapshot, checking live controls and admitting
+    /// the probe before allocating.
+    pub fn lookup_iri_controlled(
+        &self,
+        iri: &str,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Id>> {
+        check()?;
+        let Some(len) = iri.len().checked_add(1) else {
+            admit(usize::MAX)?;
+            return Err(Error::invalid("IRI key length overflow"));
+        };
+        admit(len)?;
+        check()?;
+        let mut key = Vec::with_capacity(len);
+        if key.capacity() > len {
+            admit(key.capacity())?;
+        }
+        key.push(b'<');
+        key.extend_from_slice(iri.as_bytes());
+        debug_assert_eq!(key.len(), len);
+        self.find_key_controlled(&key, check)
+    }
+
+    /// Id of a vocabulary key if it exists in this snapshot, checking live controls.
+    /// The allocation callbacks are retained for callers of this API. The search
+    /// compares directly against the supplied key and needs no reconstruction buffer.
+    pub fn lookup_key_controlled<E: From<Error>>(
+        &self,
+        key: &[u8],
+        _grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
+        _settled: impl FnMut(usize) -> std::result::Result<(), E>,
+        check: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<Id>, E> {
+        self.find_key_controlled(key, check)
+    }
+
+    fn find_key_controlled<E: From<Error>>(
+        &self,
+        key: &[u8],
+        mut check: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<Id>, E> {
+        check()?;
+        let found = match self
+            .generation
+            .vocab
+            .find_exact_controlled(key, |_| check())?
+        {
+            Ok(i) => Some(Id::vocab(i)),
+            Err(_) => self
+                .generation
+                .dvocab
+                .find_prepared(key, self.dvocab_len, &mut check)?
+                .map(Id::delta),
+        };
+        check()?;
+        Ok(found)
+    }
+
     pub fn lookup_iri(&self, iri: &str) -> Option<Id> {
         self.lookup_key(&id::iri_key(iri))
     }
@@ -789,6 +1368,115 @@ impl Snapshot {
                 .get_with(id.payload(), id::key_to_term),
             Tag::Delta => self.key(id).map(|k| id::key_to_term(&k)),
             _ => None,
+        }
+    }
+
+    /// Decode a stored id into an RDF term under explicit memory and control callbacks,
+    /// propagating any refusal with its original error instead of returning `None`.
+    pub fn term_controlled(
+        &self,
+        id: Id,
+        reserve: &mut dyn FnMut(usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Term>> {
+        check()?;
+        match id.tag() {
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => {
+                Ok(id::inline_to_literal(id).map(Term::Literal))
+            }
+            Tag::BNode => Ok(Some(Term::BlankNode(bnode_for(id)))),
+            Tag::Vocab => self.generation.vocab.get_with_controlled(
+                id.payload(),
+                reserve,
+                |_| check(),
+                id::key_to_term,
+            ),
+            Tag::Delta => {
+                let len = self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                reserve(len)?;
+                check()?;
+                Ok(self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(id::key_to_term)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Decode a stored id into an RDF term with explicit callbacks for vocabulary
+    /// scratch growth (`old_cap`, `new_cap`), settled scratch capacity (`cap`),
+    /// coexisting scratch and decoded-output bytes (`scratch_cap`, `key_len`), and
+    /// live request-control checkpoints.
+    pub(crate) fn term_controlled_owned(
+        &self,
+        id: Id,
+        grow: &mut dyn FnMut(usize, usize) -> Result<()>,
+        settled: &mut dyn FnMut(usize) -> Result<()>,
+        output: &mut dyn FnMut(usize, usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Term>> {
+        check()?;
+        match id.tag() {
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => {
+                output(0, 0)?;
+                Ok(id::inline_to_literal(id).map(Term::Literal))
+            }
+            Tag::BNode => {
+                output(0, 0)?;
+                Ok(Some(Term::BlankNode(bnode_for(id))))
+            }
+            Tag::Vocab => {
+                let key = self.generation.vocab.get_owned_with_controlled(
+                    id.payload(),
+                    grow,
+                    &mut *settled,
+                    |_| check(),
+                    Ok,
+                );
+                let Some(key) = (match key {
+                    Ok(key) => key,
+                    Err(err) => {
+                        let _ = settled(0);
+                        return Err(err);
+                    }
+                }) else {
+                    settled(0)?;
+                    return Ok(None);
+                };
+                let cap = key.capacity();
+                if let Err(err) = output(cap, key.len()).and_then(|()| check()) {
+                    drop(key);
+                    let _ = settled(0);
+                    return Err(err);
+                }
+                let term = id::key_to_term(&key);
+                drop(key);
+                settled(0)?;
+                Ok(Some(term))
+            }
+            Tag::Delta => {
+                let len = self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                output(0, len)?;
+                check()?;
+                Ok(self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(id::key_to_term)))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -873,6 +1561,19 @@ impl Snapshot {
         self.scan_between_cols(perm, lo, hi, crate::index::ALL_COLS, f)
     }
 
+    /// Like [`scan_between`](Self::scan_between), with a fallible control before index
+    /// reads and during the delta merge, including rows removed by deletions.
+    pub fn scan_between_checked(
+        &self,
+        perm: Perm,
+        lo: Key,
+        hi: Key,
+        check: impl Fn() -> Result<()>,
+        f: impl FnMut(Chunk<'_>) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_between_cols_checked(perm, lo, hi, crate::index::ALL_COLS, check, f)
+    }
+
     /// [`scan_between`](Self::scan_between) for a reader that only looks at the key
     /// columns in `mask` of base blocks: the others may be left undecoded (and read as
     /// 0). A block with delta changes in it, or between it and the block before, has
@@ -885,19 +1586,31 @@ impl Snapshot {
         mask: crate::index::ColMask,
         f: impl FnMut(Chunk<'_>) -> Result<bool>,
     ) -> Result<()> {
-        self.scan_between_cols_checked(perm, lo, hi, mask, || Ok(()), f)
+        self.scan_between_cols_with(perm, lo, hi, mask, &crate::budgeted::Unlimited, f)
     }
 
-    fn scan_between_cols_checked(
+    pub(crate) fn scan_between_cols_checked(
         &self,
         perm: Perm,
         lo: Key,
         hi: Key,
         mask: crate::index::ColMask,
         check: impl Fn() -> Result<()>,
+        f: impl FnMut(Chunk<'_>) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_between_cols_with(perm, lo, hi, mask, &crate::budgeted::FnControl(check), f)
+    }
+
+    pub(crate) fn scan_between_cols_with<C: crate::budgeted::Control>(
+        &self,
+        perm: Perm,
+        lo: Key,
+        hi: Key,
+        mask: crate::index::ColMask,
+        control: &C,
         mut f: impl FnMut(Chunk<'_>) -> Result<bool>,
     ) -> Result<()> {
-        check()?;
+        control.check(0)?;
         let pi = perm.index();
         let (ins_set, del_set) = (&self.delta.ins[pi], &self.delta.del[pi]);
         let mut ins = Delta::key_range(ins_set, lo, hi).peekable();
@@ -922,12 +1635,12 @@ impl Snapshot {
         };
         let mut stop = false;
         if base.rows > 0 {
-            let r = base.for_each_key_range_masked_checked(
+            let r = base.for_each_key_range_masked_with(
                 &self.cache,
                 &lo,
                 &hi,
                 mask_of,
-                &check,
+                control,
                 |blk, s, e| {
                     if stop {
                         return Ok(!stop);
@@ -955,7 +1668,7 @@ impl Snapshot {
                             (Some(a), _) => (a, true),
                             (None, Some(d)) => (d, false),
                         };
-                        check()?;
+                        control.check(0)?;
                         let j = first_row_from(blk, i, e, &k);
                         if i < j && !f(Chunk::Block(blk, i, j))? {
                             stop = true;
@@ -987,12 +1700,12 @@ impl Snapshot {
         }
         if !stop {
             for k in ins {
-                check()?;
+                control.check(0)?;
                 if !f(Chunk::Row(*k))? {
                     return Ok(());
                 }
             }
-            check()?;
+            control.check(0)?;
         }
         Ok(())
     }
@@ -1267,13 +1980,13 @@ impl Snapshot {
                 continue;
             }
             if delta.del[spo].contains(&k) {
-                apply(&mut delta, q, true, true);
+                apply(&self.generation, &mut delta, q, true, true);
                 continue;
             }
             if !absent && self.perm(Perm::Spo).contains(&self.cache, &k)? {
                 continue;
             }
-            apply(&mut delta, q, true, false);
+            apply(&self.generation, &mut delta, q, true, false);
         }
         Ok(Snapshot {
             delta,
@@ -1284,15 +1997,15 @@ impl Snapshot {
     }
 
     /// Distinct values of the first key column (e.g. graph names from GSPO), by skipping.
-    fn distinct_first_checked(
+    fn distinct_first_with<C: crate::budgeted::Control>(
         &self,
         perm: Perm,
-        check: impl Fn() -> Result<()>,
+        control: &C,
         mut each: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
         let mut cur: Option<u64> = None;
         loop {
-            check()?;
+            control.check(0)?;
             let from = match cur {
                 None => 0,
                 Some(u64::MAX) => break,
@@ -1304,7 +2017,7 @@ impl Snapshot {
             let b = base.blocks.partition_point(|m| m.last[0] < from);
             if b < base.blocks.len() {
                 let blk = self.cache.get(base, b)?;
-                check()?;
+                control.check(0)?;
                 let i = blk.cols[0].partition_point(|&v| v < from);
                 if i < blk.len() {
                     next = Some(blk.cols[0][i]);
@@ -1323,13 +2036,20 @@ impl Snapshot {
             // whether any quad remains under `v`: the first one found answers it, where
             // a count would walk every inserted and deleted key of the delta under `v`
             let mut any = false;
-            self.scan_checked(perm, &[v], &check, |c| {
-                any = match c {
-                    Chunk::Block(_, start, end) => start < end,
-                    Chunk::Row(_) => true,
-                };
-                Ok(!any)
-            })?;
+            self.scan_between_cols_with(
+                perm,
+                pad(&[v], 0),
+                pad(&[v], u64::MAX),
+                crate::index::ALL_COLS,
+                control,
+                |c| {
+                    any = match c {
+                        Chunk::Block(_, start, end) => start < end,
+                        Chunk::Row(_) => true,
+                    };
+                    Ok(!any)
+                },
+            )?;
             if any {
                 each(v)?;
             }
@@ -1341,15 +2061,27 @@ impl Snapshot {
     /// Distinct values of the first key column (e.g. graph names from GSPO), by skipping.
     pub fn distinct_first(&self, perm: Perm) -> Result<Vec<u64>> {
         let mut out = Vec::new();
-        self.distinct_first_checked(
-            perm,
-            || Ok(()),
-            |value| {
-                out.push(value);
-                Ok(())
-            },
-        )?;
+        self.distinct_first_with(perm, &crate::budgeted::Unlimited, |value| {
+            out.push(value);
+            Ok(())
+        })?;
         Ok(out)
+    }
+
+    /// Visit visible named graph IDs in the same order as `graph_ids`, without a list,
+    /// under `control`.
+    pub(crate) fn for_each_graph_id_with<C: crate::budgeted::Control>(
+        &self,
+        control: &C,
+        mut each: impl FnMut(Id) -> Result<()>,
+    ) -> Result<()> {
+        self.distinct_first_with(Perm::Gspo, control, |value| {
+            let graph = Id(value);
+            if graph != Id::DEFAULT_GRAPH {
+                each(graph)?;
+            }
+            Ok(())
+        })
     }
 
     /// Visit visible named graph IDs in the same order as graph_ids, without a list.
@@ -1357,15 +2089,9 @@ impl Snapshot {
     pub(crate) fn for_each_graph_id_checked(
         &self,
         check: impl Fn() -> Result<()>,
-        mut each: impl FnMut(Id) -> Result<()>,
+        each: impl FnMut(Id) -> Result<()>,
     ) -> Result<()> {
-        self.distinct_first_checked(Perm::Gspo, check, |value| {
-            let graph = Id(value);
-            if graph != Id::DEFAULT_GRAPH {
-                each(graph)?;
-            }
-            Ok(())
-        })
+        self.for_each_graph_id_with(&crate::budgeted::FnControl(check), each)
     }
 
     /// All named graph ids (excludes the default graph).
@@ -1532,17 +2258,13 @@ pub struct StoreOptions {
     pub wal_direct_writes: bool,
     /// Group commit: concurrent commits of a persistent store share one synchronization,
     /// and each is acknowledged once the prefix that holds it is durable. On by default,
-    /// and ignored for in-memory stores. Writes the group does not admit (merges, forced
-    /// and bulk commits, and commits while a full-text index recovers or rebuilds or a
-    /// spatial index builds or has failed) drain it and take the ordinary path. Datasets
+    /// and ignored for in-memory stores. Every persistent WAL commit goes through the
+    /// coordinator's fence; when this is off, or for writes the group does not admit
+    /// (merges, forced, control and bulk commits, and commits while a full-text index
+    /// recovers or rebuilds or a spatial index builds or has failed), the commit drains
+    /// prior grouped work and leads a solo fence of one under the writer lock. Datasets
     /// with a full-text, spatial or embedding index otherwise group their commits.
     pub group_commit: bool,
-    /// With group commit on, a commit that is the only writer (nothing queued, no fence
-    /// running, no transaction waiting for the writer lock) takes the ordinary path with
-    /// its write-through writes, which need no cache flush. On by default. Only tests turn
-    /// it off, to send every admitted commit through the group.
-    #[doc(hidden)]
-    pub group_commit_idle_direct: bool,
     /// Record each commit's net changes in the change log ([`ChangeLog`]), which history
     /// queries read and which outlives compactions. A dataset's `changelog.json` can
     /// turn it off or on.
@@ -1573,6 +2295,95 @@ pub const DEFAULT_WAL_PREALLOC_BYTES: u64 = 4 << 20;
 
 /// The file of the prefix names that a dataset's runtime layer removes (spec C20 §3.2).
 pub const REMOVED_PREFIXES_FILE: &str = "prefixes-removed.json";
+/// Versioned crash-recovery staging file for prefixes published jointly with a commit.
+const STAGED_PREFIXES_FILE: &str = "prefixes.staged.tmp";
+/// Temporary write path renamed into [`STAGED_PREFIXES_FILE`].
+const STAGED_PREFIXES_WRITE_TMP: &str = "prefixes.staged.write.tmp";
+/// Legacy v1 format version of [`STAGED_PREFIXES_FILE`] (quad commits without `control_seq`).
+const STAGED_PREFIXES_FORMAT_VERSION_V1: u32 = 1;
+/// Current format version of [`STAGED_PREFIXES_FILE`] (adds `control_seq` for control-only
+/// transactions).
+const STAGED_PREFIXES_FORMAT_VERSION: u32 = 2;
+/// Minimum dataset reader required before writing a v2 [`STAGED_PREFIXES_FILE`], so older
+/// binaries refuse in `check_dataset_compatibility` before WAL repair or catalog open.
+pub(crate) const STAGED_PREFIXES_V2_READER: u32 = 10;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedPrefixesFileV1 {
+    format_version: u32,
+    commit_seq: u64,
+    prefixes: BTreeMap<String, String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedPrefixesFileV2 {
+    format_version: u32,
+    commit_seq: u64,
+    control_seq: u64,
+    prefixes: BTreeMap<String, String>,
+}
+
+struct StagedPrefixesRecord {
+    commit_seq: u64,
+    control_seq: Option<u64>,
+    prefixes: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod staged_prefix_test_hooks {
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    pub(super) struct Faults {
+        pub fail_after_stage_rename: bool,
+        pub fail_clear_staged: bool,
+    }
+
+    thread_local! {
+        static FAULTS: RefCell<Faults> = RefCell::new(Faults::default());
+    }
+
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAULTS.with(|f| *f.borrow_mut() = Faults::default());
+        }
+    }
+
+    pub(super) fn install(faults: Faults) -> Guard {
+        FAULTS.with(|f| *f.borrow_mut() = faults);
+        Guard
+    }
+
+    pub(super) fn after_stage_rename() -> crate::error::Result<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_after_stage_rename {
+                s.fail_after_stage_rename = false;
+                return Err(crate::error::Error::Io(std::io::Error::other(
+                    "injected directory sync failure after staging prefixes.staged.tmp",
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn before_clear_staged() -> crate::error::Result<()> {
+        FAULTS.with(|f| {
+            let mut s = f.borrow_mut();
+            if s.fail_clear_staged {
+                s.fail_clear_staged = false;
+                return Err(crate::error::Error::Io(std::io::Error::other(
+                    "injected failure clearing prefixes.staged.tmp",
+                )));
+            }
+            Ok(())
+        })
+    }
+}
 
 /// Whether loaded data may bind a prefix name (spec C20 §3.4).
 pub type PrefixFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -1614,7 +2425,6 @@ impl Default for StoreOptions {
             wal_prealloc_bytes: DEFAULT_WAL_PREALLOC_BYTES,
             wal_direct_writes: true,
             group_commit: true,
-            group_commit_idle_direct: true,
             change_log: true,
             change_log_max_bytes: DEFAULT_CHANGE_LOG_MAX_BYTES,
             change_log_segment_bytes: 16 << 20,
@@ -1626,7 +2436,7 @@ impl Default for StoreOptions {
 }
 
 struct WriterState {
-    wal: Option<BufWriter<File>>,
+    wal: Option<Arc<File>>,
     /// bytes of complete transactions in the current generation's WAL, those of grouped
     /// commits still queued for their fence included
     wal_len: u64,
@@ -1639,8 +2449,6 @@ struct WriterState {
     head: CommitInfo,
     /// a WAL or generation write failed after a commit started: refuse further writes
     poisoned: bool,
-    /// Reused only for commits introducing persisted vocabulary entries.
-    vocab_sync: crate::vocab::LazySync,
     /// Private speculative state: readers and receipts only see the synced prefix.
     staged: Option<Arc<Snapshot>>,
     /// the store is being dropped: a backup lease released later must not collect
@@ -1663,9 +2471,8 @@ impl WriterState {
         if !self.poisoned
             && io.end == len
             && io.alloc > len
-            && let Some(wal) = self.wal.as_mut()
-            && wal.flush().is_ok()
-            && wal.get_ref().set_len(len).is_ok()
+            && let Some(wal) = self.wal.as_ref()
+            && wal.set_len(len).is_ok()
         {
             io.alloc = len;
             self.tail.release(&io);
@@ -1683,9 +2490,14 @@ struct BulkCommit {
     /// the commit may change the default graph
     default_graph: bool,
     admission: Option<managed::AdmittedManaged>,
+    /// when true, a rebuild with zero deletions and zero net insertions preserves the
+    /// head commit and returns `committed: false` instead of publishing an empty commit
+    skip_if_unchanged: bool,
+    /// prefixes staged by a bulk [`WriteTxn`] for crash-atomic publication with this commit
+    staged_prefixes: BTreeMap<String, String>,
 }
 
-/// What [`Store::build_generation`] builds a bulk commit's generation from.
+/// What [`Store::build_generation_classified`] builds a bulk commit's generation from.
 struct GenerationInput<'a> {
     extra: &'a [Source],
     extra_quads: &'a [[Id; 4]],
@@ -1695,8 +2507,6 @@ struct GenerationInput<'a> {
     /// the most changed quads the build collects for the change log
     change_cap: Option<u64>,
     opts: &'a crate::guard::WriteOptions,
-    /// a dry run, which records a refused storage check instead of failing
-    dry: bool,
 }
 
 /// A bulk commit's generation, built and not yet published.
@@ -1706,7 +2516,6 @@ struct BuiltGeneration {
     /// the temporary directory of an in-memory store's generation
     tmp: Option<tempfile::TempDir>,
     meta: IndexMeta,
-    storage: crate::preview::StorageCheck,
     /// the quads the sources gave, when the change tap collected them all
     sourced: Option<Vec<QuadKey>>,
     /// the quads of the dropped graphs, unless there were more than the change cap
@@ -1725,7 +2534,7 @@ struct SwitchFailed {
 /// The log of a generation that `CURRENT` now names, which the writer moves onto (see
 /// [`Store::adopt_generation_log`]).
 struct NextLog {
-    wal: BufWriter<File>,
+    wal: Arc<File>,
     tail: Arc<wal::Tail>,
     len: u64,
     index: wal::WalIndex,
@@ -1749,12 +2558,38 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// Whether loading `sources` may write to the default graph: a quad format may hold
-/// default-graph quads, a triple format writes there unless a target graph is set.
+/// Whether loading `sources` may write to the default graph: every syntax remaps
+/// default-graph quads to `s.graph` when set and keeps named graphs as named graphs, so
+/// only a source without a target graph can write to the default graph.
 fn sources_reach_default_graph(sources: &[Source]) -> bool {
-    sources
-        .iter()
-        .any(|s| s.graph.is_none() || s.format.supports_datasets())
+    sources.iter().any(|s| s.graph.is_none())
+}
+
+/// Error provenance from [`Store::load_sparql`], separating failures while reading,
+/// decoding or parsing the `LOAD` source (which `LOAD SILENT` hides) from store, builder,
+/// guard, publish-hook, control, budget and commit failures (which `LOAD SILENT` never
+/// hides).
+pub(crate) enum SparqlLoadError {
+    Source(Error),
+    Store(Error),
+}
+
+impl SparqlLoadError {
+    pub(crate) fn into_inner(self) -> Error {
+        match self {
+            SparqlLoadError::Source(e) | SparqlLoadError::Store(e) => e,
+        }
+    }
+}
+
+fn classify_source_error(e: Error, allow_io: bool) -> SparqlLoadError {
+    match e {
+        Error::RdfParse(_) | Error::Invalid(_) | Error::Unsupported(_) => {
+            SparqlLoadError::Source(e)
+        }
+        Error::Io(_) if allow_io => SparqlLoadError::Source(e),
+        other => SparqlLoadError::Store(other),
+    }
 }
 
 type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -1777,6 +2612,9 @@ pub struct Store {
     cache: Arc<BlockCache>,
     results: Arc<crate::sparql::cache::ResultCache>,
     prefixes: Mutex<BTreeMap<String, String>>,
+    /// an unresolved staged-prefix sidecar may remain on disk after a failed cleanup or
+    /// uncertain commit: refuse standalone prefix mutations so reopen cannot overwrite them
+    prefixes_poisoned: AtomicBool,
     /// the prefix names the runtime layer removes (spec C20 §3.2), kept in
     /// `prefixes-removed.json`; a name is never both bound and removed
     removed_prefixes: Mutex<BTreeSet<String>>,
@@ -1810,7 +2648,10 @@ pub struct Store {
     /// pins, retention, generations and materialized past states (persistent stores)
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
     /// pins and the retention window of an in-memory store, as kept snapshots
-    mem_history: Option<Mutex<crate::history::MemHistory>>,
+    mem_history: Option<Arc<Mutex<crate::history::MemHistory>>>,
+    /// Non-owning handle owned by this store and weakly referenced by its snapshots so
+    /// support-aware masking can resolve retained same-branch `ev:StoredFact` commits.
+    history_origin: Arc<evidence_view::HistoryOrigin>,
     /// the net changes of every commit, kept across generations
     changelog: Option<Arc<ChangeLog>>,
     /// write guard checked before every commit (write-time validation)
@@ -1847,6 +2688,9 @@ pub struct Store {
     control_refusal: Mutex<Option<fn() -> Error>>,
     /// the published control state (spec C26 §2.1), when the keyspace is enabled
     control: arc_swap::ArcSwapOption<crate::control::ControlState>,
+    /// Verified imported-origin closure and proven WAL intervals retained from the
+    /// opening proof of an imported destination (drops before `_lock` and `family`).
+    imported_opening: Option<Arc<configuration_history::ImportedRetained>>,
     /// Keep exclusion through Drop and every other owned field's destructor.
     /// Fields drop in declaration order. Only the family root lease follows this.
     _lock: Option<Arc<ProcessLock>>,
@@ -2127,26 +2971,45 @@ impl Store {
         // long as the store
         let control_log = None;
         let control_state = None;
+        let mem_history = Some(Arc::new(Mutex::new(Default::default())));
+        let current = Arc::new(ArcSwap::from_pointee(
+            SnapshotBuilder::of_generation(
+                Shared {
+                    dataset_id,
+                    branch_id: dataset_id,
+                    cache: &cache,
+                    results: &results,
+                    union_default_graph: opts.union_default_graph,
+                    aggregate_errors: opts.aggregate_errors,
+                    geo_op_vertices: opts.geo_op_vertices,
+                    change_log: changelog.clone(),
+                    managed: Some(family.managed.clone()),
+                    history_origin: None,
+                },
+                gen_,
+                root.seq,
+            )
+            .build(),
+        ));
+        let history_origin = Arc::new(evidence_view::HistoryOrigin::new_memory(
+            dataset_id,
+            dataset_id,
+            mem_history.clone(),
+            family.managed.clone(),
+            Arc::downgrade(&current),
+        ));
+        {
+            let mut init = (*current.load_full()).clone();
+            init.history_origin = Some(evidence_view::HistoryOriginHandle::Resident(
+                Arc::downgrade(&history_origin),
+            ));
+            current.store(Arc::new(init));
+        }
         let store = Store {
             root: None,
             group: None,
             commit_stats: Default::default(),
-            current: Arc::new(ArcSwap::from_pointee(
-                SnapshotBuilder::of_generation(
-                    Shared {
-                        dataset_id,
-                        cache: &cache,
-                        results: &results,
-                        union_default_graph: opts.union_default_graph,
-                        aggregate_errors: opts.aggregate_errors,
-                        geo_op_vertices: opts.geo_op_vertices,
-                        change_log: changelog.clone(),
-                    },
-                    gen_,
-                    root.seq,
-                )
-                .build(),
-            )),
+            current,
             writer: Arc::new(Mutex::new(WriterState {
                 wal: None,
                 wal_len: 0,
@@ -2154,7 +3017,6 @@ impl Store {
                 next_bnode,
                 head: root,
                 poisoned: false,
-                vocab_sync: Default::default(),
                 staged: None,
                 closed: false,
                 tap: None,
@@ -2163,8 +3025,10 @@ impl Store {
             cache,
             results,
             prefixes: Mutex::new(prefixes),
+            prefixes_poisoned: AtomicBool::new(false),
             removed_prefixes: Mutex::new(BTreeSet::new()),
             prefix_filter: Mutex::new(None),
+            imported_opening: None,
             _lock: None,
             family: family.clone(),
             _close_complete: Arc::new(()),
@@ -2183,7 +3047,8 @@ impl Store {
             embed: Default::default(),
             deltas: Default::default(),
             history: None,
-            mem_history: Some(Mutex::new(Default::default())),
+            mem_history,
+            history_origin,
             changelog,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
@@ -2306,12 +3171,16 @@ impl Store {
             // registry or of its history root, before anything is written.
             managed_history::check_activated_registry(root, state.as_ref())?;
             if let Some(state) = state {
-                family.managed.store(Some(Arc::new(state)));
+                family.store_managed(Some(Arc::new(state)));
             }
         } else {
             commit::check_dataset_compatibility(root)?;
             crate::formats::check_dataset_dir(root)?;
         }
+        // Check any staged prefix recovery file's format version before WAL tail repair,
+        // catalog opening, or generation creation so an unsupported version never modifies
+        // any file on disk.
+        preflight_staged_prefixes(root)?;
         let configuration_preparation = managed_history::administrative_preparation()?;
         if ctx.is_none() {
             // Pin import selection before generation creation, replay, recovery
@@ -2418,22 +3287,15 @@ impl Store {
             )));
         };
         let catalog_path = root.join("commits.bin");
-        let (base, base_configuration) = match commit::read_gen_commit_full(&root.join(&name))? {
+        let physical_commit = match commit::read_gen_commit_full(&root.join(&name))? {
             Some(physical) => {
-                let commit::RetainedGenerationCommit {
-                    dataset_id: id,
-                    commit: c,
-                    origin,
-                    configuration: binding,
-                    ..
-                } = physical;
-                if id != dataset_id {
+                if physical.dataset_id != dataset_id {
                     return Err(Error::Corrupt(format!(
-                        "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
+                        "{name}/commit.json belongs to dataset {}, not {dataset_id}",
+                        physical.dataset_id
                     )));
                 }
-                let _ = origin;
-                (c, binding)
+                physical
             }
             // Only a pre-release build left a current generation without its
             // commit.json, and the cutoff refuses it instead of giving it a
@@ -2446,31 +3308,64 @@ impl Store {
                 )));
             }
         };
+        let base = physical_commit.commit;
+        let base_configuration = physical_commit.configuration;
         let configuration_root = if ctx.is_some() {
             link::dataset_root_of(root)?
         } else {
             root.to_path_buf()
         };
         let configuration_state = family.managed.load_full();
-        let mut configuration_references = configuration_history::primary::References::new(
-            &configuration_root,
-            ctx.as_ref().map_or(dataset_id, |ctx| ctx.ident.dataset_id),
-            dataset_id,
-            ctx.as_ref().and_then(|ctx| {
-                ctx.ident
-                    .configuration_origin
-                    .as_ref()
-                    .map(|origin| (ctx.ident.from.seq, origin))
-            }),
-            configuration_state.as_deref(),
-            &configuration_preparation,
-        )?;
-        configuration_references.generation(base.seq, base_configuration)?;
+        let gen_ = Arc::new(gen_);
+        let (mut configuration_references, imported_opening) = if ctx.is_none()
+            && family.has_destination_origin()
+        {
+            let pending = configuration_history::ImportedOpening::opening(
+                root,
+                &family,
+                &lock,
+                &gen_,
+                &physical_commit,
+                &configuration_preparation,
+            )?
+            .ok_or_else(|| {
+                managed_history::unavailable("destination import origin disappeared during open")
+            })?;
+            (None, Some(pending))
+        } else {
+            let mut refs = configuration_history::primary::References::new(
+                &configuration_root,
+                ctx.as_ref().map_or(dataset_id, |ctx| ctx.ident.dataset_id),
+                dataset_id,
+                ctx.as_ref().and_then(|ctx| {
+                    ctx.ident
+                        .configuration_origin
+                        .as_ref()
+                        .map(|origin| (ctx.ident.from.seq, origin))
+                }),
+                configuration_state.as_deref(),
+                &configuration_preparation,
+            )?;
+            if ctx.is_some()
+                && let crate::history::ConfigurationBinding::ImportedUnbound { source } =
+                    base_configuration
+            {
+                refs.check_imported_unbound_base(base.seq, base_configuration)?;
+                configuration_history::verify_imported_identity_for_family(
+                    &configuration_root,
+                    &family,
+                    source,
+                    &configuration_preparation,
+                )?;
+            } else {
+                refs.generation(base.seq, base_configuration)?;
+            }
+            (Some(refs), None)
+        };
         // replay the WAL (a linked generation's onto the delta of its starting commit)
         let wal_path = root.join(&name).join("wal.log");
         let mut delta = gen_.base_delta();
         let mut version = 0;
-        let gen_ = Arc::new(gen_);
         let mut replayed: Vec<CommitInfo> = Vec::new();
         // the quads each replayed commit changed, for catching up the full-text index
         let text_on = cfg!(feature = "text") && root.join("text.json").exists();
@@ -2482,6 +3377,7 @@ impl Store {
         let mut wal_control = Vec::new();
         // the repair of the log's tail, made only once the control keyspace recovered
         let mut wal_repair = None;
+        let mut imported_retained: Option<Arc<configuration_history::ImportedRetained>> = None;
         if wal_path.exists() {
             let mut buf = Vec::new();
             File::open(&wal_path)?.read_to_end(&mut buf)?;
@@ -2497,9 +3393,18 @@ impl Store {
                 start: gen_.base_delta(),
                 annotated: annotated.as_ref(),
             };
-            let r = replay_wal(&from, &buf, &mut |_, _| Ok(()), &mut |observation| {
-                configuration_references.observation(observation)
-            })?;
+            let r = if let Some(pending) = imported_opening {
+                let completed = pending.replay(&from, &buf, &configuration_preparation)?;
+                imported_retained = Some(Arc::new(completed.imports));
+                completed.replay
+            } else {
+                let refs = configuration_references
+                    .as_mut()
+                    .expect("primary references");
+                replay_wal(&from, &buf, &mut |_, _| Ok(()), &mut |observation| {
+                    refs.observation(observation)
+                })?
+            };
             wal_len = r.good as u64;
             if r.good == 0 || r.good != buf.len() {
                 wal_repair = Some(r.good as u64);
@@ -2511,6 +3416,8 @@ impl Store {
             next_bnode = r.next_bnode.max(bnode_floor);
             wal_text = r.touched;
             wal_control = r.control;
+        } else if let Some(pending) = imported_opening {
+            imported_retained = Some(Arc::new(pending.verify_no_wal()?));
         }
         drop(configuration_references);
         drop(configuration_state);
@@ -2565,6 +3472,12 @@ impl Store {
             .last()
             .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
             .unwrap_or(base);
+        reconcile_staged_prefixes(
+            root,
+            head.seq,
+            control_opened.as_ref().map(|o| o.state.seq),
+            &mut prefixes,
+        )?;
         // The settings files were checked by the preflight after the lock, and every file
         // this open read is in a version this build reads. The release now writes the
         // database: record it in dataset.json, and require the reader of the
@@ -2582,7 +3495,7 @@ impl Store {
         let wal = wal::open_for_append(
             &wal_path,
             wal::version_with(
-                managed_history::activated(family.managed.load().as_deref(), Some(root)),
+                managed_history::activated(family.managed.load().state.as_deref(), Some(root)),
                 control_on,
             ),
         )?;
@@ -2672,41 +3585,78 @@ impl Store {
                 branching.set = branching::SetRef::Owner(set);
             }
         }
+        let owner_dataset_id = branching
+            .ident
+            .as_ref()
+            .map_or(dataset_id, |i| i.dataset_id);
+        let history_arc = Some(Arc::new(Mutex::new({
+            let mut history = history;
+            history.use_budget(match &opts.shared {
+                Some(s) => s.caches.history().clone(),
+                None => Arc::new(caches::ByteBudget::new(opts.history_cache_bytes)),
+            });
+            history
+        })));
+        let managed_root = branching
+            .set()
+            .filter(|s| !s.is_memory())
+            .map(|s| s.root().to_path_buf())
+            .unwrap_or_else(|| root.to_path_buf());
+        let current = Arc::new(ArcSwap::from_pointee(
+            SnapshotBuilder::of_generation(
+                Shared {
+                    dataset_id: owner_dataset_id,
+                    branch_id: dataset_id,
+                    cache: &cache,
+                    results: &results,
+                    union_default_graph: opts.union_default_graph,
+                    aggregate_errors: opts.aggregate_errors,
+                    geo_op_vertices: opts.geo_op_vertices,
+                    change_log: changelog.clone(),
+                    managed: Some(family.managed.clone()),
+                    history_origin: None,
+                },
+                gen_,
+                head.seq,
+            )
+            .delta(delta)
+            .version(version)
+            .build(),
+        ));
+        let history_origin = Arc::new(evidence_view::HistoryOrigin::new_persistent(
+            owner_dataset_id,
+            dataset_id,
+            root.to_path_buf(),
+            managed_root,
+            history_arc.clone(),
+            family.managed.clone(),
+            Arc::downgrade(&current),
+            cache.clone(),
+            results.clone(),
+            opts.union_default_graph,
+            opts.aggregate_errors,
+            opts.geo_op_vertices,
+            opts.history_cache_bytes,
+        ));
+        {
+            let mut init = (*current.load_full()).clone();
+            init.history_origin = Some(evidence_view::HistoryOriginHandle::Resident(
+                Arc::downgrade(&history_origin),
+            ));
+            current.store(Arc::new(init));
+        }
         let store = Store {
             root: Some(root.to_path_buf()),
-            group: opts
-                .group_commit
-                .then(|| Arc::new(group::Coordinator::default())),
+            group: Some(Arc::new(group::Coordinator::default())),
             commit_stats: Default::default(),
-            current: Arc::new(ArcSwap::from_pointee(
-                SnapshotBuilder::of_generation(
-                    Shared {
-                        dataset_id: branching
-                            .ident
-                            .as_ref()
-                            .map_or(dataset_id, |i| i.dataset_id),
-                        cache: &cache,
-                        results: &results,
-                        union_default_graph: opts.union_default_graph,
-                        aggregate_errors: opts.aggregate_errors,
-                        geo_op_vertices: opts.geo_op_vertices,
-                        change_log: changelog.clone(),
-                    },
-                    gen_,
-                    head.seq,
-                )
-                .delta(delta)
-                .version(version)
-                .build(),
-            )),
+            current,
             writer: Arc::new(Mutex::new(WriterState {
-                wal: Some(BufWriter::new(wal)),
+                wal: Some(Arc::new(wal)),
                 wal_len,
                 tail: wal::Tail::new(wal_len, wal_len),
                 next_bnode,
                 head,
                 poisoned: false,
-                vocab_sync: Default::default(),
                 staged: None,
                 closed: false,
                 tap: None,
@@ -2715,8 +3665,10 @@ impl Store {
             cache,
             results,
             prefixes: Mutex::new(prefixes),
+            prefixes_poisoned: AtomicBool::new(false),
             removed_prefixes: Mutex::new(removed_prefixes),
             prefix_filter: Mutex::new(None),
+            imported_opening: imported_retained,
             _lock: Some(lock.clone()),
             family: family.clone(),
             _close_complete: Arc::new(()),
@@ -2734,15 +3686,9 @@ impl Store {
             vector: Default::default(),
             embed: Default::default(),
             deltas: Default::default(),
-            history: Some(Arc::new(Mutex::new({
-                let mut history = history;
-                history.use_budget(match &opts.shared {
-                    Some(s) => s.caches.history().clone(),
-                    None => Arc::new(caches::ByteBudget::new(opts.history_cache_bytes)),
-                });
-                history
-            }))),
+            history: history_arc,
             mem_history: None,
+            history_origin,
             changelog,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
@@ -2949,13 +3895,24 @@ impl Store {
         head: CommitInfo,
         limit: &C,
     ) -> Result<crate::history::Resolved> {
+        self.resolve_in_seq(at, head.seq, limit)
+    }
+
+    /// [`resolve`](Self::resolve) against a captured committed head sequence `head_seq`,
+    /// under `limit`.
+    pub(super) fn resolve_in_seq<C: crate::budgeted::Control>(
+        &self,
+        at: &crate::history::At,
+        head_seq: u64,
+        limit: &C,
+    ) -> Result<crate::history::Resolved> {
         use crate::history::At;
         let seq = match at {
-            At::Head => head.seq,
+            At::Head => head_seq,
             At::Commit(n) => *n,
             At::Time(ms) => {
                 let cat = limit.lock(&self.catalog)?;
-                match cat.at_time(*ms) {
+                match cat.at_time_up_to(*ms, head_seq) {
                     Some(c) => c.seq,
                     None if self.branching.ident.is_some() => {
                         drop(cat);
@@ -2984,10 +3941,9 @@ impl Store {
                 found.ok_or_else(|| Error::NotFound(format!("no snapshot '{name}'")))?
             }
         };
-        if seq > head.seq {
+        if seq > head_seq {
             return Err(Error::NotFound(format!(
-                "no commit {seq} (head is {})",
-                head.seq
+                "no commit {seq} (head is {head_seq})"
             )));
         }
         // a branch shares the commits before its starting commit with its upstream
@@ -3020,16 +3976,16 @@ impl Store {
             };
             return Err(match &self.history {
                 Some(h) => {
-                    self.history_gone_with(&*limit.lock(h)?, seq, head.seq, snapshot, None, limit)?
+                    self.history_gone_with(&*limit.lock(h)?, seq, head_seq, snapshot, None, limit)?
                 }
-                None => self.mem_gone_with(seq, head.seq, snapshot, None, limit)?,
+                None => self.mem_gone_with(seq, head_seq, snapshot, None, limit)?,
             });
         };
         limit.check(0)?;
         Ok(crate::history::Resolved {
             at: at.clone(),
             commit,
-            head: head.seq,
+            head: head_seq,
             historical: seq != self.snapshot().commit,
         })
     }
@@ -3061,7 +4017,7 @@ impl Store {
         if !C::ACCOUNTS {
             return Ok(self.inherited(at, seq));
         }
-        let name = limit.read_limit().read_lock(&self.branching.name)?;
+        let name = limit.read_lock(&self.branching.name)?;
         limit.check(name.len() as u64)?;
         Ok(self.inherited_named(at, seq, &name))
     }
@@ -3098,6 +4054,66 @@ impl Store {
         Error::Branch(Box::new(e))
     }
 
+    /// Whether configuration history is activated on this store's family.
+    pub fn configuration_history_activated(&self) -> bool {
+        self.configuration_activated()
+    }
+
+    /// Whether support-aware projection visibility may apply on live or historical states
+    /// of this store (live active policies, unavailable managed state, or activated
+    /// configuration history that may have historical review policies).
+    pub(crate) fn has_potential_evidence_visibility(&self) -> bool {
+        if self.configuration_activated() {
+            return true;
+        }
+        let Some(state) = self.family.managed.load_full() else {
+            return false;
+        };
+        match state.as_ref() {
+            crate::managed::ManagedState::Unavailable { .. } => true,
+            crate::managed::ManagedState::Installed(installed) => {
+                !installed.evidence_visibility().is_none()
+            }
+        }
+    }
+
+    pub(crate) fn family_managed(&self) -> Arc<family::ManagedSlot> {
+        self.family.managed.clone()
+    }
+
+    /// Whether support-aware projection visibility restricts a caller with `access` on
+    /// live or historical states of this store.
+    pub(crate) fn has_evidence_visibility_for_access(
+        &self,
+        access: &crate::access::GraphAccess,
+    ) -> bool {
+        if access.reads_everything() {
+            return false;
+        }
+        let Some(state) = self.family.managed.load_full() else {
+            return false;
+        };
+        match state.as_ref() {
+            crate::managed::ManagedState::Unavailable { .. } => true,
+            crate::managed::ManagedState::Installed(installed) => {
+                if installed.may_have_evidence_history() {
+                    return true;
+                }
+                match installed.evidence_visibility() {
+                    crate::access::triples::evidence::EvidenceConfig::Unavailable(_) => true,
+                    crate::access::triples::evidence::EvidenceConfig::Active(cfg) => {
+                        cfg.settings.policies.values().any(|p| {
+                            oxrdf::NamedNode::new(&p.output).map_or(true, |n| {
+                                access.read.may_allow(Some(&oxrdf::Term::NamedNode(n)))
+                            })
+                        })
+                    }
+                    crate::access::triples::evidence::EvidenceConfig::None => false,
+                }
+            }
+        }
+    }
+
     /// The state at `at`: the live snapshot when it names the current state, otherwise
     /// the retained generation's base index with its WAL replayed through the commit
     /// (cached, within `history_cache_bytes`).
@@ -3106,18 +4122,64 @@ impl Store {
         at: &crate::history::At,
         o: &crate::history::HistoryOptions,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
-        self.snapshot_at_inner(at, o, None)
+        let (snap, resolved, _) = self.snapshot_at_inner(at, o, None)?;
+        let snap = if !matches!(at, crate::history::At::Head) && self.configuration_activated() {
+            use crate::history::ReadControl;
+            let prep = o.temporary(crate::evidence::resolve::MEMORY_BYTES)?;
+            let (pinned, _held) =
+                self.pin_historical_evidence(self, at, resolved.commit.seq, snap, &prep)?;
+            pinned
+        } else {
+            snap
+        };
+        Ok((snap, resolved))
+    }
+
+    /// Maximum memory capacity available for historical replay/cache entries on this store.
+    pub fn history_cache_capacity(&self) -> u64 {
+        self.opts
+            .shared
+            .as_ref()
+            .map_or(self.opts.history_cache_bytes, |scope| {
+                scope.caches.history().capacity()
+            })
     }
 
     /// Resolve exactly the requested retained state within a per-read memory cap.
-    /// Index mappings remain shared; owned delta and replay buffers consume this cap.
+    /// Live snapshots and persistent history-cache hits pay the 4 KiB handle charge (plus
+    /// any non-live sealed generation metadata), while in-memory historical snapshots and
+    /// freshly materialized private replays pay by delta size.
     pub fn snapshot_at_limited(
         &self,
         at: &crate::history::At,
         o: &crate::history::HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
-        self.snapshot_at_inner(at, o, Some(max_memory_bytes))
+        let (snap, resolved, charge) = self.snapshot_at_inner(at, o, Some(max_memory_bytes))?;
+        let snap = if !matches!(at, crate::history::At::Head) && self.configuration_activated() {
+            use crate::history::ReadControl;
+            let remaining = max_memory_bytes.saturating_sub(charge.total());
+            let prep = o.temporary(remaining)?;
+            let (pinned, _held) =
+                self.pin_historical_evidence(self, at, resolved.commit.seq, snap, &prep)?;
+            pinned
+        } else {
+            snap
+        };
+        Ok((snap, resolved))
+    }
+
+    /// Like [`Self::snapshot_at_limited`], also returning the snapshot's retained byte
+    /// charge (delta/handle plus any non-live sealed generation bytes) so callers can keep
+    /// it accounted while the snapshot remains live.
+    pub fn snapshot_at_limited_bytes(
+        &self,
+        at: &crate::history::At,
+        o: &crate::history::HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved, u64)> {
+        let (snap, resolved, charge) = self.snapshot_at_inner(at, o, Some(max_memory_bytes))?;
+        Ok((snap, resolved, charge.total()))
     }
 
     fn snapshot_at_inner(
@@ -3125,7 +4187,25 @@ impl Store {
         at: &crate::history::At,
         o: &dyn crate::history::ReadControl,
         memory: Option<u64>,
-    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
+    ) -> Result<(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        history_limited::SnapshotCharge,
+    )> {
+        self.snapshot_at_inner_mode(at, o, memory, false)
+    }
+
+    pub(super) fn snapshot_at_inner_mode(
+        &self,
+        at: &crate::history::At,
+        o: &dyn crate::history::ReadControl,
+        memory: Option<u64>,
+        committed_only: bool,
+    ) -> Result<(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        history_limited::SnapshotCharge,
+    )> {
         let capacity = self
             .opts
             .shared
@@ -3134,15 +4214,16 @@ impl Store {
                 scope.caches.history().capacity()
             });
         match memory {
-            Some(memory) => self.snapshot_at_with(
+            Some(memory) => self.snapshot_at_with_mode(
                 at,
                 crate::history::ReadLimit {
                     options: o,
                     memory: Some(memory.min(capacity)),
                     held: crate::history::READ_METADATA_BYTES,
                 },
+                committed_only,
             ),
-            None => self.snapshot_at_with(
+            None => self.snapshot_at_with_mode(
                 at,
                 HistoryCeiling {
                     limit: crate::history::ReadLimit {
@@ -3152,6 +4233,7 @@ impl Store {
                     },
                     ceiling: u64::MAX,
                 },
+                committed_only,
             ),
         }
     }
@@ -3159,26 +4241,49 @@ impl Store {
     /// A historical read under `limit`. An accounting control, a read with a memory cap,
     /// takes the bounded form of each step. A stride control checks cancellation and the
     /// deadline as it goes and refuses a state larger than the history cache.
-    fn snapshot_at_with<C: HistoryRead>(
+    fn snapshot_at_with_mode<C: HistoryRead>(
         &self,
         at: &crate::history::At,
         limit: C,
-    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
+        committed_only: bool,
+    ) -> Result<(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        history_limited::SnapshotCharge,
+    )> {
         limit.check(0)?;
-        let r = if C::ACCOUNTS {
-            self.resolve_limited(at, &limit.read_limit())?
+        let (r, live) = if committed_only {
+            let live = self.snapshot();
+            let r = self.resolve_committed_limited(at, live.commit, &limit.read_limit())?;
+            (r, live)
         } else {
-            self.resolve(at)?
+            let r = self.resolve_under(at, &limit)?;
+            (r, self.snapshot())
         };
-        let live = self.snapshot();
+        self.snapshot_at_resolved(at, limit, r, live)
+    }
+
+    /// Materialize a resolved commit against a published snapshot's generation.
+    fn snapshot_at_resolved<C: HistoryRead>(
+        &self,
+        at: &crate::history::At,
+        limit: C,
+        r: crate::history::Resolved,
+        live: Arc<Snapshot>,
+    ) -> Result<(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        history_limited::SnapshotCharge,
+    )> {
         if r.commit.seq == live.commit {
-            limit.check(history_limited::preparation_delta_bytes(&live.delta))?;
+            limit.check(history_limited::SHARED_SNAPSHOT_BYTES)?;
             return Ok((
                 live,
                 crate::history::Resolved {
                     historical: false,
                     ..r
                 },
+                history_limited::SnapshotCharge::shared(),
             ));
         }
         let seq = r.commit.seq;
@@ -3186,9 +4291,31 @@ impl Store {
             let mut m = limit.read_limit().lock(mem)?;
             return match m.get_with(seq, &limit)? {
                 Some(snap) => {
-                    limit.check(history_limited::preparation_delta_bytes(&snap.delta))?;
+                    // Pins and the retention window can release this delta while a
+                    // prepared view still holds it. No shared history budget backs it.
+                    let delta_bytes = if C::ACCOUNTS {
+                        history_limited::preparation_delta_bytes(&snap.delta)
+                            .max(history_limited::SHARED_SNAPSHOT_BYTES)
+                    } else {
+                        history_limited::SHARED_SNAPSHOT_BYTES
+                    };
+                    let read_limit = limit.read_limit().holding(delta_bytes)?;
+                    let generation_bytes =
+                        if C::ACCOUNTS && !Arc::ptr_eq(&snap.generation, &live.generation) {
+                            snap.generation.retained_bytes_with(&read_limit)?
+                        } else {
+                            0
+                        };
+                    read_limit.check(generation_bytes)?;
                     m.hits += 1;
-                    Ok((snap, r))
+                    Ok((
+                        snap,
+                        r,
+                        history_limited::SnapshotCharge {
+                            delta_bytes,
+                            generation_bytes,
+                        },
+                    ))
                 }
                 None => {
                     drop(m);
@@ -3240,100 +4367,121 @@ impl Store {
             }
         }
         if let Some(i) = cached {
-            let retained =
+            let generation_bytes =
                 if C::ACCOUNTS && !Arc::ptr_eq(&h.cache[i].snap.generation, &live.generation) {
-                    h.cache[i]
-                        .snap
-                        .generation
-                        .retained_bytes_limited(&limit.read_limit())?
+                    h.cache[i].snap.generation.retained_bytes_with(&limit)?
                 } else {
                     0
                 };
-            limit.read_limit().holding(retained)?.check(
-                history_limited::preparation_delta_bytes(&h.cache[i].snap.delta),
-            )?;
+            limit.check(generation_bytes)?;
+            limit.check(generation_bytes.saturating_add(history_limited::SHARED_SNAPSHOT_BYTES))?;
             let e = h.cache.remove(i);
             let snap = e.snap.clone();
             h.cache.insert(0, e);
             h.hits += 1;
-            return Ok((snap, r));
+            return Ok((
+                snap,
+                r,
+                history_limited::SnapshotCharge {
+                    delta_bytes: history_limited::SHARED_SNAPSHOT_BYTES,
+                    generation_bytes,
+                },
+            ));
         }
         h.misses += 1;
         // Snapshot/entry/path metadata remains live beside replay's owned buffers.
         let limit = limit.holding(16 << 10)?;
         let entry = h.gens[&owner].clone();
-        let generation = if C::ACCOUNTS {
-            self.history_generation_limited(
-                &mut h,
-                owner,
-                current,
-                &live,
-                &limit.read_limit(),
-                seq,
-            )?
-        } else {
-            self.history_generation(&mut h, owner, current, &live, &entry, seq)?
-        };
-        let limit = if C::ACCOUNTS && !Arc::ptr_eq(&generation, &live.generation) {
-            let retained = generation.retained_bytes_limited(&limit.read_limit())?;
-            limit.holding(retained)?
-        } else {
-            limit
-        };
+        let generation =
+            self.history_generation_with(&mut h, owner, current, &live, &entry, seq, &limit)?;
+        let (limit, generation_bytes) =
+            if C::ACCOUNTS && !Arc::ptr_eq(&generation, &live.generation) {
+                let retained = generation.retained_bytes_with(&limit)?;
+                (limit.holding(retained)?, retained)
+            } else {
+                (limit, 0)
+            };
         let t0 = std::time::Instant::now();
         let (delta, end) = self.materialize(&h, owner, &entry, &generation, &live, seq, &limit)?;
-        limit.check(history_limited::preparation_delta_bytes(&delta))?;
+        let delta_charge = if C::ACCOUNTS {
+            let bytes = history_limited::preparation_delta_bytes(&delta)
+                .max(history_limited::SHARED_SNAPSHOT_BYTES);
+            limit.check(bytes)?;
+            bytes
+        } else {
+            limit.check(0)?;
+            0
+        };
         h.materializations += 1;
         h.materialize_nanos += t0.elapsed().as_nanos() as u64;
         let bytes = delta_bytes(&delta);
-        let dvocab_len = if C::ACCOUNTS {
-            generation.dvocab.len_limited(&limit.read_limit())?
-        } else {
-            generation.dvocab.len()
-        };
-        let snap = Arc::new(
-            self.snapshot_of(generation, seq)
-                .delta(delta)
-                .dvocab_len(dvocab_len)
-                .geo(self.historical_geo())
-                .historical(true)
-                .build(),
-        );
-        let cached = crate::history::Cached {
-            generation: owner,
-            seq,
-            snap: snap.clone(),
-            bytes,
-            end,
+        let dvocab_len = generation.dvocab.len_with(&limit)?;
+        let mut snap = self
+            .snapshot_of(generation, seq)
+            .delta(delta)
+            .dvocab_len(dvocab_len)
+            .geo(self.historical_geo())
+            .historical(true)
+            .build();
+        let charge = history_limited::SnapshotCharge {
+            delta_bytes: delta_charge,
+            generation_bytes,
         };
         if C::ACCOUNTS {
-            Self::cache_limited_snapshot(&mut h, cached, &limit.read_limit())?;
-            return Ok((snap, r));
+            let snap = Self::cache_limited_snapshot(
+                &mut h,
+                snap,
+                owner,
+                seq,
+                bytes,
+                end,
+                &limit.read_limit(),
+            )?;
+            return Ok((snap, r, charge));
         }
-        h.cache.insert(0, cached);
-        // evict the least recently used states, warm pins' last
+        // Charge the shared history budget before evicting so states still pinned
+        // by active controlled views or derived masks stay accounted through eviction.
+        let hold = (bytes > 0).then(|| caches::BudgetHold::new(h.budget.clone(), bytes));
         let warm: Vec<(u32, u64)> = h
             .pins
             .values()
             .filter(|p| p.warm)
             .filter_map(|p| h.owner(p.seq, current, r.head).map(|o| (o, p.seq)))
             .collect();
-        h.settle();
-        while h.budget.over() && h.cache.len() > 1 {
-            let i = (0..h.cache.len())
+        let new_is_warm = warm.contains(&(owner, seq));
+        while h.budget.over() && !h.cache.is_empty() {
+            if let Some(i) = (0..h.cache.len())
                 .rev()
                 .find(|&i| !warm.contains(&(h.cache[i].generation, h.cache[i].seq)))
-                .unwrap_or(h.cache.len() - 1);
-            h.cache.remove(i);
-            h.settle();
+            {
+                h.cache.remove(i);
+            } else if new_is_warm {
+                h.cache.pop();
+            } else {
+                break;
+            }
         }
-        // The caches of other stores can leave the shared budget over its capacity even
-        // when this store holds only the state just built. It is then not cached.
-        if h.budget.over() && h.cache.len() == 1 && h.cache[0].seq == seq {
-            h.cache.clear();
-            h.settle();
-        }
-        Ok((snap, r))
+        // Other stores' caches, warm pins, or evicted states still pinned by active
+        // views can leave the shared budget over capacity; do not cache the new state.
+        let snap = if !h.budget.over() {
+            snap.history_charge = hold;
+            let snap = Arc::new(snap);
+            h.cache.insert(
+                0,
+                crate::history::Cached {
+                    generation: owner,
+                    seq,
+                    snap: snap.clone(),
+                    bytes,
+                    end,
+                },
+            );
+            snap
+        } else {
+            drop(hold);
+            Arc::new(snap)
+        };
+        Ok((snap, r, charge))
     }
 
     /// Materialize the warm pins' states that the history cache does not hold (a
@@ -3375,41 +4523,105 @@ impl Store {
         entry: &crate::history::GenEntry,
         through: u64,
     ) -> Result<Arc<Generation>> {
+        self.history_generation_with(
+            h,
+            owner,
+            current,
+            live,
+            entry,
+            through,
+            &crate::budgeted::Unlimited,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn history_generation_with<C: crate::budgeted::Control>(
+        &self,
+        h: &mut crate::history::HistoryState,
+        owner: u32,
+        current: u32,
+        live: &Snapshot,
+        entry: &crate::history::GenEntry,
+        through: u64,
+        limit: &C,
+    ) -> Result<Arc<Generation>> {
+        limit.check(0)?;
         if owner == current {
             return Ok(live.generation.clone());
         }
-        let history_options = crate::history::HistoryOptions::default();
-        let history_limit = crate::history::ReadLimit {
-            options: &history_options,
-            memory: None,
-            held: 0,
-        };
         branching::readonly::authenticate_retained_generation(
             self,
             entry,
-            &history_limit,
+            &limit.read_limit(),
             through,
         )?;
         if let Some(i) = h.open.iter().position(|(n, _)| *n == owner) {
+            if C::ACCOUNTS {
+                h.open[i].1.retained_bytes_with(limit)?;
+            }
             let e = h.open.remove(i);
             let g = e.1.clone();
             h.open.insert(0, e);
+            limit.check(0)?;
             return Ok(g);
         }
-        let g = match (link::read_link(&entry.dir)?, &self.root) {
-            (Some(f), Some(root)) => Arc::new(Generation::open_linked(
-                &entry.dir,
-                &entry.name,
-                root,
-                f,
-                true,
-                &self.cache,
-            )?),
-            _ => Arc::new(Generation::open_sealed(&entry.dir, &entry.name)?),
+        let (generation, charge) = if C::ACCOUNTS {
+            let mut budget = cold::ColdBudget::new(limit.read_limit())?;
+            let loaded = match link::read_link_with(&entry.dir, &mut budget)? {
+                Some(file) => Generation::open_linked_with(
+                    &entry.dir,
+                    &entry.name,
+                    self.root.as_deref().ok_or_else(|| {
+                        Error::HistoryUnsupported("linked history needs a persistent origin".into())
+                    })?,
+                    file,
+                    true,
+                    &self.cache,
+                    &mut budget,
+                )?,
+                None => Generation::open_sealed_with(&entry.dir, &entry.name, None, &mut budget)?,
+            };
+            (Arc::new(loaded.value), loaded.charge)
+        } else {
+            let g = match (link::read_link(&entry.dir)?, &self.root) {
+                (Some(f), Some(root)) => Arc::new(Generation::open_linked(
+                    &entry.dir,
+                    &entry.name,
+                    root,
+                    f,
+                    true,
+                    &self.cache,
+                )?),
+                _ => Arc::new(Generation::open_sealed(&entry.dir, &entry.name)?),
+            };
+            (g, 0)
         };
-        h.open.insert(0, (owner, g.clone()));
-        h.open.truncate(2);
-        Ok(g)
+        if C::ACCOUNTS {
+            // Caching the backing generation is optional. Do not grow an unrelated
+            // shared vector outside this request's remaining preparation allowance.
+            if h.open.capacity() < 2 {
+                let relocating = (h.open.capacity() + 2) as u64
+                    * std::mem::size_of::<(u32, Arc<Generation>)>() as u64;
+                let fits = match limit.check(charge.saturating_add(relocating)) {
+                    Ok(()) => true,
+                    Err(Error::BudgetExceeded(_)) => false,
+                    Err(error) => return Err(error),
+                };
+                if !fits || h.open.try_reserve_exact(2 - h.open.len()).is_err() {
+                    limit.check(charge)?;
+                    return Ok(generation);
+                }
+            }
+            while h.open.len() >= 2 {
+                h.open.pop();
+            }
+            h.open.insert(0, (owner, generation.clone()));
+            limit.check(charge)?;
+        } else {
+            h.open.insert(0, (owner, generation.clone()));
+            h.open.truncate(2);
+        }
+        Ok(generation)
     }
 
     /// The delta of commit `seq` in generation `owner`, and where the commit ends in
@@ -4034,9 +5246,22 @@ impl Store {
     )> {
         let mut a = self.annotations.lock();
         let ann = self.annotation_of(&a, c, message, changes);
+        let header = if !ann.is_empty() {
+            a.pending_header()
+        } else {
+            0
+        };
+        let measures = (header > 0).then(|| self.quota.measures());
         // a grouped commit never takes its record back
-        let queued = a.append_queued(c.seq, ann.clone(), self.dataset_id)?;
-        Ok((ann, queued))
+        let queued = a.append_queued(c.seq, ann.clone(), self.dataset_id);
+        drop(a);
+        if let Some(measures) = measures {
+            match &queued {
+                Ok(_) => self.quota.account_append(header, measures),
+                Err(_) => self.quota.invalidate(),
+            }
+        }
+        Ok((ann, queued?))
     }
 
     fn annotation_of(
@@ -4111,6 +5336,13 @@ impl Store {
     pub fn set_clock(&self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
         *self.clock.lock() = Some(clock);
+    }
+
+    /// Inject a vocabulary sync error after writing the terms (tests).
+    #[cfg(any(test, feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn fail_next_vocab_sync(&self) {
+        self.snapshot().generation.dvocab.fail_next_sync();
     }
 
     // ------------------------------------------------------------ full-text ------
@@ -4236,6 +5468,18 @@ impl Store {
             );
         }
         Ok(())
+    }
+
+    /// Whether a solo commit must maintain the full-text index directly at publication
+    /// instead of staging documents before the fence (during recovery at open or an
+    /// online rebuild).
+    #[cfg(feature = "text")]
+    pub(super) fn text_needs_direct_maintain(&self) -> bool {
+        self.text_recovery
+            .load()
+            .as_ref()
+            .is_some_and(|job| job.pending())
+            || self.text.load().as_ref().is_some_and(|t| t.rebuilding())
     }
 
     /// Apply a WAL commit's changes to the full-text index and give `snap` its view.
@@ -4620,29 +5864,150 @@ impl Store {
     pub fn add_prefixes(&self, p: BTreeMap<String, String>) -> Result<()> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         if p.is_empty() {
+            if self.prefixes_poisoned.load(Ordering::Acquire) {
+                return Err(Error::Poisoned);
+            }
             return Ok(());
         }
+        let PreparedPrefixes {
+            staged_fence: _,
+            _removed,
+            mut cur,
+            next,
+            skipped,
+        } = self.prepare_added_prefixes(&p)?;
+        if let Some(next) = next {
+            self.save_prefixes(&next)?;
+            *cur = next;
+        }
+        drop(cur);
+        drop(_removed);
+        self.warn_skipped_prefixes(skipped);
+        Ok(())
+    }
+
+    pub(super) fn prepare_added_prefixes(
+        &self,
+        p: &BTreeMap<String, String>,
+    ) -> Result<PreparedPrefixes<'_>> {
         let filter = self.prefix_filter.lock().clone();
+        // Acquire `removed_prefixes` before `prefixes` (matching `set_prefix` and
+        // `set_prefix_layer`) and retain both guards through admission and publication.
         let removed = self.removed_prefixes.lock();
-        let mut cur = self.prefixes.lock();
-        let before = cur.len();
+        let cur = self.prefixes.lock();
+        if self.prefixes_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
+        let mut next: Option<BTreeMap<String, String>> = None;
         let mut skipped = 0usize;
         for (k, v) in p {
-            if cur.contains_key(&k)
-                || removed.contains(&k)
-                || filter.as_ref().is_some_and(|f| !f(&k))
+            let map = next.as_ref().unwrap_or(&*cur);
+            if map.contains_key(k) || removed.contains(k) || filter.as_ref().is_some_and(|f| !f(k))
             {
                 continue;
             }
-            if self.prefixes_full(cur.len() + removed.len())
+            if self.prefixes_full(map.len() + removed.len())
                 || k.len() > MAX_PREFIX_NAME_BYTES
                 || v.len() > MAX_PREFIX_IRI_BYTES
             {
                 skipped += 1;
                 continue;
             }
-            cur.insert(k, v);
+            next.get_or_insert_with(|| cur.clone())
+                .insert(k.clone(), v.clone());
         }
+        Ok(PreparedPrefixes {
+            staged_fence: None,
+            _removed: removed,
+            cur,
+            next,
+            skipped,
+        })
+    }
+
+    fn preflight_prefixes_target(&self) -> Result<()> {
+        if let Some(root) = &self.root {
+            for name in ["prefixes.json", "prefixes.tmp"] {
+                let path = root.join(name);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) if !meta.file_type().is_file() => {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::IsADirectory,
+                            format!("{}: not a regular file", path.display()),
+                        )));
+                    }
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn stage_prefixes_for_commit(
+        &self,
+        commit_seq: u64,
+        control_seq: Option<u64>,
+        next: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.preflight_prefixes_target()?;
+        if let Some(root) = &self.root {
+            let bytes = if let Some(cseq) = control_seq {
+                // Raise `dataset.json`'s `minimumReader` BEFORE writing a v2 staged sidecar
+                // so older binaries encounter the compatibility fence before WAL repair or
+                // catalog open.
+                commit::require_reader(root, STAGED_PREFIXES_V2_READER)?;
+                let staged = StagedPrefixesFileV2 {
+                    format_version: STAGED_PREFIXES_FORMAT_VERSION,
+                    commit_seq,
+                    control_seq: cseq,
+                    prefixes: next.clone(),
+                };
+                serde_json::to_vec_pretty(&staged).unwrap()
+            } else {
+                let staged = StagedPrefixesFileV1 {
+                    format_version: STAGED_PREFIXES_FORMAT_VERSION_V1,
+                    commit_seq,
+                    prefixes: next.clone(),
+                };
+                serde_json::to_vec_pretty(&staged).unwrap()
+            };
+            crate::fsutil::write_atomic_via(
+                &root.join(STAGED_PREFIXES_FILE),
+                &root.join(STAGED_PREFIXES_WRITE_TMP),
+                &bytes,
+            )?;
+            #[cfg(test)]
+            staged_prefix_test_hooks::after_stage_rename()?;
+            self.failpoint("prefixes-staged");
+        }
+        Ok(())
+    }
+
+    pub(super) fn clear_staged_prefixes(&self) -> Result<()> {
+        if let Some(root) = &self.root {
+            #[cfg(test)]
+            staged_prefix_test_hooks::before_clear_staged()?;
+            for name in [STAGED_PREFIXES_WRITE_TMP, STAGED_PREFIXES_FILE] {
+                match std::fs::remove_file(root.join(name)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            sync_dir(root)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn install_staged_prefixes(&self, next: &BTreeMap<String, String>) -> Result<()> {
+        self.failpoint("prefixes-before-install");
+        self.save_prefixes(next)?;
+        self.clear_staged_prefixes()?;
+        Ok(())
+    }
+
+    fn warn_skipped_prefixes(&self, skipped: usize) {
         if skipped > 0 {
             tracing::warn!(
                 target: "sparkles::store",
@@ -4650,15 +6015,6 @@ impl Store {
                 self.opts.max_prefixes
             );
         }
-        if cur.len() != before
-            && let Some(root) = &self.root
-        {
-            write_atomic(
-                &root.join("prefixes.json"),
-                &serde_json::to_vec_pretty(&*cur).unwrap(),
-            )?;
-        }
-        Ok(())
     }
 
     /// Set (or replace) one prefix, and clear a removal of its name. Prefixes are
@@ -4669,6 +6025,9 @@ impl Store {
         check_prefix(prefix, iri)?;
         let mut removed = self.removed_prefixes.lock();
         let mut cur = self.prefixes.lock();
+        if self.prefixes_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
         if cur.get(prefix).map(String::as_str) == Some(iri) && !removed.contains(prefix) {
             return Ok(());
         }
@@ -4697,6 +6056,9 @@ impl Store {
     pub fn remove_prefix(&self, prefix: &str) -> Result<bool> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         let mut cur = self.prefixes.lock();
+        if self.prefixes_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
         if !cur.contains_key(prefix) {
             return Ok(false);
         }
@@ -4744,6 +6106,9 @@ impl Store {
         }
         let mut cur_removed = self.removed_prefixes.lock();
         let mut cur = self.prefixes.lock();
+        if self.prefixes_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
         if *cur_removed != removed {
             self.save_removed_prefixes(&removed)?;
             *cur_removed = removed;
@@ -4791,6 +6156,9 @@ impl Store {
     }
 
     fn save_prefixes(&self, p: &BTreeMap<String, String>) -> Result<()> {
+        if self.prefixes_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
         if let Some(root) = &self.root {
             write_atomic(
                 &root.join("prefixes.json"),
@@ -4821,11 +6189,12 @@ impl Store {
                 .expect("uncancellable family entry"),
         );
         let mut guard = self.writer.lock();
-        if !self.speculative_base(kind, &opts, &guard) {
+        let idle_group = self.clear_idle_group(&mut guard);
+        if !idle_group && !self.speculative_base(kind, &opts, &guard) {
             self.drain_group(&mut guard, None).ok();
         }
         drop(waiting);
-        self.begin(WriterGuard { guard, family }, kind, opts)
+        self.begin(WriterGuard { guard, family }, kind, opts, idle_group)
     }
 
     /// Write transactions waiting for the writer lock right now. A long holder of the
@@ -4843,27 +6212,46 @@ impl Store {
         opts: crate::guard::WriteOptions,
     ) -> Result<WriteTxn<'_>> {
         let mut guard = self.raw_writer(&opts)?;
-        // A write that will not wait must not start from a speculative head either: its
-        // commit would then wait for the fence that makes that head durable. A failed group
-        // never becomes idle again, so that write is refused as poisoned, not as busy.
-        if opts.no_wait
-            && let Some(g) = &self.group
-        {
-            if g.failed() {
-                return Err(Error::Poisoned);
+        let idle_group = self.clear_idle_group(&mut guard);
+        if idle_group {
+            if self.group.is_some() {
+                opts.check()?;
             }
-            if !g.idle() {
-                return Err(Error::WriterBusy);
+        } else {
+            // A no-wait write needs a durable base and must not park behind a fence.
+            // Recheck idle here because a previous fence may have finished since the
+            // first check.
+            if opts.no_wait
+                && let Some(g) = &self.group
+            {
+                if g.failed() {
+                    return Err(Error::Poisoned);
+                }
+                if !g.idle() {
+                    return Err(Error::WriterBusy);
+                }
             }
-        }
-        if !self.speculative_base(kind, &opts, &guard) {
-            self.drain_group(&mut guard, Some(&opts))?;
+            if !self.speculative_base(kind, &opts, &guard) {
+                self.drain_group(&mut guard, Some(&opts))?;
+            }
         }
         self.check_write_options(&opts, &mut guard)?;
         if guard.poisoned {
             return Err(Error::Poisoned);
         }
-        Ok(self.begin(guard, kind, opts))
+        Ok(self.begin(guard, kind, opts, idle_group))
+    }
+
+    /// A healthy idle group stays idle while this caller holds the writer lock and
+    /// before it queues its own commit. Only the writer can enqueue, and with no
+    /// queued or running fence there is no leader that can fail the group.
+    fn clear_idle_group(&self, w: &mut WriterState) -> bool {
+        if self.group.as_ref().is_some_and(|g| !g.idle()) {
+            return false;
+        }
+        // Keep the published snapshot as the base after a completed fence.
+        w.staged = None;
+        true
     }
 
     /// Enter before any branch writer or lifecycle table lock. Internal shutdown
@@ -4942,7 +6330,7 @@ impl Store {
     /// Whether this store groups commits
     /// ([`StoreOptions::group_commit`] on a persistent store).
     pub fn groups_commits(&self) -> bool {
-        self.group.is_some()
+        self.opts.group_commit && self.root.is_some()
     }
 
     /// The error of a write that may have started from the speculative head of a group
@@ -5032,7 +6420,7 @@ impl Store {
         o: &crate::guard::WriteOptions,
         w: &WriterState,
     ) -> bool {
-        self.group_check(kind, o, w).is_ok()
+        self.group_check(kind, o, w, false).is_ok()
     }
 
     /// `Ok` when a commit with these options may join a group. `Err(None)` when group
@@ -5044,18 +6432,20 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
         w: &WriterState,
+        idle_group: bool,
     ) -> std::result::Result<(), Option<Fallback>> {
         use Fallback::*;
-        if self.group.is_none() || w.wal.is_none() || o.dry_run.is_some() {
+        if !self.opts.group_commit || w.wal.is_none() || o.dry_run.is_some() {
             return Err(None);
         }
-        let first = if w.poisoned {
-            Some(Poisoned)
-        } else if !(kind == CommitKind::Transaction || Self::speculative_kind(kind)) {
-            Some(Kind)
-        } else {
-            self.index_fallback()
-        };
+        let first =
+            if w.poisoned || (!idle_group && self.group.as_ref().is_some_and(|g| g.failed())) {
+                Some(Poisoned)
+            } else if !(kind == CommitKind::Transaction || Self::speculative_kind(kind)) {
+                Some(Kind)
+            } else {
+                self.index_fallback()
+            };
         first.map_or(Ok(()), |f| Err(Some(f)))
     }
 
@@ -5138,6 +6528,7 @@ impl Store {
     fn check_memory_before(
         &self,
         quads: usize,
+        reifier_keys: usize,
         o: &crate::guard::WriteOptions,
         stage: crate::preview::RefusalStage,
         early: &mut Option<crate::preview::StorageCheck>,
@@ -5149,7 +6540,9 @@ impl Store {
         let now = snap.generation.disk_bytes()
             + delta_bytes(&snap.delta)
             + snap.generation.dvocab.with(|v| v.bytes()) as u64;
-        let size = now.saturating_add((quads as u64).saturating_mul(DELTA_QUAD_BYTES));
+        let size = now
+            .saturating_add((quads as u64).saturating_mul(DELTA_QUAD_BYTES))
+            .saturating_add((reifier_keys as u64).saturating_mul(DELTA_REIFIER_KEY_BYTES));
         // one reading of the configuration's history serves the check and the preview
         let total = self.memory_with_configuration(size)?;
         match self.check_memory_total(total) {
@@ -5171,7 +6564,7 @@ impl Store {
     /// an in-memory store's limit also counts.
     fn memory_with_configuration(&self, size: u64) -> Result<u64> {
         let history = self.family.managed.load();
-        let configuration = match history.as_deref() {
+        let configuration = match history.state.as_deref() {
             Some(crate::managed::ManagedState::Installed(i)) => {
                 i.history_memory.as_ref().map_or(0, |m| m.retained())
             }
@@ -5208,6 +6601,7 @@ impl Store {
         guard: WriterGuard<'a>,
         kind: CommitKind,
         opts: crate::guard::WriteOptions,
+        idle_group: bool,
     ) -> WriteTxn<'a> {
         let base = guard.staged.clone().unwrap_or_else(|| self.snapshot());
         let mark = base.generation.dvocab.mark();
@@ -5220,6 +6614,7 @@ impl Store {
             mark,
             start_bnode,
             guard: TxnGuard(Some(guard)),
+            idle_group,
             log: Vec::new(),
             bulk: Vec::new(),
             kind,
@@ -5239,10 +6634,11 @@ impl Store {
             managed: None,
             configuration: crate::history::ConfigurationBinding::LegacyUnbound,
             managed_admission: None,
-            configuration_expected: matches!(self.family.managed.load().as_deref(),
+            configuration_expected: matches!(self.family.managed.load().state.as_deref(),
                 Some(crate::managed::ManagedState::Installed(i)) if i.configuration_history.is_some()),
             stamp: None,
             control: None,
+            staged_prefixes: BTreeMap::new(),
         }
     }
 
@@ -5392,11 +6788,45 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
     ) -> Result<Receipt> {
-        let plan = self.source_plan(load_plan::Entry::Load, sources, o)?;
+        self.load_with_entry_classified(load_plan::Entry::Load, sources, kind, o)
+            .map_err(SparqlLoadError::into_inner)
+    }
+
+    /// Execute a single-operation SPARQL `LOAD` through [`LoadPlan::choose`]: a large
+    /// unrestricted load takes the bulk rebuild path and smaller or graph-restricted
+    /// loads stay transactional (spec X16, item 846). Returns [`SparqlLoadError`] so the
+    /// caller can suppress only source read/decode/parse failures under `LOAD SILENT`.
+    pub(crate) fn load_sparql(
+        &self,
+        source: &Source,
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+    ) -> std::result::Result<Receipt, SparqlLoadError> {
+        self.load_with_entry_classified(
+            load_plan::Entry::SparqlLoad,
+            std::slice::from_ref(source),
+            kind,
+            o,
+        )
+    }
+
+    fn load_with_entry_classified(
+        &self,
+        entry: load_plan::Entry,
+        sources: &[Source],
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+    ) -> std::result::Result<Receipt, SparqlLoadError> {
+        let allow_source_io = sources
+            .iter()
+            .all(|s| matches!(s.data, crate::io::SourceData::File(_)));
+        let plan = self
+            .source_plan(entry, sources, o)
+            .map_err(|e| classify_source_error(e, allow_source_io))?;
         if plan == LoadPlan::Bulk {
-            let mut w = self.lock_writer(o)?;
+            let mut w = self.lock_writer(o).map_err(SparqlLoadError::Store)?;
             if w.poisoned {
-                return Err(Error::Poisoned);
+                return Err(SparqlLoadError::Store(Error::Poisoned));
             }
             let snap = self.snapshot();
             let bulk = BulkCommit {
@@ -5405,55 +6835,101 @@ impl Store {
                 start_len: snap.len(),
                 default_graph: sources_reach_default_graph(sources),
                 admission: None,
+                skip_if_unchanged: entry == load_plan::Entry::SparqlLoad,
+                staged_prefixes: BTreeMap::new(),
             };
             let check = (crate::guard::Changes::Unknown, o);
             Ok(self
-                .rebuild_locked(&mut w, &snap, sources, &[], &[], bulk, check)?
+                .rebuild_locked_classified(&mut w, &snap, sources, &[], &[], bulk, check)?
                 .1)
         } else {
-            let mut txn = self.try_write_with(kind, o.clone())?;
+            let mut txn = self
+                .try_write_with(kind, o.clone())
+                .map_err(SparqlLoadError::Store)?;
             let mut prefixes = BTreeMap::new();
             let mut parsed = 0;
+            let mut parsed_reifier_keys = 0;
             let mut early = None;
-            let prepared = (|| -> Result<()> {
+            let prepared = (|| -> std::result::Result<(), SparqlLoadError> {
                 for s in sources {
-                    o.check()?;
+                    o.check().map_err(SparqlLoadError::Store)?;
                     let mut labels = std::collections::HashMap::new();
-                    let p = crate::io::parse_source_into(s, |q| {
-                        parsed += 1;
-                        if parsed % 65_536 == 1 {
-                            o.check()?;
+                    let mut sink_err: Option<Error> = None;
+                    let res = crate::io::parse_source_into(s, |q| {
+                        let step = (|| -> Result<()> {
+                            parsed += 1;
+                            parsed_reifier_keys += parsed_quad_reifier_keys(&q);
+                            if parsed % 65_536 == 1 {
+                                o.check()?;
+                            }
+                            self.check_memory_before(
+                                parsed,
+                                parsed_reifier_keys,
+                                o,
+                                crate::preview::RefusalStage::Parse,
+                                &mut early,
+                            )?;
+                            let ids = txn.encode_quad(&q, &mut labels)?;
+                            txn.insert(ids)?;
+                            Ok(())
+                        })();
+                        if let Err(e) = step {
+                            sink_err = Some(e);
+                            return Err(Error::Cancelled);
                         }
-                        self.check_memory_before(
-                            parsed,
-                            o,
-                            crate::preview::RefusalStage::Parse,
-                            &mut early,
-                        )?;
-                        let ids = txn.encode_quad(&q, &mut labels)?;
-                        txn.insert(ids)?;
                         Ok(())
+                    });
+                    if let Some(e) = sink_err {
+                        return Err(SparqlLoadError::Store(e));
+                    }
+                    let p = res.map_err(|e| {
+                        classify_source_error(e, matches!(s.data, crate::io::SourceData::File(_)))
                     })?;
                     prefixes.extend(p);
                 }
                 Ok(())
             })();
-            if let Err(error) = prepared {
+            if let Err(load_error) = prepared {
+                let is_source = matches!(load_error, SparqlLoadError::Source(_));
+                let error = load_error.into_inner();
                 // No uncommitted views escape this loader. Remove its terms while
                 // holding the writer lock; earlier group-commit terms precede mark.
-                if let Err(rollback_error) = txn.base.generation.dvocab.rollback(&txn.mark) {
+                if let Err(rollback_error) = txn.base.generation.rollback_dvocab(&txn.mark) {
                     // A partial file rollback may leave append state inconsistent.
                     // Refuse subsequent writes until the store is reopened.
                     txn.guard.poisoned = true;
                     tracing::error!(target: "sparkles::store", "failed load ({error}) could not remove its terms: {rollback_error}");
-                    return Err(rollback_error);
+                    return Err(SparqlLoadError::Store(rollback_error));
                 }
                 txn.guard.next_bnode = txn.start_bnode;
-                return Err(error);
+                return Err(self.classify_refusal_after_drain(is_source, error, o));
             }
-            let r = with_early_refusal(txn.commit(), early)?;
-            self.add_prefixes(prefixes)?;
+            let r = with_early_refusal(txn.commit(), early).map_err(SparqlLoadError::Store)?;
+            self.add_prefixes(prefixes)
+                .map_err(SparqlLoadError::Store)?;
             Ok(r)
+        }
+    }
+
+    /// Drain group commit after a failed transactional load and classify the resulting
+    /// error. A source error that drain turns into a store-level refusal (poisoned,
+    /// cancelled, timed out, or busy) becomes [`SparqlLoadError::Store`].
+    pub(crate) fn classify_refusal_after_drain(
+        &self,
+        is_source: bool,
+        error: Error,
+        o: &crate::guard::WriteOptions,
+    ) -> SparqlLoadError {
+        let drained = self.after_refusal(error, Some(o));
+        if is_source
+            && !matches!(
+                drained,
+                Error::Poisoned | Error::Cancelled | Error::Timeout | Error::WriterBusy
+            )
+        {
+            SparqlLoadError::Source(drained)
+        } else {
+            SparqlLoadError::Store(drained)
         }
     }
 
@@ -5530,8 +7006,15 @@ impl Store {
         }
         // the transaction checks the precondition when it opens, after this check
         let mut early = None;
+        let total_quads: usize = parsed.iter().map(Vec::len).sum();
+        let total_reifier_keys: usize = parsed
+            .iter()
+            .flat_map(|qs| qs.iter())
+            .map(parsed_quad_reifier_keys)
+            .sum();
         self.check_memory_before(
-            parsed.iter().map(Vec::len).sum(),
+            total_quads,
+            total_reifier_keys,
             o,
             crate::preview::RefusalStage::Prepare,
             &mut early,
@@ -5665,6 +7148,8 @@ impl Store {
             default_graph: graphs.contains(&Id::DEFAULT_GRAPH)
                 || sources_reach_default_graph(sources),
             admission: None,
+            skip_if_unchanged: false,
+            staged_prefixes: BTreeMap::new(),
         };
         let check = (crate::guard::Changes::Unknown, o);
         // the quads parsed, as a transactional replace counts them
@@ -5696,30 +7181,59 @@ impl Store {
         bulk: BulkCommit,
         check: (crate::guard::Changes<'_>, &crate::guard::WriteOptions),
     ) -> Result<(u64, Receipt)> {
+        self.rebuild_locked_classified(w, snap, extra, extra_quads, drop_graphs, bulk, check)
+            .map_err(SparqlLoadError::into_inner)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rebuild_locked_classified(
+        &self,
+        w: &mut WriterState,
+        snap: &Snapshot,
+        extra: &[Source],
+        extra_quads: &[[Id; 4]],
+        drop_graphs: &[Id],
+        bulk: BulkCommit,
+        check: (crate::guard::Changes<'_>, &crate::guard::WriteOptions),
+    ) -> std::result::Result<(u64, Receipt), SparqlLoadError> {
         let (changes, o) = check;
         // The graphs it drops are checked here, and its sources are checked quad by quad
-        // while the build reads them.
-        self.check_protected(bulk.kind)?;
+        // while the build reads them. When `skip_if_unchanged` is set, branch protection
+        // runs only once the built generation is known to change quads.
+        let as_new_branch = o.preview_as_new_branch && o.dry_run.is_some();
+        if !as_new_branch && !bulk.skip_if_unchanged {
+            self.check_protected(bulk.kind)
+                .map_err(SparqlLoadError::Store)?;
+        }
         let admitted = match bulk.admission {
             Some(admitted) => admitted,
-            None => self.capture_managed_admission(None)?,
+            None => self
+                .capture_managed_admission(None)
+                .map_err(SparqlLoadError::Store)?,
         };
-        admitted.admit_ids(snap, drop_graphs.iter().copied(), None)?;
+        admitted
+            .admit_ids(snap, drop_graphs.iter().copied(), None)
+            .map_err(SparqlLoadError::Store)?;
         let configuration = admitted.configuration;
         let fence = if extra.is_empty() {
             None
         } else {
-            admitted.fence()?
+            admitted.fence().map_err(SparqlLoadError::Store)?
         };
         let started = std::time::Instant::now();
         // the head state before the bulk commit, whose changes the change log records
         let prior = self.snapshot();
-        // a running compaction gives up: this rebuild makes a new generation itself
-        w.tap = None;
+        // A running compaction gives up once this rebuild is going to replace the
+        // generation. Under `skip_if_unchanged`, keep the tap alive until the candidate
+        // passes the no-change, branch-protection, fit, guard, dry-run and publish
+        // checks, so duplicate-only loads and refusals leave an active compaction alone.
+        if !bulk.skip_if_unchanged {
+            w.tap = None;
+        }
         self.compaction.rebuilding.store(true, Ordering::Relaxed);
         let _rebuilding = compaction::Rebuilding(&self.compaction.rebuilding);
         let message = match o.message.as_ref() {
-            Some(m) => crate::annotations::validate_message(m)?,
+            Some(m) => crate::annotations::validate_message(m).map_err(SparqlLoadError::Store)?,
             None => None,
         };
         // a dry run builds and checks the generation, then removes it (see `preview`)
@@ -5727,9 +7241,9 @@ impl Store {
         if dry.is_none() {
             // the old generation's WAL is the only other copy of the recent commits' ids:
             // the catalog must be durable before it is discarded
-            self.catalog.lock().sync()?;
+            self.catalog.lock().sync().map_err(SparqlLoadError::Store)?;
             // and so must the change log, which recovers its tail from that WAL
-            self.sync_change_log()?;
+            self.sync_change_log().map_err(SparqlLoadError::Store)?;
             // and so must the full-text index, which could otherwise only catch up from it
             #[cfg(feature = "text")]
             if let Some(ti) = self.text.load_full() {
@@ -5741,7 +7255,7 @@ impl Store {
                     self.group.as_ref().is_some_and(|g| g.failed())
                         || ti.applied() <= self.current.load().commit
                 );
-                ti.checkpoint()?;
+                ti.checkpoint().map_err(SparqlLoadError::Store)?;
             }
         }
         // What a bulk commit into a dataset that is not empty changes: the quads of its
@@ -5757,11 +7271,10 @@ impl Store {
             name,
             tmp,
             meta,
-            storage,
             sourced,
             dropped,
             parsed,
-        } = self.build_generation(
+        } = self.build_generation_classified(
             w,
             snap,
             GenerationInput {
@@ -5771,16 +7284,112 @@ impl Store {
                 fence,
                 change_cap,
                 opts: o,
-                dry: dry.is_some(),
             },
         )?;
-        let mut gen_ = Generation::open(&dir, &name, self.root.is_some())?;
+        let cleanup_dir = |dir: &Path| {
+            if self.root.is_some() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            self.quota.invalidate();
+        };
+        let head_seq = w.head.seq;
+        let unchanged = bulk.skip_if_unchanged && bulk.net_del == 0 && meta.quads == bulk.start_len;
+        if unchanged {
+            if let Some(dr) = &dry {
+                let mut gen_ = match Generation::open(&dir, &name, self.root.is_some()) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        drop(tmp);
+                        cleanup_dir(&dir);
+                        return Err(SparqlLoadError::Store(e));
+                    }
+                };
+                gen_._tmp = tmp;
+                let gen_ = Arc::new(gen_);
+                let candidate = Arc::new(
+                    self.snapshot_of(gen_.clone(), head_seq)
+                        .cacheable(false)
+                        .results(Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)))
+                        .build(),
+                );
+                let preview = self.preview_bulk(crate::store::preview::BulkPreview {
+                    head: w.head,
+                    view: snap,
+                    candidate: &candidate,
+                    commit: None,
+                    kind: bulk.kind,
+                    changes,
+                    drop_graphs,
+                    opts: o,
+                    dr,
+                    validation: None,
+                    storage: crate::preview::StorageCheck::default(),
+                    message: None,
+                });
+                drop(candidate);
+                drop(gen_);
+                cleanup_dir(&dir);
+                return Err(SparqlLoadError::Store(Error::DryRun(Box::new(
+                    preview.map_err(SparqlLoadError::Store)?,
+                ))));
+            }
+            let checked = o.check();
+            drop(tmp);
+            cleanup_dir(&dir);
+            checked.map_err(SparqlLoadError::Store)?;
+            let mut combined = meta.prefixes;
+            if !bulk.staged_prefixes.is_empty() {
+                o.check_publish().map_err(SparqlLoadError::Store)?;
+                combined.extend(bulk.staged_prefixes);
+            }
+            self.add_prefixes(combined)
+                .map_err(SparqlLoadError::Store)?;
+            return Ok((
+                parsed,
+                Receipt {
+                    dataset_id: self.owner_dataset_id(),
+                    committed: false,
+                    commit: w.head,
+                    validation: None,
+                    annotation: self.annotation(w.head.seq).unwrap_or_default(),
+                },
+            ));
+        }
+        if bulk.skip_if_unchanged
+            && !as_new_branch
+            && let Err(e) = self.check_protected(bulk.kind)
+        {
+            drop(tmp);
+            cleanup_dir(&dir);
+            return Err(SparqlLoadError::Store(e));
+        }
+        let mut storage = crate::preview::StorageCheck::default();
+        let old = snap.generation.dir.as_deref();
+        if dry.is_some() {
+            storage = self.rebuild_storage(old, &dir);
+        }
+        let fits = self
+            .check_memory(dir_size(&dir))
+            .and_then(|_| self.quota.check_rebuild(old, &dir));
+        match fits {
+            Err(e) if dry.is_some() => storage.refused = Some(e),
+            Err(e) => {
+                drop(tmp);
+                cleanup_dir(&dir);
+                return Err(SparqlLoadError::Store(e));
+            }
+            Ok(()) => {}
+        }
+        let mut gen_ = match Generation::open(&dir, &name, self.root.is_some()) {
+            Ok(g) => g,
+            Err(e) => {
+                drop(tmp);
+                cleanup_dir(&dir);
+                return Err(SparqlLoadError::Store(e));
+            }
+        };
         gen_._tmp = tmp;
         let gen_ = Arc::new(gen_);
-        if dry.is_none() {
-            w.next_bnode = w.next_bnode.max(meta.next_bnode);
-        }
-        let head_seq = w.head.seq;
         // not a committed state: its result cache is its own and empty
         let candidate = || {
             Arc::new(
@@ -5790,6 +7399,9 @@ impl Store {
                     .build(),
             )
         };
+        if dry.is_none() {
+            w.next_bnode = w.next_bnode.max(meta.next_bnode);
+        }
         // the bulk commit is validated on the built generation, before anything is published
         let validation = match self.run_guard(snap, candidate, bulk.kind, changes, o, head_seq) {
             Ok(v) => v,
@@ -5799,7 +7411,7 @@ impl Store {
                 if self.root.is_some() {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
-                return Err(e);
+                return Err(SparqlLoadError::Store(e));
             }
         };
         let head = CommitInfo {
@@ -5823,7 +7435,8 @@ impl Store {
                 head: w.head,
                 view: snap,
                 candidate: &candidate(),
-                commit: head,
+                commit: Some(head),
+                kind: head.kind,
                 changes,
                 drop_graphs,
                 opts: o,
@@ -5838,7 +7451,9 @@ impl Store {
             }
             // a walk of the directory during the build counted the candidate
             self.quota.invalidate();
-            return Err(Error::DryRun(Box::new(preview?)));
+            return Err(SparqlLoadError::Store(Error::DryRun(Box::new(
+                preview.map_err(SparqlLoadError::Store)?,
+            ))));
         }
         // the last check of the bulk commit, before anything of it becomes durable
         if let Err(e) = o.check_publish() {
@@ -5846,49 +7461,120 @@ impl Store {
             if self.root.is_some() {
                 let _ = std::fs::remove_dir_all(&dir);
             }
-            return Err(e);
+            return Err(SparqlLoadError::Store(e));
+        }
+        // Prepare any prefixes contributed by sources or `WriteTxn::stage_prefixes` ONLY
+        // after generation build, validation guard, dry-run, quota, and `check_publish`
+        // have succeeded, and stage them durably before `switch_generation`.
+        let mut combined_prefixes = meta.prefixes.clone();
+        combined_prefixes.extend(bulk.staged_prefixes);
+        let mut prepared_prefixes = if !combined_prefixes.is_empty() {
+            match self.prepare_added_prefixes(&combined_prefixes) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    drop(gen_);
+                    if self.root.is_some() {
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+                    return Err(SparqlLoadError::Store(e));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(prep) = prepared_prefixes.as_mut()
+            && let Some(next) = prep.next.clone()
+        {
+            prep.arm_staged_fence(self);
+            if let Err(e) = self.stage_prefixes_for_commit(head.seq, None, &next) {
+                if self.clear_staged_prefixes().is_ok() {
+                    prep.disarm_staged_fence();
+                } else {
+                    w.poisoned = true;
+                }
+                drop(prepared_prefixes);
+                drop(gen_);
+                if self.root.is_some() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                return Err(SparqlLoadError::Store(e));
+            }
+        }
+        if bulk.skip_if_unchanged {
+            w.tap = None;
         }
         let annotation;
         if let Some(root) = &self.root {
             // Publication order: the new generation's files (with the commit its base
             // holds) and directory entries are durable, its WAL file exists durably, then
             // CURRENT switches durably, and only after that is the old generation removed.
-            write_synced(
-                &dir.join("commit.json"),
-                &commit::gen_commit_bytes_for(
-                    self.dataset_id,
-                    "bulk",
-                    &head,
-                    self.configuration_activated(),
-                    configuration,
-                ),
-            )?;
-            let wal = wal::open_for_append(
-                &dir.join("wal.log"),
-                wal::version_with(self.configuration_activated(), self.control_enabled()),
-            )?;
-            let wal_size = wal.metadata()?.len();
-            sync_dir(&dir)?;
-            sync_dir(root)?;
-            // the commit's message is durable before the switch (no digest: its change
-            // set is not at hand)
-            annotation = self.annotate(&head, message.clone(), || None)?;
+            let pre_switch = (|| -> std::result::Result<(File, u64, crate::annotations::Annotation), SparqlLoadError> {
+                write_synced(
+                    &dir.join("commit.json"),
+                    &commit::gen_commit_bytes_for(
+                        self.dataset_id,
+                        "bulk",
+                        &head,
+                        self.configuration_activated(),
+                        configuration,
+                    ),
+                )
+                .map_err(SparqlLoadError::Store)?;
+                let wal = wal::open_for_append(
+                    &dir.join("wal.log"),
+                    wal::version_with(self.configuration_activated(), self.control_enabled()),
+                )
+                .map_err(|e| SparqlLoadError::Store(e.into()))?;
+                let wal_size = wal
+                    .metadata()
+                    .map_err(|e| SparqlLoadError::Store(e.into()))?
+                    .len();
+                sync_dir(&dir).map_err(SparqlLoadError::Store)?;
+                sync_dir(root).map_err(SparqlLoadError::Store)?;
+                // the commit's message is durable before the switch (no digest: its change
+                // set is not at hand)
+                let ann = self
+                    .annotate(&head, message.clone(), || None)
+                    .map_err(SparqlLoadError::Store)?;
+                Ok((wal, wal_size, ann))
+            })();
+            let (wal, wal_size, ann) = match pre_switch {
+                Ok(v) => v,
+                Err(e) => {
+                    if self.clear_staged_prefixes().is_ok() {
+                        if let Some(prep) = prepared_prefixes.as_mut() {
+                            prep.disarm_staged_fence();
+                        }
+                    } else {
+                        w.poisoned = true;
+                    }
+                    return Err(e);
+                }
+            };
+            annotation = ann;
             if let Err(f) = self.switch_generation(w, root, &name) {
                 // Unless CURRENT may name the new generation, in which case the next open
-                // may bring the bulk commit back with its annotation, the annotation goes.
-                if !f.maybe_switched
-                    && !annotation.is_empty()
-                    && self.undo_annotation(head.seq).is_err()
-                {
-                    w.poisoned = true;
+                // may bring the bulk commit back with its annotation and staged prefixes,
+                // both go.
+                if !f.maybe_switched {
+                    if self.clear_staged_prefixes().is_ok() {
+                        if let Some(prep) = prepared_prefixes.as_mut() {
+                            prep.disarm_staged_fence();
+                        }
+                    } else {
+                        w.poisoned = true;
+                    }
+                    if !annotation.is_empty() && self.undo_annotation(head.seq).is_err() {
+                        w.poisoned = true;
+                    }
                 }
-                return Err(f.error);
+                return Err(SparqlLoadError::Store(f.error));
             }
             self.adopt_generation_log(
                 w,
                 &gen_,
                 NextLog {
-                    wal: BufWriter::new(wal),
+                    wal: Arc::new(wal),
                     // the new log holds its header record
                     tail: wal::Tail::new(wal_size, wal::HEADER_BYTES),
                     len: wal::HEADER_BYTES,
@@ -5897,14 +7583,35 @@ impl Store {
                 },
             );
         } else {
-            annotation = self.annotate(&head, message.clone(), || None)?;
+            annotation = match self.annotate(&head, message.clone(), || None) {
+                Ok(a) => a,
+                Err(e) => {
+                    if self.clear_staged_prefixes().is_ok() {
+                        if let Some(prep) = prepared_prefixes.as_mut() {
+                            prep.disarm_staged_fence();
+                        }
+                    } else {
+                        w.poisoned = true;
+                    }
+                    return Err(SparqlLoadError::Store(e));
+                }
+            };
         }
         // the switch is the commit point: a failure after it leaves the published state
         // behind the durable one, so later writes are refused
         w.head = head;
-        if let Err(e) = self.add_prefixes(meta.prefixes.clone()) {
-            w.poisoned = true;
-            return Err(e);
+        if let Some(mut prep) = prepared_prefixes.take() {
+            if let Some(next) = prep.next.take() {
+                if let Err(e) = self.install_staged_prefixes(&next) {
+                    w.poisoned = true;
+                    return Err(SparqlLoadError::Store(e));
+                }
+                prep.disarm_staged_fence();
+                *prep.cur = next;
+            }
+            let skipped = prep.skipped;
+            drop(prep);
+            self.warn_skipped_prefixes(skipped);
         }
         self.compaction
             .bulk_committed(head.seq, head.timestamp_ms, started.elapsed());
@@ -6003,15 +7710,15 @@ impl Store {
 
     /// Build the generation of a bulk commit next to the current one: the quads of
     /// `snap` outside the dropped graphs, the encoded extra quads and the sources. A
-    /// build that fails removes its directory. A bulk commit also checks the built
-    /// generation's size against the memory limit and quota, which a dry run records
-    /// in the returned storage check instead of failing.
-    fn build_generation(
+    /// build that fails removes its directory. Publication-fit checks against the
+    /// memory limit and dataset quota run in [`rebuild_locked_classified`] once the
+    /// generation is known to be published or previewed as a candidate commit.
+    fn build_generation_classified(
         &self,
         w: &WriterState,
         snap: &Snapshot,
         input: GenerationInput<'_>,
-    ) -> Result<BuiltGeneration> {
+    ) -> std::result::Result<BuiltGeneration, SparqlLoadError> {
         let GenerationInput {
             extra,
             extra_quads,
@@ -6019,7 +7726,6 @@ impl Store {
             fence,
             change_cap,
             opts: o,
-            dry,
         } = input;
         let (dir, name, tmp) = match &self.root {
             Some(root) => {
@@ -6035,12 +7741,15 @@ impl Store {
                 let name = format!("gen-{n:04}");
                 let dir = root.join(&name);
                 if dir.exists() {
-                    std::fs::remove_dir_all(&dir)?;
+                    std::fs::remove_dir_all(&dir).map_err(|e| SparqlLoadError::Store(e.into()))?;
                 }
                 (dir, name, None)
             }
             None => {
-                let t = tempfile::Builder::new().prefix("sparkles-mem-").tempdir()?;
+                let t = tempfile::Builder::new()
+                    .prefix("sparkles-mem-")
+                    .tempdir()
+                    .map_err(|e| SparqlLoadError::Store(e.into()))?;
                 (t.path().to_path_buf(), "mem".to_string(), Some(t))
             }
         };
@@ -6051,8 +7760,8 @@ impl Store {
         let mut dropped: Vec<[Id; 4]> = Vec::new();
         let mut dropped_over = false;
         let mut parsed = 0;
-        let built = (|| {
-            let mut builder = Builder::new(&dir, bopts)?;
+        let built = (|| -> std::result::Result<_, SparqlLoadError> {
+            let mut builder = Builder::new(&dir, bopts).map_err(SparqlLoadError::Store)?;
             if let Some(i) = interrupt.clone() {
                 builder = builder.with_interrupt(i);
             }
@@ -6080,40 +7789,33 @@ impl Store {
                     Ok(false)
                 },
                 extra_quads,
-            )?;
+            )
+            .map_err(SparqlLoadError::Store)?;
             let before = builder.input_quads();
             for s in extra {
-                builder.add_source(s)?;
+                builder.add_source_classified(s).map_err(|e| match e {
+                    crate::builder::AddSourceError::Source(e) => {
+                        classify_source_error(e, matches!(s.data, crate::io::SourceData::File(_)))
+                    }
+                    crate::builder::AddSourceError::Sink(e) => SparqlLoadError::Store(e),
+                })?;
             }
             parsed = builder.input_quads() - before;
             sourced = builder.take_tapped();
             builder.add_prefixes(self.prefixes());
-            let meta = builder.finish()?;
+            let meta = builder.finish().map_err(SparqlLoadError::Store)?;
             // a write stopped while it was built publishes nothing
             if let Some(i) = &interrupt {
-                i()?;
+                i().map_err(SparqlLoadError::Store)?;
             }
-            let mut storage = crate::preview::StorageCheck::default();
-            let old = snap.generation.dir.as_deref();
-            if dry {
-                storage = self.rebuild_storage(old, &dir);
-            }
-            let fits = self
-                .check_memory(dir_size(&dir))
-                .and_then(|_| self.quota.check_rebuild(old, &dir));
-            match fits {
-                Err(e) if dry => storage.refused = Some(e),
-                r => r?,
-            }
-            Ok((meta, storage))
+            Ok(meta)
         })();
         match built {
-            Ok((meta, storage)) => Ok(BuiltGeneration {
+            Ok(meta) => Ok(BuiltGeneration {
                 dir,
                 name,
                 tmp,
                 meta,
-                storage,
                 sourced,
                 dropped: (!dropped_over).then_some(dropped),
                 parsed,
@@ -6330,20 +8032,19 @@ impl Store {
         Ok(path)
     }
 
-    /// Write the numeric column (`vocab.num`) of the current generation when it has
-    /// none, because an older version built it. The store opened next uses it. Returns
-    /// the number of values in it, or `None` when the generation already has one or the
-    /// store is in memory.
+    /// Write or rebuild the numeric column (`vocab.num`) of the current generation when
+    /// it has none in the current format, because an older version built it. The store
+    /// opened next uses it. Returns the number of values in it, or `None` when the
+    /// generation already uses a current numeric column or the store is in memory. A
+    /// generation without numeric terms returns `Some(0)` without writing a sidecar, and
+    /// a later call scans its vocabulary again.
     pub fn add_numeric_column(&self) -> Result<Option<u64>> {
         let _w = self.guarded_writer();
         let snap = self.snapshot();
         let Some(dir) = snap.generation.dir.as_ref() else {
             return Ok(None);
         };
-        if dir.join(crate::vocab::numeric::FILE).exists() {
-            return Ok(None);
-        }
-        crate::vocab::add_numeric_column(dir).map(Some)
+        snap.generation.vocab.ensure_numeric_column(dir)
     }
 
     pub fn disk_bytes(&self) -> u64 {
@@ -6477,14 +8178,52 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     Ok(crate::fsutil::sync_dir(dir)?)
 }
 
-/// Apply an insert/delete to a delta, preserving the invariants
-/// `ins ∩ base = ∅` and `del ⊆ base`.
-fn apply(delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
+/// Apply an insert/delete to a delta under replay control `limit` (with `held` bytes
+/// already committed), preserving the invariants `ins ∩ base = ∅` and `del ⊆ base` and
+/// maintaining `delta.reifiers_ins` for inserted `rdf:reifies` triple-term quads.
+/// Predicate resolution and triple-term hashing run before `delta` is mutated so a
+/// budget, deadline, or cancellation refusal leaves `delta` unchanged.
+pub(crate) fn apply_with<C: crate::budgeted::Control>(
+    generation: &Generation,
+    delta: &mut Delta,
+    q: &[Id; 4],
+    insert: bool,
+    in_base: bool,
+    limit: &C,
+    held: u64,
+) -> Result<()> {
     // The invariants above determine the only set this operation can change, so the
     // opposite set is left alone. The inserted quads' writes keep their statistics.
+    let spo = Perm::Spo.index();
     match (insert, in_base) {
-        (true, false) => delta.insert_quad(q),
-        (false, false) => delta.remove_inserted(q),
+        (true, false) => {
+            if !delta.ins[spo].contains(&Perm::Spo.to_key(q)) {
+                let hashes = generation.is_rdf_reifies_triple_with(q[1], q[2], limit, held)?;
+                if delta.insert_quad(q)
+                    && let Some((hs, ho)) = hashes
+                {
+                    for h in [hs, ho].into_iter().flatten() {
+                        delta.reifiers_ins.insert([q[3].0, h, q[0].0, q[2].0]);
+                    }
+                }
+            }
+        }
+        (false, false) => {
+            if delta.ins[spo].contains(&Perm::Spo.to_key(q)) {
+                let hashes = if !delta.reifiers_ins.is_empty() {
+                    generation.is_rdf_reifies_triple_with(q[1], q[2], limit, held)?
+                } else {
+                    None
+                };
+                if delta.remove_inserted(q)
+                    && let Some((hs, ho)) = hashes
+                {
+                    for h in [hs, ho].into_iter().flatten() {
+                        delta.reifiers_ins.remove(&[q[3].0, h, q[0].0, q[2].0]);
+                    }
+                }
+            }
+        }
         (true, true) => {
             for p in Perm::ALL {
                 delta.del[p.index()].remove(&p.to_key(q));
@@ -6496,6 +8235,20 @@ fn apply(delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
             }
         }
     }
+    Ok(())
+}
+
+/// Apply an insert/delete to a delta without replay control limits.
+fn apply(generation: &Generation, delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
+    let _ = apply_with(
+        generation,
+        delta,
+        q,
+        insert,
+        in_base,
+        &crate::budgeted::Unlimited,
+        0,
+    );
 }
 
 /// Declaration order releases the writer mutex before the last permit, including
@@ -6532,6 +8285,47 @@ impl std::ops::DerefMut for TxnGuard<'_> {
     }
 }
 
+struct StagedPrefixFence<'a> {
+    store: &'a Store,
+    armed: bool,
+}
+
+impl StagedPrefixFence<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedPrefixFence<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.store.prefixes_poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+pub(super) struct PreparedPrefixes<'a> {
+    // Dropped first (before `cur` and `_removed` unlock) so any unresolved staged sidecar
+    // poisons standalone prefix mutators before they can acquire `prefixes`.
+    staged_fence: Option<StagedPrefixFence<'a>>,
+    _removed: parking_lot::MutexGuard<'a, BTreeSet<String>>,
+    pub(super) cur: parking_lot::MutexGuard<'a, BTreeMap<String, String>>,
+    pub(super) next: Option<BTreeMap<String, String>>,
+    pub(super) skipped: usize,
+}
+
+impl<'a> PreparedPrefixes<'a> {
+    pub(super) fn arm_staged_fence(&mut self, store: &'a Store) {
+        self.staged_fence = Some(StagedPrefixFence { store, armed: true });
+    }
+
+    pub(super) fn disarm_staged_fence(&mut self) {
+        if let Some(f) = self.staged_fence.as_mut() {
+            f.disarm();
+        }
+    }
+}
+
 /// The single write transaction. Changes are invisible until [`commit`](Self::commit).
 pub struct WriteTxn<'s> {
     _callback_owner: crate::sparql::extensions::WriterOwner,
@@ -6539,6 +8333,8 @@ pub struct WriteTxn<'s> {
     base: Arc<Snapshot>,
     delta: Delta,
     guard: TxnGuard<'s>,
+    /// No predecessor can be queued or fenced while this transaction holds the writer.
+    idle_group: bool,
     log: Vec<(u8, [Id; 4])>,
     /// large insert batches applied by rebuilding the generation on commit
     bulk: Vec<[Id; 4]>,
@@ -6575,6 +8371,8 @@ pub struct WriteTxn<'s> {
     stamp: Option<i64>,
     /// the control records staged by an owner ([`Self::set_control`])
     control: Option<control_store::ControlTxn>,
+    /// prefixes staged for joint persistence with this transaction's commit
+    staged_prefixes: BTreeMap<String, String>,
 }
 
 impl Drop for WriteTxn<'_> {
@@ -6582,7 +8380,7 @@ impl Drop for WriteTxn<'_> {
         // a dry run leaves no terms and no blank-node ids behind, however it ended; the
         // writer lock is still held here, and only this transaction's views reached them
         if self.opts.dry_run.is_some() {
-            if let Err(e) = self.base.generation.dvocab.rollback(&self.mark) {
+            if let Err(e) = self.base.generation.rollback_dvocab(&self.mark) {
                 tracing::warn!(target: "sparkles::store", "a dry run could not remove the terms it added: {e}");
             }
             self.guard.next_bnode = self.start_bnode;
@@ -6607,6 +8405,14 @@ impl Drop for OrdinarySyncObservation<'_> {
 }
 
 impl WriteTxn<'_> {
+    /// Stage prefixes to be persisted jointly with this transaction's commit.
+    ///
+    /// Dry runs and refused transactions never touch the dataset's prefix table. If
+    /// persisting `prefixes.json` fails, the transaction aborts before publishing quads.
+    pub fn stage_prefixes(&mut self, prefixes: BTreeMap<String, String>) {
+        self.staged_prefixes.extend(prefixes);
+    }
+
     /// [`Error::NotPermitted`] unless the write's graph view lets it change graph `g`.
     /// Called before a quad is looked up, so the answer never depends on the data.
     fn check_graph(&mut self, g: Id) -> Result<()> {
@@ -6626,6 +8432,35 @@ impl WriteTxn<'_> {
         } else {
             access.check_write(&self.view(), g)
         }
+    }
+
+    /// Check that this transaction's caller is permitted to write to graph `g`.
+    pub fn check_graph_writable(&mut self, g: Id) -> Result<()> {
+        self.check_graph(g)
+    }
+
+    /// Check that this transaction is permitted to commit on the branch (refusing
+    /// protected branches unless this is a merge or a new-branch dry-run preview).
+    pub fn check_protected(&self) -> Result<()> {
+        let as_new_branch = self.opts.preview_as_new_branch && self.opts.dry_run.is_some();
+        if self.merge.is_none() && !as_new_branch {
+            self.store.check_protected(self.kind)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this transaction is running as a dry-run preview.
+    pub fn is_dry_run(&self) -> bool {
+        self.opts.dry_run.is_some()
+    }
+
+    /// Check this transaction's precondition (`If-Match` / `If-None-Match`) against its
+    /// base snapshot under the held writer lock.
+    pub fn check_precondition(&self) -> Result<()> {
+        if let Some(p) = &self.opts.precondition {
+            p.check(&self.base)?;
+        }
+        Ok(())
     }
 
     /// Let this transaction change the managed graphs of the capability's owner (see
@@ -6689,18 +8524,69 @@ impl WriteTxn<'_> {
         self.store.aggregate_errors()
     }
 
-    /// The graph view of this transaction's writes, if it does not cover every graph.
-    pub fn graphs(&self) -> Option<&Arc<crate::access::GraphAccess>> {
-        self.opts.graphs.as_ref()
+    /// Prepare a scoped, budgeted read view of this transaction under `preparation`,
+    /// reserving the transaction snapshot's delta and generation storage before
+    /// constructing the view.
+    ///
+    /// The returned [`PreparedTxnView`] borrows this [`WriteTxn`], preventing mutations,
+    /// commits, [`Self::discard_terms`], or dry-run vocabulary rollback while the view or
+    /// any [`ScopedQueryResult`] derived from it is alive. When the transaction has no
+    /// uncommitted changes yet, the prepared view reads `self.base` so a policy bound
+    /// against `self.base` remains valid; once dirty, policies bound to an earlier state
+    /// are refused.
+    pub fn prepare_read_view<'a>(
+        &'a self,
+        preparation: &crate::access::Preparation,
+    ) -> Result<PreparedTxnView<'a>> {
+        let selection = preparation.selection_scope();
+        selection.check()?;
+        let limit = crate::history::ReadLimit {
+            options: &selection,
+            memory: Some(selection.selection_room()),
+            held: 0,
+        };
+        let delta_bytes = if self.is_dirty() {
+            crate::store::history_limited::preparation_delta_bytes(&self.delta)
+                .max(crate::store::history_limited::SHARED_SNAPSHOT_BYTES)
+        } else {
+            crate::store::history_limited::SHARED_SNAPSHOT_BYTES
+        };
+        let retained = delta_bytes
+            .checked_add(self.base.generation.retained_bytes_with(&limit)?)
+            .and_then(|bytes| bytes.checked_add(crate::history::READ_METADATA_BYTES))
+            .ok_or_else(|| selection.exhausted())?;
+        let held = selection.reserve(retained)?;
+        let snap = if self.is_dirty() {
+            Arc::new(self.view())
+        } else {
+            self.base.clone()
+        };
+        let txn = bound_read_source::PreparedTxn::new(snap, self.store, held);
+        let all = crate::access::GraphAccess::all();
+        let access = self.opts.graphs.as_deref().unwrap_or(&all);
+        let view = crate::access::triples::controlled::prepare_txn(
+            txn,
+            access,
+            &preparation.without_selection_scope(),
+        )?;
+        Ok(PreparedTxnView::new(self.store, view))
     }
 
-    /// The state the transaction's reads see: [`view`](Self::view), without the triples
-    /// the graph view's protections hide. Before the first change it is the committed
-    /// snapshot's masked view, built once per commit.
+    /// Legacy unbudgeted helper returning the state the transaction's reads see:
+    /// [`view`](Self::view), without the triples the graph view's protections hide.
+    /// The returned snapshot is not bound to a [`crate::access::Preparation`] and must
+    /// not be retained past [`Self::discard_terms`]; prefer [`Self::prepare_read_view`]
+    /// for budgeted read paths.
     pub fn read_view(&self) -> Result<Arc<Snapshot>> {
-        match self.opts.graphs.as_ref().filter(|a| a.hides_triples()) {
-            Some(a) if !self.is_dirty() => a.masked(&self.base),
-            Some(a) => a.masked(&Arc::new(self.view())),
+        match self.opts.graphs.as_ref().filter(|a| !a.reads_everything()) {
+            Some(a) => {
+                let snap = if !self.is_dirty() {
+                    self.base.clone()
+                } else {
+                    Arc::new(self.view())
+                };
+                a.bound(&snap).masked(&snap)
+            }
             None => Ok(Arc::new(self.view())),
         }
     }
@@ -6801,7 +8687,7 @@ impl WriteTxn<'_> {
     /// rollback that fails part way poisons the store's writer until it is reopened, as a
     /// failed load does.
     pub fn discard_terms(&mut self) -> Result<()> {
-        if let Err(e) = self.base.generation.dvocab.rollback(&self.mark) {
+        if let Err(e) = self.base.generation.rollback_dvocab(&self.mark) {
             self.guard.poisoned = true;
             return Err(e);
         }
@@ -6905,7 +8791,7 @@ impl WriteTxn<'_> {
         if let Ok(i) = self.base.generation.vocab.find(key) {
             return Ok(Id::vocab(i));
         }
-        Ok(Id::delta(self.base.generation.dvocab.insert(key)?))
+        self.base.generation.intern_delta_key(key)
     }
 
     /// Resolve a term against this writer's vocabulary without retaining a data view.
@@ -7049,7 +8935,7 @@ impl WriteTxn<'_> {
         } else {
             self.net_ins += 1;
         }
-        apply(&mut self.delta, &q, true, ib);
+        apply(&self.base.generation, &mut self.delta, &q, true, ib);
         self.log.push((WAL_INSERT, q));
         Ok(true)
     }
@@ -7069,7 +8955,7 @@ impl WriteTxn<'_> {
         } else {
             self.net_ins -= 1;
         }
-        apply(&mut self.delta, &q, false, ib);
+        apply(&self.base.generation, &mut self.delta, &q, false, ib);
         self.log.push((WAL_DELETE, q));
         Ok(true)
     }
@@ -7158,23 +9044,30 @@ impl WriteTxn<'_> {
         sync: &mut Option<(SyncPath, std::time::Duration)>,
     ) -> Result<Receipt> {
         self._callback_owner.check()?;
-        if self.guard.poisoned || self.store.group.as_ref().is_some_and(|g| g.failed()) {
+        if self.guard.poisoned
+            || (!self.idle_group && self.store.group.as_ref().is_some_and(|g| g.failed()))
+        {
             return Err(Error::Poisoned);
         }
         let grouped = self.group_admitted();
         // A dependent no-op, preview, validation, bulk rebuild or other fallback
         // cannot acknowledge or capture a speculative predecessor.
         if !grouped || (self.net_ins == 0 && self.net_del == 0) {
-            self.store.drain_group(&mut self.guard, Some(&self.opts))?;
-        } else if self.opts.no_wait {
-            // A grouped commit is acknowledged only after a fence, which a write that will
-            // not wait must not wait for. It is refused before the guard runs, and nothing
-            // has reached the WAL.
+            self.drain_predecessors()?;
+        } else if !self.idle_group
+            && self.opts.no_wait
+            && self.store.group.as_ref().is_some_and(|g| !g.idle())
+        {
+            // A write that will not wait must not park behind another commit's fence.
+            // On an idle coordinator it seals and leads its own group of one directly.
             return Err(Error::WriterBusy);
         }
         // a commit with a merge record (a merge, or a commit a merge replays) passes
         let as_new_branch = self.opts.preview_as_new_branch && self.opts.dry_run.is_some();
-        if (self.is_dirty() || self.force) && self.merge.is_none() && !as_new_branch {
+        if (self.is_dirty() || self.force || !self.staged_prefixes.is_empty())
+            && self.merge.is_none()
+            && !as_new_branch
+        {
             self.store.check_protected(self.kind)?;
         }
         self.check_requested_all()
@@ -7214,12 +9107,27 @@ impl WriteTxn<'_> {
             }
             if self.net_ins == 0 && self.net_del == 0 && !self.force {
                 if self.control_staged() {
-                    // control changes alone: a control-only frame, not a commit
+                    // control changes alone: a control-only frame, not a commit. Staged
+                    // prefixes are reconciled against the control frame sequence inside
+                    // `publish_control_only` so a refused control frame never publishes
+                    // them.
                     self.opts.check_publish()?;
                     return self.publish_control_only();
                 }
-                // no net change: no commit, nothing to validate
-                return self.publish_log(None, sync);
+                // no net change: no commit, nothing to validate or publish
+                if !self.staged_prefixes.is_empty() {
+                    self.opts.check_publish()?;
+                    let staged = std::mem::take(&mut self.staged_prefixes);
+                    self.store.add_prefixes(staged)?;
+                }
+                let head = self.guard.head;
+                return Ok(Receipt {
+                    dataset_id: self.store.owner_dataset_id(),
+                    committed: false,
+                    commit: head,
+                    validation: None,
+                    annotation: self.store.annotation(head.seq).unwrap_or_default(),
+                });
             }
             let head = self.guard.head.seq;
             let validation = self.store.run_guard(
@@ -7240,10 +9148,63 @@ impl WriteTxn<'_> {
             };
             // the last check, after the validation, right before publication
             self.opts.check_publish()?;
-            if grouped {
-                return self.publish_grouped(validation);
+            let staged_prefixes = std::mem::take(&mut self.staged_prefixes);
+            if staged_prefixes.is_empty() {
+                if self.guard.wal.is_none() {
+                    return self.publish_memory(validation);
+                }
+                return self.publish_grouped(validation, grouped, sync);
             }
-            return self.publish_log(validation, sync);
+            let store = self.store;
+            let target_seq = self.guard.head.seq + 1;
+            let mut prep = store.prepare_added_prefixes(&staged_prefixes)?;
+            if let Some(next) = prep.next.take() {
+                prep.arm_staged_fence(store);
+                if let Err(e) = store.stage_prefixes_for_commit(target_seq, None, &next) {
+                    if store.clear_staged_prefixes().is_ok() {
+                        prep.disarm_staged_fence();
+                    } else {
+                        self.guard.poisoned = true;
+                    }
+                    return Err(e);
+                }
+                let res = if self.guard.wal.is_none() {
+                    self.publish_memory(validation)
+                } else {
+                    self.publish_grouped(validation, grouped, sync)
+                };
+                match res {
+                    Ok(receipt) => {
+                        if let Err(e) = store.install_staged_prefixes(&next) {
+                            self.guard.poisoned = true;
+                            return Err(e);
+                        }
+                        prep.disarm_staged_fence();
+                        *prep.cur = next;
+                        let skipped = prep.skipped;
+                        drop(prep);
+                        store.warn_skipped_prefixes(skipped);
+                        return Ok(receipt);
+                    }
+                    Err(e) => {
+                        if !self.guard.poisoned {
+                            if store.clear_staged_prefixes().is_ok() {
+                                prep.disarm_staged_fence();
+                            } else {
+                                self.guard.poisoned = true;
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            let skipped = prep.skipped;
+            drop(prep);
+            store.warn_skipped_prefixes(skipped);
+            if self.guard.wal.is_none() {
+                return self.publish_memory(validation);
+            }
+            return self.publish_grouped(validation, grouped, sync);
         }
         // Build the new generation from this transaction's view (base + uncommitted delta)
         // plus the bulk quads; switching CURRENT is the atomic commit point, so the
@@ -7263,6 +9224,8 @@ impl WriteTxn<'_> {
             default_graph: self.log.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH)
                 || bulk.iter().any(|q| q[3] == Id::DEFAULT_GRAPH),
             admission: self.managed_admission.take(),
+            skip_if_unchanged: false,
+            staged_prefixes: std::mem::take(&mut self.staged_prefixes),
         };
         let log = std::mem::take(&mut self.log);
         let check = (
@@ -7281,7 +9244,10 @@ impl WriteTxn<'_> {
     /// Whether this commit joins a group. A commit of a store with group commit on that
     /// does not is counted under the first reason it fell back for.
     fn group_admitted(&self) -> bool {
-        let why = match self.store.group_check(self.kind, &self.opts, &self.guard) {
+        let why = match self
+            .store
+            .group_check(self.kind, &self.opts, &self.guard, self.idle_group)
+        {
             Err(None) => return false,
             Err(Some(why)) => Some(why),
             Ok(()) if !self.bulk.is_empty() => Some(Fallback::Bulk),
@@ -7290,7 +9256,8 @@ impl WriteTxn<'_> {
                 if self.force
                     || self.merge.is_some()
                     || self.managed.is_some()
-                    || self.control.is_some() =>
+                    || self.control.is_some()
+                    || !self.staged_prefixes.is_empty() =>
             {
                 Some(Fallback::Kind)
             }
@@ -7301,62 +9268,41 @@ impl WriteTxn<'_> {
         if let Some(why) = why {
             self.store.commit_stats.fell_back(why);
         }
-        // a no-op is counted, but still drains and is answered by the ordinary path
+        // a no-op is counted, but still drains and returns without writing to the log
         if why.is_some() {
             return why == Some(Fallback::Noop);
         }
-        // Idle fast path: the only writer, with no fence running, commits as the ordinary
-        // writer does, with write-through writes that need no cache flush. A commit that
-        // finds another writer waiting for the lock groups instead.
-        let alone = self.store.opts.group_commit_idle_direct
-            && self.store.writers_waiting() == 0
-            && self.store.group.as_ref().is_some_and(|g| g.idle());
-        !alone
+        true
     }
 
-    fn publish_log(
+    fn drain_predecessors(&mut self) -> Result<()> {
+        if !self.idle_group {
+            return self.store.drain_group(&mut self.guard, Some(&self.opts));
+        }
+        if self.store.group.is_some() {
+            self.opts.check()?;
+        }
+        Ok(())
+    }
+
+    /// Publish a commit of an in-memory store, which has no write-ahead log (X16 Phase 6).
+    fn publish_memory(
         &mut self,
         validation: Option<Arc<crate::guard::ValidationSummary>>,
-        sync: &mut Option<(SyncPath, std::time::Duration)>,
     ) -> Result<Receipt> {
         let gen_ = &self.base.generation;
-        let head = self.guard.head;
-        if self.net_ins == 0 && self.net_del == 0 && !self.force {
-            // nothing changed (or every change was undone): no commit, nothing published
-            return Ok(Receipt {
-                dataset_id: self.store.owner_dataset_id(),
-                committed: false,
-                commit: head,
-                validation: None,
-                annotation: self.store.annotation(head.seq).unwrap_or_default(),
-            });
-        }
         let message = match &self.opts.message {
             Some(m) => crate::annotations::validate_message(m)?,
             None => None,
         };
-        // nothing is written when the disk (or an in-memory store's limit, or a
-        // persistent one's quota) has no room
         self.check_storage()?;
-        // A commit that added terms syncs them together with its WAL records (see
-        // `commit_direct` and `sync_commit_reused`); without a WAL they are synced here.
-        if self.guard.wal.is_none() {
-            gen_.dvocab.sync()?;
-        }
+        gen_.dvocab.sync()?;
         let c = self.next_commit(validation.as_deref());
-        // the control frame the commit carries, which names it (spec C26 §7.1)
         let control = self.control_frame(c.seq, c.timestamp_ms)?;
-        let control_bytes = match &control {
-            Some((frame, _)) => frame.encode()?,
-            None => Vec::new(),
-        };
-        // the message and digest are durable before the commit is (see `annotations`)
         let annotation = self
             .store
             .annotate(&c, message, || Some(self.change_lines()))?;
         let next_bnode = self.guard.next_bnode;
-        let prealloc = self.wal_prealloc();
-        // a merge's record is durable before its commit (open drops one above the head)
         if let Some(m) = self.merge.as_mut() {
             m.seq = c.seq;
             let rec = *m;
@@ -7366,120 +9312,6 @@ impl WriteTxn<'_> {
             }
             self.store.failpoint("merge-recorded");
         }
-        let w = &mut **self.guard;
-        if let Some(wal) = w.wal.as_mut() {
-            // the record says no earlier commit may be missing from disk, so a fence
-            // that is still running would make that untrue
-            debug_assert!(
-                self.store
-                    .group
-                    .as_ref()
-                    .is_none_or(|g| g.idle() || g.failed())
-                    && w.head.seq == self.store.current.load().commit,
-                "an ordinary commit while group commit has commits in flight"
-            );
-            // The records carry no `WAL_FLAG_ANNOTATED`: the annotation above is durable
-            // before them, so replay never has to tell a torn one from a missing one.
-            let data = wal::encode_txn_with_control(
-                &self.log,
-                &control_bytes,
-                self.configuration,
-                next_bnode,
-                wal::Seal::of(&c, 0, 0),
-            )?;
-            // In a store with a control keyspace the writer stays poisoned from here
-            // until the snapshot and the control state are published, so that an error
-            // or an unwind in between leaves no writer whose head differs from what
-            // readers see (spec C26 §7.1).
-            if self.store.control_enabled() {
-                w.poisoned = true;
-                self.store.failpoint("control-commit-armed");
-            }
-            // once the first byte is written, a failure leaves the WAL in an unknown
-            // state: refuse further writes, so a seq can never be written twice
-            let tail = w.tail.clone();
-            let mut io = tail.lock();
-            debug_assert_eq!(io.end, w.wal_len, "an ordinary commit after unwritten ones");
-            let alloc_before = io.alloc;
-            let vocab_before = gen_.dvocab.allocated();
-            let direct_on = self.store.opts.wal_direct_writes;
-            let path = gen_
-                .dir
-                .as_deref()
-                .filter(|_| direct_on)
-                .map(|d| d.join("wal.log"));
-            gen_.dvocab.set_prealloc(prealloc);
-            let written = wal.flush().map_err(Error::from).and_then(|_| {
-                if wal::DirectLog::fits(w.wal_len, data.len(), io.alloc)
-                    && let Some(direct) = io.direct.handle(path.as_deref(), wal.get_ref())
-                {
-                    let t = std::time::Instant::now();
-                    // A test's branch-selection control, not a physical EINVAL fault,
-                    // refuses before this helper performs any mutation.
-                    let direct_written = !ordinary_sync_probe::skip_direct(self.store)
-                        && commit_direct(
-                            direct,
-                            w.wal_len,
-                            &data,
-                            &gen_.dvocab,
-                            &mut w.vocab_sync,
-                            u64::MAX,
-                        )?;
-                    if direct_written {
-                        *sync = Some((SyncPath::Direct, t.elapsed()));
-                        ordinary_sync_probe::captured(self.store);
-                        return Ok(());
-                    }
-                    // the file system refused direct I/O: write this commit and the
-                    // later ones the buffered way
-                    io.direct = wal::Direct::Off;
-                }
-                // The terms are written before the records, so that a reader of the
-                // WAL (`sparkles check`, a linked branch opening) finds every term
-                // the records name. The sync covers both.
-                if gen_.dvocab.needs_sync() {
-                    gen_.dvocab.flush()?;
-                }
-                wal::write_commit(wal.get_ref(), w.wal_len, &mut io.alloc, &data, prealloc)?;
-                let t = std::time::Instant::now();
-                let synced =
-                    sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync, u64::MAX);
-                *sync = Some((SyncPath::Buffered, t.elapsed()));
-                ordinary_sync_probe::captured(self.store);
-                synced
-            });
-            tail.release(&io);
-            if let Err(e) = written {
-                // The records may have reached the file, and the commit may then come back
-                // at the next open. Its annotation and merge record stay, so a recovered
-                // commit keeps its message, its change digest and its merge parent. The
-                // writer takes no more commits, and the next open drops both records if the
-                // commit did not survive, because they lie above the recovered head.
-                w.poisoned = true;
-                return Err(e);
-            }
-            if control.is_some() {
-                self.store.failpoint("control-commit-synced");
-            }
-            // the bytes the file grew by: the records past its end and any zeros after,
-            // which the quota does not count
-            // and the bytes the vocabulary file grew by
-            self.store.quota.add(io.alloc - alloc_before);
-            self.store
-                .quota
-                .add(gen_.dvocab.allocated().saturating_sub(vocab_before));
-            w.wal_len += data.len() as u64;
-            io.end = w.wal_len;
-            self.store.quota.set_preallocated(io.alloc - io.end);
-            drop(io);
-            self.store
-                .quota
-                .set_vocab_preallocated(gen_.dvocab.preallocated());
-        }
-        // the commit's records end where the log ends now, when it has a log
-        let log_end = w.wal.is_some().then_some(w.wal_len);
-        // The tap takes the commit under the writer lock, as the group path does before
-        // it enqueues, so a compaction that is building carries it over.
         if let Some(tap) = self.guard.tap.as_mut() {
             if tap.active.load(Ordering::Acquire) {
                 tap.commits.push(compaction::TapCommit {
@@ -7516,17 +9348,13 @@ impl WriteTxn<'_> {
             info: c,
             snapshot: snap,
             configuration: self.configuration,
-            log_end,
+            log_end: None,
             changes: Some(&self.log),
             change,
             validated: validation.is_some(),
         }));
         if let Some((_, state)) = control {
             self.store.control.store(Some(Arc::new(state)));
-        }
-        if self.store.control_enabled() && self.guard.wal.is_some() {
-            self.store.failpoint("control-commit-published");
-            self.guard.poisoned = false;
         }
         Ok(Receipt {
             dataset_id: self.store.owner_dataset_id(),
@@ -7541,6 +9369,17 @@ impl WriteTxn<'_> {
     fn wal_bytes(&self) -> u64 {
         (self.log.len() as u64 + 1 + u64::from(self.configuration_expected)) * WAL_REC as u64
             + self.control_wal_bytes()
+    }
+
+    /// The pending dictionary and annotation records counted with a persistent commit.
+    fn pending_storage_bytes(&self, terms_from: u64, message: Option<&str>) -> (u64, u64) {
+        if self.store.root.is_none() {
+            return (0, 0);
+        }
+        (
+            self.base.generation.dvocab.key_bytes(terms_from),
+            crate::annotations::record_len(message, self.store.commit_digests()),
+        )
     }
 
     /// The most this commit may preallocate in the WAL past its records (see
@@ -7568,17 +9407,18 @@ impl WriteTxn<'_> {
     /// The storage checks of a commit through the WAL: the free disk space the store
     /// keeps, and for a commit that adds quads the quota or the in-memory size limit.
     fn check_storage(&self) -> Result<()> {
-        self.check_storage_for(self.net_ins > 0, self.wal_bytes())
+        let bytes = self.wal_bytes();
+        self.check_storage_for(self.net_ins > 0, bytes, bytes)
     }
 
-    fn check_storage_for(&self, inserts: bool, wal_bytes: u64) -> Result<()> {
+    fn check_storage_for(&self, inserts: bool, quota_bytes: u64, disk_bytes: u64) -> Result<()> {
         // grouped commits queued for their fence have not written their records and terms
         // yet, nor running fences their preallocation, so the free space on disk does not
         // show them
         self.store
-            .check_disk(wal_bytes.saturating_add(self.store.quota.unwritten()))?;
+            .check_disk(disk_bytes.saturating_add(self.store.quota.unwritten()))?;
         if inserts {
-            self.store.quota.check_commit(wal_bytes)?;
+            self.store.quota.check_commit(quota_bytes)?;
         }
         if inserts && self.store.root.is_none() && self.store.opts.max_memory_bytes.is_some() {
             self.store.check_memory(self.memory_size())?;
@@ -7668,6 +9508,114 @@ fn guard_required_by(root: &Path) -> bool {
     }
 }
 
+/// Read and validate [`STAGED_PREFIXES_FILE`] without mutating any file on disk.
+///
+/// Called early during [`Store::open_inner`] so an unknown `format_version` or corrupt
+/// sidecar refuses cleanly before WAL tail truncation or catalog changes occur.
+fn parse_staged_prefixes_file(root: &Path) -> Result<Option<StagedPrefixesRecord>> {
+    let staged_path = root.join(STAGED_PREFIXES_FILE);
+    let bytes = match std::fs::read(&staged_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        Error::Corrupt(format!(
+            "{}: malformed staged prefixes file: {e}",
+            staged_path.display()
+        ))
+    })?;
+    let found_u64 = raw
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            Error::Corrupt(format!(
+                "{}: missing or invalid format_version",
+                staged_path.display()
+            ))
+        })?;
+    let found = u32::try_from(found_u64).unwrap_or(u32::MAX);
+    match found {
+        STAGED_PREFIXES_FORMAT_VERSION_V1 => {
+            let v1: StagedPrefixesFileV1 = serde_json::from_value(raw).map_err(|e| {
+                Error::Corrupt(format!(
+                    "{}: invalid v1 staged prefixes payload: {e}",
+                    staged_path.display()
+                ))
+            })?;
+            Ok(Some(StagedPrefixesRecord {
+                commit_seq: v1.commit_seq,
+                control_seq: None,
+                prefixes: v1.prefixes,
+            }))
+        }
+        STAGED_PREFIXES_FORMAT_VERSION => {
+            let v2: StagedPrefixesFileV2 = serde_json::from_value(raw).map_err(|e| {
+                Error::Corrupt(format!(
+                    "{}: invalid v2 staged prefixes payload: {e}",
+                    staged_path.display()
+                ))
+            })?;
+            Ok(Some(StagedPrefixesRecord {
+                commit_seq: v2.commit_seq,
+                control_seq: Some(v2.control_seq),
+                prefixes: v2.prefixes,
+            }))
+        }
+        _ => Err(Error::Unsupported(format!(
+            "{}: unsupported staged prefixes format_version {found}; supported versions are {STAGED_PREFIXES_FORMAT_VERSION_V1} and {STAGED_PREFIXES_FORMAT_VERSION}",
+            staged_path.display()
+        ))),
+    }
+}
+
+pub(crate) fn preflight_staged_prefixes(root: &Path) -> Result<()> {
+    let _ = parse_staged_prefixes_file(root)?;
+    Ok(())
+}
+
+/// Reconcile any crash-recoverable [`STAGED_PREFIXES_FILE`] against the store's recovered
+/// durable commit head `head_seq` (and durable control sequence `control_seq` for
+/// control-only transactions).
+///
+/// If the staged commit (or control frame) reached the recovered head, install the staged
+/// prefix map into `prefixes.json` and update `prefixes`. Otherwise discard the uncommitted
+/// staging file so prefixes stay aligned with the rolled-back state. Unknown
+/// `format_version` values are refused cleanly with [`Error::Unsupported`].
+fn reconcile_staged_prefixes(
+    root: &Path,
+    head_seq: u64,
+    control_seq: Option<u64>,
+    prefixes: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let write_tmp = root.join(STAGED_PREFIXES_WRITE_TMP);
+    if write_tmp.exists() {
+        let _ = std::fs::remove_file(&write_tmp);
+    }
+    let staged_path = root.join(STAGED_PREFIXES_FILE);
+    let Some(staged) = parse_staged_prefixes_file(root)? else {
+        return Ok(());
+    };
+    let committed = match staged.control_seq {
+        Some(cseq) => control_seq.is_some_and(|recovered| recovered >= cseq),
+        None => staged.commit_seq <= head_seq,
+    };
+    if committed {
+        write_atomic(
+            &root.join("prefixes.json"),
+            &serde_json::to_vec_pretty(&staged.prefixes).unwrap(),
+        )?;
+        *prefixes = staged.prefixes;
+    }
+    match std::fs::remove_file(&staged_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    sync_dir(root)?;
+    Ok(())
+}
+
 /// A dry run's preview with `early`, the memory check that refused its sources before
 /// they were encoded, which the write itself meets before its commit checks the storage,
 /// so that the preview reports that refusal and its sizes, with or without a net change.
@@ -7706,8 +9654,12 @@ fn estimated_quads(sources: &[Source]) -> u64 {
 fn control_streams(sources: &[Source], o: &crate::guard::WriteOptions) -> Result<()> {
     for s in sources {
         if let crate::io::SourceData::Reader(r) = &s.data {
-            r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
-            r.decode(s.codec()?, s.max_decompressed, o)?;
+            if r.decoded() {
+                r.decode(crate::codec::Codec::None, s.max_decompressed, o)?;
+            } else {
+                r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
+                r.decode(s.codec()?, s.max_decompressed, o)?;
+            }
         }
     }
     Ok(())
@@ -7777,10 +9729,38 @@ fn dump_snapshot(snap: &Snapshot, w: impl Write) -> Result<u64> {
 
 /// Estimated memory of one quad of a delta (seven ordered sets of 32-byte keys).
 const DELTA_QUAD_BYTES: u64 = 7 * 64;
+/// Estimated memory of one reifier index key in a delta.
+const DELTA_REIFIER_KEY_BYTES: u64 = 64;
+
+/// Number of distinct `reifiers_ins` keys a parsed quad will insert (0, 1, or 2).
+fn parsed_quad_reifier_keys(q: &oxrdf::Quad) -> usize {
+    if q.predicate.as_str() != crate::reifiers::RDF_REIFIES {
+        return 0;
+    }
+    let oxrdf::Term::Triple(t) = &q.object else {
+        return 0;
+    };
+    let s = match &t.subject {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => Some(n.as_str()),
+        _ => None,
+    };
+    let o = match &t.object {
+        oxrdf::Term::NamedNode(n) => Some(n.as_str()),
+        _ => None,
+    };
+    match (s, o) {
+        (Some(s), Some(o)) if s == o => 1,
+        (Some(_), Some(_)) => 2,
+        (Some(_), None) | (None, Some(_)) => 1,
+        (None, None) => 0,
+    }
+}
 
 /// Estimated memory of a (replayed) delta.
 fn delta_bytes(d: &Delta) -> u64 {
-    (d.inserts() + d.deletes()) as u64 * DELTA_QUAD_BYTES
+    ((d.inserts() + d.deletes()) as u64)
+        .saturating_mul(DELTA_QUAD_BYTES)
+        .saturating_add((d.reifiers_ins.len() as u64).saturating_mul(DELTA_REIFIER_KEY_BYTES))
 }
 
 /// The control of one historical read, which narrows to the history cache once the
@@ -7847,6 +9827,13 @@ impl crate::budgeted::Control for HistoryCeiling<'_> {
         self.limit
     }
 
+    fn read_lock<'m, T>(
+        &self,
+        lock: &'m parking_lot::RwLock<T>,
+    ) -> Result<parking_lot::RwLockReadGuard<'m, T>> {
+        self.limit.read_lock(lock)
+    }
+
     fn check_delta(&self, delta: &Delta) -> Result<()> {
         let bytes = delta_bytes(delta);
         self.limit.check(bytes)?;
@@ -7887,7 +9874,6 @@ fn collect_generations(
     for (no, dir) in doomed {
         h.open.retain(|(n, _)| *n != no);
         h.cache.retain(|c| c.generation != no);
-        h.settle();
         match crate::history::retire_generation(root, &dir) {
             Ok(d) => {
                 h.gens.remove(&no);
@@ -7980,6 +9966,9 @@ impl Drop for Store {
         // process (or a restore's swap) may own next
         {
             let mut w = self.guarded_writer();
+            if self.group.as_ref().is_some_and(|g| g.failed()) {
+                w.poisoned = true;
+            }
             // a guard keeps what it knows of the head for the next open
             if !w.poisoned
                 && !std::thread::panicking()
@@ -8000,7 +9989,9 @@ impl Drop for Store {
             w.closed = true;
             // Backup leases may retain WriterState after the store closes.
             // Shut down the owned worker now, rather than with that last lease.
-            w.vocab_sync = Default::default();
+            if let Some(g) = &self.group {
+                *g.vocab.lock() = Default::default();
+            }
             w.trim_wal();
             if !w.poisoned {
                 self.snapshot().generation.dvocab.trim();
@@ -8095,7 +10086,6 @@ pub(crate) fn wal_point_with<C: crate::budgeted::Control>(
     let path = entry.dir.join("wal.log");
     let floor = if C::ACCOUNTS {
         let floor = limit
-            .read_limit()
             .lock(&g.wal_index)?
             .as_ref()
             .map(|index| index.floor(seq))
@@ -8354,12 +10344,15 @@ pub(crate) fn replay_wal(
     let probe = SnapshotBuilder::of_generation(
         Shared {
             dataset_id: uuid::Uuid::nil(),
+            branch_id: uuid::Uuid::nil(),
             cache,
             results: from.results,
             union_default_graph: false,
             aggregate_errors: Default::default(),
             geo_op_vertices: StoreOptions::default().geo_op_vertices,
             change_log: None,
+            managed: None,
+            history_origin: None,
         },
         from.generation.clone(),
         0,
@@ -8493,7 +10486,13 @@ pub(crate) fn replay_wal(
                         (false, true) => del += 1,
                         (false, false) => ins -= 1,
                     }
-                    apply(&mut out.delta, &q, op == WAL_INSERT, in_base);
+                    apply(
+                        &probe.generation,
+                        &mut out.delta,
+                        &q,
+                        op == WAL_INSERT,
+                        in_base,
+                    );
                 }
                 start.clear();
                 let (ins, del) = (ins.max(0) as u64, del.max(0) as u64);
@@ -9047,8 +11046,9 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
     fn vocabulary_worker_is_lazy_reused_and_generation_safe() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), Default::default()).unwrap();
+        let vocab_thread = |s: &Store| s.group.as_ref().unwrap().vocab.lock().thread_id();
         store.load(&[src()]).unwrap();
-        assert!(store.guarded_writer().vocab_sync.thread_id().is_none());
+        assert!(vocab_thread(&store).is_none());
         let commit = |s: &str, o: &str| {
             let mut t = store.write();
             let q = t
@@ -9064,35 +11064,44 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
             .unwrap();
         t.insert(q).unwrap();
         t.commit().unwrap();
-        assert!(store.guarded_writer().vocab_sync.thread_id().is_none());
+        assert!(vocab_thread(&store).is_none());
         commit("fresh1", "fresh-object1");
-        let id = store.guarded_writer().vocab_sync.thread_id().unwrap();
+        let id = vocab_thread(&store).unwrap();
         commit("fresh2", "fresh-object2");
-        assert_eq!(store.guarded_writer().vocab_sync.thread_id(), Some(id));
+        assert_eq!(vocab_thread(&store), Some(id));
         store.compact().unwrap();
         commit("fresh3", "fresh-object3");
-        assert_eq!(store.guarded_writer().vocab_sync.thread_id(), Some(id));
+        assert_eq!(vocab_thread(&store), Some(id));
         let head = store.snapshot().commit;
         let len = store.snapshot().len();
         drop(store);
         let reopened = Store::open(dir.path(), Default::default()).unwrap();
         assert_eq!(reopened.snapshot().commit, head);
         assert_eq!(reopened.snapshot().len(), len);
-        assert!(reopened.guarded_writer().vocab_sync.thread_id().is_none());
+        assert!(vocab_thread(&reopened).is_none());
     }
 
     #[test]
     fn vocabulary_worker_spawn_failure_keeps_commits_durable() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), Default::default()).unwrap();
-        store.guarded_writer().vocab_sync.fail_spawn = true;
+        store.group.as_ref().unwrap().vocab.lock().fail_spawn = true;
         let mut txn = store.write();
         let q = txn
             .encode_quad(&quad("s", "p", "o"), &mut Default::default())
             .unwrap();
         txn.insert(q).unwrap();
         let receipt = txn.commit().unwrap();
-        assert!(store.guarded_writer().vocab_sync.thread_id().is_none());
+        assert!(
+            store
+                .group
+                .as_ref()
+                .unwrap()
+                .vocab
+                .lock()
+                .thread_id()
+                .is_none()
+        );
         drop(store);
         let store = Store::open(dir.path(), Default::default()).unwrap();
         assert_eq!(store.snapshot().commit, receipt.commit.seq);
@@ -10045,7 +12054,7 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
 
 // Private diagnostic probes are scoped to one Store and one calling thread. No timed
 // release build contains the observer, fault selection, or post-capture panic point:
-// outside tests the three points of `publish_log` call the empty functions below.
+// outside tests the three points of a solo fence in `write_prefix` call the empty functions below.
 #[cfg(not(test))]
 mod ordinary_sync_probe {
     use super::{Store, SyncPath};
@@ -10118,7 +12127,7 @@ mod ordinary_sync_probe {
     }
 
     pub(super) fn captured(store: &Store) {
-        // The observer itself never panics. Inject only inside publish_log, after
+        // The observer itself never panics. Inject only inside a solo fence's `write_prefix`, after
         // the original sample publication (R) or sample capture (S).
         if with_probe(store, |p| p.panic_after_capture.replace(false)) {
             panic!("private diagnostic panic after ordinary sync sample");
@@ -10177,7 +12186,7 @@ mod ordinary_sync_tests {
         let before = std::fs::read(&wal_path).unwrap();
         let mut state = wal::Direct::Untried;
         let writer = store.writer.lock();
-        let descriptor = writer.wal.as_ref().unwrap().get_ref();
+        let descriptor = writer.wal.as_ref().unwrap();
         assert!(state.handle(Some(&missing), descriptor).is_none());
         assert!(matches!(state, wal::Direct::Off));
         writer.tail.lock().direct = state;
@@ -10262,6 +12271,7 @@ mod ordinary_sync_tests {
                 let store = Store::open(
                     dir.path(),
                     StoreOptions {
+                        group_commit: false,
                         wal_direct_writes: direct,
                         ..Default::default()
                     },
@@ -10297,13 +12307,18 @@ mod ordinary_sync_tests {
                 assert!(store.writer.try_lock().is_some());
                 if !panic {
                     assert_eq!(store.snapshot().commit, head + 1);
+                } else {
+                    assert!(matches!(
+                        insert(&store, "after-panic"),
+                        Err(Error::Poisoned)
+                    ));
                 }
                 drop(store);
                 let reopened = Store::open(dir.path(), Default::default()).unwrap();
-                // An injected panic has no acknowledged receipt. Orderly close
-                // trims that unpublished suffix using the unchanged head.
-                assert_eq!(reopened.snapshot().commit, head + u64::from(!panic));
-                assert_eq!(reopened.snapshot().len(), len + u64::from(!panic));
+                // The panic occurred after the commit was already durable on disk,
+                // so the poisoned store did not trim the log and reopen recovers it.
+                assert_eq!(reopened.snapshot().commit, head + 1);
+                assert_eq!(reopened.snapshot().len(), len + 1);
             }
         }
     }
@@ -10315,6 +12330,7 @@ mod ordinary_sync_tests {
             let store = Store::open(
                 dir.path(),
                 StoreOptions {
+                    group_commit: false,
                     wal_direct_writes: direct,
                     ..Default::default()
                 },
@@ -10356,7 +12372,14 @@ mod ordinary_sync_tests {
         }
         for unavailable in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let store = Store::open(dir.path(), Default::default()).unwrap();
+            let store = Store::open(
+                dir.path(),
+                StoreOptions {
+                    group_commit: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             let calibrated = calibrate(&store, unavailable);
             let before = counts(&store);
             let head = store.snapshot().commit;
@@ -10391,7 +12414,14 @@ mod ordinary_sync_tests {
     #[test]
     fn ordinary_sync_excludes_noop_dry_bulk_memory_and_group_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), Default::default()).unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                group_commit: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         insert(&store, "warm").unwrap();
         let before = counts(&store);
         let probe = Rc::new(ordinary_sync_probe::Probe::default());
@@ -10433,7 +12463,6 @@ mod ordinary_sync_tests {
             let opts = StoreOptions {
                 group_commit: group,
                 bulk_threshold: if bulk { 0 } else { 250_000 },
-                group_commit_idle_direct: false,
                 ..Default::default()
             };
             let store = if memory {
@@ -10490,6 +12519,7 @@ mod ordinary_sync_tests {
             let store = Store::open(
                 &db,
                 StoreOptions {
+                    group_commit: false,
                     wal_direct_writes: direct,
                     ..Default::default()
                 },
@@ -10599,13 +12629,12 @@ mod ordinary_sync_tests {
     }
 
     #[test]
-    fn ordinary_sync_group_enabled_idle_fallback_remains_ordinary() {
+    fn group_enabled_idle_writer_uses_a_group_of_one_fence() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(
             dir.path(),
             StoreOptions {
                 group_commit: true,
-                group_commit_idle_direct: true,
                 wal_direct_writes: false,
                 ..Default::default()
             },
@@ -10615,12 +12644,1101 @@ mod ordinary_sync_tests {
         let scope = ordinary_sync_probe::install(&store, &probe);
         let receipt = insert(&store, "idle").unwrap();
         drop(scope);
-        assert_eq!(counts(&store), [0, 1, 0]);
-        assert_observed(&probe, SyncPath::Buffered);
+        assert_eq!(counts(&store), [0, 0, 1]);
+        assert_eq!(store.commit_metrics().size.count(), 1);
+        assert_eq!(probe.publications.get(), 0);
         assert!(receipt.committed);
         drop(store);
         let reopened = Store::open(dir.path(), Default::default()).unwrap();
         assert_eq!(reopened.snapshot().commit, receipt.commit.seq);
         assert_eq!(reopened.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn uncapped_snapshot_at_propagates_cancel_and_timeout_into_history_generation() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                build: crate::builder::BuildOptions {
+                    threads: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .set_retention(crate::history::Retention {
+                keep_commits: Some(10),
+                keep_age_ms: None,
+                max_bytes: None,
+            })
+            .unwrap();
+        let r1 = insert(&store, "first").unwrap();
+        insert(&store, "second").unwrap();
+        store.compact().unwrap();
+        insert(&store, "third").unwrap();
+        let at = crate::history::At::Commit(r1.commit.seq);
+        assert!(store.snapshot_at(&at, &Default::default()).is_ok());
+
+        let cancel_opts = crate::history::HistoryOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            deadline: None,
+        };
+        assert!(matches!(
+            store.snapshot_at(&at, &cancel_opts),
+            Err(Error::Cancelled)
+        ));
+
+        let expired_opts = crate::history::HistoryOptions {
+            cancel: None,
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(matches!(
+            store.snapshot_at(&at, &expired_opts),
+            Err(Error::Timeout)
+        ));
+
+        // Directly verify history_generation_with forwards HistoryCeiling's ReadLimit
+        // (and not a blank HistoryOptions) into authenticate_retained_generation:
+        // clear the open-generation cache so the uncached !C::ACCOUNTS branch runs,
+        // corrupt commit.json so authentication fails with Error::Corrupt if reached,
+        // then let the entry check(0) pass once and trigger cancel/timeout inside
+        // authenticate_retained_generation before commit.json is read.
+        struct FailAfterFirst {
+            calls: std::sync::atomic::AtomicUsize,
+            timeout: bool,
+        }
+        impl crate::history::ReadControl for FailAfterFirst {
+            fn check_read(&self) -> Result<()> {
+                if self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    >= 1
+                {
+                    if self.timeout {
+                        Err(Error::Timeout)
+                    } else {
+                        Err(Error::Cancelled)
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+        let live = store.snapshot();
+        let current = commit::generation_number(&live.generation.name);
+        let hist = store.history.as_ref().unwrap();
+        let mut h = hist.lock();
+        let owner = h.owner(r1.commit.seq, current, live.commit).unwrap();
+        assert_ne!(owner, current);
+        let entry = h.gens[&owner].clone();
+        h.open.clear();
+        std::fs::write(entry.dir.join("commit.json"), b"{corrupt").unwrap();
+        // Confirm the tampered fixture fails authentication with Error::Corrupt when uninterrupted.
+        assert!(matches!(
+            store.history_generation_with(
+                &mut h,
+                owner,
+                current,
+                &live,
+                &entry,
+                r1.commit.seq,
+                &crate::budgeted::Unlimited,
+            ),
+            Err(Error::Corrupt(_))
+        ));
+        let cancel_after_first = FailAfterFirst {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            timeout: false,
+        };
+        let cancel_ceiling = HistoryCeiling {
+            limit: crate::history::ReadLimit {
+                options: &cancel_after_first,
+                memory: None,
+                held: 0,
+            },
+            ceiling: u64::MAX,
+        };
+        assert!(matches!(
+            store.history_generation_with(
+                &mut h,
+                owner,
+                current,
+                &live,
+                &entry,
+                r1.commit.seq,
+                &cancel_ceiling,
+            ),
+            Err(Error::Cancelled)
+        ));
+        let timeout_after_first = FailAfterFirst {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            timeout: true,
+        };
+        let timeout_ceiling = HistoryCeiling {
+            limit: crate::history::ReadLimit {
+                options: &timeout_after_first,
+                memory: None,
+                held: 0,
+            },
+            ceiling: u64::MAX,
+        };
+        assert!(matches!(
+            store.history_generation_with(
+                &mut h,
+                owner,
+                current,
+                &live,
+                &entry,
+                r1.commit.seq,
+                &timeout_ceiling,
+            ),
+            Err(Error::Timeout)
+        ));
+    }
+
+    #[test]
+    fn bulk_txn_stage_prefixes_commits_without_deadlock_and_respects_guard_dry_run_and_preflight() {
+        use crate::guard::{CommitGuard, GuardMode, GuardStatus, Severity, ValidationSummary};
+        use oxrdf::{GraphName, Literal, NamedNode, Quad};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct PrefixReadingGuard {
+            store: Arc<Store>,
+            reject: AtomicBool,
+            seen_calls: AtomicUsize,
+        }
+
+        impl CommitGuard for PrefixReadingGuard {
+            fn check(&self, _c: &crate::guard::Candidate<'_>) -> Result<ValidationSummary> {
+                // Reading `Store::prefixes()` from inside the commit guard MUST NOT deadlock
+                // when the bulk transaction staged prefixes.
+                let _ = self.store.prefixes();
+                self.seen_calls.fetch_add(1, Ordering::Relaxed);
+                let status = if self.reject.load(Ordering::Relaxed) {
+                    GuardStatus::Rejected
+                } else {
+                    GuardStatus::Passed
+                };
+                Ok(ValidationSummary::empty(
+                    status,
+                    GuardMode::Reject,
+                    Severity::Violation,
+                ))
+            }
+
+            fn describe(&self) -> String {
+                "prefix-reading-guard".into()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(
+                dir.path(),
+                StoreOptions {
+                    bulk_threshold: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let guard = Arc::new(PrefixReadingGuard {
+            store: store.clone(),
+            reject: AtomicBool::new(false),
+            seen_calls: AtomicUsize::new(0),
+        });
+        store.set_guard(Some(guard.clone()));
+
+        let make_bulk = |tx: &mut WriteTxn<'_>, base: usize| -> Vec<[Id; 4]> {
+            let mut labels = std::collections::HashMap::new();
+            (0..4)
+                .map(|i| {
+                    let q = Quad::new(
+                        NamedNode::new_unchecked(format!("http://example.org/s{}", base + i)),
+                        NamedNode::new_unchecked("http://example.org/p"),
+                        Literal::from((base + i) as i64),
+                        GraphName::DefaultGraph,
+                    );
+                    tx.encode_quad(&q, &mut labels).unwrap()
+                })
+                .collect()
+        };
+
+        // 1. Dry-run bulk transaction with staged prefixes must NOT write prefixes.json.
+        {
+            let mut tx = store.write_with(
+                CommitKind::Transaction,
+                crate::guard::WriteOptions {
+                    dry_run: Some(crate::preview::DryRun::default()),
+                    ..Default::default()
+                },
+            );
+            let quads = make_bulk(&mut tx, 0);
+            tx.insert_bulk(quads).unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "dry".into(),
+                "http://example.org/dry/".into(),
+            )]));
+            assert!(matches!(tx.commit(), Err(Error::DryRun(_))));
+        }
+        assert!(!store.prefixes().contains_key("dry"));
+        assert!(!dir.path().join("prefixes.json").exists());
+        assert_eq!(store.snapshot().len(), 0);
+
+        // 2. Guard-rejected bulk transaction must NOT write prefixes.json or deadlock.
+        guard.reject.store(true, Ordering::Relaxed);
+        {
+            let mut tx = store.write();
+            let quads = make_bulk(&mut tx, 10);
+            tx.insert_bulk(quads).unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "rej".into(),
+                "http://example.org/rej/".into(),
+            )]));
+            assert!(matches!(tx.commit(), Err(Error::Rejected(_))));
+        }
+        assert!(!store.prefixes().contains_key("rej"));
+        assert!(!dir.path().join("prefixes.json").exists());
+        guard.reject.store(false, Ordering::Relaxed);
+
+        // 3. `before_publish` refusal on bulk transaction must NOT write prefixes.json.
+        {
+            let mut tx = store.write_with(
+                CommitKind::Transaction,
+                crate::guard::WriteOptions {
+                    before_publish: Some(crate::guard::PublishHook::new(|| Err(Error::Cancelled))),
+                    ..Default::default()
+                },
+            );
+            let quads = make_bulk(&mut tx, 20);
+            tx.insert_bulk(quads).unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "hook".into(),
+                "http://example.org/hook/".into(),
+            )]));
+            assert!(matches!(tx.commit(), Err(Error::Cancelled)));
+        }
+        assert!(!store.prefixes().contains_key("hook"));
+        assert!(!dir.path().join("prefixes.json").exists());
+
+        // 4. Blocked `prefixes.json` (directory obstacle) aborts bulk transaction BEFORE
+        //    publishing bulk quads.
+        std::fs::create_dir(dir.path().join("prefixes.json")).unwrap();
+        {
+            let mut tx = store.write();
+            let quads = make_bulk(&mut tx, 30);
+            tx.insert_bulk(quads).unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "blk".into(),
+                "http://example.org/blk/".into(),
+            )]));
+            assert!(matches!(tx.commit(), Err(Error::Io(_))));
+        }
+        assert_eq!(store.snapshot().len(), 0);
+        assert!(!store.prefixes().contains_key("blk"));
+        std::fs::remove_dir(dir.path().join("prefixes.json")).unwrap();
+
+        // 5. Successful bulk transaction with staged prefixes commits without deadlock and
+        //    persists both quads and prefixes durably across reopen.
+        let receipt = {
+            let mut tx = store.write();
+            let quads = make_bulk(&mut tx, 40);
+            tx.insert_bulk(quads).unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "blk".into(),
+                "http://example.org/blk/".into(),
+            )]));
+            tx.commit().unwrap()
+        };
+        assert!(receipt.committed);
+        assert_eq!(store.snapshot().len(), 4);
+        assert_eq!(
+            store.prefixes().get("blk").map(String::as_str),
+            Some("http://example.org/blk/")
+        );
+        assert!(guard.seen_calls.load(Ordering::Relaxed) >= 3);
+        assert!(!dir.path().join(STAGED_PREFIXES_FILE).exists());
+
+        store.set_guard(None);
+        drop(guard);
+        drop(store);
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(reopened.snapshot().len(), 4);
+        assert_eq!(
+            reopened.prefixes().get("blk").map(String::as_str),
+            Some("http://example.org/blk/")
+        );
+    }
+
+    #[test]
+    fn prefix_only_txn_runs_before_publish_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        let mut tx = store.write_with(
+            CommitKind::Transaction,
+            crate::guard::WriteOptions {
+                before_publish: Some(crate::guard::PublishHook::new(|| Err(Error::Cancelled))),
+                ..Default::default()
+            },
+        );
+        tx.stage_prefixes(BTreeMap::from([(
+            "only".into(),
+            "http://example.org/only/".into(),
+        )]));
+        assert!(matches!(tx.commit(), Err(Error::Cancelled)));
+        assert!(!store.prefixes().contains_key("only"));
+        assert!(!dir.path().join("prefixes.json").exists());
+    }
+
+    #[test]
+    fn staged_prefixes_crash_recovery_aligns_with_commit_point_and_refuses_unknown_version() {
+        use oxrdf::{GraphName, Literal, NamedNode, Quad};
+
+        let insert_quad = |tx: &mut WriteTxn<'_>, n: i64| {
+            let mut labels = std::collections::HashMap::new();
+            let q = Quad::new(
+                NamedNode::new_unchecked(format!("http://example.org/s{n}")),
+                NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(n),
+                GraphName::DefaultGraph,
+            );
+            let id = tx.encode_quad(&q, &mut labels).unwrap();
+            tx.insert(id).unwrap();
+        };
+
+        // 1. Crash AFTER writing `prefixes.staged.tmp` and BEFORE WAL commit -> reopen must
+        //    keep old quads + old prefixes and remove `prefixes.staged.tmp`.
+        let dir1 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir1.path(), Default::default()).unwrap();
+            store.set_prefix("old", "http://example.org/old/").unwrap();
+            store.set_failpoint(
+                "prefixes-staged",
+                Some(Arc::new(|_| panic!("simulated crash before WAL commit"))),
+            );
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut tx = store.write();
+                insert_quad(&mut tx, 1);
+                tx.stage_prefixes(BTreeMap::from([(
+                    "newp".into(),
+                    "http://example.org/new/".into(),
+                )]));
+                let _ = tx.commit();
+            }));
+            assert!(panicked.is_err());
+            assert!(dir1.path().join(STAGED_PREFIXES_FILE).is_file());
+        }
+        let reopened1 = Store::open(dir1.path(), Default::default()).unwrap();
+        assert_eq!(reopened1.snapshot().len(), 0);
+        assert_eq!(
+            reopened1.prefixes().get("old").map(String::as_str),
+            Some("http://example.org/old/")
+        );
+        assert!(!reopened1.prefixes().contains_key("newp"));
+        assert!(!dir1.path().join(STAGED_PREFIXES_FILE).exists());
+
+        // 2. Crash AFTER WAL commit and BEFORE `prefixes.json` install -> reopen must
+        //    reconcile `prefixes.staged.tmp` so new quads AND new prefixes are both present.
+        let dir2 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir2.path(), Default::default()).unwrap();
+            store.set_prefix("old", "http://example.org/old/").unwrap();
+            store.set_failpoint(
+                "prefixes-before-install",
+                Some(Arc::new(|_| {
+                    panic!("simulated crash after WAL before prefixes.json install")
+                })),
+            );
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut tx = store.write();
+                insert_quad(&mut tx, 2);
+                tx.stage_prefixes(BTreeMap::from([(
+                    "newp".into(),
+                    "http://example.org/new/".into(),
+                )]));
+                let _ = tx.commit();
+            }));
+            assert!(panicked.is_err());
+            assert!(dir2.path().join(STAGED_PREFIXES_FILE).is_file());
+        }
+        let reopened2 = Store::open(dir2.path(), Default::default()).unwrap();
+        assert_eq!(reopened2.snapshot().len(), 1);
+        assert_eq!(
+            reopened2.prefixes().get("newp").map(String::as_str),
+            Some("http://example.org/new/")
+        );
+        assert!(!dir2.path().join(STAGED_PREFIXES_FILE).exists());
+
+        // 3. Crash AFTER bulk CURRENT switch and BEFORE `prefixes.json` install -> reopen
+        //    installs the staged bulk prefixes alongside the new generation.
+        let dir3 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(
+                dir3.path(),
+                StoreOptions {
+                    bulk_threshold: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            store.set_failpoint(
+                "prefixes-before-install",
+                Some(Arc::new(|_| {
+                    panic!("simulated crash after CURRENT switch before prefixes.json install")
+                })),
+            );
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut tx = store.write();
+                let mut labels = std::collections::HashMap::new();
+                let bulk: Vec<[Id; 4]> = (0..4)
+                    .map(|i| {
+                        let q = Quad::new(
+                            NamedNode::new_unchecked(format!("http://example.org/b{i}")),
+                            NamedNode::new_unchecked("http://example.org/p"),
+                            Literal::from(i as i64),
+                            GraphName::DefaultGraph,
+                        );
+                        tx.encode_quad(&q, &mut labels).unwrap()
+                    })
+                    .collect();
+                tx.insert_bulk(bulk).unwrap();
+                tx.stage_prefixes(BTreeMap::from([(
+                    "bulkp".into(),
+                    "http://example.org/bulkp/".into(),
+                )]));
+                let _ = tx.commit();
+            }));
+            assert!(panicked.is_err());
+            assert!(dir3.path().join(STAGED_PREFIXES_FILE).is_file());
+        }
+        let reopened3 = Store::open(dir3.path(), Default::default()).unwrap();
+        assert_eq!(reopened3.snapshot().len(), 4);
+        assert_eq!(
+            reopened3.prefixes().get("bulkp").map(String::as_str),
+            Some("http://example.org/bulkp/")
+        );
+        assert!(!dir3.path().join(STAGED_PREFIXES_FILE).exists());
+
+        // 4. Unknown format_version in `prefixes.staged.tmp` is refused cleanly on open.
+        std::fs::write(
+            dir3.path().join(STAGED_PREFIXES_FILE),
+            br#"{"format_version":99,"commit_seq":1,"prefixes":{}}"#,
+        )
+        .unwrap();
+        drop(reopened3);
+        let err = match Store::open(dir3.path(), Default::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Unsupported error for unknown staged prefixes version"),
+        };
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn concurrent_add_prefixes_and_set_prefix_layer_preserve_disjointness_and_capacity() {
+        let store = Arc::new(Store::in_memory(StoreOptions {
+            max_prefixes: 4,
+            ..Default::default()
+        }));
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let t1 = std::thread::spawn(move || {
+            for i in 0..200 {
+                let mut m = BTreeMap::new();
+                m.insert(format!("p{}", i % 4), format!("http://example.org/{i}/"));
+                m.insert("shared".into(), "http://example.org/shared/".into());
+                s1.add_prefixes(m).unwrap();
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..200 {
+                let mut removed = BTreeSet::new();
+                removed.insert("shared".into());
+                removed.insert(format!("p{}", i % 4));
+                s2.set_prefix_layer(BTreeMap::new(), removed).unwrap();
+                let r = s2.removed_prefixes.lock();
+                let p = s2.prefixes.lock();
+                for k in r.iter() {
+                    assert!(
+                        !p.contains_key(k),
+                        "prefix {k:?} became both bound and removed"
+                    );
+                }
+                assert!(
+                    p.len() + r.len() <= 4,
+                    "combined prefix + removal count exceeded max_prefixes"
+                );
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn failed_prefix_stage_after_rename_cannot_attach_to_later_unrelated_commit() {
+        use oxrdf::{GraphName, Literal, NamedNode, Quad};
+
+        let insert_quad = |tx: &mut WriteTxn<'_>, n: i64| {
+            let mut labels = std::collections::HashMap::new();
+            let q = Quad::new(
+                NamedNode::new_unchecked(format!("http://example.org/r48s{n}")),
+                NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(n),
+                GraphName::DefaultGraph,
+            );
+            let id = tx.encode_quad(&q, &mut labels).unwrap();
+            tx.insert(id).unwrap();
+        };
+
+        // 1. Post-rename staging error where cleanup succeeds: sidecar is durably cleared so
+        //    an unrelated commit reusing that sequence number never inherits the refused
+        //    prefixes on reopen.
+        let dir1 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir1.path(), Default::default()).unwrap();
+            {
+                let _g = staged_prefix_test_hooks::install(staged_prefix_test_hooks::Faults {
+                    fail_after_stage_rename: true,
+                    ..Default::default()
+                });
+                let mut tx = store.write();
+                insert_quad(&mut tx, 1);
+                tx.stage_prefixes(BTreeMap::from([(
+                    "aborted".into(),
+                    "http://example.org/aborted/".into(),
+                )]));
+                assert!(tx.commit().is_err());
+            }
+            assert!(
+                !dir1.path().join(STAGED_PREFIXES_FILE).exists(),
+                "failed post-rename stage must clear prefixes.staged.tmp"
+            );
+            let mut unrelated = store.write();
+            insert_quad(&mut unrelated, 2);
+            unrelated.commit().unwrap();
+        }
+        let reopened1 = Store::open(dir1.path(), Default::default()).unwrap();
+        assert_eq!(reopened1.snapshot().len(), 1);
+        assert!(
+            !reopened1.prefixes().contains_key("aborted"),
+            "refused prefixes must not be recovered on an unrelated commit"
+        );
+
+        // 2. Post-rename staging error where cleanup ALSO fails: the writer is poisoned so no
+        //    later unrelated commit can reuse the sequence number, and reopen discards the
+        //    uncommitted sidecar.
+        let dir2 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir2.path(), Default::default()).unwrap();
+            {
+                let _g = staged_prefix_test_hooks::install(staged_prefix_test_hooks::Faults {
+                    fail_after_stage_rename: true,
+                    fail_clear_staged: true,
+                });
+                let mut tx = store.write();
+                insert_quad(&mut tx, 10);
+                tx.stage_prefixes(BTreeMap::from([(
+                    "ghost".into(),
+                    "http://example.org/ghost/".into(),
+                )]));
+                assert!(tx.commit().is_err());
+            }
+            assert!(dir2.path().join(STAGED_PREFIXES_FILE).is_file());
+            let mut unrelated = store.write();
+            let mut labels = std::collections::HashMap::new();
+            let q = Quad::new(
+                NamedNode::new_unchecked("http://example.org/r48s11"),
+                NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(11i64),
+                GraphName::DefaultGraph,
+            );
+            let res = unrelated
+                .encode_quad(&q, &mut labels)
+                .and_then(|id| unrelated.insert(id))
+                .and_then(|_| unrelated.commit());
+            assert!(
+                matches!(res, Err(Error::Poisoned)),
+                "writer must be poisoned when staged prefix cleanup fails, got {res:?}"
+            );
+        }
+        let reopened2 = Store::open(dir2.path(), Default::default()).unwrap();
+        assert_eq!(reopened2.snapshot().len(), 0);
+        assert!(!reopened2.prefixes().contains_key("ghost"));
+        assert!(!dir2.path().join(STAGED_PREFIXES_FILE).exists());
+    }
+
+    #[test]
+    fn control_only_txn_staged_prefixes_align_with_refusal_and_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        store.enable_control().unwrap();
+
+        // 1. Refused control-only transaction must NOT persist or expose staged prefixes.
+        store.refuse_next_control_frame(|| Error::Cancelled);
+        {
+            let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+            let mut tx = store.write();
+            tx.set_control(cap).unwrap();
+            tx.control_put(b"jobs/refused", Arc::from(&b"no"[..]))
+                .unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "refusedp".into(),
+                "http://example.org/refused/".into(),
+            )]));
+            assert!(matches!(tx.commit(), Err(Error::Cancelled)));
+        }
+        assert!(!store.prefixes().contains_key("refusedp"));
+        assert!(!dir.path().join("prefixes.json").exists());
+        assert!(!dir.path().join(STAGED_PREFIXES_FILE).exists());
+
+        // 2. Successful control-only transaction publishes both control key and prefixes.
+        {
+            let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+            let mut tx = store.write();
+            tx.set_control(cap).unwrap();
+            tx.control_put(b"jobs/ok", Arc::from(&b"yes"[..])).unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "okp".into(),
+                "http://example.org/ok/".into(),
+            )]));
+            let receipt = tx.commit().unwrap();
+            assert!(!receipt.committed);
+        }
+        assert_eq!(
+            store.prefixes().get("okp").map(String::as_str),
+            Some("http://example.org/ok/")
+        );
+        assert!(!dir.path().join(STAGED_PREFIXES_FILE).exists());
+
+        // 3. Crash after control-only frame append and before prefixes.json install reconciles
+        //    on reopen.
+        store.set_failpoint(
+            "prefixes-before-install",
+            Some(Arc::new(|_| {
+                panic!("simulated crash after control-only append before prefix install")
+            })),
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+            let mut tx = store.write();
+            tx.set_control(cap).unwrap();
+            tx.control_put(b"jobs/crash", Arc::from(&b"durable"[..]))
+                .unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "ctrlp".into(),
+                "http://example.org/ctrl/".into(),
+            )]));
+            let _ = tx.commit();
+        }));
+        assert!(panicked.is_err());
+        assert!(dir.path().join(STAGED_PREFIXES_FILE).is_file());
+        drop(store);
+
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(
+            reopened.prefixes().get("ctrlp").map(String::as_str),
+            Some("http://example.org/ctrl/")
+        );
+        assert!(!reopened.prefixes().contains_key("refusedp"));
+        assert!(!dir.path().join(STAGED_PREFIXES_FILE).exists());
+    }
+
+    #[test]
+    fn unknown_staged_prefixes_version_refuses_open_before_wal_tail_truncation() {
+        use oxrdf::{GraphName, Literal, NamedNode, Quad};
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path(), Default::default()).unwrap();
+            let mut tx = store.write();
+            let mut labels = std::collections::HashMap::new();
+            let q = Quad::new(
+                NamedNode::new_unchecked("http://example.org/s"),
+                NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(1i64),
+                GraphName::DefaultGraph,
+            );
+            let id = tx.encode_quad(&q, &mut labels).unwrap();
+            tx.insert(id).unwrap();
+            tx.commit().unwrap();
+        }
+        let gen_name = std::fs::read_to_string(dir.path().join("CURRENT"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let wal_path = dir.path().join(&gen_name).join("wal.log");
+        // Append a torn tail byte that WAL repair would truncate if open progressed past
+        // staged-prefix version preflight.
+        {
+            let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            std::io::Write::write_all(&mut f, &[0xAB, 0xCD, 0xEF]).unwrap();
+        }
+        let wal_bytes_before = std::fs::read(&wal_path).unwrap();
+        std::fs::write(
+            dir.path().join(STAGED_PREFIXES_FILE),
+            br#"{"format_version":99,"commit_seq":1,"prefixes":{}}"#,
+        )
+        .unwrap();
+
+        let err = match Store::open(dir.path(), Default::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Unsupported error for unknown staged prefixes version"),
+        };
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        let wal_bytes_after = std::fs::read(&wal_path).unwrap();
+        assert_eq!(
+            wal_bytes_after, wal_bytes_before,
+            "unknown staged prefixes version must refuse open before modifying wal.log"
+        );
+    }
+
+    #[test]
+    fn staged_prefix_cleanup_failure_fences_standalone_mutators_until_reopen() {
+        use oxrdf::{GraphName, Literal, NamedNode, Quad};
+
+        let insert_quad = |tx: &mut WriteTxn<'_>, n: i64| {
+            let mut labels = std::collections::HashMap::new();
+            let q = Quad::new(
+                NamedNode::new_unchecked(format!("http://example.org/r54s{n}")),
+                NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(n),
+                GraphName::DefaultGraph,
+            );
+            let id = tx.encode_quad(&q, &mut labels).unwrap();
+            tx.insert(id).unwrap();
+        };
+
+        // 1. Durable quad commit whose post-install sidecar cleanup fails: standalone prefix
+        //    mutators must refuse with Poisoned so reopen cannot overwrite an acknowledged edit.
+        let dir1 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir1.path(), Default::default()).unwrap();
+            store
+                .set_prefix("keep", "http://example.org/keep/")
+                .unwrap();
+            {
+                let _g = staged_prefix_test_hooks::install(staged_prefix_test_hooks::Faults {
+                    fail_clear_staged: true,
+                    ..Default::default()
+                });
+                let mut tx = store.write();
+                insert_quad(&mut tx, 1);
+                tx.stage_prefixes(BTreeMap::from([(
+                    "txp".into(),
+                    "http://example.org/txp/".into(),
+                )]));
+                assert!(tx.commit().is_err());
+            }
+            assert!(dir1.path().join(STAGED_PREFIXES_FILE).is_file());
+            assert!(matches!(
+                store.set_prefix("later", "http://example.org/later/"),
+                Err(Error::Poisoned)
+            ));
+            assert!(matches!(store.remove_prefix("keep"), Err(Error::Poisoned)));
+            assert!(matches!(
+                store.add_prefixes(BTreeMap::from([(
+                    "addp".into(),
+                    "http://example.org/add/".into(),
+                )])),
+                Err(Error::Poisoned)
+            ));
+            assert!(matches!(
+                store.set_prefix_layer(BTreeMap::new(), BTreeSet::new()),
+                Err(Error::Poisoned)
+            ));
+        }
+        let reopened1 = Store::open(dir1.path(), Default::default()).unwrap();
+        assert_eq!(reopened1.snapshot().len(), 1);
+        assert_eq!(
+            reopened1.prefixes().get("txp").map(String::as_str),
+            Some("http://example.org/txp/")
+        );
+        assert_eq!(
+            reopened1.prefixes().get("keep").map(String::as_str),
+            Some("http://example.org/keep/")
+        );
+        assert!(!reopened1.prefixes().contains_key("later"));
+        assert!(!dir1.path().join(STAGED_PREFIXES_FILE).exists());
+
+        // 2. Durable control-only commit whose post-install sidecar cleanup fails: standalone
+        //    prefix mutators must likewise refuse with Poisoned, and reopen reconciles cleanly.
+        let dir2 = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir2.path(), Default::default()).unwrap();
+            store.enable_control().unwrap();
+            {
+                let _g = staged_prefix_test_hooks::install(staged_prefix_test_hooks::Faults {
+                    fail_clear_staged: true,
+                    ..Default::default()
+                });
+                let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+                let mut tx = store.write();
+                tx.set_control(cap).unwrap();
+                tx.control_put(b"jobs/cleanup-fail", Arc::from(&b"ok"[..]))
+                    .unwrap();
+                tx.stage_prefixes(BTreeMap::from([(
+                    "ctrltx".into(),
+                    "http://example.org/ctrltx/".into(),
+                )]));
+                assert!(tx.commit().is_err());
+            }
+            assert!(dir2.path().join(STAGED_PREFIXES_FILE).is_file());
+            assert!(matches!(
+                store.set_prefix("later", "http://example.org/later/"),
+                Err(Error::Poisoned)
+            ));
+        }
+        let reopened2 = Store::open(dir2.path(), Default::default()).unwrap();
+        assert_eq!(
+            reopened2.prefixes().get("ctrltx").map(String::as_str),
+            Some("http://example.org/ctrltx/")
+        );
+        assert!(!reopened2.prefixes().contains_key("later"));
+        assert!(!dir2.path().join(STAGED_PREFIXES_FILE).exists());
+    }
+
+    #[test]
+    fn staged_prefixes_v1_and_v2_version_contract_and_reader_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        store.enable_control().unwrap();
+
+        // Trigger crash after staging a control-only v2 sidecar so it stays on disk.
+        store.set_failpoint(
+            "prefixes-before-install",
+            Some(Arc::new(|_| panic!("simulated crash before install"))),
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+            let mut tx = store.write();
+            tx.set_control(cap).unwrap();
+            tx.control_put(b"jobs/v2", Arc::from(&b"ok"[..])).unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "v2p".into(),
+                "http://example.org/v2p/".into(),
+            )]));
+            let _ = tx.commit();
+        }));
+        assert!(panicked.is_err());
+        drop(store);
+
+        // Sidecar must carry format_version 2 and `dataset.json` must require reader 10,
+        // fencing older binaries (reader <= 9) before WAL repair or catalog open.
+        let staged_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(STAGED_PREFIXES_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            staged_json["format_version"],
+            STAGED_PREFIXES_FORMAT_VERSION
+        );
+        assert!(staged_json["control_seq"].as_u64().is_some());
+
+        let ds_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("dataset.json")).unwrap())
+                .unwrap();
+        assert!(
+            ds_json["minimumReader"].as_u64().unwrap() >= u64::from(STAGED_PREFIXES_V2_READER),
+            "dataset.json must raise minimumReader before writing v2 staged prefixes: {ds_json}"
+        );
+        assert!(
+            matches!(
+                commit::check_dataset_value_as(&ds_json, STAGED_PREFIXES_V2_READER - 1),
+                Err(Error::Unsupported(_))
+            ),
+            "older reader (<= 9) must refuse dataset with v2 staged prefixes before startup writes"
+        );
+
+        // Current build recovers v2 cleanly.
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(
+            reopened.prefixes().get("v2p").map(String::as_str),
+            Some("http://example.org/v2p/")
+        );
+        drop(reopened);
+
+        // A v1 sidecar illegally carrying `control_seq` must be rejected as corrupt.
+        std::fs::write(
+            dir.path().join(STAGED_PREFIXES_FILE),
+            br#"{"format_version":1,"commit_seq":0,"control_seq":1,"prefixes":{}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            Store::open(dir.path(), Default::default()),
+            Err(Error::Corrupt(_))
+        ));
+
+        // A v2 sidecar missing `control_seq` or carrying `"control_seq": null` must be
+        // rejected as corrupt during preflight BEFORE WAL repair and must never replay
+        // an uncommitted prefix map as a quad commit.
+        let wal_path = dir.path().join("wal.log");
+        let orig_wal = std::fs::read(&wal_path).unwrap_or_default();
+        let mut torn_wal = orig_wal.clone();
+        torn_wal.extend_from_slice(b"torn-tail-bytes");
+        std::fs::write(&wal_path, &torn_wal).unwrap();
+        let orig_prefixes = std::fs::read(dir.path().join("prefixes.json")).unwrap();
+        for bad_v2 in [
+            br#"{"format_version":2,"commit_seq":0,"prefixes":{"uncommitted":"http://example.org/u/"}}"#.as_slice(),
+            br#"{"format_version":2,"commit_seq":0,"control_seq":null,"prefixes":{"uncommitted":"http://example.org/u/"}}"#.as_slice(),
+        ] {
+            std::fs::write(dir.path().join(STAGED_PREFIXES_FILE), bad_v2).unwrap();
+            assert!(
+                matches!(
+                    Store::open(dir.path(), Default::default()),
+                    Err(Error::Corrupt(_))
+                ),
+                "v2 sidecar without integer control_seq must be rejected as corrupt"
+            );
+            assert_eq!(
+                std::fs::read(&wal_path).unwrap(),
+                torn_wal,
+                "corrupt v2 sidecar must fail preflight before WAL repair"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("prefixes.json")).unwrap(),
+                orig_prefixes,
+                "corrupt v2 sidecar must never replace prefixes.json"
+            );
+        }
+        std::fs::write(&wal_path, &orig_wal).unwrap();
+
+        // A valid v1 sidecar (without `control_seq`) remains readable and reconciles cleanly.
+        std::fs::write(
+            dir.path().join(STAGED_PREFIXES_FILE),
+            br#"{"format_version":1,"commit_seq":0,"prefixes":{"v1p":"http://example.org/v1p/"}}"#,
+        )
+        .unwrap();
+        let reopened_v1 = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(
+            reopened_v1.prefixes().get("v1p").map(String::as_str),
+            Some("http://example.org/v1p/")
+        );
+        assert!(!dir.path().join(STAGED_PREFIXES_FILE).exists());
+    }
+
+    #[test]
+    fn fold_prefixes_refuses_when_prefixes_poisoned_after_caught_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        store.enable_control().unwrap();
+
+        store.set_failpoint(
+            "prefixes-before-install",
+            Some(Arc::new(|_| {
+                panic!("simulated panic during prefix install")
+            })),
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cap = store.control_writer(ControlOwner::Jobs).unwrap();
+            let mut tx = store.write();
+            tx.set_control(cap).unwrap();
+            tx.control_put(b"jobs/panic", Arc::from(&b"ok"[..]))
+                .unwrap();
+            tx.stage_prefixes(BTreeMap::from([(
+                "p1".into(),
+                "http://example.org/p1/".into(),
+            )]));
+            let _ = tx.commit();
+        }));
+        assert!(panicked.is_err());
+
+        let patch = b"TX .\nPA \"late\" <http://example.org/late/> .\nTC .\n";
+        let res = store.apply_patch(patch.as_slice(), &Default::default());
+        assert!(
+            matches!(res, Err(Error::Poisoned)),
+            "expected Err(Error::Poisoned) from apply_patch after prefixes_poisoned, got {res:?}"
+        );
+        assert!(
+            !store.prefixes().contains_key("late"),
+            "apply_patch / fold_prefixes must not mutate prefixes after prefixes_poisoned is set"
+        );
+    }
+
+    #[test]
+    fn unknown_staged_prefixes_version_in_branch_refuses_main_open_before_wal_repair() {
+        use oxrdf::{GraphName, Literal, NamedNode, Quad};
+
+        for retained in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            let branch_id = {
+                let store = Store::open(&root, Default::default()).unwrap();
+                let mut tx = store.write();
+                let mut labels = std::collections::HashMap::new();
+                let q = Quad::new(
+                    NamedNode::new_unchecked("http://example.org/s"),
+                    NamedNode::new_unchecked("http://example.org/p"),
+                    Literal::from(1i64),
+                    GraphName::DefaultGraph,
+                );
+                let id = tx.encode_quad(&q, &mut labels).unwrap();
+                tx.insert(id).unwrap();
+                tx.commit().unwrap();
+                let b = store.create_branch("bad", &Default::default()).unwrap();
+                if retained {
+                    store
+                        .create_branch(
+                            "child",
+                            &crate::branch::BranchOptions {
+                                from: "bad".into(),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    store
+                        .delete_branch_with(
+                            "bad",
+                            &crate::branch::DeleteOptions {
+                                force: true,
+                                reparent: true,
+                                release_holds: false,
+                            },
+                        )
+                        .unwrap();
+                }
+                b.id
+            };
+
+            let gen_name = std::fs::read_to_string(root.join("CURRENT"))
+                .unwrap()
+                .trim()
+                .to_string();
+            let wal_path = root.join(&gen_name).join("wal.log");
+            {
+                let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+                std::io::Write::write_all(&mut f, &[0xDE, 0xAD, 0xBE]).unwrap();
+            }
+            let wal_bytes_before = std::fs::read(&wal_path).unwrap();
+
+            let branch_dir = root.join("branches").join(branch_id.to_string());
+            assert!(branch_dir.is_dir());
+            std::fs::write(
+                branch_dir.join(STAGED_PREFIXES_FILE),
+                br#"{"format_version":99,"commit_seq":1,"prefixes":{}}"#,
+            )
+            .unwrap();
+
+            let err = match Store::open(&root, Default::default()) {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "expected Unsupported error for unsupported staged prefixes in branch (retained={retained})"
+                ),
+            };
+            assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+            assert!(err.to_string().contains(&branch_id.to_string()), "{err}");
+            assert_eq!(
+                std::fs::read(&wal_path).unwrap(),
+                wal_bytes_before,
+                "branch staged-prefix preflight must refuse before modifying main wal.log (retained={retained})"
+            );
+        }
     }
 }

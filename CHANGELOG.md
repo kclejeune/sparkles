@@ -2,6 +2,356 @@
 
 ## Unreleased
 
+### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
+
+Term and value decoding in SPARQL UPDATE, ARQ property functions, registered property and aggregate extensions, custom aggregates, hybrid search, history service, path search, vector top-k, remote SERVICE and LATERAL enhancers, GeoSPARQL planner rewrites and aggregates, planner range and lexical probes and RDFS schema and explanation decoding now uses checked decode helpers that enforce live cancellation, deadline and memory controls while keeping decoded-output credit alive across multi-term operations. Plan and error diagnostic rendering decodes terms through `plan_term` so describing a plan never latches a decode refusal, and RDFS explanation keeps its answer memory limit separate from its decode workspace accounting. This lands the first wave of roadmap item 1308.
+
+### JUnit evidence for reused gate test passes
+
+The batch gate verifies a cached Rust test pass against the original gate's retained
+JUnit report and manifest. The replayed log links the receipts, including when an
+earlier run's output has been archived. This completes roadmap item 1094.
+
+### Arbitrary-precision `xsd:integer` and `xsd:decimal` evaluation (item 1065)
+
+SPARQL expressions, comparisons, arithmetic, unary operations, rounding functions, casts,
+`ORDER BY`, range filters, aggregates, maintained views, ShEx digit facets and the reasoner
+now evaluate `xsd:integer`, derived integer types and `xsd:decimal` values beyond the
+fixed-width `i64` and `oxsdatatypes::Decimal` ranges using bounded arbitrary-precision
+representations capped at 4,096 significant digits and 4,096 fractional digits, while
+keeping ordinary fixed-width values on their existing fast paths. `ORDER BY` compares
+non-NaN numbers by their exact mathematical value across integer, decimal, float and double
+types so sorting and top-k selection stay transitive, while `FILTER` keeps XPath numeric
+promotion. Float and double casts to `xsd:integer` and derived integer types truncate the
+binary floating-point value directly.
+
+- **Format.** The derived numeric vocabulary sidecar `gen-*/vocab.num` moves from magic
+  `SPKVNUM3` to `SPKVNUM4` so out-of-range integers and decimals record `UNKNOWN` rather
+  than `NOT_NUMERIC`. Older `SPKVNUM2` and `SPKVNUM3` files are ignored on open while queries
+  decode from the vocabulary, and compaction or `sparkles vocab-index` rebuilds `SPKVNUM4`. The
+  incremental-view compiler version moves from `f13-phase2-4` to `f13-phase2-5` so
+  pre-upgrade view checkpoints rebuild under the new numeric semantics and arbitrary-precision
+  `SUM`/`AVG` state checkpoints and recovers cleanly.
+- **Compatibility.** In the public Rust surface (`sparkles::sparql::value`), `Value` adds
+  `BigInteger(BigIntValue)` and `BigDecimal(BigDecValue)` with opaque canonicalizing
+  wrappers, `Num<'a>` gains a lifetime parameter, and `NumConst` implements `Clone` rather
+  than `Copy`.
+### Prepared and evidence views no longer leak raw snapshots, masks or bound policies
+
+`PreparedView::{snapshot, access}`, `BoundEvidenceView::{snapshot, shared_snapshot}`,
+`Snapshot::{mask, counts}` and `access::triples::apply` are now crate-private so callers
+cannot retain uncredited masked snapshots, access masks or bound `GraphAccess` policies
+past their owning `Preparation` or `BoundEvidenceView` reservation (roadmap item 1307).
+`GuardDecision::exempt_controlled` now receives a scoped non-escaping `GuardSnapshot`
+instead of `&Arc<Snapshot>`. Checked callers now use `BoundReadSource`,
+`BoundEvidenceView::prepare_view`, `Reads::{from_prepared, from_evidence}`,
+`WriteTxn::prepare_read_view` (returning a writer-scoped `PreparedTxnView` and
+`ScopedQueryResult`), and non-escaping read-only accessors on `PreparedView` and
+`Snapshot`. `CountCache` stores non-owning weak references in separate controlled and
+legacy mask tables alongside weak visible-graph entries, with best-effort drop-time slot
+eviction and dead-entry pruning so legacy callers cannot acquire paid controlled masks
+and masks do not outlive their active holders. `GraphAccess::bound` records the view
+identity it resolved guards against, and checked read paths and facade evidence readers
+validate top-level and nested rules, accepting the matching view and refusing another
+commit, store, uncommitted view or masked derivative. GraphRAG evidence runs and MCP
+memory recall now read evidence views through `BoundReadSource` under the call's grant or
+dataset query pool while preserving the configured query memory budget and evaluating
+recall conflicts against the reader's state rather than live `HEAD`.
+
+### Tier D pre-admits memory growth and uses a deterministic input allowance
+
+Tier D classification now pre-admits clause-store, literal-interner, context-state and
+product-table growth against the memory budget and reservation callback before allocating,
+streams rooted initialization directly through clause derivation instead of buffering one
+collection across constants and `owl:Thing`, and includes the rooted literal interner in
+retained classification memory (roadmap item 1291). The discretionary memory allowance for
+Horn and Tier D runs now depends on logical input size rather than container capacities, so
+it stays identical across single-threaded and multi-threaded normalization while the hard
+memory budget and caller charge callback continue to observe actual retained capacities.
+
+### Disjointness and inequality axioms preserve repeated operands
+
+`DisjointClasses`, `DisjointUnion`, `DisjointObjectProperties`, `DisjointDataProperties`
+and `DifferentIndividuals` now keep repeated operands in a sorted `Multiset<T>` instead of
+deduplicating them into a `BTreeSet<T>`, so axioms such as `DisjointClasses(:A :A)`,
+`DisjointUnion(:C :A :A)`, `DisjointObjectProperties(:p :p)`,
+`DisjointDataProperties(:d :d)` and `DifferentIndividuals(:a :a)` retain their semantics
+across the functional-style, RDF and JSON codecs, Manchester's four binary disjointness and
+inequality forms, entity accessors and the classifier, as roadmap item 1314. Structural
+equality, ordering, hashing and serialized output remain order-independent, and
+equivalences, unions, intersections, `SameIndividual` and `HasKey` continue to deduplicate
+with `BTreeSet<T>`. In the classifier, repeated class and property operands force the
+repeated class or property empty within each tier's existing rules, repeated individuals make
+`DifferentIndividuals` inconsistent, and Horn shape detection and normalization reduce
+repeated `DisjointClasses` and `DisjointUnion` members without escalating Horn ontologies
+to Tier D. In Rust, callers that construct the five `AxiomKind` variants directly from a
+typed `BTreeSet<T>` now convert with `.into()`, and `Ontology::disjoint_unions` now returns
+`Vec<Multiset<ClassExpression>>`; `Axiom::disjoint_classes` keeps its generic signature.
+### Rooted rewriting kept when an ontology becomes Horn or EL
+
+When item 805's rooted rewriting turns every non-Horn axiom into Horn or OWL 2 EL axioms,
+such as a one-image `DisjointUnion` or two complemented disjointness members that merge to
+one image, `Saturation::run` now keeps the lower-tier classification whenever every rewritten
+axiom is taken (roadmap item 1313). Previously it discarded the result whenever Tier D did
+not run and reported the original axiom outside the supported fragment. Kept rewritten
+results preserve original-axiom counts, compute outside-EL statistics and chain range checks
+from the original ontology, restore unchanged exclusions and hide all internal fresh classes
+and the hub individual. When Tier D does not take the rewritten ontology, runs that stay
+disjunctive or leave out any rewritten axiom still fall back to the original axioms.
+
+### One result writer per format, with the engine's own SPARQL encoders
+
+Roadmap items 828 and 243 write every SELECT, ASK and graph answer through one writer per
+format, which takes an eager result and a cursor alike. Every writer keeps the bytes it
+wrote before, so the responses that already differed between the executors, such as the
+native document's graph layout, still differ, and item 1111 holds that change. The engine
+now writes SPARQL TSV, CSV, JSON and XML SELECT results with its own encoders in place of
+the sparesults writers, with the same bytes. SPARQL Results Thrift moved from the server
+into the library and streams from a cursor in the same bytes as the eager answer. A
+streamed Thrift request no longer answers `501`, and `auto` no longer runs every Thrift
+request eagerly.
+
+The result buffer records where each row ends instead of checking the row count at every
+write, and a streamed body counts a row once the transport has handed over the bytes up to
+its end. A body whose last send fails therefore no longer reports the rows of that unsent
+chunk. In per-request instruction counts on `wally` at 1.05M triples, native JSON
+`optional-chain` runs 0.894 of the base's instructions eagerly and 0.888 streamed, and
+`export-500k` 0.888 and 0.870. In the counts of their commits, the SPARQL encoders run
+`export-500k` in 0.93 and 0.89 of the sparesults writers' instructions in TSV, 0.93 and
+0.90 in CSV, 0.37 and 0.30 in JSON and 0.51 and 0.44 in XML, eager and streamed. Item 1195
+holds the per-row cost of the whole-row output that the next paragraph describes.
+
+Each row now reaches the response whole. A row that passes the result-size budget before
+the response starts answers `507` in every SELECT format and both executors, where SPARQL
+JSON and native JSON in streaming answered `200` with a cut body. A `507` before the
+response starts logs no rows. A row longer than the 8 KiB buffer in TSV, CSV, native JSON
+or Thrift is assembled in a scratch buffer that is charged to the query's memory, so a
+tight memory budget can answer `507` where it answered `200` before. The buffer, its
+scratch and its record of row ends grow under the same charge, which admits each growth
+with the old allocation that a moving reallocation holds beside the new one. Whole-row
+admission can also move a refusal earlier, so a two-cell XML row with a 70 KiB and a 20 KiB
+literal can answer `507` where sparesults committed the response and cut the body.
+
+In the Rust library, `sparql::results::write` takes a `Source`, `WriteOptions` and a writer
+and replaces the public `_counted` writer functions, such as `write_solutions_counted` and
+`write_cursor_graph_counted`, which are removed. The uncounted functions such as
+`write_solutions` and `write_cursor_graph` keep their signatures, so the bindings and the
+CLI do not change. `write_with_completion` runs a callback once after a successful write
+and its final drain, so a caller can check a `LimitedWriter` with `check_completion` for a
+cancellation that is due. `RowCount` and `RowLedger` carry the row counts.
+
+The HTTP streaming path also removes per-chunk idle timer wakeups, waking the stream timer
+only when the idle deadline starts, moves earlier or enters a terminal or aborted state,
+and raises `SwitchWriter`'s bounded stream channel from 4 to 16 entries (`CHANNEL_CAP =
+16`). Post-switch chunks are at most 64 KiB, while a threshold-driven switch queues its
+initial buffer as one entry (up to `STREAM_AFTER` + 1 byte before the remaining 15
+chunks). That trades up to 768 KiB more queued payload per active streamed response,
+released when the stream ends or aborts, so decoded cursor batches can enqueue without
+stalling the producer when queue space allows. On quiet `atlas` at 10.5M triples with 12
+threads, native streaming runs `export-500k` at 0.3710×, `optional-chain` at 0.9420×,
+`order-by-full` at 0.7782× and `star-join` at 0.8508×, and with one thread
+`optional-chain` runs at 0.4381× in streamed SPARQL JSON and 0.5691× in streamed XML while
+`long-literal` runs at 0.4234× in streamed SPARQL JSON. All 1,274 W3C streaming
+conformance tests pass.
+
+### Streamed SERVICE, text and history readers with non-materializing timestamp lookup
+
+Explicit streaming execution now serves SERVICE without SILENT, unbounded constant-query
+text searches and unbounded history queries through resumable page readers, as part of
+roadmap item 829. Checked history cursors honor cancellation and absolute deadlines
+during both paging and read-only timestamp lookup, and `ReadOnlyLog::commit_at_time`
+validates frames, metadata, term framing and quad term references in place without
+materializing term payloads. Across all 26 cells of the history timing matrix on `forge`
+for `2233637a..01b46ba1`, checked first pulls on archived ancestor logs ran 9.9% faster
+on `ancestor-one` and 15.1% faster on `ancestor-two`, while the writable history cases
+stayed within the 2% bound at +0.46% to +1.13% and are tracked under roadmap item 1074.
+
+### Default OWL classification derives named domains of top-object-property chains
+
+The default OWL classification path now derives named-domain consequences of two-link
+OWL 2 EL property chains ending in `owl:topObjectProperty` when the ontology stays within
+OWL 2 EL without datatype-checker components. When both links are `owl:topObjectProperty`,
+every live context derives the named domains of the chain's head property and its
+superproperties. When the first link is an ordinary non-empty, non-universal object
+property, every source context with an edge under that property derives those named
+domains. The rule table is bounded at 4,096 domain and rule rows under the classifier's
+memory budget, polls cancellation and deadlines, and preserves shared `Found`-row
+ownership and private-world teardown refund ordering under pooled paid admission. Explicit
+EL-only mode (`Limits::el_only`, `ClassifyRequest::el_only` and `--reasoner ELK`) and
+rooted runs are unchanged. The chain axioms remain reported as used in part while general
+composition through `owl:topObjectProperty` remains open under roadmap item 663.
+
+### Streamed conditional merge OPTIONAL tests eligible pairs before copying output
+
+The cursor's conditional merge OPTIONAL now enables `merge_pair_conditions` by default
+for partial progress on roadmap item 570. When both sides share only the merge key, the
+query references no registered scalar, aggregate or property function, and the condition
+has no observable side effects, volatility, timezone reads, SERVICE calls or unrecognized
+IRI functions inside EXISTS, the merge evaluates the condition on the pairs decided by
+the loaded right batch before copying output rows. Runs that cross a right batch, left
+rows whose pairs exceed a batch, spooled runs and ineligible conditions keep the
+post-copy path. Merge buffer memory can rise by at most one output batch and its
+pair-test scratch, while the condition's own evaluation charge stays outside that bound.
+Automatic execution still keeps an OPTIONAL whose condition holds an EXISTS eager until
+the streamed-to-eager comparison and item 1105's unified merge-order derivation finish.
+
+On quiet `atlas` at 10.5M quads with one Rayon thread and forced streaming across six
+A, B, B, A rounds (4,320 timings and 360 answer checks, all five queries agreeing), the
+integrated candidate merging `445a7f11` into `fc7b0bb9` (tree `40c5aaaf`) reduced
+`knows-fail` to 0.7375 of base time (145.41 against 197.15 ms), `knows-exists` to 0.7720
+(130.64 against 169.22 ms) and `knows-mixed` to 0.9341 (603.50 against 646.09 ms), with
+switch on/off ratios of 0.7491, 0.7880 and 0.9391 and every round improving in both
+comparisons. The same-binary check ranged from 0.9991 to 1.0008 and `class-exists` stayed
+neutral. Streamed `class-fail` increased by 0.59 ms or 0.78% against `fc7b0bb9` (76.71
+against 76.12 ms, round-paired 95% interval 1.0060 to 1.0112) while its switch on/off
+ratio was 1.0005 (0.9976 to 1.0074), which item 1143 tracks for recovery or layout
+attribution by the end of Batch 57.
+
+### A classification is complete only for the whole ontology
+
+`complete` in a classification answer now means complete for the whole input ontology, as
+HermiT and the OWL API read an answer. It was true before when the run left axioms out
+that `excluded` listed, which is ELK's convention, and that meaning moves to
+`completeForTaken` in the wire answers and `Classification::complete_for_taken` in Rust.
+`partial` and the dataset's retention now follow `completeForTaken`. `incomplete` and a
+`consistency` of `unknown` no longer imply a stopped run. A run that left axioms out lists
+the classes whose bottom-locality module holds one of them in `incomplete`, keeps every
+other class's exact superclasses, and makes the consistency `unknown` with every class
+incomplete when a left-out axiom could make the ontology inconsistent. A classification
+without `assertions` counts any assertion with logical content that it did not read as
+left out under the rule `assertion-not-read`, so an ontology with individuals answers
+incomplete, with every class incomplete and the consistency `unknown`, until it is
+classified with them. A class that only such an assertion names shows only through
+`complete` and that entry. A triple that maps to no axiom, such as the domain of an
+undeclared property or a class assertion of a blank node that no triple describes, is
+counted in the new `unmapped` statistic and leaves the answer incomplete in the same way,
+also in a classification later in a ROBOT chain (roadmap item 1276). The
+new `strict` option, `--strict` on `sparkles ontology classify` and `--strict true` on
+ROBOT's `reason`, `reduce` and `materialize` refuse an incomplete run with the error
+`classification-incomplete`, HTTP 422. ROBOT's commands are strict by default with
+`--reasoner hermit` or `jfact`, and `--strict false` turns that off. The answers' stats gain `coverageMs`,
+`coverageOver`, `coverageStopped` and `unmapped`, the answer lists the first 100 such
+triples in `unmappedTriples` with `unmappedTruncated`, the kept classification's outcome gains
+`unmappedCount`, a classification does not count a typing as `rdf:Property` alone, which has no logical content, and the content fingerprint of a retained
+classification is version 2, as roadmap item 1271.
+
+### Rooted runs keep the disjointness of members that the rewriting merges
+
+The rewriting of item 805 gives `∃top.A` and `≥1 top.A` the same image, and `≥0 top.X`
+the image `owl:Thing`, so two members of a `DisjointClasses` or `DisjointUnion` axiom
+could become one and the axiom was dropped. A rooted run of `DisjointClasses(∃top.A,
+≥1 top.A)` with `K ⊑ A` answered A and K satisfiable where HermiT finds them empty, and
+`DisjointClasses(owl:Thing, ≥0 top.X)` came out consistent, with each run reporting itself
+complete. The rewriting now makes an image of more than one member empty and keeps the
+disjointness of the distinct images, as roadmap item 1304. The report of the axioms
+left out names every original axiom that a left-out rewritten axiom stands for, where it
+named only the first, and no longer drops an axiom that the ontology states unchanged.
+Runs without `Limits::rooted` were not affected.
+
+### Views keep ORDER BY with LIMIT as an ordered window
+
+A view or live query whose SELECT has `ORDER BY` with `LIMIT` and `OFFSET` no longer
+evaluates its whole query again at every commit that touches it. It keeps the best
+`k + m + max(k, 100)` rows in order, promotes the next row when one leaves the window and
+refills the reserve from its input when it runs out, as roadmap item 419. A live query's
+rows now carry a `position`, its diffs list the rows that leave with their old positions
+and the rows that enter with their new ones, and `view:read` returns the window in order.
+Ordered live queries no longer merge diffs under `coalesceMs` and resume with a `reset`.
+The view compiler's version changed, so every existing view is built again once after the
+upgrade. The inner nodes of a view's property paths now take hidden names that no query
+variable can spell, so a query variable named `?__incr1` keeps its own binding (item 549).
+
+### The ontology editor's head no longer waits for the whole mapping
+
+`GET /$/ontology/{ds}?view=head` answers the summary's header, entity counts, graphs,
+imports and closure from index reads, without mapping the ontology into axioms, and the Rust
+JSON `summary` operation and Python's `summary()` take the same `view`. The ontology editor
+reads the head when it opens, and its Header tab and **Count the axioms** read the full
+summary. The head answers only when an allow-list shows that no other triple can change its
+answer, and otherwise opens the ontology, so its values always equal the full summary's. On
+`wally` its first call takes 9.6 ms on ChEBI lite and 25.1 ms on a taxonomy of 1 million
+classes, where the full summary takes 2.77 and 5.63 s, as roadmap item 735.
+
+### The matrix flags of batches 49 and 50 did not reproduce in a same-day run
+
+The forge matrices of b47b582b and 0779d666 ran `order-by-full` and `optional-chain` 1.3 to
+1.8 times as long as the matrix of 6dbf2a08 at 10.5M triples with 12 threads. A same-day
+run of all three matrix binaries in that cell, through the unmodified matrix harness in six
+invocations, ran `order-by-full` in 103 to 109 ms and `optional-chain` in 25 to 27 ms in
+every build. These times are below those of the 6dbf2a08 matrix, apart from streamed
+`optional-chain` at up to 1.010 times its time, so the flags did not reproduce in this run.
+Their cause is not known, and roadmap item 1267 holds the flags of the other cells. The
+same run finds small costs of item 1136 of 2.5% to 3.4% on `class-predicate-list` and
+`class-predicates` in both modes, which item 1255 records.
+
+### The classifier takes anonymous individuals
+
+The OWL classifier left out every axiom that held an anonymous individual, and dropped
+anonymous members of `SameIndividual` and `DifferentIndividuals` without a report. On the
+ORE 2015 DL development set that left out 2.8 million axioms in 55 files, most of them
+`oboInOwl` reifications. Each anonymous individual is now a fresh individual of the run,
+as OWL 2's semantics reads it and standard reasoners classify it, so consistency accounts
+for its assertions and no answer names it. A key does not bind it. Class assertions of a
+named class whose anonymous individual occurs nowhere else share one individual for each
+class. Thirty of the 55 files now leave nothing out, and the taxonomies of the 29 with a
+HermiT reference equal HermiT's. An ontology whose only individuals are anonymous now
+counts as having individuals, so a run that is not rooted leaves its disjunctive axioms
+out instead of its assertions. This is roadmap item 1281.
+
+### An inclusion in a top property keeps no ontology from the disjunctive rules
+
+`SubObjectPropertyOf(r owl:topObjectProperty)`, in any of its subproperty forms, and
+`SubDataPropertyOf(d owl:topDataProperty)` hold of every ontology. The classifier interned
+the top property for them, which closed the disjunctive rules and the rooted run, and
+in six files of the ORE 2015 DL development set it was one of the things that did. It now
+takes them as axioms that add nothing, as roadmap item 1282.
+
+### Rooted runs with keys left after their rewriting no longer panic
+
+A rooted classification whose only individuals were in axioms outside OWL 2 EL, with a key
+over object properties that item 805's rewriting declined, exited with an internal error
+in the disjunctive rules. The rewriting declines a key past its bound, beside data, the
+bottom property or a construct it cannot rewrite, and in an ontology with a name that has
+the prefix of its made-up names. Such a run is now not rooted and gives the answer of a run
+without the option, which leaves the axioms with individuals out and reports them. Rooted
+runs that completed before give the same answers, except that some now take axioms they
+used to leave out and derive the subsumptions those axioms give. Roadmap item 1265.
+
+### The disjunctive rules reduce their automata
+
+Roadmap item 712 reduces the automata by which the disjunctive rules unfold universal and
+negative existential restrictions on properties that chains or transitivity reach. Before
+the unfolding, the states that accept the same words become one, and a transition goes
+when another from the same state into the same state has a superproperty of its property,
+as the Horn rules already did. The rules apply a universal to every link under its
+property in both directions, so a state stands for the same restriction after either step.
+`Limits::dl_automata` and `SPARKLES_DL_AUTOMATA` select level 0 or 1 for a comparison. On
+`atlas` BioTop, `ore_ont_12141`, classifies in 31.0 against 56.2 ms on one thread, a
+median paired ratio of 0.552, and in 14.3 against 23.7 ms on four, 0.599, with half the
+work and about 40% fewer estimated bytes. The taxonomies are equal at both levels on
+the development and final files of the ORE 2015 DL sample and on 208 new fixtures checked
+against HermiT and Konclude. An earlier experiment had attributed BioTop's halved work to
+schedule noise, and the experiments page now records the correction.
+
+### The Horn rules leave out range universals that the links cover
+
+A range of a property that chains reach became a universal restriction on `owl:Thing`,
+which every context of a run with the Horn rules held and unfolded. Roadmap item 693 leaves
+it out when every path of the property ends with a link whose property or a property above
+it has the same range, since the ranges on the links then give it, as F24 argues. On
+`ore_ont_14817` and `ore_ont_9663` the rule leaves out 6 of 6 and 13 of 16 such universals,
+and on `atlas`, without the disjunctive attempt and against the same binary with every
+universal kept, the two files classify in a median over five paired rounds of 0.942 and
+0.955 times the time on one thread and 0.927 and 0.960 on four, with 8.2% and 7.2% fewer conclusions and about 60 and 50 MiB
+less memory. GO is unchanged. `ore_ont_7646` classifies within 8 GiB on one thread with the attempt bounded at 1, with
+219.2 million conclusions against 398.7 million. The index also gives the sources of the
+links of negative existential restrictions that an unfolding makes positive the ranges of
+their properties' inverses, which the argument needs. Those rules add conclusions on 27 of
+3,537 generated ontologies and on none of the 389 files of the sweep, and change no
+taxonomy. `Stats::horn_ranges_left_out` and the `hornRangesLeftOut` field of
+`el_classify` count the universals left out, and `SPARKLES_HORN_RANGES=keep` keeps them
+for a comparison.
+
 ### Cold small scans at 1.05M measured again against Fluree
 
 Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M
@@ -35,6 +385,26 @@ nextest's limit of 600 s on 0779d666, beside other slow tests in its shard. The 
 not slower, since on `wally` the test took 140 s at both 0779d666 and b47b582b. The six
 cases now run as three tests of two seeds each, `..._part_1_of_3` to `..._part_3_of_3`,
 with the same seeds, checks and `SPARKLES_CLOSURE_CASES` setting, as roadmap item 1275.
+
+### The Horn rules decide OWL 2 DL datatypes and data cardinalities
+
+The classifier took only the data restrictions of OWL 2 EL and left out the literals and
+ranges of `xsd:double`, `xsd:int`, `xsd:boolean` and the other datatypes outside the
+profile, with data cardinalities, universal data restrictions, facets and
+`DisjointDataProperties`. A datatype checker now decides these in the Horn rules, so two
+values of a functional `xsd:double` property, a value outside an `xsd:int` range and a
+string in an `xsd:boolean` range make an ontology inconsistent, as roadmap item 972. The
+checker takes positive and negative assertions about named and anonymous individuals.
+An ontology whose data stays within OWL 2 EL runs as before. Three answers change beside
+the new decisions. In a run with a checker component, a `DatatypeDefinition` outside OWL
+2 EL that the checker converts and a `DisjointDataProperties` axiom over the checker's
+properties are used and no longer reported as left out. A case analysis over data values
+that a context needs is reported as used in part, but not when the context, or the world
+of the class it was found in, turns out to have no instance. `Stats::tier` reads
+`Disjunctive` for a run whose only axioms outside the Horn rules are data unions,
+enumerations of several values, complements on the left or higher data cardinalities,
+which the Horn rules now decide. Keys over the checker's properties are reported as used
+in part, and universal or maximum data restrictions on the left are left out.
 
 ### A kept EL classification over its memory budget starts again in full
 
@@ -981,6 +1351,39 @@ item 318). `scripts/eval-ask --profile-stages` records the Ask stage diagnostics
 each evaluation child.
 
 ### Compatibility
+
+- `DlQueryRequest`, `KeptQuery` and `DlReasoningUsed` in `sparkles::handles::ontology`
+  add a public `el_only: bool` field for EL-only (ELK) classification and DL queries
+  (roadmap item 694). Callers using `DlQueryRequest::new` or `KeptQuery::default` keep
+  their existing defaults; downstream exhaustive struct literals or patterns must include
+  `el_only` or `..`. In the JVM bindings (`io.github.kclejeune.sparkles.jena`),
+  `DlQuery`, `ClassifyQuery` and `KeptClassificationQuery` add `elOnly: Boolean = false`
+  at the end of their primary constructors while preserving pre-694 JVM binary linkage
+  and Java `@JvmOverloads` constructors; Kotlin callers invoking untyped callable
+  references (`::DlQuery`, `q::copy`) without an expected function type and Java source
+  callers of `copy(...)` must pass `elOnly`. HTTP, CLI, Python and Node.js contracts
+  remain backwards compatible.
+- Layered dataset settings responses can return `evidence` as the `kind`.
+  Clients that exhaustively handle the former kinds can regenerate their types
+  from the updated OpenAPI document. Dataset administrators can declare and lock
+  evidence settings and reconcile drift through the layered routes (item 508).
+
+The unreleased Rust snapshot, mask and access-control surface changed under roadmap item
+1307; HTTP and CLI wire contracts are unchanged:
+
+- `PreparedView::{snapshot, access}`, `BoundEvidenceView::{snapshot, shared_snapshot}`,
+  `Snapshot::{mask, counts}` and `access::triples::apply` are now crate-private. Migrate
+  to `BoundReadSource`, `BoundEvidenceView::prepare_view`,
+  `Reads::{from_prepared, from_evidence}`, and the non-escaping accessors on
+  `PreparedView` and `Snapshot` (`has_mask`, `mask_id`, `mask_key`, `hidden_quad_count`).
+- `GuardDecision::exempt_controlled` now takes `&GuardSnapshot<'_>` instead of
+  `&Arc<Snapshot>`. Migrate providers to `GuardSnapshot::{commit, content_key,
+  lookup_iri, scan, with_term}`.
+- `GraphGuard` now carries a crate-private `bound_to` stamp, breaking downstream struct
+  literals (including `..Default::default()`). Construct guards with `GraphGuard::new`,
+  `GraphGuard::with_decider`, `Graphs::guarded` or `Graphs::guarded_by`.
+- `WriteTxn::graphs` is removed. Use `WriteTxn::prepare_read_view`, which returns a
+  writer-scoped `PreparedTxnView` and `ScopedQueryResult`.
 
 The experimental Rust memory-admission API uses an opaque `ParentHandle` in place
 of `Arc<dyn MemoryParent>`. Parent leases, live credit, query contexts and reasoner

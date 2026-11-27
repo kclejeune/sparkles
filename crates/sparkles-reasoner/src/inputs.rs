@@ -11,13 +11,18 @@
 //! keeps them in a model cache).
 
 use crate::INFERRED_GRAPH;
+use crate::budget::{Budget, BudgetFailure, Held, WorkingWarnings, table_bytes, table_grown};
 use anyhow::Context as _;
 use oxrdf::Term;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
-use sparkles_core::id::Id;
+use sparkles_core::access::GraphAccess;
+use sparkles_core::id::{self, Id, Tag};
+use sparkles_core::incr::footprint::{FGraph, Footprint};
 use sparkles_core::index::Perm;
-use sparkles_core::store::{Snapshot, Store};
-use std::collections::{BTreeMap, BTreeSet};
+use sparkles_core::store::{Chunk, Snapshot, Store, TermKind};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 /// `owl:imports`
 pub const OWL_IMPORTS: &str = "http://www.w3.org/2002/07/owl#imports";
@@ -50,6 +55,26 @@ impl GraphRef {
         }
     }
 
+    /// This graph reference as a shared incremental [`FGraph`].
+    pub fn to_fgraph(&self) -> FGraph {
+        match self {
+            GraphRef::Default => FGraph::Default,
+            GraphRef::Named(g) => {
+                FGraph::Graph(Term::NamedNode(oxrdf::NamedNode::new_unchecked(g.clone())))
+            }
+        }
+    }
+
+    /// Recover a [`GraphRef`] from a shared incremental [`FGraph`], when it names a
+    /// concrete default or named graph.
+    pub fn from_fgraph(g: &FGraph) -> Option<GraphRef> {
+        match g {
+            FGraph::Default => Some(GraphRef::Default),
+            FGraph::Graph(Term::NamedNode(n)) => Some(GraphRef::Named(n.as_str().to_string())),
+            _ => None,
+        }
+    }
+
     /// The graph's id in a snapshot, if it has quads there.
     pub fn id(&self, snap: &Snapshot) -> Option<Id> {
         self.try_id(snap).unwrap_or(None)
@@ -66,6 +91,370 @@ impl GraphRef {
                 };
                 Ok((snap.count(Perm::Gspo, &[id.0])? > 0).then_some(id))
             }
+        }
+    }
+
+    /// Controlled [`id`](Self::id) that admits IRI lookup scratch against
+    /// `budget` and polls `check`.
+    fn try_id_controlled(&self, snap: &Snapshot, ctrl: &Control<'_>) -> anyhow::Result<Option<Id>> {
+        ctrl.check()?;
+        match self {
+            GraphRef::Default => Ok(Some(Id::DEFAULT_GRAPH)),
+            GraphRef::Named(g) => {
+                let Some(id) = lookup_iri_controlled(snap, g, ctrl)? else {
+                    return Ok(None);
+                };
+                Ok(has_quads_controlled(snap, id, ctrl)?.then_some(id))
+            }
+        }
+    }
+}
+
+struct Control<'a> {
+    budget: &'a Arc<Budget>,
+    check: std::cell::RefCell<&'a mut dyn FnMut() -> anyhow::Result<()>>,
+}
+
+impl Control<'_> {
+    fn check(&self) -> anyhow::Result<()> {
+        (self.check.borrow_mut())()
+    }
+}
+
+fn lookup_iri_controlled(
+    snap: &Snapshot,
+    iri: &str,
+    ctrl: &Control<'_>,
+) -> anyhow::Result<Option<Id>> {
+    ctrl.check()?;
+    let len = iri
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+    let mut key_held = match Held::try_new_exact(ctrl.budget, len) {
+        Ok(held) => held,
+        Err(err) => {
+            ctrl.check()?;
+            return Err(err.into());
+        }
+    };
+    let mut key = Vec::with_capacity(len);
+    if key.capacity() > len
+        && let Err(err) = key_held.try_grow(key.capacity() - len)
+    {
+        ctrl.check()?;
+        return Err(err.into());
+    }
+    key.push(b'<');
+    key.extend_from_slice(iri.as_bytes());
+    snap.lookup_key_controlled(&key, |_, _| Ok(()), |_| Ok(()), || ctrl.check())
+}
+
+enum ImportObject {
+    Iri(String),
+    NonIri(Term),
+}
+
+fn admit_string(s: &str, ctrl: &Control<'_>) -> anyhow::Result<(String, Held)> {
+    ctrl.check()?;
+    let len = s.len();
+    let mut held = match Held::try_new_exact(ctrl.budget, len) {
+        Ok(held) => held,
+        Err(err) => {
+            ctrl.check()?;
+            return Err(err.into());
+        }
+    };
+    let mut out = String::with_capacity(len);
+    if out.capacity() > len
+        && let Err(err) = held.try_grow(out.capacity() - len)
+    {
+        ctrl.check()?;
+        return Err(err.into());
+    }
+    out.push_str(s);
+    Ok((out, held))
+}
+
+fn push_warning(
+    warnings: &mut WorkingWarnings,
+    args: std::fmt::Arguments<'_>,
+    ctrl: &Control<'_>,
+) -> anyhow::Result<()> {
+    ctrl.check()?;
+    if let Err(err) = warnings.push_fmt(args) {
+        ctrl.check()?;
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+fn push_vec_controlled<T>(
+    vec: &mut Vec<T>,
+    value: T,
+    held: &mut Held,
+    ctrl: &Control<'_>,
+) -> anyhow::Result<()> {
+    let old_cap = vec.capacity();
+    let elem = std::mem::size_of::<T>();
+    let next_cap = sparkles_budget::sizes::vec_grown(old_cap, vec.len(), 1, elem);
+    if next_cap != old_cap {
+        let next_bytes = next_cap
+            .checked_mul(elem)
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        let mut grow = match Held::try_new_exact(ctrl.budget, next_bytes) {
+            Ok(h) => h,
+            Err(err) => {
+                ctrl.check()?;
+                return Err(err.into());
+            }
+        };
+        vec.reserve_exact(next_cap - vec.len());
+        let actual = vec
+            .capacity()
+            .checked_mul(elem)
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        if actual > next_bytes {
+            if let Err(err) = grow.try_grow(actual - next_bytes) {
+                ctrl.check()?;
+                return Err(err.into());
+            }
+        } else {
+            grow.shrink(next_bytes - actual);
+        }
+        held.try_merge(&mut grow)?;
+        held.shrink(old_cap * elem);
+    }
+    vec.push(value);
+    Ok(())
+}
+
+fn push_deque_controlled<T>(
+    deque: &mut VecDeque<T>,
+    value: T,
+    held: &mut Held,
+    ctrl: &Control<'_>,
+) -> anyhow::Result<()> {
+    if deque.len() == deque.capacity() {
+        let old_cap = deque.capacity();
+        let next_cap = old_cap
+            .checked_mul(2)
+            .map(|n| n.max(4))
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        let next_bytes = next_cap
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        let mut grow = match Held::try_new_exact(ctrl.budget, next_bytes) {
+            Ok(h) => h,
+            Err(err) => {
+                ctrl.check()?;
+                return Err(err.into());
+            }
+        };
+        deque.reserve(1);
+        let actual = deque
+            .capacity()
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        if actual > next_bytes {
+            if let Err(err) = grow.try_grow(actual - next_bytes) {
+                ctrl.check()?;
+                return Err(err.into());
+            }
+        } else {
+            grow.shrink(next_bytes - actual);
+        }
+        held.try_merge(&mut grow)?;
+        held.shrink(old_cap * std::mem::size_of::<T>());
+    }
+    deque.push_back(value);
+    Ok(())
+}
+
+fn insert_id_set_controlled(
+    set: &mut FxHashSet<Id>,
+    id: Id,
+    held: &mut Held,
+    ctrl: &Control<'_>,
+) -> anyhow::Result<bool> {
+    if set.contains(&id) {
+        return Ok(false);
+    }
+    let old_cap = set.capacity();
+    let next_cap = table_grown(old_cap, set.len(), 1);
+    if next_cap != old_cap {
+        let elem = std::mem::size_of::<Id>();
+        let old_bytes = table_bytes(old_cap, elem);
+        let next_bytes = table_bytes(next_cap, elem);
+        let mut grow = match Held::try_new_exact(ctrl.budget, next_bytes) {
+            Ok(h) => h,
+            Err(err) => {
+                ctrl.check()?;
+                return Err(err.into());
+            }
+        };
+        set.reserve(1);
+        let actual = table_bytes(set.capacity(), elem);
+        if actual > next_bytes {
+            if let Err(err) = grow.try_grow(actual - next_bytes) {
+                ctrl.check()?;
+                return Err(err.into());
+            }
+        } else {
+            grow.shrink(next_bytes - actual);
+        }
+        held.try_merge(&mut grow)?;
+        held.shrink(old_bytes);
+    }
+    Ok(set.insert(id))
+}
+
+fn has_quads_controlled(snap: &Snapshot, id: Id, ctrl: &Control<'_>) -> anyhow::Result<bool> {
+    ctrl.check()?;
+    match snap.count(Perm::Gspo, &[id.0]) {
+        Ok(n) => Ok(n > 0),
+        Err(
+            e @ (sparkles_core::Error::Cancelled
+            | sparkles_core::Error::Timeout
+            | sparkles_core::Error::BudgetExceeded(_)),
+        ) => Err(e.into()),
+        Err(_) => Ok(false),
+    }
+}
+
+fn decode_iri_controlled(
+    snap: &Snapshot,
+    id: Id,
+    ctrl: &Control<'_>,
+) -> anyhow::Result<Option<(String, Held)>> {
+    ctrl.check()?;
+    let decode_key = |key: &[u8]| -> anyhow::Result<Option<(String, Held)>> {
+        if let Some(iri_bytes) = key.strip_prefix(b"<")
+            && let Ok(iri) = std::str::from_utf8(iri_bytes)
+        {
+            return admit_string(iri, ctrl).map(Some);
+        }
+        Ok(None)
+    };
+    match id.tag() {
+        Tag::Vocab => {
+            if id.payload() >= snap.generation.vocab.len()
+                || !snap.generation.vocab.is_iri(id.payload())
+            {
+                return Ok(None);
+            }
+            let scratch = std::cell::RefCell::new(Held::new(ctrl.budget));
+            Ok(snap
+                .generation
+                .vocab
+                .get_with_controlled_capacity_checked(
+                    id.payload(),
+                    |old, new| -> anyhow::Result<()> {
+                        if let Err(err) = scratch.borrow_mut().try_set(old.saturating_add(new)) {
+                            ctrl.check()?;
+                            return Err(err.into());
+                        }
+                        Ok(())
+                    },
+                    |capacity| -> anyhow::Result<()> {
+                        if let Err(err) = scratch.borrow_mut().try_set(capacity) {
+                            ctrl.check()?;
+                            return Err(err.into());
+                        }
+                        Ok(())
+                    },
+                    |_| ctrl.check(),
+                    decode_key,
+                )?
+                .flatten())
+        }
+        Tag::Delta => snap.generation.dvocab.with(|vocab| {
+            let Some(key) = vocab.get(id.payload()) else {
+                return Ok(None);
+            };
+            decode_key(key)
+        }),
+        _ => Ok(None),
+    }
+}
+
+fn decode_import_object_controlled(
+    snap: &Snapshot,
+    id: Id,
+    need_non_iri: bool,
+    ctrl: &Control<'_>,
+) -> anyhow::Result<Option<(ImportObject, Held)>> {
+    ctrl.check()?;
+    if !need_non_iri {
+        return Ok(decode_iri_controlled(snap, id, ctrl)?
+            .map(|(iri, held)| (ImportObject::Iri(iri), held)));
+    }
+    let decode_key = |key: &[u8]| -> anyhow::Result<(ImportObject, Held)> {
+        if let Some(iri_bytes) = key.strip_prefix(b"<")
+            && let Ok(iri) = std::str::from_utf8(iri_bytes)
+        {
+            let (s, held) = admit_string(iri, ctrl)?;
+            return Ok((ImportObject::Iri(s), held));
+        }
+        let bytes = usize::try_from(id::key_decode_bytes(key)?).unwrap_or(usize::MAX);
+        let held = match Held::try_new_exact(ctrl.budget, bytes) {
+            Ok(held) => held,
+            Err(err) => {
+                ctrl.check()?;
+                return Err(err.into());
+            }
+        };
+        ctrl.check()?;
+        Ok((ImportObject::NonIri(id::key_to_term(key)), held))
+    };
+    match id.tag() {
+        Tag::Vocab => {
+            let scratch = std::cell::RefCell::new(Held::new(ctrl.budget));
+            snap.generation.vocab.get_with_controlled_capacity_checked(
+                id.payload(),
+                |old, new| -> anyhow::Result<()> {
+                    if let Err(err) = scratch.borrow_mut().try_set(old.saturating_add(new)) {
+                        ctrl.check()?;
+                        return Err(err.into());
+                    }
+                    Ok(())
+                },
+                |capacity| -> anyhow::Result<()> {
+                    if let Err(err) = scratch.borrow_mut().try_set(capacity) {
+                        ctrl.check()?;
+                        return Err(err.into());
+                    }
+                    Ok(())
+                },
+                |_| ctrl.check(),
+                decode_key,
+            )
+        }
+        Tag::Delta => snap.generation.dvocab.with(|vocab| {
+            let Some(key) = vocab.get(id.payload()) else {
+                return Ok(None);
+            };
+            decode_key(key).map(Some)
+        }),
+        _ => {
+            let Some(term) = snap.term(id) else {
+                return Ok(None);
+            };
+            let bytes = match &term {
+                Term::BlankNode(b) => b.as_str().len(),
+                Term::Literal(l) => l.value().len(),
+                Term::NamedNode(n) => n.as_str().len(),
+                Term::Triple(_) => 64,
+            }
+            .saturating_add(std::mem::size_of::<Term>());
+            let held = match Held::try_new_exact(ctrl.budget, bytes) {
+                Ok(held) => held,
+                Err(err) => {
+                    ctrl.check()?;
+                    return Err(err.into());
+                }
+            };
+            Ok(Some((ImportObject::NonIri(term), held)))
         }
     }
 }
@@ -179,6 +568,55 @@ impl LocationMapping {
                 || iri.to_string(),
                 |(p, alt)| format!("{alt}{}", &iri[p.len()..]),
             )
+    }
+
+    /// Mapped location for `iri` only when it differs from `iri`, admitting the
+    /// allocated string against `ctrl.budget` and keeping its credit with the result.
+    fn map_controlled(
+        &self,
+        iri: &str,
+        ctrl: &Control<'_>,
+    ) -> anyhow::Result<Option<(String, Held)>> {
+        ctrl.check()?;
+        if let Some(alt) = self.names.get(iri) {
+            if alt == iri {
+                return Ok(None);
+            }
+            return admit_string(alt, ctrl).map(Some);
+        }
+        if let Some((prefix, alt)) = self
+            .prefixes
+            .iter()
+            .filter(|(p, _)| iri.starts_with(p.as_str()))
+            .max_by_key(|(p, _)| p.len())
+        {
+            if alt == prefix {
+                return Ok(None);
+            }
+            let suffix = &iri[prefix.len()..];
+            let len = alt
+                .len()
+                .checked_add(suffix.len())
+                .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+            let mut held = match Held::try_new_exact(ctrl.budget, len) {
+                Ok(held) => held,
+                Err(err) => {
+                    ctrl.check()?;
+                    return Err(err.into());
+                }
+            };
+            let mut out = String::with_capacity(len);
+            if out.capacity() > len
+                && let Err(err) = held.try_grow(out.capacity() - len)
+            {
+                ctrl.check()?;
+                return Err(err.into());
+            }
+            out.push_str(alt);
+            out.push_str(suffix);
+            return Ok(Some((out, held)));
+        }
+        Ok(None)
     }
 
     /// A Jena location-mapping document (Turtle or another RDF syntax that `format`
@@ -329,6 +767,26 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// The footprint of the graphs whose changes make the inferences stale: those read,
+    /// and those an import that did not resolve would be read from, in deterministic
+    /// graph order.
+    pub fn footprint(&self) -> Footprint {
+        let entries = self
+            .watched()
+            .into_iter()
+            .map(|g| sparkles_core::incr::footprint::Entry {
+                g: g.to_fgraph(),
+                s: None,
+                p: None,
+                o: None,
+            })
+            .collect();
+        Footprint {
+            entries,
+            all: false,
+        }
+    }
+
     /// The graphs whose changes make the inferences stale: those read, and those an
     /// import that did not resolve would be read from.
     pub fn watched(&self) -> Vec<GraphRef> {
@@ -359,6 +817,19 @@ impl Resolved {
     /// The ids of the graphs read that have quads in `snap`.
     pub fn ids(&self, snap: &Snapshot) -> Vec<Id> {
         let mut ids: Vec<Id> = self.graph_set().iter().filter_map(|g| g.id(snap)).collect();
+        ids.dedup();
+        ids
+    }
+
+    /// The ids of the readable graphs read that have quads in `snap`, checking
+    /// readability by known [`GraphRef`] name before looking up the graph id.
+    pub fn readable_ids(&self, snap: &Snapshot, readable: &dyn Fn(&GraphRef) -> bool) -> Vec<Id> {
+        let mut ids: Vec<Id> = self
+            .graph_set()
+            .into_iter()
+            .filter(|g| readable(g))
+            .filter_map(|g| g.id(snap))
+            .collect();
         ids.dedup();
         ids
     }
@@ -416,6 +887,310 @@ pub fn resolve_readable(
     readable: &dyn Fn(Id) -> bool,
 ) -> Resolved {
     resolve_closure(snap, inputs, readable, &ImportTargets::default()).0
+}
+
+/// [`resolve_readable`] checking readability by known [`GraphRef`] name without
+/// decoding graph IDs back through `Snapshot::term`.
+pub fn resolve_readable_iri(
+    snap: &Snapshot,
+    inputs: &Inputs,
+    readable: &dyn Fn(&GraphRef) -> bool,
+) -> Resolved {
+    match closure(
+        snap,
+        inputs,
+        ReadableCheck::ByRef(readable),
+        &ImportTargets::default(),
+        false,
+        &|| Ok(()),
+    ) {
+        Ok((r, _)) => r,
+        Err(_) => unreachable!("a lenient resolution does not fail"),
+    }
+}
+
+/// Controlled graph and `owl:imports` resolution for a demand session.
+///
+/// Checks readability using known graph IRI names without decoding IDs via
+/// `Snapshot::term`, processes `owl:imports` objects incrementally while keeping
+/// budget credit alive with each decoded name, writes retained warnings directly
+/// into `warnings`, and returns a dedicated [`Held`] that keeps the resolved
+/// graph vector charged for the caller's lifetime.
+pub(crate) fn resolve_session_inputs_controlled(
+    snap: &Snapshot,
+    inputs: &Inputs,
+    readable: Option<&GraphAccess>,
+    warnings: &mut WorkingWarnings,
+    budget: &Arc<Budget>,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<Id>, Held)> {
+    resolve_inputs_controlled_inner(snap, inputs, readable, Some(warnings), budget, check)
+}
+
+/// Controlled graph and `owl:imports` resolution returning resolved graph IDs and the
+/// retained heap bytes of the returned vector, bounded by `max_memory` and `check`.
+pub fn resolve_ids_controlled(
+    snap: &Snapshot,
+    inputs: &Inputs,
+    readable: Option<&GraphAccess>,
+    max_memory: Option<usize>,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<Id>, usize)> {
+    resolve_ids_controlled_with_parent(snap, inputs, readable, max_memory, None, check)
+}
+
+/// [`resolve_ids_controlled`], reserving from `memory_parent` when present.
+pub fn resolve_ids_controlled_with_parent(
+    snap: &Snapshot,
+    inputs: &Inputs,
+    readable: Option<&GraphAccess>,
+    max_memory: Option<usize>,
+    memory_parent: Option<crate::ParentHandle>,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<Id>, usize)> {
+    let budget = Budget::with_parent(max_memory, memory_parent);
+    let (graphs, held) =
+        resolve_inputs_controlled_inner(snap, inputs, readable, None, &budget, check)?;
+    let bytes = held.bytes();
+    Ok((graphs, bytes))
+}
+
+/// Convert resolved graph IDs (plus any extra [`GraphRef`] entries) into a retained
+/// `Vec<GraphRef>` under `max_memory` and `check`, decoding named graph IRIs without
+/// unchecked `Snapshot::term` calls and returning the retained heap bytes.
+pub fn graph_refs_controlled(
+    snap: &Snapshot,
+    graphs: &[Id],
+    extra: &[GraphRef],
+    max_memory: Option<usize>,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<GraphRef>, usize)> {
+    graph_refs_controlled_with_parent(snap, graphs, extra, max_memory, None, check)
+}
+
+/// [`graph_refs_controlled`], reserving from `memory_parent` when present.
+pub fn graph_refs_controlled_with_parent(
+    snap: &Snapshot,
+    graphs: &[Id],
+    extra: &[GraphRef],
+    max_memory: Option<usize>,
+    memory_parent: Option<crate::ParentHandle>,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<GraphRef>, usize)> {
+    let budget = Budget::with_parent(max_memory, memory_parent);
+    let ctrl = Control {
+        budget: &budget,
+        check: std::cell::RefCell::new(check),
+    };
+    let mut refs: Vec<GraphRef> = Vec::new();
+    let mut held = Held::new(&budget);
+    for &id in graphs {
+        ctrl.check()?;
+        if id == Id::DEFAULT_GRAPH {
+            push_vec_controlled(&mut refs, GraphRef::Default, &mut held, &ctrl)?;
+        } else if let Some((iri, mut iri_held)) = decode_iri_controlled(snap, id, &ctrl)? {
+            push_vec_controlled(&mut refs, GraphRef::Named(iri), &mut held, &ctrl)?;
+            held.try_merge(&mut iri_held)?;
+        }
+    }
+    for graph in extra {
+        ctrl.check()?;
+        match graph {
+            GraphRef::Default => {
+                push_vec_controlled(&mut refs, GraphRef::Default, &mut held, &ctrl)?;
+            }
+            GraphRef::Named(name) => {
+                let (iri, mut iri_held) = admit_string(name, &ctrl)?;
+                push_vec_controlled(&mut refs, GraphRef::Named(iri), &mut held, &ctrl)?;
+                held.try_merge(&mut iri_held)?;
+            }
+        }
+    }
+    let bytes = held.bytes();
+    Ok((refs, bytes))
+}
+
+fn resolve_inputs_controlled_inner(
+    snap: &Snapshot,
+    inputs: &Inputs,
+    readable: Option<&GraphAccess>,
+    mut warnings: Option<&mut WorkingWarnings>,
+    budget: &Arc<Budget>,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<Id>, Held)> {
+    let ctrl = Control {
+        budget,
+        check: std::cell::RefCell::new(check),
+    };
+    let allows_ref = |g: &GraphRef| {
+        readable.is_none_or(|a| match g {
+            GraphRef::Default => a.read.default_graph(),
+            GraphRef::Named(iri) => a.read.allows_named_iri(iri),
+        })
+    };
+    let allows_named = |iri: &str| readable.is_none_or(|a| a.read.allows_named_iri(iri));
+
+    ctrl.check()?;
+    let mut state_held = Held::new(budget);
+    let mut graphs_held = Held::new(budget);
+    let mut graphs: Vec<Id> = Vec::new();
+    let mut graph_set: FxHashSet<Id> = FxHashSet::default();
+    let mut queue: VecDeque<Id> = VecDeque::new();
+
+    let mut seen_configured: Vec<&GraphRef> = Vec::new();
+    for g in inputs.data_graphs.iter().chain(&inputs.ontology_graphs) {
+        ctrl.check()?;
+        if seen_configured.contains(&g) {
+            continue;
+        }
+        push_vec_controlled(&mut seen_configured, g, &mut state_held, &ctrl)?;
+        if !allows_ref(g) {
+            continue;
+        }
+        match g.try_id_controlled(snap, &ctrl)? {
+            Some(gid) => {
+                if insert_id_set_controlled(&mut graph_set, gid, &mut state_held, &ctrl)? {
+                    push_vec_controlled(&mut graphs, gid, &mut graphs_held, &ctrl)?;
+                    push_deque_controlled(&mut queue, gid, &mut state_held, &ctrl)?;
+                }
+            }
+            None => {
+                if let Some(warnings) = warnings.as_deref_mut() {
+                    push_warning(
+                        warnings,
+                        format_args!("the input graph <{}> is empty", g.as_str()),
+                        &ctrl,
+                    )?;
+                }
+            }
+        }
+    }
+
+    if inputs.imports != ImportMode::None
+        && !queue.is_empty()
+        && let Some(owl_imports) = lookup_iri_controlled(snap, OWL_IMPORTS, &ctrl)?
+    {
+        let mut seen_iris: FxHashSet<Id> = FxHashSet::default();
+        let mut import_count = 0usize;
+        let mut stopped = false;
+
+        while let Some(g) = queue.pop_front() {
+            ctrl.check()?;
+            let mut objects: Vec<Id> = Vec::new();
+            let mut objects_held = Held::new(budget);
+            let mut scan_err: Option<anyhow::Error> = None;
+            let scan_res = snap.scan(Perm::Pos, &[owl_imports.0], |chunk| {
+                if let Err(err) = ctrl.check() {
+                    scan_err = Some(err);
+                    return Ok(false);
+                }
+                let mut visit = |k: [u64; 4]| -> bool {
+                    let q = Perm::Pos.to_quad(&k);
+                    if q[3] == g
+                        && let Err(err) =
+                            push_vec_controlled(&mut objects, q[2], &mut objects_held, &ctrl)
+                    {
+                        scan_err = Some(err);
+                        return false;
+                    }
+                    true
+                };
+                Ok(match chunk {
+                    Chunk::Block(b, s, e) => (s..e).all(|i| visit(b.key(i))),
+                    Chunk::Row(k) => visit(k),
+                })
+            });
+            if let Some(err) = scan_err {
+                return Err(err);
+            }
+            match scan_res {
+                Ok(()) => {}
+                Err(
+                    e @ (sparkles_core::Error::Cancelled
+                    | sparkles_core::Error::Timeout
+                    | sparkles_core::Error::BudgetExceeded(_)),
+                ) => return Err(e.into()),
+                Err(_) => continue,
+            }
+
+            for obj_id in objects {
+                ctrl.check()?;
+                if seen_iris.contains(&obj_id) {
+                    continue;
+                }
+                if stopped && snap.term_kind(obj_id) == TermKind::Iri {
+                    continue;
+                }
+                let Some((obj, _obj_held)) =
+                    decode_import_object_controlled(snap, obj_id, warnings.is_some(), &ctrl)?
+                else {
+                    continue;
+                };
+                match obj {
+                    ImportObject::NonIri(term) => {
+                        if let Some(warnings) = warnings.as_deref_mut() {
+                            push_warning(
+                                warnings,
+                                format_args!("owl:imports {term} is not an IRI and was ignored"),
+                                &ctrl,
+                            )?;
+                        }
+                    }
+                    ImportObject::Iri(iri) => {
+                        insert_id_set_controlled(&mut seen_iris, obj_id, &mut state_held, &ctrl)?;
+                        if import_count >= MAX_IMPORTS {
+                            if let Some(warnings) = warnings.as_deref_mut() {
+                                push_warning(
+                                    warnings,
+                                    format_args!(
+                                        "more than {MAX_IMPORTS} imports: <{iri}> and later ones were not followed"
+                                    ),
+                                    &ctrl,
+                                )?;
+                            }
+                            stopped = true;
+                            continue;
+                        }
+                        import_count += 1;
+                        let mut resolved_id = None;
+                        if allows_named(&iri) && has_quads_controlled(snap, obj_id, &ctrl)? {
+                            resolved_id = Some(obj_id);
+                        } else if !inputs.location_mapping.is_empty()
+                            && let Some((location, _loc_held)) =
+                                inputs.location_mapping.map_controlled(&iri, &ctrl)?
+                            && allows_named(&location)
+                            && let Some(loc_id) = lookup_iri_controlled(snap, &location, &ctrl)?
+                            && has_quads_controlled(snap, loc_id, &ctrl)?
+                        {
+                            resolved_id = Some(loc_id);
+                        }
+                        if let Some(gid) = resolved_id {
+                            if insert_id_set_controlled(
+                                &mut graph_set,
+                                gid,
+                                &mut state_held,
+                                &ctrl,
+                            )? {
+                                push_vec_controlled(&mut graphs, gid, &mut graphs_held, &ctrl)?;
+                                push_deque_controlled(&mut queue, gid, &mut state_held, &ctrl)?;
+                            }
+                        } else if let Some(warnings) = warnings.as_deref_mut() {
+                            push_warning(
+                                warnings,
+                                format_args!("owl:imports <{iri}> did not resolve to a graph"),
+                                &ctrl,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    graphs.sort_unstable();
+    graphs.dedup();
+    let graphs_held = graphs_held.split(graphs_held.bytes());
+    Ok((graphs, graphs_held))
 }
 
 /// Which source resolved an import (spec U12, import resolution).
@@ -498,6 +1273,11 @@ pub struct ImportEdge {
     pub cycle: bool,
 }
 
+enum ReadableCheck<'a> {
+    ById(&'a dyn Fn(Id) -> bool),
+    ByRef(&'a dyn Fn(&GraphRef) -> bool),
+}
+
 /// [`resolve_readable`] with `targets`, and the edges of the imports closure. An import
 /// resolves to the import map's graph, else to the graph its IRI (or location mapping)
 /// names, else to the graphs of the vocabulary resources it matches; a candidate counts
@@ -509,7 +1289,14 @@ pub fn resolve_closure(
     readable: &dyn Fn(Id) -> bool,
     targets: &ImportTargets,
 ) -> (Resolved, Vec<ImportEdge>) {
-    match closure(snap, inputs, readable, targets, false, &|| Ok(())) {
+    match closure(
+        snap,
+        inputs,
+        ReadableCheck::ById(readable),
+        targets,
+        false,
+        &|| Ok(()),
+    ) {
         Ok(r) => r,
         Err(_) => unreachable!("a lenient resolution does not fail"),
     }
@@ -526,13 +1313,20 @@ pub fn try_resolve_closure(
     targets: &ImportTargets,
     check: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<(Resolved, Vec<ImportEdge>)> {
-    closure(snap, inputs, readable, targets, true, check)
+    closure(
+        snap,
+        inputs,
+        ReadableCheck::ById(readable),
+        targets,
+        true,
+        check,
+    )
 }
 
 fn closure(
     snap: &Snapshot,
     inputs: &Inputs,
-    readable: &dyn Fn(Id) -> bool,
+    readable: ReadableCheck<'_>,
     targets: &ImportTargets,
     strict: bool,
     check: &dyn Fn() -> anyhow::Result<()>,
@@ -545,14 +1339,25 @@ fn closure(
             Ok(g.id(snap))
         }
     };
-    let id =
-        |g: &GraphRef| -> anyhow::Result<Option<Id>> { Ok(present(g)?.filter(|i| readable(*i))) };
+    let id = |g: &GraphRef| -> anyhow::Result<Option<Id>> {
+        match readable {
+            ReadableCheck::ByRef(allow) => {
+                if !allow(g) {
+                    return Ok(None);
+                }
+                present(g)
+            }
+            ReadableCheck::ById(allow) => Ok(present(g)?.filter(|i| allow(*i))),
+        }
+    };
+    check()?;
     let mut r = Resolved {
         graphs: inputs.configured(),
         ..Default::default()
     };
     let mut edges: Vec<ImportEdge> = Vec::new();
     for g in &r.graphs {
+        check()?;
         if present(g)?.is_none() {
             r.warnings
                 .push(format!("the input graph <{}> is empty", g.as_str()));
@@ -569,6 +1374,7 @@ fn closure(
     let mut stopped = false;
     let mut i = 0;
     while i < r.graphs.len() {
+        check()?;
         let from = r.graphs[i].clone();
         let Some(g) = id(&from)? else {
             i += 1;
@@ -778,5 +1584,132 @@ pub fn fetch_imports(
         if !tried {
             return Ok(out);
         }
+    }
+}
+
+#[cfg(test)]
+mod controlled_budget_tests {
+    use super::*;
+    use crate::budget::{Budget, BudgetFailure, Held, WorkingWarnings, table_bytes};
+
+    #[test]
+    fn insert_id_set_controlled_uses_hash_table_allocation_sizes() {
+        // First growth (0 -> 3 insertable entries, 4 buckets) requires table_bytes(3, 8) == 52 bytes.
+        let mut set = FxHashSet::default();
+        let tight = Budget::new(Some(51));
+        let mut held = Held::new(&tight);
+        let mut check = || Ok(());
+        let ctrl = Control {
+            budget: &tight,
+            check: std::cell::RefCell::new(&mut check),
+        };
+        let err = insert_id_set_controlled(&mut set, Id(1), &mut held, &ctrl)
+            .expect_err("51-byte budget must refuse 52-byte initial hash table");
+        assert!(BudgetFailure::from_anyhow(&err).is_some());
+        assert_eq!(set.capacity(), 0);
+
+        let exact = Budget::new(Some(52));
+        let mut held = Held::new(&exact);
+        let mut check = || Ok(());
+        let ctrl = Control {
+            budget: &exact,
+            check: std::cell::RefCell::new(&mut check),
+        };
+        assert!(insert_id_set_controlled(&mut set, Id(1), &mut held, &ctrl).unwrap());
+        assert!(insert_id_set_controlled(&mut set, Id(2), &mut held, &ctrl).unwrap());
+        assert!(insert_id_set_controlled(&mut set, Id(3), &mut held, &ctrl).unwrap());
+        assert_eq!(
+            held.bytes(),
+            table_bytes(set.capacity(), std::mem::size_of::<Id>())
+        );
+        assert_eq!(held.bytes(), 52);
+
+        // Second growth (cap 3 -> cap 7, 8 buckets == 88 bytes) must admit both old (52) and
+        // new (88) allocations simultaneously (140 bytes total) before reserving.
+        let mut set_tight2 = FxHashSet::default();
+        let tight2 = Budget::new(Some(139));
+        let mut held2 = Held::new(&tight2);
+        let mut check = || Ok(());
+        let ctrl = Control {
+            budget: &tight2,
+            check: std::cell::RefCell::new(&mut check),
+        };
+        for id in [Id(1), Id(2), Id(3)] {
+            assert!(insert_id_set_controlled(&mut set_tight2, id, &mut held2, &ctrl).unwrap());
+        }
+        let err = insert_id_set_controlled(&mut set_tight2, Id(4), &mut held2, &ctrl)
+            .expect_err("139-byte budget must refuse simultaneous 52 + 88 byte rehash");
+        assert!(BudgetFailure::from_anyhow(&err).is_some());
+        assert_eq!(set_tight2.capacity(), 3);
+
+        let mut set_exact2 = FxHashSet::default();
+        let exact2 = Budget::new(Some(140));
+        let mut held2 = Held::new(&exact2);
+        let mut check = || Ok(());
+        let ctrl = Control {
+            budget: &exact2,
+            check: std::cell::RefCell::new(&mut check),
+        };
+        for id in [Id(1), Id(2), Id(3), Id(4)] {
+            assert!(insert_id_set_controlled(&mut set_exact2, id, &mut held2, &ctrl).unwrap());
+        }
+        assert_eq!(
+            held2.bytes(),
+            table_bytes(set_exact2.capacity(), std::mem::size_of::<Id>())
+        );
+        assert_eq!(held2.bytes(), 88);
+    }
+
+    #[test]
+    fn resolve_session_inputs_retains_graph_vector_credit() {
+        let store = Store::in_memory(Default::default());
+        sparkles_core::sparql::update::update(
+            &store,
+            "INSERT DATA { \
+                <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> . \
+                GRAPH <http://ex.org/g1> { <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> } \
+                GRAPH <http://ex.org/g2> { <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> } \
+                GRAPH <http://ex.org/g3> { <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> } \
+                GRAPH <http://ex.org/g4> { <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> } \
+            }",
+            &Default::default(),
+        )
+        .unwrap();
+        let snap = store.snapshot();
+        let inputs = Inputs {
+            data_graphs: vec![
+                GraphRef::Default,
+                GraphRef::Named("http://ex.org/g1".into()),
+                GraphRef::Named("http://ex.org/g2".into()),
+                GraphRef::Named("http://ex.org/g3".into()),
+                GraphRef::Named("http://ex.org/g4".into()),
+            ],
+            imports: ImportMode::None,
+            ..Default::default()
+        };
+        let budget = Budget::unlimited();
+        let mut warnings = WorkingWarnings::new(&budget);
+        let mut check = || Ok(());
+        let (resolved, graphs_held) = resolve_session_inputs_controlled(
+            &snap,
+            &inputs,
+            None,
+            &mut warnings,
+            &budget,
+            &mut check,
+        )
+        .unwrap();
+        let expected = resolved.capacity() * std::mem::size_of::<Id>();
+        assert!(expected >= 5 * std::mem::size_of::<Id>());
+        assert_eq!(graphs_held.bytes(), expected);
+        assert_eq!(
+            budget.used(),
+            expected,
+            "resolved graph vector lost its budget credit on return (used={}, expected={expected})",
+            budget.used()
+        );
+        drop(resolved);
+        drop(graphs_held);
+        assert_eq!(budget.used(), 0);
     }
 }

@@ -13,6 +13,9 @@ use georust::{
     Coord, Geometry, GeometryCollection, LineString, MultiLineString, MultiPoint, MultiPolygon,
     Point, Polygon,
 };
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use std::collections::BTreeMap;
+use std::fmt;
 
 /// Deepest nesting of geometry collections.
 pub const MAX_DEPTH: usize = 32;
@@ -549,13 +552,257 @@ fn dim_tag(word: &str) -> Option<Layout> {
 // ---------------------------------------------------------------------------------------
 // GeoJSON
 
+/// Additional space for the JSON value tree and its overlap with geometry construction.
+/// The caller separately covers the lexical copy, JSON strings and string scratch.
+pub(super) fn geojson_structure_bytes(lex: &str) -> u64 {
+    let value = std::mem::size_of::<GeoJsonValue>() as u64;
+    let geometry = std::mem::size_of::<Geometry<f64>>() as u64;
+    let mut bytes = 0u64;
+    let mut in_string = false;
+    let mut escaped = false;
+    for b in lex.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        let extra = match b {
+            b'"' => {
+                in_string = true;
+                0
+            }
+            // A nonempty value vector starts with four slots. Each additional
+            // element can add up to three slots at a growth peak (old plus new).
+            b'[' => 4 * value + geometry,
+            b',' => 3 * value + 2 * geometry,
+            // A member may open a singleton map. Allow a whole B-tree node
+            // (key and value slots, child pointers and node metadata).
+            b':' => 1024,
+            _ => 0,
+        };
+        bytes = bytes.saturating_add(extra);
+    }
+    bytes
+}
+
+const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
+// serde_json's Value deserializer interprets special first map keys for its
+// `raw_value` and `arbitrary_precision` features. Read ordinary JSON keys at
+// every depth so user-supplied object keys stay literal and the tree only
+// allocates for syntax covered by the admission scan, while still decoding
+// serde_json's synthetic `arbitrary_precision` number maps.
+enum GeoJsonValue {
+    Null,
+    Bool,
+    Number(Option<f64>),
+    String(String),
+    Array(Vec<GeoJsonValue>),
+    Object(BTreeMap<String, GeoJsonValue>),
+}
+
+impl GeoJsonValue {
+    fn as_object(&self) -> Option<&BTreeMap<String, GeoJsonValue>> {
+        match self {
+            Self::Object(obj) => Some(obj),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&Vec<GeoJsonValue>> {
+        match self {
+            Self::Array(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        match *self {
+            Self::Number(f) => f,
+            _ => None,
+        }
+    }
+}
+
+enum FirstMapKey {
+    ObjectKey(String),
+    SyntheticNumber,
+}
+
+impl<'de> Deserialize<'de> for FirstMapKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FirstKeyVisitor;
+
+        impl<'de> Visitor<'de> for FirstKeyVisitor {
+            type Value = FirstMapKey;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object key")
+            }
+
+            // `serde_json`'s real JSON object `MapKey` implements
+            // `deserialize_newtype_struct` by invoking `visit_newtype_struct`
+            // (unless the struct name is `raw::TOKEN`), whereas
+            // `NumberFieldDeserializer` under `arbitrary_precision` forwards
+            // `deserialize_newtype_struct` to `deserialize_any` and visits the
+            // synthetic number token string directly.
+            fn visit_newtype_struct<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                String::deserialize(deserializer).map(FirstMapKey::ObjectKey)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value == SERDE_JSON_NUMBER_TOKEN {
+                    Ok(FirstMapKey::SyntheticNumber)
+                } else {
+                    Ok(FirstMapKey::ObjectKey(value.to_owned()))
+                }
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                if value == SERDE_JSON_NUMBER_TOKEN {
+                    Ok(FirstMapKey::SyntheticNumber)
+                } else {
+                    Ok(FirstMapKey::ObjectKey(value))
+                }
+            }
+        }
+
+        deserializer.deserialize_newtype_struct("GeoJsonObjectKey", FirstKeyVisitor)
+    }
+}
+
+struct SyntheticNumberValue(Option<f64>);
+
+impl<'de> Deserialize<'de> for SyntheticNumberValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct NumberTextVisitor;
+
+        impl Visitor<'_> for NumberTextVisitor {
+            type Value = SyntheticNumberValue;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON number string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                let parsed = value
+                    .parse::<f64>()
+                    .map_err(|_| E::custom("invalid synthetic JSON number"))?;
+                Ok(SyntheticNumberValue(parsed.is_finite().then_some(parsed)))
+            }
+        }
+
+        deserializer.deserialize_str(NumberTextVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for GeoJsonValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(GeoJsonVisitor)
+    }
+}
+
+struct GeoJsonVisitor;
+
+impl<'de> Visitor<'de> for GeoJsonVisitor {
+    type Value = GeoJsonValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_unit<E>(self) -> Result<GeoJsonValue, E> {
+        Ok(GeoJsonValue::Null)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<GeoJsonValue, E> {
+        Ok(GeoJsonValue::Bool)
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<GeoJsonValue, E> {
+        Ok(GeoJsonValue::Number(Some(value as f64)))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<GeoJsonValue, E> {
+        Ok(GeoJsonValue::Number(Some(value as f64)))
+    }
+
+    fn visit_i128<E>(self, value: i128) -> Result<GeoJsonValue, E> {
+        Ok(GeoJsonValue::Number(Some(value as f64)))
+    }
+
+    fn visit_u128<E>(self, value: u128) -> Result<GeoJsonValue, E> {
+        Ok(GeoJsonValue::Number(Some(value as f64)))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<GeoJsonValue, E> {
+        Ok(GeoJsonValue::Number(value.is_finite().then_some(value)))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<GeoJsonValue, E> {
+        Ok(GeoJsonValue::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<GeoJsonValue, E> {
+        Ok(GeoJsonValue::String(value))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<GeoJsonValue, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = access.next_element()? {
+            values.push(value);
+        }
+        Ok(GeoJsonValue::Array(values))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<GeoJsonValue, A::Error> {
+        let Some(first_key) = access.next_key::<FirstMapKey>()? else {
+            return Ok(GeoJsonValue::Object(BTreeMap::new()));
+        };
+        match first_key {
+            FirstMapKey::SyntheticNumber => {
+                let SyntheticNumberValue(num) = access.next_value()?;
+                if access.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "unexpected trailing entry in synthetic number",
+                    ));
+                }
+                Ok(GeoJsonValue::Number(num))
+            }
+            FirstMapKey::ObjectKey(key) => {
+                let mut values = BTreeMap::new();
+                values.insert(key, access.next_value()?);
+                while let Some((key, value)) = access.next_entry::<String, GeoJsonValue>()? {
+                    values.insert(key, value);
+                }
+                Ok(GeoJsonValue::Object(values))
+            }
+        }
+    }
+}
+
 fn parse_geojson(lex: &str, max_vertices: u32) -> Result<Geom, GeomError> {
     let crs = CrsRef::Known(CRS84);
     let text = lex.trim();
     if text.is_empty() || text == "null" {
         return Ok(Geom::empty(crs, GeomType::GeometryCollection));
     }
-    let v: serde_json::Value = serde_json::from_str(lex).map_err(|e| {
+    let v: GeoJsonValue = serde_json::from_str(lex).map_err(|e| {
         let offset = lex
             .split_inclusive('\n')
             .take(e.line().saturating_sub(1))
@@ -570,7 +817,7 @@ fn parse_geojson(lex: &str, max_vertices: u32) -> Result<Geom, GeomError> {
 }
 
 fn json_geometry(
-    v: &serde_json::Value,
+    v: &GeoJsonValue,
     depth: usize,
     acc: &mut Acc,
 ) -> Result<(GeomType, Geometry<f64>), String> {
@@ -613,7 +860,13 @@ fn json_geometry(
         "Feature" | "FeatureCollection" => {
             return Err(format!("a GeoJSON {ty} is not a geometry"));
         }
-        _ => return Err(format!("unknown GeoJSON geometry type {ty:?}")),
+        _ => {
+            // Debug escaping can expand each input byte. Keep the diagnostic
+            // inside the parser's fixed allowance even for a very long type.
+            let preview = &ty[..ty.floor_char_boundary(16)];
+            let suffix = if preview.len() < ty.len() { "…" } else { "" };
+            return Err(format!("unknown GeoJSON geometry type {preview:?}{suffix}"));
+        }
     };
     let cv = obj
         .get("coordinates")
@@ -651,12 +904,12 @@ fn json_geometry(
     Ok((declared, g))
 }
 
-fn json_array(v: &serde_json::Value) -> Result<&Vec<serde_json::Value>, String> {
+fn json_array(v: &GeoJsonValue) -> Result<&Vec<GeoJsonValue>, String> {
     v.as_array()
         .ok_or_else(|| "GeoJSON coordinates must be arrays".into())
 }
 
-fn json_position(v: &serde_json::Value, acc: &mut Acc) -> Result<Coord<f64>, String> {
+fn json_position(v: &GeoJsonValue, acc: &mut Acc) -> Result<Coord<f64>, String> {
     let a = json_array(v)?;
     if a.len() < 2 || a.len() > 3 {
         return Err(format!(
@@ -674,11 +927,11 @@ fn json_position(v: &serde_json::Value, acc: &mut Acc) -> Result<Coord<f64>, Str
     acc.coord(&ords[..a.len()])
 }
 
-fn json_positions(a: &[serde_json::Value], acc: &mut Acc) -> Result<Vec<Coord<f64>>, String> {
+fn json_positions(a: &[GeoJsonValue], acc: &mut Acc) -> Result<Vec<Coord<f64>>, String> {
     a.iter().map(|p| json_position(p, acc)).collect()
 }
 
-fn json_line(a: &[serde_json::Value], acc: &mut Acc) -> Result<LineString<f64>, String> {
+fn json_line(a: &[GeoJsonValue], acc: &mut Acc) -> Result<LineString<f64>, String> {
     let v = json_positions(a, acc)?;
     if v.len() == 1 {
         return Err("a line has 1 point, at least 2 needed".into());
@@ -686,7 +939,7 @@ fn json_line(a: &[serde_json::Value], acc: &mut Acc) -> Result<LineString<f64>, 
     Ok(LineString::new(v))
 }
 
-fn json_polygon(a: &[serde_json::Value], acc: &mut Acc) -> Result<Polygon<f64>, String> {
+fn json_polygon(a: &[GeoJsonValue], acc: &mut Acc) -> Result<Polygon<f64>, String> {
     let mut rings = a.iter().map(|r| {
         let v = json_positions(json_array(r)?, acc)?;
         check_ring(&v)?;
@@ -1063,6 +1316,110 @@ mod tests {
         );
         let e = json_err("{\"type\":\"Point\",\n\"coordinates\":[1,2]");
         assert!(e.offset.is_some());
+    }
+
+    #[test]
+    fn geojson_synthetic_arbitrary_precision_number_and_literal_keys() {
+        use serde::de::{DeserializeSeed, IntoDeserializer};
+
+        // Mirrors serde_json::number::NumberFieldDeserializer under arbitrary_precision:
+        // every deserialize_* method forwards to deserialize_any -> visit_borrowed_str(TOKEN).
+        struct SyntheticNumberFieldDeserializer;
+
+        impl<'de> Deserializer<'de> for SyntheticNumberFieldDeserializer {
+            type Error = serde::de::value::Error;
+
+            fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+                visitor.visit_borrowed_str("$serde_json::private::Number")
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map struct enum identifier ignored_any
+            }
+        }
+
+        struct SyntheticNumberMapAccess {
+            number: Option<String>,
+        }
+
+        impl<'de> MapAccess<'de> for SyntheticNumberMapAccess {
+            type Error = serde::de::value::Error;
+
+            fn next_key_seed<K: DeserializeSeed<'de>>(
+                &mut self,
+                seed: K,
+            ) -> Result<Option<K::Value>, Self::Error> {
+                if self.number.is_none() {
+                    return Ok(None);
+                }
+                seed.deserialize(SyntheticNumberFieldDeserializer).map(Some)
+            }
+
+            fn next_value_seed<V: DeserializeSeed<'de>>(
+                &mut self,
+                seed: V,
+            ) -> Result<V::Value, Self::Error> {
+                seed.deserialize(self.number.take().unwrap().into_deserializer())
+            }
+        }
+
+        for (raw, expected) in [
+            ("2.25", Some(2.25)),
+            ("48.84", Some(48.84)),
+            ("-0", Some(-0.0)),
+            ("1e+2", Some(100.0)),
+            ("-2.5e-1", Some(-0.25)),
+            ("1e+999", None),
+        ] {
+            let value = GeoJsonVisitor
+                .visit_map(SyntheticNumberMapAccess {
+                    number: Some(raw.to_owned()),
+                })
+                .unwrap_or_else(|e| panic!("synthetic number {raw} failed: {e}"));
+            assert_eq!(value.as_f64(), expected, "synthetic number {raw}");
+            assert!(
+                value.as_object().is_none(),
+                "synthetic number {raw} must not become an object"
+            );
+        }
+
+        // Ordinary fractional, negative-zero and exponent Points must parse cleanly,
+        // including when serde_json/arbitrary_precision is unified by an embedder.
+        let p = json(r#"{"type":"Point","coordinates":[2.25,48.84]}"#);
+        assert_eq!(p.g, Geometry::Point(Point::new(2.25, 48.84)));
+        let p3 = json(r#"{"type":"Point","coordinates":[-0,1.5e-2,3.75]}"#);
+        assert_eq!(p3.g, Geometry::Point(Point::new(-0.0, 0.015)));
+        assert_eq!((p3.layout, p3.z), (Layout::Xyz, Some((3.75, 3.75))));
+
+        // Overflowing coordinates must still be rejected, and a bare fractional
+        // number must fail as a non-object rather than a missing type.
+        json_err(r#"{"type":"Point","coordinates":[1e999,48.84]}"#);
+        assert!(json_err("2.25").msg.contains("must be an object"));
+
+        // User-supplied objects whose first key is serde_json's synthetic number
+        // token (literal or escaped) must stay literal objects, never numbers.
+        for bad in [
+            r#"{"type":"Point","coordinates":[{"$serde_json::private::Number":"2.25"},48.84]}"#,
+            r#"{"type":"Point","coordinates":[{"$serde_json::private::\u004eumber":"2.25"},48.84]}"#,
+        ] {
+            assert!(
+                json_err(bad).msg.contains("must hold numbers"),
+                "expected non-numeric coordinate error for {bad}"
+            );
+        }
+
+        // Foreign members with literal reserved keys (including non-numeric
+        // values and sibling entries) must parse without interfering with Point.
+        let p_foreign = json(
+            r#"{"type":"Point","coordinates":[2.25,48.84],"properties":{"$serde_json::private::Number":"not a number","extra":1}}"#,
+        );
+        assert_eq!(p_foreign.g, Geometry::Point(Point::new(2.25, 48.84)));
+        let p_raw = json(
+            r#"{"type":"Point","coordinates":[2.25,48.84],"properties":{"$serde_json::private::RawValue":"[1,2,3]"}}"#,
+        );
+        assert_eq!(p_raw.g, Geometry::Point(Point::new(2.25, 48.84)));
     }
 
     #[test]

@@ -527,6 +527,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                     "id": uuid("The hold's identity."),
                     "owner": with_desc(string_enum(&["evidence"]), "The profile that holds the commits."),
                     "created": with_desc(json!({ "type": "string", "format": "date-time" }), "When the hold was acquired."),
+                    "forDatasetId": uuid("The dataset whose operation acquired this hold, when it differs from this dataset."),
                     "commits": with_desc(array(closed(
                         &["branch", "branchId", "commit"],
                         json!({
@@ -602,6 +603,81 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
         )
     };
     let commit = |d: &str| with_desc(json!({ "type": "integer", "minimum": 0 }), d);
+    put(
+        "EvidenceReauthenticateRequest",
+        doc(
+            closed(
+                &["graph"],
+                json!({
+                    "graph": with_desc(string(), "The protected evidence record graph to reconcile."),
+                    "branch": with_desc(string(), "The target branch name. `main` when absent."),
+                    "records": with_desc(json!({
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 10000,
+                        "items": closed(
+                            &["iri"],
+                            json!({
+                                "iri": with_desc(string(), "The record IRI to verify and vouch for."),
+                                "recordDigest": digest("Optional expected `ev:recordDigest` that the record must match."),
+                            }),
+                        ),
+                    }), "Specific records to verify and re-authenticate. Omit to reconcile every profile record in `graph`."),
+                    "ifHead": commit("Commit only while the target branch head equals this commit."),
+                    "idempotencyKey": with_desc(json!({ "type": "string", "minLength": 1, "maxLength": 256 }), "Replays the first reconciliation receipt when repeated with the same payload."),
+                    "dryRun": with_desc(boolean(), "Verify and preview the changes without committing."),
+                    "message": with_desc(string(), "Optional commit message."),
+                }),
+            ),
+            "Administered re-authentication request for records of an earlier protection.",
+            "evidence-settings",
+        ),
+    );
+    put(
+        "EvidenceReauthenticateResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "graph",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "records",
+                ],
+                json!({
+                    "operation": with_desc(string(), "The audit `ev:Operation` IRI in the reconciled graph."),
+                    "graph": with_desc(string(), "The reconciled evidence record graph."),
+                    "committed": with_desc(boolean(), "Whether this call published a commit."),
+                    "replayed": with_desc(boolean(), "Whether an earlier idempotent operation's receipt was returned."),
+                    "commit": commit("The publishing commit, the first commit on a replay, or the branch head on a dry run or no-op."),
+                    "branchId": uuid("The reconciled branch's UUID."),
+                    "records": with_desc(array(closed(
+                        &["iri", "kind", "recordDigest", "receipt", "alreadyAuthenticated"],
+                        json!({
+                            "iri": string(),
+                            "kind": kinds(),
+                            "recordDigest": digest("The verified `ev:recordDigest`."),
+                            "receipt": with_desc(string(), "The record's preserved `ev:availabilityReceipt` operation IRI."),
+                            "alreadyAuthenticated": with_desc(boolean(), "Whether the record already carried the graph's current protection nonce."),
+                        }),
+                    )), "Every verified record of the reconciliation."),
+                    "dryRun": closed(
+                        &["wouldCommit", "inserted", "deleted", "error"],
+                        json!({
+                            "wouldCommit": boolean(),
+                            "inserted": int(),
+                            "deleted": int(),
+                            "error": or_null(string()),
+                        }),
+                    ),
+                }),
+            ),
+            "Result of an administered evidence re-authentication reconciliation.",
+            "evidence-settings",
+        ),
+    );
     put(
         "EvidenceResolveRequest",
         doc(
@@ -843,6 +919,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                             "reportedAvailableAt": date_time("An attributed allegation of earlier availability."),
                             "upstreamRevisions": array(record_ref("An upstream revision.")),
                             "families": array(string()),
+                            "wasRevisionOf": record_ref("The predecessor source revision this revision supersedes, written as `prov:wasRevisionOf`."),
                         }),
                     )),
                     "renditions": array(closed(
@@ -876,7 +953,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                         json!({
                             "key": key("The record's key in this batch."),
                             "occurrenceKey": key("The reference's key within what it references."),
-                            "storedFact": with_desc(json!({ "type": "object" }), "A stored fact in the form of `EvidenceResolveRequest`. A fact of this dataset is held for the operation."),
+                            "storedFact": with_desc(json!({ "type": "object" }), "A stored fact in the form of `EvidenceResolveRequest`. Its commit is held for the operation."),
                             "passage": closed(
                                 &["revision", "rendition", "passage"],
                                 json!({
@@ -980,7 +1057,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                     "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
                     "branchId": uuid("The branch the commit published on."),
                     "firstAvailableAt": with_desc(or_null(string()), "The commit's time, the first availability of its source revisions. `null` for a dry run."),
-                    "hold": with_desc(or_null(json!({ "type": "string", "format": "uuid" })), "The source hold of the stored facts of this dataset that the batch references."),
+                    "hold": with_desc(or_null(json!({ "type": "string", "format": "uuid" })), "The UUID shared by the source holds of this operation in the referenced datasets."),
                     "records": array(closed(
                         &["key", "kind", "iri", "graph", "recordDigest", "existing"],
                         json!({
@@ -1126,6 +1203,60 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
         ),
     );
     put(
+        "EvidenceProjectionReconcile",
+        doc(
+            closed(
+                &["policy"],
+                json!({
+                    "policy": with_desc(string(), "The name of a review policy of the evidence settings."),
+                    "policyVersion": with_desc(json!({ "type": "integer", "minimum": 1 }), "Optional expected policy version, else `409 policy-changed`."),
+                    "ifHead": commit("Publish only while this commit is the branch head, else `409 head-changed`."),
+                    "idempotencyKey": key("Makes a retry with the same payload answer the first receipt."),
+                    "dryRun": with_desc(boolean(), "Check and preview the reconciliation without committing it."),
+                    "message": with_desc(string(), "The commit message."),
+                }),
+            ),
+            "Reconcile a review policy's accepted projection after a changed protection.",
+            "evidence-reviews",
+        ),
+    );
+    put(
+        "EvidenceProjectionReconcileResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "policy",
+                    "policyVersion",
+                    "output",
+                    "projection",
+                    "vouchedSupports",
+                    "changed",
+                ],
+                json!({
+                    "operation": iri("The reconciliation operation, which is the availability receipt of any fresh projection record it publishes."),
+                    "committed": with_desc(boolean(), "Whether this request published a commit."),
+                    "replayed": with_desc(boolean(), "Whether the idempotency key had published the same payload, whose receipt this is."),
+                    "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
+                    "branchId": uuid("The branch the commit published on."),
+                    "policy": iri("The reconciled review policy."),
+                    "policyVersion": with_desc(json!({ "type": "integer", "minimum": 1 }), "The policy version recorded in the projection record."),
+                    "output": iri("The output graph recorded in the projection record."),
+                    "projection": iri("The active projection record carrying the current protections, or the projection record selected by the original operation on a replay."),
+                    "vouchedSupports": with_desc(array(string()), "The live authenticated acceptance supports vouched for under the current protections, sorted by IRI. Empty on a replay."),
+                    "changed": changed(),
+                    "dryRun": dry_run(),
+                }),
+            ),
+            "The outcome of reconciling a review policy's accepted projection.",
+            "evidence-reviews",
+        ),
+    );
+    put(
         "EvidenceWithdrawal",
         doc(
             closed(
@@ -1226,16 +1357,72 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
         ),
     );
     put(
+        "EvidenceIdentitiesRebuild",
+        doc(
+            closed(
+                &["policy"],
+                json!({
+                    "policy": with_desc(string(), "The name of a matching policy of the evidence settings."),
+                    "policyVersion": with_desc(int(), "Optional expected policy version, else `409 policy-changed`."),
+                    "ifHead": commit("Publish only while this commit is the branch head, else `409 head-changed`."),
+                    "idempotencyKey": key("Makes a retry with the same payload answer the first receipt."),
+                    "dryRun": with_desc(boolean(), "Check and preview the rebuild without committing it."),
+                    "message": with_desc(string(), "The commit message."),
+                }),
+            ),
+            "Administered rebuild of a matching policy's resolution map in its current boundary.",
+            "evidence-identities",
+        ),
+    );
+    put(
+        "EvidenceIdentitiesRebuildResult",
+        doc(
+            closed(
+                &[
+                    "operation",
+                    "committed",
+                    "replayed",
+                    "commit",
+                    "branchId",
+                    "policy",
+                    "policyVersion",
+                    "revision",
+                    "number",
+                    "previous",
+                    "boundary",
+                    "changed",
+                ],
+                json!({
+                    "operation": iri("The operation, the rebuilt revision's availability receipt."),
+                    "committed": with_desc(boolean(), "Whether this request published a commit."),
+                    "replayed": with_desc(boolean(), "Whether the idempotency key had published the same payload, whose receipt this is."),
+                    "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
+                    "branchId": uuid("The branch the commit published on."),
+                    "policy": iri("The matching policy."),
+                    "policyVersion": with_desc(int(), "The matching policy version recorded on the revision."),
+                    "revision": iri("The resolution map revision published by the rebuild, also for a replay."),
+                    "number": with_desc(int(), "The revision number, from 1."),
+                    "previous": with_desc(or_null(string()), "The previous authenticated revision it follows, or `null` when none existed or earlier revisions no longer authenticate."),
+                    "boundary": with_desc(array(string()), "The protected identity graphs of the policy's boundary recorded on the revision, sorted."),
+                    "changed": changed(),
+                    "dryRun": dry_run(),
+                }),
+            ),
+            "The outcome of rebuilding a matching policy's resolution map.",
+            "evidence-identities",
+        ),
+    );
+    put(
         "EvidenceDependents",
         doc(
             closed(
                 &["changed"],
                 json!({
                     "changed": with_desc(json!({ "type": "array", "items": string(), "minItems": 1, "maxItems": 1000 }), "The record identities that changed, such as a withdrawn claim, an ended support or the revision a new map revision follows."),
-                    "transitive": with_desc(boolean(), "Also find the assessments that depend on a dependent. Defaults to `false`."),
+                    "transitive": with_desc(boolean(), "Also find the assessments and community reports that depend on a dependent. Defaults to `false`."),
                 }),
             ),
-            "Changed evidence records whose dependent assessments to find.",
+            "Changed evidence records whose dependent assessments and community reports to find.",
             "evidence-dependents",
         ),
     );
@@ -1243,7 +1430,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
         "EvidenceDependentsResult",
         doc(
             closed(
-                &["commit", "dependents"],
+                &["commit", "dependents", "reports"],
                 json!({
                     "commit": commit("The commit the records were read at."),
                     "dependents": array(closed(
@@ -1253,12 +1440,23 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                             "graph": iri("Its proposal graph."),
                             "on": iri("The changed record it depends on, or for a transitive dependent the assessment it depends on."),
                             "dependence": string_enum(&["target", "used"]),
-                            "depth": with_desc(int(), "How many assessments lie between it and a changed record, 0 for a direct dependent."),
+                            "depth": with_desc(int(), "How many intermediate dependents lie between it and a changed record, 0 for a direct dependent."),
+                        }),
+                    )),
+                    "reports": array(closed(
+                        &["report", "community", "graph", "on", "dependence", "depth"],
+                        json!({
+                            "report": iri("A community report in a guarded reports graph."),
+                            "community": with_desc(or_null(string()), "The community the report summarizes, `null` when not recorded."),
+                            "graph": iri("Its guarded reports graph."),
+                            "on": iri("The changed record its activity used, or for a transitive dependent the assessment or report it depends on."),
+                            "dependence": string_enum(&["used"]),
+                            "depth": with_desc(int(), "How many intermediate dependents lie between it and a changed record, 0 for a direct dependent."),
                         }),
                     )),
                 }),
             ),
-            "The assessments that depend on the changed records, each once at its smallest depth.",
+            "The assessments and community reports that depend on the changed records, each once at its smallest depth.",
             "evidence-dependents",
         ),
     );
@@ -1450,7 +1648,7 @@ fn ingestion(put: &mut dyn FnMut(&str, J)) {
                     "input": any_object("What was ingested: its name, format, size, URL or source and mode. A maintenance task has `kind` `consolidation` or `retention`, and `scheduled`."),
                     "estimate": any_object("The estimate of the extraction: chunks, tokens, the first pair, its estimated cost, the threshold and whether it needs a confirmation."),
                     "usage": any_object("Model calls, tokens, estimated cost, escalations and the pair that answered each chunk. A provider that used its prompt cache adds `cacheWriteInputTokens`, `cacheWrite1hInputTokens`, `cacheReadInputTokens` and `budgetTokens`."),
-                    "result": any_object("The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities and `factGuard` `not-run`. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted."),
+                    "result": any_object("The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities, `factGuard` `not-run`, and `previousRevision` (the linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`, omitted when no predecessor evidence revision is linked, when the recorded link is hidden from the caller or on `already-proposed`). A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted."),
                     "error": any_object("The code and message of a failed task, such as `needs-ocr` with the pages that need OCR and their reasons."),
                 }),
             ),
@@ -1522,8 +1720,8 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
                     "typeHints": with_desc(boolean(), "Link mentions with the classes the words around them name. Over the dataset's `repairs.typeHints`."),
                     "thread": with_desc(string(), "The thread a follow-up continues: the `threadId` of an earlier ask, 1 to 64 letters, digits, `_` or `-`. The first ask of a thread names none and its own id becomes the thread's."),
                     "about": with_desc(about.clone(), "The resource on the page the question was asked from. The pipeline reads the question with `(about <iri>)` after it, and the history keeps the question as written with `about` beside it."),
-                    "reviewPolicy": with_desc(string(), "A review policy of the dataset's evidence settings. The summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. Not with `mode` `global`."),
-                    "matchingPolicy": with_desc(string(), "A matching policy of the dataset's evidence settings, which resolves the linked entities for the claims the summary reads. Not with `mode` `global`."),
+                    "reviewPolicy": with_desc(string(), "A review policy of the dataset's evidence settings. In local answers, the summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. In global answers, only community reports built under that policy are selected."),
+                    "matchingPolicy": with_desc(string(), "A matching policy of the dataset's evidence settings. In local answers, it resolves the linked entities for the claims the summary reads. In global answers, it resolves the entity identities referenced by the selected community reports."),
                 }),
             ),
             "A question for the dataset.",
@@ -1542,11 +1740,11 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
                     "result": any_object("The checked query with `explanation`, `assumptions`, `terms`, `graph`, `commit`, `attempt`, `verdict` and `results` in the `application/x-sparkles+json` form."),
                     "mode": with_desc(string_enum(&["local", "global"]), "Whether the answer came from the data or from community reports."),
                     "summary": obj(&["text", "citations"], json!({ "text": string(), "citations": array(int()), "claimCitations": with_desc(strings(), "With `reviewPolicy`, the claim occurrences the text cites, such as `c1`."), "rowsSent": int(), "provider": string(), "model": string(), "uncited": boolean(), "uncitedSentences": strings() })),
-                    "claims": any_object("With `reviewPolicy`, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`."),
-                    "resolution": any_object("With `matchingPolicy`, the map revision read, in the `resolution` form of `recall`."),
+                    "claims": any_object("With `reviewPolicy` in a local answer, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`."),
+                    "resolution": any_object("With `matchingPolicy`, the map revision read (`policy`, `version`, `revision` and `number`), plus `entities` for mapped identities referenced by the returned reports in a global answer."),
                     "points": with_desc(array(obj(&["n", "text", "score", "reports", "findings"], json!({ "n": int(), "text": string(), "score": int(), "reports": strings(), "findings": strings() }))), "In a global answer, the points the reduce step read. The summary's citations number them."),
-                    "reports": with_desc(array(any_object("A report with `iri`, `title`, `level`, `status`, `rating` and the `findings` the answer uses, each with its `cites`.")), "In a global answer, the reports it used."),
-                    "global": any_object("In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports and the map `batches`."),
+                    "reports": with_desc(array(any_object("A report with `iri`, `title`, `level`, `status`, `rating` and the `findings` the answer uses, each with its `cites` (and `claims`, `decisions`, `about` and report `reviewPolicy` or `identities` when present).")), "In a global answer, the reports it used."),
+                    "global": any_object("In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports, the map `batches` and, with `reviewPolicy`, the requested `reviewPolicy`."),
                     "clarify": any_object("`{id, question, choices: [{label, value}]}`."),
                     "error": obj(&["code", "message"], json!({ "code": string(), "message": string() })),
                     "attempts": array(any_object("One draft with its check and run.")),
@@ -2825,7 +3023,7 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                 ],
                 json!({
                     "dataset": string(),
-                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes", "graphrag", "paths", "forms"]),
+                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes", "graphrag", "paths", "forms", "evidence"]),
                     "effective": any_object("The effective object: the built-in defaults, the declared values and the runtime layer merged, with the locked fields from the settings file."),
                     "declared": any_object("The settings file's `defaults` and dataset entry for this kind, merged."),
                     "runtime": any_object("The runtime layer: the fields changed through the API. `null` removes a declared member."),
@@ -2836,10 +3034,31 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                     "status": closed(&["valid"], json!({ "valid": boolean(), "error": string() })),
                     "etag": with_desc(string(), "The entity tag of the runtime layer, as in the `ETag` header."),
                     "warnings": with_desc(array(sref("PrefixWarning")), "The `prefixes` kind only: the prefixes that shadow a well-known prefix with another IRI."),
+                    "recorded": with_desc(sref("EvidenceRecordedStatus"), "The `evidence` kind only: the recorded evidence settings, protection state and whether they differ from the effective settings."),
                 }),
             ),
             "One settings kind of a dataset with its layers and sources.",
             "settings",
+        ),
+    );
+    put(
+        "EvidenceRecordedStatus",
+        doc(
+            closed(
+                &[
+                    "settings", "digest", "revision", "managed", "detached", "drift",
+                ],
+                json!({
+                    "settings": sref("EvidenceSettings"),
+                    "digest": with_desc(or_null(string()), "The SHA-256 digest of `evidence.json`, `null` before the first configuration."),
+                    "revision": with_desc(int(), "The revision of the managed-graph registry, 0 when there is none."),
+                    "managed": with_desc(strings(), "Role graphs that ordinary writes cannot change."),
+                    "detached": with_desc(strings(), "Role graphs that an administrator detached."),
+                    "drift": with_desc(boolean(), "Whether the effective settings differ from the recorded ones, refusing typed evidence operations until reconciled."),
+                }),
+            ),
+            "Recorded evidence settings, protection state and drift status.",
+            "evidence-settings",
         ),
     );
     put(

@@ -520,7 +520,7 @@ fn is_xml_char(c: char) -> bool {
     matches!(c, '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
 }
 
-fn xml_chars(s: &str) -> bool {
+pub(crate) fn xml_chars(s: &str) -> bool {
     s.chars().all(is_xml_char)
 }
 
@@ -533,7 +533,7 @@ pub(crate) fn token(s: &str) -> bool {
 }
 
 /// The pattern of `xsd:language`: `[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})*`.
-fn language_tag(s: &str) -> bool {
+pub(crate) fn language_tag(s: &str) -> bool {
     let mut parts = s.split('-');
     let first = parts.next().unwrap_or("");
     (1..=8).contains(&first.len())
@@ -1115,7 +1115,8 @@ impl<'a> Literals<'a> {
                 self.class(a);
                 self.class(b);
             }
-            K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
+            K::EquivalentClasses(cs) => cs.iter().for_each(|c| self.class(c)),
+            K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
                 cs.iter().for_each(|c| self.class(c))
             }
             K::ObjectPropertyDomain(_, c)

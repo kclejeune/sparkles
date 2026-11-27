@@ -11,8 +11,9 @@
 //! After the pass's groups are output and freed, each file is read by a pass of its own,
 //! which partitions what it passes on with another hash. Every row of a group lands in
 //! the same pass, in input order, so each aggregate sees exactly the rows it would see
-//! in memory, and each pass takes at least one group. The spill files hold input rows
-//! and never accumulator state.
+//! in memory, and each pass takes at least one group. If a subtotal runs out of
+//! space, that accumulator keeps its prefix and spills its remaining evaluated
+//! arguments. Each prefix is resumed in arrival order before its result is emitted.
 //!
 //! When an aggregate needs its group's rows, such as FOLD, a registered aggregate or a
 //! custom aggregate other than ARQ's statistics, the operator is built over whole groups
@@ -22,10 +23,11 @@
 //! that read them.
 
 use super::acc::{Accumulator, Arg, Batch, Concat, Distinct, RowIndex, Rows, Running};
+use super::deferred::{Deferred, subtotal};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::sparql::ctx::{Ctx, RetainedCharge};
-use crate::sparql::exec::{compute_column, stat_aggregate};
+use crate::sparql::ctx::{Charge, Ctx, RetainedCharge};
+use crate::sparql::exec::{ScratchAdmit, SumAdmit, compute_column, stat_aggregate};
 use crate::sparql::expr::Expr;
 use crate::sparql::exprcache::Report as ExprReport;
 use crate::sparql::plan::Agg;
@@ -92,7 +94,7 @@ pub(crate) fn order_free(ctx: &Ctx, agg: &Agg) -> bool {
 }
 
 /// Where an aggregate's argument comes from in an input batch.
-enum Source {
+pub(super) enum Source {
     Star,
     Column(Option<usize>),
     Expr(Expr),
@@ -101,13 +103,13 @@ enum Source {
 }
 
 /// Groups found by their keys, in order of first appearance.
-enum Index {
+pub(super) enum Index {
     One(FxHashMap<Id, u32>),
     Many(FxHashMap<Box<[Id]>, u32>),
 }
 
 impl Index {
-    fn new(keys: usize) -> Self {
+    pub(super) fn new(keys: usize) -> Self {
         if keys == 1 {
             Index::One(Default::default())
         } else {
@@ -124,9 +126,22 @@ pub(crate) const PARTITIONS: usize = 16;
 const MIN_PASS_BYTES: u64 = 256 << 10;
 /// The most rows an accumulator that keeps running state folds before its growth is
 /// charged.
-const CHUNK_ROWS: usize = 65_536;
+pub(super) const CHUNK_ROWS: usize = 65_536;
 /// The least step by which the retained charge of the group state grows.
-const RETAIN_STEP: u64 = 64 << 10;
+pub(super) const RETAIN_STEP: u64 = 64 << 10;
+
+/// How an eager grouping enforces output limits while groups are inserted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EagerCheck {
+    /// Cursor / non-eager grouping: check `max_rows` only.
+    Off,
+    /// Eager precomputed sequential fallback while `expr_scratch` is held: enforce
+    /// `max_rows` and `max_rows_produced` as groups are inserted, and defer the memory
+    /// half of `check_output` until after expression scratch drops.
+    RowsOnly,
+    /// Full eager grouping: enforce row limits on insert and periodic `check_output`.
+    Full,
+}
 
 pub(crate) struct Grouping {
     keys: Vec<Option<usize>>,
@@ -144,14 +159,11 @@ pub(crate) struct Grouping {
     at: usize,
     /// The bytes each new group takes in the index, the keys and the accumulators.
     per_group: u64,
-    charge: Option<RetainedCharge>,
-    bytes: u64,
-    /// The bytes the charge holds, at least `bytes`.
-    reserved: u64,
-    /// The state's bytes before its first group.
-    base: u64,
+    memory: GroupMemory,
+    /// Evaluated arguments of subtotals that have reached the pass's memory limit.
+    deferred: Option<Box<Deferred>>,
     /// Whether the operator checks the output size of an eager grouping as it grows.
-    eager: bool,
+    eager: EagerCheck,
     /// Where rows of groups that do not fit go, when the query may spill.
     query: Option<Arc<QuerySpill>>,
     /// The state's bytes at which a pass takes no new groups, half the room the query
@@ -171,23 +183,234 @@ pub(crate) struct Grouping {
     pub(crate) passes: usize,
 }
 
-fn accumulators(ctx: &Ctx, aggs: &[Agg], charged: bool) -> Vec<Box<dyn Accumulator>> {
-    aggs.iter()
-        .map(|agg| -> Box<dyn Accumulator> {
-            if !running(ctx, agg) {
-                return Box::new(Rows::new(agg));
+pub(crate) struct GroupMemory {
+    charge: Option<RetainedCharge>,
+    bytes: u64,
+    reserved: u64,
+    base: u64,
+}
+
+impl GroupMemory {
+    fn spare(&self) -> u64 {
+        self.reserved.saturating_sub(self.bytes)
+    }
+
+    /// Release speculative headroom above the current retained estimate so another
+    /// charge on the query ledger can use that room.
+    fn trim(&mut self) -> Result<()> {
+        if self.reserved > self.bytes {
+            if let Some(charge) = &mut self.charge {
+                charge.resize(self.bytes)?;
             }
-            let inner: Box<dyn Accumulator> = match agg.func {
-                AggregateFunction::GroupConcat { .. } => Box::new(Concat::new(agg)),
-                _ => Box::new(Running::new(agg, charged)),
-            };
-            if agg.distinct {
-                Box::new(Distinct::new(inner, agg.expr.is_none()))
+            self.reserved = self.bytes;
+        }
+        Ok(())
+    }
+
+    /// Admit `bytes` of transient scratch on `ctx`, reusing speculative headroom held
+    /// above `self.bytes` if the query ledger is too full to admit `bytes` directly.
+    pub(super) fn charge_scratch<'a>(&mut self, ctx: &'a Ctx, bytes: u64) -> Result<Charge<'a>> {
+        match ctx.charge(bytes) {
+            Ok(charge) => Ok(charge),
+            Err(error) if memory_refused(&error) && self.spare() > 0 => {
+                let taken = self.spare().min(bytes);
+                let Some(charge) = &mut self.charge else {
+                    return Err(error);
+                };
+                let scratch = charge.split(ctx, taken, bytes)?;
+                self.reserved -= taken;
+                Ok(scratch)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Count `bytes` more of retained state. The charge grows ahead in steps of at
+    /// least 64 KiB, still before the state does, so that adding many small groups does
+    /// not update the memory ledger for each of them. It overstates the state by less
+    /// than one step.
+    fn retain(&mut self, bytes: u64) -> Result<()> {
+        let retained = self.bytes.saturating_add(bytes);
+        if retained > self.reserved {
+            let reserved = retained.saturating_add((retained / 8).max(RETAIN_STEP));
+            if let Some(charge) = &mut self.charge {
+                if charge.resize(reserved).is_err() {
+                    // Near the budget, reserve only what the state needs.
+                    charge.resize(retained)?;
+                    self.reserved = retained;
+                } else {
+                    self.reserved = reserved;
+                }
             } else {
-                inner
+                self.reserved = reserved;
             }
+        }
+        self.bytes = retained;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.bytes = self.base;
+        self.reserved = self.base;
+        if let Some(charge) = &mut self.charge {
+            charge.resize(self.base)?;
+        }
+        Ok(())
+    }
+}
+
+/// Access to the pass's memory and deferred arguments during a batch fold.
+pub(crate) enum BatchBudget<'a> {
+    Retain(&'a mut dyn FnMut(u64) -> Result<()>),
+    Memory(&'a mut GroupMemory),
+    SpillSum(SumBudget<'a>),
+}
+
+impl<'a> BatchBudget<'a> {
+    pub(super) fn retain(&mut self, bytes: u64) -> Result<()> {
+        match self {
+            Self::Retain(f) => f(bytes),
+            Self::Memory(memory) => memory.retain(bytes),
+            Self::SpillSum(b) => b.memory.retain(bytes),
+        }
+    }
+
+    pub(super) fn charge_scratch<'c>(&mut self, ctx: &'c Ctx, bytes: u64) -> Result<Charge<'c>> {
+        match self {
+            Self::Retain(_) => ctx.charge(bytes),
+            Self::Memory(memory) => memory.charge_scratch(ctx, bytes),
+            Self::SpillSum(b) => b.memory.charge_scratch(ctx, bytes),
+        }
+    }
+
+    pub(super) fn sum_budget(&mut self) -> Option<&mut SumBudget<'a>> {
+        match self {
+            Self::Retain(_) => None,
+            Self::Memory(_) => None,
+            Self::SpillSum(b) => Some(b),
+        }
+    }
+}
+
+/// Access to the pass's memory and deferred arguments during a spilling sum fold.
+pub(crate) struct SumBudget<'a> {
+    memory: &'a mut GroupMemory,
+    threshold: u64,
+    deferred: &'a mut Option<Box<Deferred>>,
+    aggregate: usize,
+}
+
+impl SumBudget<'_> {
+    pub(super) fn replace(&mut self, old: u64, new: u64) -> Result<bool> {
+        if let Some(growth) = new.checked_sub(old) {
+            if self.memory.bytes.saturating_add(growth) > self.threshold {
+                return Ok(false);
+            }
+            match self.memory.retain(growth) {
+                Ok(()) => Ok(true),
+                Err(error) if memory_refused(&error) => Ok(false),
+                Err(error) => Err(error),
+            }
+        } else {
+            self.memory.bytes -= old - new;
+            Ok(true)
+        }
+    }
+
+    pub(super) fn defer(&mut self, ctx: &Ctx, slot: u32, id: Option<Id>) -> Result<()> {
+        if self.deferred.is_none() {
+            let stream = match Deferred::new(ctx) {
+                Ok(stream) => stream,
+                Err(error) if memory_refused(&error) && self.memory.spare() > 0 => {
+                    self.memory.trim()?;
+                    Deferred::new(ctx)?
+                }
+                Err(error) => return Err(error),
+            };
+            *self.deferred = Some(Box::new(stream));
+        }
+        self.deferred
+            .as_mut()
+            .expect("open deferred argument stream")
+            .push(
+                subtotal(slot as usize, self.aggregate),
+                id.unwrap_or(Id::UNDEF),
+            )
+    }
+}
+
+impl ScratchAdmit for SumBudget<'_> {
+    fn charge_scratch<'a>(&mut self, ctx: &'a Ctx, bytes: u64) -> Result<Charge<'a>> {
+        self.memory.charge_scratch(ctx, bytes)
+    }
+}
+
+impl SumAdmit for SumBudget<'_> {
+    fn admit(&mut self, old: u64, new: u64) -> Result<bool> {
+        self.replace(old, new)
+    }
+}
+
+fn memory_refused(error: &Error) -> bool {
+    matches!(error, Error::BudgetExceeded(b) if matches!(
+        b.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
+    ))
+}
+
+fn sum_or_avg(agg: &Agg) -> bool {
+    matches!(agg.func, AggregateFunction::Sum | AggregateFunction::Avg)
+}
+
+pub(super) fn accumulator(
+    ctx: &Ctx,
+    agg: &Agg,
+    charged: bool,
+    spilling: bool,
+) -> Box<dyn Accumulator> {
+    if !running(ctx, agg) {
+        return Box::new(Rows::new(agg));
+    }
+    let inner: Box<dyn Accumulator> = match agg.func {
+        AggregateFunction::GroupConcat { .. } => Box::new(Concat::new(agg)),
+        _ => Box::new(Running::new(agg, charged && !(spilling && sum_or_avg(agg)))),
+    };
+    if agg.distinct {
+        Box::new(Distinct::new(inner, agg.expr.is_none()))
+    } else {
+        inner
+    }
+}
+
+pub(super) fn accumulators(
+    ctx: &Ctx,
+    aggs: &[Agg],
+    charged: bool,
+    spilling: bool,
+) -> Vec<Box<dyn Accumulator>> {
+    aggs.iter()
+        .map(|agg| accumulator(ctx, agg, charged, spilling))
+        .collect()
+}
+
+pub(super) fn sources_of(agg_list: &[Agg], input: &[VarId]) -> Vec<Source> {
+    agg_list
+        .iter()
+        .map(|agg| match &agg.expr {
+            None => Source::Star,
+            Some(_) if agg.fold.is_some() || agg.registered.is_some() => Source::Rows,
+            Some(Expr::Var(v)) => Source::Column(input.iter().position(|x| x == v)),
+            Some(expr) => Source::Expr(expr.clone()),
         })
         .collect()
+}
+
+pub(super) fn group_bytes_per_entry(key_count: usize, accs: &[Box<dyn Accumulator>]) -> u64 {
+    let nk = key_count as u64;
+    // The index entry, twice while the index grows, a boxed key for several key
+    // columns, the key in `order`, and each accumulator's state for the group.
+    // Text and values that states own are charged as they grow.
+    let entry = if nk == 1 { 13 } else { 8 * nk + 16 + 21 };
+    entry * 2 + nk * 8 + accs.iter().map(|a| a.group_bytes()).sum::<u64>() + 16
 }
 
 impl Grouping {
@@ -202,30 +425,26 @@ impl Grouping {
         charged: bool,
         spill: bool,
     ) -> Result<Self> {
-        let bytes = aggs.len() as u64 * 256 + keys.len() as u64 * 64 + 1024;
+        let whole = !hashable(ctx, aggs);
+        let query = if spill && !whole && !keys.is_empty() {
+            ctx.spill.clone()
+        } else {
+            None
+        };
+        let agg_list: Vec<Agg> = aggs.iter().map(|(_, a)| a.clone()).collect();
+        let bytes = if spill {
+            aggs.len() as u64 * 256 + keys.len() as u64 * 64 + 1024
+        } else {
+            aggs.len() as u64 * 64 + keys.len() as u64 * 64 + 64
+        };
         let charge = if charged {
             ctx.retained_charge(bytes)?
         } else {
             None
         };
-        let agg_list: Vec<Agg> = aggs.iter().map(|(_, a)| a.clone()).collect();
-        let accs = accumulators(ctx, &agg_list, charge.is_some());
-        let whole = !hashable(ctx, aggs);
-        let sources = agg_list
-            .iter()
-            .map(|agg| match &agg.expr {
-                None => Source::Star,
-                Some(_) if agg.fold.is_some() || agg.registered.is_some() => Source::Rows,
-                Some(Expr::Var(v)) => Source::Column(input.iter().position(|x| x == v)),
-                Some(expr) => Source::Expr(expr.clone()),
-            })
-            .collect();
-        let nk = keys.len() as u64;
-        // The index entry, twice while the index grows, a boxed key for several key
-        // columns, the key in `order`, and each accumulator's state for the group.
-        // Text and values that states own are charged as they grow.
-        let entry = if nk == 1 { 13 } else { 8 * nk + 16 + 21 };
-        let per_group = entry * 2 + nk * 8 + accs.iter().map(|a| a.group_bytes()).sum::<u64>() + 16;
+        let accs = accumulators(ctx, &agg_list, charge.is_some(), query.is_some());
+        let sources = sources_of(&agg_list, input);
+        let per_group = group_bytes_per_entry(keys.len(), &accs);
         let mut grouping = Self {
             keys: keys
                 .iter()
@@ -240,12 +459,15 @@ impl Grouping {
             groups: 0,
             at: 0,
             per_group,
-            charge,
-            bytes,
-            reserved: bytes,
-            base: bytes,
-            eager: false,
-            query: None,
+            memory: GroupMemory {
+                charge,
+                bytes,
+                reserved: bytes,
+                base: bytes,
+            },
+            deferred: None,
+            eager: EagerCheck::Off,
+            query,
             threshold: 0,
             frozen: false,
             writers: Vec::new(),
@@ -256,8 +478,6 @@ impl Grouping {
         };
         if keys.is_empty() {
             grouping.insert(ctx, &[])?;
-        } else if spill && !whole {
-            grouping.query = ctx.spill.clone();
         }
         Ok(grouping)
     }
@@ -286,8 +506,12 @@ impl Grouping {
     /// Add a group with these keys and return its number.
     fn insert(&mut self, ctx: &Ctx, key: &[Id]) -> Result<u32> {
         let at = self.groups as u32;
-        ctx.check_rows(self.groups.saturating_add(1))?;
-        self.retain(self.per_group)?;
+        let next = self.groups.saturating_add(1);
+        match self.eager {
+            EagerCheck::Off => ctx.check_rows(next)?,
+            EagerCheck::RowsOnly | EagerCheck::Full => ctx.check_output_rows(next)?,
+        }
+        self.memory.retain(self.per_group)?;
         match &mut self.index {
             Index::One(index) => {
                 index.insert(key[0], at);
@@ -304,37 +528,13 @@ impl Grouping {
         Ok(at)
     }
 
-    /// Count `bytes` more of retained state. The charge grows ahead in steps of at
-    /// least 64 KiB, still before the state does, so that adding many small groups does
-    /// not update the memory ledger for each of them. It overstates the state by less
-    /// than one step.
-    fn retain(&mut self, bytes: u64) -> Result<()> {
-        let retained = self.bytes.saturating_add(bytes);
-        if retained > self.reserved {
-            let reserved = retained.saturating_add((retained / 8).max(RETAIN_STEP));
-            if let Some(charge) = &mut self.charge {
-                if charge.resize(reserved).is_err() {
-                    // Near the budget, reserve only what the state needs.
-                    charge.resize(retained)?;
-                    self.reserved = retained;
-                } else {
-                    self.reserved = reserved;
-                }
-            } else {
-                self.reserved = reserved;
-            }
-        }
-        self.bytes = retained;
-        Ok(())
-    }
-
     /// Add a group with these keys, or pass its rows on when the pass is full.
     fn place(&mut self, ctx: &Ctx, key: &[Id]) -> Result<u32> {
         // A pass also stops taking groups when what else the query holds leaves less
         // than a quarter of the room it had, so that the batches in flight still fit.
         if self.query.is_some()
             && self.groups > 0
-            && (self.bytes >= self.threshold || ctx.memory_room() < self.threshold / 2)
+            && (self.memory.bytes >= self.threshold || ctx.memory_room() < self.threshold / 2)
         {
             self.frozen = true;
         }
@@ -344,14 +544,7 @@ impl Grouping {
         match self.insert(ctx, key) {
             Ok(group) => Ok(group),
             // A pass that holds a group passes on the groups that do not fit.
-            Err(Error::BudgetExceeded(b))
-                if self.query.is_some()
-                    && self.groups > 0
-                    && matches!(
-                        b.kind,
-                        crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
-                    ) =>
-            {
+            Err(error) if self.query.is_some() && self.groups > 0 && memory_refused(&error) => {
                 self.frozen = true;
                 Ok(PASSED)
             }
@@ -378,7 +571,7 @@ impl Grouping {
             for (row, &id) in column.iter().enumerate() {
                 if row.is_multiple_of(1024) {
                     ctx.check()?;
-                    if self.eager && row.is_multiple_of(65_536) {
+                    if self.eager == EagerCheck::Full && row.is_multiple_of(65_536) {
                         ctx.check_output(self.groups, width)?;
                     }
                 }
@@ -396,7 +589,7 @@ impl Grouping {
             for row in 0..table.len {
                 if row.is_multiple_of(1024) {
                     ctx.check()?;
-                    if self.eager && row.is_multiple_of(65_536) {
+                    if self.eager == EagerCheck::Full && row.is_multiple_of(65_536) {
                         ctx.check_output(self.groups, width)?;
                     }
                 }
@@ -467,12 +660,36 @@ impl Grouping {
                 _ => Ok(None),
             })
             .collect::<Result<Vec<Option<Vec<Id>>>>>()?;
+        self.fold_computed(ctx, table, &slots, &computed)
+    }
+
+    /// Fold `table` using already-evaluated expression columns (used by sequential
+    /// fallback from parallel grouping so expressions and `ExprReport` are never run twice).
+    fn add_with_computed(
+        &mut self,
+        ctx: &Ctx,
+        table: &Table,
+        computed: &[Option<Vec<Id>>],
+    ) -> Result<()> {
+        debug_assert!(!self.frozen && self.query.is_none());
+        let _slots = ctx.charge(table.len as u64 * 4 + 64)?;
+        let slots = self.slots(ctx, table)?;
+        self.fold_computed(ctx, table, &slots, computed)
+    }
+
+    fn fold_computed(
+        &mut self,
+        ctx: &Ctx,
+        table: &Table,
+        slots: &[u32],
+        computed: &[Option<Vec<Id>>],
+    ) -> Result<()> {
         // The rows of each group, for the aggregates that read them.
         let index = self
             .whole
             .then(|| -> Result<RowIndex> {
                 let _index = ctx.charge(table.len as u64 * 4 + self.groups as u64 * 8 + 64)?;
-                Ok(RowIndex::new(&slots, self.groups))
+                Ok(RowIndex::new(slots, self.groups))
             })
             .transpose()?;
         for (a, values) in computed.iter().enumerate() {
@@ -501,13 +718,23 @@ impl Grouping {
                         other => other,
                     },
                     rows: index.as_ref(),
+                    weights: None,
                     base,
                 };
-                self.accs[a].add_batch(ctx, &batch, &slots[base..end])?;
-                let growth = self.accs[a].take_growth();
-                if growth > 0 {
-                    self.retain(growth)?;
+                if self.query.is_some() {
+                    let mut budget = BatchBudget::SpillSum(SumBudget {
+                        memory: &mut self.memory,
+                        threshold: self.threshold,
+                        deferred: &mut self.deferred,
+                        aggregate: a,
+                    });
+                    self.accs[a].add_batch(ctx, &batch, &slots[base..end], &mut budget)?;
+                } else {
+                    let mut budget = BatchBudget::Memory(&mut self.memory);
+                    self.accs[a].add_batch(ctx, &batch, &slots[base..end], &mut budget)?;
                 }
+                ctx.check()?;
+                let _ = self.accs[a].take_growth();
                 base = end;
                 if base >= slots.len() {
                     break;
@@ -568,6 +795,11 @@ impl Grouping {
             self.spilled = self.spilled.saturating_add(run.bytes());
             self.pending.push((Arc::new(run), self.depth + 1));
         }
+        if let Some(deferred) = &mut self.deferred {
+            deferred.seal()?;
+            self.spilled += deferred.take_written();
+        }
+        self.memory.trim()?;
         Ok(())
     }
 
@@ -579,6 +811,20 @@ impl Grouping {
         vars: &[VarId],
         cap: usize,
     ) -> Result<Option<Table>> {
+        let mut scratch = crate::sparql::exec::DirectScratch;
+        self.output_with_scratch(ctx, vars, cap, &mut scratch)
+    }
+
+    pub(crate) fn output_with_scratch(
+        &mut self,
+        ctx: &Ctx,
+        vars: &[VarId],
+        cap: usize,
+        scratch: &mut dyn ScratchAdmit,
+    ) -> Result<Option<Table>> {
+        // Release speculative group-growth headroom before finalizing results,
+        // reading deferred spill frames, or interning output terms.
+        self.memory.trim()?;
         let n = cap.min(self.groups - self.at);
         if n == 0 {
             return Ok(None);
@@ -589,15 +835,41 @@ impl Grouping {
             col.reserve_exact(n);
         }
         for k in 0..nk {
-            out.cols[k].extend((self.at..self.at + n).map(|g| self.order[g * nk + k]));
-        }
-        for (a, acc) in self.accs.iter_mut().enumerate() {
-            ctx.check()?;
-            for g in self.at..self.at + n {
-                let id = acc.finish(ctx, g)?;
-                out.cols[nk + a].push(id);
+            for (i, g) in (self.at..self.at + n).enumerate() {
+                if i.is_multiple_of(4_096) {
+                    ctx.check()?;
+                }
+                out.cols[k].push(self.order[g * nk + k]);
             }
         }
+        if let Some(deferred) = &mut self.deferred {
+            // Replay the shared spill stream in its slot and aggregate order.
+            for g in self.at..self.at + n {
+                ctx.check()?;
+                for (a, acc) in self.accs.iter_mut().enumerate() {
+                    let id = acc.finish_replay(ctx, g, a, deferred, scratch)?;
+                    ctx.check()?;
+                    out.cols[nk + a].push(id);
+                }
+            }
+            self.spilled += deferred.take_written();
+            if deferred.is_empty() {
+                self.deferred = None;
+            }
+        } else {
+            for (a, acc) in self.accs.iter_mut().enumerate() {
+                ctx.check()?;
+                for (i, g) in (self.at..self.at + n).enumerate() {
+                    if i.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    let id = acc.finish_with(ctx, g, scratch)?;
+                    ctx.check()?;
+                    out.cols[nk + a].push(id);
+                }
+            }
+        }
+        ctx.check()?;
         out.len = n;
         self.at += n;
         Ok(Some(out))
@@ -611,19 +883,101 @@ impl Grouping {
         };
         self.index = Index::new(self.keys.len());
         self.order = Vec::new();
-        self.accs = accumulators(ctx, &self.aggs, self.charge.is_some());
+        self.accs = accumulators(ctx, &self.aggs, self.memory.charge.is_some(), true);
         self.groups = 0;
         self.at = 0;
         self.frozen = false;
-        self.bytes = self.base;
-        self.reserved = self.base;
-        if let Some(charge) = &mut self.charge {
-            charge.resize(self.base)?;
-        }
+        self.memory.reset()?;
         self.depth = depth;
         self.passes += 1;
         Ok(Some(run.reader()?))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn whole_sequential_with_computed(
+    ctx: &Ctx,
+    table: &Table,
+    keys: &[VarId],
+    aggs: &[(VarId, Agg)],
+    charged: bool,
+    eager: bool,
+    vars: &[VarId],
+    computed: Vec<Option<Vec<Id>>>,
+    expr_scratch: Option<Charge<'_>>,
+) -> Result<Table> {
+    let mut grouping = Grouping::new(ctx, keys, aggs, &table.vars, charged, false)?;
+    // While `expr_scratch` is still held, enforce row limits (including
+    // `max_rows_produced`) as groups are inserted and defer the memory half of
+    // `check_output` until after expression scratch and slots drop.
+    grouping.eager = if eager {
+        EagerCheck::RowsOnly
+    } else {
+        EagerCheck::Off
+    };
+    if eager {
+        ctx.check_output_rows(grouping.groups)?;
+    }
+    if grouping.only_counts_rows() {
+        grouping.count_rows(table.len as u64);
+    } else {
+        grouping.add_with_computed(ctx, table, &computed)?;
+    }
+    drop(computed);
+    drop(expr_scratch);
+    if eager {
+        ctx.check_output(grouping.groups, vars.len())?;
+    }
+    Ok(grouping
+        .output(ctx, vars, usize::MAX)?
+        .unwrap_or_else(|| Table::new(vars.to_vec())))
+}
+
+fn whole_inner(
+    ctx: &Ctx,
+    table: &Table,
+    keys: &[VarId],
+    aggs: &[(VarId, Agg)],
+    charged: bool,
+    eager: bool,
+    report: &mut ExprReport,
+) -> Result<(Table, bool)> {
+    let only_counts = keys.is_empty()
+        && hashable(ctx, aggs)
+        && aggs.iter().all(|(_, a)| a.expr.is_none() && !a.distinct);
+    if eager
+        && !only_counts
+        && table.len >= super::par::PAR_GROUP_THRESHOLD
+        && table.len <= u32::MAX as usize
+        && rayon::current_num_threads() > 1
+        && hashable(ctx, aggs)
+    {
+        return super::par::whole_parallel_observing_merge_fallback(
+            ctx, table, keys, aggs, charged, eager, report,
+        );
+    }
+    let mut vars = keys.to_vec();
+    vars.extend(aggs.iter().map(|(v, _)| *v));
+    let mut grouping = Grouping::new(ctx, keys, aggs, &table.vars, charged, false)?;
+    grouping.eager = if eager {
+        EagerCheck::Full
+    } else {
+        EagerCheck::Off
+    };
+    if eager {
+        ctx.check_output_rows(grouping.groups)?;
+    }
+    if grouping.only_counts_rows() {
+        grouping.count_rows(table.len as u64);
+    } else {
+        grouping.add(ctx, table, report)?;
+    }
+    Ok((
+        grouping
+            .output(ctx, &vars, usize::MAX)?
+            .unwrap_or_else(|| Table::new(vars)),
+        false,
+    ))
 }
 
 /// GROUP BY over a table that holds the whole input, for the eager executor and for
@@ -640,16 +994,18 @@ pub(crate) fn whole(
     eager: bool,
     report: &mut ExprReport,
 ) -> Result<Table> {
-    let mut vars = keys.to_vec();
-    vars.extend(aggs.iter().map(|(v, _)| *v));
-    let mut grouping = Grouping::new(ctx, keys, aggs, &table.vars, charged, false)?;
-    grouping.eager = eager;
-    if grouping.only_counts_rows() {
-        grouping.count_rows(table.len as u64);
-    } else {
-        grouping.add(ctx, table, report)?;
-    }
-    Ok(grouping
-        .output(ctx, &vars, usize::MAX)?
-        .unwrap_or_else(|| Table::new(vars)))
+    whole_inner(ctx, table, keys, aggs, charged, eager, report).map(|(out, _)| out)
+}
+
+#[cfg(test)]
+pub(crate) fn whole_observing_range_merge_fallback(
+    ctx: &Ctx,
+    table: &Table,
+    keys: &[VarId],
+    aggs: &[(VarId, Agg)],
+    charged: bool,
+    eager: bool,
+    report: &mut ExprReport,
+) -> Result<(Table, bool)> {
+    whole_inner(ctx, table, keys, aggs, charged, eager, report)
 }

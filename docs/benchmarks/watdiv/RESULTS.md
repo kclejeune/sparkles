@@ -5,10 +5,10 @@ This is a [manual report](../README.md#evidence-and-generated-reports). Read the
 
 ## Comparison summary
 
-At 10.97M triples, Sparkles is fastest on 19 of the 20 templates and ties
-  Fluree on S7, with a geometric mean of 4.63 ms against 6.97 ms for Fluree, 13.6 ms for
-  Fuseki, 16.2 ms for Oxigraph and 17.9 ms for QLever. A [rerun](#l1-l3-and-s7-rerun) of
-  L1, L3 and S7 found Sparkles ahead of Fluree on all three.
+At 10.97M triples, Sparkles is fastest on 19 of the 20 templates and ties Fluree on S7,
+with a geometric mean of 4.63 ms against 6.97 ms for Fluree, 13.6 ms for Fuseki, 16.2 ms
+for Oxigraph and 17.9 ms for QLever. A [rerun](#l1-l3-and-s7-rerun) of L1, L3 and S7 found
+Sparkles ahead of Fluree on all three.
 
 ## WatDiv
 

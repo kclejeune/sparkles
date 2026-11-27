@@ -36,6 +36,9 @@ enum Prim {
     Plain,
     /// The string of an IRI, a blank node or an `xsd:string` decides completely.
     Text,
+    /// The ordinal of an IRI in the heap's base vocabulary. The decoded value
+    /// still decides comparisons with IRIs from other vocabularies.
+    BaseIri(u64),
     /// A language-tagged string orders by its lexical form, then by its tag as written.
     Lang,
     /// An `xsd:integer` or `xsd:decimal` in units of 10⁻¹⁸ (exact), and whether it is a
@@ -75,6 +78,13 @@ impl SortKey {
         }
     }
 
+    pub(super) fn with_base_iri(mut self, id: u64) -> Self {
+        if self.class == IRI {
+            self.prim = Prim::BaseIri(id);
+        }
+        self
+    }
+
     /// Whether the key's value is of a kind on which the order is total (see
     /// [`totally_ordered`]).
     pub fn totally_ordered(&self) -> bool {
@@ -89,6 +99,8 @@ impl SortKey {
                 (s.len() + lang.len()) as u64 + 128
             }
             Some(Value::Other { lex, dt }) => (lex.len() + dt.len()) as u64 + 128,
+            Some(Value::BigInteger(i)) => i.heap_bytes() + 32,
+            Some(Value::BigDecimal(d)) => d.heap_bytes() + 32,
             Some(Value::Triple(triple)) => super::graph_triple_bytes(triple),
             _ => 0,
         }
@@ -121,6 +133,7 @@ fn classify(v: &Value) -> (u8, Prim) {
             LITERAL + 2,
             Prim::Exact(i128::from_be_bytes(d.to_be_bytes()), true),
         ),
+        Value::BigInteger(_) | Value::BigDecimal(_) => (LITERAL + 2, Prim::Plain),
         Value::Float(f) => (LITERAL + 2, Prim::Approx(f64::from(f32::from(*f)), true)),
         Value::Double(d) => (LITERAL + 2, Prim::Approx(f64::from(*d), false)),
         Value::Bool(b) => (LITERAL + 3, Prim::Bool(*b)),
@@ -140,6 +153,7 @@ fn decide(class: u8, a: Prim, b: Prim, va: &Option<Value>, vb: &Option<Value>) -
     match (a, b) {
         _ if class == NULL => Some(Ordering::Equal),
         (Prim::Text, Prim::Text) => Some(text(va).cmp(text(vb))),
+        (Prim::BaseIri(x), Prim::BaseIri(y)) => Some(x.cmp(&y)),
         (Prim::Lang, Prim::Lang) => match (va, vb) {
             (Some(Value::Lang(x, lx)), Some(Value::Lang(y, ly))) => {
                 Some(x.cmp(y).then_with(|| lx.cmp(ly)))
@@ -184,7 +198,9 @@ pub fn totally_ordered(v: Option<&Value>) -> bool {
             | Value::Str(_)
             | Value::Lang(..)
             | Value::Integer(_)
+            | Value::BigInteger(_)
             | Value::Decimal(_)
+            | Value::BigDecimal(_)
             | Value::Bool(_),
         ) => true,
         Some(Value::Float(f)) => !f32::from(*f).is_nan(),
@@ -299,6 +315,24 @@ impl<P> TopK<P> {
     /// Count a row that [`TopK::screen`] rejected.
     pub fn skip(&mut self) {
         self.seen += 1;
+    }
+
+    /// With two keys, compare a candidate's base IRI id against the worst row's
+    /// only when the primary keys tie. Equal secondary keys lose by arrival order.
+    pub(super) fn rejects_base_iri_tie(&self, first: &SortKey, id: u64) -> bool {
+        let [_, asc] = self.asc.as_slice() else {
+            return false;
+        };
+        if !self.is_full() {
+            return false;
+        }
+        let Some(worst) = self.heap.first() else {
+            return false;
+        };
+        let Prim::BaseIri(other) = worst.keys[1].prim else {
+            return false;
+        };
+        (if *asc { id >= other } else { id <= other }) && worst.keys[0].cmp(first).is_eq()
     }
 
     /// Offer the next row with all its keys. Returns the entry that left the heap: the

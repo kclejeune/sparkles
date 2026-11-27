@@ -68,16 +68,39 @@ impl std::fmt::Debug for Table {
     }
 }
 
+/// Cooperative admission and checkpoint hooks for [`Table::measure_with`].
+pub(super) trait SuffixMeasure<E> {
+    fn admit(&mut self, length: usize) -> Result<(), E>;
+    fn checkpoint(&mut self, phase: &'static str) -> Result<(), E>;
+    fn overflow(&self) -> E;
+}
+
+struct UncheckedMeasure;
+
+impl SuffixMeasure<std::convert::Infallible> for UncheckedMeasure {
+    #[inline(always)]
+    fn admit(&mut self, _length: usize) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+    #[inline(always)]
+    fn checkpoint(&mut self, _phase: &'static str) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+    fn overflow(&self) -> std::convert::Infallible {
+        unreachable!("unchecked measure cannot overflow")
+    }
+}
+
 impl Table {
-    pub(crate) fn first_byte_checked(
+    pub(crate) fn first_byte_with<C: crate::budgeted::Control>(
         &self,
         codes: &[u8],
-        check: impl Fn() -> Result<()>,
+        control: &C,
     ) -> Result<Option<u8>> {
         let mut index = 0usize;
         while index < codes.len() {
-            if index.is_multiple_of(64 << 10) {
-                check()?;
+            if C::CHECKS && index.is_multiple_of(64 << 10) {
+                control.check(0)?;
             }
             let code = codes[index];
             if code == ESCAPE {
@@ -88,7 +111,7 @@ impl Table {
             }
             index += 1;
         }
-        check()?;
+        control.check(0)?;
         Ok(None)
     }
 
@@ -277,30 +300,84 @@ impl Table {
         }
     }
 
-    /// The number of bytes that `codes` decode to.
-    pub fn decoded_len(&self, codes: &[u8]) -> usize {
-        let mut n = 0;
-        let mut i = 0;
+    /// Compare the decoded bytes of `codes` against `other`, returning the ordering and
+    /// the length of their longest common prefix without allocating.
+    ///
+    /// Matches [`Table::decode_into`] on damaged input: codes without a symbol and a
+    /// trailing escape emit no bytes.
+    #[inline]
+    pub fn cmp_with_lcp(&self, codes: &[u8], other: &[u8]) -> (std::cmp::Ordering, usize) {
+        let mut matched = 0usize;
+        let mut i = 0usize;
         while i < codes.len() {
             let c = codes[i];
             if c == ESCAPE {
-                n += usize::from(i + 1 < codes.len());
+                if let Some(&b) = codes.get(i + 1) {
+                    let Some(&ob) = other.get(matched) else {
+                        return (std::cmp::Ordering::Greater, matched);
+                    };
+                    if b != ob {
+                        return (b.cmp(&ob), matched);
+                    }
+                    matched += 1;
+                }
                 i += 2;
             } else {
-                n += self.lens[c as usize] as usize;
+                let l = self.lens[c as usize] as usize;
+                if l != 0 {
+                    let sym = &self.syms[c as usize][..l];
+                    let rem = &other[matched..];
+                    let n = l.min(rem.len());
+                    if sym[..n] == rem[..n] {
+                        matched += n;
+                        if l > rem.len() {
+                            return (std::cmp::Ordering::Greater, matched);
+                        }
+                    } else {
+                        for k in 0..n {
+                            if sym[k] != rem[k] {
+                                return (sym[k].cmp(&rem[k]), matched + k);
+                            }
+                        }
+                    }
+                }
                 i += 1;
             }
         }
-        n
+        (matched.cmp(&other.len()), matched)
     }
 
-    /// Controlled opt-in decoder. Old decoder paths retain their optimized loops.
-    pub(super) fn measure_controlled(
+    /// The number of bytes that `codes` decode to.
+    #[inline]
+    pub fn decoded_len(&self, codes: &[u8]) -> usize {
+        self.measure_with::<false, _, _>(codes, &mut UncheckedMeasure)
+            .unwrap_or_else(|e| match e {})
+    }
+
+    /// Measure the decoded length of `codes`. With `POLLS = false`, compiles to the
+    /// unchecked loop; with `POLLS = true`, admits length incrementally and polls
+    /// checkpoints every 1024 code bytes.
+    #[inline(always)]
+    pub(super) fn measure_with<const POLLS: bool, M: SuffixMeasure<E>, E>(
         &self,
         codes: &[u8],
-        mut admit: impl FnMut(usize) -> Result<()>,
-        checkpoint: &mut impl FnMut(&'static str) -> Result<()>,
-    ) -> Result<usize> {
+        measure: &mut M,
+    ) -> Result<usize, E> {
+        if !POLLS {
+            let mut n = 0usize;
+            let mut i = 0usize;
+            while i < codes.len() {
+                let c = codes[i];
+                if c == ESCAPE {
+                    n += usize::from(i + 1 < codes.len());
+                    i += 2;
+                } else {
+                    n += self.lens[c as usize] as usize;
+                    i += 1;
+                }
+            }
+            return Ok(n);
+        }
         let (mut at, mut length, mut since_check) = (0usize, 0usize, 0usize);
         while at < codes.len() {
             let code = codes[at];
@@ -311,28 +388,28 @@ impl Table {
             };
             length = length
                 .checked_add(bytes)
-                .ok_or_else(|| Error::invalid("vocabulary suffix overflows"))?;
+                .ok_or_else(|| measure.overflow())?;
             at += consumed;
             since_check += consumed;
             if since_check >= 1024 {
                 // Admit incrementally, so a low cap refuses before a full long scan.
-                admit(length)?;
-                checkpoint("measuring vocabulary suffix")?;
+                measure.admit(length)?;
+                measure.checkpoint("measuring vocabulary suffix")?;
                 since_check = 0;
             }
         }
-        admit(length)?;
-        checkpoint("finishing vocabulary measurement")?;
+        measure.admit(length)?;
+        measure.checkpoint("finishing vocabulary measurement")?;
         Ok(length)
     }
 
-    pub(super) fn decode_controlled(
+    pub(super) fn decode_controlled<E>(
         &self,
         codes: &[u8],
         max: usize,
         output: &mut Vec<u8>,
-        checkpoint: &mut impl FnMut(&'static str) -> Result<()>,
-    ) -> Result<()> {
+        checkpoint: &mut impl FnMut(&'static str) -> Result<(), E>,
+    ) -> Result<(), E> {
         let limit = output.len().saturating_add(max).min(output.capacity());
         let (mut at, mut since_check) = (0usize, 0usize);
         while at < codes.len() && output.len() < limit {
@@ -355,6 +432,61 @@ impl Table {
             }
         }
         checkpoint("finishing vocabulary decode")
+    }
+
+    /// Stream-decode `codes` and compare the decoded suffix directly against `target`
+    /// without allocating a scratch buffer. Returns the lexicographical ordering and
+    /// the number of leading bytes that matched `target`, stopping as soon as a byte
+    /// differs or the decoded suffix extends past `target`.
+    pub(super) fn compare_controlled<E>(
+        &self,
+        codes: &[u8],
+        target: &[u8],
+        checkpoint: &mut impl FnMut(&'static str) -> Result<(), E>,
+    ) -> Result<(std::cmp::Ordering, usize), E> {
+        let (mut at, mut matched, mut since_check) = (0usize, 0usize, 0usize);
+        while at < codes.len() {
+            let code = codes[at];
+            let (sym, consumed): (&[u8], usize) = if code == ESCAPE {
+                if let Some(slice) = codes.get(at + 1..at + 2) {
+                    (slice, 2)
+                } else {
+                    at += 2;
+                    continue;
+                }
+            } else {
+                let len = self.lens[code as usize] as usize;
+                (&self.syms[code as usize][..len], 1)
+            };
+            let rem = &target[matched..];
+            if rem.is_empty() {
+                if !sym.is_empty() {
+                    checkpoint("completed vocabulary comparison")?;
+                    return Ok((std::cmp::Ordering::Greater, matched));
+                }
+            } else {
+                let n = sym.len().min(rem.len());
+                for (i, (&a, &b)) in sym[..n].iter().zip(&rem[..n]).enumerate() {
+                    if a != b {
+                        checkpoint("completed vocabulary comparison")?;
+                        return Ok((a.cmp(&b), matched + i));
+                    }
+                }
+                matched += n;
+                if sym.len() > n {
+                    checkpoint("completed vocabulary comparison")?;
+                    return Ok((std::cmp::Ordering::Greater, matched));
+                }
+            }
+            at += consumed;
+            since_check += consumed;
+            if since_check >= 1024 {
+                checkpoint("comparing vocabulary suffix")?;
+                since_check = 0;
+            }
+        }
+        checkpoint("completed vocabulary comparison")?;
+        Ok((matched.cmp(&target.len()), matched))
     }
 
     /// Whether `codes` is a valid code sequence of this table: every code has a symbol
@@ -668,6 +800,69 @@ mod tests {
                 })
                 .collect();
             roundtrip(&enc, 0, &s);
+        }
+    }
+
+    #[test]
+    fn cmp_with_lcp_matches_decoded_comparison_without_allocating() {
+        let c = corpus();
+        let refs: Vec<&[u8]> = c.iter().map(|v| &v[..]).collect();
+        let enc = Encoder::train([&refs, &refs[..10]]);
+        let t = &enc.tables[0];
+        let lcp = |a: &[u8], b: &[u8]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+
+        let mut coded = Vec::new();
+        for s in c.iter().take(64).chain([c.last().unwrap()]) {
+            if !enc.encode(0, s, &mut coded) {
+                continue;
+            }
+            let mut probes: Vec<Vec<u8>> = vec![Vec::new(), s.clone()];
+            if !s.is_empty() {
+                probes.push(s[..s.len() - 1].to_vec());
+                probes.push(s[..s.len() / 2].to_vec());
+                let mut shorter_diff = s.clone();
+                let mid = s.len() / 2;
+                shorter_diff[mid] = shorter_diff[mid].wrapping_add(1);
+                probes.push(shorter_diff);
+                let mut last_diff = s.clone();
+                let last = s.len() - 1;
+                last_diff[last] = last_diff[last].wrapping_sub(1);
+                probes.push(last_diff);
+            }
+            let mut longer = s.clone();
+            longer.push(0);
+            probes.push(longer);
+
+            for probe in &probes {
+                let (got, stats) =
+                    crate::test_alloc::record_alloc_stats(|| t.cmp_with_lcp(&coded, probe));
+                assert_eq!(got, (s.as_slice().cmp(probe.as_slice()), lcp(s, probe)));
+                assert_eq!(stats.total_alloc, 0, "cmp_with_lcp must not allocate");
+            }
+        }
+
+        // Damaged inputs (trailing escape, unused code with lens == 0) match decode_into.
+        let mut damaged = Vec::new();
+        assert!(enc.encode(
+            0,
+            b"label number 1 of the http://example.org/thing",
+            &mut damaged
+        ));
+        if t.n < MAX_SYMBOLS as u8 {
+            damaged.push(t.n);
+        }
+        damaged.push(ESCAPE);
+        let mut decoded = Vec::new();
+        t.decode_into(&damaged, &mut decoded);
+        for probe in [
+            decoded.as_slice(),
+            &decoded[..decoded.len().saturating_sub(1)],
+            [decoded.as_slice(), b"z"].concat().as_slice(),
+        ] {
+            let (got, stats) =
+                crate::test_alloc::record_alloc_stats(|| t.cmp_with_lcp(&damaged, probe));
+            assert_eq!(got, (decoded.as_slice().cmp(probe), lcp(&decoded, probe)));
+            assert_eq!(stats.total_alloc, 0);
         }
     }
 

@@ -187,9 +187,19 @@ impl Key<'_> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn serialize(
     access: &GraphAccess,
     rules: &TripleRules,
+    preparation: &Preparation,
+) -> Result<(String, Reservation)> {
+    serialize_with_evidence(access, Some(rules), None, preparation)
+}
+
+pub(super) fn serialize_with_evidence(
+    access: &GraphAccess,
+    rules: Option<&TripleRules>,
+    evidence_fingerprint: Option<&str>,
     preparation: &Preparation,
 ) -> Result<(String, Reservation)> {
     // Reserve before quoted's fixed stack scratch can be entered. All owned
@@ -201,36 +211,44 @@ pub(super) fn serialize(
         _scratch: scratch,
     };
     key.graphs(&access.read)?;
-    key.raw("|[")?;
-    let mut first = true;
-    for rule in &rules.rules {
-        preparation.check()?;
-        if rule.read.is_all() {
-            continue;
-        }
-        if !first {
+    if let Some(rules) = rules {
+        key.raw("|[")?;
+        let mut first = true;
+        for rule in &rules.rules {
+            preparation.check()?;
+            if rule.read.is_all() {
+                continue;
+            }
+            if !first {
+                key.raw(", ")?;
+            }
+            first = false;
+            key.raw("(")?;
+            key.protection(&rule.protection)?;
             key.raw(", ")?;
+            key.graphs(&rule.read)?;
+            key.raw(")")?;
         }
-        first = false;
-        key.raw("(")?;
-        key.protection(&rule.protection)?;
-        key.raw(", ")?;
-        key.graphs(&rule.read)?;
-        key.raw(")")?;
+        key.raw("]|")?;
+        // A pattern may read the caller's attributes, so two callers share a mask only
+        // when they are the same caller, as the legacy key says.
+        if rules
+            .rules
+            .iter()
+            .any(|rule| !rule.read.is_all() && rule.protection.pattern.is_some())
+        {
+            key.caller(&rules.caller)?;
+            key.raw("|")?;
+        }
+        // Only two fixed-width integers reach ordinary formatting here.
+        let _ = write!(key.text, "{:?}", rules.limits);
+    } else {
+        key.raw("|none")?;
     }
-    key.raw("]|")?;
-    // A pattern may read the caller's attributes, so two callers share a mask only
-    // when they are the same caller, as the legacy key says.
-    if rules
-        .rules
-        .iter()
-        .any(|rule| !rule.read.is_all() && rule.protection.pattern.is_some())
-    {
-        key.caller(&rules.caller)?;
-        key.raw("|")?;
+    if let Some(fp) = evidence_fingerprint {
+        key.raw("|ev:")?;
+        key.raw(fp)?;
     }
-    // Only two fixed-width integers reach ordinary formatting here.
-    let _ = write!(key.text, "{:?}", rules.limits);
     preparation.check()?;
     key.text.finish()
 }
@@ -299,11 +317,13 @@ mod tests {
                     pattern: strings[2].clone(),
                     exempt: strings.clone(),
                     decide: None,
+                    bound_to: None,
                 },
                 GraphGuard {
                     pattern: "other".into(),
                     exempt: Vec::new(),
                     decide: Some(Decider(Arc::new(Uncalled))),
+                    bound_to: None,
                 },
             ],
         });

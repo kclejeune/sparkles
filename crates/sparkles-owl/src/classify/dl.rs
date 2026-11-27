@@ -70,72 +70,119 @@ fn add(a: u8, b: u8) -> u8 {
     (a + b).min(2)
 }
 
-fn sum(xs: impl Iterator<Item = u8>) -> u8 {
-    xs.fold(0, add)
+struct PollState<'a, E> {
+    step: usize,
+    visited: usize,
+    poll: &'a mut dyn FnMut() -> Result<(), E>,
 }
 
-/// The counts of a class expression.
-fn class(c: &ClassExpression) -> Pl {
+impl<E> PollState<'_, E> {
+    #[inline]
+    fn tick(&mut self) -> Result<(), E> {
+        self.visited += 1;
+        if self.visited.is_multiple_of(self.step) {
+            (self.poll)()?;
+        }
+        Ok(())
+    }
+}
+
+/// The counts of a class expression, computed without heap allocation and polling
+/// cooperatively every `state.step` nodes.
+fn class<E>(c: &ClassExpression, state: &mut PollState<'_, E>) -> Result<Pl, E> {
     use ClassExpression as C;
-    match c {
-        C::Class(c) => match c.as_str() {
-            vocab::OWL_THING | vocab::OWL_NOTHING => pl(0, 0),
-            _ => pl(1, 0),
-        },
+    state.tick()?;
+    Ok(match c {
+        C::Class(c) => class_name_pl(c),
         C::ObjectIntersectionOf(cs) => {
-            let ps: Vec<Pl> = cs.iter().map(class).collect();
-            pl(
-                ps.iter().map(|p| p.pos).max().unwrap_or(0),
-                sum(ps.iter().map(|p| p.neg)),
-            )
+            let (mut max_pos, mut sum_neg) = (0u8, 0u8);
+            for c in cs {
+                let p = class(c, state)?;
+                max_pos = max_pos.max(p.pos);
+                sum_neg = add(sum_neg, p.neg);
+            }
+            pl(max_pos, sum_neg)
         }
         C::ObjectUnionOf(cs) => {
-            let ps: Vec<Pl> = cs.iter().map(class).collect();
-            pl(
-                sum(ps.iter().map(|p| p.pos)),
-                ps.iter().map(|p| p.neg).max().unwrap_or(0),
-            )
+            let (mut sum_pos, mut max_neg) = (0u8, 0u8);
+            for c in cs {
+                let p = class(c, state)?;
+                sum_pos = add(sum_pos, p.pos);
+                max_neg = max_neg.max(p.neg);
+            }
+            pl(sum_pos, max_neg)
         }
         C::ObjectComplementOf(c) => {
-            let p = class(c);
+            let p = class(c, state)?;
             pl(p.neg, p.pos)
         }
         C::ObjectOneOf(is) => pl(is.len().min(2) as u8, 0),
         C::ObjectSomeValuesFrom(_, f) => {
-            let p = class(f);
+            let p = class(f, state)?;
             pl(p.pos.max(1), p.neg)
         }
         C::ObjectAllValuesFrom(_, f) => {
-            let p = class(f);
+            let p = class(f, state)?;
             pl(p.pos, p.neg.max(1))
         }
         C::ObjectHasValue(..) | C::ObjectHasSelf(_) | C::DataHasValue(..) => pl(1, 0),
         C::ObjectMinCardinality(n, _, f) => {
-            let p = f.as_deref().map_or(pl(0, 0), class);
+            let p = match f.as_deref() {
+                Some(f) => class(f, state)?,
+                None => pl(0, 0),
+            };
             at_least(*n, p)
         }
         C::ObjectMaxCardinality(n, _, f) => {
-            let p = f.as_deref().map_or(pl(0, 0), class);
+            let p = match f.as_deref() {
+                Some(f) => class(f, state)?,
+                None => pl(0, 0),
+            };
             at_most(*n, p)
         }
         C::ObjectExactCardinality(n, _, f) => {
-            let p = f.as_deref().map_or(pl(0, 0), class);
+            let p = match f.as_deref() {
+                Some(f) => class(f, state)?,
+                None => pl(0, 0),
+            };
             both(at_least(*n, p), at_most(*n, p))
         }
         C::DataSomeValuesFrom(_, r) => {
-            let p = data(r);
+            let p = data(r, state)?;
             pl(p.pos.max(1), p.neg)
         }
         C::DataAllValuesFrom(_, r) => {
-            let p = data(r);
+            let p = data(r, state)?;
             pl(p.pos, p.neg.max(1))
         }
-        C::DataMinCardinality(n, _, r) => at_least(*n, r.as_ref().map_or(pl(1, 0), data)),
-        C::DataMaxCardinality(n, _, r) => at_most(*n, r.as_ref().map_or(pl(1, 0), data)),
+        C::DataMinCardinality(n, _, r) => {
+            let p = match r.as_ref() {
+                Some(r) => data(r, state)?,
+                None => pl(1, 0),
+            };
+            at_least(*n, p)
+        }
+        C::DataMaxCardinality(n, _, r) => {
+            let p = match r.as_ref() {
+                Some(r) => data(r, state)?,
+                None => pl(1, 0),
+            };
+            at_most(*n, p)
+        }
         C::DataExactCardinality(n, _, r) => {
-            let p = r.as_ref().map_or(pl(1, 0), data);
+            let p = match r.as_ref() {
+                Some(r) => data(r, state)?,
+                None => pl(1, 0),
+            };
             both(at_least(*n, p), at_most(*n, p))
         }
+    })
+}
+
+fn class_name_pl(c: &Class) -> Pl {
+    match c.as_str() {
+        vocab::OWL_THING | vocab::OWL_NOTHING => pl(0, 0),
+        _ => pl(1, 0),
     }
 }
 
@@ -168,49 +215,74 @@ fn both(a: Pl, b: Pl) -> Pl {
 
 /// The counts of a data range: a datatype, a value or a restriction is one disjunct, a
 /// union adds its operands', an enumeration counts its values.
-fn data(r: &DataRange) -> Pl {
-    match r {
+fn data<E>(r: &DataRange, state: &mut PollState<'_, E>) -> Result<Pl, E> {
+    state.tick()?;
+    Ok(match r {
         DataRange::Datatype(_) | DataRange::DatatypeRestriction(..) => pl(1, 0),
         DataRange::IntersectionOf(rs) => {
-            let ps: Vec<Pl> = rs.iter().map(data).collect();
-            pl(
-                ps.iter().map(|p| p.pos).max().unwrap_or(0),
-                sum(ps.iter().map(|p| p.neg)),
-            )
+            let (mut max_pos, mut sum_neg) = (0u8, 0u8);
+            for r in rs {
+                let p = data(r, state)?;
+                max_pos = max_pos.max(p.pos);
+                sum_neg = add(sum_neg, p.neg);
+            }
+            pl(max_pos, sum_neg)
         }
         DataRange::UnionOf(rs) => {
-            let ps: Vec<Pl> = rs.iter().map(data).collect();
-            pl(
-                sum(ps.iter().map(|p| p.pos)),
-                ps.iter().map(|p| p.neg).max().unwrap_or(0),
-            )
+            let (mut sum_pos, mut max_neg) = (0u8, 0u8);
+            for r in rs {
+                let p = data(r, state)?;
+                sum_pos = add(sum_pos, p.pos);
+                max_neg = max_neg.max(p.neg);
+            }
+            pl(sum_pos, max_neg)
         }
         DataRange::ComplementOf(r) => {
-            let p = data(r);
+            let p = data(r, state)?;
             pl(p.neg, p.pos)
         }
         DataRange::OneOf(ls) => pl(ls.len().min(2) as u8, 0),
-    }
+    })
 }
 
 /// Whether a class expression is empty when every class and property is.
-fn bottom(c: &ClassExpression) -> bool {
+fn bottom<E>(c: &ClassExpression, state: &mut PollState<'_, E>) -> Result<bool, E> {
     use ClassExpression as C;
-    match c {
+    state.tick()?;
+    Ok(match c {
         C::Class(c) => c.as_str() != vocab::OWL_THING,
-        C::ObjectIntersectionOf(cs) => cs.iter().any(bottom),
-        C::ObjectUnionOf(cs) => cs.iter().all(bottom),
-        C::ObjectComplementOf(c) => top(c),
+        C::ObjectIntersectionOf(cs) => {
+            for c in cs {
+                if bottom(c, state)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+        C::ObjectUnionOf(cs) => {
+            for c in cs {
+                if !bottom(c, state)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
+        C::ObjectComplementOf(c) => top(c, state)?,
         // the individuals of the signature are not emptied
         C::ObjectOneOf(_) => false,
-        C::ObjectSomeValuesFrom(p, f) => !is_top_role(p) || bottom(f),
+        C::ObjectSomeValuesFrom(p, f) => !is_top_role(p) || bottom(f, state)?,
         C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => !is_top_role(p),
         C::ObjectMinCardinality(n, p, f) | C::ObjectExactCardinality(n, p, f) => {
-            *n > 0 && (!is_top_role(p) || f.as_deref().is_some_and(bottom))
+            *n > 0
+                && (!is_top_role(p)
+                    || match f.as_deref() {
+                        Some(f) => bottom(f, state)?,
+                        None => false,
+                    })
         }
         // the top property relates every element to every other, so `∀U.F` is empty
         // when F is
-        C::ObjectAllValuesFrom(p, f) => is_top_role(p) && bottom(f),
+        C::ObjectAllValuesFrom(p, f) => is_top_role(p) && bottom(f, state)?,
         C::DataSomeValuesFrom(ps, _) => ps.iter().all(|d| !is_top_data(d)),
         C::DataHasValue(d, _) => !is_top_data(d),
         C::DataMinCardinality(n, d, _) | C::DataExactCardinality(n, d, _) => {
@@ -218,26 +290,45 @@ fn bottom(c: &ClassExpression) -> bool {
         }
         C::ObjectMaxCardinality(..) => false,
         C::DataAllValuesFrom(..) | C::DataMaxCardinality(..) => false,
-    }
+    })
 }
 
 /// Whether a class expression is everything when every class and property is empty.
-fn top(c: &ClassExpression) -> bool {
+fn top<E>(c: &ClassExpression, state: &mut PollState<'_, E>) -> Result<bool, E> {
     use ClassExpression as C;
-    match c {
+    state.tick()?;
+    Ok(match c {
         C::Class(c) => c.as_str() == vocab::OWL_THING,
-        C::ObjectIntersectionOf(cs) => cs.iter().all(top),
-        C::ObjectUnionOf(cs) => cs.iter().any(top),
-        C::ObjectComplementOf(c) => bottom(c),
-        C::ObjectAllValuesFrom(p, f) => !is_top_role(p) || top(f),
+        C::ObjectIntersectionOf(cs) => {
+            for c in cs {
+                if !top(c, state)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
+        C::ObjectUnionOf(cs) => {
+            for c in cs {
+                if top(c, state)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+        C::ObjectComplementOf(c) => bottom(c, state)?,
+        C::ObjectAllValuesFrom(p, f) => !is_top_role(p) || top(f, state)?,
         C::ObjectMaxCardinality(_, p, f) | C::ObjectExactCardinality(0, p, f) => {
-            !is_top_role(p) || f.as_deref().is_some_and(bottom)
+            !is_top_role(p)
+                || match f.as_deref() {
+                    Some(f) => bottom(f, state)?,
+                    None => false,
+                }
         }
         C::ObjectMinCardinality(0, ..) | C::DataMinCardinality(0, ..) => true,
         C::DataAllValuesFrom(ps, _) => ps.iter().all(|d| !is_top_data(d)),
         C::DataMaxCardinality(_, d, _) | C::DataExactCardinality(0, d, _) => !is_top_data(d),
         _ => false,
-    }
+    })
 }
 
 fn is_top_role(p: &ObjectPropertyExpression) -> bool {
@@ -251,118 +342,275 @@ fn is_top_data(d: &DataProperty) -> bool {
 /// The counts of the clauses an axiom stands for, as the largest number of disjuncts of
 /// one of them, and whether one of them is not ⊥-local for the empty signature. Axioms
 /// about properties alone are Horn and local.
-fn clauses(ax: &AxiomKind) -> (u8, bool) {
+fn clauses<E>(
+    ax: &AxiomKind,
+    state: &mut PollState<'_, E>,
+    report_global: bool,
+) -> Result<(u8, bool), E> {
     use AxiomKind as K;
     // C ⊑ D has ¬C ⊔ D as its clause
     let sub = |c: Pl, d: Pl| add(c.neg, d.pos);
-    match ax {
-        K::SubClassOf(c, d) => (sub(class(c), class(d)), !bottom(c) && !top(d)),
-        K::EquivalentClasses(cs) => {
-            let ps: Vec<Pl> = cs.iter().map(class).collect();
-            let most = cross(&ps);
-            let global = !(cs.iter().all(bottom) || cs.iter().all(top));
+    Ok(match ax {
+        K::SubClassOf(c, d) => {
+            let most = sub(class(c, state)?, class(d, state)?);
+            let global = report_global && most > 1 && !bottom(c, state)? && !top(d, state)?;
             (most, global)
         }
-        K::DisjointClasses(cs) => (
-            pairs(cs.iter().map(|c| class(c).neg)),
-            cs.iter().filter(|c| !bottom(c)).count() > 1,
-        ),
-        K::DisjointUnion(c, cs) => {
-            let parts: Vec<Pl> = cs.iter().map(class).collect();
-            let union = pl(
-                sum(parts.iter().map(|p| p.pos)),
-                parts.iter().map(|p| p.neg).max().unwrap_or(0),
-            );
-            let named = ClassExpression::Class(c.clone());
-            let most = sub(class(&named), union)
-                .max(sub(union, class(&named)))
-                .max(pairs(parts.iter().map(|p| p.neg)));
-            // c ≡ ⊔cs is local when both sides are emptied or both are everything, and
-            // the disjointness of the parts when at most one of them is not emptied
-            let equal =
-                (bottom(&named) && cs.iter().all(bottom)) || (top(&named) && cs.iter().any(top));
-            let apart = cs.iter().filter(|c| !bottom(c)).count() <= 1;
-            (most, !(equal && apart))
+        K::EquivalentClasses(cs) => {
+            let mut best_pos: [(u8, usize); 2] = [(0, usize::MAX); 2];
+            let mut best_neg: [(u8, usize); 2] = [(0, usize::MAX); 2];
+            for (i, c) in cs.iter().enumerate() {
+                let p = class(c, state)?;
+                if best_pos[0].1 == usize::MAX || p.pos > best_pos[0].0 {
+                    best_pos = [(p.pos, i), best_pos[0]];
+                } else if best_pos[1].1 == usize::MAX || p.pos > best_pos[1].0 {
+                    best_pos[1] = (p.pos, i);
+                }
+                if best_neg[0].1 == usize::MAX || p.neg > best_neg[0].0 {
+                    best_neg = [(p.neg, i), best_neg[0]];
+                } else if best_neg[1].1 == usize::MAX || p.neg > best_neg[1].0 {
+                    best_neg[1] = (p.neg, i);
+                }
+            }
+            let mut most = 0u8;
+            for &(neg, i) in &best_neg {
+                if i == usize::MAX {
+                    continue;
+                }
+                for &(pos, j) in &best_pos {
+                    if j != usize::MAX && i != j {
+                        most = most.max(add(neg, pos));
+                    }
+                }
+            }
+            let global = if report_global && most > 1 {
+                let mut all_bot = true;
+                for c in cs {
+                    if !bottom(c, state)? {
+                        all_bot = false;
+                        break;
+                    }
+                }
+                let mut all_top = true;
+                if !all_bot {
+                    for c in cs {
+                        if !top(c, state)? {
+                            all_top = false;
+                            break;
+                        }
+                    }
+                }
+                !(all_bot || all_top)
+            } else {
+                false
+            };
+            (most, global)
         }
-        K::ClassAssertion(c, _) => (class(c).pos, !top(c)),
-        K::ObjectPropertyDomain(p, c) => (class(c).pos, is_top_role(p) && !top(c)),
-        K::ObjectPropertyRange(p, c) => (class(c).pos, is_top_role(p) && !top(c)),
-        K::DataPropertyDomain(d, c) => (class(c).pos, is_top_data(d) && !top(c)),
+        K::DisjointClasses(cs) => {
+            let (_, most) = disjoint_counts(cs, state)?;
+            let mut non_bot = 0;
+            if report_global && most > 1 {
+                for c in cs {
+                    if !bottom(c, state)? {
+                        non_bot += 1;
+                        if non_bot > 1 {
+                            break;
+                        }
+                    }
+                }
+            }
+            (most, non_bot > 1)
+        }
+        K::DisjointUnion(c, cs) => {
+            let (union, disjoint) = disjoint_counts(cs, state)?;
+            let named = class_name_pl(c);
+            let most = sub(named, union).max(sub(union, named)).max(disjoint);
+            let global = if report_global && most > 1 {
+                let named_top = c.as_str() == vocab::OWL_THING;
+                let mut non_bot = 0;
+                let mut any_top = false;
+                for part in cs {
+                    if !bottom(part, state)? {
+                        non_bot += 1;
+                        if non_bot > 1 {
+                            break;
+                        }
+                    }
+                    if named_top && !any_top {
+                        any_top = top(part, state)?;
+                    }
+                }
+                let equal = (!named_top && non_bot == 0) || (named_top && any_top);
+                !(equal && non_bot <= 1)
+            } else {
+                false
+            };
+            (most, global)
+        }
+        K::ClassAssertion(c, _) => {
+            let most = class(c, state)?.pos;
+            let global = report_global && most > 1 && !top(c, state)?;
+            (most, global)
+        }
+        K::ObjectPropertyDomain(p, c) => {
+            let most = class(c, state)?.pos;
+            let global = report_global && most > 1 && is_top_role(p) && !top(c, state)?;
+            (most, global)
+        }
+        K::ObjectPropertyRange(p, c) => {
+            let most = class(c, state)?.pos;
+            let global = report_global && most > 1 && is_top_role(p) && !top(c, state)?;
+            (most, global)
+        }
+        K::DataPropertyDomain(d, c) => {
+            let most = class(c, state)?.pos;
+            let global = report_global && most > 1 && is_top_data(d) && !top(c, state)?;
+            (most, global)
+        }
         // a data range is not emptied with the signature, so a range of the top data
         // property is global unless it holds of every value
-        K::DataPropertyRange(d, r) => (data(r).pos, is_top_data(d) && !all_values(r)),
+        K::DataPropertyRange(d, r) => {
+            let most = data(r, state)?.pos;
+            let global = report_global && most > 1 && is_top_data(d) && !all_values(r, state)?;
+            (most, global)
+        }
         K::DatatypeDefinition(_, r) => {
-            let p = data(r);
+            let p = data(r, state)?;
             (p.pos.max(add(p.neg, 1)), false)
         }
         // C(x) ∧ C(y) ∧ the key's values shared → x = y, an equality besides the two
         // negative occurrences of C
         K::HasKey(c, ..) => {
-            let n = class(c).neg;
+            let n = class(c, state)?.neg;
             (add(1, add(n, n)), false)
         }
         _ => (0, false),
-    }
+    })
 }
 
-/// The most that two of the counts add up to, from the two largest, which is the largest
-/// clause of a set of pairwise disjointness conditions.
-fn pairs(ns: impl Iterator<Item = u8>) -> u8 {
-    let (mut a, mut b) = (0, 0);
-    for n in ns {
-        if n > a {
-            b = a;
-            a = n;
-        } else if n > b {
-            b = n;
-        }
-    }
-    add(a, b)
-}
-
-/// The largest clause of an equivalence: the negative count of one operand and the
-/// positive count of another, from the two largest positive counts.
-fn cross(ps: &[Pl]) -> u8 {
-    let mut best: [(u8, usize); 2] = [(0, usize::MAX); 2];
-    for (i, p) in ps.iter().enumerate() {
-        if best[0].1 == usize::MAX || p.pos > best[0].0 {
-            best = [(p.pos, i), best[0]];
-        } else if best[1].1 == usize::MAX || p.pos > best[1].0 {
-            best[1] = (p.pos, i);
-        }
-    }
-    ps.iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let other = if best[0].1 == i { best[1] } else { best[0] };
-            if other.1 == usize::MAX {
-                0
-            } else {
-                add(p.neg, other.0)
+/// Count the union and pairwise clauses over single-occurrence operands. A repeated
+/// operand must be empty, so it contributes only its own negative count.
+fn disjoint_counts<E>(
+    cs: &Multiset<ClassExpression>,
+    state: &mut PollState<'_, E>,
+) -> Result<(Pl, u8), E> {
+    let mut parts = cs.iter().peekable();
+    let (mut sum_pos, mut max_neg) = (0, 0);
+    let (mut first, mut second) = (0, 0);
+    let mut singles = 0;
+    let mut repeated = 0;
+    while let Some(part) = parts.next() {
+        let counts = class(part, state)?;
+        let mut duplicate = false;
+        while let Some(&other) = parts.peek() {
+            if !super::dl_reduce::class_eq_polled(part, other, &mut || state.tick())? {
+                break;
             }
-        })
-        .max()
-        .unwrap_or(0)
+            parts.next();
+            duplicate = true;
+        }
+        if duplicate {
+            repeated = repeated.max(counts.neg);
+            continue;
+        }
+        singles += 1;
+        sum_pos = add(sum_pos, counts.pos);
+        max_neg = max_neg.max(counts.neg);
+        if counts.neg > first {
+            second = first;
+            first = counts.neg;
+        } else if counts.neg > second {
+            second = counts.neg;
+        }
+    }
+    let pair = if singles < 2 { 0 } else { add(first, second) };
+    Ok((pl(sum_pos, max_neg), pair.max(repeated)))
+}
+
+/// Partitions a sorted multiset into its surviving single-occurrence members and the
+/// distinct members that occur at least twice.
+pub(super) fn split_multiset<T: Eq>(ms: &Multiset<T>) -> (Vec<&T>, Vec<&T>) {
+    let mut unique = Vec::new();
+    let mut repeated = Vec::new();
+    let slice = ms.as_slice();
+    let mut i = 0;
+    while i < slice.len() {
+        let mut j = i + 1;
+        while j < slice.len() && slice[j] == slice[i] {
+            j += 1;
+        }
+        if j - i == 1 {
+            unique.push(&slice[i]);
+        } else {
+            repeated.push(&slice[i]);
+        }
+        i = j;
+    }
+    (unique, repeated)
 }
 
 /// Whether a data range holds of every data value.
-fn all_values(r: &DataRange) -> bool {
-    match r {
+fn all_values<E>(r: &DataRange, state: &mut PollState<'_, E>) -> Result<bool, E> {
+    state.tick()?;
+    Ok(match r {
         DataRange::Datatype(d) => d.as_str() == vocab::RDFS_LITERAL,
-        DataRange::UnionOf(rs) => rs.iter().any(all_values),
-        DataRange::IntersectionOf(rs) => rs.iter().all(all_values),
+        DataRange::UnionOf(rs) => {
+            for r in rs {
+                if all_values(r, state)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+        DataRange::IntersectionOf(rs) => {
+            for r in rs {
+                if !all_values(r, state)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
         _ => false,
-    }
+    })
+}
+
+/// What an axiom needs: whether it is Horn and, when it is not, whether it is global,
+/// computed without heap allocation and polling `poll` every `poll_step` nodes.
+pub(super) fn shape_polled<E>(
+    ax: &AxiomKind,
+    poll_step: usize,
+    poll: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Shape, E> {
+    let mut state = PollState {
+        step: poll_step.max(1),
+        visited: 0,
+        poll,
+    };
+    state.tick()?;
+    let (most, global) = clauses(ax, &mut state, true)?;
+    let horn = most <= 1;
+    Ok(Shape {
+        horn,
+        global: !horn && global,
+    })
+}
+
+/// Streaming, allocation-free, cooperatively polled Horn check.
+pub(super) fn is_horn_polled<E>(
+    ax: &AxiomKind,
+    poll: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    let mut state = PollState {
+        step: 1,
+        visited: 0,
+        poll,
+    };
+    Ok(clauses(ax, &mut state, false)?.0 <= 1)
 }
 
 /// What an axiom needs: whether it is Horn and, when it is not, whether it is global.
 pub fn shape(ax: &AxiomKind) -> Shape {
-    let (most, global) = clauses(ax);
-    let horn = most <= 1;
-    Shape {
-        horn,
-        global: !horn && global,
-    }
+    shape_polled(ax, usize::MAX, &mut || Ok::<(), ()>(())).unwrap()
 }
 
 /// The axioms outside OWL 2 EL of a run, counted by what they need.
@@ -599,5 +847,168 @@ mod tests {
                 taken: 0
             }
         );
+    }
+
+    #[test]
+    fn repeated_disjoint_shapes_follow_surviving_members() {
+        assert_eq!(
+            of("DisjointUnion(:C :A :A)"),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of("DisjointUnion(:C :A :A :B)"),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of("DisjointUnion(:C :A :A :B :B)"),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert!(!horn("DisjointUnion(:C :A :A :B :D)"));
+        assert_eq!(
+            of("DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:A))"),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:A) ObjectComplementOf(:B))"
+            ),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:A) ObjectComplementOf(:B) ObjectComplementOf(:C))"
+            ),
+            Shape {
+                horn: false,
+                global: true
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(ObjectIntersectionOf(ObjectComplementOf(:A) ObjectComplementOf(:B)) ObjectIntersectionOf(ObjectComplementOf(:A) ObjectComplementOf(:B)))"
+            ),
+            Shape {
+                horn: false,
+                global: true
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(:A :A ObjectIntersectionOf(ObjectComplementOf(:B) ObjectComplementOf(:C)))"
+            ),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:A) ObjectComplementOf(ObjectUnionOf(:B :C)))"
+            ),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+    }
+
+    #[test]
+    fn disjoint_operand_comparison_polls_before_finishing() {
+        fn operand(last: &str) -> ClassExpression {
+            let individuals = (0..64)
+                .map(|i| Individual::named(format!("urn:disjoint:i{i:02}")))
+                .chain(std::iter::once(Individual::named(last)))
+                .collect();
+            ClassExpression::ObjectIntersectionOf(
+                [ClassExpression::ObjectOneOf(individuals)].into(),
+            )
+        }
+
+        for (last, horn) in [("urn:disjoint:z0", true), ("urn:disjoint:z1", false)] {
+            let parts = [operand("urn:disjoint:z0"), operand(last)].into();
+            let axiom = AxiomKind::DisjointUnion(Class::new("urn:disjoint:Union"), parts);
+            assert_eq!(is_horn_polled(&axiom, &mut || Ok::<(), ()>(())), Ok(horn));
+
+            // The polarity count sees only the intersection and enumeration nodes in
+            // each operand. Reaching ten polls requires visiting individuals in equality.
+            let mut ticks = 0;
+            let result = is_horn_polled(&axiom, &mut || {
+                ticks += 1;
+                if ticks == 10 {
+                    Err("cancelled")
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result, Err("cancelled"), "{last}");
+            assert_eq!(ticks, 10);
+        }
+    }
+
+    #[test]
+    fn streaming_is_horn_polled_matches_shape_and_stops_on_poll_error() {
+        let cases = [
+            "SubClassOf(:A ObjectUnionOf(:B :C))",
+            "SubClassOf(ObjectUnionOf(:B :C) :A)",
+            "EquivalentClasses(:A :B)",
+            "EquivalentClasses(:A ObjectUnionOf(:B :C))",
+            "EquivalentClasses(:A ObjectComplementOf(:B))",
+            "EquivalentClasses(:A ObjectAllValuesFrom(:r :B) :C)",
+            "DisjointClasses(:A :B :C)",
+            "DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:B))",
+            "DisjointUnion(:A :B :C)",
+            "DisjointUnion(:A owl:Nothing :B)",
+            "HasKey(:A (:r) ())",
+            "HasKey(ObjectComplementOf(:A) (:r) ())",
+            "DataPropertyRange(:d DataUnionOf(xsd:int xsd:string))",
+            "DataPropertyRange(:d DataIntersectionOf(xsd:int xsd:string))",
+        ];
+        for src in cases {
+            let doc = ofn_read::parse(&format!(
+                "Prefix(:=<http://ex.org/>)\nPrefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)\n\
+                 Prefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n{src}\n)"
+            ))
+            .unwrap();
+            let ax = doc
+                .axioms
+                .iter()
+                .map(|a| &a.kind)
+                .find(|k| !matches!(k, AxiomKind::Declaration(_)))
+                .unwrap();
+            let polled = is_horn_polled(ax, &mut || Ok::<(), ()>(())).unwrap();
+            assert_eq!(polled, shape(ax).horn, "{src}");
+        }
+
+        // Cooperative poll error halts mid-expression.
+        let wide = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("http://ex.org/A")),
+            ClassExpression::ObjectUnionOf(
+                (0..100usize)
+                    .map(|i| ClassExpression::Class(Class::new(format!("http://ex.org/C{i}"))))
+                    .collect(),
+            ),
+        );
+        let mut ticks = 0usize;
+        let res = is_horn_polled(&wide, &mut || {
+            ticks += 1;
+            if ticks == 10 { Err(()) } else { Ok(()) }
+        });
+        assert_eq!(res, Err(()));
+        assert_eq!(ticks, 10);
     }
 }

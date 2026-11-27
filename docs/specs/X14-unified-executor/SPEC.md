@@ -74,7 +74,7 @@ spill format.
 
 **Shared format registry and small helpers.** Add one syntax registry for format names, extensions and media types, one INFERRED_GRAPH constant, one `parse_duration` and one durable atomic-write helper, and fix the Turtle string escaping that differs between `mapping/rdf.rs` and `mapping/draft.rs`. About ten format tables, nine INFERRED_GRAPH constants and ten atomic-write helpers exist. The unescaped draft writer could produce invalid Turtle. Roadmap item 477 holds this phase.
 
-**Implementation-selecting switches made test-only.** Make the EnvSwitch statics, implementation-only StoreOptions booleans and measurement switches test-only or remove them after X07 closes. No measured difference has been recorded for I/O hints on bulk loads. Roadmap item 478 holds this phase, and item 513 makes the cold-read switches test-only once item 4 has measured them.
+**Implementation-selecting switches made test-only.** Make the EnvSwitch statics, implementation-only StoreOptions booleans and measurement switches test-only or remove them after X07 closes. No measured difference has been recorded for I/O hints on bulk loads. Roadmap item 478 holds this phase. Item 513 covers the cold-read switches after item 4 measures them, with the I/O hint switch also depending on item 573.
 
 ### Stage 3: policy and plumbing
 
@@ -226,10 +226,16 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's accounting model, mode-neutral kernels and decoding twins have
-shipped, and the hierarchical budget of item 675 remains. Stage 5's
+479 of stage 2. Stage 4's query-memory accounting, mode-neutral kernels and decoding twins
+have shipped. Item 675 remains open for reasoning and incremental-view budgets. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
+
+Item 513 removed the sparse vocabulary and read-window environment switches and moved
+the query prefetch and decoding switches to test controls. The read-ahead target is
+4 MiB. A budgeted historical reader still looks up terms through the offsets when
+its budget cannot hold the sparse vocabulary index. `SPARKLES_IO_HINTS` remains in use
+for the dense export comparison in item 573.
 
 Items 678 and 1069 have shipped. The string floors of `string_order_mask` read their keys
 and search for a string's first extension inside the decoding envelope, and a refused
@@ -257,10 +263,9 @@ the floors it evicted that had been read again reaches a thirty-second of its sl
 inputs whose strings rarely repeat keep it. Each table is charged to the query before it is allocated, inside
 the spill threshold, and the cache holds at most 64 MiB or a sixteenth of the query's
 memory budget. This memory buys the speed below, and a table that the budget refuses
-leaves the floors the cache lacks to be computed each time. A cursor reads a key and the key before it in one walk of their block when
-that walk admits at most 4 KiB and the envelope grants it, and otherwise reads the key
-alone. A cursor batch spreads its floor comparison over the pool as the generic filter
-does. The bounded-reads test counts every read of the mode, seven in all.
+leaves the floors the cache lacks to be computed each time. A cursor batch spreads its
+floor comparison over the pool as the generic filter does. The bounded-reads test
+counts every read of the mode, seven in all.
 
 Forge measured 3a8b7adb, the build with the shared table, against c0948014, the build
 before item 1069, with 1.05M triples in five A,B,B,A rounds of ten requests per cell, and
@@ -278,23 +283,95 @@ streaming `str-pair-names` read 1.000 of the base and `str-pair-colleague` 1.118
 that build with one thread, the shared table reads 0.952 on `str-pair-colleague` and
 0.907 on `str-pair-lt` in streaming execution and 0.931 and 0.908 in eager execution,
 while `str-pair-names` takes 5.3% longer in streaming and 9.7% longer in eager execution.
-The names query's table grows from its first 2^16 slots during the query. On wally, a
+The names query's table grew from its first 2^16 slots during the query. On wally, a
 first table as large as the vocabulary's clamp closed that gap but made `str-pair-lt`,
-whose table never grows, 1.5% slower in streaming and 2.2% in eager execution, and item 1140 follows the cost of the growth.
+whose table never grows, 1.5% slower in streaming and 2.2% in eager execution. Item 1140
+now validates the initial sample of `string_order_mask` in left-to-right order before
+sizing or installing the table, so ineligible base-vocabulary literals fall back without
+reserving memory or locking cache initialization while cursor decode refusals keep their
+order and already-decoded floors seed the cache. For the first eligible mask, it sizes
+the initial table from a stack-allocated stratified sample of the two columns using
+widened arithmetic, clamped to the vocabulary's strings, the cache cap and the remaining
+memory budget and stepping down by halves to 2^10 slots before refusing, so
+small-distinct and one-unique-column inputs stay compact while large repeating inputs
+pre-size without growth. When a table does grow, live non-zero entries are copied
+directly into the replacement table before publication and `FloorMap` drops its secondary
+previous-table lookup and caches `first_triple`, so lookups probe only the current table.
 
-`str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so its
-floors are nearly all computed once, and in streaming execution they cost more than
-comparing the two keys. A switch that turns the floors off
-when a prefix of the rows repeats few values was considered and not built, because in a
-shuffled order the first 4,096 rows of `str-pair-names` repeat as few values as
-`str-pair-colleague` while the whole query repeats many, so the switch would lose the
-names query's 2x. A profile of the per-worker maps put most of the floors' time in
-`Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and its
-predecessor. The shared table has not been profiled, so that read is the suspected cause
-of its cost, and item 1088 recovers the streaming cost. Its first candidate admits and allocates
-the checked walk's key buffer before the walk instead of growing it from empty and reads the
-predecessor without the copy that `PrevKey::keep` makes, keeping the checked envelope and
-its fallback.
+On `atlas` at 1.05M triples in twelve alternating ABBA and BAAB rounds of 16 measured
+requests per query and server process, with four processes per round across 12 rounds,
+`329f82f9` against its own base `a643de75` returned byte-identical sorted TSV answers
+across every cell and same-binary control, and `f0240009` only extracted an inline
+stratum-bounds helper and tightened a unit test. Both one-thread A/B cells stayed within
+the 3% spread limit, with A/B spreads of 1.79% in streaming execution and 1.77% in eager
+execution. The separate same-binary A/A controls ran six alternating ABBA and BAAB rounds
+of 12 measured requests per query and server process with four processes per round. The
+`eager-1t` A/A control passed at 1.45% spread, whereas the `streaming-1t` A/A control
+failed the 3% limit at 4.55%. Against `a643de75`, `str-pair-names` improved by 3.0% in
+streaming execution, at 0.970 times the base's execution time, 27.40 against 28.23 ms,
+with a 95% interval of 0.966 to 0.974 and 0.975 times the instructions per request. In
+eager execution it improved by 10.0%, at 0.900 times, 24.95 against 27.68 ms, with a pooled
+ratio of 0.901, a 95% interval of 0.896 to 0.903 and 0.918 times the instructions per
+request, and all twelve rounds were faster in both modes. This Atlas comparison measures
+the gain of `329f82f9` against `a643de75` alone. The earlier Forge gap of 5.3% in
+streaming and 9.7% in eager execution (`174de1f8..3a8b7adb`) stays historical context on a
+different host and revision pair, and claiming recovery against the old per-worker maps
+would need a direct comparison on one host. Eager `str-pair-lt` stayed flat at 1.000
+times, 9.33 against 9.34 ms with a 95% interval of 0.997 to 1.002 and 0.994 times the
+instructions, and streaming `str-filter-two` crossed 1.0 at 1.002 times with an interval
+of 0.993 to 1.008. Both 12-thread cells failed the 3% spread diagnostic without a repeat
+run, with A/B spreads of 7.19% in streaming execution and 40.50% in eager execution
+against 9.37% and 25.30% in their A/A controls. Their ratios are therefore observations
+from cells that failed the spread diagnostic, including eager `str-pair-names` at 0.954
+times with a 95% interval of 0.946 to 0.962 across twelve faster rounds. Six one-thread
+observations kept their 95% interval above 1.0 with more than 0.5 µs of added time despite
+unchanged or lower per-request instruction counts. Added times below use the formula
+`pooled base median × (order-balanced ratio − 1)`, and all six also exceed 0.5 µs on the
+median of the 12 paired round differences, where eager `str-filter-two` reads +15.6 µs
+rather than +20.2 µs. Item 1089 tracks all six for profiling and recovery on Intel
+hardware by the second batch after the one that lands item 1140, with the `streaming-1t`
+A/A failure disclosed above and eager `str-pair-colleague` awaiting confirmation:
+
+* On `atlas`, `a643de75` to `329f82f9`, streaming `str-pair-colleague` reads 1.0049 times
+  with a 95% interval of 1.0006 to 1.0078, +49.1 µs across 9 of 12 slower rounds and
+  0.9979 times the instructions.
+* On `atlas`, `a643de75` to `329f82f9`, streaming `str-pair-lt` reads 1.0021 times with a
+  95% interval of 1.0004 to 1.0029, +24.0 µs across 10 of 12 slower rounds and 0.9939
+  times the instructions.
+* On `atlas`, `a643de75` to `329f82f9`, streaming `lang-filter` reads 1.0047 times with a
+  95% interval of 1.0038 to 1.0060, +6.1 µs across all 12 rounds and 1.0000 times the
+  instructions.
+* On `atlas`, `a643de75` to `329f82f9`, eager `str-pair-colleague` reads 1.0046 times with
+  a 95% interval of 1.0014 to 1.0067, +36.6 µs across 9 of 12 slower rounds and 0.9978
+  times the instructions. In the valid `eager-1t` A/A control it read 1.0028 times with an
+  overlapping 95% interval of 1.0008 to 1.0039 and +22.6 µs, so this cost awaits
+  confirmation.
+* On `atlas`, `a643de75` to `329f82f9`, eager `lang-filter` reads 1.0061 times with a 95%
+  interval of 1.0043 to 1.0073, +7.9 µs across all 12 rounds and 1.0000 times the
+  instructions.
+* On `atlas`, `a643de75` to `329f82f9`, eager `str-filter-two` reads 1.0008 times with a
+  95% interval of 1.00003 to 1.0015, +20.2 µs by the formula (+15.6 µs paired round
+  median) across 9 of 12 slower rounds and 1.0000 times the instructions.
+
+`str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so most
+floors are computed only once. A profile of the per-worker maps put most of their cost
+in `Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and
+its predecessor. Item 1088 uses the common prefix length stored by both vocabulary
+codecs to detect a proper extension inside a block. A block boundary still needs the
+preceding key. The checked floor walk admits its initial scratch before the walk and
+reuses it across lookups. The cache can defer allocation when the first eligible mask's
+estimate predicts few hits, or bypass a table after a sufficiently large sample of
+lookups falls below one hit in eight. Every fourth mask probes so that late reuse can
+re-enable floors, including when shuffled `str-pair-names` repeats few values in its
+first batch.
+
+The direct comparison uses the same single-key block walk for each operand, with a
+reusable buffer for each key. A full FSST suffix needs no separate length scan when
+the admitted buffer fits the maximum decoded length and the optional decoder headroom.
+For other suffixes the growth check still uses the measured length. Scratch remains
+inside the decoding envelope, and the cursor's checkpoints still report cancellation
+and required decoding refusals. [Forge confirmation](#forge-confirmation-for-item-1088)
+of the streaming cost is pending.
 
 Queries that the floors do not reach also became slower in every round, and item 1089
 holds these costs. The 37-query screens compared 174de1f8, before the shared table, with
@@ -350,32 +427,49 @@ not project. The seeded queries of `tests/query_cursor.rs` compare the eager ans
 the cursor answers at batch sizes 1, 2, 3 and 4,096 with it over a compacted base, a
 pending delta, several index blocks and a masked view, and the optimizer, index-join and
 string-filter tests compare `Optimizations::ALL` with it as well as with
-`Optimizations::NONE`. Both go through one comparison, which passes no answer that the specification
-forbids and, where it cannot decide, reports a partial or unordered comparison instead.
+`Optimizations::NONE`. Both use the same comparison of terms, numeric values and ordering.
+It reports when it can check only part of an answer.
 An open column is compared only by its place in the rows, which makes the comparison
-partial. A column that only computed values bind compares numbers by datatype and value,
-and a column that only copied terms bind compares them exactly. Arithmetic, the numeric
-functions, a cast to a number and the COUNT, SUM and AVG aggregates compute values. A
-variable, a constant, IF, COALESCE, STRDT, STRLANG, STRLANGDIR and the MIN, MAX and SAMPLE
-aggregates pass on the terms or lexical forms they are given, and any other operator
-counts as both. A string or constructor that shows the lexical form of a computed number,
-such as `STR(1.0 + 1.0)` or `STRDT(STR(1.0 + 1.0), xsd:decimal)`, still compares exactly,
-so an engine that writes that number in another allowed form would fail the comparison. A column bound by both,
-such as a COALESCE over a variable and a constant, compares exactly, and a number that
-differs there only in its lexical form makes the comparison partial. An ordered or sliced
-answer must be a slice, at the query's offset, of an order that ORDER BY allows, and an
-answer with open rows is left uncompared. A sort key stops before the first condition
-that reads an open value. The conditions after it can still order the rows that tie
-before it, so the key only finds an answer that the earlier conditions forbid, and
-otherwise the order is unchecked and a slice of it is left uncompared. A slice that passes
-the checks against each other row is compared when the reference's other rows, placed
-around it in their own order, complete it to an order that ORDER BY allows. When that
-completion breaks a constraint between two rows, or the order of a slice is otherwise not
-established, the slice is left uncompared. Where DISTINCT keeps a row whose copies have different sort
-keys, the order is unchecked and a slice of it is open. The order check tests the strict
-order between every two blocks of equal keys that it meets, gives up past 50 million key
-comparisons, and where equal rows with different keys make its matching ambiguous it
-reports the order unchecked rather than fail. Whether an open value is bound is open too,
+partial. The evaluator records how each binding was produced. Copied terms and constants
+compare exactly. Arithmetic, numeric functions, numeric casts and COUNT, SUM and AVG
+produce numbers that compare by datatype and value. Variables, IF, COALESCE, MIN, MAX
+and SAMPLE retain the provenance of the binding they return.
+
+STR, STRDT, STRLANG and STRLANGDIR can carry the spelling of a computed number. An exact
+match compares fully. A different spelling of the same value in the source number's
+datatype compares partially if the result's datatype, language tag and base direction
+match. An xsd:string cast from a number has a prescribed spelling. A cast that copies a
+string can carry its provenance. String transformations compare exactly. The comparison
+uses the reference's spelling for expressions that select rows or aggregate values.
+
+An ordered or sliced answer must follow an order that ORDER BY allows. The comparison
+uses the engine's spelling for a key it can recover from the returned bindings.
+A key stops before the first open value or spelling it cannot recover. This includes
+a hidden aggregate key whose inputs, selection or distinct solution count depend on
+spelling, or a variable whose BIND may be unbound under a different spelling. A
+distinct solution count stays fixed when fixed bindings, fixed presence or distinct
+fixed metadata already separate every spelling-dependent pair within the evaluator's
+proof budget. That budget bounds both recursive bucket refinement and pairwise
+distinctness checks across the evaluation, and the count keeps its spelling dependency
+if the budget runs out. In MIN and MAX, a
+guaranteed candidate in a strictly better RDF term class rules out lexical-only
+candidates in worse classes. Metadata reads such as LANG and DATATYPE keep their
+place when the remaining input can change only lexically, as with UCASE on a computed
+string or a selection aggregate whose winning-class candidates share their RDF
+metadata. Earlier conditions can still rule out an order or slice.
+
+When several reference rows match a returned row, the comparison uses the observed
+keys of those candidates to check for inversions. A slice must have room on either side
+for omitted rows whose order is forced across the candidate keys, counting each
+returned row at most once across the groups it can match. The comparison reports the
+order unchecked when it cannot establish the order from these constraints and leaves a
+slice of it uncompared. It also leaves an answer with open rows uncompared.
+A slice that passes the checks against each other row is compared when the reference's
+other rows, placed around it in their own order, complete it to an order that ORDER BY
+allows. Otherwise the slice is left uncompared. DISTINCT retains the common sort key
+prefix of a row's copies. The order check tests the strict order between every two
+blocks of equal keys it meets and gives up past 50 million key comparisons.
+Whether an open value is bound is open too,
 so BOUND, EXISTS, a join, DISTINCT, a LATERAL join and a GRAPH pattern whose name is a
 variable that its inner pattern binds make the rows open when that variable holds open
 values. Numbers sort by their exact values, which keeps the sort
@@ -391,22 +485,42 @@ by both copied terms and computed values that differs only in a number's lexical
 the algebra treats as a variable, so a `COUNT(DISTINCT *)` over such a middle is an open
 value. A query whose nested loops pass the evaluator's work limit of 20 million
 intermediate solutions is left uncompared, and so is one that reads a number of more than
-16 digits. The comparison found disagreements, which items 1064, 1065, 1071 and 1077 hold. The
+16 digits. The comparison found disagreements, which items 1064, 1065, 1071 and 1077 held. The
 engine passes over an error in MIN and MAX, where the specification's order makes MIN an
 error and Jena makes both an error, and it follows Jena in making AVG over errors only an
-error and in letting GROUP_CONCAT read IRIs and numbers. It does not read an
+error and in letting GROUP_CONCAT read IRIs and numbers. It did not read an
 `xsd:integer` or `xsd:decimal` beyond the range of its decimal type as a number, which
-XSD permits and Jena does not do. Its string functions take a directional string and a
+item 1065 resolved by adding bounded arbitrary-precision `BigInt` and `BigDec` fallback
+variants capped at 4,096 significant digits and 4,096 fractional digits while keeping
+ordinary `i64` and `Decimal` values on their fixed-width fast paths, and bumping
+`vocab.num` to magic `SPKVNUM4` so out-of-range numeric literals classify as `UNKNOWN`
+and decode from the vocabulary. Its string functions once took a directional string and a
 language-tagged string of the same language as compatible arguments, which SPARQL 1.2
-and Jena do not. The evaluator evaluates the aggregates of item 1064 under the
-specification's, Jena's or the engine's reading, answers the W3C suites under the
-specification's, and compares the engine under the engine's current reading until the
-setting of item 1064 lands with Jena's as its default. The evaluator notes where a query
-meets item 1064 or 1071, and the tests compare such a query exactly under the engine's
-reading. Item 1077 holds three
-XSD and XPath readings in which the engine differs from both the specification and
-Jena, `isNumeric("inf"^^xsd:double)`, the canonical form of a double cast to a string and
-`.` in REGEX, which matches a carriage return. The
+and Jena do not. With item 1071, `STRSTARTS`, `STRENDS`, `CONTAINS`, `STRBEFORE`,
+`STRAFTER` and vocabulary-key filters compare language tag and base direction.
+Matching string-returning functions preserve the base direction. The evaluator dropped
+its compatibility workaround for these functions. For the aggregates of item 1064,
+the evaluator answers the W3C suites under the specification's reading. Engine
+comparisons follow item 1064's setting, whose default is Jena's. Item 1077 has shipped and resolves the three XSD and XPath disagreements flagged
+by the reference comparison. `xsd:float` and `xsd:double` parsing now accepts only XSD 1.1
+lexical forms (`INF`, `+INF`, `-INF`, `NaN` and decimal or exponent numerals) across
+expression evaluation, XML-whitespace-trimmed string casts, `numeric_key`, inline literal
+encoding, `vocab.num` classification and `xsd::is_valid`. The numeric column format marker
+is bumped to `SPKVNUM3` so pre-existing `SPKVNUM2` files fall back to key decoding until
+recompaction or `add_numeric_column`. Casting `xsd:float` or `xsd:double` to `xsd:string` spells `NaN`, `INF`, `-INF`, `0`, and
+`-0` directly. Finite nonzero values whose absolute magnitude lies in `[1e-6, 1e6)` format
+as each type's shortest round-trip decimal, matching the reference evaluator while Jena
+widens `xsd:float` to `double` through `BigDecimal.valueOf`. Finite nonzero values with
+absolute magnitude below `1e-6` or at least `1e6` format in scientific notation with an
+uppercase `E` and at least one fractional digit, such as `"1.0E6"` for `1e6`, `"-1.0E6"`
+for `-1e6`, and `"1.0E-7"` for `1e-7`. XPath regular expression translation removes XML
+whitespace outside character classes before interpreting escapes under the `x` flag while
+preserving literal spaces inside classes, tracks inline Rust `(?s)`, `(?-s)`, and `(?x)`
+flag scopes including whitespace and comments after `(`, preserves named capture headers
+verbatim, rewrites unescaped `.` outside character classes to `[^\n\r]` when effective `s`
+is disabled, and treats `REPLACE` replacement strings literally under `q` without capture
+expansion across `REGEX`, `REPLACE`, key-filter pushdowns, mapping `REPLACE`, SHACL, and
+ShEx. The
 evaluator takes two well-formed values of different supported types, such as a string
 and an integer, as unequal, which the note to section 17.4.1.7 allows and Jena does by
 default, where Jena's strict mode and the section's main text make the comparison an
@@ -521,12 +635,75 @@ stops before successful completion metadata. Native output holds a whole decoded
 rather than one cell at a time, and its additional live storage counts against the
 budget. These remain estimated heap charges rather than process RSS limits.
 
-Hierarchical ownership of public results, native buffers, reasoner work and views, and
-strict decoding throughout their callers remain part of item 675.
-One follow-up of item 675 is MCP native frame ownership. MCP tool results are still
-application copies of their rendered text. A retained renderer would keep each response
-frame under its query's credit until the transport writes it. That needs an rmcp
-transport qualified for retained results, including session replay and tasks.
+The remaining stage 4 ownership seams are tracked by their own items. Retaining every
+result table under its own lease belongs to the merge phase of item 453, linking the
+reasoner's budgets and incremental views into the query pool belongs to item 675, binding
+result buffers belong to item 1306, strict decoding across all callers belongs to item
+1308 and the post-merge retained-source flip for MCP rendering belongs to item 1305.
+
+MCP tool results, resource reads and completed task results keep their rendered payloads
+and encoded wire frames under query memory credit until the transport writes or drops
+them. `sparql_query` renders compact table and JSON pages iteratively under `NativeBudget`
+with a single-row transient workspace rather than building uncredited full-result text
+copies. On crates.io `rmcp`, qualified stdio and Streamable HTTP transports,
+`Last-Event-ID` session replay buffers and background tasks carry staged responses and
+encode each wire frame directly into `Bytes` backed by `OwnedBytes` credit, releasing that
+credit on delivery, client disconnect, cancellation, TTL expiry or session close. Budget
+refusals release retained credit before returning an MCP error frame. Rendering directly
+from the post-merge leased result table follows the flip in the merge phase of item 453.
+
+### Snapshot, mask and graph-access escapes
+
+Item 1307 audited 46 snapshot, mask and graph-access surfaces across the core, facade,
+server and binding crates, closed the actionable escapes behind owned handles or
+non-owning caches and documented the intentional caller-owned views.
+
+`PreparedView::snapshot`, `PreparedView::access`, `BoundEvidenceView::snapshot` and
+`BoundEvidenceView::shared_snapshot` are now crate-private so external callers cannot
+clone an uncredited masked snapshot or bound access policy past its preparation
+reservation. `GuardDecision::exempt_controlled` now takes a scoped non-escaping
+`GuardSnapshot` instead of `&Arc<Snapshot>`, so controlled providers cannot retain a
+paid snapshot past preparation. External callers consume prepared and evidence views
+through `BoundReadSource`, `BoundEvidenceView::prepare_view`, `Reads::from_prepared`,
+`Reads::from_evidence` and non-escaping policy and metadata accessors on `PreparedView`.
+`BoundEvidenceView::prepare_view` retains the evidence view, its reservation, its
+Store-instance validation and a weak identity of the original policy `Arc` inside the
+returned `PreparedView`. In the server, GraphRAG's `Evidence` replaces `snapshot`
+with `read_source` and `commit` using the server query pool and configured execution
+memory budget with a distinct `Preparation::with_selection_limit` ceiling for evidence
+selection, and MCP memory recall runs evidence-backed reads and conflict checks
+through `BoundReadSource` and `Schema::constraints_for_evidence` under the call's grant
+or dataset pool with the same distinct selection ceiling instead of cloning the raw
+snapshot or opening live `HEAD`.
+
+`Snapshot::mask`, `Snapshot::counts` and `access::triples::apply` are now crate-private,
+with read-only non-escaping accessors `has_mask`, `mask_id`, `mask_key` and
+`hidden_quad_count` on `Snapshot`. `CountCache` stores non-owning weak references in
+separate legacy `masks` and controlled `controlled_masks` tables alongside weak `views`,
+with best-effort drop-time slot eviction on `Mask` and dead-entry pruning on lookup and
+insertion. Legacy callers cannot upgrade a mask paid for by a controlled preparation, and
+masked delta nodes and visible-graph lists do not survive past their last live owner.
+`GraphAccess::bound` stamps each decided guard with the view's dataset, generation,
+commit, mask and uncommitted view identity; checked read paths and facade evidence
+readers validate both top-level and nested rules, accepting the matching view and
+refusing another commit, store, uncommitted view or masked derivative. `WriteTxn::graphs`
+is removed and `WriteTxn::prepare_read_view` reserves the transaction snapshot storage up
+front and returns a `PreparedTxnView` borrowed from the writer so neither the view nor
+its `ScopedQueryResult` can outlive `WriteTxn::discard_terms` or a dry-run rollback;
+`PreparedTxnView::query` also refuses owning snapshot callbacks (`QueryOptions::reasoning`
+and `QueryOptions::views`) so a provider cannot retain the transaction snapshot past drop.
+`QueryBatch::transient_term`, used only by the FFI cursor encoder, remains deferred to
+coordinate with items 1306 and 1308.
+
+The remaining audited getters are intentional caller-owned unbudgeted views or unbound
+policy builders documented as limitations in the server and storage guides. These cover
+`Store::snapshot`, `Dataset::snapshot`, `QuadIter::snapshot`, `Embedder::snapshot`,
+`WriteTxn::view`, `WriteTxn::base`, `WriteTxn::read_view`, `Snapshot::without_cache_fill`,
+`Snapshot::with_overlay`, `Snapshot::generation`, `Snapshot::delta`,
+`sparql::with_union_default`, `Opened::snapshot`, `ReportOutcome::snapshot`,
+`Store::managed_snapshot`, `Access::view`, `Grants::graphs`, `guard::apply`, incremental
+view snapshot accessors covered by item 675 and internal context structs that carry a
+caller's snapshot.
 
 ### Dead compaction arm and one generation switch
 
@@ -578,10 +755,8 @@ different algorithms for diagnosis. `expr_cache`, `sampled_filters`,
 `decorrelate_exists`, `count_filter_runs`, `filter_scan_runs` and `topk_first_key` are
 switched off at run time for queries that call extensions, so their off paths are live.
 The cost-model switches `sampled_filters`, `characteristic_sets`, `probed_keys` and
-`fused_star_costs` are what the cost calibration harness compares. `grow_input` and
-`decode_ahead` are the memory and latency tradeoffs that the cursor tests measure against
-their off paths, and the sequential writer stays as the path of a single Rayon worker.
-The prefetch and decoding switches of X07 wait for item 4 under item 478. The switches
+`fused_star_costs` are what the cost calibration harness compares. `grow_input` remains a diagnostic switch. Cursor tests still compare decoding ahead
+with sequential decoding, which also serves a single Rayon worker. The switches
 that shipped with their measurements in the current release, `probed_optional` and
 `bound_order_keys`, keep their off paths as the baseline of the forge checks.
 `gallop_index_join` chooses between the galloping reader and the clustered reader, which
@@ -631,9 +806,14 @@ are gone, and the store options they set, `wal_direct_writes` and
 and of the group set. The buffered path still serves a file system that refuses direct
 I/O. The undocumented `SPARKLES_DEBUG_CACHE` printout of result-cache keys is deleted.
 
-The cold-read switches `SPARKLES_IO_HINTS`, `SPARKLES_SPARSE_VOCAB` and
-`SPARKLES_READ_WINDOW_KB`, and the prefetch and decoding switches of `Optimizations`,
-remain until item 4 has measured them, and item 513 makes them test-only then.
+Item 513 removed `SPARKLES_SPARSE_VOCAB` and `SPARKLES_READ_WINDOW_KB`. Vocabulary
+opens use the sparse index when the reader can hold it, and permutation scans and
+vocabulary passes use a fixed 4 MiB read-ahead target. The `prefetch_blocks`,
+`prefetch_constants`, `prefetch_terms` and `prefetch_first_scan` fields of
+`Optimizations` compile only for unit tests. The `parallel_decode` and `decode_ahead`
+fields are hidden controls used by integration tests. The six switches are absent
+from `SPARKLES_DISABLE_OPTIMIZATIONS` and the named diagnostics. Item 513 still tracks
+`SPARKLES_IO_HINTS` after item 573.
 `SPARKLES_NO_IN_PLACE` remains as the method of the published memory benchmark, which
 compares the in-place runner with the blocking pool.
 
@@ -929,11 +1109,12 @@ row of the table before it starts, which is more than the 12 bytes and one value
 decoded row that the separate large-input pre-decode admitted. Under a budget with little room left,
 a large column can therefore fall back to its rows where it was decoded before, which
 costs time but no correctness. The comparison of two string columns through cached
-lexicographic floors serves eager tables and cursor batches of at least 4,096 rows. A floor reads its
-string's key, the key before it and, for a string that other strings extend, the search
-for the first of them inside the decoding envelope, and a refused read fails the
-comparison with the refusal it recorded. The floors last the query in a charged cache,
-which the batches of a cursor share.
+lexicographic floors serves eager tables and cursor batches of at least 4,096 rows. A floor
+uses the string's key and its shared prefix length within the block. When that length is
+unavailable, it reads the preceding key. If the preceding key extends the string, the
+lookup searches for the first extension. These reads use the decoding envelope, and a
+refused required read fails the comparison with the refusal it recorded. The floors last
+the query in a charged cache, which the batches of a cursor share.
 
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
 reads of the accounting mode outside tests and fails above its bound. A read is a call of
@@ -1056,7 +1237,12 @@ measurement of item 570's conditional OPTIONAL in both modes on the benchmark wo
 which the plan asks of this phase, was taken after the cursor gained a conditional
 merge, and the
 [X05 outcome](../X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19)
-records it.
+records it. A follow-up in the
+[pair-condition X05 outcome](../X05-streaming-query-execution.md#pair-conditions-in-the-streamed-merge-2026-11-23)
+enables `merge_pair_conditions` by default to test eligible single-key pairs before
+copying output rows; measuring the streamed-to-eager ratio on `knows-*` and admitting
+eligible EXISTS conditions once item 1105 unifies merge-order derivation remain under
+item 570.
 
 ### One grouping operator
 
@@ -1071,11 +1257,24 @@ the aggregate underneath once. `Rows` runs the per-group kernel `exec::aggregate
 registered aggregate over its group's rows, which FOLD, registered aggregates and the
 other custom aggregates, `MEDIAN` and `MODE` among them, need. `AggState` gained `merge` and
 `retract`. `merge` keeps row order for SAMPLE, GROUP_CONCAT and the ties of MIN and MAX,
-and a statistics aggregate does not merge. `retract` takes back unit-weight rows of
-COUNT, SUM and AVG without DISTINCT. The view operator of `incr/ops/group.rs` keeps its
-own states, which item 418 extended with an ordered multiset of each group's values, and
-adds and retracts with a weight per change. It does not use the trait, and moving it
-there would give `Batch` a weight column.
+and a statistics aggregate does not merge. `retract` takes back rows with an optional
+signed weight column on `Batch`, defaulting to unit weight for one-off queries. The
+incremental view operator in `incr/ops/group.rs` runs every aggregate through the shared
+`Accumulator` trait via `acc::retractable`, folding positive weights with `add_batch` and
+negative weights with `retract`, and reading live groups without destroying their state.
+`COUNT` uses `Running` directly, `SUM` and `AVG` use `RetractableSum`, `MIN`, `MAX`,
+`SAMPLE` and `GROUP_CONCAT` use `Ordered` over an ordered multiset, and `DISTINCT`
+aggregates wrap their inner accumulator in `RetractableDistinct`. All one-off and view
+accumulators share `finish_sum_avg`, `finish_best` and `finish_concat` so every reading of
+`aggregate-errors`, empty groups and numeric promotions agrees across both paths.
+`RetractableSum` sums integers and decimals in 256-bit exact arithmetic and promotes an
+overflowing exact subtotal to float or double when the group holds float or double terms,
+keeping its result independent of row order where a one-off left-fold can overflow earlier
+if overflowing decimals precede a float or double. Deleted non-implicit groups release
+their slot and state with `swap_remove`, reclaim oversized or emptied backing buffers and
+account for allocated buffer capacity in view memory budgeting, and `Group::save` writes a
+versioned state header alongside the bumped incremental compiler version `f13-phase2-6` so
+unknown versions and earlier checkpoints are refused cleanly.
 
 The operator finds each row's group through a hash table on the keys, in order of first
 appearance. When every aggregate keeps running state, rows arrive in any batches, and a
@@ -1097,16 +1296,7 @@ are evaluated once per batch through `compute_column`, which reuses one value pe
 distinct input in both modes. An eager grouping of a query that may spill charges its
 groups, and when they do not fit, it runs again as the cursor's grouping over its input
 table and its plan notes `[groups did not fit: partitioned to disk]`. An eager grouping
-of a query that cannot spill charges nothing, as before. The `incremental_group` switch
-stays as a diagnostic that sends every aggregate through `Rows`, so the optimization
-tests keep an independent check of the running states until item 512's reference
-evaluator replaces it, and the merge phase retires it. The parallel split of a grouping
-over Rayon with `merge`, which the plan names, is not built, since the eager grouping
-was sequential before and the sequential operator measured faster than its base with one
-thread. The 12-thread cells of the forge matrix decide its value. Roadmap
-item 1066 holds the split, together with the cases in which a merged SUM or AVG differs
-from one pass. A DISTINCT accumulator charges the slots and values it passes to the
-aggregate underneath while that aggregate reads them.
+of a query that cannot spill charges nothing, as before. The `incremental_group` switch stays as a diagnostic that sends every aggregate through `Rows`, so the optimization tests keep an independent check of the running states until item 512's reference evaluator replaces it, and the merge phase retires it. Eager hashable groupings with at least `PAR_GROUP_THRESHOLD` and at most `u32::MAX` rows on multi-threaded pools now dispatch to `par::whole_parallel`, except ungrouped pure-count plans that take the constant-time row-count shortcut. `whole_parallel` runs contiguous range-split folding with `Accumulator::merge` for ungrouped and low-cardinality mergeable groupings and key-hash partitioning for higher-cardinality groupings and for grouped non-mergeable running aggregates that sample more than one distinct key. Ungrouped non-mergeable plans go straight to sequential grouping, and grouped non-mergeable plans with at most one sampled distinct key also bypass hash partitioning and run sequentially. `AggState::can_merge` and `Running::merge` check exactness against single-pass semantics for `SUM`, `AVG`, `MIN` and `MAX`, re-folding only refused aggregates sequentially over the built global group index, and falling back to key-hash partitioning on high cardinality or to sequential execution under tight memory pressure without latching sticky memory failures. The 12-thread benchmark cells on `forge` remain open under roadmap item 1066 to decide where parallel dispatch stays enabled. A DISTINCT accumulator charges the slots and values it passes to the aggregate underneath while that aggregate reads them.
 
 Tests compare mixed aggregates with HAVING between eager execution and the cursor at
 batches of one row and 4,096 rows, with and without the memory to hold the groups, and
@@ -1159,10 +1349,10 @@ run the eager kernel through `execute_with_inputs` or `execute_owned`, so the me
 move them. EXPLAIN gives each operator a reason that names what it reads whole or what
 bounds its answer.
 
-The strict policy refuses the unbounded forms, which are a SERVICE, a view read, a
+The strict policy originally refused the unbounded forms, which included SERVICE and view reads, a
 spatial scan or relation over constants, a search without a bound, a path search between
 constants without a limit, a spatial join, a property function over constants and a
-registered property function without prefix output. They are the second part of the item. Automatic execution keeps its base
+registered property function without prefix output. They are the second part of the item, whose [readers](#streamed-service-text-and-history-readers) serve a SERVICE without SILENT, a text search without a bound and a history query without a limit. Automatic execution keeps its base
 set of expanding kinds, and each new kind joins it only after a same-host A/B of eager
 against streamed runs. The text, geo and vector benchmark scripts send an `EXECUTION`
 mode with every request, and the vector script fingerprints its exact and approximate
@@ -1239,6 +1429,175 @@ its merge base with main, 5f3f69c2, streamed and 1.006 eager, so no query is 5% 
 slower at 12 threads, which is the stage's acceptance gate. The
 [synthetic results](../../benchmarks/synthetic/RESULTS.md#leaf-cursors) list each query.
 
+### Streamed SERVICE, text and history readers
+
+The second part of item 829 gives three of the refused kinds resumable readers that hold
+one page of their answer between pulls. They serve explicit streaming, and automatic
+execution runs these forms eagerly until a same-host A/B admits them. Each opens nothing
+until its first pull, because operators are also built to learn whether an EXISTS
+pattern streams, so its checks, its request and its errors come when an eager run would
+reach the node.
+
+A SERVICE without SILENT, in `cursor/service.rs`, parses a remote response as it arrives
+and holds one output batch and the parser's buffer. A query endpoint of the same process
+opens as a cursor of its own under the caller's policy, charged to the caller's memory
+budget, and the reader pulls one of its batches per batch. One blank-node map spans the
+whole answer, as in one eager call. A cached answer is read from its entry, which the
+reader keeps charged while it reads, since the cache may evict the entry meanwhile. Three
+things differ from an eager run. A failure after rows were emitted fails the cursor. An
+answer enters the cache only when it was read to its end, and the copy for the cache is
+dropped once it grows past the largest entry the cache keeps or past what the budget
+holds beside the answer. The outbound timeout counts from the start of the request, while
+the query's deadline leaves out the time a consumer keeps the cursor waiting, so a slow
+consumer can expire a transfer that an eager run would finish. In part 2, the strict policy
+refused a SILENT SERVICE, which needed its whole answer before its first row, and a JSON
+response whose results come before its head, which [item 1125](../../ROADMAP.md) decodes in
+either order; part 3 below moves SILENT SERVICE onto a native budget-buffered cursor. Under
+the permissive policy, a late-head JSON response is buffered under a memory
+charge, and the runtime plan reports and retains `fullInputBeforeOutput` on that SERVICE
+node after the response is released. Its refusal inside an EXISTS fails the query, as it
+does outside one.
+
+A text search with a constant query and no limit, in `cursor/text.rs`, collects its
+scored hits in one pass over each index segment, charging the hit list before each growth,
+and decodes rows from it a page at a time. The row state that eager execution keeps for
+one call, which holds the duplicate set, the default graph's filter, the stale hits and
+the rank, lasts across pages, so ties and duplicates that span a batch keep their eager
+answers. A search over more hits than the index's `maxHits` fails with eager's row error.
+A search with a limit keeps the bounded leaf of the first part, and
+[item 1155](../../ROADMAP.md) routes a limit above `maxHits` through the reader. An
+earlier form counted the hits without scores before it collected them, which built the
+query's automaton and scorers twice and cost about 2.2 million instructions per request,
+and the [experiments page](../../PERFORMANCE-EXPERIMENTS.md#query-execution) records it.
+
+A history query without a limit or input, in `cursor/history.rs`, reads the change log a
+page of whole commits at a time through `store::HistoryPages`. Each record's frame is
+admitted before it is read and its decoded size before it is decoded, and the page stays
+charged until its rows are handed out. A commit larger than a page is held whole, as eager
+execution holds it. The reader pins the log at the first commit of its range until the
+range ends or the reader is released, so retention keeps the segments it has still to
+read, past `maxBytes` too, and turning the log off is refused meanwhile. It counts the
+changes it accepts and fails past the row budget at the change where an eager run fails.
+Deleting the branch or dataset still removes the segments under a read, which
+[item 1173](../../ROADMAP.md) holds, eager execution does not admit records before it
+decodes them, which [item 1124](../../ROADMAP.md) holds, and a read-only log's newest-first
+walk is [item 1175](../../ROADMAP.md).
+
+Every `SERVICE path:search` without `path:limit` now runs natively through
+`cursor/pathsearch.rs` and `pathsearch::Reader`, covering `path:shortest`,
+`path:allShortest`, `path:kShortest` and `path:all` across constant or variable
+endpoints, group inputs and nested edge patterns (items 1122 and 1123). Search trees,
+distance maps, priority queues, candidate tables, path-reconstruction stacks and
+triple-term caches pre-admit every allocation and growth through the query's memory
+budget before allocating and release their charges on completion, error or early stop.
+Single-ended breadth-first and Dijkstra searches, bidirectional unweighted and weighted
+`path:allShortest`, Yen's algorithm and depth-first `path:all` stream matching paths one
+at a time through resumable iterators, so a `LIMIT` over a graph with many tied shortest
+paths stops without materializing every path. Searches over a group input or a nested
+edge pattern without `path:limit` read their group rows into a charged buffer and stream
+edge-pattern batches into pre-admitted adjacency maps before streaming matching paths
+batch by batch, reporting `fullInputBeforeOutput` on the `PathSearch` node. Grouped
+streaming emits each discovered path across its matching group rows without
+materializing every path of a search, matching eager execution in full solution
+multiset, `pathIndex` numbering, per-node search counters and work counts at every batch
+size while allowing row order across group rows that share an endpoint to vary when no
+`ORDER BY` is present.
+
+A maintained view read streams from the immutable version published by its circuit.
+Current and stale readers release the circuit lock after taking a reference. A published
+row table and frozen term table count toward the view memory pool while readers still
+hold them. A local term key has one charge across the circuit and all frozen tables that
+share its backing. When the circuit has advanced
+within the retained history, the reader admits and folds history slices and applies the
+net change while streaming the shared table.
+
+When history has expired or the reader asks for another aggregate-errors reading, a
+child query runs under the caller's memory, row-work, spill, cancellation and deadline
+controls. Rebuilds admit the principal's permission mask before allocating it. The child
+retains the mask's charge and releases temporary planning credit before it streams.
+SELECT rebuilds preserve the maintained treatment of each REDUCED occurrence. CONSTRUCT
+rebuilds use the maintained VALUES terms for template blank-node identity and charge
+distinct graph state as the graph streams. Strict policy also
+applies inside the child. A custom source that only implements eager view reads requires
+the permissive policy. The cursor inventory and heap audit cover the maintained readers.
+The inventory test `cursor_inventory.rs` lists every built-in plan form as native.
+
+Leaf ARQ property functions (`Kind::PropertyFn` without plan inputs) and `SILENT SERVICE`
+now run natively under `FallbackPolicy::RejectMaterialization`, completing item 829.
+`cursor/propertyfn.rs` and `arqpf::LeafReader` stream store-backed collections, RDF
+containers, `rdfs:member` triples and `apf:strSplit` tokens a batch at a time under
+`OwnedCharge` with cooperative control polling, and emit constant scalar functions on
+first pull. `cursor/service.rs` runs `SILENT SERVICE` lazily by draining remote and
+in-process responses into a memory-charged buffer before the first row so open-time and
+mid-stream endpoint failures become one empty solution while cancellation, query
+deadlines, policy refusals, budget limits and strict callee refusals still propagate;
+cache hits stream directly and late-head JSON is accepted under byte metering because the
+operator already reports `fullInputBeforeOutput`. Every built-in form in
+`cursor_inventory.rs` runs natively, and the ARQ property-function and CDT streaming
+suites record zero eager fallbacks. Strict cursors still refuse only unprefixed
+user-registered property functions, legacy eager-only `ViewSource` implementations,
+late-head JSON responses on non-`SILENT` `SERVICE` (tracked in
+[item 1125](../../ROADMAP.md)) and operators whose `EXISTS` embeds one of those shapes.
+
+Tests compare each reader with eager answers at batch sizes down to one row, refuse the
+budget and row limits where eager execution refuses, measure each reader's heap against
+its ledger in `cursor_text_heap.rs`, `cursor_history_heap.rs` and
+`cursor_memory_audit.rs`, and cover retention and disabling between pulls, a branch
+deleted under a read, endpoint failures, timeouts, cancellation and the cache.
+
+Checked history cursors honor source and query cancellation and absolute deadlines during
+read-only timestamp lookup as well as during page reads. To avoid allocating term tables
+while resolving time bounds on a read-only log, `ReadOnlyLog::commit_at_time` validates
+each frame's CRC, metadata, term framing and quad term references in place without
+materializing `Arc<[u8]>` term payloads, while preserving consecutive-prefix semantics,
+full-walk head-before-clamp selection and cooperative stop precedence. On `forge`, an
+Intel i5-13500 pinned to CPU 2 with one Rayon thread, matched release builds of
+`2233637a` and `01b46ba1` ran all 26 cells of the history timing matrix with 12 ABBA,
+12 BAAB and 12 same-binary rounds of 200 samples per process and 100% row-count
+agreement. Checked first pulls on archived ancestor logs became 9.9% faster on
+`ancestor-one`, at 0.901 of the base and 16.95 ms against 18.80 ms, and 15.1% faster on
+`ancestor-two`, at 0.849 and 20.90 ms against 24.61 ms. No cell failed the 2% bound.
+The 16 primary cells on writable history logs that showed a real slowdown between 0.46%
+and 1.13% are recorded below for [item 1074](../../ROADMAP.md) on host `forge` comparing
+`2233637a..01b46ba1`, to be recovered by profiling the checked cursor's per-entry control
+polls and timestamp-index lookup path within two batches or by 2026-12-08.
+
+| Query and route | Phase | Host | Commits | Baseline | Ratio and 95% interval | Added | Recovery and deadline |
+|---|---|---|---|---:|---|---:|---|
+| `commit-warm` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.26 ms | 1.0053, 1.0036 to 1.0063 | +43.9 µs | Item 1074, within two batches or by 2026-12-08 |
+| `commit-warm` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.50 ms | 1.0046, 1.0029 to 1.0059 | +34.5 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-first-one` checked | `first` | `forge` | `2233637a..01b46ba1` | 123.1 µs | 1.0103, 1.0080 to 1.0113 | +1.26 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-first-two` checked | `first` | `forge` | `2233637a..01b46ba1` | 123.6 µs | 1.0112, 1.0099 to 1.0121 | +1.38 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-one` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.12 ms | 1.0075, 1.0060 to 1.0089 | +60.8 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-one` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.37 ms | 1.0056, 1.0027 to 1.0090 | +41.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-one` eager | `eager` | `forge` | `2233637a..01b46ba1` | 31.48 ms | 1.0113, 1.0094 to 1.0126 | +354.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-two` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.23 ms | 1.0057, 1.0048 to 1.0069 | +46.8 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-two` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.49 ms | 1.0046, 1.0030 to 1.0061 | +34.4 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-two` eager | `eager` | `forge` | `2233637a..01b46ba1` | 30.99 ms | 1.0103, 1.0083 to 1.0141 | +320.7 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-one` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.21 ms | 1.0083, 1.0050 to 1.0117 | +68.0 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-one` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.43 ms | 1.0089, 1.0064 to 1.0108 | +66.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-one` eager | `eager` | `forge` | `2233637a..01b46ba1` | 31.56 ms | 1.0107, 1.0090 to 1.0120 | +337.0 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-two` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.45 ms | 1.0060, 1.0042 to 1.0089 | +50.4 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-two` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.71 ms | 1.0104, 1.0061 to 1.0126 | +80.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-two` eager | `eager` | `forge` | `2233637a..01b46ba1` | 31.17 ms | 1.0104, 1.0084 to 1.0119 | +325.0 µs | Item 1074, within two batches or by 2026-12-08 |
+
+All three streamed readers report `growingState` from construction onward because the
+batch cap does not bound their retained state. An in-process SERVICE call clears the
+target's pool alongside inheriting the caller's grant so an unpooled caller keeps its
+unpooled accounting domain and a pooled caller charges only its own grant, and
+`Service::fill` polls stop conditions between remote solutions, before cache
+publication and across cached and local rows. The history reader uses the same execution
+check when it opens on first demand, resolves timestamp bounds, reads pages and converts
+changes to rows. Writable timestamp lookup polls during cold index reads, CRC and
+decoding. Read-only timestamp lookup polls while walking the captured log. Both page
+backends poll during record reads, CRC, footprint calculation, decoding and filtering.
+Consumer wait credit still extends ordinary query deadlines. A checked source retains
+its original cancellation controls and absolute source and query deadlines. A zero
+internal page budget asks for at least one matching change. Read-only paging skips
+segments above the clamped upper commit bound and stops once a validated record covers
+that bound, while [item 1175](../../ROADMAP.md) retains the valid-prefix limitation for
+earlier records in an overlapping segment.
+
 ### Readings of errors in aggregates
 
 Item 1064 makes the treatment of errors in MIN, MAX, AVG and GROUP_CONCAT a setting,
@@ -1254,13 +1613,19 @@ reading comes from `QueryOptions::aggregate_errors`, else the dataset's setting 
 The `jena` reading was fixed by running ARQ 6.2.0 on every aggregate, with and without
 DISTINCT and over a variable and an expression, for groups with unbound values, type
 errors, only errors and no rows. The fixture `tests/fixtures/aggregate-errors/` keeps
-that output, and the `jena` reading gives every answer in it apart from SAMPLE's choice
-and the digits beyond 18 of a decimal AVG, which item 1084 holds. Jena's rule turned out
-wider than the three cases of the item only where the engine already agreed, so an error
-makes SUM, AVG, MIN, MAX and GROUP_CONCAT unbound and COUNT and SAMPLE pass over it. The
-one further difference was `GROUP_CONCAT(DISTINCT …)` over no rows, which ARQ makes
+that output, and the `jena` reading gives every answer in it apart from SAMPLE's choice.
+An error makes SUM, AVG, MIN, MAX and GROUP_CONCAT unbound, and COUNT and SAMPLE pass
+over it. The one further difference was `GROUP_CONCAT(DISTINCT …)` over no rows, which ARQ makes
 unbound and the `jena` reading follows. The planner's shortcuts were audited, and only
 the COUNT plans assume anything about errors, which every reading shares.
+
+Item 1084 gives AVG of integers and decimals the same division as ARQ under all three
+readings. Eager queries, cursors and maintained views divide the exact subtotal by the
+count. Partial groups merge their subtotals before dividing. A terminating quotient
+stays exact, and a repeating quotient rounds to 24 fractional digits using half-even
+rounding. A quotient outside the numeric bounds is unbound. The view compiler
+fingerprint changed so checkpoints that store results at the previous precision are
+rebuilt from the data.
 
 Materialized and incrementally maintained state follows the dataset's reading, else the
 server's. Views and live queries run under it, switch when it changes as they switch on
@@ -1455,6 +1820,127 @@ The eager costs of 1% to 4% that stage 4 added to filters and aggregates, such a
 `subquery-agg` at 1.040 of 005df56d at 10.5M triples and `contains` at 1.036 at 1.05M
 triples, are unchanged, and item 682 holds them.
 
+### Fixed cost of the hierarchical budget
+
+An eager SELECT stores its charged projection metadata inline in the result backing.
+The query admits the vectors and names before building them and admits the inline
+storage as part of the result header before publishing it. Cursors still use one
+shared allocation for their variables and the batches that can outlive them.
+The common result header is larger for collected cursor, ASK and graph results.
+The fast account also owns a single grant reference and skips returning credit when
+it held none. Admission and pool granules are unchanged.
+
+Item 884 remains open pending a valid wall-time comparison on `atlas`. Set
+`BASE_BIN` and `TIP_BIN` to the server binaries built on the same Boat worker with
+matched `nix develop` compilers, identical release settings and
+`MBX_LEARNED_INCREMENTAL=false` from `0c425e86` and the item 884 tip. Set
+`PEOPLE_100K_ZST` to the 1.05M-triple synthetic dataset. Run the comparison under the
+timing kit's atlas locks. Arm C runs the base binary again as a same-binary control
+for all four small queries. Use syscall spinners in every arm so that a wake-up can
+run before the next scheduler tick.
+
+```sh
+python3 scripts/timing-kit.py stage --out .artifacts/884-atlas \
+  --base "A=$BASE_BIN" --tip "B=$TIP_BIN" --tip "C=$BASE_BIN" --data "$PEOPLE_100K_ZST" \
+  --only count-all,distinct-obj,predicate-counts,employee-docs,class-predicates,contains,two-hop-count \
+  --controls class-predicates,contains,two-hop-count --execution auto --spin-loop syscall \
+  --serve-args="--total-query-memory-mb 256" --rounds 18 --reps 200 --rotate \
+  --rerun-rounds 24 --rerun-reps 300
+printf 'STORE_OF_B=A\nSTORE_OF_C=A\n' >> .artifacts/884-atlas/run.env
+python3 scripts/timing-kit.py preflight .artifacts/884-atlas
+python3 scripts/timing-kit.py launch --host atlas --unit item-884-atlas .artifacts/884-atlas
+```
+
+After `DONE` reports exit 0, copy back `pass1` and retain its summaries and raw samples.
+Check the `wall_ms` distributions in `pass1/results/samples.tsv` for all three arms on
+the four small queries and reject a run with clusters at scheduler tick boundaries.
+The kit's execution verdict can leave a wall-only cost unflagged. Check wall and
+execution separately with paired per-round medians from `pass1/results/samples.tsv`,
+bootstrapping whole three-round rotations of per-round microsecond differences
+`1000 * (median(other) - median(A))` for absolute bounds and per-round ratios for the
+relative criterion. The wall control's 95% interval must fit inside ±2 µs for every
+query. The tip must meet the [Intel rule](PLAN.md#the-intel-rule) for both metrics,
+and the wall interval's paired upper bound must also be below 2 µs added.
+
+```sh
+python3 - .artifacts/884-atlas/pass1 <<'PY'
+import csv
+import json
+import random
+import statistics as stats
+import subprocess
+import sys
+from collections import defaultdict
+from itertools import chain
+from pathlib import Path
+
+run = Path(sys.argv[1])
+rounds = int(next(line.split("=", 1)[1] for line in (run / "run.env").read_text().splitlines()
+                  if line.startswith("ROUNDS=")))
+if rounds < 18 or rounds % 3:
+    sys.exit("Use at least 18 rounds in complete three-round rotations")
+queries = ("count-all", "distinct-obj", "predicate-counts", "employee-docs")
+samples = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+with (run / "results" / "samples.tsv").open() as fh:
+    for row in csv.DictReader(fh, delimiter="\t"):
+        if row["query"] not in queries or row["exec_ms"] == "error":
+            continue
+        r = int(row["round"])
+        for metric in ("wall_ms", "exec_ms"):
+            samples[(row["query"], metric)][row["variant"]][r].append(float(row[metric]))
+
+def boot_interval(values, seed):
+    rng = random.Random(seed)
+    rotations = [values[i:i+3] for i in range(0, len(values), 3)]
+    boot = [stats.median(chain.from_iterable(rng.choices(rotations, k=len(rotations))))
+            for _ in range(10_000)]
+    low, *_, high = stats.quantiles(boot, n=40, method="inclusive")
+    return low, stats.median(values), high
+
+accepted = True
+for pair, other, metrics in (("A-C", "C", ("wall_ms",)), ("A-B", "B", ("wall_ms", "exec_ms"))):
+    summary = run / f"summary-{pair}.json"
+    subprocess.run([sys.executable, "scripts/nsc-bench-summary.py", "--check",
+                    str(summary), "first"], check=True)
+    data = json.loads(summary.read_text())
+    if data["errors"]:
+        sys.exit(f"Failed timed requests in {pair}")
+    for query in queries:
+        for metric in metrics:
+            cell = data["queries"][query][metric]
+            ratios = cell["rounds"]
+            if len(ratios) != rounds or min(cell["epochs_a"], cell["epochs_b"]) != 2 * rounds:
+                sys.exit(f"Incomplete rotations for {pair} {query} {metric}")
+            by_var = samples[(query, metric)]
+            common = sorted(set(by_var["A"]) & set(by_var[other]))
+            if len(common) != rounds:
+                sys.exit(f"Incomplete sample rounds for {pair} {query} {metric}")
+            diffs_us = [1000 * (stats.median(by_var[other][r]) - stats.median(by_var["A"][r]))
+                        for r in common]
+            low, estimate, high = boot_interval(ratios, 884)
+            low_us, added_us, high_us = boot_interval(diffs_us, 884)
+            ok = (high <= 1.02 or added_us <= 0.5) if pair == "A-B" else low_us > -2
+            if metric == "wall_ms":
+                ok = ok and high_us < 2
+            accepted &= ok
+            print(f"{pair} {query} {metric}: medians {cell['a']:.6f}, {cell['b']:.6f} ms, "
+                  f"ratio {estimate:.4f} [{low:.4f}, {high:.4f}], "
+                  f"added {added_us:+.2f} µs [{low_us:+.2f}, {high_us:+.2f}], "
+                  f"{'pass' if ok else 'check with a repeat'}")
+sys.exit(0 if accepted else 1)
+PY
+```
+
+If the controls fail or the wall intervals leave a 2 µs effect unresolved, stage a
+fresh run of all arms with 36 rounds and 300 requests per round, even when the kit
+selects no rerun. Report a wall improvement only if its interval lies below zero.
+The adjacent comparison measures the effect of the item 884 change on one shared store.
+To estimate the remaining cost against the earlier query path, repeat the same procedure
+using `001f2328`, the first parent of the query hierarchy merge `65686274`, for both A
+and C, keeping `STORE_OF_C=A`, verifying store-format compatibility before setting
+`STORE_OF_B=A`, and recording separate imports if the older format requires them.
+Report that comparison separately because it includes changes between the two bases.
+
 ### Checked result output
 
 The eager SELECT writers admit every decoded cell against the query's memory account
@@ -1531,8 +2017,18 @@ partway, as they do for an eager one. A streamed body that the result-size budge
 after its first bytes now sends what it had buffered before it aborts, as an eager body
 already did, so the rows reported are the rows a client that keeps reading receives.
 That last send waits under the body's idle limit like any other, and when it fails the
-bytes reported leave out the unsent chunk while the row count still includes its rows,
-so the count is exact when the client keeps reading and otherwise within one chunk.
+bytes reported leave out the unsent chunk while the row count still included its rows,
+so the count was exact when the client kept reading and otherwise within one chunk.
+Roadmap item 243 made it exact in that case too. The writer records where each row
+ends, and the transport counts a row once a send that enqueued has handed over the bytes
+up to its end.
+
+For Rust callers, `write_with_completion` runs a callback after the output
+buffer has drained and credited the accepted rows. The callback can check
+pending cancellation on a `LimitedWriter`, including one it reaches through
+a known wrapper, without writing or flushing the sink. A failed serialization
+keeps its original error and skips completion. A completion failure is
+recorded on a cursor before the writer can return successful statistics.
 
 Matched release builds of 8baa5686 and a016b7bd, both from wally, were counted on the
 laptop with the server on four performance cores, over two passes of 200 requests for
@@ -1578,3 +2074,233 @@ included 1.0, as did the eager control's. A streamed answer still took 0.21 to 0
 more wall time than an eager one on those queries, against 0.23 to 0.31 ms in the base,
 because the hand-off between threads that the phase trace measured lies outside the
 writer.
+
+Both thread-handoff changes of item 534 have now landed on top of item 828's batch-source
+writers. Pool-routed cursors, both explicit `execution=streaming` and pool-routed
+`execution=auto` or eager-trial requests, open and serialize in one blocking-pool task
+through `stream::open_and_serialize_controlled`, removing the return wake to the handler
+and the second pool wake while keeping open-phase error responses, concurrency permit
+lifetimes, `StreamControl`, and the execution-to-serialization timing split unchanged.
+When a request targets the current snapshot and an in-place runtime is available, eligible
+`execution=auto` requests open and drain cursors in place through resumable `Send`
+`CursorWriter` sessions in `sparkles-core`. Eligibility covers texts whose quick history
+retains automatic execution and unseen first runs that carry a timeout, arrive after a
+server-idle interval (`FIRST_RUN_QUIET`) and pass a conservative text scan rejecting any
+case-insensitive `service` substring or `\u` or `\U` Unicode escape prefix.
+A cursor whose encoded output finishes within `STREAM_AFTER` returns a whole response with
+`Content-Length` and zero thread hops, and a cursor that would cross `STREAM_AFTER` pauses
+before buffering an oversized row, quad or footer and hands off the cursor, encoder state
+and buffered `SwitchWriter` prefix to a blocking streaming task whose initial chunk stays
+within `STREAM_AFTER + 1` bytes and whose subsequent chunks drain in `CHUNK`-sized
+backpressured frames. Explicit `execution=streaming` keeps the blocking-pool route with
+early first-batch or 64 KiB commit and immediate cancellation on client disconnect, and
+queries that call graph algorithms are never recorded as quick on either route. Core
+session parity tests and HTTP router integration tests cover route selection, format parity
+across all SELECT, ASK and graph formats (including JSON-LD, with decoded statement
+equality for Jena binary formats and native JSON), open errors, memory, result-byte and
+row budgets on both sides of commit, mid-stream timeouts, and client-disconnect
+cancellation. The quiet `atlas` timing comparison against pre-handoff `5369883f` is
+pending.
+
+### One writer per format and exact row accounting (items 828 and 243)
+
+Roadmap items 828 and 243 shipped one columnar writer per format over a shared `Source`
+trait for SELECT, ASK and graph answers, replacing the separate eager and cursor writers
+and removing the public `_counted` writer functions. The engine now writes SPARQL JSON,
+XML, CSV and TSV SELECT results with its own encoders in place of the sparesults writers,
+keeping the same bytes and delivering each row whole under the query's memory and
+result-size budgets. SPARQL Results Thrift moved from `sparkles-server` into
+`sparkles-core` so a streamed Thrift SELECT writes from a cursor in the same bytes as an
+eager answer and no longer returns `501`. The result buffer records row ends in a
+`RowLedger` rather than checking the row count on every write, and a streamed HTTP
+response credits a row once the transport has handed over the bytes up to its end, so a
+failed final send excludes the unsent chunk's rows. The in-place cursor hand-off remains
+under item 534, graph response shape unification remains under item 1111, and the
+per-row cost of whole-row output remains under item 1195.
+
+Initial quiet `atlas` timing of `fd47b7ae` against `726563ad` confirmed a 1.1919×
+regression (+43.73 ms, 16/16 slower) on 12-thread native streaming `optional-chain`
+entirely inside serialization. Commit `a6814599` resolved that backpressure cliff by
+changing `Shared::timer` in `http/stream/lifetime.rs` so it no longer wakes on every
+64 KiB chunk or `Err(Full)` and instead notifies only when `idle_at` starts, moves
+earlier or enters a terminal or aborted state, and by growing `SwitchWriter`'s bounded
+stream channel from 4 to 16 entries (`CHANNEL_CAP = 16`). A row-storage charge hoist
+also included in `a6814599` was reverted afterward so `CursorSolutions::drive` releases
+row-storage credit between batches instead of holding it across subsequent pulls and
+decode-ahead checks. Each post-switch channel entry holds at most 64 KiB, while a
+threshold-driven switch queues its initial buffer as one entry (up to `STREAM_AFTER` + 1
+byte before the remaining 15 chunks). Raising the queue from 4 to 16 entries trades up to
+768 KiB more queued payload per active streamed HTTP response, released when the stream
+ends or aborts, so decoded cursor batches can enqueue without stalling the blocking
+producer inside `rayon::in_place_scope` when their encoded bytes fit in the available
+queue space.
+
+Quiet `atlas` order-corrected ABBA measurements with matched `wally` release builds
+(8 rounds of 10 requests in both orders at 10.5M triples, recorded with full provenance
+in the [engine benchmark report](../../benchmarks/engine/RESULTS.md#unified-result-writers-and-exact-row-accounting))
+confirmed the gains across both streaming and format encoders with identical answer
+fingerprints. In the 12-thread native streaming confirmation cell comparing `fd47b7ae`
+with `a6814599`, all four workload queries improved with 0/16 rounds slower: `export-500k`
+ran at 0.3710× (250.94 against 676.68 ms), `optional-chain` at 0.9420× (211.72 against
+224.86 ms), `order-by-full` at 0.7782× (794.14 against 1,018.84 ms) and `star-join` at
+0.8508× (53.87 against 63.35 ms). Across the full 34-pair `atlas` matrix comparing
+`fd47b7ae` with `726563ad`, 1-thread `optional-chain` ran at 0.4381× streamed and 0.5658×
+eager in SPARQL JSON, 0.5691× streamed and 0.7154× eager in XML, 0.9078× streamed in TSV
+and 0.8979× streamed in CSV; on the `literals` dataset, `long-literal` ran at 0.4234×
+streamed and 0.4447× eager in SPARQL JSON, 0.7580× eager and 0.8632× streamed in CSV and
+0.8381× streamed in TSV. The streamed Thrift probe passed with matching HTTP chunked
+framing and identical body fingerprints across base eager, tip eager and tip streaming.
+Three confirmed small costs on quiet `atlas` (`fd47b7ae..726563ad`) that passed the gate
+are tracked in roadmap item 1195: `workload-native-eager-1t` `order-by-full` at 1.0029×
+(+2.43 ms, 13/16), `literal-tsv-eager-1t` `escape-straddle` at 1.0017× (+3.76 µs, 14/16)
+and `short-native-streaming-1t` `predicate-counts` at 1.0010× (+2.00 µs, 23/24). Non-Intel
+gates passed on `726563ad`: `mise run test:w3c:streaming` passed 1,274 of 1,274 tests
+with zero regressions and 24 unchanged fallbacks, and `py:test`, `jvm:test`, `node:test`
+and `bench:bindings` across all five Sparkles engines passed with zero answer
+discrepancies.
+
+### Strict decoding across non-SELECT callers
+
+Item 1308 Wave 2 closed the eager decode bypass in `Ctx` by removing `envelope_refuses`
+and unifying `DecodeEnvelope` across both accounting modes, which lowered the
+bounded-reads check from seven to six sites. Eager and streaming execution now enforce
+the same memory budget and live request controls across expression combinators, batch
+loops, executor operators, ORDER BY and top-k heaps, external sort frame reloads,
+streaming and eager group accumulators, DESCRIBE, SERVICE, text highlighting, dataset
+restriction, incremental passes, SHACL embedded query results and GeoSPARQL execution.
+Optional FILTER selectivity sampling skips impure expressions and uses a disposable
+trial on a snapshot cache miss. The trial admits copies of query setup before cloning
+them, including the local vocabulary's backing buckets, and releases its decode,
+cache and local-term state before execution starts.
+Triple keys validate their framing and nesting depth before recursive decoding, and
+vocabulary read locks are released before memory admission or geometry parsing.
+GeoJSON fallback and recheck paths admit the JSON value tree before parsing. The parser
+reads object keys as ordinary strings and bounds the unknown-type diagnostic. The
+nearest-neighbour fallback keeps parsed entry credit through distance measurement.
+
+### Forge confirmation for item 1088
+
+Use release binaries built on the Boat worker with the same compiler and profile and
+`MBX_LEARNED_INCREMENTAL=false`. Set `BASE_BIN` to the binary for `0c425e86`,
+`TIP_BIN` to the candidate, and `PRE1069_BIN` to the binary for `c0948014`. Run the
+following from the candidate checkout on forge in a named terminal. It reuses the
+historical queries and CPU placement, compares the candidate against its base and the
+pre-1069 baseline, and records a same-binary control for each thread count.
+
+At both one and 12 threads, require valid summaries, matching answers and zero timed
+request errors in all three comparisons. Judge server execution time against the
+corresponding query's same-binary control. The control's largest deviation from parity
+across the pooled and per-round ratios must be at most 3%. The candidate must stay
+within that noise bound against its base on all three queries and against the pre-1069
+baseline on `str-pair-colleague`. Reject any of those comparisons when every round is
+slower and the pooled median adds more than 0.5 µs, even if it falls within the control's
+noise bound. Retain the summaries for both thread counts when closing item 1088.
+
+```bash
+export BASE_BIN TIP_BIN PRE1069_BIN
+flock "$HOME/lanes/.heavy.lock" bash -s <<'SH'
+set -euo pipefail
+: "${BASE_BIN:?}" "${TIP_BIN:?}" "${PRE1069_BIN:?}"
+repo=$PWD
+runs="$repo/.artifacts/bench-floor-1088/$(date -u +%Y%m%dT%H%M%SZ)"
+queries="$repo/docs/benchmarks/synthetic/runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g1-streaming/queries"
+mkdir -p "$runs"
+python3 scripts/gen-data.py 100000 | zstd -q -o "$runs/data.nt.zst"
+for threads in 1 12; do
+    server_cpu=2 client_cpu=4 spin=1
+    if [ "$threads" -eq 12 ]; then
+        server_cpu=0-11 client_cpu=12 spin=0
+    fi
+    for comparison in control candidate recovery; do
+        a=$BASE_BIN b=$TIP_BIN
+        case "$comparison" in
+            control) b=$BASE_BIN ;;
+            recovery) a=$PRE1069_BIN ;;
+        esac
+        out="$runs/$threads-$comparison"
+        mkdir -p "$out/queries"
+        for query in str-pair-colleague str-pair-names str-pair-lt; do
+            cp "$queries/$query.rq" "$out/queries/"
+        done
+        install -m 755 "$a" "$out/bin-A"
+        install -m 755 "$b" "$out/bin-B"
+        {
+            printf 'host: %s\nA: %s\nB: %s\n' "$(hostname)" "$a" "$b"
+            sha256sum "$a" "$b" "$runs/data.nt.zst"
+            readelf -p .comment "$a" "$b"
+        } >"$out/manifest.txt"
+        cp "$runs/data.nt.zst" "$out/"
+        cp scripts/nsc-bench-remote.sh "$out/"
+        cat >"$out/run.env" <<EOF
+ROUNDS=12
+REPS=16
+WARMUP=3
+ORDERS="A B B A;B A A B"
+BINARY_OF_A=A
+BINARY_OF_B=B
+EXPECTED_ANSWER_CHANGE=0
+EXPECTED_ANSWER_CHANGE_REASON=""
+RAYON_THREADS=$threads
+SERVER_CPU=$server_cpu
+CLIENT_CPU=$client_cpu
+SPIN=$spin
+EXECUTION=streaming
+PORT=31941
+EOF
+        env -u BINARY_OF_A -u BINARY_OF_B -u EXPECTED_ANSWER_CHANGE -u EXPECTED_ANSWER_CHANGE_REASON \
+            bash "$out/nsc-bench-remote.sh"
+        python3 scripts/nsc-bench-summary.py "$out" >"$out/summary.md"
+    done
+done
+python3 - "$runs" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+runs = Path(sys.argv[1])
+queries = ("str-pair-colleague", "str-pair-names", "str-pair-lt")
+failures = []
+for threads in (1, 12):
+    comparisons = {}
+    for comparison in ("control", "candidate", "recovery"):
+        path = runs / f"{threads}-{comparison}" / "summary.json"
+        result = subprocess.run(
+            [sys.executable, "scripts/nsc-bench-summary.py", "--check", str(path), "first"]
+        )
+        summary = json.loads(path.read_text())
+        if summary["errors"]:
+            failures.append(f"{threads}t {comparison}: timed request errors {summary['errors']}")
+        for query in queries:
+            answers = summary.get("answers", {}).get(query)
+            if answers != "same":
+                failures.append(f"{threads}t {comparison} {query}: answers {answers!r} != 'same'")
+        if result.returncode:
+            failures.append(f"{threads}t {comparison}: invalid summary")
+            continue
+        comparisons[comparison] = summary["queries"]
+    if len(comparisons) != 3:
+        continue
+
+    for query in queries:
+        control = comparisons["control"][query]["exec_ms"]
+        ratios = [control["ratio"], *control["rounds"]]
+        bound = max(max(r, 1 / r) for r in ratios)
+        if len(control["rounds"]) != 12 or bound > 1.03:
+            failures.append(f"{threads}t {query}: incomplete or noisy control ({bound:.4f}x)")
+            continue
+
+        for comparison in ("candidate", "recovery") if query == queries[0] else ("candidate",):
+            stats = comparisons[comparison][query]["exec_ms"]
+            ratio = stats["ratio"]
+            added_us = (stats["b"] - stats["a"]) * 1000
+            print(f"{threads}t {comparison} {query}: {ratio:.4f}x, control limit {bound:.4f}x")
+            if len(stats["rounds"]) != 12:
+                failures.append(f"{threads}t {comparison} {query}: incomplete timing rounds")
+            elif ratio > bound or (added_us > 0.5 and all(r > 1 for r in stats["rounds"])):
+                failures.append(f"{threads}t {comparison} {query}: regression ({ratio:.4f}x)")
+if failures:
+    sys.exit("\n".join(failures))
+PY
+SH
+```

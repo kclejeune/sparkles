@@ -1914,9 +1914,9 @@ mutation. Node.js transaction callbacks already guard note and delete operations
 through their family context. The remaining work must preserve legitimate operations
 from another thread and on independent datasets.
 
-Python's `branches.update(name, note=None)` treats explicit `None` as omission and
-keeps the note. Rust's optional note and the JVM's nullable note can clear it. Roadmap
-item 755 separately owns Python argument presence and compatibility, as
+Python's `branches.update(name, note=None)` now distinguishes explicit `None` from an
+omitted `note` argument and clears the note like Rust and the JVM, while omitting `note`
+leaves the existing value unchanged, as
 [P01](P01-python-bindings.md#python-note-argument-presence) records.
 
 ### Scope changes

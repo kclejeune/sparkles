@@ -928,11 +928,12 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
     }
 }
 
-/// A view source with one `table` view whose column ?x holds the integers below `.0`.
-/// A view read has no resumable cursor, so it is the remaining eager fallback leaf.
+/// Legacy eager-only `ViewSource` (`streams_views() == false`), refused by strict
+/// cursors and used to test eager fallback visibility, laziness, and input streaming.
 #[derive(Debug)]
-struct IntegersView(i64);
-impl sparkles_core::sparql::viewsvc::ViewSource for IntegersView {
+struct LegacyViews(usize);
+
+impl sparkles_core::sparql::viewsvc::ViewSource for LegacyViews {
     fn read_view(
         &self,
         _: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
@@ -940,22 +941,28 @@ impl sparkles_core::sparql::viewsvc::ViewSource for IntegersView {
         Ok(sparkles_core::sparql::viewsvc::ViewRows {
             columns: vec!["x".into()],
             rows: (0..self.0)
-                .map(|i| (vec![Some(Term::Literal(oxrdf::Literal::from(i)))], 1))
+                .map(|i| {
+                    (
+                        vec![Some(Term::Literal(oxrdf::Literal::from(i.to_string())))],
+                        1,
+                    )
+                })
                 .collect(),
             commit: 0,
             evaluated_under: None,
+            lease: None,
         })
     }
 }
 
-fn with_view(rows: i64) -> QueryOptions {
+const LEGACY_VIEW_LEAF: &str = "SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"v\" ; <urn:x-sparkles:view#bind> ?x }";
+
+fn legacy_view_opts(n: usize) -> QueryOptions {
     QueryOptions {
-        views: Some(Arc::new(IntegersView(rows))),
+        views: Some(Arc::new(LegacyViews(n))),
         ..Default::default()
     }
 }
-
-const VIEW_READ: &str = "SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"ints\" ; <urn:x-sparkles:view#bind> ?x }";
 
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
@@ -969,28 +976,28 @@ fn eager_fallback_is_visible_lazy_and_budgeted() {
         None,
     )])
     .unwrap();
-    let q = &format!("SELECT ?x WHERE {{ {VIEW_READ} }}");
-    let views = with_view(100);
+    let q = &format!("SELECT ?x WHERE {{ {LEGACY_VIEW_LEAF} }}");
+    let opts_q = legacy_view_opts(100);
     assert!(matches!(
-        select_cursor(s.snapshot(), q, &views, &options(2)),
+        select_cursor(s.snapshot(), q, &opts_q, &options(2)),
         Err(Error::Unsupported(_))
     ));
     let opts = CursorOptions {
         batch_rows: 2,
         ..Default::default()
     };
-    let mut c = select_cursor(s.snapshot(), q, &views, &opts).unwrap();
+    let mut c = select_cursor(s.snapshot(), q, &opts_q, &opts).unwrap();
     assert!(c.plan().has_materialization());
     assert_eq!(c.stats().rows_produced, 0);
     let b = c.next_batch().unwrap().unwrap();
     assert_eq!(
         b.row(0).unwrap().values().to_vec(),
-        query(s.snapshot(), q, &views).unwrap().application_rows()[0]
+        query(s.snapshot(), q, &opts_q).unwrap().application_rows()[0]
     );
     assert!(c.stats().rows_produced >= 100);
     assert_eq!(
-        all(select_cursor(s.snapshot(), q, &views, &opts).unwrap()),
-        query(s.snapshot(), q, &views).unwrap().application_rows()
+        all(select_cursor(s.snapshot(), q, &opts_q, &opts).unwrap()),
+        query(s.snapshot(), q, &opts_q).unwrap().application_rows()
     );
 }
 
@@ -1243,28 +1250,35 @@ fn standard_writers_match_eager_and_stop_at_send_without_draining() {
 #[test]
 fn counted_cursor_writers_report_the_rows_a_byte_budget_let_through() {
     use sparkles_core::sparql::results::{
-        LimitedWriter, SolutionsFormat, write_cursor_native_json_counted,
-        write_cursor_solutions_counted, write_solutions_counted,
+        Format, LimitedWriter, RowCount, SolutionsFormat, Source, WriteOptions, write,
     };
-    use std::cell::Cell;
     let s = store(3000);
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
     let eager = query(s.snapshot(), q, &Default::default()).unwrap();
     for fmt in [SolutionsFormat::Tsv, SolutionsFormat::Csv] {
         for limit in [1u64, 20_000, 40_000] {
             let mut cut = LimitedWriter::new(Vec::new(), Some(limit), None);
-            let sent = Cell::new(0);
+            let sent = RowCount::new();
             let mut c = open(&s, q, 1024);
-            let result = write_cursor_solutions_counted(&mut c, fmt, &mut cut, None, &sent);
+            let result = write(
+                Source::Select(&mut c),
+                WriteOptions::new(Format::Solutions(fmt), &sent),
+                &mut cut,
+            );
             assert!(result.is_err(), "{fmt:?} {limit}");
             let out = cut.get_ref();
             let lines = out.iter().filter(|&&b| b == b'\n').count() as u64;
             assert_eq!(sent.get(), lines.saturating_sub(1), "{fmt:?} {limit}");
             assert!(c.stats().emitted_rows >= sent.get());
             let mut eager_cut = LimitedWriter::new(Vec::new(), Some(limit), None);
-            let eager_sent = Cell::new(0);
+            let eager_sent = RowCount::new();
             assert!(
-                write_solutions_counted(&eager, fmt, &mut eager_cut, None, &eager_sent).is_err()
+                write(
+                    Source::Result(&eager),
+                    WriteOptions::new(Format::Solutions(fmt), &eager_sent),
+                    &mut eager_cut,
+                )
+                .is_err()
             );
             // the cursor's flush after its first batch moves where the buffer's pieces
             // end, so the bytes may differ, but the rule that counts them is the same
@@ -1275,16 +1289,28 @@ fn counted_cursor_writers_report_the_rows_a_byte_budget_let_through() {
                 "{fmt:?} {limit}"
             );
         }
-        let sent = Cell::new(0);
+        let sent = RowCount::new();
         let mut whole = Vec::new();
         let mut c = open(&s, q, 1024);
-        write_cursor_solutions_counted(&mut c, fmt, &mut whole, None, &sent).unwrap();
+        write(
+            Source::Select(&mut c),
+            WriteOptions::new(Format::Solutions(fmt), &sent),
+            &mut whole,
+        )
+        .unwrap();
         assert_eq!(sent.get(), 3000);
     }
     let mut cut = LimitedWriter::new(Vec::new(), Some(40_000), None);
-    let sent = Cell::new(0);
+    let sent = RowCount::new();
     let mut c = open(&s, q, 1024);
-    assert!(write_cursor_native_json_counted(&mut c, &mut cut, None, None, &sent).is_err());
+    assert!(
+        write(
+            Source::Select(&mut c),
+            WriteOptions::new(Format::Solutions(SolutionsFormat::Sparkles), &sent),
+            &mut cut,
+        )
+        .is_err()
+    );
     // every cell is bound and an object, so each whole row ends with `}]`
     let rows = cut.get_ref().windows(2).filter(|w| w == b"}]").count() as u64;
     assert_eq!(sent.get(), rows);
@@ -2235,6 +2261,131 @@ fn native_graph_document_and_jena_writers_stream_and_fuse_failures() {
 }
 
 #[test]
+fn completion_runs_once_after_ask_empty_select_and_graph_output() {
+    use sparkles_core::sparql::graph_cursor;
+    use sparkles_core::sparql::results::{
+        Format, RowCount, SolutionsFormat, Source, WriteOptions, write, write_with_completion,
+    };
+
+    let s = store(1);
+    let construct = "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }";
+    let tsv = Format::Solutions(SolutionsFormat::Tsv);
+    let ntriples = Format::Rdf(RdfFormat::NTriples);
+    for (text, format) in [
+        ("ASK {}", tsv),
+        ("SELECT ?s WHERE { ?s <urn:missing> ?o }", tsv),
+        (construct, ntriples),
+    ] {
+        let result = query(s.snapshot(), text, &Default::default()).unwrap();
+        let expected_rows = RowCount::new();
+        let mut expected = Vec::new();
+        write(
+            Source::Result(&result),
+            WriteOptions::new(format, &expected_rows),
+            &mut expected,
+        )
+        .unwrap();
+        let mut calls = 0;
+        let mut out = Vec::new();
+        let sent = RowCount::new();
+        let stats = write_with_completion(
+            Source::Result(&result),
+            WriteOptions {
+                format,
+                send: None,
+                prefixes: &[],
+                metadata: None,
+                rows: &sent,
+            },
+            &mut out,
+            |out| {
+                calls += 1;
+                assert_eq!(*out, expected);
+                assert_eq!(sent.get(), expected_rows.get());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(stats.is_none());
+        assert_eq!(calls, 1);
+    }
+
+    let mut graph =
+        graph_cursor(s.snapshot(), construct, &Default::default(), &options(1)).unwrap();
+    let sent = RowCount::new();
+    let error = write_with_completion(
+        Source::Graph(&mut graph),
+        WriteOptions::new(ntriples, &sent),
+        &mut Vec::new(),
+        |out| {
+            assert!(out.ends_with(b" .\n"));
+            assert_eq!(sent.get(), 1);
+            Err(Error::Cancelled)
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Cancelled));
+    let stats = graph.stats();
+    assert_eq!(stats.status, CursorStatus::Failed);
+    assert_eq!(stats.error, Some(error.to_string()));
+}
+
+#[test]
+fn completion_is_skipped_on_dispatch_drain_and_flush_failures() {
+    use sparkles_core::sparql::results::{
+        Format, LimitedWriter, RowCount, SolutionsFormat, Source, WriteOptions,
+        write_with_completion,
+    };
+    use std::io::{self, Write};
+
+    let s = store(1);
+    let ask = query(s.snapshot(), "ASK {}", &Default::default()).unwrap();
+    let sent = RowCount::new();
+    let error = write_with_completion(
+        Source::Result(&ask),
+        WriteOptions::new(Format::ResultsThrift, &sent),
+        &mut Vec::new(),
+        |_| panic!("invalid format must skip completion"),
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Invalid(_)));
+
+    let mut limited = LimitedWriter::new(Vec::new(), Some(0), None);
+    let error = write_with_completion(
+        Source::Result(&ask),
+        WriteOptions::new(Format::Solutions(SolutionsFormat::Csv), &sent),
+        &mut limited,
+        |_| panic!("failed drain must skip completion"),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        limited.classify(error),
+        Error::BudgetExceeded(b) if b.kind == BudgetKind::ResultBytes
+    ));
+
+    struct BrokenFlush;
+    impl Write for BrokenFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    let mut cursor = open(&s, "SELECT ?o WHERE { ?s <urn:p> ?o }", 1);
+    let error = write_with_completion(
+        Source::Select(&mut cursor),
+        WriteOptions::new(Format::Solutions(SolutionsFormat::Tsv), &sent),
+        &mut BrokenFlush,
+        |_| panic!("failed first-batch flush must skip completion"),
+    )
+    .unwrap_err();
+    assert!(matches!(&error, Error::Io(e) if e.kind() == io::ErrorKind::BrokenPipe));
+    assert_eq!(sent.get(), 1);
+    assert_eq!(cursor.stats().error, Some(error.to_string()));
+}
+
+#[test]
 fn ordered_optional_unique_and_duplicate_runs_resume_across_batch_boundaries() {
     let s = store(0);
     s.load(&[Source::from_bytes(
@@ -2372,8 +2523,8 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            &format!("SELECT ?x {{ {VIEW_READ} }}"),
-            &with_view(3),
+            &format!("SELECT ?x {{ {LEGACY_VIEW_LEAF} }}"),
+            &legacy_view_opts(3),
             &strict,
             ExecutionMode::Auto,
         ),
@@ -3951,33 +4102,41 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
             fallbacks(child, out);
         }
     }
-    let views = with_view(30);
+    let opts_q = legacy_view_opts(30);
     for q in [
         format!(
-            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o FILTER EXISTS {{ {VIEW_READ} FILTER(?x = ?o) }} }}"
+            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o FILTER EXISTS {{ {LEGACY_VIEW_LEAF} FILTER(?x = STR(?o)) }} }}"
         ),
         format!(
-            "SELECT ?s WHERE {{ ?s <urn:q> ?t FILTER NOT EXISTS {{ {VIEW_READ} FILTER(?x = 3) }} }}"
+            "SELECT ?s WHERE {{ ?s <urn:q> ?t FILTER NOT EXISTS {{ {LEGACY_VIEW_LEAF} FILTER(?x = \"3\") }} }}"
         ),
-        // a path search over its group without a limit reads its whole input, and that
+        // a BIND over an EXISTS that does not stream reads its whole input, and that
         // input streams into it
-        "SELECT ?s ?b WHERE { ?s <urn:p> ?o FILTER(?o < 5) SERVICE <urn:x-sparkles:path#search> { [] <urn:x-sparkles:path#source> ?s ; <urn:x-sparkles:path#target> ?b ; <urn:x-sparkles:path#predicate> <urn:q> } }".to_string(),
+        format!(
+            "SELECT ?s ?e WHERE {{ ?s <urn:p> ?o FILTER(?o < 5) BIND(EXISTS {{ {LEGACY_VIEW_LEAF} }} AS ?e) }}"
+        ),
     ] {
         let q = q.as_str();
-        let expected = bag(query(s.snapshot(), q, &views).unwrap().application_rows());
+        let expected = bag(query(s.snapshot(), q, &opts_q).unwrap().application_rows());
         for rows in [1, 2, 3, 4096] {
             let opts = CursorOptions {
                 batch_rows: rows,
                 ..Default::default()
             };
-            let c = select_cursor(s.snapshot(), q, &views, &opts).unwrap();
+            let c = select_cursor(s.snapshot(), q, &opts_q, &opts).unwrap();
             let mut found = Vec::new();
             fallbacks(c.plan(), &mut found);
             assert!(!found.is_empty(), "{q}");
-            assert!(found.iter().all(|(_, nested)| !nested), "{q}: {:?}", c.plan());
-            if q.contains("path#search") {
-                assert!(found.iter().any(|(inputs, _)| *inputs), "{q}: {:?}", c.plan());
-            }
+            assert!(
+                found.iter().all(|(_, nested)| !nested),
+                "{q}: {:?}",
+                c.plan()
+            );
+            assert!(
+                found.iter().any(|(inputs, _)| *inputs),
+                "{q}: {:?}",
+                c.plan()
+            );
             assert_eq!(bag(all(c)), expected, "{q}; {rows}");
         }
     }
@@ -4256,6 +4415,43 @@ fn streaming_top_k_matches_eager_in_order_at_every_batch_size() {
 }
 
 #[test]
+fn streaming_top_k_matches_eager_with_compacted_iris_and_offset() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        b"<urn:a> <urn:p> <urn:b> . <urn:c> <urn:p> <urn:d> . <urn:e> <urn:p> <urn:f> .".to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.compact().unwrap();
+    let query_text = "SELECT ?row WHERE {
+        VALUES (?rank ?iri ?row) {
+            (2 <urn:d> 0) (2 <urn:f> 1) (2 <urn:e> 2)
+            (2 <urn:c> 3) (2 <urn:e> 4) (2 <urn:b> 5)
+            (2 <urn:f> 6) (1 <urn:f> 7) (2 <urn:a> 8) (2 <urn:d> 9)
+        }
+    } ORDER BY ?rank ?iri LIMIT 2 OFFSET 1";
+    let expected = query(s.snapshot(), query_text, &Default::default())
+        .unwrap()
+        .application_rows();
+    assert_eq!(
+        expected,
+        [8, 5].map(|row: i32| vec![Some(Term::Literal(row.into()))]),
+    );
+    for rows in [1, 2, 3, 10] {
+        let cursor = select_cursor(
+            s.snapshot(),
+            query_text,
+            &Default::default(),
+            &options(rows),
+        )
+        .unwrap();
+        assert!(!cursor.plan().has_materialization());
+        assert_eq!(all(cursor), expected, "batch {rows}");
+    }
+}
+
+#[test]
 fn streaming_top_k_keeps_only_its_rows_within_the_memory_budget() {
     let s = store(200_000);
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) LIMIT 5";
@@ -4378,6 +4574,16 @@ fn without(names: &str) -> QueryOptions {
     }
 }
 
+fn without_decode_ahead() -> QueryOptions {
+    QueryOptions {
+        optimizations: Some(sparkles_core::sparql::Optimizations {
+            decode_ahead: false,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 #[test]
 fn writers_decoding_ahead_match_eager_at_send_limits_across_batches() {
     use sparkles_core::sparql::results::{
@@ -4394,7 +4600,7 @@ fn writers_decoding_ahead_match_eager_at_send_limits_across_batches() {
         for send in [None, Some(0), Some(1), Some(4096), Some(4097), Some(8999)] {
             let mut expected = Vec::new();
             write_solutions(&eager, fmt, &mut expected, send).unwrap();
-            for opts in [QueryOptions::default(), without("decode_ahead")] {
+            for opts in [QueryOptions::default(), without_decode_ahead()] {
                 let mut c = select_cursor(s.snapshot(), q, &opts, &options(1000)).unwrap();
                 let mut output = Vec::new();
                 let stats = pool
@@ -4417,7 +4623,7 @@ fn a_failure_while_decoding_ahead_comes_after_the_rows_before_it() {
         .num_threads(4)
         .build()
         .unwrap();
-    for opts in [QueryOptions::default(), without("decode_ahead")] {
+    for opts in [QueryOptions::default(), without_decode_ahead()] {
         let opts = QueryOptions {
             max_rows_produced: Some(2500),
             ..opts
@@ -4601,7 +4807,7 @@ fn decoding_ahead_under_tight_budgets_and_failing_writers() {
             max_memory_bytes: Some(kb << 10),
             ..opts
         };
-        let serial = write(&budget(without("decode_ahead")));
+        let serial = write(&budget(without_decode_ahead()));
         let ahead = write(&budget(QueryOptions::default()));
         match (serial, ahead) {
             (Ok(a), Ok(b)) => assert_eq!(a, b, "{kb} KiB"),
@@ -4614,7 +4820,7 @@ fn decoding_ahead_under_tight_budgets_and_failing_writers() {
         }
     }
     for after in [0, 10, 40_000, 200_000] {
-        for opts in [QueryOptions::default(), without("decode_ahead")] {
+        for opts in [QueryOptions::default(), without_decode_ahead()] {
             let mut c = select_cursor(s.snapshot(), q, &opts, &options(1000)).unwrap();
             let r = pool.install(|| {
                 write_cursor_solutions(&mut c, SolutionsFormat::Tsv, Failing(after), None)
@@ -4714,7 +4920,7 @@ fn decoding_ahead_with_growing_batches_under_tight_budgets() {
             max_memory_bytes: Some(kb << 10),
             ..opts
         };
-        let serial = write(&budget(without("decode_ahead")));
+        let serial = write(&budget(without_decode_ahead()));
         let ahead = write(&budget(QueryOptions::default()));
         match (serial, ahead) {
             (Ok(a), Ok(b)) => assert_eq!(a, b, "{kb} KiB"),
@@ -5530,52 +5736,123 @@ fn arq_uuid_aliases_and_dynamic_calls_stay_volatile_across_cursor_morsels() {
     }
 }
 
-/// The graph writers flush once after their first batch, with that batch's statements
-/// written and later batches not yet, so a writer that commits on a flush starts the
-/// response then. RDF/JSON groups by subject and writes everything at the end.
+/// The graph writers flush once after their first batch, before they pull the second, so
+/// a writer that commits on a flush starts the response then. The probe cancels the query
+/// at its first flush, so the next pull fails, and the output holds exactly the first
+/// batch's statements, written and counted.
 #[test]
 fn graph_writers_flush_after_their_first_batch() {
     use sparkles_core::jena_formats::JenaFormat;
-    use sparkles_core::sparql::{cursor::graph::write_cursor_graph, graph_cursor, results};
-    #[derive(Default)]
+    use sparkles_core::sparql::graph_cursor;
+    use sparkles_core::sparql::results::{
+        self, Format, RowCount, SolutionsFormat, Source, WriteOptions,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     struct Probe {
-        written: usize,
-        first_flush: Option<usize>,
+        out: Vec<u8>,
+        flushes: usize,
+        cancel: Arc<AtomicBool>,
     }
     impl std::io::Write for Probe {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.written += b.len();
+            self.out.extend_from_slice(b);
             Ok(b.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            self.first_flush.get_or_insert(self.written);
+            self.flushes += 1;
+            self.cancel.store(true, Ordering::Relaxed);
             Ok(())
         }
     }
     let s = store(1000);
     let q = "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }";
-    let check = |name: &str, probe: Probe| {
-        let at = probe
-            .first_flush
-            .unwrap_or_else(|| panic!("{name}: no flush"));
+    let formats = [
+        Format::Rdf(RdfFormat::NTriples),
+        Format::Rdf(RdfFormat::NQuads),
+        Format::Rdf(RdfFormat::Turtle),
+        Format::Jena(JenaFormat::Thrift),
+        Format::Jena(JenaFormat::Protobuf),
+        Format::Jena(JenaFormat::TriX),
+        Format::Solutions(SolutionsFormat::Sparkles),
+    ];
+    for format in formats {
+        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
+        let mut probe = Probe {
+            out: Vec::new(),
+            flushes: 0,
+            cancel: c.cancellation_token(),
+        };
+        let rows = RowCount::new();
+        let options = WriteOptions::new(format, &rows);
+        let r = results::write(Source::Graph(&mut c), options, &mut probe);
         assert!(
-            at > 0 && at * 10 < probe.written,
-            "{name}: flushed at {at} of {}",
-            probe.written
+            matches!(r, Err(sparkles_core::Error::Cancelled)),
+            "{format:?}: {r:?}"
         );
+        assert_eq!(probe.flushes, 1, "{format:?}");
+        assert_eq!(rows.get(), 10, "{format:?}");
+        if matches!(format, Format::Rdf(RdfFormat::NTriples | RdfFormat::NQuads)) {
+            let lines = probe.out.iter().filter(|&&b| b == b'\n').count();
+            assert_eq!(lines, 10, "{format:?}");
+        }
+    }
+}
+
+/// The cursor's SPARQL Results Thrift writer flushes once after its first batch, before it
+/// pulls the second, so a writer that commits on a flush starts the response then. The
+/// probe cancels the query at its first flush, and the output holds exactly the first
+/// batch's rows, written and counted.
+#[test]
+fn the_cursor_thrift_writer_flushes_after_its_first_batch() {
+    use sparkles_core::jena_formats::ThriftResults;
+    use sparkles_core::sparql::results::{self, Format, RowCount, Source, WriteOptions};
+    struct Probe {
+        out: Vec<u8>,
+        flushes: usize,
+        cancel: Arc<AtomicBool>,
+    }
+    impl std::io::Write for Probe {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.out.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            self.cancel.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    let s = store(1000);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let eager = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows();
+    let vars = ["s".to_string(), "o".to_string()];
+    let mut expected = ThriftResults::new(Vec::new(), &vars).unwrap();
+    for row in &eager[..10] {
+        expected.row(row).unwrap();
+    }
+    let mut c = open(&s, q, 10);
+    let mut probe = Probe {
+        out: Vec::new(),
+        flushes: 0,
+        cancel: c.cancellation_token(),
     };
-    for format in [RdfFormat::NTriples, RdfFormat::NQuads] {
-        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
-        let mut probe = Probe::default();
-        write_cursor_graph(&mut c, format, &mut probe, None, &[]).unwrap();
-        check(&format!("{format:?}"), probe);
-    }
-    for format in [JenaFormat::Thrift, JenaFormat::Protobuf, JenaFormat::TriX] {
-        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
-        let mut probe = Probe::default();
-        results::write_cursor_jena_graph(&mut c, format, &mut probe, None).unwrap();
-        check(&format!("{format:?}"), probe);
-    }
+    let rows = RowCount::new();
+    let r = results::write(
+        Source::Select(&mut c),
+        WriteOptions::new(Format::ResultsThrift, &rows),
+        &mut probe,
+    );
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    assert_eq!(probe.flushes, 1);
+    assert_eq!(rows.get(), 10);
+    assert_eq!(
+        &probe.out,
+        expected.get_mut(),
+        "the first batch's rows, whole"
+    );
 }
 
 /// An OPTIONAL over two inputs sorted on their shared variable merges when the
@@ -6121,15 +6398,15 @@ fn reference_evaluator_review_round_2_cases() {
     assert!(s1.rows_open);
     let s1b = selected("SELECT ?x WHERE { BIND(IF(RAND() < 0.5, 1, 1/0) AS ?x) VALUES ?x { 2 } }");
     assert!(s1b.rows_open);
-    // 2: the readings are taken until no new one is met. MAX passes over the error under
-    // the specification's reading and is unbound under Jena's, the engine's, which alone
-    // reaches the string arguments of different base directions
+    // 2: MAX passes over the error under the specification's reading and is unbound under
+    // Jena's, the engine's, which reaches STRSTARTS("Ada"@en--ltr, "A"@en); under SPARQL
+    // 1.2 (item 1071) mismatched base directions are incompatible and raise a type error
     let q2 = "SELECT (IF(!BOUND(?m), STRSTARTS(\"Ada\"@en--ltr, \"A\"@en), false) AS ?x) \
               WHERE { { SELECT (MAX(?v) AS ?m) WHERE { VALUES ?v { UNDEF 1 } } } }";
     let Expected::Select(s2) = under_engine_readings(&r, q2).unwrap().0 else {
         panic!("a SELECT answer");
     };
-    assert_eq!(s2.rows, vec![vec![boolean(true)]]);
+    assert_eq!(s2.rows, vec![vec![None]]);
     // 3: an open second key keeps the order of the first, and an answer that keeps it
     // is not passed, since the open key decides the rest of the order
     let s3 = selected("SELECT ?x WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND()");
@@ -6351,16 +6628,22 @@ fn reference_evaluator_review_round_3_cases() {
     check(!compared(&o2), format!("2: {o2:?}"));
     let o2b = check_select(&s2, &vars(&["x"]), &col(vec![xsd("16777219.5", "double")]));
     check(compared(&o2b), format!("2 allowed: {o2b:?}"));
-    // a weaker outcome of the comparison by value in a mixed column stays as weak
+    // Open order still permits another spelling of the computed cell.
     let s2c = selected(
         "SELECT ?y WHERE { { VALUES ?y { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } } \
          UNION { BIND(1 + 1 AS ?y) } } ORDER BY ?y RAND()",
     );
-    let o2c = check_select(&s2c, &vars(&["y"]), &col(vec![int(1), int(2)]));
+    let o2c = check_select(
+        &s2c,
+        &vars(&["y"]),
+        &col(vec![xsd("01", "integer"), xsd("+2", "integer")]),
+    );
     check(
         matches!(o2c, Ok(Outcome::OrderUnchecked(_))),
         format!("2 mixed: {o2c:?}"),
     );
+    let o2d = check_select(&s2c, &vars(&["y"]), &col(vec![int(1), int(2)]));
+    check(o2d.is_err(), format!("2 changed copied term: {o2d:?}"));
 
     // 3: STRDT keeps the lexical form of its argument
     let s3 = selected(
@@ -6380,6 +6663,1782 @@ fn reference_evaluator_review_round_3_cases() {
     let o4b = check_select(&s4, &vars(&["g"]), &col(vec![Some(iri("urn:g1").into())]));
     check(o4b.is_ok(), format!("4 allowed: {o4b:?}"));
     assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// An expected cell can carry the spelling of a computed number through `STR`, `STRDT`,
+/// `STRLANG` and `STRLANGDIR`. Another valid spelling gives a partial comparison, while
+/// constant and copied arguments keep exact comparison.
+#[test]
+fn reference_evaluator_str_computed_numbers_1093() {
+    use oxrdf::{BaseDirection, Literal, NamedNode};
+    use reference::check::{Outcome, check_select};
+    let iri = |s: &str| NamedNode::new_unchecked(s);
+    let string = |v: &str| Some(Term::Literal(Literal::new_simple_literal(v)));
+    let typed = |v: &str, dt: &str| Some(Term::Literal(Literal::new_typed_literal(v, iri(dt))));
+    let xsd = |v: &str, name: &str| typed(v, &format!("http://www.w3.org/2001/XMLSchema#{name}"));
+    let lang = |v: &str, l: &str| {
+        Some(Term::Literal(
+            Literal::new_language_tagged_literal(v, l).unwrap(),
+        ))
+    };
+    let lang_dir = |v: &str, l: &str, d: BaseDirection| {
+        Some(Term::Literal(
+            Literal::new_directional_language_tagged_literal(v, l, d).unwrap(),
+        ))
+    };
+    let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let one = |t: Option<Term>| vec![vec![t]];
+    let r = reference::Reference::new(Vec::new());
+    let selected = |q: &str| r.run_selected(q, None).unwrap().unwrap();
+
+    // 1: STR over computed numbers (inline, via variable, via aggregate, scientific, INF)
+    for q in [
+        "SELECT (STR(1.0 + 1.0) AS ?s) WHERE {}",
+        "SELECT (STR(?x) AS ?s) WHERE { BIND(1.0 + 1.0 AS ?x) }",
+        "SELECT (STR(SUM(?v)) AS ?s) WHERE { VALUES ?v { 1.0 1.0 } }",
+        "SELECT (STR(IF(true, 1.0 + 1.0, \"01\")) AS ?s) WHERE {}",
+        "SELECT (COALESCE(?u, STR(1.0 + 1.0)) AS ?s) WHERE { VALUES ?u { UNDEF } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["s"]), &one(string("2"))),
+            Ok(Outcome::Compared),
+            "exact match: {q}"
+        );
+        for alt in ["2.0", "+2.00", "02"] {
+            assert!(
+                matches!(
+                    check_select(&s, &vars(&["s"]), &one(string(alt))),
+                    Ok(Outcome::Partial(_))
+                ),
+                "allowed lexical {alt}: {q}"
+            );
+        }
+        for bad in [
+            string("3"),
+            string("2.1"),
+            string("two"),
+            string(" 2"),
+            xsd("2.0", "decimal"),
+            lang("2.0", "en"),
+        ] {
+            assert!(
+                check_select(&s, &vars(&["s"]), &one(bad.clone())).is_err(),
+                "must fail for {bad:?}: {q}"
+            );
+        }
+    }
+
+    // Scientific notation and special floats through STR
+    let s_dbl = selected("SELECT (STR(1.0e0 + 1.0e0) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_dbl, &vars(&["s"]), &s_dbl.rows),
+        Ok(Outcome::Compared)
+    );
+    for alt in ["2.0E0", "2.0e+0", "2.0", "2E0"] {
+        let res = check_select(&s_dbl, &vars(&["s"]), &one(string(alt)));
+        assert!(
+            matches!(res, Ok(Outcome::Compared | Outcome::Partial(_))),
+            "double lexical {alt}: {res:?}"
+        );
+    }
+    assert!(
+        matches!(
+            check_select(&s_dbl, &vars(&["s"]), &one(string("2.00E+0"))),
+            Ok(Outcome::Partial(_))
+        ),
+        "distinct double lexical must be partial"
+    );
+
+    let s_inf = selected("SELECT (STR(1.0e0 / 0.0e0) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_inf, &vars(&["s"]), &one(string("INF"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(matches!(
+        check_select(&s_inf, &vars(&["s"]), &one(string("+INF"))),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_select(&s_inf, &vars(&["s"]), &one(string("inf"))).is_err());
+    assert!(check_select(&s_inf, &vars(&["s"]), &one(string("-INF"))).is_err());
+
+    // 16-digit computed integer past f64's 2^53 precision does not collapse via f64
+    let s_big = selected("SELECT (STR(9007199254740992 + 1) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_big, &vars(&["s"]), &one(string("9007199254740993"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(matches!(
+        check_select(&s_big, &vars(&["s"]), &one(string("+9007199254740993"))),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(
+        check_select(&s_big, &vars(&["s"]), &one(string("9007199254740992"))).is_err(),
+        "off-by-one 16-digit integer past 2^53 must fail"
+    );
+
+    // 2: STR over constants and purely copied variables stays exact
+    for (q, exact, alt) in [
+        (
+            "SELECT (STR(\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>) AS ?s) WHERE {}",
+            "01",
+            "1",
+        ),
+        ("SELECT (STR(1.0) AS ?s) WHERE {}", "1.0", "1"),
+        (
+            "SELECT (STR(?x) AS ?s) WHERE { VALUES ?x { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } }",
+            "01",
+            "1",
+        ),
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["s"]), &one(string(exact))),
+            Ok(Outcome::Compared),
+            "copied exact: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["s"]), &one(string(alt))).is_err(),
+            "copied STR must reject {alt}: {q}"
+        );
+    }
+
+    // 3: STRDT over computed numbers (xsd:decimal, xsd:integer, custom datatype, via variable)
+    for q in [
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(STR(1.0 + 1.0), xsd:decimal) AS ?x) WHERE {}",
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(?s, xsd:decimal) AS ?x) WHERE { BIND(STR(1.0 + 1.0) AS ?s) }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(xsd("2", "decimal"))),
+            Ok(Outcome::Compared),
+            "STRDT exact: {q}"
+        );
+        assert!(
+            matches!(
+                check_select(&s, &vars(&["x"]), &one(xsd("2.0", "decimal"))),
+                Ok(Outcome::Partial(_))
+            ),
+            "STRDT partial: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["x"]), &one(xsd("2", "integer"))).is_err(),
+            "STRDT wrong datatype: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["x"]), &one(xsd("3.0", "decimal"))).is_err(),
+            "STRDT wrong value: {q}"
+        );
+    }
+
+    // STRDT with custom datatype and with xsd:integer (where "2.0"^^xsd:integer is ill-formed)
+    let s_dt_custom = selected("SELECT (STRDT(STR(1.0 + 1.0), <urn:custom>) AS ?x) WHERE {}");
+    assert_eq!(
+        check_select(&s_dt_custom, &vars(&["x"]), &one(typed("2", "urn:custom"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(matches!(
+        check_select(
+            &s_dt_custom,
+            &vars(&["x"]),
+            &one(typed("2.0", "urn:custom"))
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_select(&s_dt_custom, &vars(&["x"]), &one(typed("2.0", "urn:other"))).is_err());
+
+    let s_dt_int = selected(
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(STR(1.0 + 1.0), xsd:integer) AS ?x) WHERE {}",
+    );
+    assert!(matches!(
+        check_select(&s_dt_int, &vars(&["x"]), &one(xsd("2.0", "integer"))),
+        Ok(Outcome::Partial(_))
+    ));
+
+    // STRDT over constant, copied variable, and STR of copied variable stays exact
+    for q in [
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(\"01\", xsd:integer) AS ?x) WHERE {}",
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(?s, xsd:integer) AS ?x) WHERE { VALUES ?s { \"01\" } }",
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(STR(?n), xsd:integer) AS ?x) WHERE { VALUES ?n { \"01\"^^xsd:integer } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(xsd("01", "integer"))),
+            Ok(Outcome::Compared),
+            "STRDT copied exact: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["x"]), &one(xsd("1", "integer"))).is_err(),
+            "STRDT copied must reject different lexical: {q}"
+        );
+    }
+
+    // 4: STRLANG over computed numbers vs constants and copied variables
+    for q in [
+        "SELECT (STRLANG(STR(1.0 + 1.0), \"en\") AS ?x) WHERE {}",
+        "SELECT (STRLANG(?s, \"en\") AS ?x) WHERE { BIND(STR(1.0 + 1.0) AS ?s) }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(lang("2", "en"))),
+            Ok(Outcome::Compared),
+            "STRLANG exact: {q}"
+        );
+        assert!(
+            matches!(
+                check_select(&s, &vars(&["x"]), &one(lang("2.0", "en"))),
+                Ok(Outcome::Partial(_))
+            ),
+            "STRLANG partial: {q}"
+        );
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("2.0", "fr"))).is_err());
+        assert!(check_select(&s, &vars(&["x"]), &one(string("2.0"))).is_err());
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("3.0", "en"))).is_err());
+    }
+    for q in [
+        "SELECT (STRLANG(\"01\", \"en\") AS ?x) WHERE {}",
+        "SELECT (STRLANG(?s, \"en\") AS ?x) WHERE { VALUES ?s { \"01\" } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(lang("01", "en"))),
+            Ok(Outcome::Compared)
+        );
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("1", "en"))).is_err());
+    }
+
+    // 5: STRLANGDIR over computed numbers vs constants and copied variables
+    for q in [
+        "SELECT (STRLANGDIR(STR(1.0 + 1.0), \"en\", \"ltr\") AS ?x) WHERE {}",
+        "SELECT (STRLANGDIR(?s, \"en\", \"ltr\") AS ?x) WHERE { BIND(STR(1.0 + 1.0) AS ?s) }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("2", "en", BaseDirection::Ltr))
+            ),
+            Ok(Outcome::Compared),
+            "STRLANGDIR exact: {q}"
+        );
+        assert!(
+            matches!(
+                check_select(
+                    &s,
+                    &vars(&["x"]),
+                    &one(lang_dir("2.0", "en", BaseDirection::Ltr))
+                ),
+                Ok(Outcome::Partial(_))
+            ),
+            "STRLANGDIR partial: {q}"
+        );
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("2.0", "en", BaseDirection::Rtl))
+            )
+            .is_err()
+        );
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("2.0", "fr", BaseDirection::Ltr))
+            )
+            .is_err()
+        );
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("2.0", "en"))).is_err());
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("3.0", "en", BaseDirection::Ltr))
+            )
+            .is_err()
+        );
+    }
+    for q in [
+        "SELECT (STRLANGDIR(\"01\", \"en\", \"ltr\") AS ?x) WHERE {}",
+        "SELECT (STRLANGDIR(?s, \"en\", \"ltr\") AS ?x) WHERE { VALUES ?s { \"01\" } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("01", "en", BaseDirection::Ltr))
+            ),
+            Ok(Outcome::Compared)
+        );
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("1", "en", BaseDirection::Ltr))
+            )
+            .is_err()
+        );
+    }
+
+    // 6: Isolation — xsd:string cast canonical form (item 1077) and copied sibling columns
+    // remain strictly exact, and weaker order outcomes stay as weak.
+    let s_cast = selected("SELECT (<http://www.w3.org/2001/XMLSchema#string>(1e6) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_cast, &vars(&["s"]), &one(string("1.0E6"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(
+        check_select(&s_cast, &vars(&["s"]), &one(string("1000000"))).is_err(),
+        "xsd:string(1e6) must not relax canonical form"
+    );
+
+    let s_two = selected(
+        "SELECT (STR(\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>) AS ?a) \
+         (STR(1.0 + 1.0) AS ?b) WHERE {}",
+    );
+    assert!(matches!(
+        check_select(
+            &s_two,
+            &vars(&["a", "b"]),
+            &[vec![string("01"), string("2.0")]]
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(
+        check_select(
+            &s_two,
+            &vars(&["a", "b"]),
+            &[vec![string("1"), string("2.0")]]
+        )
+        .is_err(),
+        "sibling copied column must stay exact"
+    );
+
+    let s_ord =
+        selected("SELECT (STR(1.0 + 1.0) AS ?s) WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND()");
+    assert!(matches!(
+        check_select(
+            &s_ord,
+            &vars(&["s"]),
+            &[vec![string("2.0")], vec![string("2.0")]]
+        ),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+fn check_str_1093(query: &str, rows: &[&[&str]]) -> Result<reference::check::Outcome, String> {
+    let oracle = reference::Reference::new(Vec::new());
+    let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+    let expected = oracle
+        .run_selected(&query, None)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+        .unwrap();
+    let rows = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|text| Some(text.parse::<Term>().unwrap()))
+                .collect()
+        })
+        .collect::<Vec<_>>();
+    reference::check::check_select(&expected, &expected.variables, &rows)
+}
+
+#[test]
+fn reference_str_1093_tracks_the_selected_cell() {
+    use reference::check::Outcome;
+    for expression in [
+        r#"IF(?i = 0, "02", STR(1 + 1))"#,
+        r#"IF(?i = 0, ?v, STR(1 + 1))"#,
+        r#"COALESCE(?v, STR(1 + 1))"#,
+    ] {
+        let query = format!(
+            "SELECT ?i ({expression} AS ?s) {{ VALUES (?i ?v) {{ (0 \"02\") (1 UNDEF) }} }}"
+        );
+        let fixed = r#""02""#;
+        let computed = r#""+2""#;
+        assert!(matches!(
+            check_str_1093(&query, &[&["1", computed], &["0", fixed]]),
+            Ok(Outcome::Partial(_))
+        ));
+        assert!(check_str_1093(&query, &[&["0", r#""2""#], &["1", computed]]).is_err());
+    }
+
+    // The first got row can match either branch, and the second can only match the computed one.
+    let duplicates = r#"SELECT (IF(?i = 0, STR(1 + 1), "2") AS ?s) { VALUES ?i { 0 1 } }"#;
+    assert!(matches!(
+        check_str_1093(duplicates, &[&[r#""2""#], &[r#""+2""#]]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(duplicates, &[&[r#""+2""#], &[r#""+2""#]]).is_err());
+
+    let distinct = r#"SELECT DISTINCT (IF(?i = 0, STR(1 + 1), "2") AS ?s)
+        { VALUES ?i { 0 1 } }"#;
+    assert_eq!(
+        check_str_1093(distinct, &[&[r#""2""#]]),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_str_1093(distinct, &[&[r#""+2""#]]).is_err());
+}
+
+#[test]
+fn reference_str_1093_keeps_typed_numeric_lexicals_well_formed() {
+    use reference::check::Outcome;
+    let direct = r#"SELECT ?i (IF(?i = 0, STR(1.0 + 1.0), 1 + 1) AS ?s)
+        { VALUES ?i { 0 1 } }"#;
+    assert!(matches!(
+        check_str_1093(
+            direct,
+            &[
+                &["0", r#""2.0""#],
+                &["1", r#""+2"^^<http://www.w3.org/2001/XMLSchema#integer>"#]
+            ]
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(
+        check_str_1093(
+            direct,
+            &[
+                &["0", r#""2.0""#],
+                &["1", r#""2.0"^^<http://www.w3.org/2001/XMLSchema#integer>"#]
+            ]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn reference_str_1093_uses_the_source_numeric_type() {
+    use reference::check::Outcome;
+    for (expression, spelling, equivalent) in [
+        ("STR(1 + 1)", r#""+02""#, true),
+        ("STR(1 + 1)", r#""2.0""#, false),
+        ("STR(1 + 1)", r#""2E0""#, false),
+        ("STR(1.0 + 1.0)", r#""2E0""#, false),
+        (
+            "STR(123456789012345.1 + 0)",
+            r#""123456789012345.1000000000000000001""#,
+            false,
+        ),
+        (
+            "STR(123456789012345.1 + 0)",
+            r#""123456789012345.1000000000000000000""#,
+            true,
+        ),
+        ("STR(0e0 / -1e0)", r#""-0.0E0""#, true),
+        ("STR(0e0 / -1e0)", r#""0""#, false),
+        (
+            "STR(0e0 / -1e0)",
+            r#""-1e-9999999999999999999999999999999999999999""#,
+            true,
+        ),
+        (
+            "STR(xsd:float(\"0.1\") + xsd:float(\"0.0\"))",
+            r#""0.10000000009""#,
+            true,
+        ),
+        ("STR(0.1e0 + 0e0)", r#""0.10000000000000001""#, true),
+        ("STR(0e0 / 0e0)", r#""NaN""#, true),
+        ("STR(0e0 / 0e0)", r#""+NaN""#, false),
+        (
+            "STR(1e0 / 0e0)",
+            r#""1e9999999999999999999999999999999999999999""#,
+            true,
+        ),
+        (
+            "STR(1e0 / 0e0)",
+            r#""-1e9999999999999999999999999999999999999999""#,
+            false,
+        ),
+        ("STR(1e0 / 0e0)", r#""1e+""#, false),
+        (
+            "STRDT(STR(16777216 + 0), xsd:float)",
+            r#""+16777216"^^<http://www.w3.org/2001/XMLSchema#float>"#,
+            true,
+        ),
+        (
+            "STRDT(STR(16777216 + 0), xsd:float)",
+            r#""16777217"^^<http://www.w3.org/2001/XMLSchema#float>"#,
+            false,
+        ),
+    ] {
+        let query = format!("SELECT ({expression} AS ?s) {{}}");
+        let result = check_str_1093(&query, &[&[spelling]]);
+        if equivalent {
+            assert!(
+                matches!(result, Ok(Outcome::Compared | Outcome::Partial(_))),
+                "{query} against {spelling}: {result:?}"
+            );
+        } else {
+            assert!(result.is_err(), "{query} against {spelling}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn reference_str_1093_keeps_string_operations_exact() {
+    use reference::check::Outcome;
+    for (query, changed) in [
+        (r#"SELECT (STR(UCASE("01")) AS ?s) {}"#, r#""1""#),
+        (r#"SELECT (STR(xsd:string(1e6)) AS ?s) {}"#, r#""1000000""#),
+        (
+            r#"SELECT (STR(?c) AS ?s) { BIND(xsd:string(1e6) AS ?c) }"#,
+            r#""1000000""#,
+        ),
+        (
+            r#"SELECT (STR(?c) AS ?s) { VALUES ?code { "007x" } BIND(SUBSTR(?code, 1, 3) AS ?c) }"#,
+            r#""7""#,
+        ),
+    ] {
+        assert!(check_str_1093(query, &[&[changed]]).is_err(), "{query}");
+    }
+    assert!(matches!(
+        check_str_1093(
+            "SELECT (STR(xsd:string(STR(1 + 0))) AS ?s) {}",
+            &[&[r#""+01""#]]
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_respects_binding_scopes() {
+    use reference::check::Outcome;
+    for (query, changed) in [
+        (
+            r#"SELECT (STR(?n) AS ?s) { VALUES ?n { "01" }
+            { SELECT ?keep { BIND(1 + 0 AS ?n) BIND(0 AS ?keep) } } }"#,
+            r#""1""#,
+        ),
+        (
+            r#"SELECT (STR(?n) AS ?s) { VALUES ?n { "01" }
+            MINUS { BIND(1 + 0 AS ?n) } }"#,
+            r#""1""#,
+        ),
+        (
+            r#"SELECT (STR(?n) AS ?s) { VALUES ?n { "01" }
+            { SELECT ?k { BIND(1 + 0 AS ?n) BIND(0 AS ?k) } GROUP BY ?k } }"#,
+            r#""1""#,
+        ),
+    ] {
+        assert!(check_str_1093(query, &[&[changed]]).is_err(), "{query}");
+    }
+    for query in [
+        "SELECT (STR(?n) AS ?s) { { SELECT ?n { BIND(1 + 0 AS ?n) } } }",
+        "SELECT (STR(MIN(?n)) AS ?s) { VALUES ?i { 1 2 } BIND(?i + 0 AS ?n) }",
+    ] {
+        assert!(
+            matches!(
+                check_str_1093(query, &[&[r#""+01""#]]),
+                Ok(Outcome::Partial(_))
+            ),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn reference_str_1093_compares_order_using_observed_spellings() {
+    use reference::check::Outcome;
+    let query = "SELECT ?n (STR(?n + 0) AS ?s) { VALUES ?n { 2 10 } }";
+    let two = &["2", r#""02""#][..];
+    let ten = &["10", r#""10""#][..];
+    let lexical = format!("{query} ORDER BY ?s");
+    assert!(matches!(
+        check_str_1093(&lexical, &[two, ten]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(&lexical, &[ten, two]).is_err());
+    let sliced = format!("{lexical} LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&sliced, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert!(check_str_1093(&sliced, &[&["3", r#""03""#]]).is_err());
+
+    let hidden = format!("{query} ORDER BY STR(?n + 0)");
+    assert!(matches!(
+        check_str_1093(&hidden, &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    let numeric = format!("{query} ORDER BY ?n ?s");
+    assert!(matches!(
+        check_str_1093(&numeric, &[two, ten]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(&numeric, &[ten, two]).is_err());
+    assert!(check_str_1093(&format!("{numeric} LIMIT 1"), &[ten]).is_err());
+    let unaffected = format!("{query} ORDER BY ?n LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&unaffected, &[two]),
+        Ok(Outcome::Partial(_))
+    ));
+
+    let raw = r#"SELECT ?n ?number { VALUES ?n { 2 10 } BIND(?n + 0 AS ?number) }
+        ORDER BY STR(?number)"#;
+    let raw_two = &["2", r#""02"^^<http://www.w3.org/2001/XMLSchema#integer>"#][..];
+    let raw_ten = &["10", "10"][..];
+    assert_eq!(
+        check_str_1093(raw, &[raw_two, raw_ten]),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_str_1093(raw, &[raw_ten, raw_two]).is_err());
+
+    let open = format!("{query} ORDER BY RAND() LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&open, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_rejects_inversions_with_ambiguous_matches() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?s {
+        { VALUES ?s { "02" "10" } } UNION { BIND(STR(2 + 0) AS ?s) }
+    } ORDER BY ?s"#;
+    let two = &[r#""02""#][..];
+    let ten = &[r#""10""#][..];
+    assert!(matches!(
+        check_str_1093(query, &[two, two, ten]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_str_1093(query, &[ten, two, two]).is_err());
+}
+
+#[test]
+fn reference_str_1093_checks_slice_boundaries_with_ambiguous_matches() {
+    use reference::check::Outcome;
+    let two = &[r#""02""#][..];
+    let first = &[r#""first""#][..];
+    let priority = r#"SELECT ?s {
+        { VALUES (?s ?priority) { ("first" 0) ("02" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(1 AS ?priority) }
+    } ORDER BY ?priority ?s"#;
+    assert!(check_str_1093(&format!("{priority} LIMIT 1"), &[two]).is_err());
+    assert!(matches!(
+        check_str_1093(&format!("{priority} LIMIT 1"), &[first]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check_str_1093(
+            &priority.replace("ORDER BY ?priority ?s", "ORDER BY ?priority LIMIT 1"),
+            &[first]
+        ),
+        Ok(Outcome::Compared)
+    );
+
+    let lexical = r#"SELECT ?s {
+        { VALUES ?s { "01" "02" } } UNION { BIND(STR(2 + 0) AS ?s) }
+    }"#;
+    assert!(check_str_1093(&format!("{lexical} ORDER BY ?s LIMIT 1"), &[two]).is_err());
+    assert!(check_str_1093(&format!("{lexical} ORDER BY DESC(?s) OFFSET 2"), &[two]).is_err());
+
+    let between = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("middle" 1) ("last" 2) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s"#;
+    let last = &[r#""last""#][..];
+    assert!(check_str_1093(&format!("{between} LIMIT 2 OFFSET 1"), &[two, last]).is_err());
+
+    let surplus = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("02" 0) ("last" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 2"#;
+    assert!(check_str_1093(surplus, &[two, last]).is_err());
+
+    let unresolved = r#"SELECT ?s {
+        { VALUES ?s { "02" } } UNION { BIND(STR(2 + 0) AS ?s) }
+    } ORDER BY ?s LIMIT 1"#;
+    assert!(matches!(
+        check_str_1093(unresolved, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_tracks_failed_binds_in_order_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+        BIND(IF(?n = 10, 1, IF(?s = "2", 1 / 0, 2)) AS ?key)
+    }"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    assert!(matches!(
+        check_str_1093(&format!("{query} ORDER BY ?key"), &[ten, two]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    assert!(check_str_1093(&format!("{query} ORDER BY ?n ?key"), &[ten, two]).is_err());
+
+    let union = r#"SELECT ?n ?s {
+        VALUES ?group { 0 }
+        { VALUES (?n ?s ?key ?group) { (10 "10" 0 0) } }
+        UNION
+        { SELECT ?n ?s ?key ?group {
+            BIND(2 AS ?n) BIND(STR(2 + 0) AS ?s) BIND(0 AS ?group)
+            BIND(IF(?s = "2", 1 / 0, 1) AS ?key)
+        } }
+    } ORDER BY ?key ?n"#;
+    assert!(matches!(
+        check_str_1093(union, &[ten, two]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_tracks_boundness_in_order_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+        BIND(IF(?s = "2", 1, 1 / 0) AS ?key)
+    }"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    assert!(matches!(
+        check_str_1093(&format!("{query} ORDER BY BOUND(?key) ?n"), &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    assert!(check_str_1093(&format!("{query} ORDER BY BOUND(?s) ?n"), &[ten, two]).is_err());
+    assert!(
+        check_str_1093(
+            &format!("{query} ORDER BY DESC(?n) BOUND(?key)"),
+            &[two, ten]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn reference_str_1093_tracks_aggregate_value_dependencies_in_order_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ?s"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    for aggregate in ["SUM(STRLEN(?s))", "AVG(STRLEN(?s))"] {
+        let ordered = format!("{query} ORDER BY {aggregate}");
+        assert!(
+            matches!(
+                check_str_1093(&ordered, &[ten, two]),
+                Ok(Outcome::OrderUnchecked(_))
+            ),
+            "{ordered}"
+        );
+    }
+    let ordered = format!("{query} ORDER BY GROUP_CONCAT(?s)");
+    assert!(matches!(
+        check_str_1093(&ordered, &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_tracks_aggregate_presence_and_distinct_values() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES (?n ?copy) { (2 true) (2 false) (10 true) (10 false) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ?s"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    for aggregate in [
+        r#"COUNT(IF(?copy || ?s != "2", 1, 1 / 0))"#,
+        r#"COUNT(DISTINCT IF(?copy, "2", ?s))"#,
+        "MAX(DISTINCT IF(?copy, IF(?n = 2, 1, 2), STRLEN(?s)))",
+    ] {
+        let ordered = format!("{query} ORDER BY {aggregate} DESC(?n)");
+        assert!(
+            matches!(
+                check_str_1093(&ordered, &[ten, two]),
+                Ok(Outcome::OrderUnchecked(_))
+            ),
+            "{ordered}"
+        );
+    }
+    assert!(check_str_1093(&format!("{query} ORDER BY COUNT(?s) ?n"), &[ten, two]).is_err());
+}
+
+#[test]
+fn reference_str_1093_keeps_distinct_sort_prefixes() {
+    use reference::check::Outcome;
+    let query = r#"SELECT DISTINCT ?n ?s {
+        { VALUES (?n ?s) { (0 "first") (1 "2") } }
+        UNION { BIND(1 AS ?n) BIND(STR(1 + 1) AS ?s) }
+    } ORDER BY ?n ?s"#;
+    let first = &["0", r#""first""#][..];
+    let second = &["1", r#""2""#][..];
+    assert!(check_str_1093(query, &[second, first]).is_err());
+    assert!(check_str_1093(&format!("{query} LIMIT 1"), &[second]).is_err());
+    assert_eq!(
+        check_str_1093(query, &[first, second]),
+        Ok(Outcome::Compared)
+    );
+
+    let differing_suffix = r#"SELECT DISTINCT ?n ?s {
+        VALUES (?n ?s ?suffix) { (0 "first" 0) (1 "2" 0) (1 "2" 1) }
+    } ORDER BY ?n ?suffix"#;
+    assert!(check_str_1093(differing_suffix, &[second, first]).is_err());
+    assert!(check_str_1093(&format!("{differing_suffix} LIMIT 1"), &[second]).is_err());
+    assert!(matches!(
+        check_str_1093(differing_suffix, &[first, second]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_keeps_spelling_dependencies_of_numeric_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+        BIND(STRLEN(?s) AS ?len)
+        BIND(?len + 1 AS ?key)
+    }"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    for key in ["?len", "?key"] {
+        assert!(matches!(
+            check_str_1093(&format!("{query} ORDER BY {key}"), &[ten, two]),
+            Ok(Outcome::OrderUnchecked(_))
+        ));
+        assert!(check_str_1093(&format!("{query} ORDER BY ?n {key}"), &[ten, two]).is_err());
+    }
+}
+
+#[test]
+fn reference_str_1093_keeps_order_after_spelling_invariant_metadata() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+    }"#;
+    let two = &["2", r#""2""#][..];
+    let ten = &["10", r#""10""#][..];
+    for metadata in [
+        "LANG(?s)",
+        "DATATYPE(STR(?n + 0))",
+        "LANG(UCASE(?s))",
+        "DATATYPE(LCASE(UCASE(?s)))",
+    ] {
+        let ordered = format!("{query} ORDER BY {metadata} ?n");
+        assert!(check_str_1093(&ordered, &[ten, two]).is_err());
+        assert_eq!(check_str_1093(&ordered, &[two, ten]), Ok(Outcome::Compared));
+    }
+    let dependent = format!(r#"{query} ORDER BY LANG(STRLANG("x", IF(?s = "2", "en", "fr"))) ?n"#);
+    let padded = &["2", r#""002""#][..];
+    assert!(matches!(
+        check_str_1093(&dependent, &[ten, padded]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_r4_shared_candidate_capacity_rejects_forced_omissions() {
+    use reference::check::Outcome;
+    let first = &[r#""first""#][..];
+    let two = &[r#""02""#][..];
+    let last = &[r#""last""#][..];
+
+    let leading = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("last" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 2"#;
+    assert!(check_str_1093(leading, &[two, last]).is_err());
+    assert!(matches!(
+        check_str_1093(leading, &[two, two]),
+        Ok(Outcome::Partial(_))
+    ));
+
+    let tail = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("first" 0) ("02" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(1 AS ?k) }
+    } ORDER BY ?k ?s OFFSET 1 LIMIT 2"#;
+    assert!(check_str_1093(tail, &[first, two]).is_err());
+    assert!(matches!(
+        check_str_1093(tail, &[two, two]),
+        Ok(Outcome::Partial(_))
+    ));
+
+    let between = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("first" 0) ("02" 1) ("last" 2) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(1 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 3"#;
+    assert!(check_str_1093(between, &[first, two, last]).is_err());
+
+    let spare_unresolved = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("02" 0) ("last" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 2"#;
+    assert!(matches!(
+        check_str_1093(spare_unresolved, &[two, two]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_r4_tracks_selection_aggregate_dependencies() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES (?n ?copy) { (2 true) (2 false) (10 true) (10 false) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ?s"#;
+    let two_exact = &["2", r#""2""#][..];
+    let two_padded3 = &["2", r#""002""#][..];
+    let two_padded4 = &["2", r#""0002""#][..];
+    let ten = &["10", r#""10""#][..];
+
+    for aggregate in [
+        "MAX(DISTINCT IF(?copy, IF(?n = 2, 2, 3), STRLEN(?s)))",
+        "MAX(IF(?copy, IF(?n = 2, 2, 3), STRLEN(?s))) ?n",
+    ] {
+        let ordered = format!("{query} ORDER BY {aggregate}");
+        assert!(
+            matches!(
+                check_str_1093(&ordered, &[ten, two_padded4]),
+                Ok(Outcome::OrderUnchecked(_))
+            ),
+            "{ordered}"
+        );
+    }
+
+    let min_overtaken = format!(r#"{query} ORDER BY MIN(IF(?copy, IF(?n = 2, "05", "03"), ?s))"#);
+    assert!(matches!(
+        check_str_1093(&min_overtaken, &[two_padded3, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let min_metadata =
+        format!("{query} ORDER BY DATATYPE(MIN(DISTINCT IF(?copy, 1.5, STRLEN(?s)))) ?n");
+    assert!(matches!(
+        check_str_1093(&min_metadata, &[two_padded3, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let sample = format!(r#"{query} ORDER BY SAMPLE(IF(?copy, IF(?n = 2, "2", "10"), ?s))"#);
+    assert!(matches!(
+        check_str_1093(&sample, &[two_padded3, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let fixed_metadata = format!("{query} ORDER BY DATATYPE(MIN(IF(?copy, 2, STRLEN(?s)))) ?n");
+    assert!(check_str_1093(&fixed_metadata, &[ten, two_exact]).is_err());
+    assert_eq!(
+        check_str_1093(&fixed_metadata, &[two_exact, ten]),
+        Ok(Outcome::Compared)
+    );
+
+    let leading_key =
+        format!("{query} ORDER BY ?n MAX(DISTINCT IF(?copy, IF(?n = 2, 2, 3), STRLEN(?s)))");
+    assert!(check_str_1093(&leading_key, &[ten, two_padded4]).is_err());
+}
+
+#[test]
+fn reference_str_1093_r4_tracks_count_distinct_star_dependencies() {
+    use reference::check::Outcome;
+    let two = &["2"][..];
+    let ten = &["10"][..];
+
+    let lexical = r#"SELECT ?n {
+        { VALUES (?n ?s) { (2 "02") (10 "10") } }
+        UNION { VALUES ?n { 2 10 } BIND(STR(?n + 0) AS ?s) }
+    } GROUP BY ?n"#;
+    assert!(matches!(
+        check_str_1093(
+            &format!("{lexical} ORDER BY COUNT(DISTINCT *)"),
+            &[two, ten]
+        ),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    assert!(
+        check_str_1093(
+            &format!("{lexical} ORDER BY DATATYPE(COUNT(DISTINCT *)) ?n"),
+            &[ten, two]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        check_str_1093(
+            &format!("{lexical} ORDER BY DATATYPE(COUNT(DISTINCT *)) ?n"),
+            &[two, ten]
+        ),
+        Ok(Outcome::Compared)
+    );
+
+    let unbound_bind = r#"SELECT ?n {
+        { VALUES (?n ?k) { (2 1) (10 1) (10 2) } }
+        UNION {
+            SELECT ?n ?k {
+                BIND(2 AS ?n)
+                BIND(STR(2 + 0) AS ?s)
+                BIND(IF(?s = "2", 1 / 0, 1) AS ?k)
+            }
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) DESC(?n)"#;
+    assert!(matches!(
+        check_str_1093(unbound_bind, &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let plain_count = r#"SELECT ?n {
+        { VALUES (?n ?s) { (2 "02") (10 "10") (10 "20") } }
+        UNION { VALUES ?n { 2 10 } BIND(STR(?n + 0) AS ?s) }
+    } GROUP BY ?n ORDER BY COUNT(*)"#;
+    assert!(check_str_1093(plain_count, &[ten, two]).is_err());
+    assert_eq!(
+        check_str_1093(plain_count, &[two, ten]),
+        Ok(Outcome::Compared)
+    );
+
+    let singleton = r#"SELECT ?n {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) ?n"#;
+    assert!(check_str_1093(singleton, &[ten, two]).is_err());
+    assert_eq!(
+        check_str_1093(singleton, &[two, ten]),
+        Ok(Outcome::Compared)
+    );
+
+    let projected_out = r#"SELECT ?n {
+        SELECT ?n ?tag {
+            VALUES (?n ?tag) { (2 "a") (2 "b") (10 "a") (10 "a") }
+            BIND(STR(?n + 0) AS ?s)
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *)"#;
+    assert!(check_str_1093(projected_out, &[two, ten]).is_err());
+    assert_eq!(
+        check_str_1093(projected_out, &[ten, two]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r5_keeps_count_distinct_star_fixed_with_discriminator() {
+    use reference::check::Outcome;
+    let two = &["2"][..];
+    let ten = &["10"][..];
+
+    let fixed_tag = r#"SELECT ?n WHERE {
+        VALUES (?n ?tag) { (2 "a") (10 "a") (10 "b") }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(fixed_tag, &[ten]).is_err());
+    assert_eq!(check_str_1093(fixed_tag, &[two]), Ok(Outcome::Compared));
+
+    let fixed_presence = r#"SELECT ?n WHERE {
+        VALUES (?n ?tag) { (2 "a") (10 "a") (10 UNDEF) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(fixed_presence, &[ten]).is_err());
+    assert_eq!(
+        check_str_1093(fixed_presence, &[two]),
+        Ok(Outcome::Compared)
+    );
+
+    let fixed_metadata = r#"SELECT ?n WHERE {
+        { VALUES ?n { 2 10 } BIND(STR(?n + 0) AS ?s) }
+        UNION { VALUES ?n { 10 } BIND(STRLANG(STR(?n + 0), "en") AS ?s) }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(fixed_metadata, &[ten]).is_err());
+    assert_eq!(
+        check_str_1093(fixed_metadata, &[two]),
+        Ok(Outcome::Compared)
+    );
+
+    let unbound_with_tag = r#"SELECT ?n WHERE {
+        { VALUES (?n ?tag ?k) { (2 "a" 1) (10 "a" 1) } }
+        UNION {
+            SELECT ?n ?tag ?k {
+                BIND(10 AS ?n)
+                BIND("b" AS ?tag)
+                BIND(STR(10 + 0) AS ?s)
+                BIND(IF(?s = "10", 1 / 0, 1) AS ?k)
+            }
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(unbound_with_tag, &[ten]).is_err());
+    assert_eq!(
+        check_str_1093(unbound_with_tag, &[two]),
+        Ok(Outcome::Compared)
+    );
+
+    let colliding_lexical = r#"SELECT ?n WHERE {
+        { VALUES (?n ?tag ?s) { (2 "a" "2") (10 "a" "010") } }
+        UNION { VALUES (?n ?tag) { (10 "a") } BIND(STR(?n + 0) AS ?s) }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(matches!(
+        check_str_1093(colliding_lexical, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    let colliding_unbound = r#"SELECT ?n WHERE {
+        { VALUES (?n ?k) { (2 1) (10 1) } }
+        UNION {
+            SELECT ?n ?k {
+                BIND(10 AS ?n)
+                BIND(STR(10 + 0) AS ?s)
+                BIND(IF(?s = "10", 1 / 0, 1) AS ?k)
+            }
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(matches!(
+        check_str_1093(colliding_unbound, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_r6_bounds_count_distinct_star_pair_scan() {
+    use oxrdf::{GraphName, NamedNode, Quad};
+    use reference::check::Outcome;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    let member_pred = NamedNode::new_unchecked("urn:member");
+    let group_obj = NamedNode::new_unchecked("urn:group");
+    let make_quads = |count: usize| -> Vec<Quad> {
+        (0..count)
+            .map(|i| {
+                Quad::new(
+                    NamedNode::new_unchecked(format!("urn:item:{i}")),
+                    member_pred.clone(),
+                    group_obj.clone(),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    };
+
+    let rotating_grouped_slice = r#"SELECT ?g WHERE {
+        { VALUES (?g ?a ?b ?c) { (1 <urn:only> 0 0) } }
+        UNION {
+            { ?a <urn:member> <urn:group> . BIND(0 AS ?b) BIND(0 AS ?c) }
+            UNION {
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?a)
+                BIND(1 AS ?b) BIND(1 AS ?c)
+            }
+            UNION {
+                BIND(0 AS ?a)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?b)
+                BIND(2 AS ?c)
+            }
+            UNION {
+                BIND(1 AS ?a) BIND(2 AS ?b)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?c)
+            }
+            BIND(2 AS ?g)
+        }
+        BIND(STR(1 + 0) AS ?s)
+    } GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+
+    let rotating_count_only = r#"SELECT (COUNT(DISTINCT *) AS ?count) WHERE {
+        { ?a <urn:member> <urn:group> . BIND(0 AS ?b) BIND(0 AS ?c) }
+        UNION {
+            BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?a)
+            BIND(1 AS ?b) BIND(1 AS ?c)
+        }
+        UNION {
+            BIND(0 AS ?a)
+            BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?b)
+            BIND(2 AS ?c)
+        }
+        UNION {
+            BIND(1 AS ?a) BIND(2 AS ?b)
+            BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?c)
+        }
+        BIND(STR(1 + 0) AS ?s)
+    }"#;
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+
+    // Small unsplit group (13 rows -> 78 pairs <= budget) still proves fixed.
+    let small = reference::Reference::new(make_quads(10));
+    assert!(check(&small, rotating_grouped_slice, &[two]).is_err());
+    assert_eq!(
+        check(&small, rotating_grouped_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+
+    // Tight work_limit bounds the pair scan conservatively without failing evaluation.
+    let tight = reference::Reference::new(make_quads(60)).with_work_limit(1_000);
+    assert!(matches!(
+        check(&tight, rotating_grouped_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&tight, rotating_count_only, &[&["63"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Single unsplit bucket exceeding the pair budget (503 rows -> 126,253 pairs > 100,000)
+    // retains spelling dependency conservatively and still compares without ORDER BY.
+    let over_budget = reference::Reference::new(make_quads(500));
+    assert!(matches!(
+        check(&over_budget, rotating_grouped_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&over_budget, rotating_count_only, &[&["503"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Cross-bucket budget: 50 buckets of 73 rows each (2,628 pairs per bucket,
+    // 131,400 pairs combined > 100,000) exhausts the shared budget across buckets.
+    let in_bucket = NamedNode::new_unchecked("urn:inBucket");
+    let is_bucket = NamedNode::new_unchecked("urn:isBucket");
+    let yes = NamedNode::new_unchecked("urn:yes");
+    let mut bucket_quads = Vec::with_capacity(50 * 71);
+    for b in 0..50 {
+        let bucket = NamedNode::new_unchecked(format!("urn:b:{b}"));
+        bucket_quads.push(Quad::new(
+            bucket.clone(),
+            is_bucket.clone(),
+            yes.clone(),
+            GraphName::DefaultGraph,
+        ));
+        for i in 0..70 {
+            bucket_quads.push(Quad::new(
+                NamedNode::new_unchecked(format!("urn:item:{b}:{i}")),
+                in_bucket.clone(),
+                bucket.clone(),
+                GraphName::DefaultGraph,
+            ));
+        }
+    }
+    let multi_bucket_query = r#"SELECT ?g WHERE {
+        { VALUES (?g ?k ?a ?b ?c) { (1 <urn:only> <urn:only> 0 0) } }
+        UNION {
+            { ?a <urn:inBucket> ?k . BIND(0 AS ?b) BIND(0 AS ?c) }
+            UNION {
+                ?k <urn:isBucket> <urn:yes> .
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?a)
+                BIND(1 AS ?b) BIND(1 AS ?c)
+            }
+            UNION {
+                ?k <urn:isBucket> <urn:yes> .
+                BIND(0 AS ?a)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?b)
+                BIND(2 AS ?c)
+            }
+            UNION {
+                ?k <urn:isBucket> <urn:yes> .
+                BIND(1 AS ?a) BIND(2 AS ?b)
+                BIND(IF(STR(1 + 0) = "1", 0, 1) AS ?c)
+            }
+            BIND(2 AS ?g)
+        }
+        BIND(STR(1 + 0) AS ?s)
+    } GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    let multi_bucket = reference::Reference::new(bucket_quads);
+    assert!(matches!(
+        check(&multi_bucket, multi_bucket_query, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    // Large group matching the review query shape under the optimizer work limit.
+    let large = reference::Reference::new(make_quads(5_000)).with_work_limit(20_000_000);
+    assert_eq!(
+        check(&large, rotating_count_only, &[&["5003"]]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r7_bounds_count_distinct_star_bucket_refinement() {
+    use reference::check::Outcome;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    fn balanced_union(branches: &[String]) -> String {
+        match branches {
+            [] => unreachable!(),
+            [single] => single.clone(),
+            _ => {
+                let mid = branches.len() / 2;
+                format!(
+                    "{{ {} UNION {} }}",
+                    balanced_union(&branches[..mid]),
+                    balanced_union(&branches[mid..])
+                )
+            }
+        }
+    }
+
+    let peeling_union = |count: usize, prefix: &str| -> String {
+        let branches: Vec<String> = (1..=count)
+            .map(|i| {
+                if i < count {
+                    format!(
+                        "{{ BIND(1 AS ?{prefix}{i}) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{prefix}{}) }}",
+                        i + 1
+                    )
+                } else {
+                    format!("{{ BIND(1 AS ?{prefix}{i}) }}")
+                }
+            })
+            .collect();
+        balanced_union(&branches)
+    };
+
+    let grouped_slice = |count: usize| -> String {
+        let body = peeling_union(count, "v");
+        format!(
+            "SELECT ?g WHERE {{ \
+                {{ VALUES (?g ?x) {{ (1 1) (1 2) }} }} \
+                UNION {{ {body} BIND(2 AS ?g) }} \
+            }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+        )
+    };
+
+    let count_only = |count: usize| -> String {
+        let body = peeling_union(count, "v");
+        format!("SELECT (COUNT(DISTINCT *) AS ?count) WHERE {{ {body} }}")
+    };
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+
+    // Small peeling chain (10 rows, 9 refinement passes, 0 pair checks) fits
+    // within the proof budget and still proves COUNT(DISTINCT *) fixed.
+    let default_oracle = reference::Reference::new(Vec::new());
+    let small_slice = grouped_slice(10);
+    assert!(check(&default_oracle, &small_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &small_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+
+    // Tight work_limit bounds recursive bucket refinement conservatively without
+    // failing evaluation: 30 peeling rows evaluate well under work_limit(1_000)
+    // but need more refinement work than the remaining proof budget allows.
+    let tight = reference::Reference::new(Vec::new()).with_work_limit(1_000);
+    let medium_slice = grouped_slice(30);
+    assert!(matches!(
+        check(&tight, &medium_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&tight, &count_only(30), &[&["30"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Peeling chain exceeding the default proof budget (240 rows, 0 pair checks)
+    // retains spelling dependency conservatively and still compares without ORDER BY.
+    let over_budget_slice = grouped_slice(240);
+    assert!(matches!(
+        check(&default_oracle, &over_budget_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&default_oracle, &count_only(240), &[&["240"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Shared cross-group proof budget: a single 120-row peeling group fits within
+    // the default budget (~36k), while three such groups (~108k) exhaust it.
+    let single_120_slice = grouped_slice(120);
+    assert!(check(&default_oracle, &single_120_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &single_120_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+    let multi_group_slice = format!(
+        "SELECT ?g WHERE {{ \
+            {{ VALUES (?g ?x) {{ (1 1) (1 2) }} }} \
+            UNION {{ {} BIND(2 AS ?g) }} \
+            UNION {{ {} BIND(3 AS ?g) }} \
+            UNION {{ {} BIND(4 AS ?g) }} \
+        }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1",
+        peeling_union(120, "a"),
+        peeling_union(120, "b"),
+        peeling_union(120, "c"),
+    );
+    assert!(matches!(
+        check(&default_oracle, &multi_group_slice, &[one]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    // Large peeling chain under the optimizer work limit completes quickly and
+    // compares cleanly without ORDER BY.
+    let large = reference::Reference::new(Vec::new()).with_work_limit(20_000_000);
+    assert_eq!(
+        check(&large, &count_only(600), &[&["600"]]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r8_projects_sparse_spelling_maps_in_peeling_chain() {
+    use reference::check::Outcome;
+    use std::fmt::Write as _;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    fn balanced_union(branches: &[String]) -> String {
+        match branches {
+            [] => unreachable!(),
+            [single] => single.clone(),
+            _ => {
+                let mid = branches.len() / 2;
+                format!(
+                    "{{ {} UNION {} }}",
+                    balanced_union(&branches[..mid]),
+                    balanced_union(&branches[mid..])
+                )
+            }
+        }
+    }
+
+    fn balanced_binds(vars: &[String]) -> String {
+        if vars.len() <= 8 {
+            let mut out = String::new();
+            for v in vars {
+                let _ = write!(out, " BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{v})");
+            }
+            return format!("{{ {out} }}");
+        }
+        let mid = vars.len() / 2;
+        format!(
+            "{{ {} {} }}",
+            balanced_binds(&vars[..mid]),
+            balanced_binds(&vars[mid..])
+        )
+    }
+
+    let projected_peeling_union = |count: usize, dropped_bindings: usize, prefix: &str| -> String {
+        let drop_vars: Vec<String> = (0..dropped_bindings).map(|j| format!("drop{j}")).collect();
+        let dropped = balanced_binds(&drop_vars);
+        let branches: Vec<String> = (1..=count)
+            .map(|i| {
+                if i < count {
+                    format!(
+                        "{{ BIND(1 AS ?{prefix}{i}) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{prefix}{}) }}",
+                        i + 1
+                    )
+                } else {
+                    format!(
+                        "{{ SELECT ?{prefix}{i} ?keep WHERE {{ {{ BIND(1 AS ?{prefix}{i}) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?keep) }} {dropped} }} }}"
+                    )
+                }
+            })
+            .collect();
+        balanced_union(&branches)
+    };
+
+    let grouped_slice = |count: usize, dropped_bindings: usize| -> String {
+        let body = projected_peeling_union(count, dropped_bindings, "v");
+        format!(
+            "SELECT ?g WHERE {{ \
+                {{ VALUES (?g ?x) {{ (1 1) (1 2) }} }} \
+                UNION {{ {body} BIND(2 AS ?g) }} \
+            }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+        )
+    };
+
+    let count_only = |count: usize, dropped_bindings: usize| -> String {
+        let body = projected_peeling_union(count, dropped_bindings, "v");
+        format!("SELECT (COUNT(DISTINCT *) AS ?count) WHERE {{ {body} }}")
+    };
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+    let default_oracle = reference::Reference::new(Vec::new());
+
+    // Small peeling chain whose last row drops 300 of 301 spelling-dependent
+    // bindings via projection still proves COUNT(DISTINCT *) fixed.
+    let small_slice = grouped_slice(10, 300);
+    assert!(check(&default_oracle, &small_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &small_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+    assert_eq!(
+        check(&default_oracle, &count_only(10, 300), &[&["10"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Multi-pass peeling chain (~36k refinement units <= 100k) where the
+    // projected row survives all 119 splits with one retained spelling entry
+    // out of 501 completes quickly and proves fixed.
+    let medium_slice = grouped_slice(120, 500);
+    assert!(check(&default_oracle, &medium_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &medium_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+
+    // Over-budget peeling chain with a projected trailing row falls back
+    // conservatively while keeping the numeric count unchanged.
+    let over_budget_slice = grouped_slice(240, 300);
+    assert!(matches!(
+        check(&default_oracle, &over_budget_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&default_oracle, &count_only(240, 300), &[&["240"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Projection that drops every spelling-dependent binding leaves a
+    // spelling-free row whose COUNT(DISTINCT *) remains fixed.
+    let drop_vars: Vec<String> = (0..300).map(|j| format!("drop{j}")).collect();
+    let dropped = balanced_binds(&drop_vars);
+    let all_dropped_slice = format!(
+        "SELECT ?g WHERE {{ \
+            {{ VALUES (?g ?v) {{ (1 1) }} }} \
+            UNION {{ \
+                {{ SELECT ?v WHERE {{ {{ BIND(1 AS ?v) }} {dropped} }} }} \
+                UNION {{ SELECT ?v WHERE {{ {{ BIND(2 AS ?v) }} {dropped} }} }} \
+                BIND(2 AS ?g) \
+            }} \
+        }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+    );
+    let tight = reference::Reference::new(Vec::new()).with_work_limit(2_000);
+    assert!(check(&tight, &all_dropped_slice, &[two]).is_err());
+    assert_eq!(
+        check(&tight, &all_dropped_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r8_charges_pair_variable_visits() {
+    use oxrdf::{GraphName, NamedNode, Quad};
+    use reference::check::Outcome;
+    use std::fmt::Write as _;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    let member_pred = NamedNode::new_unchecked("urn:member");
+    let group_obj = NamedNode::new_unchecked("urn:group");
+    let make_quads = |count: usize| -> Vec<Quad> {
+        (0..count)
+            .map(|i| {
+                Quad::new(
+                    NamedNode::new_unchecked(format!("urn:item:{i}")),
+                    member_pred.clone(),
+                    group_obj.clone(),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    };
+
+    fn balanced_binds(vars: &[String]) -> String {
+        if vars.len() <= 8 {
+            let mut out = String::new();
+            for v in vars {
+                let _ = write!(out, " BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{v})");
+            }
+            return format!("{{ {out} }}");
+        }
+        let mid = vars.len() / 2;
+        format!(
+            "{{ {} {} }}",
+            balanced_binds(&vars[..mid]),
+            balanced_binds(&vars[mid..])
+        )
+    }
+
+    let wide_rotating_body = |extra_vars: usize, duplicate_fixed: bool| -> String {
+        let fixed_arm = if duplicate_fixed {
+            "{ SELECT ?a ?b ?c WHERE { ?dummy <urn:member> <urn:group> . BIND(<urn:fixed> AS ?a) BIND(0 AS ?b) BIND(0 AS ?c) } }"
+        } else {
+            "{ ?a <urn:member> <urn:group> . BIND(0 AS ?b) BIND(0 AS ?c) }"
+        };
+        let extra_names: Vec<String> = (0..extra_vars).map(|i| format!("A{i}")).collect();
+        let extra = balanced_binds(&extra_names);
+        format!(
+            "{fixed_arm} \
+            UNION {{ {{ BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?a) BIND(1 AS ?b) BIND(1 AS ?c) }} {extra} }} \
+            UNION {{ BIND(0 AS ?a) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?b) BIND(2 AS ?c) }} \
+            UNION {{ BIND(1 AS ?a) BIND(2 AS ?b) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?c) }}"
+        )
+    };
+
+    let grouped_slice = |extra_vars: usize, duplicate_fixed: bool| -> String {
+        let body = wide_rotating_body(extra_vars, duplicate_fixed);
+        format!(
+            "SELECT ?g WHERE {{ \
+                {{ VALUES (?g ?a ?b ?c) {{ (1 <urn:only> 0 0) }} }} \
+                UNION {{ {body} BIND(2 AS ?g) }} \
+            }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+        )
+    };
+
+    let count_only = |extra_vars: usize, duplicate_fixed: bool| -> String {
+        let body = wide_rotating_body(extra_vars, duplicate_fixed);
+        format!("SELECT (COUNT(DISTINCT *) AS ?count) WHERE {{ {body} }}")
+    };
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+
+    // Small wide-row group still proves COUNT(DISTINCT *) fixed within budget.
+    let small = reference::Reference::new(make_quads(5));
+    let small_slice = grouped_slice(10, false);
+    assert!(check(&small, &small_slice, &[two]).is_err());
+    assert_eq!(check(&small, &small_slice, &[one]), Ok(Outcome::Compared));
+
+    // Tight-budget case: only 63 pairs, but repeated scans across 100 extra
+    // spelling-dependent bindings on the wide row exhaust the remaining proof
+    // budget, retaining the dependency without changing the count.
+    let tight = reference::Reference::new(make_quads(20)).with_work_limit(2_000);
+    let tight_slice = grouped_slice(100, false);
+    assert!(matches!(
+        check(&tight, &tight_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&tight, &count_only(100, false), &[&["23"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Default proof budget (100,000): refinement (~2.3k) plus pair count (903)
+    // is far below 100,000, but 302 comparisons against 400 extra bindings
+    // (~121k variable visits) exhaust the default budget cleanly.
+    let wide_default = reference::Reference::new(make_quads(300));
+    let wide_slice = grouped_slice(400, false);
+    assert!(matches!(
+        check(&wide_default, &wide_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&wide_default, &count_only(400, false), &[&["303"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Duplicate fixed rows also exhaust the pair variable-visit budget while
+    // leaving the distinct count (4) unchanged.
+    let dup_slice = grouped_slice(400, true);
+    assert!(matches!(
+        check(&wide_default, &dup_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&wide_default, &count_only(400, true), &[&["4"]]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r5_keeps_min_max_fixed_across_strict_term_classes() {
+    use reference::check::Outcome;
+    let two = &["2"][..];
+    let ten = &["10"][..];
+    let base = r#"SELECT ?n WHERE {
+        VALUES (?n ?copy) { (2 true) (2 false) (10 true) (10 false) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n"#;
+
+    let min_iri = format!("{base} ORDER BY MIN(IF(?copy, <urn:fixed>, ?s)) ?n LIMIT 1");
+    assert!(check_str_1093(&min_iri, &[ten]).is_err());
+    assert_eq!(check_str_1093(&min_iri, &[two]), Ok(Outcome::Compared));
+
+    let max_triple =
+        format!("{base} ORDER BY MAX(IF(?copy, <<( <urn:s> <urn:p> <urn:o> )>>, ?s)) ?n LIMIT 1");
+    assert!(check_str_1093(&max_triple, &[ten]).is_err());
+    assert_eq!(check_str_1093(&max_triple, &[two]), Ok(Outcome::Compared));
+
+    let max_datatype =
+        format!("{base} ORDER BY DATATYPE(MAX(IF(?copy, <urn:fixed>, ?s))) ?n LIMIT 1");
+    assert!(check_str_1093(&max_datatype, &[ten]).is_err());
+    assert_eq!(check_str_1093(&max_datatype, &[two]), Ok(Outcome::Compared));
+
+    let max_literal_wins = format!("{base} ORDER BY MAX(IF(?copy, <urn:fixed>, ?s)) ?n LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&max_literal_wins, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    let min_class_can_change = format!(
+        r#"{base} ORDER BY MIN(IF(?copy, <urn:fixed>, IF(?s != "010", "a", <urn:a>))) ?n LIMIT 1"#
+    );
+    assert!(matches!(
+        check_str_1093(&min_class_can_change, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    let min_error_can_appear = format!(
+        r#"{base} ORDER BY MIN(IF(?copy, <urn:fixed>, IF(?s = "010", 1 / 0, "a"))) ?n LIMIT 1"#
+    );
+    assert!(matches!(
+        check_str_1093(&min_error_can_appear, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
 }
 
 /// The reference evaluator's own cases: the choices that it notes, the scope of the
@@ -6519,4 +8578,1286 @@ fn reference_evaluator_notes_open_choices_and_keeps_scopes() {
     }
     // NaN is unordered against a number
     assert_eq!(spec_order(terms[3].as_ref(), terms[0].as_ref()), None);
+}
+
+/// A term that the memory budget refuses to decode in the middle of an answer fails the
+/// output with the budget's error, in every SELECT format of both executors, after the
+/// rows before it, which are written whole and counted. The long literal sorts in the
+/// middle of the objects, and the query reads them in object order.
+///
+/// The cursor runs with batches of 1 and 64 rows, whose term caches fit the budget, so the
+/// batches before the long literal are written from the cache and the batch holding it
+/// falls back to decoding row by row. With 4,096 rows the one batch's cache needs 128 bytes
+/// a cell before any term, 256 KiB, which the 128 KiB budget refuses, so every row is
+/// decoded row by row. The unit test
+/// `the_refused_decode_cases_cover_cached_and_declined_batches` checks these cases, and a
+/// control without the long literal is written whole under the same budget.
+#[test]
+fn a_refused_decode_mid_answer_keeps_the_budget_error_in_every_writer() {
+    use sparkles_core::sparql::results::{
+        self, Format, RowCount, SolutionsFormat, WriteOptions, write,
+    };
+    let load = |long: bool| {
+        let s = Store::in_memory(StoreOptions::default());
+        let data = (0..1000)
+            .map(|i| {
+                if i == 600 && long {
+                    format!(
+                        "<urn:s:{i}> <urn:p> \"v{i:04}{}\" .\n",
+                        "x".repeat(256 << 10)
+                    )
+                } else {
+                    format!("<urn:s:{i}> <urn:p> \"v{i:04}\" .\n")
+                }
+            })
+            .collect::<String>();
+        s.load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        s
+    };
+    let s = load(true);
+    let control = load(false);
+    let q = "SELECT ?o ?s WHERE { ?s <urn:p> ?o }";
+    let opts = QueryOptions {
+        max_memory_bytes: Some(128 << 10),
+        ..Default::default()
+    };
+    // the rows whose object, the last thing a row holds of its own, was written
+    let complete = |out: &[u8]| -> u64 {
+        out.windows(6)
+            .filter(|w| w[0] == b'v' && w[1..5].iter().all(u8::is_ascii_digit) && w[5] != b'x')
+            .count() as u64
+    };
+    let refused = |name: &str, error: &Error| {
+        assert!(
+            matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+            "{name}: {error:?}"
+        );
+    };
+    for batch in [1, 64, 4096] {
+        let mut c = select_cursor(control.snapshot(), q, &opts, &options(batch)).unwrap();
+        let rows = RowCount::new();
+        write(
+            results::Source::Select(&mut c),
+            WriteOptions::new(Format::Solutions(SolutionsFormat::Tsv), &rows),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(rows.get(), 1000, "control batch {batch}");
+    }
+    for fmt in [
+        SolutionsFormat::Json,
+        SolutionsFormat::Xml,
+        SolutionsFormat::Csv,
+        SolutionsFormat::Tsv,
+        SolutionsFormat::Sparkles,
+    ] {
+        let r = query(s.snapshot(), q, &opts).unwrap();
+        let rows = RowCount::new();
+        let mut out = Vec::new();
+        let error = write(
+            results::Source::Result(&r),
+            WriteOptions::new(Format::Solutions(fmt), &rows),
+            &mut out,
+        )
+        .unwrap_err();
+        let name = format!("eager {fmt:?}");
+        refused(&name, &error);
+        assert!(
+            rows.get() > 0 && rows.get() < 1000,
+            "{name}: {}",
+            rows.get()
+        );
+        assert_eq!(rows.get(), complete(&out), "{name}");
+        for batch in [1, 64, 4096] {
+            let mut c = select_cursor(s.snapshot(), q, &opts, &options(batch)).unwrap();
+            let rows = RowCount::new();
+            let mut out = Vec::new();
+            let error = write(
+                results::Source::Select(&mut c),
+                WriteOptions::new(Format::Solutions(fmt), &rows),
+                &mut out,
+            )
+            .unwrap_err();
+            let name = format!("cursor {fmt:?} batch {batch}");
+            refused(&name, &error);
+            assert!(
+                rows.get() > 0 && rows.get() < 1000,
+                "{name}: {}",
+                rows.get()
+            );
+            assert_eq!(rows.get(), complete(&out), "{name}");
+            // a cursor still open fails with the output; the one batch of 4,096 rows
+            // completed the plan before the writer failed, and keeps the output's error
+            let status = if batch == 4096 {
+                CursorStatus::Complete
+            } else {
+                CursorStatus::Failed
+            };
+            assert_eq!(c.status(), status, "{name}");
+            assert!(c.stats().error.is_some(), "{name}");
+            assert!(
+                c.next_batch().unwrap().is_none(),
+                "{name}: the cursor is fused"
+            );
+        }
+    }
+}
+
+/// Regression tests for roadmap item 1077: strict XSD 1.1 float/double lexical forms,
+/// canonical XPath F&O `xsd:string` casts of floats/doubles, and XPath `.` excluding `\r`
+/// without the `s` flag across eager, cursor/streaming, `NumColumn`, and `KeyFilter` paths.
+#[test]
+fn xsd_float_double_lexical_forms_string_casts_and_xpath_regex_dot() {
+    use oxrdf::Literal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let ttl = r#"
+@prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:d_inf_upper ex:num "INF"^^xsd:double .
+ex:d_pinf_upper ex:num "+INF"^^xsd:double .
+ex:d_ninf_upper ex:num "-INF"^^xsd:double .
+ex:d_nan_upper ex:num "NaN"^^xsd:double .
+ex:d_inf_lower ex:num "inf"^^xsd:double .
+ex:d_ninf_lower ex:num "-inf"^^xsd:double .
+ex:d_pinf_lower ex:num "+inf"^^xsd:double .
+ex:d_infinity ex:num "infinity"^^xsd:double .
+ex:d_nan_lower ex:num "nan"^^xsd:double .
+ex:d_nnan ex:num "-NaN"^^xsd:double .
+ex:d_pnan ex:num "+NaN"^^xsd:double .
+
+ex:f_inf_upper ex:num "INF"^^xsd:float .
+ex:f_pinf_upper ex:num "+INF"^^xsd:float .
+ex:f_ninf_upper ex:num "-INF"^^xsd:float .
+ex:f_nan_upper ex:num "NaN"^^xsd:float .
+ex:f_inf_lower ex:num "inf"^^xsd:float .
+ex:f_ninf_lower ex:num "-inf"^^xsd:float .
+ex:f_infinity ex:num "infinity"^^xsd:float .
+ex:f_nan_lower ex:num "nan"^^xsd:float .
+ex:f_nnan ex:num "-NaN"^^xsd:float .
+
+ex:c_d_1e6 ex:cast "1e6"^^xsd:double .
+ex:c_d_1000000 ex:cast "1000000"^^xsd:double .
+ex:c_d_n1e6 ex:cast "-1e6"^^xsd:double .
+ex:c_d_1_5e6 ex:cast "1.5e6"^^xsd:double .
+ex:c_d_1_23e6 ex:cast "1.23e6"^^xsd:double .
+ex:c_d_1e_6 ex:cast "1e-6"^^xsd:double .
+ex:c_d_n1e_6 ex:cast "-1e-6"^^xsd:double .
+ex:c_d_1e_7 ex:cast "1e-7"^^xsd:double .
+ex:c_d_n1e_7 ex:cast "-1e-7"^^xsd:double .
+ex:c_d_999999 ex:cast "999999.0e0"^^xsd:double .
+ex:c_d_1_0 ex:cast "1.0e0"^^xsd:double .
+ex:c_d_1_5 ex:cast "1.5e0"^^xsd:double .
+ex:c_d_0_1 ex:cast "0.1"^^xsd:double .
+ex:c_d_0 ex:cast "0.0e0"^^xsd:double .
+ex:c_d_n0 ex:cast "-0.0e0"^^xsd:double .
+ex:c_d_inf ex:cast "INF"^^xsd:double .
+ex:c_d_ninf ex:cast "-INF"^^xsd:double .
+ex:c_d_nan ex:cast "NaN"^^xsd:double .
+
+ex:c_f_1e6 ex:cast "1e6"^^xsd:float .
+ex:c_f_n1e6 ex:cast "-1e6"^^xsd:float .
+ex:c_f_1_5e6 ex:cast "1.5e6"^^xsd:float .
+ex:c_f_1e_6 ex:cast "1e-6"^^xsd:float .
+ex:c_f_above_1e_6 ex:cast "1.0000001e-6"^^xsd:float .
+ex:c_f_1e_7 ex:cast "1e-7"^^xsd:float .
+ex:c_f_0_1 ex:cast "0.1"^^xsd:float .
+ex:c_f_0 ex:cast "0.0"^^xsd:float .
+ex:c_f_n0 ex:cast "-0.0"^^xsd:float .
+ex:c_f_inf ex:cast "INF"^^xsd:float .
+ex:c_f_ninf ex:cast "-INF"^^xsd:float .
+ex:c_f_nan ex:cast "NaN"^^xsd:float .
+
+ex:r_cr ex:txt "a\rb" .
+ex:r_lf ex:txt "a\nb" .
+ex:r_crlf ex:txt "a\r\nb" .
+ex:r_x ex:txt "axb" .
+ex:r_dot ex:txt "a.b" .
+ex:r_bs_x ex:txt "a\\xb" .
+ex:r_bs_cr ex:txt "a\\\rb" .
+ex:r_br_x ex:txt "a]xb" .
+ex:r_br_cr ex:txt "a]\rb" .
+ex:r_lines ex:txt "first\rline\nsecond" .
+"#;
+    store
+        .load(&[Source::from_bytes(
+            ttl.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    // Also add delta triples so both compacted base (`vocab.num`) and delta paths are exercised.
+    sparkles_core::sparql::update::update(
+        &store,
+        r#"
+        PREFIX ex: <http://ex.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        INSERT DATA {
+            ex:delta_d_inf_lower ex:num "inf"^^xsd:double .
+            ex:delta_d_inf_upper ex:num "INF"^^xsd:double .
+            ex:delta_r_cr ex:txt "a\rb" .
+        }
+        "#,
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(
+        store.snapshot().generation.vocab.numeric().is_some(),
+        "compacted store builds vocab.num"
+    );
+
+    let run_both = |q: &str| -> Vec<Vec<Option<Term>>> {
+        let opts = QueryOptions::default();
+        let eager = query(store.snapshot(), q, &opts)
+            .unwrap()
+            .application_rows();
+        for batch in [1, 4096] {
+            let streamed = all(open(&store, q, batch));
+            assert_eq!(
+                bag(streamed),
+                bag(eager.clone()),
+                "batch {batch} diverged for: {q}"
+            );
+        }
+        eager
+    };
+    let iri_names = |rows: Vec<Vec<Option<Term>>>| -> Vec<String> {
+        let mut names: Vec<String> = rows
+            .into_iter()
+            .map(|r| match &r[0] {
+                Some(Term::NamedNode(n)) => n
+                    .as_str()
+                    .strip_prefix("http://ex.org/")
+                    .unwrap()
+                    .to_string(),
+                other => panic!("expected ex: IRI, got {other:?}"),
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let str_pairs = |rows: Vec<Vec<Option<Term>>>| -> Vec<(String, Option<String>)> {
+        let mut pairs: Vec<(String, Option<String>)> = rows
+            .into_iter()
+            .map(|r| {
+                let k = match &r[0] {
+                    Some(Term::NamedNode(n)) => n
+                        .as_str()
+                        .strip_prefix("http://ex.org/")
+                        .unwrap()
+                        .to_string(),
+                    other => panic!("expected ex: IRI, got {other:?}"),
+                };
+                let v = r[1].as_ref().map(|t| match t {
+                    Term::Literal(l) => l.value().to_string(),
+                    other => panic!("expected literal, got {other:?}"),
+                });
+                (k, v)
+            })
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    };
+
+    // 1. Strict XSD 1.1 float/double lexical forms
+    let numeric = iri_names(run_both(
+        "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:num ?v FILTER(isNumeric(?v)) }",
+    ));
+    assert_eq!(
+        numeric,
+        vec![
+            "d_inf_upper",
+            "d_nan_upper",
+            "d_ninf_upper",
+            "d_pinf_upper",
+            "delta_d_inf_upper",
+            "f_inf_upper",
+            "f_nan_upper",
+            "f_ninf_upper",
+            "f_pinf_upper",
+        ]
+    );
+
+    let gt_zero = iri_names(run_both(
+        "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:num ?v FILTER(?v > 0) }",
+    ));
+    assert_eq!(
+        gt_zero,
+        vec![
+            "d_inf_upper",
+            "d_pinf_upper",
+            "delta_d_inf_upper",
+            "f_inf_upper",
+            "f_pinf_upper",
+        ]
+    );
+
+    // Arithmetic on valid vs ill-typed float/double literals.
+    let arith_ok = iri_names(run_both(
+        "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:num ?v BIND(?v + 1 AS ?sum) FILTER(BOUND(?sum)) }",
+    ));
+    assert_eq!(
+        arith_ok,
+        vec![
+            "d_inf_upper",
+            "d_nan_upper",
+            "d_ninf_upper",
+            "d_pinf_upper",
+            "delta_d_inf_upper",
+            "f_inf_upper",
+            "f_nan_upper",
+            "f_ninf_upper",
+            "f_pinf_upper",
+        ]
+    );
+
+    // Casting an ill-typed float/double literal to xsd:string preserves its lexical form.
+    let ill_typed_cast = run_both(
+        "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT (xsd:string(?v) AS ?out) WHERE { ex:d_inf_lower ex:num ?v }",
+    );
+    assert_eq!(
+        ill_typed_cast,
+        vec![vec![Some(Term::Literal(Literal::new_simple_literal(
+            "inf"
+        )))]]
+    );
+
+    // String-to-float/double casts reject non-XSD spellings and Unicode whitespace
+    // (U+00A0), while accepting XML whitespace around INF/+INF/-INF/NaN.
+    let cast_checks = run_both(
+        r#"
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?in (BOUND(?d) AS ?d_ok) (BOUND(?f) AS ?f_ok)
+        WHERE {
+            VALUES ?in { "INF" "+INF" "-INF" "NaN" " INF " "\tINF\r\n" "\u00A0INF\u00A0" "\u00A01.5\u00A0" "inf" "-inf" "+inf" "infinity" "nan" "-NaN" "+NaN" }
+            BIND(xsd:double(?in) AS ?d)
+            BIND(xsd:float(?in) AS ?f)
+        }
+        "#,
+    );
+    let expected_cast_ok = [
+        ("INF", true),
+        ("+INF", true),
+        ("-INF", true),
+        ("NaN", true),
+        (" INF ", true),
+        ("\tINF\r\n", true),
+        ("\u{00A0}INF\u{00A0}", false),
+        ("\u{00A0}1.5\u{00A0}", false),
+        ("inf", false),
+        ("-inf", false),
+        ("+inf", false),
+        ("infinity", false),
+        ("nan", false),
+        ("-NaN", false),
+        ("+NaN", false),
+    ];
+    assert_eq!(cast_checks.len(), expected_cast_ok.len());
+    let mut got_casts = std::collections::BTreeMap::new();
+    for row in &cast_checks {
+        let got_in = match &row[0] {
+            Some(Term::Literal(l)) => l.value().to_string(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(
+            got_casts
+                .insert(got_in.clone(), (row[1].clone(), row[2].clone()))
+                .is_none(),
+            "duplicate input {got_in:?}"
+        );
+    }
+    for (input, want) in expected_cast_ok {
+        let want_term = Some(Term::Literal(Literal::from(want)));
+        let (d_ok, f_ok) = got_casts
+            .get(input)
+            .unwrap_or_else(|| panic!("missing cast check row for {input:?}"));
+        assert_eq!(d_ok, &want_term, "xsd:double({input:?})");
+        assert_eq!(f_ok, &want_term, "xsd:float({input:?})");
+    }
+
+    // 2. XPath F&O canonical xsd:string casts of xsd:double and xsd:float
+    let casts = str_pairs(run_both(
+        "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT ?s (xsd:string(?v) AS ?out) WHERE { ?s ex:cast ?v }",
+    ));
+    let expected_casts: Vec<(&str, &str)> = vec![
+        ("c_d_0", "0"),
+        ("c_d_0_1", "0.1"),
+        ("c_d_1000000", "1.0E6"),
+        ("c_d_1_0", "1"),
+        ("c_d_1_23e6", "1.23E6"),
+        ("c_d_1_5", "1.5"),
+        ("c_d_1_5e6", "1.5E6"),
+        ("c_d_1e6", "1.0E6"),
+        ("c_d_1e_6", "0.000001"),
+        ("c_d_1e_7", "1.0E-7"),
+        ("c_d_999999", "999999"),
+        ("c_d_inf", "INF"),
+        ("c_d_n0", "-0"),
+        ("c_d_n1e6", "-1.0E6"),
+        ("c_d_n1e_6", "-0.000001"),
+        ("c_d_n1e_7", "-1.0E-7"),
+        ("c_d_nan", "NaN"),
+        ("c_d_ninf", "-INF"),
+        ("c_f_0", "0"),
+        ("c_f_0_1", "0.1"),
+        ("c_f_1_5e6", "1.5E6"),
+        ("c_f_1e6", "1.0E6"),
+        ("c_f_1e_6", "1.0E-6"),
+        ("c_f_1e_7", "1.0E-7"),
+        ("c_f_above_1e_6", "0.0000010000001"),
+        ("c_f_inf", "INF"),
+        ("c_f_n0", "-0"),
+        ("c_f_n1e6", "-1.0E6"),
+        ("c_f_nan", "NaN"),
+        ("c_f_ninf", "-INF"),
+    ];
+    let mut expected_casts: Vec<(String, Option<String>)> = expected_casts
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), Some(v.to_string())))
+        .collect();
+    expected_casts.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(casts, expected_casts);
+
+    // STR() preserves the original lexical form while xsd:string() uses XPath canonical form.
+    let str_vs_cast = run_both(
+        "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT (STR(?v) AS ?lex) (xsd:string(?v) AS ?cast) WHERE { ex:c_d_1e6 ex:cast ?v }",
+    );
+    assert_eq!(
+        str_vs_cast,
+        vec![vec![
+            Some(Term::Literal(Literal::new_simple_literal("1e6"))),
+            Some(Term::Literal(Literal::new_simple_literal("1.0E6"))),
+        ]]
+    );
+
+    // 3. XPath REGEX / REPLACE `.` excludes `\r` without the `s` flag (including KeyFilter pushdown)
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a.b$")) }"#
+        )),
+        vec!["r_dot", "r_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a.b$", "s")) }"#
+        )),
+        vec!["delta_r_cr", "r_cr", "r_dot", "r_lf", "r_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(STR(?v), "^a.b$")) }"#
+        )),
+        vec!["r_dot", "r_x"]
+    );
+    // Escaped `\.`, `[.]`, `[^.]`, `\\.` and `[\]].`
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a\\.b$")) }"#
+        )),
+        vec!["r_dot"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[.]b$")) }"#
+        )),
+        vec!["r_dot"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[^.]b$")) }"#
+        )),
+        vec!["delta_r_cr", "r_cr", "r_lf", "r_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a\\\\.b$")) }"#
+        )),
+        vec!["r_bs_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a\\\\.b$", "s")) }"#
+        )),
+        vec!["r_bs_cr", "r_bs_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[\\]].b$")) }"#
+        )),
+        vec!["r_br_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[\\]].b$", "s")) }"#
+        )),
+        vec!["r_br_cr", "r_br_x"]
+    );
+    // `m` flag without `s` still excludes `\r` from `.`; `ms` includes both `\r` and `\n`.
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^first.line$", "m")) }"#
+        )),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^first.line$", "ms")) }"#
+        )),
+        vec!["r_lines"]
+    );
+    // REPLACE without `s` leaves `\r` and `\n` untouched; with `s` replaces them too;
+    // with `q` treats both pattern and replacement (`$` and `\`) literally.
+    let replaced = run_both(
+        r#"
+        SELECT
+            (REPLACE("a\rb\nc", ".", "X") AS ?no_s)
+            (REPLACE("a\rb\nc", ".", "X", "s") AS ?with_s)
+            (REPLACE("a\rb", "a.b", "X") AS ?no_match)
+            (REPLACE("a\rb", "a.b", "X", "s") AS ?match_s)
+            (REPLACE("a.b", ".", "$", "q") AS ?q_dollar)
+            (REPLACE("a.b", ".", "\\$1\\", "q") AS ?q_bs_dollar)
+            (REGEX(" axb", "^[ ]a.b$", "x") AS ?x_space_ok)
+            (REGEX(" a\rb", "^[ ]a.b$", "x") AS ?x_space_cr)
+            (REGEX("hello world", "hello\\ sworld", "x") AS ?x_esc_ws)
+            (REGEX("\n", "(?x)^( ?s:.)$") AS ?rx_ws_scoped_s)
+            (REGEX("\r", "(?x)^(# comment\n ?-s:.)$", "s") AS ?rx_comment_scoped_no_s)
+            (REGEX("x", "^(?-s:(?P<a.b>.))$", "s") AS ?named_dot_ok)
+            (REGEX("\r", "^(?-s:(?P<a.b>.))$", "s") AS ?named_dot_cr)
+            (REGEX("\r", "^(?s:.)$") AS ?scoped_s_on)
+            (REGEX("\r", "^(?-s:.)$", "s") AS ?scoped_s_off)
+        WHERE {}
+        "#,
+    );
+    assert_eq!(
+        replaced,
+        vec![vec![
+            Some(Term::Literal(Literal::new_simple_literal("X\rX\nX"))),
+            Some(Term::Literal(Literal::new_simple_literal("XXXXX"))),
+            Some(Term::Literal(Literal::new_simple_literal("a\rb"))),
+            Some(Term::Literal(Literal::new_simple_literal("X"))),
+            Some(Term::Literal(Literal::new_simple_literal("a$b"))),
+            Some(Term::Literal(Literal::new_simple_literal(r"a\$1\b"))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(false))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(false))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(false))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(false))),
+        ]]
+    );
+
+    // Dollar-heavy literal `q` replacement stays within a tight query memory budget.
+    let hay = "a".repeat(4096);
+    let dollars = "$".repeat(4096);
+    let q_budget =
+        format!(r#"SELECT (REPLACE("{hay}", "{hay}", "{dollars}", "q") AS ?out) WHERE {{}}"#);
+    let tight_opts = QueryOptions {
+        max_memory_bytes: Some(8 << 20),
+        ..QueryOptions::default()
+    };
+    let eager_q = query(store.snapshot(), &q_budget, &tight_opts)
+        .unwrap()
+        .application_rows();
+    assert_eq!(
+        eager_q,
+        vec![vec![Some(Term::Literal(Literal::new_simple_literal(
+            &dollars
+        )))]]
+    );
+    let cur_q =
+        all(select_cursor(store.snapshot(), &q_budget, &tight_opts, &options(4096)).unwrap());
+    assert_eq!(cur_q, eager_q);
+}
+
+/// Regression test for upgrading a store whose compacted generation still carries a legacy
+/// `SPKVNUM2` numeric column written under pre-1077 rules (which classified `"inf"^^xsd:double`
+/// and `"-inf"^^xsd:float` as IEEE infinities): reopening ignores `SPKVNUM2` cleanly,
+/// `sparkles check --full` warns rather than failing, both query modes decode from keys with
+/// strict XSD 1.1 semantics, and `add_numeric_column` upgrades the file to `SPKVNUM4`.
+#[test]
+fn legacy_spkvnum2_column_falls_back_cleanly_on_reopen() {
+    use sparkles_core::check::{CheckOptions, Status, check};
+    use sparkles_core::id::Id;
+    use sparkles_core::vocab::numeric::{DOUBLE, FILE, FLOAT, NOT_NUMERIC};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ttl = r#"
+@prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:d_inf_lower ex:v "inf"^^xsd:double .
+ex:f_ninf_lower ex:v "-inf"^^xsd:float .
+ex:d_pinf_upper ex:v "+INF"^^xsd:double .
+ex:d_num ex:v "1.50"^^xsd:double .
+"#;
+    {
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        store
+            .load(&[Source::from_bytes(
+                ttl.as_bytes().to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_some());
+        let gen_dir = snap.generation.dir.as_ref().unwrap().clone();
+        let vocab_len = snap.generation.vocab.len();
+
+        // Build a valid SPKVNUM2 file using the pre-1077 classification rules where
+        // `"inf"^^xsd:double` and `"-inf"^^xsd:float` were stored as numeric values.
+        let mut covered = 0u64;
+        let mut kinds = Vec::new();
+        let mut values = Vec::new();
+        for id in 0..vocab_len {
+            let Some(Term::Literal(lit)) = snap.term(Id::vocab(id)) else {
+                break;
+            };
+            covered += 1;
+            let dt = lit.datatype().as_str();
+            let (kind, bits) = if dt == oxrdf::vocab::xsd::DOUBLE.as_str() {
+                match lit.value().parse::<f64>() {
+                    Ok(v) => (DOUBLE, v.to_bits()),
+                    Err(_) => (NOT_NUMERIC, 0),
+                }
+            } else if dt == oxrdf::vocab::xsd::FLOAT.as_str() {
+                match lit.value().parse::<f32>() {
+                    Ok(v) => (FLOAT, v.to_bits() as u64),
+                    Err(_) => (NOT_NUMERIC, 0),
+                }
+            } else {
+                (NOT_NUMERIC, 0)
+            };
+            kinds.push(kind);
+            if kind & 8 != 0 {
+                values.push(bits);
+            }
+        }
+        assert!(
+            values.len() >= 4,
+            "all four non-inlined literals are in vocab: {values:?}"
+        );
+        let positions = covered;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"SPKVNUM2");
+        bytes.extend_from_slice(&vocab_len.to_le_bytes());
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&positions.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // 1 segment covering 0..covered
+        let mut word = 0u64;
+        for (i, &k) in kinds.iter().enumerate() {
+            word |= (k as u64) << ((i % 16) * 4);
+            if (i + 1) % 16 == 0 {
+                bytes.extend_from_slice(&word.to_le_bytes());
+                word = 0;
+            }
+        }
+        if !kinds.len().is_multiple_of(16) {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        // Rank array (positions < 128 -> 1 u32 entry = 0, padded to 8 bytes).
+        assert!(positions <= 128);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        for bits in &values {
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        // Segment (lo=0, hi=covered, base=0).
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        std::fs::write(gen_dir.join(FILE), &bytes).unwrap();
+    }
+
+    let report = check(dir.path(), &CheckOptions { quick: false }).unwrap();
+    assert_eq!(
+        report.status,
+        Status::Warning,
+        "legacy SPKVNUM2 should warn, not error: {}",
+        report.to_text()
+    );
+
+    let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    assert!(
+        store.snapshot().generation.vocab.numeric().is_none(),
+        "legacy SPKVNUM2 must not be loaded"
+    );
+
+    let verify_queries = |store: &Store| {
+        let run_both = |q: &str| -> Vec<Vec<Option<Term>>> {
+            let opts = QueryOptions::default();
+            let eager = query(store.snapshot(), q, &opts)
+                .unwrap()
+                .application_rows();
+            for batch in [1, 4096] {
+                let streamed = all(open(store, q, batch));
+                assert_eq!(
+                    bag(streamed),
+                    bag(eager.clone()),
+                    "batch {batch} diverged for: {q}"
+                );
+            }
+            eager
+        };
+        let names = |q: &str| -> Vec<String> {
+            let mut out: Vec<String> = run_both(q)
+                .into_iter()
+                .map(|r| match &r[0] {
+                    Some(Term::NamedNode(n)) => n
+                        .as_str()
+                        .strip_prefix("http://ex.org/")
+                        .unwrap()
+                        .to_string(),
+                    other => panic!("expected IRI, got {other:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            names(
+                "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:v ?v FILTER(isNumeric(?v)) }"
+            ),
+            vec!["d_num", "d_pinf_upper"]
+        );
+        assert_eq!(
+            names("PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:v ?v FILTER(?v > 0) }"),
+            vec!["d_num", "d_pinf_upper"]
+        );
+        assert_eq!(
+            names(
+                "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:v ?v BIND(?v + 1 AS ?n) FILTER(BOUND(?n)) }"
+            ),
+            vec!["d_num", "d_pinf_upper"]
+        );
+        let mut lex_and_cast: Vec<(String, String, String)> = run_both(
+            "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             SELECT ?s (STR(?v) AS ?lex) (xsd:string(?v) AS ?cast) WHERE { ?s ex:v ?v }",
+        )
+        .into_iter()
+        .map(|r| {
+            let s = match &r[0] {
+                Some(Term::NamedNode(n)) => n
+                    .as_str()
+                    .strip_prefix("http://ex.org/")
+                    .unwrap()
+                    .to_string(),
+                other => panic!("{other:?}"),
+            };
+            let lex = match &r[1] {
+                Some(Term::Literal(l)) => l.value().to_string(),
+                other => panic!("{other:?}"),
+            };
+            let cast = match &r[2] {
+                Some(Term::Literal(l)) => l.value().to_string(),
+                other => panic!("{other:?}"),
+            };
+            (s, lex, cast)
+        })
+        .collect();
+        lex_and_cast.sort();
+        assert_eq!(
+            lex_and_cast,
+            vec![
+                ("d_inf_lower".into(), "inf".into(), "inf".into()),
+                ("d_num".into(), "1.50".into(), "1.5".into()),
+                ("d_pinf_upper".into(), "+INF".into(), "INF".into()),
+                ("f_ninf_lower".into(), "-inf".into(), "-inf".into()),
+            ]
+        );
+    };
+
+    verify_queries(&store);
+
+    // Rebuilding upgrades vocab.num to SPKVNUM4 (holding only the 2 valid numbers),
+    // and a second call on the same handle returns None without rewriting the file.
+    assert_eq!(store.add_numeric_column().unwrap(), Some(2));
+    assert_eq!(store.add_numeric_column().unwrap(), None);
+    drop(store);
+
+    let clean = check(dir.path(), &CheckOptions { quick: false }).unwrap();
+    assert_eq!(clean.status, Status::Ok, "{}", clean.to_text());
+
+    let reopened = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    assert!(reopened.snapshot().generation.vocab.numeric().is_some());
+    assert_eq!(reopened.add_numeric_column().unwrap(), None);
+    verify_queries(&reopened);
+}
+
+/// Upgrading a legacy `SPKVNUM2` column whose only numeric entries were invalid spellings
+/// (`"inf"^^xsd:double` and `"-inf"^^xsd:float`) returns `Some(0)`, removes the stale
+/// `vocab.num` file, and leaves `check --full` clean.
+#[test]
+fn legacy_spkvnum2_invalid_only_column_removed_on_upgrade() {
+    use sparkles_core::check::{CheckOptions, Status, check};
+    use sparkles_core::id::Id;
+    use sparkles_core::vocab::numeric::{DOUBLE, FILE, FLOAT, NOT_NUMERIC};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ttl = r#"
+@prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:d_inf_lower ex:v "inf"^^xsd:double .
+ex:f_ninf_lower ex:v "-inf"^^xsd:float .
+"#;
+    let gen_dir;
+    {
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        store
+            .load(&[Source::from_bytes(
+                ttl.as_bytes().to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_none());
+        gen_dir = snap.generation.dir.as_ref().unwrap().clone();
+        let vocab_len = snap.generation.vocab.len();
+
+        let mut covered = 0u64;
+        let mut kinds = Vec::new();
+        let mut values = Vec::new();
+        for id in 0..vocab_len {
+            let Some(Term::Literal(lit)) = snap.term(Id::vocab(id)) else {
+                break;
+            };
+            covered += 1;
+            let dt = lit.datatype().as_str();
+            let (kind, bits) = if dt == oxrdf::vocab::xsd::DOUBLE.as_str() {
+                match lit.value().parse::<f64>() {
+                    Ok(v) => (DOUBLE, v.to_bits()),
+                    Err(_) => (NOT_NUMERIC, 0),
+                }
+            } else if dt == oxrdf::vocab::xsd::FLOAT.as_str() {
+                match lit.value().parse::<f32>() {
+                    Ok(v) => (FLOAT, v.to_bits() as u64),
+                    Err(_) => (NOT_NUMERIC, 0),
+                }
+            } else {
+                (NOT_NUMERIC, 0)
+            };
+            kinds.push(kind);
+            if kind & 8 != 0 {
+                values.push(bits);
+            }
+        }
+        assert_eq!(values.len(), 2);
+        let positions = covered;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"SPKVNUM2");
+        bytes.extend_from_slice(&vocab_len.to_le_bytes());
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&positions.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let mut word = 0u64;
+        for (i, &k) in kinds.iter().enumerate() {
+            word |= (k as u64) << ((i % 16) * 4);
+            if (i + 1) % 16 == 0 {
+                bytes.extend_from_slice(&word.to_le_bytes());
+                word = 0;
+            }
+        }
+        if !kinds.len().is_multiple_of(16) {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        assert!(positions <= 128);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        for bits in &values {
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        std::fs::write(gen_dir.join(FILE), &bytes).unwrap();
+    }
+
+    let report = check(dir.path(), &CheckOptions { quick: false }).unwrap();
+    assert_eq!(report.status, Status::Warning, "{}", report.to_text());
+
+    let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    assert_eq!(store.add_numeric_column().unwrap(), Some(0));
+    assert!(
+        !gen_dir.join(FILE).exists(),
+        "stale SPKVNUM2 file must be removed when zero valid numbers remain"
+    );
+    drop(store);
+
+    let clean = check(dir.path(), &CheckOptions { quick: false }).unwrap();
+    assert_eq!(clean.status, Status::Ok, "{}", clean.to_text());
+}
+
+/// Roadmap item 1071: STRSTARTS, STRENDS, CONTAINS, STRBEFORE and STRAFTER require both
+/// matching language tags (case-insensitively) and matching base directions when both
+/// arguments are language-tagged, across eager, streaming/cursor and string-run/keyfilter
+/// pushdown paths, and preserve base direction on matching STRBEFORE/STRAFTER results.
+#[test]
+fn directional_string_function_compatibility_and_results() {
+    use oxrdf::{BaseDirection, Literal, Term};
+    use sparkles_core::sparql::Optimizations;
+
+    let store = Store::in_memory(StoreOptions::default());
+    // Populate >4,096 rows so cursor Morsels, CountFilterFromRuns and filter_scan_runs
+    // all activate on the compacted base vocabulary.
+    let mut nt = String::new();
+    for i in 0..5_000usize {
+        let lit = match i % 5 {
+            0 => format!("\"Ada{i}end\"@en--ltr"),
+            1 => format!("\"Ada{i}end\"@en"),
+            2 => format!("\"Ada{i}end\"@en--rtl"),
+            3 => format!("\"Ada{i}end\""),
+            _ => format!("\"Ada{i}end\"@EN-US--ltr"),
+        };
+        nt.push_str(&format!("<urn:s:{i}> <urn:label> {lit} .\n"));
+    }
+    store
+        .load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+
+    // Helper: run a query eagerly (ALL and NONE), via streaming cursors (batch 1, 3,
+    // 4096 with FallbackPolicy::RejectMaterialization), and compare against the reference
+    // evaluator when `compare_ref` is true.
+    let check_all_modes = |store: &Store, q: &str, compare_ref: bool| -> Vec<Vec<Option<Term>>> {
+        let snap = store.snapshot();
+        let eager_all = query(
+            snap.clone(),
+            q,
+            &QueryOptions {
+                optimizations: Some(Optimizations::ALL),
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("eager ALL failed for {q}: {e}"));
+        let eager_none = query(
+            snap.clone(),
+            q,
+            &QueryOptions {
+                optimizations: Some(Optimizations::NONE),
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("eager NONE failed for {q}: {e}"));
+
+        let mut want: Vec<Vec<Option<Term>>> = eager_all.application_rows();
+        let mut none_rows: Vec<Vec<Option<Term>>> = eager_none.application_rows();
+        let key = |r: &[Option<Term>]| {
+            r.iter()
+                .map(|t| {
+                    t.as_ref()
+                        .map_or_else(|| "UNDEF".to_string(), ToString::to_string)
+                })
+                .collect::<Vec<_>>()
+                .join("\t")
+        };
+        want.sort_by_key(|r| key(r));
+        none_rows.sort_by_key(|r| key(r));
+        assert_eq!(want, none_rows, "eager ALL vs NONE: {q}");
+
+        for batch_rows in [1usize, 3, 4096] {
+            let cur = select_cursor(
+                snap.clone(),
+                q,
+                &QueryOptions {
+                    optimizations: Some(Optimizations::ALL),
+                    no_cache: true,
+                    ..Default::default()
+                },
+                &options(batch_rows),
+            )
+            .unwrap_or_else(|e| panic!("cursor(batch={batch_rows}) open failed for {q}: {e}"));
+            let mut got = all(cur);
+            got.sort_by_key(|r| key(r));
+            assert_eq!(want, got, "cursor(batch={batch_rows}) vs eager: {q}");
+        }
+
+        if compare_ref {
+            let mut quads = Vec::new();
+            snap.for_each_quad(|quad| {
+                quads.push(snap.quad_to_terms(quad).unwrap());
+                Ok(())
+            })
+            .unwrap();
+            let oracle = reference::Reference::new(quads);
+            let (reference::check::Expected::Select(expected), _) =
+                reference::check::under_engine_readings(&oracle, q).unwrap()
+            else {
+                panic!("expected SELECT from reference: {q}");
+            };
+            assert_eq!(
+                reference::check::check_select(
+                    &expected,
+                    eager_all.variables(),
+                    &eager_all.application_rows(),
+                ),
+                Ok(reference::check::Outcome::Compared),
+                "reference mismatch for {q}"
+            );
+        }
+        want
+    };
+
+    // 1. Scalar / BIND / SELECT expression compatibility matrix for all 5 functions across
+    //    all 6 argument pairs (both in eager and streaming cursor execution).
+    let small = Store::in_memory(StoreOptions::default());
+    small
+        .load(&[Source::from_bytes(
+            b"<urn:x> <urn:p> \"seed\" .\n".to_vec(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+
+    let bool_t = Some(Term::Literal(Literal::from(true)));
+    let dir_ltr = |s: &str, lang: &str| {
+        Some(Term::Literal(
+            Literal::new_directional_language_tagged_literal_unchecked(s, lang, BaseDirection::Ltr),
+        ))
+    };
+    let dir_rtl = |s: &str, lang: &str| {
+        Some(Term::Literal(
+            Literal::new_directional_language_tagged_literal_unchecked(s, lang, BaseDirection::Rtl),
+        ))
+    };
+    let plain = |s: &str| Some(Term::Literal(Literal::new_simple_literal(s)));
+
+    // (arg1, arg2, compatible)
+    let pairs: [(&str, &str, bool); 6] = [
+        ("\"Ada1end\"@en--ltr", "\"Ada\"@en", false),
+        ("\"Ada1end\"@en", "\"Ada\"@en--ltr", false),
+        ("\"Ada1end\"@en--ltr", "\"Ada\"@en--rtl", false),
+        ("\"Ada1end\"@en--ltr", "\"Ada\"@EN--ltr", true),
+        ("\"Ada1end\"@en--ltr", "\"Ada\"", true),
+        ("\"Ada1end\"", "\"Ada\"@en--ltr", false),
+    ];
+    for (a, b, ok) in pairs {
+        for (func, arg2, expected) in [
+            ("STRSTARTS", b, if ok { bool_t.clone() } else { None }),
+            (
+                "STRENDS",
+                &b.replace("Ada", "end"),
+                if ok { bool_t.clone() } else { None },
+            ),
+            (
+                "CONTAINS",
+                &b.replace("Ada", "1"),
+                if ok { bool_t.clone() } else { None },
+            ),
+            (
+                "STRBEFORE",
+                &b.replace("Ada", "1"),
+                if ok { dir_ltr("Ada", "en") } else { None },
+            ),
+            (
+                "STRAFTER",
+                &b.replace("Ada", "1"),
+                if ok { dir_ltr("end", "en") } else { None },
+            ),
+        ] {
+            let q =
+                format!("SELECT ({func}({a}, {arg2}) AS ?r) WHERE {{ <urn:x> <urn:p> ?dummy }}");
+            let rows = check_all_modes(&small, &q, true);
+            assert_eq!(rows, vec![vec![expected]], "{q}");
+        }
+    }
+
+    // 2. STRBEFORE / STRAFTER edge cases: empty needle, match at start/end, non-match
+    //    returning simple "", RTL preservation, and SUBSTR/UCASE/LCASE/REPLACE preserving
+    //    base direction.
+    let result_cases: [(&str, Option<Term>); 14] = [
+        (r#"STRBEFORE("abc"@en--ltr, "b")"#, dir_ltr("a", "en")),
+        (
+            r#"STRBEFORE("abc"@en--ltr, "b"@EN--ltr)"#,
+            dir_ltr("a", "en"),
+        ),
+        (r#"STRBEFORE("abc"@en--ltr, "")"#, dir_ltr("", "en")),
+        (r#"STRBEFORE("abc"@en--ltr, ""@en--ltr)"#, dir_ltr("", "en")),
+        (r#"STRBEFORE("abc"@en--ltr, "a")"#, dir_ltr("", "en")),
+        (r#"STRBEFORE("abc"@en--ltr, "z")"#, plain("")),
+        (r#"STRBEFORE("abc"@en--ltr, "z"@en--ltr)"#, plain("")),
+        (r#"STRAFTER("abc"@en--ltr, "b")"#, dir_ltr("c", "en")),
+        (
+            r#"STRAFTER("abc"@en--ltr, "b"@EN--ltr)"#,
+            dir_ltr("c", "en"),
+        ),
+        (r#"STRAFTER("abc"@en--ltr, "")"#, dir_ltr("abc", "en")),
+        (r#"STRAFTER("abc"@en--ltr, "z")"#, plain("")),
+        (
+            r#"STRBEFORE("abc"@ar--rtl, "b"@ar--rtl)"#,
+            dir_rtl("a", "ar"),
+        ),
+        (
+            r#"STRAFTER("abc"@ar--rtl, "b"@AR--rtl)"#,
+            dir_rtl("c", "ar"),
+        ),
+        (r#"SUBSTR("abc"@en--ltr, 2, 1)"#, dir_ltr("b", "en")),
+    ];
+    for (expr, want) in result_cases {
+        let q = format!("SELECT ({expr} AS ?r) WHERE {{ <urn:x> <urn:p> ?dummy }}");
+        let rows = check_all_modes(&small, &q, true);
+        assert_eq!(rows, vec![vec![want]], "{q}");
+    }
+    for (expr, want) in [
+        (r#"UCASE("abc"@en--ltr)"#, dir_ltr("ABC", "en")),
+        (r#"LCASE("ABC"@ar--rtl)"#, dir_rtl("abc", "ar")),
+        (r#"REPLACE("abc"@en--ltr, "b", "X")"#, dir_ltr("aXc", "en")),
+    ] {
+        let q = format!("SELECT ({expr} AS ?r) WHERE {{ <urn:x> <urn:p> ?dummy }}");
+        let rows = check_all_modes(&small, &q, true);
+        assert_eq!(rows, vec![vec![want]], "{q}");
+    }
+    for (expr, want) in [
+        (
+            r#"<http://www.w3.org/2005/xpath-functions#normalize-space>("  a \t b  "@en--ltr)"#,
+            dir_ltr("a b", "en"),
+        ),
+        (
+            r#"<http://www.w3.org/2005/xpath-functions#normalize-space>("  a \n b  "@ar--rtl)"#,
+            dir_rtl("a b", "ar"),
+        ),
+    ] {
+        let q = format!("SELECT ({expr} AS ?r) WHERE {{ <urn:x> <urn:p> ?dummy }}");
+        let rows = check_all_modes(&small, &q, false);
+        assert_eq!(rows, vec![vec![want]], "{q}");
+    }
+
+    // 3. String-run / KeyFilter / CountFilterFromRuns / cursor Morsels pushdown paths on
+    //    the 5,000-row store (both compacted base vocab and uncompacted delta vocab).
+    let filter_cases: [(&str, usize); 14] = [
+        // STRSTARTS
+        (r#"STRSTARTS(?v, "Ada")"#, 5_000),
+        (r#"STRSTARTS(?v, "Ada"@en)"#, 1_000),
+        (r#"STRSTARTS(?v, "Ada"@en--ltr)"#, 1_000),
+        (r#"STRSTARTS(?v, "Ada"@EN--ltr)"#, 1_000),
+        (r#"STRSTARTS(?v, "Ada"@en--rtl)"#, 1_000),
+        (r#"STRSTARTS(?v, "Ada"@en-us--ltr)"#, 1_000),
+        (r#"STRSTARTS(?v, "Ada"@en-us)"#, 0),
+        (r#"STRSTARTS(?v, "Ada"@en-us--rtl)"#, 0),
+        // STRENDS
+        (r#"STRENDS(?v, "end"@en--ltr)"#, 1_000),
+        (r#"STRENDS(?v, "end"@en)"#, 1_000),
+        (r#"STRENDS(?v, "end"@en--rtl)"#, 1_000),
+        // CONTAINS
+        (r#"CONTAINS(?v, "da"@EN--ltr)"#, 1_000),
+        (r#"CONTAINS(?v, "da"@en-us)"#, 0),
+        // STRBEFORE / STRAFTER inside FILTER
+        (r#"STRBEFORE(?v, "end"@en--ltr) != """#, 1_000),
+    ];
+    for (pred, expected_count) in filter_cases {
+        let count_q =
+            format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?s <urn:label> ?v FILTER({pred}) }}");
+        let rows = check_all_modes(&store, &count_q, false);
+        assert_eq!(
+            rows,
+            vec![vec![Some(Term::Literal(Literal::from(
+                expected_count as i64
+            )))]],
+            "{count_q}"
+        );
+
+        let scan_q = format!("SELECT ?s ?v WHERE {{ ?s <urn:label> ?v FILTER({pred}) }}");
+        let scan_rows = check_all_modes(&store, &scan_q, false);
+        assert_eq!(scan_rows.len(), expected_count, "{scan_q}");
+    }
+
+    // Confirm the KeyFilter pushdown plan is actually active for directional needles.
+    let plan_q = r#"SELECT (COUNT(*) AS ?c) WHERE { ?s <urn:label> ?v FILTER(STRSTARTS(?v, "Ada"@en-us--ltr)) }"#;
+    let plan_res = query(
+        store.snapshot(),
+        plan_q,
+        &QueryOptions {
+            optimizations: Some(Optimizations::ALL),
+            no_cache: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let plan_text = format!("{:#?}", plan_res.plan());
+    assert!(
+        plan_text.contains("CountFilterFromRuns")
+            && plan_text.contains("tested on vocabulary keys")
+            && plan_text.contains("key ranges"),
+        "expected KeyFilter count-from-runs plan: {plan_text}"
+    );
+
+    // Confirm the cursor morsel path actually runs on the compacted base scan for
+    // directional needles at 4,096-row demand (requires an empty delta).
+    for morsel_q in [
+        r#"SELECT ?s ?v WHERE { ?s <urn:label> ?v FILTER(STRSTARTS(?v, "Ada"@en-us--ltr)) }"#,
+        r#"SELECT ?s ?v WHERE { ?s <urn:label> ?v FILTER(CONTAINS(?v, "da"@EN--ltr)) }"#,
+    ] {
+        let mut cur = select_cursor(
+            store.snapshot(),
+            morsel_q,
+            &QueryOptions {
+                optimizations: Some(Optimizations::ALL),
+                no_cache: true,
+                ..Default::default()
+            },
+            &options(4096),
+        )
+        .unwrap();
+        let mut morsel_rows = 0usize;
+        while let Some(batch) = cur.next_batch().unwrap() {
+            morsel_rows += batch.len();
+        }
+        assert_eq!(cur.status(), CursorStatus::Complete, "{morsel_q}");
+        assert_eq!(morsel_rows, 1_000, "{morsel_q}");
+        assert!(
+            leaf_counter(cur.plan(), "morselRows") > 0,
+            "expected cursor morsel path for {morsel_q}: {:#?}",
+            cur.plan()
+        );
+    }
+
+    // 4. Add delta terms (uncompacted update) and re-check directional filter compatibility
+    //    across base + delta keys.
+    sparkles_core::sparql::update::update(
+        &store,
+        r#"INSERT DATA {
+            <urn:d:1> <urn:label> "AdaDelta1end"@en--ltr .
+            <urn:d:2> <urn:label> "AdaDelta2end"@en .
+            <urn:d:3> <urn:label> "AdaDelta3end"@en--rtl .
+            <urn:d:4> <urn:label> "AdaDelta4end" .
+        }"#,
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    for (pred, expected_count) in [
+        (r#"STRSTARTS(?v, "AdaDelta"@en--ltr)"#, 1usize),
+        (r#"STRSTARTS(?v, "AdaDelta"@EN--ltr)"#, 1),
+        (r#"STRSTARTS(?v, "AdaDelta"@en)"#, 1),
+        (r#"STRSTARTS(?v, "AdaDelta"@en--rtl)"#, 1),
+        (r#"STRSTARTS(?v, "AdaDelta")"#, 4),
+        (r#"STRENDS(?v, "end"@en--ltr) && CONTAINS(?v, "Delta")"#, 1),
+        (r#"STRAFTER(?v, "AdaDelta"@en--rtl) = "3end"@en--rtl"#, 1),
+    ] {
+        let scan_q = format!("SELECT ?s ?v WHERE {{ ?s <urn:label> ?v FILTER({pred}) }}");
+        let rows = check_all_modes(&store, &scan_q, false);
+        assert_eq!(rows.len(), expected_count, "delta: {scan_q}");
+    }
 }

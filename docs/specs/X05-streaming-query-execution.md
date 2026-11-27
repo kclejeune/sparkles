@@ -1845,6 +1845,12 @@ Unit tests in `cursor/merge.rs` compare the conditional merge with eager executi
 batch caps from one row up, with left rows whose failing pairs span batches, unmatched
 rows and a second shared variable, and hold its peak within the budget at small batch
 caps over long runs of failing pairs.
+They check that a deciding batch ends before it collects a second crossing run beside
+staged pairs and flushes its results when the deciding scratch has no room. The stop
+checks cover cancellation and deadlines on unmatched rows and periodic polling in the
+pair scan, column gathering, pair compaction and output copy. A 31-column fixture checks
+fixed memory budgets with constant and changing batch caps while the consumer holds
+or releases earlier output.
 `tests/exists_auto.rs` checks that automatic execution keeps the EXISTS conditions
 eager and that a strict cursor returns the eager answers at one, three and 1,000 rows
 per batch with the merge on and off. A `tests/query_cursor.rs` test checks that the
@@ -1901,8 +1907,129 @@ whose bytes reached the response, so a streamed body that stopped partway report
 rows the response writer accepted, as an eager body does. A streamed body that the result-size budget stops after the
 response committed sends what it had buffered before it aborts the transfer, which only
 eager bodies did before. That send waits under the body's idle limit, and when it fails
-the report leaves out its bytes but still counts its rows. On the large answers at 1.05M
+the report leaves out its bytes and the rows that end in them, since item 243 counts a
+row only once the transport has handed over the bytes up to its end. On the large answers at 1.05M
 triples a streamed request runs 0.46 to 0.69 times the instructions it ran before, within
 2% of the eager request's count in native JSON or below it, and the
 [X14 Outcome](X14-unified-executor/SPEC.md#the-streamed-response-cost) gives the counts
 and where the short queries' remaining cost lies.
+
+### Pair conditions in the streamed merge (2026-11-23)
+
+The cursor's conditional merge OPTIONAL now enables `merge_pair_conditions` by default.
+When the two sides share only the merge key, the query references no registered scalar,
+aggregate or property function, and the condition has no observable side effects,
+volatility, timezone reads, SERVICE calls or unrecognized IRI functions inside EXISTS,
+the merge tests the condition over the pairs of the left rows decided by the loaded right
+batch before copying output rows. Runs that cross a right batch, left rows whose pairs
+exceed a batch, spooled runs and ineligible conditions keep the post-copy test path.
+Testing pairs first can require more merge buffer memory than the post-copy path, bounded
+by at most one output batch and the scratch used to test its pairs, while the condition's
+own evaluation charge stays outside that bound and scales with the pairs tested together.
+Automatic execution still keeps an OPTIONAL whose condition holds an EXISTS eager.
+
+A quiet comparison on `atlas` measured forced streaming at 10.5M quads with one Rayon
+thread, `--result-cache-mb 0`, six A, B, B, A rounds and twelve timed requests per query
+per process across 4,320 timings and 360 answer checks. It compared preceding base
+`fc7b0bb9` against the clean merge of `445a7f11` into `fc7b0bb9` (tree `40c5aaaf`),
+compared the candidate with `merge_pair_conditions` off against on, and checked
+`fc7b0bb9` against itself. All five queries agreed across all arms, with four distinct
+answer digests because `class-exists` and `class-fail` return the same answer. Against
+`fc7b0bb9`, `knows-fail` ran in 0.7375 of base time (145.41 against 197.15 ms),
+`knows-exists` in 0.7720 (130.64 against 169.22 ms) and `knows-mixed` in 0.9341 (603.50
+against 646.09 ms). Comparing the candidate with the switch on against off gave 0.7491 on
+`knows-fail` (145.37 against 194.07 ms), 0.7880 on `knows-exists` (130.60 against
+165.74 ms) and 0.9391 on `knows-mixed` (602.85 against 641.95 ms), with all three queries
+improving in every round of both comparisons. The same-binary check ranged from 0.9991 to
+1.0008 across all five queries with every round-paired 95% interval containing 1, and the
+`class-exists` control included 1 in both comparisons. Streamed `class-fail` rose from
+76.12 ms to 76.71 ms against `fc7b0bb9`, an increase of 0.59 ms or 0.78% with a
+round-paired 95% interval of 1.0060 to 1.0112, while its switch on/off ratio was 1.0005
+with an interval of 0.9976 to 1.0074; item 1143 records that binary-level cost with a
+Batch 57 recovery deadline. The
+[memory results](../benchmarks/memory/RESULTS.md#automatic-exists) summarize the tables,
+and the [run record](../benchmarks/memory/records/conditional-merge-atlas-445a7f11/README.md)
+holds the raw samples, answers, queries and scripts.
+
+Item 570 remains partial because all three arms used forced streaming. Finishing it
+requires measuring the shipping candidate's streamed-to-eager ratio on all three
+`knows-*` queries against the under-1.10 threshold in every round, and then admitting
+eligible EXISTS conditions in automatic execution once item 1105 gives admission and the
+cursor build the same guaranteed merge order.
+
+### Arbitrary EXISTS nesting depth (2026-11-24)
+
+Item 1081 removed the four-level `AUTO_EXISTS_DEPTH` cap in automatic streaming admission
+so nested `EXISTS` and `NOT EXISTS` patterns stream at any depth accepted by the parser
+and plan-depth bounds. Each `ExistsSpec` now carries a `PlanCache` that is separate from
+`Decor`, caching its unsubstituted plan, structural variable classification, native
+streaming verdict, and strict-cursor verdict without mutating `EXPLAIN` notes or runtime
+decorrelation state.
+
+Before this change, automatic admission discarded the unsubstituted plans it built and
+re-planned patterns across `keyed_exists`, `streams_natively`, and `cursor_state_bytes`,
+while `Operator::build_for` re-ran `exists_streams` at every nested key-set drain in
+quadratic O(D^2) strict builds. With `PlanCache`, `unsubstituted_plan` builds one
+unsubstituted plan and runs one strict cursor check per `ExistsSpec` (D calls for a
+depth-D chain) and shares the resulting `Arc<Node>` across admission, strict-cursor
+validation, and key-set building. Compiling each ordinary nested `ExistsSpec` still walks
+and clones its remaining `GraphPattern` suffix for variable collection, layout sizing,
+syntax retention, and `SERVICE` detection, so total ordinary compilation work and live
+syntax bytes across a depth-D chain remain O(D^2) in the nested suffix size, bounded by
+`MAX_ALGEBRA_DEPTH` and released once each key set finishes or on eager fallback.
+
+Speculative `EXISTS` planning reserves a shallow node estimate before invoking the
+planner, and ordinary `VALUES` tables and unattached nested `EXISTS` specs reserve their
+backing before allocation. During `auto_streaming_lease` before `ctx.attach_owner()`,
+newly cached plans and structural admission metadata adopt their live charges into a
+single admission reservation and hand it across `enable_cursor_accounting` via a
+`QueryMemoryLease`, so no pool bytes are released between admission and
+`charge_cached_plans`. Strict validation (`exists_streams`) and key-set draining
+(`cursor::drain`) reserve `cloned_plan_bytes` before cloning a cached `Node` while the
+cached `Arc<Node>` remains live. Once a key set consumes its structural admission metadata
+or transitions to `State::Built` or `State::Rejected`, `PlanCache` drops the cached plan,
+metadata, and retained charges. When automatic admission keeps a query eager or aborts on
+error, `clear_cached_plans` drops all cached plans and structural admission metadata
+before the admission reservation releases. Speculative EXISTS planning uses selectivities
+already recorded in the query context and the standard estimates for the remaining filters.
+This also applies when Auto SELECT checks whether a memory failure can retry without spill.
+Ordinary planning can evaluate and record new samples.
+
+Automatic ASK checks the fixed opening costs before attempting to build a cursor. The
+cursor plans and strictly validates EXISTS in operator order under the opening charges.
+It stops at the first strict refusal for an operator. A memory refusal during opening
+can retry eagerly before any row is pulled, using the original deadline.
+
+Query preparation installs the `started`-anchored deadline before automatic admission,
+and automatic admission, state estimation, strict validation, and key-set admission all
+propagate `Cancelled`, `Timeout`, `Io`, and `Corrupt` errors instead of swallowing them
+into eager fallback or caching negative verdicts. Per-row substitution through
+`cursor::has_solution` skips speculative `exists_streams` preflight checks under
+`AllowMaterialization` so deeply nested correlated `EXISTS` patterns do not re-plan
+unreached inner levels per outer key. `spill_admitted` checks `largest_output_bytes`
+before `streams_natively_with_admission` so small eager queries with spill enabled skip
+speculative `EXISTS` planning. Recursive transitions across `streams_natively`,
+`exists_streams`, `cursor_state_bytes`, `exists::build`, `exists::build_streaming`, and
+`plan::eval_exists` run inside `depth::guard_exists` (`stacker::maybe_grow`) so deep
+nesting executes safely on 2 MiB threads in both debug and release builds. Existing
+admission exclusions for `SERVICE` inside `EXISTS`, `OPTIONAL` conditions holding
+`EXISTS` (item 570), and `decorrelate_exists: false` remain unchanged.
+
+As debug test evidence on Boat worker `bx_4xarzecx` (debug build, 75,000-subject chain;
+not published benchmark numbers), automatic streaming at depths 8, 12, and 16 built
+exactly 8, 12, and 16 unsubstituted plans in 4.5 to 6.9 ms of open time, releasing all
+`Ctx` live bytes and `QueryPool` grants on cursor drop. Unit tests in `cursor.rs` cover
+pre-planning budget refusal on large nested `VALUES`, zero-gap pool reservation handoff
+across `enable_cursor_accounting` under a saturated shared `QueryPool`, cloning charges in
+`exists_streams` and `cursor::drain` between one and two copies, clearing of speculative
+`PlanCache::admit` metadata on eager fallback, pre-expired relative timeouts anchored at
+`started`, deterministic mid-admission cancellation and timeout after caching the first
+nested plan (verifying partial-cache cleanup), and `spill_admitted` short-circuiting on
+small eager queries. `tests/exists_auto.rs` verifies automatic streaming, strict
+non-materializing cursors at batch sizes 1, 64, and 4096, and exact parity with eager and
+per-key evaluation at depths 5, 8, and 16 across pure `EXISTS`, alternating `NOT EXISTS`,
+deeply correlated outer variables, `UNION`, `OPTIONAL`, named and variable `GRAPH`, empty
+and non-empty branches, `BIND`, `SUM`, and `ORDER BY`, as well as tight memory budgets
+from 256 KiB to 16 MiB, pre-cancelled and expired-deadline admission, and cancellation
+before the first pull. `crates/sparkles/tests/nesting.rs` verifies depth-16 and depth-32
+streamed execution on a 2 MiB stack.

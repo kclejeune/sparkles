@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# run.sh: the body of the atlas unit horn-ranges-693. Takes the bench lock and then the heavy lock,
+# checks the binaries' and inputs' hashes, records the host state, runs timing.sh (which caps
+# each process at 12 GiB) and analyze.py, and writes DONE with the exit status on every path once
+# the locks are held. Launch from this directory, alone on the host:
+#   systemd-run --user --unit=horn-ranges-693 --collect --working-directory=$HOME/lanes/horn-ranges-693 \
+#     $HOME/lanes/horn-ranges-693/run.sh
+set -u
+cd "$(dirname "$0")"
+mkdir -p out; rm -f DONE
+for c in jq python3 timeout sha256sum flock taskset systemd-run; do
+  command -v $c > /dev/null || { echo "$(date -Is) missing $c" >> queue.log; echo "exit=4" > DONE; exit 4; }
+done
+echo "$(date -Is) queued for locks" >> queue.log
+exec 8>> ~/lanes/.bench.lock
+flock 8 || { echo "$(date -Is) bench lock failed" >> queue.log; exit 2; }
+exec 9>> ~/lanes/.heavy.lock
+flock 9 || { echo "$(date -Is) heavy lock failed" >> queue.log; exit 2; }
+rc=1
+trap 'echo "exit=$rc" > DONE' EXIT
+echo "$(date -Is) locks held" >> queue.log
+if ! sha256sum -c SHA256SUMS > out/sha-check.txt 2>&1; then rc=3; exit "$rc"; fi
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -m
+  systemctl --user list-units --no-legend --state=active --type=service; } > out/before.txt
+ROUNDS=5 bash timing.sh >> out/timing.stdout 2>&1
+trc=$?
+{ echo "end=$(date -Is)"; uptime; free -m; } > out/after.txt
+python3 -B analyze.py out 120 > out/summary.md 2>&1
+arc=$?
+echo "$(date -Is) timing=$trc analyze=$arc" >> queue.log
+if [ $trc -ne 0 ]; then rc=$trc; elif [ $arc -ne 0 ]; then rc=$((100 + arc)); else rc=0; fi
+exit $rc

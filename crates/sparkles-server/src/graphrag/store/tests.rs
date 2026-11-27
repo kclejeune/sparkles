@@ -420,3 +420,30 @@ fn policy_reports_keep_what_their_provenance_names() {
         1
     );
 }
+
+#[test]
+fn parse_term_parses_rdf12_triple_terms() {
+    let parsed = parse_term("<<( <http://ex/alice> <http://ex/leads> <http://ex/payments> )>>");
+    let Some(Term::Triple(t)) = parsed else {
+        panic!("expected triple term, got {parsed:?}");
+    };
+    assert_eq!(
+        t.subject,
+        oxrdf::NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://ex/alice"))
+    );
+    assert_eq!(t.predicate, NamedNode::new_unchecked("http://ex/leads"));
+    assert_eq!(
+        t.object,
+        Term::NamedNode(NamedNode::new_unchecked("http://ex/payments"))
+    );
+
+    let lit_triple = parse_term("<<( <http://ex/alice> <http://ex/name> \"Alice\"@en )>>");
+    assert!(
+        matches!(lit_triple, Some(Term::Triple(_))),
+        "{lit_triple:?}"
+    );
+    assert_eq!(
+        parse_term("<http://ex/alice>"),
+        Some(Term::NamedNode(NamedNode::new_unchecked("http://ex/alice")))
+    );
+}

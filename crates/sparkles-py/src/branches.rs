@@ -10,6 +10,40 @@ use pyo3::prelude::*;
 use sparkles::branch::{ConflictScope, MergeOptions, MergeOutcome, Take};
 handle!(PyBranches, "Branches");
 handle!(PyBranchSettings, "BranchSettings");
+
+/// Argument presence for `Branches.update(..., note=...)`.
+///
+/// PyO3 evaluates the signature default only when `note` is omitted, while an
+/// explicit `note=None` passes through `FromPyObject` and clears the note.
+#[derive(Debug)]
+enum BranchNoteArg {
+    Omitted,
+    Clear,
+    Set(String),
+}
+
+impl BranchNoteArg {
+    fn into_change(self) -> Option<Option<String>> {
+        match self {
+            Self::Omitted => None,
+            Self::Clear => Some(None),
+            Self::Set(text) => Some(Some(text)),
+        }
+    }
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for BranchNoteArg {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if obj.is_none() {
+            Ok(Self::Clear)
+        } else {
+            obj.extract::<String>().map(Self::Set)
+        }
+    }
+}
+
 impl PyBranches {
     fn locking(&self, py: Python<'_>, branches: &[&str]) -> PyResult<sparkles::Dataset> {
         let ds = self.write(py)?;
@@ -81,25 +115,17 @@ impl PyBranches {
         })?;
         admin::to_py(py, &r)
     }
-    #[pyo3(signature=(name,*,protected=None,note=None,new_name=None))]
+    #[pyo3(signature=(name,*,protected=None,note=BranchNoteArg::Omitted,new_name=None))]
     fn update<'py>(
         &self,
         py: Python<'py>,
         name: &str,
         protected: Option<bool>,
-        note: Option<&Bound<'py, PyAny>>,
+        note: BranchNoteArg,
         new_name: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ds = self.metadata(py, name)?;
-        let note = note
-            .map(|n| {
-                if n.is_none() {
-                    Ok(None)
-                } else {
-                    n.extract::<String>().map(Some)
-                }
-            })
-            .transpose()?;
+        let note = note.into_change();
         let r = py
             .detach(|| {
                 let mut r = ds.branch_info(name)?;

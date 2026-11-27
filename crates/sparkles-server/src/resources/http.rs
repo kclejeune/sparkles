@@ -43,6 +43,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/resources/{id}/license", get(license))
         .route("/$/resources/{id}/notice", get(notice))
         .route("/$/resources/{id}/header", get(header_read))
+        .route(
+            "/$/resources/{id}/recipes",
+            get(crate::linked_data::http::recipes),
+        )
         .route("/$/resources/{id}/install/{ds}", post(install))
 }
 
@@ -102,6 +106,8 @@ const RESOURCE_MEMBERS: &[&str] = &[
 ];
 const VERSION_MEMBERS: &[&str] = &[
     "version",
+    "versionIri",
+    "snapshot",
     "issued",
     "notes",
     "license",

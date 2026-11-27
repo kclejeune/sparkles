@@ -440,8 +440,11 @@ description = "Check cited source paths and public documentation entry-page link
 run = ["python3 scripts/check-doc-paths.py --code", "python3 scripts/check-doc-links.py"]
 
 [tasks."test:quickstart"]
-description = "Build the server and exercise the README quick start"
-run = "mbx sparkles-task -- bash -ec 'mbx build -p sparkles-server && python3 scripts/test-quickstart.py'"
+description = "Exercise subprocess harnesses and build the server for the README quick start"
+run = [
+  "python3 scripts/test-sparkles-test-server.py",
+  "mbx sparkles-task -- bash -ec 'mbx build -p sparkles-server && python3 scripts/test-quickstart.py'",
+]
 
 [tasks.check]
 description = "Fast compile check of all crates and targets + UI type check"
@@ -449,14 +452,17 @@ depends = ["ui:check", "ui:build"]
 run = "mbx check --workspace --all-targets"
 
 [tasks.test]
-sources = ["@group:rust", "@group:ui", "@group:docs", "testsuite/**", "scripts/changed-crates.py", "scripts/nextest-slow.py"]
+sources = ["@group:rust", "@group:ui", "@group:docs", "testsuite/**", "scripts/changed-crates.py", "scripts/nextest-slow.py", "scripts/ci-retain-junit.py"]
 outputs = []
 # The W3C, SHACL, ShEx and JSON-LD suites read checkouts of Apache Jena and Oxigraph
 # next to this repository when they exist, so their commits are part of the key.
+# Gate passes need an origin in the cached log. All gate runs share one cache mode,
+# and standalone tests use a separate mode.
 cache = { enabled = true, command_inputs = [
   "rustc -V",
   "mbx --version",
   "mbx-policy-key.py",
+  'printf "%s" "${SPARKLES_CI_GATE_RUN:+gate-junit-v1}"',
   "git -C ../../apache/jena rev-parse HEAD 2> /dev/null || echo absent",
   "git -C ../../oxigraph/oxigraph rev-parse HEAD 2> /dev/null || echo absent",
 ] }
@@ -494,9 +500,13 @@ exit $rc
   '''
 set -e
 pkgs=$(python3 scripts/changed-crates.py --cargo-args --doc)
-[ "$pkgs" != none ] || exit 0
-if [ "$(uname -s)" = Darwin ]; then ulimit -c 0; fi
-mbx test $pkgs --doc
+if [ "$pkgs" != none ]; then
+  if [ "$(uname -s)" = Darwin ]; then ulimit -c 0; fi
+  mbx test $pkgs --doc
+fi
+if [ -n "${SPARKLES_CI_GATE_RUN:-}" ]; then
+  python3 scripts/ci-retain-junit.py cache-origin 2>> .artifacts/ci/junit-retention.log
+fi
 ''',
 ]
 
@@ -729,7 +739,10 @@ run = "pnpm --dir js build"
 
 [tasks."node:test"]
 # The remote client's tests run against a debug server, so every Rust input counts.
-sources = ["@group:rust", "@group:js", "scripts/node-native.sh"]
+sources = [
+  "@group:rust", "@group:js", "scripts/node-native.sh",
+  "ui/scripts/ask-stub.mjs", "ui/scripts/seed-design.mjs", "ui/scripts/server-process.mjs",
+]
 outputs = []
 tools = { node = "24" }
 description = "Test Node bindings, remote client and transaction/lifecycle contracts, with the remote client's tests against a debug server"

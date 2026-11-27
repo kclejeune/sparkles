@@ -547,7 +547,7 @@ pub fn reload(st: &AppState, args: &ModelArgs) {
     };
     match checked {
         Ok(d) => {
-            settings.declared.store(Arc::new(d));
+            settings.replace_declared(Arc::new(d));
             let mut s = settings.status.lock();
             s.read_at = Some(super::now());
             s.error = None;

@@ -13,7 +13,7 @@ pub const JSON_LEXICAL_UTF8_V1: &str = "urn:x-sparkles:evidence:normalization:js
 /// The encoding is identified by both its immutable method IRI and this version.
 pub const JSON_LEXICAL_UTF8_VERSION: &str = "1";
 
-const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+pub(super) const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const CHUNK: usize = 64 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -35,6 +35,24 @@ pub fn select_json_lexical_utf8<'a>(
     Ok(selected.swap_remove(0))
 }
 
+/// Like [`select_json_lexical_utf8`], charging all temporary and retained selection
+/// scratch directly to `preparation` instead of a separate 64 MiB counter. The caller
+/// is responsible for keeping `source` charged to `preparation`.
+pub(super) fn select_json_lexical_utf8_prepared<'a>(
+    source: &'a str,
+    pointer: &str,
+    preparation: &crate::access::Preparation,
+) -> Result<SelectedJsonValue<'a>> {
+    let mut selected = select_json_lexical_utf8_batch_with(
+        source,
+        &[pointer],
+        preparation.control(),
+        MEMORY_LIMIT,
+        Some(preparation),
+    )?;
+    Ok(selected.swap_remove(0))
+}
+
 /// A revision is validated and traversed once for its entire set of mandatory
 /// pointers. Outputs retain their input positions, including duplicate pointers.
 pub(super) fn select_json_lexical_utf8_batch<'a>(
@@ -42,14 +60,80 @@ pub(super) fn select_json_lexical_utf8_batch<'a>(
     pointers: &[&str],
     control: &Control,
 ) -> Result<Vec<SelectedJsonValue<'a>>> {
+    select_json_lexical_utf8_batch_limited(source, pointers, MEMORY_LIMIT, control)
+}
+
+/// [`select_json_lexical_utf8_batch`] bounded by `memory_limit` bytes.
+pub(super) fn select_json_lexical_utf8_batch_limited<'a>(
+    source: &'a str,
+    pointers: &[&str],
+    memory_limit: usize,
+    control: &Control,
+) -> Result<Vec<SelectedJsonValue<'a>>> {
+    select_json_lexical_utf8_batch_with(source, pointers, control, memory_limit, None)
+}
+
+fn select_json_lexical_utf8_batch_with<'a>(
+    source: &'a str,
+    pointers: &[&str],
+    control: &Control,
+    memory_limit: usize,
+    preparation: Option<&crate::access::Preparation>,
+) -> Result<Vec<SelectedJsonValue<'a>>> {
+    let selected = select_json_lexical_utf8_batch_optional_with(
+        source,
+        pointers,
+        memory_limit,
+        control,
+        preparation,
+    )?;
+    selected
+        .into_iter()
+        .map(|value| {
+            value.ok_or_else(|| {
+                Error::invalid("span-mismatch: JSON Pointer does not select a retained value")
+            })
+        })
+        .collect()
+}
+
+/// Like [`select_json_lexical_utf8_batch_limited`], returning `None` at positions whose
+/// pointer does not select a value so callers can attribute a miss to its exact key.
+pub(super) fn select_json_lexical_utf8_batch_optional<'a>(
+    source: &'a str,
+    pointers: &[&str],
+    memory_limit: usize,
+    control: &Control,
+) -> Result<Vec<Option<SelectedJsonValue<'a>>>> {
+    select_json_lexical_utf8_batch_optional_with(source, pointers, memory_limit, control, None)
+}
+
+fn select_json_lexical_utf8_batch_optional_with<'a>(
+    source: &'a str,
+    pointers: &[&str],
+    memory_limit: usize,
+    control: &Control,
+    preparation: Option<&crate::access::Preparation>,
+) -> Result<Vec<Option<SelectedJsonValue<'a>>>> {
     control.check()?;
     if pointers.is_empty() {
         return Ok(Vec::new());
     }
     input_bound(source.len())?;
-    let mut memory = Memory::new(pointers.iter().fold(source.len(), |total, pointer| {
-        total.saturating_add(pointer.len())
-    }))?;
+    let mut memory = match preparation {
+        Some(prep) => {
+            let initial = pointers
+                .iter()
+                .fold(0usize, |total, pointer| total.saturating_add(pointer.len()));
+            Memory::prepared(prep, initial)?
+        }
+        None => Memory::new(
+            pointers.iter().fold(source.len(), |total, pointer| {
+                total.saturating_add(pointer.len())
+            }),
+            memory_limit,
+        )?,
+    };
     memory.add(
         pointers.len().saturating_mul(
             (std::mem::size_of::<SelectedJsonValue<'_>>()
@@ -58,7 +142,7 @@ pub(super) fn select_json_lexical_utf8_batch<'a>(
         ),
     )?;
     let trie = pointer_trie(pointers, &mut memory, control)?;
-    validate_json(source, control)?;
+    validate_json(source, &mut memory, control)?;
     let bytes = source.as_bytes();
     let mut position = whitespace(bytes, 0, control)?;
     let mut matched = Some(0);
@@ -120,11 +204,10 @@ pub(super) fn select_json_lexical_utf8_batch<'a>(
                 let mut digests = std::collections::BTreeMap::new();
                 for range in selected {
                     control.check()?;
-                    let (start, end) = range.ok_or_else(|| {
-                        Error::invalid(
-                            "span-mismatch: JSON Pointer does not select a retained value",
-                        )
-                    })?;
+                    let Some((start, end)) = range else {
+                        values.push(None);
+                        continue;
+                    };
                     let utf8 = &source[start..end];
                     let digest = match digests.entry((start, end)) {
                         std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
@@ -133,7 +216,7 @@ pub(super) fn select_json_lexical_utf8_batch<'a>(
                             *entry.insert(Sha256Digest::of_bytes(utf8.as_bytes(), control)?)
                         }
                     };
-                    values.push(SelectedJsonValue { utf8, digest });
+                    values.push(Some(SelectedJsonValue { utf8, digest }));
                 }
                 return Ok(values);
             };
@@ -395,8 +478,9 @@ fn decode_string(raw: &str, memory: &mut Memory, control: &Control) -> Result<St
     // before allocating, then retain only the actual string and tree-node bound.
     let temporary = raw.len().saturating_mul(4).saturating_add(96);
     memory.add(temporary)?;
-    let decoded: String = serde_json::from_str(raw)
-        .map_err(|_| Error::invalid("JSON strings require valid Unicode scalar values"))?;
+    let decoded: String = serde_json::from_str(raw).map_err(|_| {
+        Error::invalid("span-mismatch: JSON strings require valid Unicode scalar values")
+    })?;
     let retained = decoded.capacity().saturating_add(96);
     memory.remove(temporary);
     memory.add(retained)?;
@@ -404,27 +488,52 @@ fn decode_string(raw: &str, memory: &mut Memory, control: &Control) -> Result<St
     Ok(decoded)
 }
 
-struct Memory(usize);
+enum Memory {
+    Local { used: usize, limit: usize },
+    Prepared(crate::access::Reservation),
+}
 impl Memory {
-    fn new(bytes: usize) -> Result<Self> {
-        let mut memory = Self(0);
+    fn new(bytes: usize, limit: usize) -> Result<Self> {
+        let mut memory = Self::Local { used: 0, limit };
         memory.add(bytes)?;
         Ok(memory)
     }
+    fn prepared(preparation: &crate::access::Preparation, bytes: usize) -> Result<Self> {
+        let res = preparation.reserve(bytes as u64)?;
+        Ok(Self::Prepared(res))
+    }
     fn add(&mut self, bytes: usize) -> Result<()> {
-        let requested = self.0.saturating_add(bytes);
-        if requested > MEMORY_LIMIT {
-            return Err(Error::BudgetExceeded(Budget {
-                kind: BudgetKind::Memory,
-                limit: MEMORY_LIMIT as u64,
-                requested: requested as u64,
-            }));
+        match self {
+            Self::Local { used, limit } => {
+                let requested = used.saturating_add(bytes);
+                if requested > *limit {
+                    return Err(Error::BudgetExceeded(Budget {
+                        kind: BudgetKind::Memory,
+                        limit: *limit as u64,
+                        requested: requested as u64,
+                    }));
+                }
+                *used = requested;
+                Ok(())
+            }
+            Self::Prepared(res) => res.grow_by(bytes as u64),
         }
-        self.0 = requested;
-        Ok(())
     }
     fn remove(&mut self, bytes: usize) {
-        self.0 = self.0.saturating_sub(bytes);
+        match self {
+            Self::Local { used, .. } => *used = used.saturating_sub(bytes),
+            Self::Prepared(res) => {
+                let next = res.bytes().saturating_sub(bytes as u64);
+                res.release_to(next);
+            }
+        }
+    }
+    #[cfg(test)]
+    fn used(&self) -> usize {
+        match self {
+            Self::Local { used, .. } => *used,
+            Self::Prepared(res) => res.bytes() as usize,
+        }
     }
 }
 
@@ -433,16 +542,22 @@ std::thread_local! {
     pub(super) static JSON_REVISION_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn validate_json(source: &str, control: &Control) -> Result<()> {
+/// Bounded scratch allocated by `serde_json::Deserializer::ignore_value` up to
+/// `nesting::MAX_ELEMENTS` (one byte per open container, rounded up for Vec growth)
+/// plus fixed parser overhead.
+const VALIDATE_SCRATCH_BYTES: usize = nesting::MAX_ELEMENTS.next_power_of_two() * 2 + 2048;
+
+fn validate_json(source: &str, memory: &mut Memory, control: &Control) -> Result<()> {
     #[cfg(test)]
     JSON_REVISION_VALIDATIONS.with(|count| count.set(count.get() + 1));
     let mut nesting = nesting::Scanner::new(nesting::Syntax::Json, nesting::MAX_ELEMENTS);
     for chunk in source.as_bytes().chunks(CHUNK) {
         control.check()?;
-        nesting
-            .feed(chunk)
-            .map_err(|_| Error::invalid("JSON reference exceeds the nesting bound"))?;
+        nesting.feed(chunk).map_err(|_| {
+            Error::invalid("span-mismatch: JSON reference exceeds the nesting bound")
+        })?;
     }
+    memory.add(VALIDATE_SCRATCH_BYTES)?;
     let mut reader = ControlledRead {
         bytes: source.as_bytes(),
         until_check: 0,
@@ -453,10 +568,11 @@ fn validate_json(source: &str, control: &Control) -> Result<()> {
         let mut parser = serde_json::Deserializer::from_reader(&mut reader);
         serde::de::IgnoredAny::deserialize(&mut parser).and_then(|_| parser.end())
     };
+    memory.remove(VALIDATE_SCRATCH_BYTES);
     if let Some(error) = reader.failure {
         return Err(error);
     }
-    parsed.map_err(|_| Error::invalid("invalid retained JSON revision"))?;
+    parsed.map_err(|_| Error::invalid("span-mismatch: invalid retained JSON revision"))?;
     control.check()
 }
 
@@ -707,13 +823,13 @@ mod tests {
         let values = select_json_lexical_utf8_batch(&source, &pointers, &Control::none()).unwrap();
         assert_eq!(values.len(), 2000);
         assert!(values.iter().all(|value| value.utf8 == "0"));
-        let mut once = Memory::new(0).unwrap();
+        let mut once = Memory::new(0, MEMORY_LIMIT).unwrap();
         let one = pointer_trie(&[&pointer], &mut once, &Control::none()).unwrap();
-        let mut repeated = Memory::new(0).unwrap();
+        let mut repeated = Memory::new(0, MEMORY_LIMIT).unwrap();
         let many = pointer_trie(&pointers, &mut repeated, &Control::none()).unwrap();
         assert_eq!(one.len(), 1025);
         assert_eq!(many.len(), one.len());
-        assert!(repeated.0 < once.0 + pointers.len() * 64);
+        assert!(repeated.used() < once.used() + pointers.len() * 64);
         let source = format!("{}0{}", "{\"é/x~\":".repeat(1024), "}".repeat(1024));
         let pointer = "/é~1x~0".repeat(1024);
         let values =
@@ -813,7 +929,7 @@ mod tests {
             select_json_lexical_utf8("{}", "", &control),
             Err(Error::Cancelled)
         ));
-        let mut memory = Memory::new(MEMORY_LIMIT).unwrap();
+        let mut memory = Memory::new(MEMORY_LIMIT, MEMORY_LIMIT).unwrap();
         assert!(matches!(
             memory.add(1),
             Err(Error::BudgetExceeded(Budget {
@@ -821,5 +937,26 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn tight_budget_refuses_grammar_validation_scratch_before_parsing() {
+        // A shallow root document whose traversal requires well under 1 KiB, so a 2 KiB
+        // budget would succeed without `VALIDATE_SCRATCH_BYTES` (4 KiB) admission and
+        // fails strictly at grammar-scratch admission.
+        let shallow = r#"{"a":1}"#;
+        let tight_limit = 2048;
+        assert!(matches!(
+            select_json_lexical_utf8_batch_optional(shallow, &[""], tight_limit, &Control::none()),
+            Err(Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Memory,
+                ..
+            }))
+        ));
+        // Adding room for grammar scratch succeeds.
+        let enough = tight_limit + VALIDATE_SCRATCH_BYTES;
+        let out = select_json_lexical_utf8_batch_optional(shallow, &[""], enough, &Control::none())
+            .unwrap();
+        assert_eq!(out[0].as_ref().unwrap().utf8, shallow);
     }
 }

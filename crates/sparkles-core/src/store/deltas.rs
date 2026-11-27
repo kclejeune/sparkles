@@ -67,6 +67,39 @@ impl Ring {
             }
         }
     }
+
+    /// Look for a possible match in the raw records of a complete range of recent
+    /// commits. The caller controls the walk, and nothing from the ring is copied.
+    pub(super) fn probe_raw(
+        &self,
+        generation: &Arc<Generation>,
+        range: std::ops::RangeInclusive<u64>,
+        limit: crate::history::ReadLimit<'_>,
+        step: &impl Fn() -> Result<()>,
+        matches: &impl Fn([Id; 4]) -> bool,
+    ) -> Result<Option<bool>> {
+        let inner = limit.lock(&self.inner)?;
+        let end = *range.end();
+        let start = inner
+            .entries
+            .partition_point(|entry| entry.seq < *range.start());
+        for (seq, entry) in range.zip(inner.entries.iter().skip(start)) {
+            step()?;
+            if entry.seq != seq || !Arc::ptr_eq(&entry.generation, generation) {
+                return Ok(None);
+            }
+            for &(_, quad) in &entry.changes {
+                step()?;
+                if matches(quad) {
+                    return Ok(Some(true));
+                }
+            }
+            if seq == end {
+                return Ok(Some(false));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Keeps the ring of recent changes filled until it is dropped.
@@ -289,21 +322,21 @@ impl Snapshot {
         for q in added {
             let k = Perm::Spo.to_key(q);
             if delta.ins[spo].contains(&k) {
-                apply(&mut delta, q, false, false);
+                apply(&self.generation, &mut delta, q, false, false);
             } else if !delta.del[spo].contains(&k)
                 && self.perm(Perm::Spo).contains(&self.cache, &k)?
             {
-                apply(&mut delta, q, false, true);
+                apply(&self.generation, &mut delta, q, false, true);
             }
         }
         for q in removed {
             let k = Perm::Spo.to_key(q);
             if delta.del[spo].contains(&k) {
-                apply(&mut delta, q, true, true);
+                apply(&self.generation, &mut delta, q, true, true);
             } else if !delta.ins[spo].contains(&k)
                 && !self.perm(Perm::Spo).contains(&self.cache, &k)?
             {
-                apply(&mut delta, q, true, false);
+                apply(&self.generation, &mut delta, q, true, false);
             }
         }
         Ok(Snapshot {

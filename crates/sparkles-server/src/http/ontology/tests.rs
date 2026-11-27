@@ -138,6 +138,82 @@ async fn the_summary_counts_the_terminology() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
 
+/// Roadmap item 735: `view=head` answers the summary's header, entity counts, graphs
+/// and imports without the axiom counts, under its own tag, which an edit can name.
+#[tokio::test]
+async fn the_summary_head_answers_the_header_and_counts() {
+    let s = server();
+    let full = get(&s.app, "/$/ontology/t").await.json();
+    let r = get(&s.app, "/$/ontology/t?view=head").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["view"], "head");
+    for k in [
+        "dataset", "commit", "mode", "graphs", "imports", "warnings", "header", "entities",
+        "closure",
+    ] {
+        assert_eq!(j[k], full[k], "{k}");
+    }
+    for k in [
+        "axioms",
+        "axiomCount",
+        "triples",
+        "unmapped",
+        "diagnostics",
+        "cached",
+    ] {
+        assert!(j.get(k).is_none(), "{k}");
+    }
+    let tag = r.headers[header::ETAG].to_str().unwrap().to_string();
+    assert!(tag.ends_with(":owl-head\""), "{tag}");
+    assert_eq!(
+        r.headers["sparkles-commit"],
+        full["commit"].to_string().as_str()
+    );
+    let r = send(
+        &s.app,
+        "GET",
+        "/$/ontology/t?view=head",
+        &[("if-none-match", &tag)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+    let r = get(&s.app, "/$/ontology/t?view=full").await;
+    assert_eq!(r.json()["axioms"], full["axioms"]);
+    for bad in [
+        "/$/ontology/t?view=light",
+        "/$/ontology/t?view=head&metrics=true",
+    ] {
+        assert_eq!(
+            get(&s.app, bad).await.status,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    // an edit's If-Match can name the head's tag
+    let body = json!({"add": [sub("http://ex.org/A", json!("http://ex.org/B"))]}).to_string();
+    let ct = (header::CONTENT_TYPE.as_str(), "application/json");
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/axioms",
+        &[ct, ("if-match", &tag)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/axioms",
+        &[ct, ("if-match", &tag)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.text());
+}
+
 #[tokio::test]
 async fn axioms_page_and_filter() {
     let s = server();
@@ -628,10 +704,33 @@ async fn classify_answers_the_taxonomy_and_writes_it() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(r.headers.contains_key("sparkles-commit"), "{:?}", r.headers);
     let j = r.json();
+    // the terminology alone leaves out the assertions about :ada, which a run with the
+    // assertions reads
     assert_eq!(
-        (j["consistent"].as_bool(), j["complete"].as_bool()),
-        (Some(true), Some(true)),
+        (
+            j["consistent"].as_bool(),
+            j["complete"].as_bool(),
+            j["completeForTaken"].as_bool(),
+            j["consistency"].as_str(),
+        ),
+        (Some(true), Some(false), Some(true), Some("unknown")),
         "{j}"
+    );
+    assert_eq!(j["excluded"][0]["rule"], "assertion-not-read", "{j}");
+    let with_assertions = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"assertions": true}),
+    )
+    .await
+    .json();
+    assert_eq!(
+        (
+            with_assertions["complete"].as_bool(),
+            with_assertions["consistency"].as_str(),
+        ),
+        (Some(true), Some("consistent")),
+        "{with_assertions}"
     );
     assert_eq!(j["nodes"].as_array().unwrap().len(), 2, "{j}");
     assert_eq!(j["next"], 2, "{j}");
@@ -738,7 +837,10 @@ async fn kept_classification_get_is_fresh_read_only_and_pins_pages() {
     assert_eq!(read.headers[header::CACHE_CONTROL], "no-store");
     let j = read.json();
     assert_eq!(j["status"], "available");
-    assert_eq!(j["outcome"]["consistency"], "consistent");
+    // the fixture holds assertions that a terminology-only run does not read
+    assert_eq!(j["outcome"]["consistency"], "unknown");
+    assert_eq!(j["outcome"]["complete"], false);
+    assert_eq!(j["outcome"]["excludedCount"], 1);
     let pin = format!(
         "at=commit:{}&resultId={}",
         j["commit"],
@@ -753,6 +855,9 @@ async fn kept_classification_get_is_fresh_read_only_and_pins_pages() {
     )
     .await;
     assert_eq!(parents.status, StatusCode::OK, "{}", parents.text());
+    assert_eq!(parents.json()["outcome"]["partial"], false);
+    assert_eq!(parents.json()["entity"]["present"], true);
+    assert_eq!(parents.json()["entity"]["incomplete"], true);
     assert_eq!(
         parents.json()["page"]["items"][0]["iri"],
         "http://ex.org/Person"
@@ -774,6 +879,7 @@ async fn kept_classification_get_is_fresh_read_only_and_pins_pages() {
     )
     .await;
     assert_eq!(missing.json()["entity"]["present"], false);
+    assert!(missing.json()["entity"]["incomplete"].is_null());
 }
 
 #[tokio::test]
@@ -1236,7 +1342,7 @@ async fn classify_answers_in_part_under_a_deadline() {
         let j = post(
             &s.app,
             "/$/ontology/t/classify",
-            json!({"partial": true, "expansion": e}),
+            json!({"partial": true, "expansion": e, "assertions": true}),
         )
         .await
         .json();
@@ -1270,6 +1376,196 @@ async fn classify_leaves_the_consistency_unknown_when_stopped_early() {
     // the deadlines check every answer, and a stop of the clock may or may not come
     // before the inconsistency is found
     partial_over_http(true).await;
+}
+
+#[tokio::test]
+async fn partial_classification_reports_per_class_incomplete_on_frame_and_about() {
+    let data = cases(case_count(), false);
+    let (full, _) = whole_over_http(false).await;
+    let estimate = full["stats"]["estimatedBytes"].as_u64().unwrap();
+    // Find a deterministic budget that stops the disjunctive run with multiple open classes.
+    let mut found = None;
+    for k in 1..20 {
+        let budget = estimate * k / 20;
+        let s = server_with_memory(&data, Some(budget));
+        let r = post(
+            &s.app,
+            "/$/ontology/t/classify",
+            json!({"partial": true, "threads": 1, "limit": 10000}),
+        )
+        .await;
+        if r.status != StatusCode::OK {
+            continue;
+        }
+        let j = r.json();
+        if j["partial"] == true
+            && j["incomplete"]
+                .as_array()
+                .is_some_and(|open| open.len() > 1)
+        {
+            let open_iri = j["incomplete"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            found = Some((budget, open_iri));
+            break;
+        }
+    }
+    let (budget, open_iri) = found.expect("no budget gave a partial answer with open classes");
+
+    // Legacy `about` reports `class.incomplete: true` even when `limit: 1` truncates `incomplete`.
+    let s = server_with_memory(&data, Some(budget));
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"partial": true, "threads": 1, "limit": 1, "about": open_iri}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["partial"], true, "{j}");
+    assert_eq!(j["complete"], false, "{j}");
+    assert_eq!(j["incomplete"].as_array().unwrap().len(), 1, "{j}");
+    assert_ne!(j["incomplete"][0], json!(open_iri), "{j}");
+    assert_eq!(j["class"]["iri"], json!(open_iri), "{j}");
+    assert_eq!(j["class"]["incomplete"], true, "{j}");
+
+    // `projection=frame` reports `frame.incomplete: true` alongside outcome and non-retention.
+    let s = server_with_memory(&data, Some(budget));
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"projection": "frame", "about": open_iri, "partial": true, "threads": 1, "limit": 10}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let frame = &j["frame"];
+    assert_eq!(frame["iri"], json!(open_iri), "{j}");
+    assert_eq!(frame["incomplete"], true, "{j}");
+    assert_eq!(frame["outcome"]["partial"], true, "{j}");
+    assert_eq!(frame["outcome"]["complete"], false, "{j}");
+    assert_eq!(frame["outcome"]["tier"], "disjunctive", "{j}");
+    assert!(
+        frame["outcome"]["incompleteCount"].as_u64().unwrap_or(0) > 1,
+        "{j}"
+    );
+    assert!(
+        matches!(
+            frame["outcome"]["consistency"].as_str(),
+            Some("consistent" | "unknown")
+        ),
+        "{j}"
+    );
+    assert_eq!(frame["retention"]["kept"], false, "{j}");
+    assert!(frame["retention"]["resultId"].is_null(), "{j}");
+
+    // Complete run reports `incomplete: false` on both legacy `about` and `projection=frame`.
+    let s = server_of(&data);
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"about": open_iri, "threads": 1}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["class"]["incomplete"], false);
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"projection": "frame", "about": open_iri, "threads": 1}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["frame"]["incomplete"], false, "{j}");
+    assert_eq!(j["frame"]["outcome"]["complete"], true, "{j}");
+}
+
+#[tokio::test]
+async fn classify_answers_in_part_for_el_and_horn_under_budgets() {
+    let n = if cfg!(debug_assertions) { 50 } else { 150 };
+    let prefixes = "@prefix : <http://ex.org/> .\n\
+                    @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+                    @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n";
+    let mut el_body = format!(
+        "{prefixes}:r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . :s a owl:ObjectProperty .\n\
+         :part a owl:ObjectProperty , owl:TransitiveProperty .\n\
+         :s owl:propertyChainAxiom ( :r1 :r2 ) .\n",
+    );
+    for i in 0..n {
+        let next = (i + 1) % n;
+        el_body.push_str(&format!(
+            ":A{i} a owl:Class ; rdfs:subClassOf :A{next} , [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B{i} ] .\n\
+             :B{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :C{next} ] .\n\
+             :C{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :part ; owl:someValuesFrom :P{next} ] .\n\
+             :P{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :part ; owl:someValuesFrom :P{next} ] .\n\
+             [ a owl:Restriction ; owl:onProperty :s ; owl:someValuesFrom :C{i} ] rdfs:subClassOf :D{i} .\n",
+        ));
+    }
+    let hn = if cfg!(debug_assertions) { 45 } else { 120 };
+    let mut horn_body = format!(
+        "{prefixes}:r a owl:ObjectProperty . :rinv a owl:ObjectProperty ; owl:inverseOf :r .\n"
+    );
+    for i in 0..hn {
+        let b = (7 * i + 3) % hn;
+        let d = (11 * i + 5) % hn;
+        horn_body.push_str(&format!(
+            ":H{i} a owl:Class ;\n\
+              rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :M{i} ] ,\n\
+                              [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :F{b} ] ,\n\
+                              [ a owl:Restriction ; owl:onProperty :r ; owl:maxCardinality 1 ] ,\n\
+                              [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :G{d} ] .\n\
+             :M{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :rinv ; owl:allValuesFrom :Back{i} ] .\n",
+        ));
+    }
+
+    for (tier, data) in [("el", el_body), ("horn", horn_body)] {
+        let full = post(
+            &server_of(&data).app,
+            "/$/ontology/t/classify",
+            json!({"partial": true, "threads": 1, "limit": 10000}),
+        )
+        .await
+        .json();
+        assert_eq!(full["complete"], true, "{tier}: {full}");
+        assert_eq!(full["partial"], false, "{tier}: {full}");
+        assert_eq!(full["tier"], tier, "{tier}: {full}");
+        let estimate = full["stats"]["estimatedBytes"].as_u64().unwrap();
+        let mut saw_partial = false;
+        for k in 1..20 {
+            let s = server_with_memory(&data, Some(estimate * k / 20));
+            let r = post(
+                &s.app,
+                "/$/ontology/t/classify",
+                json!({"partial": true, "threads": 1, "limit": 10000}),
+            )
+            .await;
+            if r.status == StatusCode::INSUFFICIENT_STORAGE {
+                continue;
+            }
+            assert_eq!(r.status, StatusCode::OK, "{tier}: {}", r.text());
+            let j = r.json();
+            assert_eq!(j["tier"], tier, "{tier}: {j}");
+            if j["partial"] == true {
+                assert_eq!(j["complete"], false, "{tier}: {j}");
+                let open = j["incomplete"].as_array().unwrap();
+                assert_eq!(
+                    j["incompleteCount"].as_u64(),
+                    Some(open.len() as u64),
+                    "{tier}: {j}"
+                );
+                let c = j["consistency"].as_str().unwrap();
+                assert!(c == "consistent" || c == "unknown", "{tier}: {j}");
+                saw_partial = true;
+            }
+        }
+        assert!(saw_partial, "{tier}: no budget gave a partial HTTP answer");
+    }
 }
 
 /// Every quad of dataset `t`, as sorted N-Quads lines.
@@ -2805,4 +3101,1469 @@ async fn the_outbound_policy_refuses_a_fetch_and_nothing_changes() {
         json!([])
     );
     assert_eq!(get(&s.app, "/$/ontology/t").await.json()["commit"], commit);
+}
+
+/// A classification that leaves an axiom out is not complete, names the classes it may
+/// miss, and is refused when strict (roadmap item 1271).
+#[tokio::test]
+async fn classify_reports_what_a_left_out_axiom_reaches_and_strict_refuses_it() {
+    let s = server_of(
+        r#"@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:o a owl:Ontology .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :X a owl:Class . :Y a owl:Class .
+:A rdfs:subClassOf [ a owl:Class ; owl:unionOf ( :B :C ) ] .
+:X rdfs:subClassOf :Y .
+:k a owl:NamedIndividual , :A .
+"#,
+    );
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"assertions": true}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["complete"], false, "{j}");
+    assert_eq!(j["completeForTaken"], true, "{j}");
+    assert_eq!(j["partial"], false, "{j}");
+    assert_eq!(j["incomplete"], json!(["http://ex.org/A"]), "{j}");
+    assert_eq!(j["consistency"], "consistent", "{j}");
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"assertions": true, "strict": true}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["code"], "classification-incomplete", "{j}");
+    assert!(
+        j["error"].as_str().unwrap().contains("ObjectUnionOf"),
+        "{j}"
+    );
+    // strict as a query parameter refuses a terminology-only run that leaves assertions unread
+    let r = post(&s.app, "/$/ontology/t/classify?strict=true", json!({})).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["code"], "classification-incomplete", "{j}");
+    assert!(
+        j["error"].as_str().unwrap().contains("assertion-not-read"),
+        "{j}"
+    );
+    // strict as a query parameter, on an answer that is complete
+    let complete = server_of(
+        r#"@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:o a owl:Ontology .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :X a owl:Class . :Y a owl:Class .
+:A rdfs:subClassOf [ a owl:Class ; owl:unionOf ( :B :C ) ] .
+:X rdfs:subClassOf :Y .
+"#,
+    );
+    let r = post(
+        &complete.app,
+        "/$/ontology/t/classify?strict=true",
+        json!({}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["complete"], true);
+}
+
+const DL663_TRAILING_SUPERROLES: &str = include_str!(
+    "../../../../sparkles-owl/tests/fixtures/dl663_top_chain_default/03-trailing-superroles.ofn"
+);
+const DL663_CLASSIFY: &str = "/$/ontology/t/classify?graph=urn%3Adl663%3Ainput";
+const DL663_GAP: &str = "property chains through the top object property";
+
+async fn dl663_classification_server() -> Server {
+    let s = server();
+    // Supply declarations for the reverse RDF mapping of the retained OFN fixture.
+    let body = DL663_TRAILING_SUPERROLES.replacen(
+        "Ontology(",
+        "Ontology(<urn:dl663:input>
+         Declaration(Class(:A)) Declaration(Class(:B)) Declaration(Class(:D))
+         Declaration(ObjectProperty(:r)) Declaration(ObjectProperty(:s))
+         Declaration(ObjectProperty(:t)) Declaration(ObjectProperty(:g))
+         ",
+        1,
+    );
+    let r = send(
+        &s.app,
+        "PUT",
+        "/t/data?graph=urn%3Adl663%3Ainput",
+        &[(header::CONTENT_TYPE.as_str(), sparkles::io::OFN_MEDIA_TYPE)],
+        &body,
+    )
+    .await;
+    assert!(r.status.is_success(), "{} {}", r.status, r.text());
+    s
+}
+
+#[tokio::test]
+async fn dl663_http_default_classification_includes_the_projected_parent() {
+    let s = dl663_classification_server().await;
+    let about = "urn:top-domain:A";
+    let r = post(&s.app, DL663_CLASSIFY, json!({"about": about})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let plain = r.json();
+    assert_eq!(plain["reused"], false, "{plain}");
+    assert_eq!(plain["complete"], false, "{plain}");
+    assert_eq!(plain["completeForTaken"], true, "{plain}");
+    assert_eq!(plain["excludedCount"], 1, "{plain}");
+    assert_eq!(plain["excluded"][0]["partial"], DL663_GAP, "{plain}");
+
+    let r = post(
+        &s.app,
+        DL663_CLASSIFY,
+        json!({"projection": "frame", "about": about}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let projected = r.json();
+    let frame = &projected["frame"];
+    assert_eq!(
+        projected["classificationSource"],
+        plain["classificationSource"]
+    );
+    assert_eq!(
+        projected["classificationSource"]["producer"]["elOnly"],
+        false
+    );
+    assert_eq!(frame["result"]["resultId"], plain["resultId"]);
+    assert_eq!(frame["retention"]["kept"], true);
+    assert_eq!(frame["retention"]["resultId"], plain["resultId"]);
+    assert_eq!(frame["result"]["elOnly"], false);
+    assert_eq!(frame["outcome"]["complete"], false);
+    assert_eq!(frame["outcome"]["partial"], false);
+    assert_eq!(frame["outcome"]["unmappedCount"], 0);
+    assert_eq!(frame["excluded"]["total"], 1);
+    let e = &frame["excluded"]["items"][0];
+    assert_eq!(
+        e["gap"],
+        json!({"kind": "partiallyUsed", "reason": DL663_GAP})
+    );
+    let original = sparkles::owl::ofn_read::parse_axiom(
+        "SubObjectPropertyOf(ObjectPropertyChain(<urn:top-domain:r> owl:topObjectProperty) <urn:top-domain:t>)",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(e["axiom"], sparkles::owl::json::axiom(&original));
+
+    let r = post(&s.app, DL663_CLASSIFY, json!({"about": "urn:top-domain:C"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(
+        !r.json()["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("urn:top-domain:D"))
+    );
+    assert!(
+        frame["parents"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["iri"] == "urn:top-domain:D")
+            && plain["class"]["superClasses"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("urn:top-domain:D")),
+        "dl663 missing: HTTP default projected domain",
+    );
+    println!("dl663 ok: HTTP default projected domain");
+}
+
+#[tokio::test]
+async fn dl663_http_strict_refusal_leaves_the_target_unpublished() {
+    let s = dl663_classification_server().await;
+    let ds = s._state.get("t").unwrap();
+    let head = ds.store.head_commit().seq;
+    let r = post(
+        &s.app,
+        DL663_CLASSIFY,
+        json!({"strict": true, "target": "urn:dl663:target"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["code"], "classification-incomplete", "{j}");
+    let message = j["error"].as_str().unwrap();
+    assert!(
+        message.contains("ObjectPropertyChain") && message.contains(DL663_GAP),
+        "{j}"
+    );
+    assert_eq!(ds.store.head_commit().seq, head);
+
+    let r = get(&s.app, "/$/ontology/t/axioms?graph=urn%3Adl663%3Atarget").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["total"], 0);
+    println!("dl663 ok: HTTP strict leaves target unpublished");
+}
+
+#[tokio::test]
+async fn patterns_preview_dry_run_and_atomic_apply_robot_and_dosdp() {
+    let s = server();
+    let ds = s._state.get("t").unwrap();
+    let initial_head = ds.store.head_commit().seq;
+
+    let robot_body = json!({
+        "table": {
+            "format": "csv",
+            "data": "ID,Label,Type,Parent,Note\nID,LABEL@en,TYPE,SC %,A rdfs:comment\nex:Lecturer,Lecturer,owl:Class,ex:Person,Teaches classes\nex:Seminar,Seminar,owl:Class,ex:Course,Small class\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        },
+        "declare": true,
+        "limit": 50
+    });
+
+    // 1. Preview returns generated axioms, diff summary, ETag, and leaves dataset unchanged.
+    let prev = post(&s.app, "/$/ontology/t/patterns/preview", robot_body.clone()).await;
+    assert_eq!(prev.status, StatusCode::OK, "{}", prev.text());
+    let etag = prev
+        .headers
+        .get(header::ETAG)
+        .expect("preview returns ETag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let pj = prev.json();
+    assert_eq!(pj["valid"], true);
+    assert_eq!(pj["rowsProcessed"], 2);
+    assert_eq!(pj["rowsWithErrors"], 0);
+    assert!(pj["newAxioms"].as_u64().unwrap() >= 6);
+    assert!(pj["estimatedTriples"].as_u64().unwrap() >= 6);
+    assert_eq!(ds.store.head_commit().seq, initial_head);
+
+    // 2. Dry-run apply returns WritePreview parity without committing.
+    let dry_body = json!({
+        "table": robot_body["table"],
+        "spec": robot_body["spec"],
+        "declare": true,
+        "message": "Import roles from ROBOT sheet"
+    });
+    let dry = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/patterns/apply?dryRun=true",
+        &[("content-type", "application/json"), ("if-match", &etag)],
+        &dry_body.to_string(),
+    )
+    .await;
+    assert_eq!(dry.status, StatusCode::OK, "{}", dry.text());
+    let dj = dry.json();
+    assert_eq!(dj["dryRun"], true, "{dj}");
+    assert!(dj["commit"]["inserted"].as_u64().unwrap() >= 6, "{dj}");
+    assert_eq!(ds.store.head_commit().seq, initial_head);
+
+    // 3. Apply commits atomically in one commit with If-Match.
+    let applied = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/patterns/apply?receipt=true",
+        &[("content-type", "application/json"), ("if-match", &etag)],
+        &dry_body.to_string(),
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::OK, "{}", applied.text());
+    let aj = applied.json();
+    assert_eq!(aj["committed"], true, "{aj}");
+    assert!(aj["added"].as_u64().unwrap() >= 6);
+    assert_eq!(aj["pattern"]["rowsProcessed"], 2);
+    assert_eq!(ds.store.head_commit().seq, initial_head + 1);
+
+    // 4. Reusing stale If-Match returns 412 Precondition Failed.
+    let stale = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/patterns/apply",
+        &[("content-type", "application/json"), ("if-match", &etag)],
+        &dry_body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{}",
+        stale.text()
+    );
+
+    // 5. DOSDP pattern mode with errors aborts by default (422) and commits valid rows with onError=skip.
+    let dosdp_err = json!({
+        "table": {
+            "data": "cls,parent\nAdjunct,ex:Person\nBad One,not a valid ( expr\n"
+        },
+        "spec": {
+            "mode": "pattern",
+            "baseIri": "http://ex.org/",
+            "prefixes": { "ex": "http://ex.org/" },
+            "declarations": [{ "column": "cls", "kind": "Class" }],
+            "rules": [{
+                "name": "sub",
+                "template": "${cls|iri} SubClassOf ${parent}",
+                "syntax": "manchester"
+            }]
+        }
+    });
+    let aborted = post(&s.app, "/$/ontology/t/patterns/apply", dosdp_err.clone()).await;
+    assert_eq!(
+        aborted.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        aborted.text()
+    );
+    assert_eq!(aborted.json()["code"], "pattern-errors");
+    assert_eq!(ds.store.head_commit().seq, initial_head + 1);
+
+    let mut dosdp_skip = dosdp_err;
+    dosdp_skip["onError"] = json!("skip");
+    let skipped = post(&s.app, "/$/ontology/t/patterns/apply", dosdp_skip).await;
+    assert_eq!(skipped.status, StatusCode::OK, "{}", skipped.text());
+    let sj = skipped.json();
+    assert_eq!(sj["committed"], true, "{sj}");
+    assert_eq!(sj["pattern"]["rowsWithErrors"], 1);
+    assert_eq!(ds.store.head_commit().seq, initial_head + 2);
+}
+
+#[tokio::test]
+async fn patterns_preview_assertion_parity_row_atomicity_and_refusal_ordering() {
+    let s = persistent();
+    let ds = s._state.get("h").unwrap();
+
+    // 1. Apply an individual + class assertion + object property assertion table, then
+    //    re-preview: store-resident assertions must be reported as `existing` with 0 new
+    //    axioms and 0 estimated triples (matching apply).
+    let ind_body = json!({
+        "table": {
+            "format": "tsv",
+            "data": "ID\tClass\tTeaches\nID\tTYPE\tI ex:teaches\nex:bob\tex:Professor\tex:logic\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        },
+        "declare": true
+    });
+    let first_prev = post(&s.app, "/$/ontology/h/patterns/preview", ind_body.clone()).await;
+    assert_eq!(first_prev.status, StatusCode::OK, "{}", first_prev.text());
+    let fpj = first_prev.json();
+    assert_eq!(fpj["valid"], true);
+    assert_eq!(fpj["newAxioms"], 3, "{fpj}");
+    assert_eq!(fpj["existingAxioms"], 0, "{fpj}");
+
+    // Dry-run with changes=50 returns triple sample quads.
+    let dry = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?dryRun=true&changes=50",
+        ind_body.clone(),
+    )
+    .await;
+    assert_eq!(dry.status, StatusCode::OK, "{}", dry.text());
+    let dj = dry.json();
+    assert!(
+        !dj["changes"]["quads"].as_array().unwrap().is_empty(),
+        "dryRun with changes=50 must return quads: {dj}"
+    );
+
+    let applied = post(&s.app, "/$/ontology/h/patterns/apply", ind_body.clone()).await;
+    assert_eq!(applied.status, StatusCode::OK, "{}", applied.text());
+    assert_eq!(applied.json()["committed"], true);
+
+    let second_prev = post(&s.app, "/$/ontology/h/patterns/preview", ind_body).await;
+    assert_eq!(second_prev.status, StatusCode::OK, "{}", second_prev.text());
+    let spj = second_prev.json();
+    assert_eq!(
+        spj["newAxioms"], 0,
+        "repeat preview must see stored assertions: {spj}"
+    );
+    assert_eq!(spj["existingAxioms"], 3, "{spj}");
+    assert_eq!(spj["estimatedTriples"], 0, "{spj}");
+
+    // 2. Row-atomic onError=skip: Row 2 has a valid declaration (`ex:ValidBadRow`) AND a
+    //    broken restriction; skipping it must NOT commit `Declaration(Class(ex:ValidBadRow))`.
+    let partial_row = json!({
+        "table": {
+            "data": "ID,Parent\nID,SC %\nex:GoodRow,ex:Person\nex:ValidBadRow,not valid ( syntax\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        },
+        "onError": "skip"
+    });
+    let skip_resp = post(&s.app, "/$/ontology/h/patterns/apply", partial_row).await;
+    assert_eq!(skip_resp.status, StatusCode::OK, "{}", skip_resp.text());
+    let sj = skip_resp.json();
+    assert_eq!(sj["committed"], true, "{sj}");
+    assert_eq!(sj["pattern"]["rowsWithErrors"], 1);
+    let entities = get(&s.app, "/$/ontology/h/entities?kind=Class")
+        .await
+        .json();
+    let entity_text = entities.to_string();
+    assert!(
+        entity_text.contains("http://ex.org/GoodRow"),
+        "{entity_text}"
+    );
+    assert!(
+        !entity_text.contains("http://ex.org/ValidBadRow"),
+        "failed row's declaration must not commit under onError=skip: {entity_text}"
+    );
+
+    // 3. Structural spec errors refuse commit even under onError=skip.
+    let structural_err = json!({
+        "table": { "data": "ID,Parent\nID,NO_SUCH_DIRECTIVE\nex:X,ex:Person\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        },
+        "onError": "skip"
+    });
+    let struct_resp = post(&s.app, "/$/ontology/h/patterns/apply", structural_err).await;
+    assert_eq!(
+        struct_resp.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        struct_resp.text()
+    );
+    assert_eq!(struct_resp.json()["code"], "pattern-errors");
+
+    // 4. Stale If-Match and protected branch refuse BEFORE 422 pattern-errors.
+    let invalid_pattern = json!({
+        "table": { "data": "ID,Parent\nID,SC %\nex:Bad,not valid (\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let stale_tag = format!("W/\"{}:0:owl\"", ds.store.dataset_id());
+    let stale_resp = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/patterns/apply",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &stale_tag),
+        ],
+        &invalid_pattern.to_string(),
+    )
+    .await;
+    assert_eq!(
+        stale_resp.status,
+        StatusCode::PRECONDITION_FAILED,
+        "stale If-Match must win over 422 pattern-errors: {}",
+        stale_resp.text()
+    );
+
+    // 5. Import-target digest change invalidates preview ETag on apply with 412.
+    let valid_pattern = json!({
+        "table": { "data": "ID,Parent\nID,SC %\nex:AfterImport,ex:Person\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let prev_before_import = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        valid_pattern.clone(),
+    )
+    .await;
+    assert_eq!(prev_before_import.status, StatusCode::OK);
+    let tag_before = prev_before_import.headers[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let imp_get = get(&s.app, "/$/ontology/h/imports").await;
+    assert_eq!(imp_get.status, StatusCode::OK, "{}", imp_get.text());
+    let imp_etag = imp_get.headers[header::ETAG].to_str().unwrap().to_string();
+    let patch_imp = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/h/imports",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &imp_etag),
+        ],
+        &json!({ "set": { "http://ex.org/imp": "http://ex.org/g-imp" } }).to_string(),
+    )
+    .await;
+    assert_eq!(patch_imp.status, StatusCode::OK, "{}", patch_imp.text());
+    let apply_after_import = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/patterns/apply",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &tag_before),
+        ],
+        &valid_pattern.to_string(),
+    )
+    .await;
+    assert_eq!(
+        apply_after_import.status,
+        StatusCode::PRECONDITION_FAILED,
+        "import map change must invalidate preview ETag: {}",
+        apply_after_import.text()
+    );
+
+    // 6. Protected branch returns 403 branch-protected BEFORE 422 pattern-errors.
+    ds.dataset
+        .create_branch("locked", &sparkles::branch::BranchOptions::default())
+        .unwrap();
+    ds.dataset.set_branch_protected("locked", true).unwrap();
+    let prot_resp = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?branch=locked",
+        invalid_pattern,
+    )
+    .await;
+    assert_eq!(
+        prot_resp.status,
+        StatusCode::FORBIDDEN,
+        "branch-protected must win over 422 pattern-errors: {}",
+        prot_resp.text()
+    );
+    assert_eq!(prot_resp.json()["code"], "branch-protected");
+}
+
+#[tokio::test]
+async fn patterns_apply_refuses_read_only_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.read_only = true;
+    let state = Arc::new(st);
+    let ds = state.attach("ro", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let app = router(state);
+    let body = json!({
+        "table": { "data": "ID,Parent\nID,SC %\nex:A,ex:Person\n" },
+        "spec": { "mode": "robot", "headerTemplateRow": true, "prefixes": { "ex": "http://ex.org/" } }
+    });
+    assert_eq!(
+        post(&app, "/$/ontology/ro/patterns/preview", body.clone())
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, "/$/ontology/ro/patterns/apply", body)
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn patterns_r2_triple_limit_parity_dry_run_precondition_prefix_etag_and_response_caps() {
+    let s = persistent();
+    let ds = s._state.get("h").unwrap();
+
+    // 1. Triple-limit parity (507 triple-limit) across preview, apply (abort & skip), and
+    //    apply?dryRun=true under tight max_triples, leaving head unchanged.
+    {
+        let lim = sparkles::owl::patterns::Limits {
+            max_triples: 4,
+            ..Default::default()
+        };
+        *s._state.pattern_test_limits.lock() = Some((lim, 16 * 1024 * 1024));
+    }
+    let over_triples_body = json!({
+        "table": {
+            "data": "ID,Parent\nID,SC %\nex:C1,ex:Person\nex:C2,ex:Person\nex:C3,ex:Person\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        },
+        "declare": true
+    });
+    let head_before = ds.store.head_commit().seq;
+
+    let prev_507 = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        over_triples_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        prev_507.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        prev_507.text()
+    );
+    assert_eq!(prev_507.json()["code"], "triple-limit");
+
+    let apply_abort_507 = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply",
+        over_triples_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        apply_abort_507.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        apply_abort_507.text()
+    );
+    assert_eq!(apply_abort_507.json()["code"], "triple-limit");
+    assert_eq!(ds.store.head_commit().seq, head_before);
+
+    let mut over_skip = over_triples_body.clone();
+    over_skip["onError"] = json!("skip");
+    let apply_skip_507 = post(&s.app, "/$/ontology/h/patterns/apply", over_skip).await;
+    assert_eq!(
+        apply_skip_507.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        apply_skip_507.text()
+    );
+    assert_eq!(apply_skip_507.json()["code"], "triple-limit");
+    assert_eq!(ds.store.head_commit().seq, head_before);
+
+    let dry_507 = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?dryRun=true",
+        over_triples_body,
+    )
+    .await;
+    assert_eq!(
+        dry_507.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        dry_507.text()
+    );
+    assert_eq!(dry_507.json()["code"], "triple-limit");
+    assert_eq!(ds.store.head_commit().seq, head_before);
+
+    // Reset limits for subsequent checks.
+    *s._state.pattern_test_limits.lock() = None;
+
+    // 2. Stale If-Match + dryRun=true + invalid table row MUST return 412 with dry-run
+    //    precondition-failed headers, NOT 422 pattern-errors.
+    let invalid_table = json!({
+        "table": { "data": "ID,Parent\nID,SC %\nex:Bad,not valid (\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let stale_tag = format!(
+        "W/\"{}:0:owl-patterns.0000000000000000\"",
+        ds.store.dataset_id()
+    );
+    let dry_stale = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/patterns/apply?dryRun=true",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &stale_tag),
+        ],
+        &invalid_table.to_string(),
+    )
+    .await;
+    assert_eq!(
+        dry_stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "stale dry-run If-Match must win over 422 pattern-errors: {}",
+        dry_stale.text()
+    );
+    assert_eq!(
+        dry_stale
+            .headers
+            .get("sparkles-dry-run")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        dry_stale
+            .headers
+            .get("sparkles-dry-run-outcome")
+            .and_then(|v| v.to_str().ok()),
+        Some("precondition-failed")
+    );
+
+    // 3. Same-head dataset prefix rebind MUST invalidate the pattern preview ETag (412).
+    ds.store.set_prefix("dyn", "http://dyn1.org/").unwrap();
+    let prefix_body = json!({
+        "table": { "data": "ID,Parent\nID,SC %\ndyn:Heart,ex:Person\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let prev_pref = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        prefix_body.clone(),
+    )
+    .await;
+    assert_eq!(prev_pref.status, StatusCode::OK, "{}", prev_pref.text());
+    let pref_tag = prev_pref.headers[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        pref_tag.contains(":owl-patterns."),
+        "expected owl-patterns ETag, got {pref_tag}"
+    );
+    let head_same = ds.store.head_commit().seq;
+    // Mutate dataset prefix with NO commit.
+    ds.store.set_prefix("dyn", "http://dyn2.org/").unwrap();
+    assert_eq!(ds.store.head_commit().seq, head_same);
+
+    let apply_rebound = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/patterns/apply",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &pref_tag),
+        ],
+        &prefix_body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        apply_rebound.status,
+        StatusCode::PRECONDITION_FAILED,
+        "same-head prefix rebind must invalidate preview ETag: {}",
+        apply_rebound.text()
+    );
+    assert_eq!(ds.store.head_commit().seq, head_same);
+
+    // 4. Queued apply under writer-lock contention: if import map changes while queued
+    //    for the writer lock, apply must check and evaluate under ONE single context
+    //    captured after acquiring the writer lock.
+    let prev_q = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        prefix_body.clone(),
+    )
+    .await;
+    assert_eq!(prev_q.status, StatusCode::OK);
+    let tag_q = prev_q.headers[header::ETAG].to_str().unwrap().to_string();
+    let imp_get = get(&s.app, "/$/ontology/h/imports").await;
+    let imp_etag = imp_get.headers[header::ETAG].to_str().unwrap().to_string();
+
+    // Hold the dataset writer lock so the apply task queues behind it.
+    let held_txn = ds
+        .store
+        .try_write_with(
+            sparkles::commit::CommitKind::Update,
+            sparkles::guard::WriteOptions::default(),
+        )
+        .unwrap();
+    let app_clone = s.app.clone();
+    let body_str = prefix_body.to_string();
+    let tag_q_clone = tag_q.clone();
+    let apply_task = tokio::spawn(async move {
+        send(
+            &app_clone,
+            "POST",
+            "/$/ontology/h/patterns/apply",
+            &[
+                ("content-type", "application/json"),
+                ("if-match", &tag_q_clone),
+            ],
+            &body_str,
+        )
+        .await
+    });
+    // Give the apply request a moment to parse and block on the writer lock, then mutate
+    // the import map while it is queued before releasing the writer lock.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let patch_imp = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/h/imports",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &imp_etag),
+        ],
+        &json!({ "set": { "http://ex.org/queued-imp": "http://ex.org/g-queued" } }).to_string(),
+    )
+    .await;
+    assert_eq!(patch_imp.status, StatusCode::OK, "{}", patch_imp.text());
+    drop(held_txn);
+
+    let queued_resp = apply_task.await.unwrap();
+    assert_eq!(
+        queued_resp.status,
+        StatusCode::PRECONDITION_FAILED,
+        "queued apply must observe the import map under the writer lock and fail 412: {}",
+        queued_resp.text()
+    );
+
+    // 5. Tight byte limits on preview (long namespace + annotations) and apply response
+    //    ceiling (truncating addedAxioms cleanly, including entry 0 on preview).
+    let long_ns = format!("http://example.org/{}/", "n".repeat(1_500));
+    let long_ns_body = json!({
+        "table": { "data": "ID,Note\nID,A rdfs:comment\np:1,hello\np:2,world\np:3,again\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "p": long_ns }
+        }
+    });
+    {
+        let lim = sparkles::owl::patterns::Limits {
+            max_total_expanded_bytes: 5_000,
+            ..Default::default()
+        };
+        *s._state.pattern_test_limits.lock() = Some((lim, 512));
+    }
+    let prev_budget = post(&s.app, "/$/ontology/h/patterns/preview", long_ns_body).await;
+    assert_eq!(prev_budget.status, StatusCode::OK, "{}", prev_budget.text());
+    let pbj = prev_budget.json();
+    assert_eq!(pbj["valid"], false, "{pbj}");
+    assert!(
+        pbj["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "expansion-bytes-limit"),
+        "expected expansion-bytes-limit diagnostic: {pbj}"
+    );
+
+    // Replicated >A annotation bytes on preview also hit expansion-bytes-limit before cloning.
+    let rep_ann_body = json!({
+        "table": {
+            "data": format!(
+                "ID,Parents,Note\nID,SC % SPLIT=|,>A rdfs:comment\nex:Rep,ex:A|ex:B|ex:C|ex:D|ex:E|ex:F|ex:G|ex:H|ex:I|ex:J,{}\n",
+                "z".repeat(600)
+            )
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let prev_rep = post(&s.app, "/$/ontology/h/patterns/preview", rep_ann_body).await;
+    assert_eq!(prev_rep.status, StatusCode::OK, "{}", prev_rep.text());
+    let prj = prev_rep.json();
+    assert_eq!(prj["valid"], false, "{prj}");
+    assert!(
+        prj["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "expansion-bytes-limit"),
+        "expected replicated >A expansion-bytes-limit diagnostic: {prj}"
+    );
+
+    // Preview response byte ceiling must cap the full serialized response (including
+    // entry 0, long ontology labels, and diagnostics).
+    {
+        let lim = sparkles::owl::patterns::Limits::default();
+        *s._state.pattern_test_limits.lock() = Some((lim, 420));
+    }
+    let small_ok_body = json!({
+        "table": {
+            "data": "ID,Parent\nID,SC %\nex:CapA,ex:Person\nex:CapB,ex:Person\nex:CapC,ex:Person\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let prev_capped = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        small_ok_body.clone(),
+    )
+    .await;
+    assert_eq!(prev_capped.status, StatusCode::OK, "{}", prev_capped.text());
+    assert!(
+        prev_capped.body.len() <= 420,
+        "preview response exceeded 420-byte cap: {} bytes: {}",
+        prev_capped.body.len(),
+        prev_capped.text()
+    );
+    let pcj = prev_capped.json();
+    assert_eq!(pcj["axiomsTruncated"], true, "{pcj}");
+    assert_eq!(
+        pcj["axioms"].as_array().unwrap().len(),
+        0,
+        "entry 0 must not bypass tight preview response byte cap: {pcj}"
+    );
+
+    // Preview with an existing long ontology label must bail out in Manchester bounded
+    // rendering and stay within the serialized response byte ceiling.
+    let long_label = "L".repeat(2_000);
+    let add_long_label = post(
+        &s.app,
+        "/$/ontology/h/axioms",
+        json!({
+            "add": [format!("AnnotationAssertion(rdfs:label <http://ex.org/Person> \"{long_label}\")")]
+        }),
+    )
+    .await;
+    assert_eq!(
+        add_long_label.status,
+        StatusCode::OK,
+        "{}",
+        add_long_label.text()
+    );
+    {
+        let lim = sparkles::owl::patterns::Limits::default();
+        *s._state.pattern_test_limits.lock() = Some((lim, 1_200));
+    }
+    let prev_long_label = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        small_ok_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        prev_long_label.status,
+        StatusCode::OK,
+        "{}",
+        prev_long_label.text()
+    );
+    assert!(
+        prev_long_label.body.len() <= 1_200,
+        "preview with long ontology label exceeded 1200-byte cap: {} bytes",
+        prev_long_label.body.len()
+    );
+    let pllj = prev_long_label.json();
+    assert_eq!(pllj["axiomsTruncated"], true, "{pllj}");
+
+    // Apply response byte ceiling bounds addedAxioms and serialized body length (without
+    // and with receipt=true).
+    {
+        let lim = sparkles::owl::patterns::Limits::default();
+        *s._state.pattern_test_limits.lock() = Some((lim, 1_200));
+    }
+    let apply_capped = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply",
+        small_ok_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        apply_capped.status,
+        StatusCode::OK,
+        "{}",
+        apply_capped.text()
+    );
+    assert!(
+        apply_capped.body.len() <= 1_200,
+        "apply response exceeded 1200-byte cap: {} bytes: {}",
+        apply_capped.body.len(),
+        apply_capped.text()
+    );
+    let acj = apply_capped.json();
+    assert_eq!(acj["committed"], true, "{acj}");
+    assert_eq!(acj["axiomsTruncated"], true, "{acj}");
+    assert!(
+        acj["addedAxioms"].as_array().unwrap().len() < acj["added"].as_u64().unwrap() as usize,
+        "apply response byte cap must bound rendered addedAxioms: {acj}"
+    );
+
+    let receipt_body = json!({
+        "table": {
+            "data": "ID,Parent\nID,SC %\nex:RecA,ex:Person\nex:RecB,ex:Person\nex:RecC,ex:Person\nex:RecD,ex:Person\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let apply_receipt_capped = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?receipt=true",
+        receipt_body,
+    )
+    .await;
+    assert_eq!(
+        apply_receipt_capped.status,
+        StatusCode::OK,
+        "{}",
+        apply_receipt_capped.text()
+    );
+    assert!(
+        apply_receipt_capped.body.len() <= 1_200,
+        "apply?receipt=true response exceeded 1200-byte cap: {} bytes: {}",
+        apply_receipt_capped.body.len(),
+        apply_receipt_capped.text()
+    );
+    let arcj = apply_receipt_capped.json();
+    assert_eq!(arcj["committed"], true, "{arcj}");
+    assert_eq!(arcj["axiomsTruncated"], true, "{arcj}");
+    assert!(
+        arcj["commit"].is_object(),
+        "receipt must be present: {arcj}"
+    );
+
+    // OFN `# "` comment bypass and ROBOT `I <data-prop>` typed literal prefix expansion
+    // are both caught under tight expanded-byte limits on HTTP preview.
+    let add_dp = post(
+        &s.app,
+        "/$/ontology/h/axioms",
+        json!({ "add": ["Declaration(DataProperty(<http://ex.org/score>))"] }),
+    )
+    .await;
+    assert_eq!(add_dp.status, StatusCode::OK, "{}", add_dp.text());
+    {
+        let lim = sparkles::owl::patterns::Limits {
+            max_total_expanded_bytes: 1_200,
+            ..sparkles::owl::patterns::Limits::default()
+        };
+        *s._state.pattern_test_limits.lock() = Some((lim, 64 * 1024));
+    }
+    let long_ns = format!("http://ex.org/{}/", "p".repeat(500));
+    let ofn_comment_body = json!({
+        "table": { "data": "a\nx\n" },
+        "spec": {
+            "mode": "pattern",
+            "prefixes": { "p": long_ns },
+            "rules": [{
+                "syntax": "functional",
+                "template": "# \"\nSubClassOf(p:${a} ObjectIntersectionOf(p:1 p:2 p:3 p:4))"
+            }]
+        }
+    });
+    let prev_ofn_comment = post(&s.app, "/$/ontology/h/patterns/preview", ofn_comment_body).await;
+    assert_eq!(
+        prev_ofn_comment.status,
+        StatusCode::OK,
+        "{}",
+        prev_ofn_comment.text()
+    );
+    let pocj = prev_ofn_comment.json();
+    assert_eq!(pocj["valid"], false, "{pocj}");
+    assert!(
+        pocj["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "expansion-bytes-limit"),
+        "OFN comment quote bypass must hit expansion-bytes-limit: {pocj}"
+    );
+
+    let dp_lit_body = json!({
+        "table": {
+            "data": "ID,Score\nID,I ex:score\nex:i1,\"\"\"1\"\"^^p:t\"\nex:i2,\"\"\"2\"\"^^p:t\"\nex:i3,\"\"\"3\"\"^^p:t\"\nex:i4,\"\"\"4\"\"^^p:t\"\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/", "p": format!("http://ex.org/{}/", "q".repeat(500)) }
+        }
+    });
+    let prev_dp_lit = post(&s.app, "/$/ontology/h/patterns/preview", dp_lit_body).await;
+    assert_eq!(prev_dp_lit.status, StatusCode::OK, "{}", prev_dp_lit.text());
+    let pdlj = prev_dp_lit.json();
+    assert_eq!(pdlj["valid"], false, "{pdlj}");
+    assert!(
+        pdlj["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "expansion-bytes-limit"),
+        "ROBOT I <data-prop> typed literal expansion must hit expansion-bytes-limit: {pdlj}"
+    );
+
+    // Multi-triple unannotated axiom exceeding max_triples is refused cleanly with 507
+    // without materializing RDF triples during presence checks.
+    {
+        let lim = sparkles::owl::patterns::Limits {
+            max_triples: 5,
+            ..sparkles::owl::patterns::Limits::default()
+        };
+        *s._state.pattern_test_limits.lock() = Some((lim, 64 * 1024));
+    }
+    let multi_triple_body = json!({
+        "table": { "data": "c\nex:Complex\n" },
+        "spec": {
+            "mode": "pattern",
+            "prefixes": { "ex": "http://ex.org/" },
+            "rules": [{
+                "syntax": "functional",
+                "template": "SubClassOf(${c} ObjectIntersectionOf(ex:C1 ex:C2 ex:C3 ex:C4))"
+            }]
+        }
+    });
+    let prev_multi = post(&s.app, "/$/ontology/h/patterns/preview", multi_triple_body).await;
+    assert_eq!(
+        prev_multi.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        prev_multi.text()
+    );
+    assert_eq!(prev_multi.json()["code"], "triple-limit");
+
+    *s._state.pattern_test_limits.lock() = None;
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn patterns_r4_shacl_warn_receipt_respects_response_cap() {
+    let s = persistent();
+
+    // Oversized SHACL warn-mode validation receipt on apply?receipt=true must preserve
+    // the committed outcome and stay strictly within the response byte ceiling.
+    let huge_shacl_msg = "V".repeat(2_000);
+    let warn_shapes = format!(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+         @prefix ex: <http://ex.org/> .\n\
+         ex:WarnShape a sh:NodeShape ; sh:targetClass ex:Person ;\n\
+           sh:property [ sh:path ex:mustHave ; sh:minCount 1 ; sh:message \"{huge_shacl_msg}\" ] .\n"
+    );
+    let put_guard = send(
+        &s.app,
+        "PUT",
+        "/$/validation/h",
+        &[("content-type", "application/json")],
+        &json!({
+            "mode": "warn",
+            "shapes": { "inline": warn_shapes, "format": "text/turtle" }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(put_guard.status, StatusCode::OK, "{}", put_guard.text());
+
+    {
+        let lim = sparkles::owl::patterns::Limits::default();
+        *s._state.pattern_test_limits.lock() = Some((lim, 1_400));
+    }
+    let shacl_apply_body = json!({
+        "table": {
+            "data": "ID,Kind,Class\nID,TYPE,TI %\nex:WarnInd1,owl:NamedIndividual,ex:Person\nex:WarnInd2,owl:NamedIndividual,ex:Person\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let apply_warn_capped = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?receipt=true",
+        shacl_apply_body,
+    )
+    .await;
+    assert_eq!(
+        apply_warn_capped.status,
+        StatusCode::OK,
+        "{}",
+        apply_warn_capped.text()
+    );
+    assert!(
+        apply_warn_capped.body.len() <= 1_400,
+        "apply?receipt=true with oversized SHACL warn receipt exceeded 1400-byte cap: {} bytes: {}",
+        apply_warn_capped.body.len(),
+        apply_warn_capped.text()
+    );
+    assert!(
+        apply_warn_capped
+            .headers
+            .contains_key("sparkles-validation"),
+        "Sparkles-Validation header must still be present"
+    );
+    let awj = apply_warn_capped.json();
+    assert_eq!(awj["committed"], true, "{awj}");
+    assert!(awj["commit"].is_object(), "commit receipt missing: {awj}");
+    assert_eq!(awj["validation"]["status"], "warned", "{awj}");
+    assert_eq!(awj["validation"]["truncated"], true, "{awj}");
+    assert_eq!(
+        awj["validation"]["results"].as_array().unwrap().len(),
+        0,
+        "oversized SHACL results must be omitted to stay under cap: {awj}"
+    );
+
+    // Even when the remaining budget cannot fit the validation shell itself, the commit
+    // outcome is preserved and the body stays within the cap while keeping the header.
+    {
+        let lim = sparkles::owl::patterns::Limits::default();
+        *s._state.pattern_test_limits.lock() = Some((lim, 700));
+    }
+    let shacl_tight_body = json!({
+        "table": {
+            "data": "ID,Kind,Class\nID,TYPE,TI %\nex:WarnInd3,owl:NamedIndividual,ex:Person\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let apply_warn_ultra_tight = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?receipt=true",
+        shacl_tight_body,
+    )
+    .await;
+    assert_eq!(
+        apply_warn_ultra_tight.status,
+        StatusCode::OK,
+        "{}",
+        apply_warn_ultra_tight.text()
+    );
+    assert!(
+        apply_warn_ultra_tight.body.len() <= 700,
+        "apply?receipt=true with ultra-tight cap exceeded 700 bytes: {} bytes: {}",
+        apply_warn_ultra_tight.body.len(),
+        apply_warn_ultra_tight.text()
+    );
+    assert!(
+        apply_warn_ultra_tight
+            .headers
+            .contains_key("sparkles-validation")
+    );
+    let awuj = apply_warn_ultra_tight.json();
+    assert_eq!(awuj["committed"], true, "{awuj}");
+    assert!(awuj["commit"].is_object(), "{awuj}");
+    assert!(awuj.get("validation").is_none(), "{awuj}");
+
+    let del_guard = send(&s.app, "DELETE", "/$/validation/h", &[], "").await;
+    assert_eq!(
+        del_guard.status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        del_guard.text()
+    );
+
+    *s._state.pattern_test_limits.lock() = None;
+}
+
+#[tokio::test]
+async fn el_only_http_classify_kept_and_dl_query_reproduce_elk_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    let ds = state.attach("horn", DbType::Mem, None).unwrap();
+    let ttl = "@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:o a owl:Ontology .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class . :BC a owl:Class .
+:r a owl:ObjectProperty .
+:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] ,
+                   [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :C ] .
+:BC owl:equivalentClass [ a owl:Class ; owl:intersectionOf ( :B :C ) ] .
+[ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :BC ] rdfs:subClassOf :D .
+";
+    ds.store
+        .load(&[Source::from_bytes(
+            ttl.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let app = router(state);
+
+    // Default classification uses Horn rules and derives :A subClassOf :D.
+    let full = post(
+        &app,
+        "/$/ontology/horn/classify",
+        json!({"about": "http://ex.org/A"}),
+    )
+    .await;
+    assert_eq!(full.status, StatusCode::OK, "{}", full.text());
+    let fj = full.json();
+    assert_eq!(fj["reused"], false);
+    assert_eq!(fj["complete"], true);
+    assert_eq!(fj["tier"], "horn");
+    assert_eq!(fj["classificationSource"]["producer"]["elOnly"], false);
+    assert!(
+        fj["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("http://ex.org/D")),
+        "{fj}"
+    );
+
+    // EL-only classification reproduces ELK: leaves out ObjectAllValuesFrom and omits :D.
+    let elk = post(
+        &app,
+        "/$/ontology/horn/classify",
+        json!({"about": "http://ex.org/A", "elOnly": true}),
+    )
+    .await;
+    assert_eq!(elk.status, StatusCode::OK, "{}", elk.text());
+    let ej = elk.json();
+    assert_eq!(ej["reused"], false);
+    assert_eq!(ej["complete"], false);
+    assert_eq!(ej["completeForTaken"], true);
+    assert_eq!(ej["tier"], "horn");
+    assert_eq!(ej["excludedCount"], 1);
+    assert_eq!(ej["classificationSource"]["producer"]["elOnly"], true);
+    assert!(
+        !ej["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("http://ex.org/D")),
+        "{ej}"
+    );
+
+    // Both stay cached under their own keys without clobbering each other.
+    let full2 = post(
+        &app,
+        "/$/ontology/horn/classify",
+        json!({"about": "http://ex.org/A"}),
+    )
+    .await;
+    assert_eq!(full2.json()["reused"], true);
+    assert_eq!(full2.json()["resultId"], fj["resultId"]);
+
+    let elk2 = post(
+        &app,
+        "/$/ontology/horn/classify?elOnly=true",
+        json!({"about": "http://ex.org/A"}),
+    )
+    .await;
+    assert_eq!(elk2.status, StatusCode::OK, "{}", elk2.text());
+    assert_eq!(elk2.json()["reused"], true);
+    assert_eq!(elk2.json()["resultId"], ej["resultId"]);
+
+    // Frame projection with elOnly=true reports elOnly=true and keeps the EL-only pin.
+    let frame = post(
+        &app,
+        "/$/ontology/horn/classify",
+        json!({"projection": "frame", "about": "http://ex.org/A", "elOnly": true}),
+    )
+    .await;
+    assert_eq!(frame.status, StatusCode::OK, "{}", frame.text());
+    assert_eq!(frame.json()["frame"]["result"]["elOnly"], true);
+    assert_eq!(frame.json()["frame"]["retention"]["kept"], true);
+    assert_eq!(
+        frame.json()["frame"]["retention"]["resultId"],
+        ej["resultId"]
+    );
+
+    // GET /classification separates elOnly=false vs elOnly=true.
+    let kept_full = get(&app, "/$/ontology/horn/classification").await;
+    assert_eq!(kept_full.json()["status"], "available");
+    assert_eq!(kept_full.json()["result"]["elOnly"], false);
+    assert_eq!(kept_full.json()["result"]["resultId"], fj["resultId"]);
+
+    let kept_elk = get(&app, "/$/ontology/horn/classification?elOnly=true").await;
+    assert_eq!(kept_elk.json()["status"], "available");
+    assert_eq!(kept_elk.json()["result"]["elOnly"], true);
+    assert_eq!(kept_elk.json()["result"]["resultId"], ej["resultId"]);
+
+    // Strict mode succeeds for full and refuses EL-only (422 classification-incomplete).
+    let strict_full = post(&app, "/$/ontology/horn/classify", json!({"strict": true})).await;
+    assert_eq!(strict_full.status, StatusCode::OK, "{}", strict_full.text());
+    let strict_elk = post(
+        &app,
+        "/$/ontology/horn/classify",
+        json!({"strict": true, "elOnly": true}),
+    )
+    .await;
+    assert_eq!(
+        strict_elk.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        strict_elk.text()
+    );
+    assert_eq!(strict_elk.json()["code"], "classification-incomplete");
+
+    // Selector validation rejects invalid, duplicate, or conflicting elOnly values on
+    // GET /classification, projection classify, and ordinary POST /classify (leaving target
+    // writes uncommitted).
+    assert_eq!(
+        get(&app, "/$/ontology/horn/classification?elOnly=maybe")
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post(
+            &app,
+            "/$/ontology/horn/classify?projection=frame&elOnly=true",
+            json!({"about": "http://ex.org/A", "elOnly": true}),
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    let head_before = ds.store.snapshot().commit;
+    for (uri, body) in [
+        (
+            "/$/ontology/horn/classify?elOnly=treu",
+            json!({"about": "http://ex.org/A", "target": "urn:elk:bad-target"}),
+        ),
+        (
+            "/$/ontology/horn/classify?elOnly=false&elOnly=true",
+            json!({"about": "http://ex.org/A", "target": "urn:elk:bad-target"}),
+        ),
+        (
+            "/$/ontology/horn/classify?elOnly=true",
+            json!({"about": "http://ex.org/A", "elOnly": false, "target": "urn:elk:bad-target"}),
+        ),
+        (
+            "/$/ontology/horn/classify?elOnly=true",
+            json!({"about": "http://ex.org/A", "elOnly": true, "target": "urn:elk:bad-target"}),
+        ),
+    ] {
+        let bad = post(&app, uri, body).await;
+        assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{uri}: {}", bad.text());
+        assert_eq!(
+            ds.store.snapshot().commit,
+            head_before,
+            "{uri} must not write target"
+        );
+    }
+
+    // DL query: default reasoning="el" derives :A; elOnly=true reproduces ELK and omits :A.
+    let q_horn = post(
+        &app,
+        "/$/ontology/horn/dl-query",
+        json!({"expression": "r some (B and C)", "reasoning": "el", "answers": ["subclasses"]}),
+    )
+    .await;
+    assert_eq!(q_horn.status, StatusCode::OK, "{}", q_horn.text());
+    assert_eq!(q_horn.json()["reasoning"]["engine"], "el");
+    assert_eq!(q_horn.json()["reasoning"]["elOnly"], false);
+    assert_eq!(q_horn.json()["subclasses"], json!(["http://ex.org/A"]));
+
+    let q_elk = post(
+        &app,
+        "/$/ontology/horn/dl-query",
+        json!({"expression": "r some (B and C)", "elOnly": true, "answers": ["subclasses"]}),
+    )
+    .await;
+    assert_eq!(q_elk.status, StatusCode::OK, "{}", q_elk.text());
+    assert_eq!(q_elk.json()["reasoning"]["engine"], "el");
+    assert_eq!(q_elk.json()["reasoning"]["elOnly"], true);
+    assert_eq!(q_elk.json()["reasoning"]["complete"], false);
+    assert_eq!(q_elk.json()["subclasses"], json!([]));
+
+    // elOnly=true with reasoning="rl" is 400.
+    let q_bad = post(
+        &app,
+        "/$/ontology/horn/dl-query",
+        json!({"expression": "r some (B and C)", "reasoning": "rl", "elOnly": true}),
+    )
+    .await;
+    assert_eq!(q_bad.status, StatusCode::BAD_REQUEST, "{}", q_bad.text());
 }

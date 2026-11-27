@@ -732,6 +732,11 @@ impl Store {
         to: &Snapshot,
         o: &DiffOptions,
     ) -> Result<Option<Diff>> {
+        if o.graphs.as_ref().is_some_and(|a| !a.reads_everything())
+            && self.has_potential_evidence_visibility()
+        {
+            return Ok(None);
+        }
         let Some(generation) = mark.generation.upgrade() else {
             return Ok(None);
         };
@@ -749,6 +754,7 @@ impl Store {
             delta: mark.delta.clone(),
             dvocab_len: mark.dvocab_len,
             commit: mark.commit,
+            history_charge: None,
             ..to.clone()
         };
         let mut net = Net {
@@ -795,24 +801,43 @@ impl Store {
         };
         let (mut log_changes, mut compared) = (0u64, 0u64);
         let mut method = DiffMethod::Same;
-        // protections that depend on the data: the difference of the two states as the
-        // view sees them, so that triples whose visibility changed count too
+        // protections that depend on the data (classes, patterns, or support-aware
+        // projection visibility): the difference of the two states as the view sees
+        // them, so that triples whose visibility changed count too
+        let evidence_vis = self.has_potential_evidence_visibility();
         let data_view = o.graphs.as_ref().filter(|a| {
             a.triples
                 .as_ref()
                 .is_some_and(|t| t.hides() && !t.state_independent())
+                || (evidence_vis && !a.reads_everything())
         });
-        if lo != hi
-            && let Some(view) = data_view
+        if let Some(view) = data_view
+            && (lo != hi || evidence_vis)
         {
-            for (r, at) in [(&rf, from), (&rt, to)] {
-                self.check_readable(r, at)?;
+            let (at_lo, at_hi) = if a <= b { (from, to) } else { (to, from) };
+            if lo == hi {
+                let (sa, _) = self.snapshot_at(at_lo, &self.history_opts(o))?;
+                let (sb, _) = self.snapshot_at(at_hi, &self.history_opts(o))?;
+                let ka = sa.evidence_visibility_key();
+                let kb = sb.evidence_visibility_key();
+                if ka != kb || ka.as_deref() == Some("unavailable") {
+                    for (r, at) in [(&rf, from), (&rt, to)] {
+                        self.check_readable(r, at)?;
+                    }
+                    method = DiffMethod::Compare;
+                    let (sa, sb) = (view.bound(&sa).masked(&sa)?, view.bound(&sb).masked(&sb)?);
+                    compared += compare_states(&sa, &sb, &mut net)?;
+                }
+            } else {
+                for (r, at) in [(&rf, from), (&rt, to)] {
+                    self.check_readable(r, at)?;
+                }
+                method = DiffMethod::Compare;
+                let (sa, _) = self.snapshot_at(at_lo, &self.history_opts(o))?;
+                let (sb, _) = self.snapshot_at(at_hi, &self.history_opts(o))?;
+                let (sa, sb) = (view.bound(&sa).masked(&sa)?, view.bound(&sb).masked(&sb)?);
+                compared += compare_states(&sa, &sb, &mut net)?;
             }
-            method = DiffMethod::Compare;
-            let (sa, _) = self.snapshot_at(&At::Commit(lo), &self.history_opts(o))?;
-            let (sb, _) = self.snapshot_at(&At::Commit(hi), &self.history_opts(o))?;
-            let (sa, sb) = (view.masked(&sa)?, view.masked(&sb)?);
-            compared += compare_states(&sa, &sb, &mut net)?;
         } else if lo != hi
             && let Some(n) = self.diff_via_change_log(&rf, from, &rt, to, o, &mut net)?
         {
@@ -1004,13 +1029,24 @@ impl Store {
             n += 1;
             if n & 0xFF == 0 { o.check() } else { Ok(()) }
         };
-        let holes = log.scan(lo + 1, hi, &filter, false, &mut check, &mut |_, add, k| {
-            found.push((k.clone(), add));
-            if found.len() & 0xFFFF == 0 {
-                o.over(found.len() as u64)?;
-            }
-            Ok(true)
-        })?;
+        let holes = log.scan(
+            lo + 1,
+            hi,
+            &filter,
+            false,
+            true,
+            false,
+            None,
+            &mut check,
+            None,
+            &mut |_, add, k| {
+                found.push((k.clone(), add));
+                if found.len() & 0xFFFF == 0 {
+                    o.over(found.len() as u64)?;
+                }
+                Ok(true)
+            },
+        )?;
         if !holes.is_empty() {
             return Ok(None);
         }

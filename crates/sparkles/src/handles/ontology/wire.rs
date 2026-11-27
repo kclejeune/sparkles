@@ -122,6 +122,39 @@ pub fn summary_body(name: &str, o: &Opened, req: &OntologyRequest, r: &Renderer)
     j
 }
 
+/// What a summary answers: everything, or the head alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SummaryView {
+    Full,
+    Head,
+}
+
+/// The view `v` names, `full` when it is absent.
+pub fn summary_view(v: Option<&str>) -> Result<SummaryView> {
+    match v {
+        None | Some("full") => Ok(SummaryView::Full),
+        Some("head") => Ok(SummaryView::Head),
+        Some(v) => Err(bad(format!("view must be full or head, not '{v}'"))),
+    }
+}
+
+/// The JSON of the head of an open ontology, as `GET /$/ontology/{ds}?view=head`
+/// answers it: the members of [`summary_body`] that need no mapping of the whole graph,
+/// which are the read's members, `header`, `entities` and `closure`, with `view`.
+pub fn head_body(name: &str, h: &super::head::Head, req: &OntologyRequest, r: &Renderer) -> J {
+    let mut j = read_json(name, &h.view(), req);
+    j["view"] = json!("head");
+    j["header"] = header_json(&h.header, r);
+    j["entities"] = json!(
+        h.entities
+            .iter()
+            .map(|(k, n)| (k.name().to_string(), json!(*n)))
+            .collect::<Map<String, J>>()
+    );
+    j["closure"] = closure_json(&h.closure);
+    j
+}
+
 /// The edges of an imports closure as the summary answers them (spec U12, import
 /// resolution): the importing graph, the IRI, the graphs it resolved to, the source that
 /// resolved it and whether it closes a cycle.
@@ -228,6 +261,29 @@ pub fn axiom_json(ax: &Axiom, graph: Option<&str>, r: &Renderer) -> J {
     j
 }
 
+/// Like [`axiom_json`], returning `None` before materializing OFN or JSON trees if the
+/// rendered axiom cannot fit within `max_bytes`.
+pub fn axiom_json_bounded(
+    ax: &Axiom,
+    graph: Option<&str>,
+    r: &Renderer,
+    max_bytes: usize,
+) -> Option<J> {
+    if !sparkles_owl::json::axiom_fits_bytes(ax, max_bytes) {
+        return None;
+    }
+    let ofn = r.axiom_bounded(ax, max_bytes)?;
+    let mut j = json!({
+        "type": ax.axiom_type().name(),
+        "ofn": ofn,
+        "axiom": sparkles_owl::json::axiom(ax),
+    });
+    if let Some(g) = graph {
+        j["graph"] = g.into();
+    }
+    Some(j)
+}
+
 /// The JSON of a page of axioms.
 pub fn page_body(name: &str, o: &Opened, req: &OntologyRequest, r: &Renderer, page: &Page) -> J {
     let next = page.offset + page.items.len();
@@ -280,21 +336,117 @@ pub fn reports_body(
 /// edit wrote and removed, at most [`MAX_LIMIT`] of each, so that a client can undo the
 /// edit exactly; `axiomsTruncated` says whether a list was cut.
 pub fn edit_body(e: &EditOutcome, r: &Renderer) -> J {
-    let list = |l: &[Axiom]| -> Vec<J> {
-        l.iter()
-            .take(MAX_LIMIT)
-            .map(|a| axiom_json(a, None, r))
-            .collect()
+    edit_body_bounded(e, r, usize::MAX)
+}
+
+/// Serialized byte length of the empty-array scalar envelope of [`edit_body_bounded`].
+pub fn edit_body_shell_bytes(e: &EditOutcome) -> usize {
+    let shell = json!({
+        "added": e.added,
+        "present": e.present,
+        "removed": e.removed,
+        "absent": [],
+        "declared": [],
+        "addedAxioms": [],
+        "removedAxioms": [],
+        "axiomsTruncated": false,
+        "inserted": e.inserted,
+        "deleted": e.deleted,
+        "kept": e.kept,
+        "committed": e.receipt.committed,
+    });
+    serde_json::to_string(&shell).map_or(256, |s| s.len())
+}
+
+/// Like [`edit_body`], additionally capping the serialized JSON byte footprint of the
+/// entire body (shell plus `absent`, `declared`, `addedAxioms`, and `removedAxioms`) at
+/// `max_bytes` (including the first rendered entry), stopping before rendering oversized
+/// entries and marking `axiomsTruncated` when any entry is omitted.
+pub fn edit_body_bounded(e: &EditOutcome, r: &Renderer, max_bytes: usize) -> J {
+    let mut used = edit_body_shell_bytes(e);
+    let mut truncated = e.added_axioms.len() > MAX_LIMIT || e.removed_axioms.len() > MAX_LIMIT;
+
+    let mut absent = Vec::new();
+    for a in &e.absent {
+        let rem = max_bytes.saturating_sub(used.saturating_add(3));
+        if rem == 0 {
+            truncated = true;
+            break;
+        }
+        let Some(s) = r.axiom_bounded(a, rem) else {
+            truncated = true;
+            break;
+        };
+        let entry_bytes = serde_json::to_string(&s)
+            .map_or(usize::MAX, |j| j.len())
+            .saturating_add(1);
+        if used.saturating_add(entry_bytes) > max_bytes {
+            truncated = true;
+            break;
+        }
+        used = used.saturating_add(entry_bytes);
+        absent.push(s);
+    }
+
+    let mut declared = Vec::new();
+    for d in &e.declared {
+        let rem = max_bytes.saturating_sub(used.saturating_add(3));
+        if rem == 0 {
+            truncated = true;
+            break;
+        }
+        let Some(s) = r.entity_bounded(d, rem) else {
+            truncated = true;
+            break;
+        };
+        let entry_bytes = serde_json::to_string(&s)
+            .map_or(usize::MAX, |j| j.len())
+            .saturating_add(1);
+        if used.saturating_add(entry_bytes) > max_bytes {
+            truncated = true;
+            break;
+        }
+        used = used.saturating_add(entry_bytes);
+        declared.push(s);
+    }
+
+    let mut list_bounded = |l: &[Axiom]| -> Vec<J> {
+        let mut out = Vec::new();
+        for a in l.iter().take(MAX_LIMIT) {
+            let rem = max_bytes.saturating_sub(used.saturating_add(1));
+            if rem == 0 {
+                truncated = true;
+                break;
+            }
+            let Some(j) = axiom_json_bounded(a, None, r, rem) else {
+                truncated = true;
+                break;
+            };
+            let entry_bytes = serde_json::to_string(&j)
+                .map_or(usize::MAX, |s| s.len())
+                .saturating_add(1);
+            if used.saturating_add(entry_bytes) > max_bytes {
+                truncated = true;
+                break;
+            }
+            used = used.saturating_add(entry_bytes);
+            out.push(j);
+        }
+        out
     };
+
+    let added_axioms = list_bounded(&e.added_axioms);
+    let removed_axioms = list_bounded(&e.removed_axioms);
+
     json!({
         "added": e.added,
         "present": e.present,
         "removed": e.removed,
-        "absent": e.absent.iter().map(|a| r.axiom(a)).collect::<Vec<_>>(),
-        "declared": e.declared.iter().map(|d| r.entity(d)).collect::<Vec<_>>(),
-        "addedAxioms": list(&e.added_axioms),
-        "removedAxioms": list(&e.removed_axioms),
-        "axiomsTruncated": e.added_axioms.len() > MAX_LIMIT || e.removed_axioms.len() > MAX_LIMIT,
+        "absent": absent,
+        "declared": declared,
+        "addedAxioms": added_axioms,
+        "removedAxioms": removed_axioms,
+        "axiomsTruncated": truncated,
         "inserted": e.inserted,
         "deleted": e.deleted,
         "kept": e.kept,
@@ -631,28 +783,42 @@ pub fn entity_body(
                     // once both are cut
                     let (mut same_cut, mut different_cut) = (false, false);
                     o.equalities(&i, opts, |ax, _| {
-                        let (into, cut) = match &ax.kind {
-                            AxiomKind::SameIndividual(_) => (&mut same, &mut same_cut),
-                            AxiomKind::DifferentIndividuals(_) => {
-                                (&mut different, &mut different_cut)
+                        match &ax.kind {
+                            AxiomKind::SameIndividual(set) => {
+                                for x in set.iter().filter(|x| **x != i) {
+                                    if same.contains(x) {
+                                        continue;
+                                    }
+                                    if same.len() >= q.limit {
+                                        same_cut = true;
+                                        truncated = true;
+                                        break;
+                                    }
+                                    same.insert(x.clone());
+                                }
+                            }
+                            AxiomKind::DifferentIndividuals(bag) => {
+                                let mut skipped = false;
+                                for x in bag.iter().filter(|x| {
+                                    if !skipped && **x == i {
+                                        skipped = true;
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                }) {
+                                    if different.contains(x) {
+                                        continue;
+                                    }
+                                    if different.len() >= q.limit {
+                                        different_cut = true;
+                                        truncated = true;
+                                        break;
+                                    }
+                                    different.insert(x.clone());
+                                }
                             }
                             _ => return Ok(true),
-                        };
-                        let (AxiomKind::SameIndividual(set) | AxiomKind::DifferentIndividuals(set)) =
-                            &ax.kind
-                        else {
-                            return Ok(true);
-                        };
-                        for x in set.iter().filter(|x| **x != i) {
-                            if into.contains(x) {
-                                continue;
-                            }
-                            if into.len() >= q.limit {
-                                *cut = true;
-                                truncated = true;
-                                break;
-                            }
-                            into.insert(x.clone());
                         }
                         Ok(!(same_cut && different_cut))
                     })?;
@@ -699,7 +865,7 @@ pub const OPERATIONS: [&str; 16] = [
 /// The members each operation reads besides those that name the ontology.
 fn members(op: &str) -> &'static [&'static str] {
     match op {
-        "summary" => &["metrics"],
+        "summary" => &["metrics", "view"],
         "axioms" => &["type", "about", "assertions", "limit", "offset"],
         "entities" => &["kind", "limit", "offset"],
         "entity" => &["iri", "kind", "assertions", "limit"],
@@ -718,6 +884,7 @@ fn members(op: &str) -> &'static [&'static str] {
         ],
         "classify" => &[
             "assertions",
+            "elOnly",
             "target",
             "message",
             "about",
@@ -726,6 +893,7 @@ fn members(op: &str) -> &'static [&'static str] {
             "offset",
             "threads",
             "partial",
+            "strict",
             "expansion",
             "projection",
             "lang",
@@ -746,12 +914,15 @@ fn members(op: &str) -> &'static [&'static str] {
         "individuals" => &[
             "type", "untyped", "iri", "after", "limit", "lang", "sourceId",
         ],
-        "keptClassification" => &["part", "about", "offset", "limit", "resultId", "lang"],
+        "keptClassification" => &[
+            "part", "about", "offset", "limit", "resultId", "lang", "elOnly",
+        ],
         "term" => &["iri", "mentions", "incoming", "lang", "sourceId"],
         "dlQuery" => &[
             "expression",
             "syntax",
             "reasoning",
+            "elOnly",
             "answers",
             "limit",
             "threads",
@@ -910,7 +1081,10 @@ fn profiles_of(a: &Map<String, J>) -> Result<Vec<Profile>> {
 /// Answer the ontology operation `op` with the arguments `args`, a JSON object, in the
 /// JSON forms of the HTTP routes. The operations and their members:
 ///
-/// - `summary`: the summary of `GET /$/ontology/{ds}`, with optional `metrics`.
+/// - `summary`: the summary of `GET /$/ontology/{ds}`, with optional `metrics`, or with
+///   `view: "head"` the head of `GET /$/ontology/{ds}?view=head`, which leaves out the
+///   axiom counts, the triples and the diagnostics and needs no mapping of the whole
+///   graph.
 /// - `axioms`: a page of `GET /$/ontology/{ds}/axioms`, with `type` (a list such as
 ///   `SubClassOf,ClassAssertion`), `about` (an IRI), `assertions`, `limit` and
 ///   `offset`. `about` an IRI the ontology neither declares nor uses is `NotFound`.
@@ -978,9 +1152,17 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
     match op {
         "summary" => {
             let opts = handle.anchored(opts)?;
+            let metrics = boolean(a, "metrics")?.unwrap_or(false);
+            if summary_view(string(a, "view")?)? == SummaryView::Head {
+                if metrics {
+                    return Err(bad("metrics needs the full view"));
+                }
+                let h = handle.head(&req, &opts)?;
+                return Ok(head_body(name, &h, &req, &r));
+            }
             let o = handle.open(&req, &opts)?;
             let mut j = summary_body(name, &o, &req, &r);
-            if boolean(a, "metrics")?.unwrap_or(false) {
+            if metrics {
                 j["metrics"] = super::metrics::body(name, &o, &req, &r, &opts)?;
             }
             Ok(j)
@@ -1107,8 +1289,10 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 target: string(a, "target")?.map(graph_ref).transpose()?,
                 message: string(a, "message")?.map(str::to_string),
                 about: about.clone(),
-                el_only: false,
+                el_only: boolean(a, "elOnly")?.unwrap_or(false),
                 partial: boolean(a, "partial")?.unwrap_or(false),
+                strict: boolean(a, "strict")?.unwrap_or(false),
+                skip_coverage: false,
                 expansion: expansion_of(string(a, "expansion")?)?,
             };
             let q = ClassifyQuery {
@@ -1599,9 +1783,11 @@ pub fn classification_body(
         Consistency::Inconsistent => "inconsistent",
         Consistency::Unknown => "unknown",
     });
-    // a partial answer is never complete, whatever it left out
+    // complete for the whole ontology: nothing left out and the run not stopped, and
+    // completeForTaken, as a profile reasoner such as ELK reports, only the second
     j["complete"] = json!(c.excluded.is_empty() && cl.complete);
-    j["partial"] = json!(!cl.complete);
+    j["completeForTaken"] = json!(cl.complete_for_taken);
+    j["partial"] = json!(!cl.complete_for_taken);
     j["tier"] = json!(s.tier.as_str());
     j["incompleteCount"] = json!(cl.incomplete.len());
     j["incomplete"] = json!(
@@ -1616,6 +1802,22 @@ pub fn classification_body(
     j["nodeCount"] = json!(t.nodes().len());
     j["unsatisfiableCount"] = json!(unsat.len());
     j["unsatisfiable"] = json!(unsat.iter().take(q.limit).collect::<Vec<_>>());
+    // the triples that map to no axiom, which no `excluded` entry names: the first of
+    // them, as N-Triples terms, and whether `stats.unmapped` counts more
+    j["unmappedTriples"] = J::Array(
+        cl.unmapped
+            .triples
+            .iter()
+            .map(|t| {
+                json!({
+                    "subject": t.subject.to_string(),
+                    "predicate": t.predicate.to_string(),
+                    "object": t.object.to_string(),
+                })
+            })
+            .collect(),
+    );
+    j["unmappedTruncated"] = json!(cl.unmapped.truncated);
     j["excludedCount"] = json!(c.excluded.len());
     j["excluded"] = J::Array(
         c.excluded
@@ -1651,6 +1853,10 @@ pub fn classification_body(
         "indexMs": s.index.as_secs_f64() * 1000.0,
         "saturationMs": s.saturation.as_secs_f64() * 1000.0,
         "taxonomyMs": s.taxonomy.as_secs_f64() * 1000.0,
+        "coverageMs": s.coverage.as_secs_f64() * 1000.0,
+        "coverageOver": s.coverage_over,
+        "coverageStopped": s.coverage_stopped,
+        "unmapped": s.unmapped,
     });
     if q.nodes {
         let total = t.nodes().len();
@@ -1678,6 +1884,7 @@ pub fn classification_body(
         let mut x = node_json(t, n);
         x["iri"] = json!(about);
         x["unsatisfiable"] = json!(t.is_unsatisfiable(&class));
+        x["incomplete"] = json!(cl.incomplete.binary_search(&class).is_ok());
         x["childClasses"] = json!(firsts(t.node(n).children.clone()));
         x["superClasses"] = json!(
             t.ancestors(n)
@@ -1765,6 +1972,7 @@ pub fn dl_query_of(a: &Map<String, J>) -> Result<(DlQueryRequest, usize)> {
     }
     q.threads = number(a, "threads", 0, 1024)?.unwrap_or(0);
     q.max_derived = number(a, "maxDerived", 1, usize::MAX)?;
+    q.el_only = boolean(a, "elOnly")?.unwrap_or(false);
     let limit = number(a, "limit", 1, MAX_LIMIT)?.unwrap_or(DL_QUERY_LIMIT);
     Ok((q, limit))
 }
@@ -1841,6 +2049,7 @@ pub fn dl_query_body(
         "engine": u.engine.as_str(),
         "title": u.engine.title(),
         "why": u.why,
+        "elOnly": u.el_only,
         "complete": u.complete,
         "instancesComplete": u.instances_complete,
         "gapCount": u.gaps.len(),
@@ -2003,6 +2212,7 @@ pub fn kept_query_of(a: &Map<String, J>) -> Result<super::kept::KeptQuery> {
         limit: number(a, "limit", 1, 1000)?.unwrap_or(100),
         result_id,
         languages: languages_of(a)?,
+        el_only: boolean(a, "elOnly")?.unwrap_or(false),
     })
 }
 pub fn kept_body(name: &str, answer: &super::kept::KeptRead) -> Result<J> {
@@ -2043,10 +2253,16 @@ fn frame_body(name: &str, c: &Classified, req: &OntologyRequest, q: &ClassifyQue
         source_samples.push(handle.source.source_row(i).expect("source ordinal"));
     }
     let class = sparkles_owl::Class::new(about.as_str());
+    let incomplete = handle
+        .classification
+        .incomplete
+        .binary_search(&class)
+        .is_ok();
     Ok(
         json!({"dataset":name,"commit":h.commit,"classificationSource":handle.identity(),"frame":{
             "iri":about,"result":handle.metadata(),"outcome":handle.outcome(),
             "unsatisfiable":handle.classification.taxonomy.is_unsatisfiable(&class),
+            "incomplete":incomplete,
             "parents":project(parents),"equivalents":project(equivalents),"excluded":project(exclusions),
             "sources":{"items":source_samples,"total":handle.source.source_count(),"truncated":handle.source.source_count()>q.limit},
             "retention":{"kept":kept,"resultId":if kept { Some(handle.id) } else { None::<uuid::Uuid> }}

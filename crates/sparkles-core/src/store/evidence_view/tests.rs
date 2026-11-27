@@ -386,3 +386,116 @@ fn bound_read_source_keeps_genuine_history_view_and_configuration_credit() {
     assert!(backing.upgrade().is_none());
     assert_eq!(preparation.inner_used(), before);
 }
+
+#[test]
+fn persistent_and_cold_inherited_evidence_selection_respects_sub_ceiling_pool() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dataset");
+    drop(Store::open(&path, Default::default()).unwrap());
+    let init = preparation();
+    crate::migrate::activate_configuration_history(&path, false, &init).unwrap();
+
+    let (parent_id, seq_p1) = {
+        let store = Store::open(&path, Default::default()).unwrap();
+        update(&store, "main-data");
+        configure(&store, "second");
+        let parent_info = store.create_branch("parent", &Default::default()).unwrap();
+        let parent = store.branch("parent").unwrap();
+        update(&parent, "parent-first");
+        let seq_p1 = parent.head_commit().seq;
+        update(&parent, "parent-second");
+        store
+            .create_branch(
+                "child",
+                &crate::branch::BranchOptions {
+                    from: "parent".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        (parent_info.id, seq_p1)
+    };
+
+    let reopened = Store::open(&path, Default::default()).unwrap();
+    let child = reopened.branch("child").unwrap();
+    assert!(
+        reopened
+            .try_resident_branch(parent_id, &Default::default())
+            .unwrap()
+            .is_none(),
+        "parent branch must remain cold before inherited selection"
+    );
+
+    let pool = crate::sparql::pool::QueryPool::new(32 << 20);
+    {
+        let grant = Arc::new(pool.empty_grant());
+        {
+            let prep = Preparation::with_grant(Control::none(), 16 << 20, grant.clone())
+                .unwrap()
+                .with_selection_limit(64 << 20)
+                .unwrap();
+            let baseline = grant.used();
+
+            let head = reopened.evidence_view(&At::Head, &prep).unwrap();
+            let cold = reopened
+                .evidence_view_with_branch(&child, &At::Commit(seq_p1), &prep)
+                .unwrap();
+            assert_eq!(cold.commit().seq, seq_p1);
+            assert!(
+                reopened
+                    .try_resident_branch(parent_id, &Default::default())
+                    .unwrap()
+                    .is_none(),
+                "cold inherited selection must not make parent branch resident"
+            );
+
+            drop(cold);
+            drop(head);
+            assert_eq!(grant.used(), baseline);
+        }
+        assert_eq!(grant.used(), 0);
+    }
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn wal_replay_drops_boundary_cursor_before_apply_forward() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let c1 = {
+        let store = Store::open(&path, Default::default()).unwrap();
+        let mut bulk = String::from("INSERT DATA { ");
+        for i in 0..200 {
+            bulk.push_str(&format!("<urn:wal:s{i}> <urn:wal:p> <urn:wal:o{i}> . "));
+        }
+        bulk.push('}');
+        crate::sparql::update::update(&store, &bulk, &Default::default()).unwrap();
+        let c1 = store.head_commit().seq;
+        update(&store, "after-bulk");
+        c1
+    };
+
+    // Reopen so the history cache is cold and `HistoryOrigin::snapshot_at_commit` must
+    // scan `wal.log` for the commit boundary and then replay it with `wal::apply_forward`.
+    let reopened = Store::open(&path, Default::default()).unwrap();
+    let snap = reopened.snapshot();
+    let prep = preparation();
+
+    crate::store::wal::cursor_stats::reset();
+    let origin = snap
+        .history_origin
+        .as_ref()
+        .expect("resident history origin")
+        .upgrade()
+        .expect("live history origin");
+    let (replayed, _held) = origin
+        .snapshot_at_commit(c1, &prep)
+        .unwrap()
+        .expect("replayed historical snapshot for c1");
+    assert_eq!(replayed.commit, c1);
+    assert_eq!(
+        crate::store::wal::cursor_stats::peak(),
+        1,
+        "boundary scan WalCursor must drop before wal::apply_forward opens its replay cursor"
+    );
+}

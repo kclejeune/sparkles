@@ -385,8 +385,16 @@ fn finding_support(
     probe: Option<Term>,
 ) -> Result<JustifiedTarget> {
     let view = analysis::view(&snapshot, options)?;
-    let graphs = analysis::input_graphs(&view, &program, options);
+    let (graphs, graphs_bytes) = analysis::input_graphs_controlled(
+        &view,
+        &program,
+        options,
+        control,
+        options.max_memory,
+        dataset.state().pool.as_ref().map(|p| p.work_parent()),
+    )?;
     let mut bytes = 0;
+    hold(options.max_memory, &mut bytes, graphs_bytes)?;
     let mut quads = Vec::new();
     view.for_each_quad(|quad| {
         control.check()?;
@@ -493,13 +501,23 @@ fn class_support(
     request: &JustifyRequest,
 ) -> Result<JustifiedTarget> {
     let view = analysis::view(snapshot, options)?;
-    let graphs = analysis::input_graphs(&view, program, options);
+    let pool = dataset.state().pool.clone();
+    let (graphs, graphs_bytes) = analysis::input_graphs_controlled(
+        &view,
+        program,
+        options,
+        control,
+        options.max_memory,
+        pool.as_ref().map(|p| p.work_parent()),
+    )?;
     let copy = dataset
         .store()
         .copy_view_to_memory(
             &view,
             crate::store::StoreOptions {
-                max_memory_bytes: options.max_memory.map(|limit| (limit / 8) as u64),
+                max_memory_bytes: options
+                    .max_memory
+                    .map(|limit| (limit.saturating_sub(graphs_bytes) / 8) as u64),
                 result_cache_bytes: 0,
                 service_cache_bytes: 0,
                 ..Default::default()
@@ -508,7 +526,13 @@ fn class_support(
             |quad| Ok(graphs.contains(&quad[3])),
         )
         .map_err(|error| control.error(error))?;
-    let copied = Dataset::from_store(copy);
+    let copied = Dataset::from_store_with(
+        copy,
+        crate::DatasetOptions {
+            pool,
+            ..Default::default()
+        },
+    );
     let graph = NamedNode::new(format!(
         "urn:x-sparkles:class-probe:{}",
         uuid::Uuid::new_v4()
@@ -1042,6 +1066,17 @@ pub fn diagnose(
     let snapshot = analysis::view(&dataset.store().snapshot(), &analysis)?;
     let record = dataset.reasoning().record();
     let state = dataset.state();
+    let owned_options;
+    let options = if options.grant.is_none()
+        && let Some(pool) = &state.pool
+    {
+        let mut pooled = options.clone();
+        pooled.grant = Some(Arc::new(pool.empty_grant()));
+        owned_options = pooled;
+        &owned_options
+    } else {
+        options
+    };
     let diagnostics = super::run::diagnose_snapshot_with(
         dataset.store(),
         record.as_ref(),
@@ -1056,6 +1091,11 @@ pub fn diagnose(
             deadline: control.deadline,
             cancel: Some(control.cancel.clone()),
             max_memory: analysis.max_memory.map(|limit| (limit / 16) as u64),
+            memory_parent: options
+                .grant
+                .as_ref()
+                .map(|g| g.memory_parent())
+                .or_else(|| state.pool.as_ref().map(|p| p.work_parent())),
         },
     )
     .map_err(|error| control.error(error))?;

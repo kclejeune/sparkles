@@ -4,46 +4,32 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
 
 struct Server {
-    child: Child,
+    child: common::ServerProcess,
     base: String,
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    (39400..39500)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .expect("a free port in 39400..39500")
-}
-
 fn start(dir: &Path, log: &Path) -> Server {
-    let port = free_port();
-    let child = Command::new(BIN)
-        .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
-        .arg("--data")
-        .arg(dir.join("data"))
-        .arg("--loc")
-        .arg(format!("ds={}", dir.join("db").display()))
-        .arg("--prewarm")
-        .env_remove("SPARKLES_AUTH_CONFIG")
-        .env_remove("SPARKLES_BACKUP_CONFIG")
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(log).unwrap())
-        .spawn()
-        .unwrap();
+    let (child, port) = common::ServerProcess::start(
+        common::serve()
+            .arg("--data")
+            .arg(dir.join("data"))
+            .arg("--loc")
+            .arg(format!("ds={}", dir.join("db").display()))
+            .arg("--prewarm")
+            .env_remove("SPARKLES_AUTH_CONFIG")
+            .env_remove("SPARKLES_BACKUP_CONFIG")
+            .env("RUST_LOG", "info"),
+        log,
+    );
     let s = Server {
         child,
         base: format!("http://127.0.0.1:{port}"),

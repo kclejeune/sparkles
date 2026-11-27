@@ -1,107 +1,104 @@
 # Remote build and validation executors
 
 Available local hosts take implementation, builds and gates first. Boat provides explicit
-overflow capacity on an isolated 8-vCPU, 16-GiB `large` worker. One worker runs one heavy
-job at a time. The configured benchmark host runs benchmarks only. Atlas remains
-available for benchmarks and can be named explicitly as a quiet migration fallback.
-The default gate host list contains Wally alone.
+overflow capacity on an isolated 8-vCPU, 16-GiB `large` worker running one heavy job at a
+time. The configured benchmark host runs benchmarks only, Atlas remains available for
+benchmarks (or as an explicitly permitted quiet migration fallback), and Wally is the
+default gate host.
 
-The remote commands accept `boat:bx_ID` for a running warm worker. They do not create,
-resume, extend, snapshot or stop a sandbox. The lifecycle owner qualifies and admits a
-worker once, supplies the admission receipt, and retains the deadline and stop guard
-while several jobs reuse it. Each create, resume, fork and CI start counts against the
-shared allowance of 200 starts per day. An owned-operation ledger does not establish the
-account-wide total.
+| Rule | Policy |
+|---|---|
+| Default placement | Local build and gate hosts first; Boat (`boat:bx_ID`) for explicit overflow or isolation. |
+| Benchmark host | Runs benchmarks only, never builds, CI or gates. |
+| Worker concurrency | One heavy job per 8-vCPU, 16-GiB Boat worker under a 12-GiB `MemoryMax` (no swap). |
+| Sandbox lifecycle | Remote commands never create, resume, extend, snapshot or stop a worker; the lifecycle owner qualifies it once and holds the deadline and stop guard. |
+| Quota & provider boundary | Each create, resume, fork and CI start counts against the shared 200 starts/day allowance. Failed Boat operations never silently retry on another provider or host. |
+
+* [Qualification boundary](#qualification-boundary)
+* [Qualification and job admission](#qualification-and-job-admission)
+* [Warm worker commands](#warm-worker-commands)
+  * [Remote CI](#remote-ci)
+* [Source, results and cleanup](#source-results-and-cleanup)
 
 ## Qualification boundary
 
-The Boat transport and workload adapters are separate from provider qualification.
-The batch query screen runs on Boat and is the only screen of record. Namespace is not
-used. Local contract tests exercise quoting, exact source identities, result bounds and
-cleanup. They do not establish provider behavior or performance equivalence. Roadmap
-item 762 tracks the remaining qualification of the other commands, and item 1134 tracks
-a write screen.
+The Boat transport and workload adapters are separate from provider qualification. The
+batch query screen runs on Boat and is the only screen of record; Namespace is retired and
+not used. Local contract tests check quoting, exact source identities, result bounds and
+cleanup, without establishing provider behavior or performance equivalence. Remaining
+command qualification and a write screen are tracked in [ROADMAP.md](ROADMAP.md) (items
+762 and 1134).
 
 A lifecycle owner must establish startup quiescence, actual tool and source identities,
-cache authentication, available memory and disk, worker exclusivity and a finite
-lifetime before handing over a worker. A ready provider state or `setupStatus: null`
-does not establish tool readiness. The worker's bootstrap lock must be idle and its
-current toolchain manifest must match the handoff. The provider's own desktop-session
-processes are allowed by exact name and parent, and any other process of the worker's
-user still holds startup open. Every refusal records a bounded reason code, as the
-[startup closure](../scripts/boat/README.md#startup-closure) section describes. MBX 1.29.1 and the matching child
-Cargo shim use the shared host cache and each source directory's managed target.
+cache authentication, available memory and disk, worker exclusivity and a finite lifetime
+before handing over a worker. A ready provider state or `setupStatus: null` does not prove
+tool readiness. The worker's bootstrap lock must be idle and its toolchain manifest must
+match the handoff. Only the provider's own desktop-session processes are permitted by exact
+name and parent; any other user process keeps startup open. Every refusal records a bounded
+reason code ([startup closure](../scripts/boat/README.md#startup-closure)). MBX 1.29.1 and
+its matching child Cargo shim use the shared host cache and each source directory's managed
+target.
 
-The memory check counts only memory that the kernel cannot reclaim. On the host this is
-anonymous, shared, unevictable and unreclaimable kernel memory. For every ancestor
-cgroup with a limit it is the cgroup's anonymous, shared, unevictable and unreclaimable
-kernel memory from `memory.stat`. Each limit must leave room for a 12-GiB job, the
-512-MiB metadata service and a 1-GiB host reserve. Page cache does not count, so a
-worker whose slice holds several gigabytes of cache is admitted, and a slice that
-exposes no `memory.stat` is refused. On a 16-GiB worker that leaves 2.1 GiB for memory
-the kernel cannot reclaim. A worker restored from its snapshot holds 1.4 to 2.2 GiB of
-it at qualification, about 0.9 GiB of which is the provider's restore filesystem, and
-part of that is transient while files are restored. A reading that is refused only
-because the headroom is short is therefore read again every 2 seconds for up to 60
-seconds, before the probe observes any source, and never past the qualification phase's
-120-second bound or the last 40 seconds of the metadata unit's runtime. A later
-reading admits only when the reading before it admitted too, so one low reading never
-admits, and the first reading that admits ends the wait at once. A missing or malformed
-`memory.stat` is not read again. The readings are recorded with the qualification, or
-with the refusal when the headroom never settles.
+### Memory and headroom checks
 
-Every job unit on a Boat worker has a 12-GiB `MemoryMax`, which covers lane CI from
-`scripts/remote-ci.sh`, a gate from `scripts/gate/gate.sh`, a screen's workload units
-from `scripts/remote-screen.sh` and a screen build from `scripts/nsc-build-host.sh`.
-`BOAT_JOB_MEMORY_GIB` in `scripts/boat/metadata-probe.py` holds the figure, and a test
-checks that each of these caps matches it. The worker's user slice allows no swap, so a
-job has none whatever its `MemorySwapMax` says. The largest single user is the rustc
-that builds the server's unit-test binary, which reaches about 11.4 GiB.
+The memory check counts only unreclaimable memory: anonymous, shared, unevictable and
+unreclaimable kernel memory on the host, and the same fields from `memory.stat` for every
+ancestor cgroup with a limit. Each limit must leave room for a 12-GiB job, the 512-MiB
+metadata service and a 1-GiB host reserve. Page cache is excluded, so a slice holding
+several gigabytes of cache still qualifies; a slice without `memory.stat` is refused.
 
-`admit` resolves `mbx` and `rustc` through the same environment that jobs receive. That
-environment puts the pinned mise MBX install on PATH, selects the pinned Rust toolchain
-with `RUSTUP_TOOLCHAIN` and turns off automatic toolchain installation. A missing `mbx`,
-an `mbx` found elsewhere or at another version, a `rustc` at a version other than the pin,
-and a missing `rustdoc` or one at another version each refuse admission with the reason
-named, rather than running with the rustup default. The worker image keeps rustup's
-`rustdoc` proxy only in `/usr/local/cargo/bin`, so the job PATH includes it after
-`/usr/local/bin` for the doctests.
+On a 16-GiB worker this leaves 2.1 GiB for unreclaimable host memory. A worker restored
+from a snapshot starts with 1.4 to 2.2 GiB of unreclaimable memory (about 0.9 GiB in the
+provider's restore filesystem, part of it transient during restore). If admission fails
+only on memory headroom, the probe re-reads every 2 seconds for up to 60 seconds before
+inspecting any source, bounded by the 120-second qualification phase and the last 40
+seconds of the metadata unit. Admission requires two consecutive passing readings so a
+single dip never admits; a missing or malformed `memory.stat` fails immediately. All
+readings are recorded with the qualification or refusal.
 
-Development credentials stay on the owned development worker. They are excluded from
-source packets, result manifests and reusable snapshot seeds. GitHub Actions retains
-its separate OIDC authentication. A mode-0600 worker environment file contains only
-literal PATH, `RUSTUP_TOOLCHAIN`, `RUSTUP_AUTO_INSTALL`, `MBX_REMOTE_URL`,
-`MBX_CACHE_DIR`, `MBX_GC_MAX_TOTAL_SIZE` and `MBX_GC_MIN_FREE_SIZE` assignments.
-Admission binds the environment file by digest.
+Every job unit on a Boat worker carries a 12-GiB `MemoryMax` — covering lane CI
+(`scripts/remote-ci.sh`), gates (`scripts/gate/gate.sh`), screen workloads
+(`scripts/remote-screen.sh`) and screen builds (`scripts/nsc-build-host.sh`).
+`BOAT_JOB_MEMORY_GIB` in `scripts/boat/metadata-probe.py` defines that cap, and a test
+enforces consistency across scripts. The worker's user slice allows no swap regardless of
+`MemorySwapMax`. The largest single process is `rustc` building the server's unit-test
+binary, which peaks near 11.4 GiB.
 
-Boat jobs build with MBX in local-only mode. The empty `MBX_REMOTE_URL` overrides the
-worker's configured remote cache, and the job shell drops any inherited token setting.
-The provider's snapshot saves the worker home but not `~/.cache`, so MBX's default cache
-directory would be empty after every resume. Every job therefore sets `MBX_CACHE_DIR` to
-`~/.local/share/mbx-cache`, which holds the worker's single shared store with its managed
-targets and incremental state, and the normal stop's snapshot keeps it. Its 40 GiB budget
-leaves a cold workspace test build room on the large worker's 146 GiB disk, and its 45 GiB
-free-space floor keeps the disk headroom that qualification requires. A build directory
-that a running build uses stays whatever its size, so the budget does not bound a build
-in progress. `admit` asks the pinned `mbx` for
-these effective settings and refuses a remote URL, a token setting, another cache
-directory or another budget. Laptops, gate hosts and other ssh hosts keep their own MBX
-configuration.
+### Toolchains, local-only MBX cache and hydration
 
-A cold server build on the 8-vCPU worker takes about 29 minutes, and the store then holds
-about 5 GiB of objects and a 5 GiB managed target. After a normal stop and a
-resume onto a new machine, the store comes back unchanged, and a rebuild of the same
-commit at its stable path takes about 4 minutes with no misses and gives the same binary.
-The snapshot holds the store's files, so a full 40 GiB store takes more than a third of the
-111 GB of own files that the provider restores on a large worker, and roadmap item 858
-covers keeping the saved files under that limit.
+`admit` resolves `mbx` and `rustc` in the same environment jobs receive: the pinned mise
+MBX install on `PATH`, `RUSTUP_TOOLCHAIN` fixed to the pin and automatic toolchain
+installation disabled. Any missing or mismatched `mbx`, `rustc` or `rustdoc` refuses
+admission by name instead of falling back to the rustup default. Because the worker image
+places rustup's `rustdoc` proxy only in `/usr/local/cargo/bin`, the job `PATH` appends that
+directory after `/usr/local/bin` for doctests.
 
-A resume runs on a new machine and downloads the snapshot's files in the background. A
-file whose content arrives while a build reads it changes under the compiler, and mbx
-then discards the result and fails the build. `admit` therefore refuses a worker until
-the provider reports it `hydrated`, which took about 90 seconds for a 45 GB snapshot. A
-job started sooner is refused, and its caller admits it again once the worker is
-hydrated.
+Development credentials remain on the owned worker and never enter source packets, result
+manifests or reusable snapshot seeds. GitHub Actions keeps its separate OIDC setup. A
+mode-0600 worker environment file contains only literal `PATH`, `RUSTUP_TOOLCHAIN`,
+`RUSTUP_AUTO_INSTALL`, `MBX_REMOTE_URL`, `MBX_CACHE_DIR`, `MBX_GC_MAX_TOTAL_SIZE` and
+`MBX_GC_MIN_FREE_SIZE` assignments, bound by digest at admission.
+
+Boat jobs run MBX in local-only mode: an empty `MBX_REMOTE_URL` overrides any worker remote
+cache, and the job shell clears inherited tokens. Because provider snapshots preserve the
+home directory but not `~/.cache`, jobs point `MBX_CACHE_DIR` at
+`~/.local/share/mbx-cache` so normal stops retain the shared store, managed targets and
+incremental state. Its 40-GiB budget fits a cold workspace build on the 146-GiB disk, and
+its 45-GiB free-space floor preserves qualification headroom; active builds are never
+evicted mid-run. `admit` verifies these effective MBX settings and refuses any mismatch.
+Laptops, gate hosts and other SSH hosts keep their own MBX settings.
+
+A cold server build on an 8-vCPU worker takes about 29 minutes, leaving roughly 5 GiB of
+store objects and a 5-GiB managed target. After a normal stop and resume onto a new
+machine, rebuilding the same commit at its stable path takes about 4 minutes with zero
+misses and produces the same binary. Because a full 40-GiB store consumes over a third of
+the 111 GB of own files a large worker restores, keeping saved files under that cap is
+tracked in [ROADMAP.md](ROADMAP.md) (item 858).
+
+Resuming onto a new machine downloads snapshot files in the background. If a file arrives
+while a compiler reads it, MBX discards the action and fails the build. `admit` therefore
+refuses any worker until the provider reports it `hydrated` (about 90 seconds for a 45-GB
+snapshot). Callers re-admit once hydration completes.
 
 ## Qualification and job admission
 
@@ -142,27 +139,22 @@ A warm worker reused across many jobs and lanes keeps that one original end, sin
 every job-admission record references the same qualification and receipts. No call,
 job environment, lane or wall-clock change renews it.
 
-The lifecycle owner can lengthen the lifetime of the same running worker with an
-explicit extension, which is its own receipted act. The act adopts the worker only when
-the local boot, the live guard invocation, the worker's boot recorded at qualification,
-the provider environment version and a fresh environment and hook fact all match. It
-sets a new end of at most 10,500 seconds after its own observation on both clocks, and
-no end may fall more than 12 hours after the original controller intent. The provider
-lifetime is set past the new end and confirmed before the act publishes a numbered
-`sparkles.boat.lifetime-extension` version-1 receipt in the operation directory.
-Admission and the guard apply only a consecutive chain of valid receipts that the
-running guard accepted, by its own clocks, before the previous end. A malformed or unknown receipt refuses admission and
-leaves the guard on the conservative original deadline. The guard holds the extension
-lock when it decides to stop and records the stop trigger, and admission refuses a
-stopping operation.
-`admit --minimum` uses this measure. Environment preparation and each operation
-also check both ends while they run, so a suspend during a transfer is counted.
-`admit` prints a version-2 `sparkles.boat.adapter-observation` that records the
-original wall and BOOTTIME ends. Its `expires_at` is the effective wall end at that
-observation and is never later than the original. Scripts take a job runtime from a
-saved observation with `remote-executor.py runtime FILE --reserve SECONDS`, which
-measures both ends again and refuses another version, another boot or an exhausted
-lifetime.
+The lifecycle owner can extend the same running worker's lifetime through an explicit,
+receipted act. Adoption requires matching local boot, live guard invocation, qualification
+worker boot, provider environment version and fresh environment/hook facts. Each extension
+sets a new end at most 10,500 seconds ahead on both clocks, capped at 12 hours from the
+original controller intent. The provider lifetime is updated and confirmed before writing a
+numbered `sparkles.boat.lifetime-extension` version-1 receipt to the operation directory.
+
+Admission and the guard apply only a consecutive chain of valid receipts accepted by the
+running guard before the previous end. Any malformed or unknown receipt refuses admission
+and keeps the conservative original deadline. When the guard decides to stop, it holds the
+extension lock and records the stop trigger, so admission refuses a stopping operation.
+`admit --minimum`, environment preparation and active transfers all check both clocks so
+host suspends are counted. `admit` outputs a version-2 `sparkles.boat.adapter-observation`
+carrying both original ends and an `expires_at` never later than the original; scripts
+derive job runtimes with `remote-executor.py runtime FILE --reserve SECONDS`, refusing
+other versions, other boots or exhausted lifetimes.
 
 ## Warm worker commands
 
@@ -195,8 +187,8 @@ leaves the closure watch its 900-second lead. The gate's start runs on the worke
 transient scope `gate-prep-NAME`, which systemd ends with all its processes
 `GATE_BOAT_PREP_SECONDS` after it begins, 900 by default, and the runtime adds that bound,
 so a late activation still ends in time. `gate.sh` computes the runtime before it sends the
-start, so a slow dispatch can still carry a gate past the lead, and roadmap item 803 keeps
-the absolute expiry open. Partitions request
+start, so a slow dispatch can still carry a gate past the lead ([ROADMAP.md](ROADMAP.md),
+item 803). Partitions request
 `TEST_PARTITION_TIMEOUT` and check again after archive transfer. Boat caps follow the
 original qualification deadline. The `--duration` screen option applies only to the
 retired Namespace executor and has no effect on a Boat worker.
@@ -232,24 +224,23 @@ binary back and keeps it in the local cache with a record of the worker that bui
 mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HEAD
 ```
 
-The worker builds each revision in a scope without swap, with 6 compile jobs. The cap is
-12 GiB by default, the job that qualification admits, but the server's final rustc peaks just
-above 12 GiB at any job count, so that cap runs a cold release build out of memory. A 13 GiB
-build needs a dedicated worker that runs nothing else, whose own job release checks that its
-user slice leaves 14.5 GiB for the build, the metadata service and the host reserve, and whose
-job environment sets `SPARKLES_BOAT_BUILD_MEMORY_MAX=13G`. The build scope keeps its own
-13 GiB cap with `OOMPolicy=continue`, so reaching that cap kills a process of the build and
-nothing outside it, but a host that runs short first leaves the choice to the kernel. The host
-formula is not part of that check while the memory a resumed worker cannot reclaim varies
-(item 1092). The setting takes a cap
-from 8G to 13G and `SPARKLES_BOAT_BUILD_JOBS` a count from 2 to 8, and a value outside either
-range is refused before the worker is admitted. A cold build of both revisions takes most of an hour, so the worker's
+The worker builds each revision in a swapless scope with 6 compile jobs. The default
+12-GiB cap admitted by qualification is tight because the server's final `rustc` peaks
+above 12 GiB at any job count, which can OOM a cold release build. A 13-GiB build requires
+a dedicated worker running nothing else, a job release verifying 14.5 GiB of headroom for
+the build, metadata service and host reserve, and `SPARKLES_BOAT_BUILD_MEMORY_MAX=13G` in
+the job environment. The build scope keeps `OOMPolicy=continue` so exceeding 13 GiB kills
+only a build process (if the host runs short first, the kernel chooses). Because resumed
+unreclaimable memory varies, the host formula is not part of that check
+([ROADMAP.md](ROADMAP.md), item 1092). `SPARKLES_BOAT_BUILD_MEMORY_MAX` accepts `8G` to
+`13G` and `SPARKLES_BOAT_BUILD_JOBS` accepts `2` to `8`; out-of-range values fail before
+admission. Because a cold build of both revisions takes most of an hour, the worker's
 admitted lifetime must cover both builds, the screen and its reruns.
 
-Binaries that a Boat screen builds therefore differ from those built for another host,
-and timings from different providers or hosts are never compared. The Boat and Namespace
-screens of the same two batches disagreed by about 10% in their geometric means, and item
-1133 settles the difference on an Intel host.
+Binaries built on a Boat worker differ from binaries built elsewhere, so timings from
+different providers or hosts are never compared. Boat and Namespace screens of the same
+two batches differed by roughly 10% in geometric mean ([ROADMAP.md](ROADMAP.md), item
+1133 settles the difference on an Intel host).
 
 The operator establishes actual native/cgroup/lease closure before supplying the fresh
 job-closure receipt. `boat:finish` validates that evidence and observes the guard's
@@ -284,118 +275,97 @@ scripts/remote-ci.sh --host "$worker" --status ci-1234abcd-5678ef90
 scripts/remote-ci.sh --host "$worker" --fetch ci-1234abcd-5678ef90
 ```
 
-The command bundles the commit and, for `--changed`, its merge base with the base, checks
-both on the host and starts the job as the user unit `gate-NAME`. The job script
-`scripts/gate/remote/ci-job.sh` runs the disk cleanup when the disk is 90% used, takes the
-heavy lock `~/gate/.lock`, adds a worktree, runs the check and removes the worktree, all
-inside that unit. On a Boat worker the job's end is fixed before the start at
-`REMOTE_CI_RESERVE` seconds before the admitted end, 1200 by default. The worker computes
-the unit's runtime from that end immediately before the start and refuses with under
-`REMOTE_CI_MIN_SECONDS` left, 600 by default. Because the runtime counts from the unit's
-activation, the job also stops its own unit at that end and takes every wait from it, and the
-unit's shutdown is bounded at 60 seconds, so the closure watch finds the job closed. Starts on
-one host are serialized, and a job of the same name starts only after the earlier unit has
-fully stopped. Under the heavy lock a job on any host needs `REMOTE_CI_MIN_FREE_GIB`
-free, 85 by default, and ends with exit 4 rather than start with less. A Boat worker runs
-its disk cleanup first. An ssh host runs `mbx gc` with `gc.min_free_size` raised to the
-floor, which evicts cache objects and managed targets until that much is free, and removes
-nothing else, so a lane's build cannot fill a gate host's disk from a start with too little
-room. On an ssh host the job also reads the free space every `REMOTE_CI_WATCH_SECONDS`
-while the check runs, 30 by default, and once more when a failed check ends. It stops the
-check with exit 5, or marks the failure as exit 5, when less than `REMOTE_CI_RUN_FLOOR_GIB`
-is free, 4 by default. The server's tests keep 1 GiB free and fail below it, so a disk that
-another job fills ends the run as a host problem rather than as test failures. On an ssh host
-the unit is delegated and the check runs in a child cgroup, so a stopped check's processes,
-those that ignore the stop or left its process group included, are killed and gone before
-the job copies its results and removes its worktree. The job sets aside a MiB before the
-check and gives it back before it writes its outcome and exit records, so they fit on a
-disk the check filled. A stopped check whose processes cannot be shown gone ends with exit
-6 and leaves its worktree for a later cleanup. Each start has its own id, which the job
-records first, so the waiting `remote-ci.sh` takes only that start's results and says so
-when another start of the same name replaced them on the host. Its local copy goes to
-`.artifacts/remote-ci/NAME.ID`, which no later fetch replaces, and `NAME` links to the
-newest. Either refusal writes `disk-below-floor` to the job's `outcome` file,
-and `remote-ci.sh` then says that the host's disk was below its floor. The check's `TMPDIR`
-on an ssh host is a new `~/gate/tmp-NAME.XXXXXX` directory beside its worktree, which the job
-creates and removes with the worktree, so its temporary files do not fill the host's `/tmp`. A Boat worker keeps its disk timer's hard limit
-and its own temporary directory. A cold workspace test build of the lane CI added 67.8 GiB to the large worker's disk,
-and the default adds 25% to that. The build cache does not help a second run on the large
-worker, because the test build stores about 48 GiB, more than the store's 40 GiB budget, so
-a rerun of the same commit measured 3 hits in 343 lookups and grew the disk by 65.7 GiB. The worker's disk timer stops any running job at 95% use, which is a recovery rather
-than a guarantee, since it checks once a minute and a build can fill the disk sooner. A job on an ssh host may run 6
-hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. `--cmd`
-runs one command in place of `ci.sh` under the same bounds, with the commit's pinned
-compiler, and `--worktree` checks the working tree instead of a commit, which
-`mise run check:remote` combines. Results
-land in `.artifacts/remote-ci/NAME`, with the exit status and the logs.
+The command bundles the commit and, for `--changed`, its merge base with the target base,
+verifies both on the host and launches `scripts/gate/remote/ci-job.sh` as user unit
+`gate-NAME`. Inside that unit the job cleans disk at 90% usage, acquires `~/gate/.lock`,
+creates a worktree, runs the check and removes the worktree. Starts on one host are
+serialized, and a job with an existing name starts only after the earlier unit stops.
+
+* **Runtime bounds.** On a Boat worker the job ends `REMOTE_CI_RESERVE` seconds (default
+  1200) before the admitted end, refusing to start with fewer than `REMOTE_CI_MIN_SECONDS`
+  (default 600) remaining. The job also stops its own unit at that deadline (with a
+  60-second shutdown bound) so the closure watch finds it closed. SSH hosts allow up to 6
+  hours; the benchmark host is always refused.
+* **Disk floors and monitoring.** Under the heavy lock every job requires
+  `REMOTE_CI_MIN_FREE_GIB` free (default 85), exiting 4 if still short after Boat disk
+  cleanup or SSH `mbx gc`. On SSH hosts, the job also checks free space every
+  `REMOTE_CI_WATCH_SECONDS` (default 30) and again after any failure, stopping with exit 5
+  if free space drops below `REMOTE_CI_RUN_FLOOR_GIB` (default 4; server tests require
+  1 GiB). Either disk refusal writes `disk-below-floor` to `outcome`, and the job reserves
+  1 MiB up front so it can still record outcome files on a full disk.
+* **Process cleanup and temporary space.** SSH units run delegated with the check in a
+  child cgroup so every descendant is killed before copying results and deleting the
+  worktree; if processes cannot be confirmed gone, the job exits 6 and keeps the worktree
+  for cleanup. SSH checks use a sibling `~/gate/tmp-NAME.XXXXXX` as `TMPDIR` instead of
+  `/tmp`. Boat workers keep their own temporary directory and their 95%-disk watchdog
+  timer (a 1-minute recovery check, not a hard guarantee).
+* **Boat cache sizing.** A cold workspace test build adds roughly 67.8 GiB to a large
+  worker's disk and stores about 48 GiB of outputs — exceeding the 40-GiB MBX store budget
+  — so repeating the same commit hit only 3 of 343 lookups and grew the disk by 65.7 GiB.
+* **Results and invocation.** Each start records a unique ID so waiting callers only fetch
+  their own run into `.artifacts/remote-ci/NAME.ID` (with `NAME` linked to the newest).
+  `SPARKLES_REMOTE_CI_HOST` sets the default host. `--cmd` runs one command under the
+  commit's pinned compiler instead of `ci.sh`, and `--worktree` checks uncommitted changes
+  (combined by `mise run check:remote`).
 
 ## Source, results and cleanup
 
 Query and write commands keep the current worker scripts, A/B order, compiler checks,
-answer checks, default query selection, rerun settings and regression thresholds. A
-Boat screen holds the host's heavy lock across both arms, result collection and flagged
-reruns. Each workload runs in an exact named memory-capped unit. Cleanup stops those
-units before releasing its exact lock holder. Uncertain cleanup retains the lock and
-source/results for the lifecycle owner to reconcile.
+answer checks, default query selection, rerun settings and regression thresholds. A Boat
+screen holds the host's heavy lock across both arms, result collection and flagged reruns,
+running each workload in an exact named memory-capped unit. Cleanup stops those units
+before releasing the lock; uncertain cleanup retains the lock and artifacts for the
+lifecycle owner to reconcile.
 
-Each build receives an exact commit archive in a new source directory. Warm reuse
-shares immutable compiler cache entries and cannot retain deleted files in a reused
-source directory. While it holds the host's heavy lock, the build moves that directory
-to a stable path named by the commit and a hash of its cargo flags, builds there and
-moves it back. mbx records the predicted compiler actions of each checkout path, and a
-rebuild of an unchanged commit at the same path finds its own predictions, so its crates
-come from the store when the store still holds them. A rebuild at a new path takes the
-latest predictions of the same command, which name the other revision's crates when a
-screen alternates two revisions. The crates it then compiles embed the new path in their
-metadata, so the crates that depend on them miss as well, and the rebuilt binary differs
-from the first.
+Each build receives an exact commit archive in a fresh source directory so deleted files
+never leak across warm runs. While holding the heavy lock, the build moves the directory to
+a stable path keyed by commit and Cargo flag hash, builds there and moves it back. Because
+MBX indexes predicted compiler actions by checkout path, rebuilding an unchanged commit at
+its stable path reuses cached crates and produces an identical binary, whereas alternating
+two revisions at fresh paths causes path-embedded metadata misses and distinct binaries.
 
-A remote build runs detached from the ssh connection in its named `nsc-build-*` scope.
-The caller polls the scope over a fresh connection for its log and recorded exit
-status. Each remote step is written so that repeating it does not change what an earlier
-attempt did, and a step whose connection drops is retried a bounded number of times. A
-start whose reply was lost is resolved from the build's recorded state, and a start the
-host refuses fails at once. A cancellation takes the same lock as a start and fences any
-later one, and a scope that begins after a cancellation builds nothing. A start whose scope
-does not begin within 30 seconds cancels its own build. The caller gives the start an
-absolute expiry, at which the remaining admitted lifetime falls to the closure watch's lead
-and a minute, and the host enforces it on its own clock, which must agree with the
-caller's. The scope's runtime limit is computed from the expiry at the launch, and a
-watchdog in the scope stops it at the expiry less its 30-second stop time however late it
-began. A Boat screen's lock and workload units get an absolute expiry at the same point of
-the admitted lifetime. The worker refuses a unit that begins too close to it, and a
-watchdog in each unit stops the unit 30 seconds before it. The lock starts its watchdog
-before it answers through its readiness FIFO, and its answer waits at most 15 seconds for
-a reader. When contact cannot be restored
-within the retry bound, the build fails. Its cleanup then stops the scope, or names the
-scope for reconciliation when it cannot reach the host within its own shorter bound. The closure watch's unit check covers the detached scope. A gate receives a standard bounded Git bundle of the exact
-commit and comparison base. Temporary bundle refs live outside the caller's repository.
-The first bounded seed preserves a complete valid history and the original merge-base
-selection. Later jobs reuse an exact commit whose reachable object coverage matches
-the local source. A changed commit uses an incremental standard bundle only after the
-worker proves complete coverage of the exact prerequisite. Unknown or incomplete
-coverage requires a bounded full seed or a clear refusal. Each gate source receipt
-records the mode, bundle digest, prerequisite IDs and prerequisite coverage digest. Source packets exclude untracked credentials,
-compiler targets, agent authentication and private evidence history.
+### Detached builds and gate bundles
 
-Boat artifacts travel over its explicit SSH transport with byte-preserving stdin and
-stdout. Individual files are checked by SHA-256. Sender and receiver share a finite operation
-deadline capped by the original admission end. No blocked chunk renews that deadline.
-Archive creation checks byte, member and expanded bounds during traversal and writing.
-Screen and gate archive transfers are bounded to
-4 GiB and 100,000 members, including expanded size, and refuse escaping paths, links and
-device entries before extraction. Nextest archives use a 32-GiB expanded bound, set explicitly with
-`TEST_PARTITION_ARCHIVE_MAX_BYTES` up to 64 GiB, and retain their SHA-256. Larger
-workloads need an explicit artifact-transport extension. A Boat fetch with `--delete` first retains the previous tree beside its destination,
-then validates a fresh staged tree before publishing it. Failed fetches leave no old
-`gate.exit` at the current result path. Failed and interrupted runs retain their owned
-worker directories and local receipt paths. Cleanup never stops another job or the
-warm sandbox. The lifecycle owner decides retention and verified stop after evidence
-and leases are closed.
+Remote builds run detached from SSH in named `nsc-build-*` scopes, polled over fresh
+connections for logs and exit status. Every remote step is idempotent with bounded retries
+on dropped connections; lost start replies resolve from recorded state, refused starts fail
+immediately, and cancellation takes the start lock to fence late scopes. A start whose
+scope does not begin within 30 seconds cancels itself.
+
+Both remote builds and Boat screen lock/workload units carry an absolute expiry (the
+admitted lifetime minus the closure watch's lead and one minute), checked against the
+host's clock. Each scope or unit runs an internal watchdog that stops it 30 seconds before
+expiry regardless of activation delay; the lock unit starts its watchdog before signaling
+its readiness FIFO (waiting at most 15 seconds for a reader). If contact is lost past the
+retry bound, cleanup stops the scope or names it for reconciliation, and the closure watch
+covers detached scopes.
+
+Gates transfer a bounded Git bundle of the commit and comparison base using temporary refs
+outside the caller's repository. The first seed preserves complete history and merge-base
+selection; later jobs reuse an exact verified commit or send an incremental bundle only
+after proving complete coverage of its prerequisite (otherwise falling back to a bounded
+full seed or refusing). Each gate source receipt records the mode, bundle digest and
+prerequisite digests. Source packets exclude untracked credentials, compiler targets, agent
+authentication and private evidence history.
+
+### Artifact transport and retired Namespace tasks
+
+Boat artifacts travel over explicit SSH transport with byte-preserving stdin/stdout,
+per-file SHA-256 verification and a shared deadline capped by the original admission end
+(stalled transfers never extend it). Archive creation validates byte, member and expanded
+limits during traversal: screen and gate transfers cap at 4 GiB and 100,000 members
+(refusing escaping paths, links and device entries), while nextest archives use a 32-GiB
+expanded cap (`TEST_PARTITION_ARCHIVE_MAX_BYTES` up to 64 GiB) with SHA-256 verification.
+
+A Boat fetch with `--delete` preserves the previous tree beside the destination and
+validates a staged tree before swapping, so failed fetches never leave a stale `gate.exit`.
+Failed or interrupted runs retain their worker directories and local receipts. Cleanup
+never stops another job or the warm sandbox; the lifecycle owner manages retention and
+verified stop after evidence and leases close.
 
 The `bench:nsc`, `bench:nsc-writes` and `bench:jena-nsc` tasks, the `nsc` executor and the
-`nsc` and `nsc:MACHINE` test shares are retired and unsupported, and item 1135 removes
-them. The `nsc-*` scripts that `bench:remote`, `bench:remote-writes` and the build hosts
-run keep their names and stay in use, and SSH build hosts remain a local build path. A
-failed Boat operation never silently retries on another provider or a local host.
-Historical benchmark records retain their actual provider and host attribution.
+`nsc` and `nsc:MACHINE` test shares are retired and unsupported ([ROADMAP.md](ROADMAP.md),
+item 1135). The underlying `nsc-*` helper scripts used by `bench:remote`,
+`bench:remote-writes` and SSH build hosts keep their names and stay in use. Failed Boat
+operations never fall back silently to another provider or local host, and historical
+benchmark records retain their original provider and host attribution.

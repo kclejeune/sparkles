@@ -634,12 +634,64 @@ fn sh(local: &str) -> NamedNode {
 /// whose value space they are: the facts `lit rdf:type DT`, with `DT` in the OWL 2 RL
 /// datatype map, which RDF cannot state and the inferred graph therefore lacks. See
 /// [`crate::literal_typings`].
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LiteralTypings {
     /// the commit of the materialization
     pub commit: u64,
     /// the literal and the datatype, each literal outside the datatype's value space
     pub facts: Vec<(Literal, NamedNode)>,
+}
+
+/// [`LiteralTypings`] paired with an opaque budget guard that keeps pooled summary
+/// credit alive until this wrapper drops. Declared with `typings` before `_held` so
+/// `facts` drops before credit returns. Moving the wrapper transfers the facts and
+/// their admission together.
+#[derive(Debug, Default)]
+pub struct GuardedLiteralTypings {
+    typings: LiteralTypings,
+    _held: Option<crate::budget::Held>,
+}
+
+impl PartialEq for GuardedLiteralTypings {
+    fn eq(&self, other: &Self) -> bool {
+        self.typings == other.typings
+    }
+}
+
+impl Eq for GuardedLiteralTypings {}
+
+impl std::ops::Deref for GuardedLiteralTypings {
+    type Target = LiteralTypings;
+
+    fn deref(&self) -> &Self::Target {
+        &self.typings
+    }
+}
+
+impl AsRef<LiteralTypings> for GuardedLiteralTypings {
+    fn as_ref(&self) -> &LiteralTypings {
+        &self.typings
+    }
+}
+
+impl GuardedLiteralTypings {
+    pub(crate) fn new(typings: LiteralTypings, held: Option<crate::budget::Held>) -> Self {
+        Self {
+            typings,
+            _held: held,
+        }
+    }
+
+    /// Borrow the inner [`LiteralTypings`].
+    pub fn typings(&self) -> &LiteralTypings {
+        &self.typings
+    }
+
+    /// Consume the wrapper and return the inner [`LiteralTypings`], releasing any
+    /// attached summary credit.
+    pub fn into_typings(self) -> LiteralTypings {
+        self.typings
+    }
 }
 
 impl LiteralTypings {
@@ -684,6 +736,8 @@ pub struct DiagnosticControls {
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Each query and the decoded rows it retains are held to this estimate.
     pub max_memory: Option<u64>,
+    /// Parent memory handle that controlled diagnostic reads reserve from (`None`: unpooled).
+    pub memory_parent: Option<crate::ParentHandle>,
 }
 
 pub(crate) fn check_control(
@@ -732,6 +786,11 @@ pub fn diagnose_for_gate(
         deadline: query.deadline.into_iter().chain(timeout).min(),
         cancel: query.cancel.clone(),
         max_memory: query.max_memory_bytes,
+        memory_parent: query
+            .grant
+            .as_ref()
+            .map(|g| g.memory_parent())
+            .or_else(|| query.pool.as_ref().map(|p| p.work_parent())),
     };
     let gate = Gate {
         query,
@@ -848,6 +907,14 @@ fn diagnose_impl(
                 findings.extend(found);
             }
             Err(Error::Timeout) => out.status = CheckStatus::Timeout,
+            Err(
+                error @ Error::BudgetExceeded(sparkles_core::Budget {
+                    kind: sparkles_core::BudgetKind::ServerMemory,
+                    ..
+                }),
+            ) => {
+                return Err(error.into());
+            }
             Err(error @ (Error::BudgetExceeded(_) | Error::Cancelled)) if gate.is_some() => {
                 return Err(error.into());
             }
@@ -2407,6 +2474,16 @@ fn family(local: &str) -> Option<Family> {
 pub(crate) fn decidable_range(range: &str) -> bool {
     matches!(range, RDF_LANG_STRING | RDF_PLAIN_LITERAL)
         || range.strip_prefix(XSD).is_some_and(|l| family(l).is_some())
+}
+
+/// Screen a borrowed IRI key before copying it from the materialization cache.
+pub(crate) fn decidable_range_key(key: &[u8]) -> bool {
+    // rdf:PlainLiteral is the longest IRI in the range table. Bound UTF-8
+    // validation by its length so unsupported keys can be rejected under the lock.
+    key.strip_prefix(b"<")
+        .filter(|iri| iri.len() <= RDF_PLAIN_LITERAL.len())
+        .and_then(|iri| std::str::from_utf8(iri).ok())
+        .is_some_and(decidable_range)
 }
 
 /// Whether `lit` is in the value space of the datatype `range` (OWL 2 RL `dt-not-type`),

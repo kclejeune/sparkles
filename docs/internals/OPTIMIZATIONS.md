@@ -1,18 +1,33 @@
 # Query optimization reference
 
 [ARCHITECTURE.md](../ARCHITECTURE.md#query-execution-and-where-optimizations-live)
-explains the query pipeline and the role of these mechanisms. This reference records
-operator applicability, cost-model choices and local implementation measurements.
-The timings below describe those measurements and are not a performance guarantee.
-[BENCHMARKS.md](../BENCHMARKS.md) owns the published engine comparisons and methodology.
+explains the query pipeline and where each optimization sits. This reference documents
+operator applicability, cost-model parameters and the local measurements that motivated
+each choice. Local timings describe implementation experiments and are not performance
+guarantees; [BENCHMARKS.md](../BENCHMARKS.md) owns published engine comparisons and
+methodology.
 
-The switches are defined in
-[`Optimizations`](../../crates/sparkles-core/src/sparql/ctx.rs). Each fast path has an
-applicability check and a generic fallback. The source is authoritative when an
-operator or its cost model changes.
+Toggleable switches are defined in
+[`Optimizations`](../../crates/sparkles-core/src/sparql/ctx.rs) and can be disabled per
+query (`QueryOptions::optimizations`) or per process
+(`SPARKLES_DISABLE_OPTIMIZATIONS=range_pushdown,…`). Every fast path has an applicability
+check and a generic fallback, and `EXPLAIN` reports which paths ran. The source is
+authoritative whenever an operator or its cost model changes.
+
+| Category | Toggleable switches (`SPARKLES_DISABLE_OPTIMIZATIONS`) |
+|---|---|
+| Cardinality & planning | `sampled_filters`, `characteristic_sets`, `set_remainders`, `node_sets`, `key_backoff`, `domain_estimates`, `probed_keys` |
+| Filters & scans | `count_filter_runs`, `filter_scan_runs`, `expr_cache`, `range_pushdown`, `point_patterns` |
+| Joins & stars | `anti_join`, `merge_left_join`, `merge_pair_conditions`, `probed_optional`, `keyed_join`, `keyed_left_join`, `batched_join`, `gallop_index_join`, `star_fusion`, `fused_star_costs` |
+| Aggregation & top-k | `metadata_counts`, `topk_heap`, `topk_first_key`, `bound_order_keys` |
+| Streaming | `predicate_patterns`, `grow_input` |
 
 * [Optimizations adopted from QLever](#optimizations-adopted-from-qlever)
 * [Further scan and filter optimizations](#further-scan-and-filter-optimizations)
+  * [Filter and range pushdown](#filter-and-range-pushdown)
+  * [Cardinality estimation and join ordering](#cardinality-estimation-and-join-ordering)
+  * [Aggregation and top-k](#aggregation-and-top-k)
+  * [Join operators, paths and star fusion](#join-operators-paths-and-star-fusion)
 * [Cold reads](#cold-reads)
 
 ## Optimizations adopted from QLever
@@ -90,474 +105,332 @@ operator or its cost model changes.
 
 ## Further scan and filter optimizations
 
-Each of these that names a switch can be switched off per query
-(`QueryOptions::optimizations`) or per process
-(`SPARKLES_DISABLE_OPTIMIZATIONS=range_pushdown,…`). The others replaced an earlier
-implementation and always apply. EXPLAIN shows which ones ran.
+Each entry that names a switch can be disabled per query (`QueryOptions::optimizations`)
+or per process (`SPARKLES_DISABLE_OPTIMIZATIONS=…`). Entries without a switch replaced an
+earlier implementation and always apply. `EXPLAIN` shows which fast paths ran.
+
+### Filter and range pushdown
 
 * **`COUNT(DISTINCT ?v)` from index runs.** Over one triple pattern, the scan switches to a
-  permutation sorted on `?v` and counts runs of equal ids (`CountDistinctFromIndex`). No
-  rows are materialized or hashed. When the pattern is `?s ?p ?o`, or binds only its
-  predicate, the count comes from the index statistics instead, corrected like the counts
-  from statistics below (`CountDistinctFromMetadata`, part of `metadata_counts`).
+  permutation sorted on `?v` and counts runs of equal IDs (`CountDistinctFromIndex`) without
+  materializing or hashing rows. When the pattern is `?s ?p ?o` or binds only its predicate,
+  the count comes from index statistics instead (`CountDistinctFromMetadata`, part of
+  `metadata_counts`).
 * **Filters on vocabulary keys.** `CONTAINS`, `STRSTARTS`, `STRENDS` and `REGEX` over `?v`
   or `STR(?v)`, `STRLEN` comparisons with integer constants, and
-  `LANGMATCHES(LANG(?v), …)`, are tested on the stored key bytes
-  (`"lexical 0xFF @lang`, `<iri`). Each front-coded block is read once, in parallel,
-  without allocating a string per term. A `CONTAINS` needle is searched with a substring
-  finder built once. A passing key must be valid UTF-8, and string lengths count Unicode
-  scalar values while preserving the literal argument rules. Each parallel task tests
-  with its own
-  copy of a regular expression, because threads that share one wait for its match caches.
-  Terms added by updates are tested on their delta keys. Inline values (numbers, dates)
-  go through the general evaluator.
+  `LANGMATCHES(LANG(?v), …)` test stored key bytes (`"lexical 0xFF @lang`, `<iri`) directly.
+  Each front-coded block is scanned once in parallel without allocating a string per term;
+  a `CONTAINS` needle builds its substring finder once, and each parallel task holds its
+  own regex copy to avoid match-cache contention. Passing keys must be valid UTF-8, and
+  `STRLEN` counts Unicode scalar values while preserving literal argument rules. Delta terms
+  are tested on delta keys, while inline values (numbers, dates) use the general evaluator.
 * **Filtered counts from index runs** (`count_filter_runs`). `COUNT(*)`, `COUNT(?x)` and
-  `COUNT(DISTINCT ?v)` over a FILTER that reads only `?v` of a single triple pattern read
-  the pattern from the permutation sorted on `?v`. The filter is tested once per run of
-  equal ids, and the count is the sum of the lengths of the runs that pass, or the number
-  of such runs for `COUNT(DISTINCT ?v)` (`CountFilterFromRuns`). No rows are
-  materialized. The index blocks are read in parallel, with the delta merged into the
-  blocks it changes, and each block's vocabulary ids are tested on their keys as the
-  block is read, in pieces of 8192 rows so that a short scan still uses every thread.
-  Union-graph dedup, which compares neighbouring rows, and a larger delta than the
-  parallel reads merge read the runs in order. At 10.5M triples, counting the
-  `foaf:name` values that contain "Ada" tests 1.02M names and takes about 4 ms in the
-  server, against 14 ms when the name column is materialized first.
+  `COUNT(DISTINCT ?v)` over a FILTER reading only `?v` of one triple pattern read the
+  permutation sorted on `?v`, test each run of equal IDs once, and sum passing run lengths
+  or count passing runs (`CountFilterFromRuns`) without materializing rows. Blocks are read
+  in parallel in 8,192-row pieces with changed blocks merging their delta; union-graph dedup
+  and oversized deltas fall back to sequential runs. In local measurements at 10.5M triples,
+  counting `foaf:name` values containing `"Ada"` (1.02M names) takes about 4 ms versus 14 ms
+  when materializing the column first.
 * **Filters on the runs of a scan** (`filter_scan_runs`). A FILTER directly over a scan
-  sorted on a variable it tests evaluates the conjuncts that read only that variable once
-  per value, then copies out of the index blocks only the rows of the values that pass,
-  in parallel. The other conjuncts are applied to those rows. EXPLAIN notes
-  `[runs of ?v: N values tested on vocabulary keys, M passed]`. Union-graph dedup, which
-  compares neighbouring rows, and a larger delta than the parallel reads merge keep the
-  generic scan and filter. Under streaming execution the filter reads its scan in morsels
-  of whole blocks only when the snapshot has no delta at all.
-* **Filter selectivity from samples** (`sampled_filters`). Without other knowledge the
-  planner assumes that a FILTER conjunct keeps 30% of its input. A conjunct whose
-  variables are all bound by one triple pattern is instead tested on a sample of that
-  pattern's rows, and the share of the sample it keeps becomes its estimate. The sample
-  comes from the sorted index. The first and last keys of the pattern's blocks are held in
-  memory by the block metadata and cost nothing to read. When they are too few, one or
-  two blocks are decoded as well, preferably blocks the cache already holds, and give 128
-  rows each. A pattern of at most a few thousand rows is read whole, with the delta. The
-  pattern is read sorted on another variable when it has one, so that a decoded block
-  holds values from all over the filtered variable's range. Selectivities are kept with
-  the snapshot, and later queries at the same commit reuse them. A conjunct over several
-  patterns keeps the fixed estimate. EXPLAIN notes `[selectivity 0.0650 of 187 sampled
-  rows]` on the filter. At 10.5M triples, `?p foaf:name ?n ; foaf:age ?a
-  FILTER(CONTAINS(?n, "Ada"))` keeps 5% of the names. With an estimate of 6.5% instead
-  of 30%, the planner tests each distinct name once in a scan sorted on the name, sorts
-  the 50,000 rows that pass and merges them with the ages. The query runs in 12 ms
-  instead of 20 ms. Sampling adds 0.02 to 0.08 ms to planning a filter when the blocks are
-  cached, and 0.3 to 0.6 ms when one has to be decoded.
-* **Star estimates from characteristic sets** (`characteristic_sets`). A join on a
-  variable estimated from distinct values assumes that the values of the side with fewer
-  are all among the other side's. For patterns on one subject this holds only when every
-  subject with the rarer predicate has the others. In WatDiv, where users have most
-  predicates independently of each other, it overestimated a star of six patterns
-  tenfold. A bulk load or compaction therefore counts the characteristic sets of the subjects,
-  after Neumann and Moerkotte: each set of predicates some subject has exactly, with its
-  subjects and the triples of each predicate. The classes a subject has by `rdf:type`
-  count as predicates of their own, since a class usually decides which predicates its
-  instances have. The statistics keep the 32,768 sets with the most subjects. A join on a
-  subject variable of patterns `?s p ?o` with a constant predicate, or `?s a <class>`, is
-  then estimated from the sets that hold the predicates of both sides, including the
-  number of triples per subject of each predicate within those sets. Whatever else
-  restricts an input is taken to be independent of the predicates. Patterns with another
-  constant object and stores loaded before this change keep the estimate from distinct
-  values. The sets holding a predicate are
-  found once per index generation, and the sums for a query's predicates are kept for
-  later queries. On WatDiv at 1.1M triples, the joins of the C3 star are estimated
-  exactly, and C3 runs in 0.65 ms instead of 1.48 ms. C2 runs in 0.03 ms instead of
-  0.21 ms.
-* **The remainder of the sets** (`set_remainders`). The subjects whose sets are not kept
-  are counted as one remainder, with its number of subjects and, per predicate or class,
-  the remainder subjects that have it and its triples there. A star's rows and subjects
-  are the kept sets' sums plus the remainder's, in which the predicates are taken to be
-  independent of each other. Every triple is then accounted for, and a predicate that the
-  kept sets cover poorly is estimated from the sets too. Stores built before the
-  remainder existed use a predicate only when the kept sets hold 95% of its triples. At
-  the scale-100 WatDiv the 10,000 sets kept before held less than 95% of the triples of
-  68 of its 86 predicates, so its S3, S4 and S5 stars, which return no rows, were
-  estimated at 661 to 1,090 rows. With 32,768 sets all 24,037 are kept, the worst join
-  of S3 is estimated within a factor of 2 and that of S5 within 106 instead of 1,041.
-  DBpedia's 8.2M-triple slice has 64,814 sets, and the 32,768 kept hold 95% of its
-  subjects.
-* **Node characteristic sets** (`node_sets`). The subject sets say nothing about a join on
-  an object, such as `?a p ?v . ?b q ?v`, or on the link of a chain, such as
-  `?a p ?v . ?v q ?b`. A bulk load or compaction therefore also counts the sets of the
-  nodes over both directions: the predicates a node is the subject of, the predicates it
-  is the object of and its classes, with the nodes and triples of each, again 32,768 sets
-  and a remainder. A variable that is the object of a pattern `?x p ?v` with a constant
-  predicate is estimated from these node sets, for every join on it, so that the
-  estimates of the joins on one variable come from one family of sets. This is the
-  characteristic-pair idea of Gubichev and Neumann reduced to the join node: it captures
-  which objects of one predicate are subjects or objects of another, but not how the far
-  end of a link is restricted. When an input restricts the variable otherwise, such as a
-  pattern with a constant object, a subquery or a VALUES table, a join over its outgoing
-  items alone is estimated from the subject sets, which take the restriction to be
-  independent, and other joins on it keep the estimate from distinct values. The object
-  of `?x a ?c` keeps the subject sets, since what a class gains depends almost wholly on
-  what its instances are. The counts take one pass over the SPO and OPS
-  permutations after they are written, on the build's threads, and a partial compaction
-  updates them for the nodes its changes touch. The sets kept do not depend on the thread
-  count. Past 2^20 distinct node signatures, a count-min sketch filled by the first pass
-  ranks them by their nodes, with ties broken by a stable hash, and a second pass counts
-  the best-ranked ones exactly, so a load of data without blank nodes writes the same
-  `stats.json` at any thread count. On WatDiv the L1 chains were estimated 10
-  to 87 times too high and are now 2 to 11 times, and the C2 template's worst join goes
-  from 1,222 times too high to 30. DBpedia's join of two `birthPlace` patterns on their
-  object goes from 1,478 times too high to 8 times. The statistics trade memory for these
-  estimates. With the larger subject-set cap, `stats.json` grows from 5.0 MB to 44.3 MB on
-  that slice. On atlas, opening it takes 0.30 s instead of 0.07 s, and the server holds
-  214 MB instead of 133 MB once ready. Smaller caps cost less but give up much of the
-  gain, as the [engine results](../benchmarks/engine/RESULTS.md#cardinality-estimates)
-  show.
-* **Joins on several keys** (`key_backoff`). A join on several variables divided by the
-  largest distinct count of one key, as if the other keys added nothing. A cycle closed by
-  a join on two keys, such as the last edge of a triangle or LUBM `q9`'s
-  `?Y teacherOf ?Z`, keeps few of the pairs its input holds. The estimate now divides by
-  the distinct key tuples of the larger side, estimated from its counts sorted from the
-  largest with exponents 1, 1/2, 1/4 and 1/8. This exponential back-off lies between the
-  largest count and the product that independent keys would give. When each side has one
-  input that binds every key, such as two predicates between the same nodes or two
-  subqueries grouped by both keys, the keys depend on each other, so a side has at most
-  as many tuples as rows. LUBM `q9`'s closing join is estimated at 792 rows for 2,540
-  instead of 32,256, and `q2`'s at 115 for 28.
-* **Join estimates against a constant restriction** (`domain_estimates`). A pattern such as
-  `?v0 age AgeGroup5` keeps the subjects of `age` with that value, a sample of all its
-  subjects, where the distinct-value estimate took the larger input's keys to hold the
-  other side's. A join on a variable that a pattern binds with the predicate and the other
-  column fixed to a constant, for a predicate other than `rdf:type`, divides by the
-  predicate's distinct subjects or objects at least, on the pattern and on the joins,
-  filters, sorts, projections and extends above it. It applies to the estimate from
-  distinct values, after the probed keys and the characteristic sets have declined, and
-  not while the snapshot holds a delta, since the predicate statistics are the
-  generation's. WatDiv `S4-2` then merges the `artist` and `nationality` scans, estimated
-  at 122 rows for 21, and probes `age` and `familyName` with the 21 keys instead of
-  probing `familyName` with 704. Classes stay with the characteristic sets. The domain
-  carries no identity of the restriction, so two sides restricted by the same constant
-  on the same predicate are taken for independent samples, which item 875 follows up.
-* **Join estimates from probed values** (`probed_keys`). When one input of a group is
-  small, a VALUES table or a pattern of at most 1,024 rows, the planner reads up to 32 of
-  its values, spread over them in order, and counts the rows each has in every other
-  pattern of the group on the same variable, as an index join would look them up. The mean
-  count and the share of values that have rows then estimate a join of the small input
-  with that pattern. They replace the assumption that every value is on the other side
-  with the pattern's average number of rows, less 30%. This is index-based join sampling
-  as Leis et al. describe it, from one small input. When the small input is itself a
-  pattern the characteristic sets count, their estimate comes first, since the sets know
-  how a star's predicates occur together. The counts read each block of a pattern once,
-  and at most two blocks per group that the block cache does not hold. A small pattern
-  whose blocks are not cached is left to a later query, after this one has read them. The
-  counts are kept with the snapshot. At 10.5M triples, a star of three patterns over
-  30,000 VALUES keys is estimated at its 30,000 rows instead of 10,290. A sample that
-  finds no rows for any of its values, without having probed every distinct value of the
-  small input, is not taken as an empty join. Its share of values with rows is taken as
-  `1 / (k + 2)` of the `k` values probed, with the pattern's average rows per value. In
-  LUBM `q2`, 32 of the 1,000 universities find no departments, since only 10 have any,
-  and the join that returns 3,016 rows was estimated at one row.
-
-  Joins that neither the characteristic sets nor probed values estimate keep QLever's
-  0.7 correction. Measured over the two-input joins of every plan of `scripts/bench.sh`,
-  the queries for these estimates and WatDiv at 1.1M triples, with the new estimates
-  switched off, the factor makes the median join of the generated data 30% low, since its
-  joins follow references that exist. The median WatDiv join is still 3.4 times too high
-  with it. No single factor fits both. With the new estimates, the median join of both
-  datasets is estimated exactly, and the mean error falls from a factor of 1.37 to 1.04
-  on the generated data and from 4.2 to 1.6 on WatDiv.
-* **Key ranges for a fixed start.** Under a `STRSTARTS`, or a
-  `REGEX` anchored on a literal start (`^abc` with no flag other than `s` and no
-  alternation), the two operators above read only the base-vocabulary ids of the keys
-  with that start: literals for `?v`, literals and IRIs for `STR(?v)`. Ids outside the
-  base vocabulary (inline values and terms added by updates) are still read and tested.
-* **Id ranges for a fixed start.** The same starts restrict the other
-  places that test such a filter on vocabulary keys. A FILTER over the rows of a join
-  fails the base-vocabulary ids outside the ranges without reading their keys, and reads
-  only the keys of the ids inside them, which lie together in the vocabulary. The planner
-  costs a filtered scan sorted on the tested variable by the rows of its ranges, counted
-  exactly, instead of by every row of the scan. On English DBpedia, `?s a dbo:Band ;
-  rdfs:label ?l FILTER(REGEX(?l, "^The B"))` then reads the 23,812 labels in the range
-  and merges them with the bands, instead of looking up the label of each of the 36,745
-  bands. It takes 3.8 ms warm and 90 ms cold, against 18.8 ms and 1,040 ms with
+  sorted on a tested variable evaluates single-variable conjuncts once per distinct value,
+  then copies passing rows out of index blocks in parallel and applies remaining conjuncts.
+  `EXPLAIN` notes `[runs of ?v: N values tested on vocabulary keys, M passed]`. Union-graph
+  dedup and oversized deltas keep the generic scan; streaming execution reads whole-block
+  morsels only when the snapshot has no delta.
+* **Key ranges for a fixed start.** Under `STRSTARTS` or a `REGEX` anchored on a literal
+  prefix (`^abc` with at most the `s` flag and no alternation), the run-based operators
+  above scan only base-vocabulary IDs in that prefix range (literals for `?v`; literals and
+  IRIs for `STR(?v)`). Inline values and delta terms are still read and tested.
+* **ID ranges for a fixed start.** The same prefix ranges restrict post-join filters:
+  base-vocabulary IDs outside the ranges fail without reading their keys, and only keys
+  inside the ranges are read. The planner costs a filtered sorted scan by the exact row
+  count of its ranges rather than the full scan. In local measurements on English DBpedia,
+  `?s a dbo:Band ; rdfs:label ?l FILTER(REGEX(?l, "^The B"))` reads 23,812 labels and merges
+  them with bands in 3.8 ms warm (90 ms cold), versus 18.8 ms warm (1,040 ms cold) for
   per-band label lookups.
 * **Pure expressions per distinct value** (`expr_cache`). A FILTER conjunct, BIND, ORDER BY
-  key or aggregate argument that reads one variable and gives the same result for the same
-  term is evaluated once per distinct id of that variable. Rows look up the result, errors
-  included. RAND, UUID, STRUUID, BNODE and EXISTS run per row, as do the ARQ UUID
-  aliases, dynamic `fn:apply` and `afn:eval` calls, and effectful extension functions.
-  NOW and the base IRI are fixed for the query. On a column sorted by the variable, the distinct ids are its runs.
-  Otherwise a sample estimates how often values repeat, and when fewer than half the rows
-  repeat a value the operator runs row by row. EXPLAIN notes `[expr cache: …]` with the
-  distinct count or the reason it ran row by row, and reports `exprCacheHits`,
-  `exprCacheMisses` and `exprCacheSkipped`. A constant regular expression is compiled once
-  per query, or taken from the server's table of recently compiled programs, and each
-  thread that searches it gets its own charged match cache while the budget has room,
-  which the table keeps warm for the thread's next query.
-  The planner counts the cost of sorting an unsorted input column, so a single pattern
-  under such a FILTER is read from the permutation sorted on the filtered variable. A
-  cursor BIND can retain results across batches in a map keyed by exact input IDs. Its
-  first batch admits the map when one row in eight repeats an earlier key, or when a key
-  repeats and unchanged-snapshot predicate statistics put the input domain below four
-  fifths of the estimated rows. This optional profit hint walks at most 64 plan nodes
-  and declines on changed snapshots or unknown operators. Later batches feed a sketch
-  that observes one key in sixteen, chosen by hash, and holds at most 4,096 keys, charged at
-  32 bytes a key. A window of 256 sampled rows admits the map at one repeat in
-  eight, and so does the exact distinct count of the expression cache's pass over one
-  batch, which sees hot keys the sketch does not sample. A full sketch without admission
-  ends the observation for the query. An admitted map evaluates its misses once per
-  distinct key as one column, and it is released once it has seen 65,536 rows or filled
-  and then answers fewer than one row in sixteen without an evaluation. The query owns
-  the map, including cached expression errors. It keeps at most 65,536 entries under the memory
-  budget, charged conservatively at about 6 MiB, while dense inline integers retain their
-  smaller 16,384-entry cap. Both charges grow in steps of a sixty-fourth of the query's
-  memory limit. Each batch the map answers also charges 68 bytes a row of scratch while
-  it runs. A refused optional allocation or a full cache leaves uncached
-  inputs on ordinary evaluation. Identity copies, volatile expressions and application
-  callbacks do not enter this cache.
-* **Numeric range scans.** A FILTER that compares a scan's sort column with numeric
-  constants reads only the id ranges that can match. Inline integers, and inline decimals
-  of one scale, sort by value within their id segment, so each segment's matches form one
-  range, found by binary search with the ordinary comparison. Doubles and vocabulary
-  literals are read and tested. Booleans, dates and blank nodes are skipped. The planner
-  costs the scan from an exact count of the rows in those ranges (`IndexRangeScan`).
-* **Comparisons decided on ids** (part of `range_pushdown`). A FILTER that compares one
-  variable with numeric, `xsd:date` or `xsd:dateTime` constants, over a table that a
-  range scan cannot read, first classifies the ids of the variable's column. Numbers use
-  the id ranges of the numeric range scan. Inline dates and dateTimes sort by their local
-  calendar fields, and a value whose local day lies three days or more from a constant's
-  day is earlier or later in every timezone, because timezones span 14 hours on either
-  side. Inline values of other kinds cannot compare with the constant and fail. Values
-  in the vocabulary, computed values and inline values near a constant are evaluated as
-  before, once per distinct value where the expression cache admits them. The id range
-  of an integer or decimal segment is searched when an id of the segment first occurs.
-  With ORDER BY keys from BIND, BSBM BI `q3` at 10M takes 31.5 ms instead of 41.4 ms on
-  forge. EXPLAIN notes `[decided on ids: … for N of M rows]`.
-* **Top-k heap** (`topk_heap`). `ORDER BY … LIMIT k` (with or without OFFSET) keeps the
-  best k rows in a bounded heap. Each key is classified once, so most comparisons are
-  of exact decimals, doubles or strings, and the remaining pairs go to the ordinary
-  comparator. The later keys are evaluated only for rows whose first key can still
-  enter. Streaming execution reads its input batch by batch into the same heap.
-  EXPLAIN notes `[top-k heap kept N of M rows]`. With the heap off, the two shortcuts
-  below apply.
+  key or aggregate argument reading one variable with deterministic output runs once per
+  distinct ID, caching results and errors. Volatile or effectful calls (`RAND`, `UUID`,
+  `STRUUID`, `BNODE`, `EXISTS`, ARQ UUID aliases, `fn:apply`, `afn:eval` and effectful
+  extension functions) always run per row; `NOW` and the base IRI are fixed per query. On a
+  sorted column distinct IDs are runs; otherwise a sample skips caching when fewer than half
+  the rows repeat (`EXPLAIN` reports `[expr cache: …]`, `exprCacheHits`, `exprCacheMisses`
+  and `exprCacheSkipped`). Constant regexes compile once per query or reuse the server's
+  compiled-program table with per-thread budgeted match caches.
+
+  The planner accounts for sorting an unsorted column so a single filtered pattern picks the
+  permutation sorted on the filtered variable. A cursor BIND can retain cached results
+  across batches when at least a quarter of a bounded pilot repeats exact input IDs (or
+  when unchanged-snapshot statistics estimate the input domain below 80% of rows, walking at
+  most 64 plan nodes). The per-query cache caps at 65,536 entries (charged conservatively at
+  about 6 MiB; dense inline integers cap at 16,384 entries); budget refusals or a full cache
+  fall back to ordinary evaluation. Identity copies, volatile expressions and application
+  callbacks never enter this cache.
+* **Numeric range scans.** A FILTER comparing a scan's sort column with numeric constants
+  reads only matching ID ranges (`IndexRangeScan`). Inline integers and single-scale inline
+  decimals sort by value within their ID segments, so binary search finds each segment's
+  range. Doubles and vocabulary literals are read and tested; booleans, dates and blank
+  nodes are skipped. The planner costs the scan from exact range row counts.
+* **Comparisons decided on IDs** (part of `range_pushdown`). When a FILTER compares one
+  variable with numeric, `xsd:date` or `xsd:dateTime` constants over a non-range-scan table,
+  IDs are classified first. Numbers reuse the numeric range-scan segments (searched lazily
+  when a segment first appears). Inline dates and dateTimes sort by local calendar fields,
+  and values three or more days away from a constant decide in every timezone (covering
+  ±14h offsets). Non-comparable inline kinds fail immediately, while vocabulary literals,
+  computed values and near-boundary dates fall back to expression evaluation (with
+  `expr_cache` where eligible). In local measurements at 10M triples, together with
+  `bound_order_keys`, BSBM BI `q3` drops from 41.4 ms to 31.5 ms. `EXPLAIN` notes
+  `[decided on ids: … for N of M rows]`.
+* **Single-row point patterns** (`point_patterns`). For a pattern with one free variable
+  and at most four estimated rows, the planner reads up to two rows and substitutes a
+  constant when the snapshot holds exactly one matching row, restoring the variable in the
+  result and preserving term identity, graph scope and multiplicity. This also turns
+  dependent arithmetic FILTER bounds into constants. Volatile filters, application callbacks
+  and variables referenced in other algebra nodes keep their bindings.
+* **Whole-block scans under graph filters.** When a pass over a block's graph column shows
+  every row matches the graph filter, the slice is copied column-wise instead of row by row.
+
+### Cardinality estimation and join ordering
+
+* **Filter selectivity from samples** (`sampled_filters`). By default the planner assumes a
+  FILTER conjunct retains 30% of rows. For a conjunct whose variables come from one triple
+  pattern, the planner instead tests it on a sample from the sorted index and caches the
+  selectivity on the snapshot for later queries at the same commit.
+
+  Samples use in-memory block first/last keys first (zero I/O); if too few exist, one or
+  two blocks (preferring cached blocks, sorted on another variable when available) yield 128
+  rows each, and patterns of at most a few thousand rows are read whole with the delta.
+  Multi-pattern conjuncts keep the fixed 30% estimate. `EXPLAIN` notes `[selectivity 0.0650
+  of 187 sampled rows]`. In local measurements at 10.5M triples, `?p foaf:name ?n ; foaf:age
+  ?a FILTER(CONTAINS(?n, "Ada"))` (5% true selectivity, 6.5% sampled) switches to a
+  name-sorted scan and merge, dropping runtime from 20 ms to 12 ms. Sampling adds 0.02 to
+  0.08 ms when blocks are cached, or 0.3 to 0.6 ms when decoding a block.
+* **Star estimates from characteristic sets** (`characteristic_sets`). Estimating a join
+  from distinct counts assumes the smaller side's keys all appear on the larger side, which
+  overestimated six-pattern WatDiv stars tenfold. During bulk load and compaction, Sparkles
+  counts subject characteristic sets (after Neumann and Moerkotte): each exact set of
+  predicates and `rdf:type` classes a subject has, keeping the top 32,768 sets by subject
+  count along with predicate triple counts.
+
+  A subject join of constant-predicate patterns (`?s p ?o` or `?s a <class>`) sums over
+  matching sets, treating other restrictions as independent; patterns with other constant
+  objects or older stores fall back to distinct-value estimates. Matching sets are indexed
+  once per generation and predicate-set sums are cached. In local measurements on WatDiv at
+  1.1M triples, C3 drops from 1.48 ms to 0.65 ms and C2 from 0.21 ms to 0.03 ms.
+* **Characteristic-set remainders** (`set_remainders`). Subjects outside the top 32,768
+  sets are summarized in one remainder record (total subjects plus per-predicate subject and
+  triple counts, assuming predicate independence inside the remainder). Every triple is
+  accounted for, removing the older 95%-coverage cutoff. At WatDiv scale-100, keeping
+  32,768 sets captures all 24,037 sets, bringing S3's worst join estimate within 2× and S5
+  from 1,041× to 106×; on DBpedia's 8.2M-triple slice (64,814 sets), the top 32,768 cover
+  95% of subjects.
+* **Node characteristic sets** (`node_sets`). Subject sets cannot estimate object-object
+  joins (`?a p ?v . ?b q ?v`) or chain links (`?a p ?v . ?v q ?b`). Bulk load and
+  compaction also collect bidirectional node sets (outgoing predicates, incoming predicates
+  and classes, capped at 32,768 sets plus a remainder) in one parallel pass over SPO and
+  OPS; partial compaction updates affected nodes. Past 2^20 distinct signatures, a count-min
+  sketch with stable hash tie-breaking selects candidates for a deterministic second pass so
+  `stats.json` is independent of thread count (absent blank nodes).
+
+  Any variable appearing as the object of a constant-predicate pattern `?x p ?v` (except
+  `?x a ?c`) uses node sets across all its joins; inputs restricted by a constant object,
+  subquery or VALUES fall back to subject sets for outgoing joins or distinct-value
+  estimates otherwise. In local measurements, WatDiv L1 error falls from 10–87× to 2–11×,
+  C2's worst join from 1,222× to 30×, and DBpedia's `birthPlace` object join from 1,478× to
+  8×. The tradeoff is statistics memory: on that DBpedia slice, `stats.json` grows from
+  5.0 MB to 44.3 MB, open time from 0.07 s to 0.30 s, and ready server RSS from 133 MB to
+  214 MB ([cardinality results](../benchmarks/engine/RESULTS.md#cardinality-estimates)).
+* **Joins on several keys** (`key_backoff`). Multi-key joins previously divided only by the
+  largest single-key distinct count, overestimating closing edges such as triangle joins or
+  LUBM `q9`'s `?Y teacherOf ?Z`. The estimate now divides by the larger side's estimated
+  distinct key tuples using exponential back-off (exponents 1, 1/2, 1/4, 1/8 on sorted key
+  counts), capped at the side's row count when one input binds all keys. LUBM `q9`'s closing
+  join estimate improves from 32,256 to 792 (actual 2,540), and `q2`'s to 115 (actual 28).
+* **Join estimates against a constant restriction** (`domain_estimates`). When a pattern
+  fixes both predicate (other than `rdf:type`) and the opposite column to constants (such as
+  `?v0 age AgeGroup5`), its bound variable is a subset of that predicate's domain. When
+  probed keys and characteristic sets decline on an unchanged snapshot, distinct-value
+  estimates divide by at least the predicate's distinct subject or object count across that
+  pattern and joins, filters, sorts, projections and extends above it. On WatDiv `S4-2`,
+  this merges `artist` and `nationality` (estimated 122 for 21 rows) and probes `age` and
+  `familyName` with 21 keys instead of 704. Because domains do not record the constant's
+  identity, two sides sharing the same constant restriction are still treated as independent
+  ([ROADMAP.md](../ROADMAP.md), item 875).
+* **Join estimates from probed values** (`probed_keys`). When one input in a group is small
+  (VALUES or a pattern of at most 1,024 rows) and characteristic sets do not apply, the
+  planner samples up to 32 evenly spaced keys and counts their matches in every other
+  pattern on that variable (index-based join sampling after Leis et al.). Probes touch at
+  most two uncached blocks per group and cache counts on the snapshot; uncached small
+  patterns defer to later queries. When a partial sample finds zero hits across `k` probed
+  keys, it uses a non-zero floor of `1 / (k + 2)` times average rows per key so sparse
+  joins (such as LUBM `q2`, where 10 of 1,000 universities have departments) are not
+  underestimated at 1 row.
+
+  Joins outside characteristic sets and probed keys keep QLever's 0.7 factor. Across the
+  synthetic benchmark queries and WatDiv 1.1M, the combined estimators bring the median
+  join error to exact on both datasets and reduce mean error from 1.37× to 1.04× on
+  synthetic data and from 4.2× to 1.6× on WatDiv.
+* **Join ordering on cost summaries.** The dynamic-programming join orderer (always active)
+  operates on compact plan summaries (cost, estimated rows, sort variable and distinct
+  counts) and materializes only the winning plan tree. A greedy baseline prunes any partial
+  plan that exceeds its cost; plans sorted on variables no remaining join reads are pruned
+  when matched by an equal-or-cheaper plan; only connected subsets are enumerated.
+
+  Up to 10 patterns this matches exhaustive DP (bringing a nine-pattern star like WatDiv S1
+  from 400 ms to ~1 ms). Larger groups whose subsets exceed the ~1 ms split budget are
+  planned in bounded rounds (never worse than greedy), and groups with more than 16 inputs
+  or more than 128 shared variables use the greedy plan directly.
+
+### Aggregation and top-k
+
+* **Top-k heap** (`topk_heap`). `ORDER BY … LIMIT k` (with or without `OFFSET`) keeps the
+  best `k` rows in a bounded heap. Keys are classified once so most comparisons stay on
+  exact decimals, doubles or strings, and later keys evaluate only for rows whose first key
+  can still enter. Streaming execution feeds batches into the same heap. `EXPLAIN` notes
+  `[top-k heap kept N of M rows]`. With the heap off, numeric top-k and first-key top-k
+  apply instead.
 * **Numeric top-k.** `ORDER BY ?v LIMIT k` over numbers ranks cheap rounded keys first and
-  computes exact values only for rows that can still reach the first k.
-* **First-key top-k** (`topk_first_key`). `ORDER BY k1 k2 … LIMIT k` finds the k-th row by
-  the first key alone and drops every row whose first key is worse, since at least k rows
-  come before it. The later keys, often IRIs or strings that must be decoded, are
-  evaluated only for the rows that remain. EXPLAIN notes `[first-key prefilter kept N
-  rows]`.
-* **ORDER BY keys from BIND** (`bound_order_keys`). An ORDER BY key equal to the
-  expression of a BIND or SELECT expression directly below it orders by that
-  expression's variable, so `SELECT (?a / ?b AS ?r) … ORDER BY DESC(?a / ?b)` evaluates
-  the division once per row. The variable is unbound where the expression is an error,
-  and an unbound value takes the same place in the order as an error. Expressions with `RAND`, `UUID`, `STRUUID`, `BNODE`, `EXISTS` or
-  a function outside SPARQL and the XSD casts are evaluated again.
-* **Ordered-scan top-k.** `ORDER BY ?v LIMIT k` (with or without OFFSET) over one triple
-  pattern and its FILTERs reads the pattern in `?v` order and stops once the first k rows
-  are proven (`IndexTopK`). The scan switches to a permutation sorted on `?v`. Inline
-  integers, decimals of one scale and doubles of one sign sort by value within their id
-  segment. The IRIs of the base vocabulary do too, because the vocabulary is sorted by
-  key and an IRI's key is its UTF-8 bytes after a `<`, which is the code point order
-  that ORDER BY gives IRIs. Each such segment is read from its best end, a few rows at a
-  time, until the k-th candidate beats the best unread value. In ascending order the
-  literals of the base vocabulary are read from their low end in the same way. A
-  literal's key is its lexical form followed by a 0xFF byte and any language tag or
-  datatype, so ids follow lexical forms except that a form sorts after the longer forms
-  it begins. When the k-th candidate is a plain string, an unread plain string can only
-  beat it if it is a prefix of the last string read, and the reader looks those prefixes
-  up in the vocabulary and reads their rows. The plain sort answers instead when the
-  k-th candidate is a literal of another kind, which unread plain strings may beat, and
-  when the prefixes to look up exceed 256 bytes. Literals in descending order, blank nodes and the terms that updates added
-  since the last rebuild are not in value order by id, so they are read whole. Candidates are ranked by the ordinary ORDER BY in the plain scan's
-  row order, so ties come out the same. NaN, dates and durations have no total order and
-  use the plain sort. The planner picks this operator, from exact row counts per segment,
-  when it reads at most half of the pattern's rows.
-* **Incremental GROUP BY.** With one group key and COUNT, SUM, AVG, MIN, MAX or SAMPLE over
-  variables, each group keeps a running state in a hash map keyed by id. Sums stay exact
-  64-bit integers until a value is not an inline integer.
+  computes exact values only for candidates that can reach the top `k`.
+* **First-key top-k** (`topk_first_key`). `ORDER BY k1 k2 … LIMIT k` locates the `k`-th row
+  by `k1` alone and drops worse rows before decoding or evaluating later keys. `EXPLAIN`
+  notes `[first-key prefilter kept N rows]`.
+* **ORDER BY keys from BIND** (`bound_order_keys`). When an ORDER BY key matches a BIND or
+  SELECT expression directly below it (for example `SELECT (?a / ?b AS ?r) … ORDER BY
+  DESC(?a / ?b)`), the sort reads the bound variable instead of re-evaluating the expression
+  (unbound and error sort identically). Volatile expressions and functions outside SPARQL
+  and XSD casts are still evaluated again.
+* **Ordered-scan top-k.** `ORDER BY ?v LIMIT k` (with or without `OFFSET`) over one triple
+  pattern and its FILTERs reads a `?v`-sorted permutation and stops once the first `k` rows
+  are proven (`IndexTopK`). Inline integers, single-scale decimals, same-sign doubles and
+  base-vocabulary IRIs sort by value within their ID segments and are read incrementally
+  from the best end.
+
+  In ascending order, base-vocabulary literals are read from their low end as well; because
+  a literal's key appends `0xFF` after the lexical form, shorter prefix strings sort after
+  longer ones and are looked up in the vocabulary (up to 256 bytes; non-plain-string `k`-th
+  candidates fall back to plain sort). Descending literals, blank nodes and delta terms are
+  read whole. Ties preserve plain-scan order, while NaN, dates and durations (no total
+  order) use plain sort. The planner chooses `IndexTopK` from exact segment counts when it
+  reads at most half the pattern's rows.
+* **Incremental GROUP BY.** With one group key and `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` or
+  `SAMPLE` over variables, each group updates running state in an ID-keyed hash map. Sums
+  stay exact 64-bit integers until a non-inline-integer value arrives.
 * **Count joins from key runs.** `COUNT(*)` over two scans joined on one variable reads both
-  sides as (key, run length) pairs from indexes sorted on that variable and sums the
-  products (`CountJoinFromRuns`).
-* **Counts from statistics.** `GROUP BY ?class` with a count over `?s a ?class`, and
-  `GROUP BY ?p` with a count over `?s ?p ?o`, read their counts from the index statistics
-  (`GroupCountFromMetadata`, part of `metadata_counts`). The statistics describe the base
-  index as the last compaction or bulk load wrote it, so the updates since then are
-  applied at query time. Each inserted or deleted quad changes a quad count by one. It
-  changes a distinct count only when an index probe finds no other quad that holds the
-  value before or after the change. Quads of graphs the query does not read are taken out
-  in the same way. The quad counts per predicate are used only when the query reads a
-  single graph, because a union of graphs counts a triple once however many graphs hold
-  it. The planner uses the statistics when one probe per changed value costs less than
-  reading the scan. The corrected counts are kept with the snapshot, so later queries at
-  the same commit reuse them. EXPLAIN notes `[from statistics, corrected for N delta
-  quads]` or `[from statistics, without N quads of graphs not read]`.
-* **Batched path frontiers.** `p*` and `p+` traversals expand a large BFS level with one
-  merged pass over the predicate's index rows instead of a seek per node.
-* **Selective column decoding.** The block cache holds decoded columns, and scans decode
-  only the key columns they read (variables, graph, repeated variables), which also leaves
-  more room in the cache.
-* **Decorrelated EXISTS.** `FILTER EXISTS { P }` and `FILTER NOT EXISTS { P }`, where `P`
-  holds triple patterns, paths without `*` or `?`, `GRAPH` and deterministic FILTERs,
-  evaluate `P` once and keep the distinct values of the variables the outer rows bind.
-  Each outer row probes that set instead of evaluating the substituted pattern. A row that
-  leaves some of them unbound (after OPTIONAL) probes the set of the bound ones. A row
-  that binds a variable used only by a FILTER inside `P` is still evaluated by
-  substitution. The key set is built once per query, only when `P` costs less than
-  evaluating it per distinct outer key, and EXISTS stays per row when the set does not fit
-  in the memory budget. EXPLAIN shows `[EXISTS decorrelated on ?y: …]` or the reason it
-  was not, with `exists*` counters.
-* **Anti-join MINUS** (`anti_join`). When the two sides of a MINUS share one variable that
-  every row of both binds, the left rows whose value appears on the right are removed. Both
-  sides sorted on the variable give a merge. Otherwise the right side's values go into a
-  set of ids that the left rows probe. EXPLAIN notes `[anti-join on ?p by merge]`. Other
-  MINUS shapes keep the generic compatibility test.
-* **Merge left joins** (`merge_left_join`). An OPTIONAL whose two sides share one
-  variable, are both sorted on it and both always bind it runs as a merge. A branch-free
-  zipper like the anti-join's finds where each left row's key starts on the right, and
-  each left row is then written with the right rows of its key, or alone. The output keeps
-  the left side's order, and the planner treats it as sorted that way. A FILTER inside
-  the OPTIONAL is tested on the matched rows, and a left row none of whose matches pass
-  is kept alone. At 10.5M triples, `optional-count` runs in 6 ms instead of 15 ms on a
-  warm store. EXPLAIN notes `[merge on ?p]`. Other OPTIONALs keep the hash join, which
-  puts the unmatched left rows last.
-* **Probed OPTIONAL** (`probed_optional`). An OPTIONAL whose right side is a triple
-  pattern, with its FILTERs, sorted on a variable that every row of the evaluated left
-  side binds reads the pattern only for the left side's distinct values. It uses the
-  index join's reader and cost model and runs when probing those keys costs less than
-  reading the pattern. The pattern's other rows match no left row, so the result is
-  unchanged, and the merge or hash join then runs on the rows read. EXPLAIN notes
-  `[probed for the left side's keys: N keys, … rows read]` on the pattern. BSBM
-  Explore `q7` and `q8` at 10M take 3.8 ms instead of 5.2 and 5.8 ms on forge. Eager
-  execution runs it. A streamed OPTIONAL reads its right side as before.
-* Groups linked only by a FILTER equality use a keyed inner join when `keyed_join` is
-  enabled. The keys propose candidate pairs and the full FILTER still decides which
-  pairs pass. An eager LIMIT bounds the larger input in growing prefixes. A large ASK
-  instead reads both inputs alternately, starting with 64 rows, and stops at its first
-  matching pair. Hash joins below that ASK can probe a triple-pattern index when
-  conservative scan and key-multiplicity bounds fit the output and memory budgets.
-  This avoids collecting a whole input before their first output. Unproved expansion
-  and finite produced-row caps retain the original streaming hash join. The alternating join can hold
-  prefixes of both inputs, which uses more memory than one hash-build input. It charges
-  that storage before allocation and drops obsolete history once an input ends.
-* An eager ASK over a bounded pure UNION compares work before the first answer. An
-  unfiltered scan uses its requested prefix. VALUES, filters, sorts and probes retain
-  their full costs, and joins include the input eager execution builds in full.
-  Nested UNION estimates include later operands until they meet the remaining demand.
-  On an unchanged snapshot without a total produced-row cap, the whole ASK must pass
-  the whitelist before pure projections, filters, constant bindings, index joins and
-  the limited side of joins pass the requested demand instead of at least 64 rows.
-  SELECT and effectful consumers retain their order and demand policy. Explicit
-  streaming uses its existing operators. A finite produced-row cap keeps the original
-  prefixes, since geometric retries can exceed a sum of full-plan rows.
-  Branch order changes only when conservative output bounds fit the row and memory
-  budgets. Covering block counts bound scan rows before graph filtering. Join bounds
-  use the product of their inputs, including compatible UNDEF keys, and UNION bounds
-  sum their operands. Index probes retain their original order because cheap metadata
-  does not bound duplicate-key fanout. Pure demand admission is independent, so reducing
-  excess demand can still avoid unnecessary work. Retrying filters, probes and nested
-  joins keep the ordinary initial prefix when a new input prefix would rebuild a full
-  join input and whole-consumer bounds prove that widening fits the row and memory
-  limits. Otherwise they retain exact demand. Row-preserving projections and constant
-  bindings still pass exact demand.
-* A pattern with one free variable and at most four estimated rows is eligible for
-  `point_patterns`. The planner reads at most two rows and substitutes a constant only
-  when exactly one row exists in the query snapshot. It restores the variable in the
-  result and preserves RDF term identity, graph scope and multiplicity. The substitution
-  also makes arithmetic FILTER bounds constant. Filters with volatile functions,
-  application callbacks and occurrences in other algebra nodes keep their bindings.
-* **Keyed left joins** (`keyed_left_join`). Without this path, an OPTIONAL whose two
-  sides share no variable joins every left row with every right row before its FILTER
-  runs. When
-  the FILTER has a conjunct `?a = ?b` with one variable from each side, the join pairs
-  the rows through that equality instead. IRIs, blank nodes, simple strings and literals
-  of uninterpreted datatypes use their term ids. Language strings use keys that normalize
-  the case of their tags. Interpreted datatypes and triple terms meet other values in
-  that category, and unbound values meet none. The whole FILTER is then tested
-  on these candidate pairs, 64K pairs at a time, so the result and its bag multiplicity
-  are the product's. SP²Bench `q6` links its OPTIONAL to the outer pattern only by
-  `?author = ?author2`. At 10M triples the product has 1.58 × 10¹² rows, while the
-  candidate pairs number 7.4 million. EXPLAIN notes `[keyed on ?a = ?b: N
-  candidate pairs]`.
-* **Flat hash joins.** A hash join groups the rows of its smaller input
-  by key in flat arrays instead of a list per key. It counts each key's rows and then
-  places every row, so the rows of a key are one span of an array, in row order. An input
-  of 64K rows or more is first split into partitions of about 8K rows by bits of a hash
-  of the key, so that each partition's table stays in the CPU caches while it is built,
-  and the partitions are built in parallel. The larger input probes the table in pieces
-  of 32K rows in parallel, and the pieces' pairs are joined in its order, so the output
-  keeps the probing side's order. Joining a million rows with a million takes 16 to 21
-  ms instead of 62 to 69 ms, and joins of inputs that fit in the caches take as long as
-  before. EXPLAIN notes `[flat hash table: N keys in M parts]`.
-* **Batched index joins.** When a join's input always binds a variable that a triple
-  pattern can be read sorted on, and has few distinct values of it for the pattern's size,
-  the pattern is read only for those values (`IndexJoin`). The sorted distinct keys become
-  key ranges, and ranges in adjacent blocks are read in one scan: scattered keys cost a
-  seek per region, dense keys one sweep. Each input row then joins its key's rows, so the
-  input's order and duplicates are kept. The planner offers this next to merge and hash
-  joins. The keys are read with one cursor over the permutation (`gallop_index_join`).
-  Each key finds its first block by galloping over the blocks' first and last keys from
-  the block of the key before. It finds its rows by galloping in the block the cursor
-  holds, from where the key before ended, and the spans of the keys in the rows read are
-  found the same way. A range with changes from updates in it is read by a scan that
-  merges them. A key then takes 35 to 90 ns when the keys lie close together and 50 to
-  630 ns when they are spread over the pattern, where binary searches and a scan per
-  cluster of keys took 120 to 490 ns and 250 to 1250 ns. A scan reads a row in 2.2 ns on
-  the same machine. The planner counts 15 scanned rows per key, plus 3.5 for each
-  doubling of the pattern's rows per key, as fitted on keys spread at random. Each block
-  the keys touch costs 256 and each row read 8. These figures were measured on stores of
-  1.05M and 10.5M triples by the ignored tests in `sparql/costcal_tests.rs`. Probing then
-  wins when the input has up to about 5% as many keys as the pattern has rows, against a
-  merge join, and more against a hash join with a large input to build. With the cursor
-  switched off, a key costs 140 rows plus 6 per doubling, and probing wins up to about 1
-  or 2%. Probing is not offered when it would cost more than twice the scan of the
-  pattern. EXPLAIN counts the keys, seeks, blocks and rows read (`batched_join`).
-  A single two-column probe whose other variable is already present in the input can
-  narrow each primary-key span by a bound secondary value. It verifies secondary
-  ordering within equal primary keys before binary search, with cancellation and
-  deadline checks during that pass. This uses the existing probe table without another
-  index allocation. Equal secondary rows keep their multiplicity, and an unbound value
-  or unordered secondary column retains the complete compatibility scan.
-* **Fused stars.** Index joins on one subject over constant predicates (`?p ex:worksFor
-  ex:org7 ; foaf:name ?n ; foaf:age ?a`) run as one operator (`StarJoin`). It walks each
-  subject's SPO run once and picks out the star's predicates, or probes each pattern's own
-  permutation, whichever touches fewer blocks, and builds the output once instead of
-  through intermediate tables (`star_fusion`). The planner costs a star as its separate
-  index joins, since a fused star still spends about as long per key and pattern. A fused
-  star looks up every pattern for every key of its input, so each of those index joins is
-  costed for the keys of the star's input, not for those left after the patterns below
-  it (`fused_star_costs`).
-* **Whole-block scans under graph filters.** A block slice is copied column-wise whenever
-  every row passes the graph filter (one pass over the graph column), so default-graph
-  queries avoid row-by-row filtering.
-* **Join ordering on cost summaries.** The planner orders the joins of a group with one
-  program, which cannot be switched off. The dynamic program runs on
-  small summaries of plans, which hold the cost, the estimated rows, the sort variable and
-  the distinct-value estimates that later joins read. The plan tree is built once, for the
-  chosen joins only. A greedy plan is made first, and a partial plan that costs more than
-  it is dropped, because it cannot be part of a cheaper plan. A plan sorted on a variable
-  that no later join reads is dropped when another plan of the same patterns has the same
-  estimates at no more cost. Only subsets whose patterns share variables are planned. Up to
-  ten patterns, the result is the exhaustive program's plan or one of equal cost, except in
-  rare cases where a dropped plan is the one that a later filter would have favored. Every
-  WatDiv and `scripts/bench.sh` query plans at the same cost as before, and a star of nine
-  patterns (WatDiv S1) plans in about a millisecond instead of 400 ms. A group whose
-  subsets have too many splits to enumerate in about a millisecond is planned in rounds. A
-  group of more than 16 inputs, or one whose inputs share more than 128 variables, keeps
-  the greedy plan.
-  Each round plans the subsets up to the size that fits, and the cheapest plan of that
-  size becomes one input of the next round. That plan never costs more than the greedy
-  one. Groups of more than 16 patterns keep the greedy plan, which costs each pair of
-  plans once. Switched off, the program builds every candidate plan tree for every split
-  of up to 12 patterns, and larger groups are planned greedily.
+  sorted indexes as `(key, run length)` pairs and sums their products (`CountJoinFromRuns`).
+* **Counts from statistics.** `GROUP BY ?class` over `?s a ?class` and `GROUP BY ?p` over
+  `?s ?p ?o` read index statistics (`GroupCountFromMetadata`, part of `metadata_counts`) and
+  adjust them at query time for delta quads and excluded graphs (distinct counts probe the
+  index to verify whether a value appeared before or disappeared after the change; predicate
+  quad counts apply only to single-graph reads). The planner picks this when probe cost is
+  below scan cost, and caches corrected counts on the snapshot. `EXPLAIN` notes `[from
+  statistics, corrected for N delta quads]` or `[from statistics, without N quads of graphs
+  not read]`.
+
+### Join operators, paths and star fusion
+
+* **Batched path frontiers.** `p*` and `p+` traversals expand large BFS levels with one
+  merged pass over the predicate's index rows instead of one seek per node.
+* **Selective column decoding.** Scans decode only the columns they read (variables, graph,
+  repeated variables) into the block cache, reducing decode work and cache footprint.
+* **Decorrelated EXISTS.** `FILTER EXISTS { P }` and `FILTER NOT EXISTS { P }` (where `P`
+  uses triple patterns, `*`/`?`-free paths, `GRAPH` and deterministic FILTERs) evaluate `P`
+  once into a set of distinct outer-variable tuples that outer rows probe. Rows leaving some
+  keys unbound probe the bound-key subset; rows binding variables used only inside `P`'s
+  FILTER still run by substitution. Decorrelation runs only when cheaper than per-key
+  evaluation and within the memory budget (`EXPLAIN` reports `[EXISTS decorrelated on ?y: …]`
+  and `exists*` counters).
+* **Anti-join MINUS** (`anti_join`). When both sides of `MINUS` share one always-bound
+  variable, matching left rows are removed by merge (if both inputs are sorted) or via an
+  ID hash set (`EXPLAIN` notes `[anti-join on ?p by merge]`). Other shapes keep generic
+  compatibility testing.
+* **Merge left joins** (`merge_left_join`). An `OPTIONAL` sharing one always-bound variable
+  with both sides sorted on it runs as a branch-free zipper merge, preserving left-side sort
+  order for upstream operators and evaluating inner FILTERs on matched pairs before falling
+  back to unmatched left rows. In local measurements at 10.5M triples, `optional-count`
+  drops from 15 ms to 6 ms warm (`EXPLAIN` notes `[merge on ?p]`). Other OPTIONALs use hash
+  join.
+* **Pair conditions in streamed merge OPTIONAL** (`merge_pair_conditions`). A conditioned
+  streamed merge OPTIONAL whose merge key is the only shared variable evaluates the
+  condition on staged pairs before copying output rows, matching eager merge behavior. With
+  the switch off, all pairs and left extensions are copied into the output batch and then
+  compacted.
+
+  The fallback copy-and-compact path is retained for cross-batch right runs, oversized left
+  runs, spooled runs, tight memory budgets that cannot fit deciding scratch, and any query
+  referencing registered functions or observable conditions (side effects, `RAND`, `UUID`,
+  `STRUUID`, `BNODE`, `afn:system-timezone`, `afn:nowtz`, or `EXISTS` calling `SERVICE`,
+  volatile functions or non-XSD-cast IRI functions). Deciding merges can hold up to one
+  extra output batch plus condition scratch within tight budgets and may end batches at
+  different left rows than the fallback path; observable calls remain identical in arguments
+  and order, though batch boundaries are not part of that contract
+  ([ROADMAP.md](../ROADMAP.md), item 1199).
+* **Probed OPTIONAL** (`probed_optional`). In eager execution, an `OPTIONAL` whose right
+  side is a triple pattern (with optional FILTERs) sorted on a variable always bound by the
+  left side probes only the left side's distinct keys when cheaper than a full scan
+  (`EXPLAIN` notes `[probed for the left side's keys: N keys, … rows read]`). In local
+  measurements at 10M triples, BSBM Explore `q7` and `q8` drop from 5.2 and 5.8 ms to
+  3.8 ms. Streamed OPTIONALs still read the full right side.
+* **Keyed inner joins and alternating ASK** (`keyed_join`). Groups linked only by a FILTER
+  equality run a keyed inner join to propose candidate pairs before applying the full
+  FILTER. An eager `LIMIT` reads the larger input in growing prefixes; a large `ASK` reads
+  both inputs alternately starting at 64 rows and stops at the first match. Hash joins below
+  that `ASK` can probe a triple-pattern index when conservative scan and multiplicity bounds
+  fit output and memory budgets; unproved expansions and finite row caps keep the streaming
+  hash join. Alternating joins charge both prefix buffers before allocation and drop
+  obsolete history once an input ends.
+* **Eager ASK over bounded UNION.** An eager `ASK` over a bounded pure `UNION` orders
+  branches by work before the first answer when conservative output bounds fit row and
+  memory budgets (covering block counts for scans, input products for joins, sums for
+  unions; index probes keep original order because metadata does not bound duplicate-key
+  fanout). On an unchanged snapshot without a finite produced-row cap, whitelisted pure
+  projections, filters, constant bindings, index joins and limited join sides propagate
+  exact requested demand instead of a 64-row minimum, while retrying operators keep the
+  ordinary prefix when widening would rebuild a full join input and proven bounds allow it.
+  `SELECT`, effectful consumers and explicit streaming keep their existing order and demand
+  policies.
+* **Keyed left joins** (`keyed_left_join`). An `OPTIONAL` whose sides share no variable
+  normally evaluates a Cartesian product before filtering. When the FILTER contains `?a = ?b`
+  across both sides, candidate pairs are matched via equality keys (term IDs for IRIs, blank
+  nodes, simple strings and uninterpreted datatypes; case-normalized keys for language
+  strings; category keys for interpreted datatypes and triple terms) and tested in 64K-pair
+  chunks, preserving bag multiplicity. On SP²Bench `q6` at 10M triples, this narrows
+  1.58 × 10¹² product rows to 7.4M candidate pairs (`EXPLAIN` notes `[keyed on ?a = ?b: N
+  candidate pairs]`).
+* **Flat hash joins.** Build-side rows are stored contiguously per key in flat arrays in row
+  order. Inputs of 64K rows or more are hash-partitioned into ~8K-row cache-resident chunks
+  and built in parallel; the probe side probes in parallel 32K-row pieces and stitches
+  results in probe order. In local measurements, joining 1M × 1M rows drops from 62–69 ms
+  to 16–21 ms (`EXPLAIN` notes `[flat hash table: N keys in M parts]`).
+* **Batched index joins** (`batched_join`, `gallop_index_join`). When an input always binds
+  a variable a triple pattern can read sorted on and has few distinct keys relative to
+  pattern size, `IndexJoin` reads only those key ranges while preserving input order and
+  duplicates. With `gallop_index_join`, one permutation cursor gallops across block metadata
+  and within blocks (merging delta scans where changed).
+
+  In local measurements on 1.05M and 10.5M-triple stores (`sparql/costcal_tests.rs`),
+  galloping costs 35–90 ns per clustered key and 50–630 ns per scattered key (versus
+  120–490 ns and 250–1,250 ns for separate binary searches), against 2.2 ns per sequentially
+  scanned row. The planner models 15 scanned rows per key plus 3.5 per doubling of rows per
+  key (256 per touched block, 8 per row read), winning up to ~5% key density versus merge
+  join (and higher versus large hash builds); probing is not offered above twice the scan
+  cost. When a two-column probe's secondary variable is already bound, each primary span
+  binary-searches the secondary column after verifying secondary ordering, falling back to
+  compatibility scan for unbound or unordered values.
+* **Fused stars** (`star_fusion`, `fused_star_costs`). Consecutive constant-predicate index
+  joins on one subject (`?p ex:worksFor ex:org7 ; foaf:name ?n ; foaf:age ?a`) execute as
+  one `StarJoin`, choosing between one SPO sweep per subject and per-predicate probes by
+  estimated block cost and writing the output table once. Each member join is costed against
+  the star's input keys rather than the rows remaining after earlier members
+  (`fused_star_costs`).
 
 ## Cold reads
 
-These switches matter on a server whose index and vocabulary files are not in the page
-cache, such as the first queries after a restart. With the files in memory they cost
-little and change nothing. Each one has the same answers with it on and off.
+Read hints and read-ahead overlap reads on a server whose index and vocabulary files
+are outside the page cache, such as on the first queries after a restart.
 [X07](../specs/X07-cold-sparse-reads.md) has the design and the measurements.
 
-* **Constants requested together** (`prefetch_constants`). Before the planner looks up
+* **Constants requested together.** Before the planner looks up
   the constants of a query one by one, it collects the IRIs and literals of the patterns,
   paths, VALUES rows, graph names and the common FILTER comparisons. It asks for the
   sparse-index group of every one of them in one pass (`Vocab::prefetch_keys`), so the
@@ -565,7 +438,7 @@ little and change nothing. Each one has the same answers with it on and off.
   and it does nothing without a sparse index or with the read hints off. A table of
   1,024 key hashes per vocabulary remembers the keys whose group was already asked for,
   so a warm constant costs a hash and a load instead of a search of the sparse index.
-* **Scans requested before they run** (`prefetch_first_scan`). When the plan is built,
+* **Scans requested before they run.** When the plan is built,
   every scan of 64 blocks or fewer asks the kernel for the columns the reader will decode.
   A block inside the key range needs the scan's columns, and a block at an end of the range
   also needs the columns that bound it. A range scan asks for the blocks of its id ranges.
@@ -586,11 +459,10 @@ little and change nothing. Each one has the same answers with it on and off.
   received no advice gets current-block fallback advice in eager and cursor readers.
   Cached and empty spans also have a finite traversal budget, so repeated calls at one
   position do not add another window. Concurrent scans share no coverage state and do
-  not change the mapping's random-access advice. `SPARKLES_READ_WINDOW_KB` sets the
-  target, 4096 KiB by default. This bounds requested bytes, not physical I/O completion.
+  not change the mapping's random-access advice. The target bounds requested bytes.
   A pass consults its window only at a block the cache does not hold, so a warm pass does
-  no read-ahead work. Passes over the vocabulary in id order use the same configured size.
-* **Terms of small inputs** (`prefetch_terms`). A FILTER, BIND or ORDER BY over a table of
+  no read-ahead work. Passes over the vocabulary in id order use the same 4 MiB target.
+* **Terms of small inputs.** A FILTER, BIND or ORDER BY over a table of
   2 to 4,095 rows evaluates the rows one at a time. Before the first row, it asks for the
   vocabulary blocks of the terms it will read. With a numeric column it also asks for the
   pages of the values, and for the pages of the kinds and the rank when the column keeps
@@ -598,7 +470,7 @@ little and change nothing. Each one has the same answers with it on and off.
   mapping, so a warm call makes no system call. It does locate each id, which costs a
   memory read. Larger tables decode their terms in id order as before. The native JSON
   result writer asks for the blocks of the terms it prints, as the other result writers do.
-* **Parallel decode** (`parallel_decode`). An index join that has asked the kernel for
+* **Parallel decode.** An index join that has asked the kernel for
   its blocks decodes their columns on a small thread pool of the block cache's own, before
   the reader reaches them. Scans do not use it. It decodes only columns the reader decodes
   anyway and keeps them in the cache. A request adds at most an eighth of the cache, so a
@@ -624,15 +496,16 @@ little and change nothing. Each one has the same answers with it on and off.
   the resident pages of its other index files, and the next start reads them on a
   background thread after it is ready. [Memory and caches](../USAGE.md#memory-and-caches)
   describes it.
-* **Decoding the next cursor batch ahead** (`decode_ahead`). A result writer that reads
+* **Decoding the next cursor batch ahead.** A result writer that reads
   a cursor decodes the terms of the next batch on another Rayon thread while it writes the
   current one. It writes the first batch before it pulls the second, so the first rows
   wait for one batch only, and it reads ahead only when the memory budget has room for
   twice what the first batch took. The decoded terms of a batch are charged to the
   query's memory ledger, and a batch whose terms the ledger refuses is decoded cell by
   cell as before. With one Rayon thread the writer decodes in turn. Together with
-  charging each written row's terms once, this took a streamed TSV export of 500,000 rows
-  on forge from 134.7 ms to 72 ms at 12 threads, where eager execution takes 84 ms.
+  charging each written row's terms once, in local measurements this took a streamed TSV
+  export of 500,000 rows from 134.7 ms to 72 ms at 12 threads, where eager execution takes
+  84 ms.
 * **Predicate patterns** (`predicate_patterns`). A generation keeps `patterns.bin`, which
   gives every subject the number of its set of predicates and lists those sets, once for
   the default graph and once for the union of the named graphs. A `GROUP BY ?p` that

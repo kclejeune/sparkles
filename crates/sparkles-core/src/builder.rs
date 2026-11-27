@@ -202,6 +202,10 @@ pub struct IndexMeta {
     /// the member ignore it, and the file next to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patterns: Option<crate::patterns::PatternInfo>,
+    /// The generation's reifier proposition-term index (`reifiers.bin`). Absent in
+    /// generations written before item 766.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reifiers: Option<crate::reifiers::ReifierInfo>,
     /// The features of the generation that every reader of its format does not read
     /// (spec X11 §7.1), such as [`FEATURE_FSST_VOCAB`]. The list is always present from
     /// format 5, empty for a generation without one, and a reader refuses a generation
@@ -375,6 +379,22 @@ impl LabelScope {
     }
 }
 
+/// Provenance of a failure during [`Builder::add_source_classified`].
+pub(crate) enum AddSourceError {
+    /// Failed while reading, decoding or parsing the input source.
+    Source(Error),
+    /// Failed inside the builder's sink (graph fence, interrupt, spill or batch I/O).
+    Sink(Error),
+}
+
+impl AddSourceError {
+    pub(crate) fn into_inner(self) -> Error {
+        match self {
+            AddSourceError::Source(e) | AddSourceError::Sink(e) => e,
+        }
+    }
+}
+
 pub struct Builder {
     dir: PathBuf,
     tmp: PathBuf,
@@ -517,9 +537,50 @@ impl Builder {
 
     /// Parse and encode a source (in parallel where the format allows it).
     pub fn add_source(&self, src: &Source) -> Result<()> {
+        self.add_source_classified(src)
+            .map_err(AddSourceError::into_inner)
+    }
+
+    /// [`add_source`](Self::add_source), keeping errors from the builder sink (graph
+    /// fences, interrupts, batch spill I/O) distinct from errors reading or parsing `src`.
+    pub(crate) fn add_source_classified(
+        &self,
+        src: &Source,
+    ) -> std::result::Result<(), AddSourceError> {
+        struct TrackedSink<S> {
+            inner: S,
+            sink_err: Arc<Mutex<Option<Error>>>,
+        }
+        impl<S: QuadSink> QuadSink for TrackedSink<S> {
+            fn quad(&mut self, q: Quad) -> Result<()> {
+                self.inner.quad(q).map_err(|e| {
+                    self.sink_err.lock().get_or_insert(e);
+                    Error::Cancelled
+                })
+            }
+            fn finish(self) -> Result<()> {
+                let sink_err = self.sink_err;
+                self.inner.finish().map_err(|e| {
+                    sink_err.lock().get_or_insert(e);
+                    Error::Cancelled
+                })
+            }
+        }
         let scope = Arc::new(LabelScope::new());
+        let sink_err: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
         self.report(&format!("parsing {}", src.name));
-        let prefixes = parse_source(src, self.opts.threads, || self.encoder(scope.clone()))?;
+        let prefixes = match parse_source(src, self.opts.threads, || TrackedSink {
+            inner: self.encoder(scope.clone()),
+            sink_err: Arc::clone(&sink_err),
+        }) {
+            Ok(prefixes) => prefixes,
+            Err(e) => {
+                if let Some(se) = sink_err.lock().take() {
+                    return Err(AddSourceError::Sink(se));
+                }
+                return Err(AddSourceError::Source(e));
+            }
+        };
         self.add_prefixes(prefixes);
         Ok(())
     }
@@ -723,6 +784,10 @@ impl Builder {
             .find(&id::iri_key(oxrdf::vocab::rdf::TYPE.as_str()))
             .ok()
             .map(|i| Id::vocab(i).0);
+        let rdf_reifies = vocab
+            .find(crate::reifiers::RDF_REIFIES_KEY)
+            .ok()
+            .map(Id::vocab);
         drop(vocab);
         let plan = Plan::new(self.named_graphs.load(Ordering::Relaxed));
         let mut built = if total_in as usize <= self.opts.sort_mem_quads {
@@ -783,6 +848,19 @@ impl Builder {
             }
             None => crate::patterns::PatternInfo::skipped("turned off for this build"),
         };
+        let reifiers = if rdf_reifies.is_some() {
+            self.interrupted()?;
+            self.report("writing reifier index");
+            let vocab = Vocab::open_codec(&self.dir, fsst)?;
+            let pos = crate::index::PermIndex::open(&self.dir, Perm::Pos)?;
+            let info = crate::reifiers::build(&self.dir, &vocab, &pos, rdf_reifies, &|| {
+                self.interrupted()
+            })?;
+            self.phase_done("reifier index");
+            info
+        } else {
+            crate::reifiers::ReifierInfo::empty()
+        };
 
         let features: Vec<String> = match self.opts.vocab_codec.unwrap_or_default() {
             VocabCodec::Front => Vec::new(),
@@ -797,6 +875,7 @@ impl Builder {
             prefixes: std::mem::take(&mut *self.prefixes.lock()),
             created: now_rfc3339(),
             patterns: Some(patterns),
+            reifiers: Some(reifiers),
         };
         crate::store::write_synced(
             &self.dir.join("stats.json"),

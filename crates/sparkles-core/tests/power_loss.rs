@@ -128,7 +128,6 @@ fn base_commit(s: &Store, n: u32) {
 struct Config {
     group: bool,
     direct: bool,
-    idle_direct: bool,
     threads: u32,
     commits: u32,
 }
@@ -138,7 +137,6 @@ impl Config {
         StoreOptions {
             group_commit: self.group,
             wal_direct_writes: self.direct,
-            group_commit_idle_direct: self.idle_direct,
             ..Default::default()
         }
     }
@@ -201,15 +199,10 @@ fn child_writer() {
         return;
     };
     let f: Vec<&str> = spec.split(',').collect();
-    assert_eq!(
-        f.len(),
-        5,
-        "group, WAL direct, threads, commits, idle direct"
-    );
+    assert_eq!(f.len(), 4, "group, WAL direct, threads, commits");
     let cfg = Config {
         group: f[0] == "1",
         direct: f[1] == "1",
-        idle_direct: f[4] == "1",
         threads: f[2].parse().unwrap(),
         commits: f[3].parse().unwrap(),
     };
@@ -521,12 +514,11 @@ fn run_writer(
         .env(
             CHILD,
             format!(
-                "{},{},{},{},{}",
+                "{},{},{},{}",
                 u8::from(cfg.group),
                 u8::from(cfg.direct),
                 cfg.threads,
                 cfg.commits,
-                u8::from(cfg.idle_direct)
             ),
         )
         .env("SPARKLES_PL_DB", &db)
@@ -537,9 +529,13 @@ fn run_writer(
         .env_remove(BACKGROUND)
         .env_remove("SPARKLES_IO_DELAY_US")
         .env_remove("SPARKLES_IO_SYNC_ENTERED")
-        .env_remove("SPARKLES_IO_SYNC_RELEASE");
+        .env_remove("SPARKLES_IO_SYNC_RELEASE")
+        .env_remove("SPARKLES_IO_HOLD_ANN_UNTIL_WAL");
     if record {
         cmd.env("SPARKLES_IO_LOG", root.join("io.log"));
+        if cfg.threads == 1 && !text && fault.is_empty() {
+            cmd.env("SPARKLES_IO_HOLD_ANN_UNTIL_WAL", "1");
+        }
     }
     if background {
         assert!(text && record && fault.is_empty());
@@ -916,7 +912,7 @@ impl Model {
         root: &Path,
         out: &Path,
         dir_prefix: usize,
-        mut keep: impl FnMut(&Op) -> Option<Vec<bool>>,
+        mut keep: impl FnMut(&str, &Op) -> Option<Vec<bool>>,
     ) {
         let _ = std::fs::remove_dir_all(out);
         copy_dir(base, out);
@@ -966,7 +962,7 @@ impl Model {
                     let pages = match op.state {
                         State::Dropped => continue,
                         State::Durable => None,
-                        State::Pending => match keep(op) {
+                        State::Pending => match keep(path, op) {
                             None => continue,
                             some => some,
                         },
@@ -1167,6 +1163,7 @@ fn check_image(
     base: u32,
     acked: &[(u64, u32, u32)],
     text: bool,
+    exact_head: Option<u64>,
     what: &str,
 ) -> Option<u64> {
     // The full-text index's checkpoint never names a commit above the recovered log, so
@@ -1197,6 +1194,17 @@ fn check_image(
         .max()
         .unwrap_or(0)
         .max(u64::from(base));
+    if let Some(expected) = exact_head {
+        assert_eq!(
+            head, expected,
+            "{what}: expected exact recovered head {expected}, got {head}"
+        );
+        assert!(
+            s.annotation(expected + 1).is_none(),
+            "{what}: dropped commit {} must have no annotation",
+            expected + 1
+        );
+    }
     assert!(
         head >= top,
         "{what}: head {head} is before the last acknowledged commit {top}"
@@ -1438,11 +1446,11 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             "{name}: no fresh transaction began and was acknowledged during one successful text-file synchronization"
         );
     }
-    // With every commit grouped and the write-through handles on, the leaders write each
-    // fence's records and terms with `O_DSYNC` writes once the log has preallocated
-    // space, and no writer writes the log itself (X09 item 446). The crash images below
-    // then check those writes against the receipts.
-    if cfg.group && cfg.direct && !cfg.idle_direct {
+    // With every persistent commit fenced and the write-through handles on, the leaders
+    // write each fence's records and terms with `O_DSYNC` writes once the log has
+    // preallocated space (X09 item 446, X16 Phase 6). The crash images below then check
+    // those writes against the receipts.
+    if cfg.direct {
         let dsync = |name: &str| {
             log.iter()
                 .filter(
@@ -1509,7 +1517,15 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
     // in either order and whether or not the writes overlap.
     let (mut open, mut ann_done, mut wal_done) = (false, false, false);
     let (mut forced, mut split) = (0usize, 0usize);
+    let (mut missing_ann_dropped, mut missing_ann_dropped_direct, mut missing_ann_with_prior) =
+        (0usize, 0usize, 0usize);
+    let (mut last_asymmetric_seq, mut last_asymmetric_direct_seq) = (None::<u64>, None::<u64>);
+    let (mut pending_wal_dsync, mut commit_wal_dsync) = (false, false);
+    let (mut commit_wal_written, mut commit_vocab_written) = (false, false);
+    let hold_ann = cfg.threads == 1 && !text;
+    let workload_commits = (cfg.threads * cfg.commits) as usize;
     const FORCED: usize = 48;
+    const MAX_ASYMMETRIC: usize = 4;
     for (i, rec) in log.iter().enumerate() {
         if let Rec::Write { path, data, .. } = rec
             && path.ends_with("ack.log")
@@ -1518,6 +1534,10 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             let t = u32::from_le_bytes(data[8..12].try_into().unwrap());
             let k = u32::from_le_bytes(data[12..16].try_into().unwrap());
             acked.push((seq, t, k));
+            pending_wal_dsync = false;
+            commit_wal_dsync = false;
+            commit_wal_written = false;
+            commit_vocab_written = false;
         }
         model.apply(rec);
         // Always check the clean state just after the forced locked pass, even when
@@ -1526,6 +1546,31 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             matches!(rec, Rec::Write { path, .. } if path.ends_with("/locked-cleared"));
         let ann = |path: &str| path.ends_with("/annotations.bin");
         let wal = |path: &str| path.ends_with("/wal.log");
+        let vocab = |path: &str| path.ends_with("/delta.vocab");
+        match rec {
+            Rec::Write { path, dsync, .. } if wal(path) => {
+                if *dsync {
+                    pending_wal_dsync = true;
+                }
+            }
+            Rec::WriteEnd { path, failed, .. } if wal(path) => {
+                if !failed {
+                    commit_wal_written = true;
+                    if pending_wal_dsync {
+                        commit_wal_dsync = true;
+                    }
+                }
+                pending_wal_dsync = false;
+            }
+            Rec::WriteEnd {
+                path,
+                failed: false,
+                ..
+            } if vocab(path) => {
+                commit_vocab_written = true;
+            }
+            _ => {}
+        }
         if let Rec::Write { path, .. } = rec
             && (ann(path) || wal(path))
             && !open
@@ -1546,6 +1591,75 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             }
             _ => (false, false),
         };
+        // Deterministically construct an asymmetric crash image where a complete WAL
+        // transaction and its vocabulary reached disk while its annotation write has
+        // not yet reached disk, keeping all prior durable annotations intact, and
+        // verify that recovery truncates that exact tail commit.
+        let asymmetric_candidate = if hold_ann {
+            acked.len() < workload_commits
+                && commit_wal_written
+                && commit_vocab_written
+                && matches!(
+                    rec,
+                    Rec::WriteEnd { path, failed: false, .. } if wal(path) || vocab(path)
+                )
+        } else {
+            !background
+                && matches!(
+                    rec,
+                    Rec::Write { path, .. } | Rec::WriteEnd { path, failed: false, .. }
+                        if wal(path) || vocab(path)
+                )
+        };
+        if asymmetric_candidate {
+            let top = acked
+                .iter()
+                .map(|a| a.0)
+                .max()
+                .unwrap_or(0)
+                .max(u64::from(base));
+            let next = top + 1;
+            let need = if commit_wal_dsync {
+                missing_ann_dropped_direct < MAX_ASYMMETRIC
+                    && last_asymmetric_direct_seq != Some(next)
+            } else {
+                missing_ann_dropped < MAX_ASYMMETRIC && last_asymmetric_seq != Some(next)
+            };
+            if need {
+                model.image(&base_db, &root, &img, usize::MAX, |path, _| {
+                    (!ann(path)).then(Vec::new)
+                });
+                let pre = check(&img, &CheckOptions::default()).unwrap();
+                let needle =
+                    format!("the annotation of commit {next} is missing from annotations.bin");
+                let matched = pre.status == Status::Warning && pre.to_text().contains(&needle);
+                if hold_ann {
+                    assert!(
+                        matched,
+                        "{name}: handshake image after record {i} for commit {next} (dsync={commit_wal_dsync}) did not report missing-annotation warning:\n{}",
+                        pre.to_text()
+                    );
+                }
+                if matched {
+                    let what = format!(
+                        "{name}: crash after record {i} of {}, complete WAL+vocab with missing annotation for commit {next} (dsync={commit_wal_dsync})",
+                        log.len()
+                    );
+                    let p = check_image(&img, base, &acked, text, Some(top), &what);
+                    named = named.max(p.unwrap_or(0));
+                    images += 1;
+                    missing_ann_dropped += 1;
+                    if top > u64::from(base) {
+                        missing_ann_with_prior += 1;
+                    }
+                    last_asymmetric_seq = Some(next);
+                    if commit_wal_dsync {
+                        missing_ann_dropped_direct += 1;
+                        last_asymmetric_direct_seq = Some(next);
+                    }
+                }
+            }
+        }
         split += usize::from(between && is_split && forced < FORCED);
         let between = between && forced < FORCED;
         forced += usize::from(between);
@@ -1554,24 +1668,32 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         }
         let what = format!("{name}: crash after record {i} of {}", log.len());
         // everything still unsynchronized is lost
-        model.image(&base_db, &root, &img, 0, |_| None);
+        model.image(&base_db, &root, &img, 0, |_, _| None);
         let p = check_image(
             &img,
             base,
             &acked,
             text,
+            None,
             &format!("{what}, unsynced writes lost"),
         );
         named = named.max(p.unwrap_or(0));
         // everything is kept, as after a process crash
-        model.image(&base_db, &root, &img, usize::MAX, |_| Some(Vec::new()));
-        let p = check_image(&img, base, &acked, text, &format!("{what}, nothing lost"));
+        model.image(&base_db, &root, &img, usize::MAX, |_, _| Some(Vec::new()));
+        let p = check_image(
+            &img,
+            base,
+            &acked,
+            text,
+            None,
+            &format!("{what}, nothing lost"),
+        );
         named = named.max(p.unwrap_or(0));
         // a random part of what is pending survives, in whole writes or single pages, and
         // a random prefix of the directory operations
         for _ in 0..2 {
             let dirs = (rng.next() % (model.pending_dirs() as u64 + 1)) as usize;
-            model.image(&base_db, &root, &img, dirs, |op| {
+            model.image(&base_db, &root, &img, dirs, |_, op| {
                 if !rng.coin(50) {
                     return None;
                 }
@@ -1589,6 +1711,7 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
                 base,
                 &acked,
                 text,
+                None,
                 &format!("{what}, random pages lost"),
             );
             named = named.max(p.unwrap_or(0));
@@ -1596,15 +1719,31 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         images += 4;
     }
     println!(
-        "{name}: checked {images} crash images from {} I/O records, {} acknowledgements, highest text checkpoint {named}, {forced} points at annotation writes, {split} between an annotation write and a log write",
+        "{name}: checked {images} crash images from {} I/O records, {} acknowledgements, highest text checkpoint {named}, {forced} points at annotation writes, {split} between an annotation write and a log write, {missing_ann_dropped} asymmetric missing-annotation drops ({missing_ann_dropped_direct} direct)",
         log.len(),
         acked.len()
     );
-    if cfg.group && cfg.direct && !cfg.idle_direct && direct_io_available(&run.root) {
+    if cfg.direct && direct_io_available(&run.root) {
         assert!(
             split > 0,
             "{name}: no crash point fell between a fence's annotation write and its log write"
         );
+    }
+    if hold_ann {
+        assert!(
+            missing_ann_dropped >= MAX_ASYMMETRIC,
+            "{name}: expected at least {MAX_ASYMMETRIC} asymmetric missing-annotation crash images, got {missing_ann_dropped}"
+        );
+        assert!(
+            missing_ann_with_prior > 0,
+            "{name}: no asymmetric missing-annotation crash image kept prior durable annotations"
+        );
+        if cfg.direct && direct_io_available(&run.root) {
+            assert_eq!(
+                missing_ann_dropped_direct, MAX_ASYMMETRIC,
+                "{name}: expected {MAX_ASYMMETRIC} direct-I/O asymmetric missing-annotation crash images, got {missing_ann_dropped_direct}"
+            );
+        }
     }
     assert!(images > 0);
     assert!(!acked.is_empty(), "the writer acknowledged no commit");
@@ -1656,17 +1795,6 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: true,
                 direct: true,
-                idle_direct: true,
-                threads: 4,
-                commits: 25,
-            },
-        ),
-        (
-            "group-direct-fences",
-            Config {
-                group: true,
-                direct: true,
-                idle_direct: false,
                 threads: 4,
                 commits: 25,
             },
@@ -1676,8 +1804,25 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: true,
                 direct: false,
-                idle_direct: true,
                 threads: 4,
+                commits: 25,
+            },
+        ),
+        (
+            "group-of-one-direct",
+            Config {
+                group: true,
+                direct: true,
+                threads: 1,
+                commits: 25,
+            },
+        ),
+        (
+            "group-of-one-buffered",
+            Config {
+                group: true,
+                direct: false,
+                threads: 1,
                 commits: 25,
             },
         ),
@@ -1686,7 +1831,6 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: false,
                 direct: true,
-                idle_direct: true,
                 threads: 2,
                 commits: 25,
             },
@@ -1696,7 +1840,6 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: false,
                 direct: false,
-                idle_direct: true,
                 threads: 2,
                 commits: 25,
             },
@@ -1728,7 +1871,6 @@ fn crash_images_of_a_dataset_with_full_text_search_grouped() {
         Config {
             group: true,
             direct: false,
-            idle_direct: false,
             threads: 4,
             commits: 25,
         },
@@ -1751,7 +1893,6 @@ fn crash_images_of_a_dataset_with_full_text_search_ordinary() {
         Config {
             group: false,
             direct: false,
-            idle_direct: true,
             threads: 2,
             commits: 15,
         },
@@ -1776,7 +1917,6 @@ fn background_full_text_checkpoints(group: bool) {
         Config {
             group,
             direct: false,
-            idle_direct: false,
             threads: 4,
             commits: 50,
         },
@@ -1801,23 +1941,26 @@ fn crash_images_during_background_full_text_checkpoints_grouped() {
 
 const RETRY: &str = "SPARKLES_PL_RETRY";
 
-/// The writer process of `a_failed_first_annotation_sync_keeps_later_messages`: two serial
-/// updates that carry a message each. Prints `LINE first ...` and `LINE second ...`.
+/// The writer process of `a_failed_first_annotation_sync_keeps_later_messages`:
+/// - `bulk`: a bulk commit calls `Annotations::append` before switching `CURRENT`, so a
+///   failed first annotation sync cuts the record back, keeps the header, and lets the
+///   second commit succeed in the same store instance.
+/// - `ordinary` / `group`: a WAL commit writes its annotation in parallel with its WAL
+///   records under the group fence contract (X16 Phase 6), so a failed first annotation
+///   sync poisons the store; the second commit in the same store is refused as poisoned,
+///   and reopening preserves the header and lets the next message succeed.
 #[test]
 fn child_annotation_retry() {
     let Ok(spec) = std::env::var(RETRY) else {
         return;
     };
     let db = PathBuf::from(std::env::var("SPARKLES_PL_DB").unwrap());
-    let s = Store::open(
-        &db,
-        StoreOptions {
-            group_commit: spec == "group",
-            group_commit_idle_direct: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let opts = StoreOptions {
+        group_commit: spec == "group",
+        bulk_threshold: if spec == "bulk" { 0 } else { 250_000 },
+        ..Default::default()
+    };
+    let s = Store::open(&db, opts).unwrap();
     // faults count the calls after the store has opened
     std::fs::write(std::env::var("SPARKLES_IO_ARM").unwrap(), b"armed").unwrap();
     for (name, k) in [("first", 0), ("second", 1)] {
@@ -1828,9 +1971,16 @@ fn child_annotation_retry() {
                 ..Default::default()
             },
         );
-        let ids = w.encode_quad(&quad(1, k), &mut Default::default()).unwrap();
-        w.insert(ids).unwrap();
-        match w.commit() {
+        let staged = w
+            .encode_quad(&quad(1, k), &mut Default::default())
+            .and_then(|ids| {
+                if spec == "bulk" {
+                    w.insert_bulk(vec![ids])
+                } else {
+                    w.insert(ids).map(|_| ())
+                }
+            });
+        match staged.and_then(|_| w.commit()) {
             Ok(r) => println!("LINE {name} ok {}", r.commit.seq),
             Err(e) => println!("LINE {name} err {e}"),
         }
@@ -1839,8 +1989,12 @@ fn child_annotation_retry() {
 }
 
 /// The first annotation of a database creates `annotations.bin` and its header. When the
-/// sync of that first record fails, the record is taken back and the header stays, so the
-/// next message lands after the header and survives a reopen.
+/// sync of that first record fails:
+/// - for a bulk commit (`Annotations::append`), the record is taken back and the header
+///   stays, so the next message lands after the header in the same store and survives reopen;
+/// - for a WAL commit (group-of-one fence, X16 Phase 6), the fence poisons the writer
+///   while keeping the synced header, so the store refuses later writes until reopen, and
+///   after reopen the next message lands after the header and survives another reopen.
 fn annotation_retry(name: &str, mode: &str) {
     let root = work_root().join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1873,18 +2027,52 @@ fn annotation_retry(name: &str, mode: &str) {
         lines.iter().any(|l| l.starts_with("first err ")),
         "{name}: the first message was acknowledged: {lines:?}"
     );
-    assert!(
-        lines.iter().any(|l| l == "second ok 1"),
-        "{name}: the second message did not take sequence 1: {lines:?}"
-    );
-    let s = Store::open(&db, StoreOptions::default()).unwrap();
-    assert_eq!(s.snapshot().commit, 1, "{name}");
-    assert_eq!(
-        s.annotation(1).and_then(|a| a.message).as_deref(),
-        Some("second"),
-        "{name}: the acknowledged message was lost"
-    );
-    drop(s);
+    if mode == "bulk" {
+        assert!(
+            lines.iter().any(|l| l == "second ok 1"),
+            "{name}: the second message did not take sequence 1: {lines:?}"
+        );
+        let s = Store::open(&db, StoreOptions::default()).unwrap();
+        assert_eq!(s.snapshot().commit, 1, "{name}");
+        assert_eq!(
+            s.annotation(1).and_then(|a| a.message).as_deref(),
+            Some("second"),
+            "{name}: the acknowledged message was lost"
+        );
+        drop(s);
+    } else {
+        assert!(
+            lines.iter().any(|l| l.starts_with("second err ")),
+            "{name}: poisoned writer accepted a second write: {lines:?}"
+        );
+        let s = Store::open(&db, StoreOptions::default()).unwrap();
+        let recovered = s.snapshot().commit;
+        assert!(recovered <= 1, "{name}: unexpected commit {recovered}");
+        // the header survived; a fresh commit with a message lands cleanly after reopen
+        let mut w = s.write_with(
+            CommitKind::Update,
+            sparkles_core::guard::WriteOptions {
+                message: Some("after-reopen".into()),
+                ..Default::default()
+            },
+        );
+        let ids = w.encode_quad(&quad(2, 0), &mut Default::default()).unwrap();
+        w.insert(ids).unwrap();
+        let r = w.commit().unwrap();
+        assert_eq!(r.commit.seq, recovered + 1, "{name}");
+        drop(s);
+        let reopened = Store::open(&db, StoreOptions::default()).unwrap();
+        assert_eq!(reopened.snapshot().commit, recovered + 1, "{name}");
+        assert_eq!(
+            reopened
+                .annotation(recovered + 1)
+                .and_then(|a| a.message)
+                .as_deref(),
+            Some("after-reopen"),
+            "{name}: message after reopen was lost"
+        );
+        drop(reopened);
+    }
     let report = check(&db, &CheckOptions::default()).unwrap();
     assert!(
         report.status != Status::Error,
@@ -1896,8 +2084,8 @@ fn annotation_retry(name: &str, mode: &str) {
 
 #[test]
 fn a_failed_first_annotation_sync_keeps_later_messages() {
+    annotation_retry("ann-retry-bulk", "bulk");
     annotation_retry("ann-retry-ordinary", "ordinary");
-    // the idle direct path of group commit, which is on by default
     annotation_retry("ann-retry-group", "group");
 }
 
@@ -1984,21 +2172,18 @@ fn failed_synchronizations_fail_unacknowledged_commits_and_publish_nothing() {
     let grouped = Config {
         group: true,
         direct: false,
-        idle_direct: true,
         threads: 4,
         commits: 12,
     };
     let ordinary = Config {
         group: false,
         direct: false,
-        idle_direct: true,
         threads: 1,
         commits: 12,
     };
     let direct = Config {
         group: false,
         direct: true,
-        idle_direct: true,
         threads: 1,
         commits: 12,
     };
@@ -2019,14 +2204,7 @@ fn failed_synchronizations_fail_unacknowledged_commits_and_publish_nothing() {
     failed_sync("d-write", direct, "pwrite:wal.log:5");
     failed_sync("d-vocab", direct, "pwrite:delta.vocab:5");
     // the annotation file alone, in a run of fences
-    failed_sync(
-        "g-ann",
-        Config {
-            idle_direct: false,
-            ..grouped
-        },
-        "fdatasync:annotations.bin:2",
-    );
+    failed_sync("g-ann", grouped, "fdatasync:annotations.bin:2");
 }
 
 #[test]
@@ -2036,7 +2214,6 @@ fn a_single_writer_annotation_fence_fault_is_poisoning() {
         Config {
             group: true,
             direct: false,
-            idle_direct: false,
             threads: 1,
             commits: 12,
         },

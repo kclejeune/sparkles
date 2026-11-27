@@ -1189,3 +1189,46 @@ fn turning_provenance_off_clears_the_state() {
     plain.decode(&body, &snap).unwrap();
     assert!(c.annotation(&[]).is_none());
 }
+
+#[test]
+fn matching_refuses_before_copying_large_left_annotation() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut seed = String::from("INSERT DATA { ");
+    for i in 0..1024 {
+        seed.push_str(&format!("<urn:left:{i}> <urn:left> <urn:key> . "));
+    }
+    seed.push('}');
+    sparql::update::update(&store, &seed, &QueryOptions::default()).unwrap();
+    let query = sparql::parse_query(
+        "SELECT ?k WHERE { { SELECT ?k WHERE { ?s <urn:left> ?k } } \
+         FILTER EXISTS { ?r <urn:right> ?k } }",
+        None,
+        &[],
+    )
+    .unwrap();
+    let mut circuit = Circuit::new(compile(&query, None).unwrap(), None);
+    circuit.set_provenance(Provenance::Lineage).unwrap();
+    circuit.build(store.snapshot(), &Control::none()).unwrap();
+    assert!(circuit.result.is_empty());
+    sparql::update::update(
+        &store,
+        "INSERT DATA { <urn:r> <urn:right> <urn:key> }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let delta = DeltaSet::read(&store, circuit.applied, &Control::none());
+    circuit.max_memory_bytes = Some(circuit.bytes() + 4096);
+
+    let mut refused = false;
+    let largest = crate::test_alloc::record_largest(|| {
+        refused = matches!(
+            circuit.advance(&delta, &Control::none()),
+            Err(crate::Error::BudgetExceeded(_))
+        );
+    });
+    assert!(refused, "the retained annotation's copy must be refused");
+    assert!(
+        largest <= 4096,
+        "the match allocated a {largest}-byte buffer"
+    );
+}

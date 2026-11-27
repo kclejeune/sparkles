@@ -6,7 +6,7 @@
 //! thread a product of more choices than its limit ends the attempt too (roadmap item
 //! 1011).
 
-use sparkles_owl::classify::{Classification, Classifier, Excluded, Limits, Tier};
+use sparkles_owl::classify::{Classification, Classifier, Excluded, Expansion, Limits, Tier};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
 
@@ -203,7 +203,7 @@ fn an_attempt_on_one_thread_past_its_width_takes_the_answer_of_the_horn_rules() 
             })
             .unwrap();
         let a = answer(&out, &k);
-        (out.complete, out.stats.dl_attempt_over, a)
+        (out.complete_for_taken, out.stats.dl_attempt_over, a)
     };
     let past = partial(Some(1), Some(0));
     assert!(past.1);
@@ -432,4 +432,132 @@ fn kept_and_fresh_runs_agree_on_the_attempt_at_every_bound() {
         // both answers occur
         assert!(fell[0] > 0 && fell[1] > 0, "{fell:?}");
     }
+}
+
+/// Pure class axioms (no role axioms, so `must_restart` keeps prior Tier D state) whose
+/// `Pred` resolution in `:W` forms a 2×2 = 4-way product under `Expansion::Eager` on one
+/// thread: `:W` has `∃r.S` and two conditional `∀r.P1` and two conditional `∀r.P2`
+/// unions, so `:S` returns `P1(x) ∧ P2(x) → ⊥` and `Pred` multiplies 2×2 = 4 choices.
+const EAGER_WIDE: &str = "SubClassOf(:W ObjectSomeValuesFrom(:r :S))
+     SubClassOf(:W ObjectUnionOf(:Q1 ObjectAllValuesFrom(:r :P1)))
+     SubClassOf(:W ObjectUnionOf(:Q2 ObjectAllValuesFrom(:r :P1)))
+     SubClassOf(:W ObjectUnionOf(:R1 ObjectAllValuesFrom(:r :P2)))
+     SubClassOf(:W ObjectUnionOf(:R2 ObjectAllValuesFrom(:r :P2)))
+     SubClassOf(ObjectIntersectionOf(:P1 :P2) owl:Nothing)";
+
+#[test]
+fn eager_kept_run_past_attempt_work_and_width_starts_again_in_full() {
+    let eager = |bound: Option<usize>, width: Option<usize>| Limits {
+        threads: 1,
+        expansion: Expansion::Eager,
+        dl_attempt_work: bound,
+        dl_attempt_width: width,
+        ..Limits::default()
+    };
+    let unbounded = eager(Some(UNREACHED), None);
+    let mut k = Classifier::of(&axioms(UNIONS));
+    let first = k.classify(&unbounded).unwrap().stats.dl_work;
+    k.add(&axioms(EDIT));
+    let added = k.classify(&unbounded).unwrap();
+    assert!(added.stats.incremental);
+    k.remove(&axioms(EDIT));
+    k.add(&axioms(SWAP));
+    let swapped = k.classify(&unbounded).unwrap();
+    assert!(swapped.stats.incremental);
+    let (added, swapped) = (added.stats.dl_work, swapped.stats.dl_work);
+    let mut held = axioms(UNIONS);
+    held.extend(axioms(SWAP));
+    let fresh = Classifier::of(&held)
+        .classify(&unbounded)
+        .unwrap()
+        .stats
+        .dl_work;
+
+    let bound = (first + added).max(fresh);
+    assert!(
+        bound < first + added + swapped,
+        "{first} {added} {swapped} {fresh}"
+    );
+    let mut k = Classifier::of(&axioms(UNIONS));
+    let out = k.classify(&eager(Some(bound), None)).unwrap();
+    assert!(!out.stats.dl_attempt_over);
+    k.add(&axioms(EDIT));
+    let out = k.classify(&eager(Some(bound), None)).unwrap();
+    assert!(out.stats.incremental && !out.stats.dl_attempt_over);
+    assert!(out.taxonomy.is_subclass(&c("M"), &c("L")));
+    k.remove(&axioms(EDIT));
+    k.add(&axioms(SWAP));
+    let out = k.classify(&eager(Some(bound), None)).unwrap();
+    assert!(
+        !out.stats.incremental,
+        "eager kept run past work bound did not start again"
+    );
+    assert!(!out.stats.dl_attempt_over);
+    assert_eq!(out.stats.dl_work, fresh);
+    let mut f = Classifier::of(&held);
+    let want = f.classify(&eager(Some(bound), None)).unwrap();
+    assert_eq!(answer(&out, &k), answer(&want, &f));
+    assert_eq!(out.taxonomy, want.taxonomy);
+
+    // 1-thread width limit under Expansion::Eager on a kept run using pure class axioms
+    // (`EAGER_WIDE`) so `must_restart` enters kept saturation rather than discarding state.
+    let mut held_w = axioms(UNIONS);
+    held_w.extend(axioms(EAGER_WIDE));
+
+    // First establish that adding `EAGER_WIDE` runs incrementally at the exact width
+    // boundary (`Some(4)` allows the 2×2 = 4-way product) without restarting or falling back.
+    let mut k_at_4 = Classifier::of(&axioms(UNIONS));
+    let base_at_4 = k_at_4.classify(&eager(None, Some(4))).unwrap();
+    assert!(!base_at_4.stats.dl_attempt_over);
+    k_at_4.add(&axioms(EAGER_WIDE));
+    let inc_at_4 = k_at_4.classify(&eager(None, Some(4))).unwrap();
+    assert!(
+        inc_at_4.stats.incremental,
+        "EAGER_WIDE edit did not stay incremental at width limit 4"
+    );
+    assert!(!inc_at_4.stats.dl_attempt_over && !inc_at_4.stats.dl_over_budget);
+
+    // At width limit 3 (< 4), the kept Eager attempt enters saturation, stops on the width
+    // limit, retries fresh (which also stops on width), and falls back to Horn matching a
+    // fresh run. Because the kept attempt runs before the fresh retry on 1 thread, it
+    // deterministically executes more cancellation polls than a fresh run alone.
+    let count_polls = |k: &mut Classifier| {
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p = polls.clone();
+        let out = k
+            .classify(&Limits {
+                cancelled: Some(std::sync::Arc::new(move || {
+                    p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    false
+                })),
+                ..eager(None, Some(3))
+            })
+            .unwrap();
+        (out, polls.load(std::sync::atomic::Ordering::Relaxed))
+    };
+    let mut kw = Classifier::of(&axioms(UNIONS));
+    let out = kw.classify(&eager(None, Some(3))).unwrap();
+    assert!(!out.stats.dl_attempt_over);
+    kw.add(&axioms(EAGER_WIDE));
+    let (out, kept_polls) = count_polls(&mut kw);
+    assert!(
+        out.stats.dl_attempt_over && out.stats.dl_over_budget,
+        "kept eager run did not report width stop"
+    );
+    assert!(!out.stats.incremental);
+    let mut fw = Classifier::of(&held_w);
+    let (want, fresh_polls) = count_polls(&mut fw);
+    assert!(
+        want.stats.dl_attempt_over && want.stats.dl_over_budget,
+        "fresh eager run did not report width stop"
+    );
+    assert!(
+        kept_polls > fresh_polls,
+        "kept attempt did not run before fresh retry (kept_polls={kept_polls}, fresh_polls={fresh_polls})"
+    );
+    assert_eq!(answer(&out, &kw), answer(&want, &fw));
+    kw.remove(&axioms(EAGER_WIDE));
+    let out = kw.classify(&eager(None, Some(3))).unwrap();
+    assert!(!out.stats.dl_attempt_over && !out.stats.dl_over_budget);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
 }

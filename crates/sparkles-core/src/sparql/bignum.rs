@@ -1,0 +1,2050 @@
+//! Bounded arbitrary-precision integers and decimals for SPARQL numeric values beyond
+//! the fixed-width `i64` / `oxsdatatypes::Decimal` ranges (roadmap item 1065).
+//!
+//! Ordinary values stay on `Value::Integer` and `Value::Decimal`; this module is used
+//! only as a cold fallback when a valid `xsd:integer`, derived integer, or `xsd:decimal`
+//! literal or arithmetic result exceeds those fixed widths.
+//!
+//! Both types store magnitudes in base 10^9 (`u32` limbs, little-endian) so decimal
+//! parsing, formatting, scaling, rounding, and exact order comparisons are linear in the
+//! digit count. Digit count and fractional scale are bounded by [`MAX_DIGITS`] and
+//! [`MAX_SCALE`] so malicious literals or repeated multiplications cannot exhaust memory
+//! or CPU.
+
+use oxsdatatypes::Decimal;
+use std::cmp::Ordering;
+use std::fmt;
+
+/// Radix of each limb: 10^9 fits in `u32`, and products of two limbs fit in `u64`.
+const BASE: u32 = 1_000_000_000;
+const BASE_U64: u64 = 1_000_000_000;
+const BASE_U128: u128 = 1_000_000_000;
+const BASE_DIGITS: usize = 9;
+const POW10: [u32; 10] = [
+    1,
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+];
+
+/// Maximum significant decimal digits retained by a [`BigInt`] or [`BigDec`].
+pub const MAX_DIGITS: usize = 4_096;
+/// Maximum fractional decimal scale retained by a [`BigDec`].
+pub const MAX_SCALE: u32 = 4_096;
+/// Bounded intermediate digit headroom for integer `SUM`/`AVG` accumulation so row
+/// order and cancellation before finalization do not fail prematurely.
+pub(crate) const AGG_MAX_INT_DIGITS: usize = MAX_DIGITS + 32;
+/// Bounded intermediate digit headroom for decimal `SUM`/`AVG` accumulation.
+pub(crate) const AGG_MAX_DEC_DIGITS: usize = MAX_DIGITS + MAX_SCALE as usize + 32;
+/// A decimal subtotal's aligned limbs, one carry limb, and the owned value.
+pub(crate) const AGG_SUM_PAYLOAD_BYTES: u64 =
+    ((AGG_MAX_DEC_DIGITS + 2).div_ceil(BASE_DIGITS) as u64 + 1) * 4 + 72;
+/// Transient scratch for one arbitrary-precision `SUM`/`AVG` addition or `AVG` division
+/// (operand alignment or scaling, Knuth division buffers, result, and normalization).
+pub(crate) const AGG_SUM_SCRATCH_BYTES: u64 = 5 * AGG_SUM_PAYLOAD_BYTES;
+/// Division and interning scratch for AVG from a fixed-width subtotal. Scaling an
+/// i128 coefficient by at most 63 decimal places needs at most 12 base-10^9 limbs.
+pub(crate) const FIXED_AVG_SCRATCH_BYTES: u64 = 1024;
+/// Transient decimal-string scratch for converting a [`BigInt`] or [`BigDec`] to `f32`.
+pub(crate) const TO_F32_SCRATCH_BYTES: u64 = 256;
+/// Transient decimal-string scratch for converting a [`BigInt`] or [`BigDec`] to `f64`.
+pub(crate) const TO_F64_SCRATCH_BYTES: u64 = 1024;
+/// Transient scratch for formatting a [`BigInt`] or [`BigDec`] lexical string and
+/// encoding its vocabulary key during result interning (covers both vocabulary hits
+/// and misses).
+pub(crate) fn intern_scratch_bytes(lexical_len: usize) -> u64 {
+    // Pre-sized lexical String (`lexical_len`), datatype IRI (~40 B), and encoded key
+    // Vec<u8> (`lexical_len + 43` B via `write_literal_ref_key`), plus framing overhead.
+    (lexical_len as u64).saturating_mul(2).saturating_add(160)
+}
+/// Minimum fractional digits produced by a non-terminating [`BigDec`] division, matching
+/// `oxsdatatypes::Decimal`.
+const MIN_DIV_SCALE: u32 = 18;
+/// Fractional scale for a non-terminating Jena ARQ average.
+const AVG_DIV_SCALE: u32 = 24;
+/// Raw scale of `oxsdatatypes::Decimal` (`raw * 10^-18`).
+const OXS_DEC_SCALE: u32 = 18;
+
+/// Signed arbitrary-precision integer in base 10^9, bounded to [`MAX_DIGITS`] decimal
+/// digits.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BigInt {
+    /// True only when strictly negative (`limbs` non-empty).
+    neg: bool,
+    /// Little-endian base-10^9 limbs with no trailing zeros. Empty means zero.
+    limbs: Vec<u32>,
+}
+
+/// Signed arbitrary-precision decimal `mantissa * 10^(-scale)`, normalized so that
+/// `scale == 0` whenever `mantissa` is zero or divisible by 10.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BigDec {
+    mantissa: BigInt,
+    scale: u32,
+}
+
+#[inline]
+fn digits_u32(mut n: u32) -> usize {
+    debug_assert!(n > 0 && n < BASE);
+    let mut d = 1;
+    while n >= 10 {
+        n /= 10;
+        d += 1;
+    }
+    d
+}
+
+fn trim_limbs(limbs: &mut Vec<u32>) {
+    while limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+}
+
+fn limbs_digits(limbs: &[u32]) -> usize {
+    match limbs.last() {
+        None => 0,
+        Some(&top) => (limbs.len() - 1) * BASE_DIGITS + digits_u32(top),
+    }
+}
+
+fn cmp_mag(a: &[u32], b: &[u32]) -> Ordering {
+    a.len()
+        .cmp(&b.len())
+        .then_with(|| a.iter().rev().cmp(b.iter().rev()))
+}
+
+fn add_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let n = a.len().max(b.len());
+    let mut out = Vec::with_capacity(n + 1);
+    let mut carry: u64 = 0;
+    for i in 0..n {
+        let s = u64::from(*a.get(i).unwrap_or(&0)) + u64::from(*b.get(i).unwrap_or(&0)) + carry;
+        if s >= BASE_U64 {
+            out.push((s - BASE_U64) as u32);
+            carry = 1;
+        } else {
+            out.push(s as u32);
+            carry = 0;
+        }
+    }
+    if carry > 0 {
+        out.push(carry as u32);
+    }
+    out
+}
+
+/// Subtract `b` from `a`, requiring `a >= b`.
+fn sub_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len());
+    let mut borrow: i64 = 0;
+    for (i, &ai) in a.iter().enumerate() {
+        let d = i64::from(ai) - i64::from(*b.get(i).unwrap_or(&0)) - borrow;
+        if d < 0 {
+            out.push((d + BASE_U64 as i64) as u32);
+            borrow = 1;
+        } else {
+            out.push(d as u32);
+            borrow = 0;
+        }
+    }
+    debug_assert_eq!(borrow, 0);
+    trim_limbs(&mut out);
+    out
+}
+
+fn mul_mag_u32(a: &[u32], k: u32) -> Vec<u32> {
+    debug_assert!(k < BASE);
+    if a.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    if k == 1 {
+        return a.to_vec();
+    }
+    let mut out = Vec::with_capacity(a.len() + 1);
+    let mut carry: u64 = 0;
+    let k = u64::from(k);
+    for &limb in a {
+        let p = u64::from(limb) * k + carry;
+        out.push((p % BASE_U64) as u32);
+        carry = p / BASE_U64;
+    }
+    if carry > 0 {
+        out.push(carry as u32);
+    }
+    out
+}
+
+fn div_rem_mag_u32(a: &[u32], k: u32) -> (Vec<u32>, u32) {
+    debug_assert!(k > 0 && k <= BASE);
+    if a.is_empty() {
+        return (Vec::new(), 0);
+    }
+    if k == 1 {
+        return (a.to_vec(), 0);
+    }
+    let mut q = vec![0u32; a.len()];
+    let mut rem: u64 = 0;
+    let k = u64::from(k);
+    for i in (0..a.len()).rev() {
+        let cur = rem * BASE_U64 + u64::from(a[i]);
+        q[i] = (cur / k) as u32;
+        rem = cur % k;
+    }
+    trim_limbs(&mut q);
+    (q, rem as u32)
+}
+
+fn mul_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![0u32; a.len() + b.len()];
+    for (i, &ai) in a.iter().enumerate() {
+        if ai == 0 {
+            continue;
+        }
+        let mut carry: u64 = 0;
+        let ai = u64::from(ai);
+        for (j, &bj) in b.iter().enumerate() {
+            let cur = u64::from(out[i + j]) + ai * u64::from(bj) + carry;
+            out[i + j] = (cur % BASE_U64) as u32;
+            carry = cur / BASE_U64;
+        }
+        let mut idx = i + b.len();
+        while carry > 0 {
+            let cur = u64::from(out[idx]) + carry;
+            out[idx] = (cur % BASE_U64) as u32;
+            carry = cur / BASE_U64;
+            idx += 1;
+        }
+    }
+    trim_limbs(&mut out);
+    out
+}
+
+/// Unsigned long division in base 10^9 (Knuth Algorithm D). `v` must be non-empty.
+fn div_rem_mag(u: &[u32], v: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    debug_assert!(!v.is_empty());
+    match cmp_mag(u, v) {
+        Ordering::Less => return (Vec::new(), u.to_vec()),
+        Ordering::Equal => return (vec![1], Vec::new()),
+        Ordering::Greater => {}
+    }
+    if v.len() == 1 {
+        let (q, r) = div_rem_mag_u32(u, v[0]);
+        return (q, if r == 0 { Vec::new() } else { vec![r] });
+    }
+    let n = v.len();
+    let m = u.len() - n;
+    // Normalize so v'[n - 1] >= BASE / 2.
+    let d = (BASE_U64 / (u64::from(v[n - 1]) + 1)) as u32;
+    let mut un = mul_mag_u32(u, d);
+    un.resize(m + n + 1, 0);
+    let vn = mul_mag_u32(v, d);
+    debug_assert_eq!(vn.len(), n);
+    let v1 = u128::from(vn[n - 1]);
+    let v2 = u128::from(vn[n - 2]);
+
+    let mut q = vec![0u32; m + 1];
+    for j in (0..=m).rev() {
+        let num = u128::from(un[j + n]) * BASE_U128 + u128::from(un[j + n - 1]);
+        let mut qhat = num / v1;
+        let mut rhat = num % v1;
+        if qhat >= BASE_U128 {
+            qhat = BASE_U128 - 1;
+            rhat = num - qhat * v1;
+        }
+        while rhat < BASE_U128 && qhat * v2 > rhat * BASE_U128 + u128::from(un[j + n - 2]) {
+            qhat -= 1;
+            rhat += v1;
+        }
+        let mut borrow: u64 = 0;
+        let qh = qhat as u64;
+        for i in 0..n {
+            let prod = qh * u64::from(vn[i]) + borrow;
+            let prod_lo = (prod % BASE_U64) as u32;
+            borrow = prod / BASE_U64;
+            if un[j + i] >= prod_lo {
+                un[j + i] -= prod_lo;
+            } else {
+                un[j + i] = un[j + i] + BASE - prod_lo;
+                borrow += 1;
+            }
+        }
+        if u64::from(un[j + n]) < borrow {
+            // Trial quotient was 1 too large; add vn back once.
+            qhat -= 1;
+            let mut carry: u64 = 0;
+            for i in 0..n {
+                let sum = u64::from(un[j + i]) + u64::from(vn[i]) + carry;
+                if sum >= BASE_U64 {
+                    un[j + i] = (sum - BASE_U64) as u32;
+                    carry = 1;
+                } else {
+                    un[j + i] = sum as u32;
+                    carry = 0;
+                }
+            }
+            debug_assert_eq!(u64::from(un[j + n]) + carry, borrow);
+            un[j + n] = 0;
+        } else {
+            un[j + n] -= borrow as u32;
+        }
+        debug_assert_eq!(un[j + n], 0);
+        q[j] = qhat as u32;
+    }
+    trim_limbs(&mut q);
+    let mut rem_slice = un[..n].to_vec();
+    trim_limbs(&mut rem_slice);
+    let (r, rem_check) = div_rem_mag_u32(&rem_slice, d);
+    debug_assert_eq!(rem_check, 0);
+    debug_assert_eq!(cmp_mag(&r, v), Ordering::Less);
+    (q, r)
+}
+
+fn shift_mag_pow10(a: &[u32], k: usize) -> Vec<u32> {
+    if a.is_empty() || k == 0 {
+        return a.to_vec();
+    }
+    let limb_shift = k / BASE_DIGITS;
+    let rem = k % BASE_DIGITS;
+    let mut scaled = mul_mag_u32(a, POW10[rem]);
+    if limb_shift == 0 {
+        return scaled;
+    }
+    let mut out = vec![0u32; limb_shift + scaled.len()];
+    out[limb_shift..].copy_from_slice(&scaled);
+    scaled.clear();
+    out
+}
+
+/// Divide `a` by 10^k, returning `(quotient, remainder)`.
+fn div_rem_mag_pow10(a: &[u32], k: usize) -> (Vec<u32>, Vec<u32>) {
+    if a.is_empty() || k == 0 {
+        return (a.to_vec(), Vec::new());
+    }
+    let limb_shift = k / BASE_DIGITS;
+    let rem = k % BASE_DIGITS;
+    if limb_shift >= a.len() {
+        return (Vec::new(), a.to_vec());
+    }
+    let p = POW10[rem];
+    let (q, top_rem) = div_rem_mag_u32(&a[limb_shift..], p);
+    let mut r = Vec::with_capacity(limb_shift + 1);
+    r.extend_from_slice(&a[..limb_shift]);
+    if top_rem > 0 {
+        r.push(top_rem);
+    }
+    trim_limbs(&mut r);
+    (q, r)
+}
+
+/// Count trailing decimal zeros of a non-empty magnitude.
+fn trailing_zeros_mag(a: &[u32]) -> usize {
+    let mut zeros = 0;
+    for &limb in a {
+        if limb == 0 {
+            zeros += BASE_DIGITS;
+        } else {
+            let mut x = limb;
+            while x.is_multiple_of(10) {
+                x /= 10;
+                zeros += 1;
+            }
+            break;
+        }
+    }
+    zeros
+}
+
+/// Decimal digit at position `idx` from the most significant digit (`0` = MSB) of a
+/// non-empty magnitude with `total` decimal digits.
+#[inline]
+fn digit_from_msb(limbs: &[u32], total: usize, idx: usize) -> u8 {
+    if idx >= total {
+        return 0;
+    }
+    let pos_from_lsb = total - 1 - idx;
+    let limb_idx = pos_from_lsb / BASE_DIGITS;
+    let in_limb = pos_from_lsb % BASE_DIGITS;
+    ((limbs[limb_idx] / POW10[in_limb]) % 10) as u8
+}
+
+/// Format up to `max_sig` significant decimal digits of `limbs` (with `total` digits) into
+/// `out`, setting `sticky` if any dropped digit is nonzero.
+fn write_sig_digits(limbs: &[u32], total: usize, max_sig: usize, out: &mut String) -> bool {
+    let take = total.min(max_sig);
+    for idx in 0..take {
+        out.push(char::from(b'0' + digit_from_msb(limbs, total, idx)));
+    }
+    if take == total {
+        return false;
+    }
+    // Check if any remaining digit below `take` is nonzero.
+    let rem_digits = total - take;
+    let full_limbs = rem_digits / BASE_DIGITS;
+    let rem_in_limb = rem_digits % BASE_DIGITS;
+    if limbs[..full_limbs].iter().any(|&l| l != 0) {
+        return true;
+    }
+    if rem_in_limb > 0 && !limbs[full_limbs].is_multiple_of(POW10[rem_in_limb]) {
+        return true;
+    }
+    false
+}
+
+/// Convert `(-1)^neg * limbs * 10^(-scale)` to exact IEEE-754 `f64`.
+fn to_f64_exact(neg: bool, limbs: &[u32], scale: u32) -> f64 {
+    if limbs.is_empty() {
+        return 0.0;
+    }
+    let total = limbs_digits(limbs);
+    // Value is in [10^(mag - 1), 10^mag).
+    let mag = total as i64 - i64::from(scale);
+    if mag > 310 {
+        return if neg {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    if mag < -326 {
+        return if neg { -0.0 } else { 0.0 };
+    }
+    // 800 significant digits exceeds the 768-digit exact worst case for IEEE-754 f64
+    // half-way ties, and a sticky digit preserves exact round-to-nearest-even.
+    let mut s = String::with_capacity(820);
+    if neg {
+        s.push('-');
+    }
+    let sticky = write_sig_digits(limbs, total, 800, &mut s);
+    let kept = total.min(800);
+    let mut exp = total as i64 - kept as i64 - i64::from(scale);
+    if sticky {
+        s.push('1');
+        exp -= 1;
+    }
+    if exp != 0 {
+        use std::fmt::Write;
+        let _ = write!(s, "e{exp}");
+    }
+    s.parse::<f64>().unwrap_or(if neg {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    })
+}
+
+/// Convert `(-1)^neg * limbs * 10^(-scale)` to exact IEEE-754 `f32` without double
+/// rounding.
+fn to_f32_exact(neg: bool, limbs: &[u32], scale: u32) -> f32 {
+    if limbs.is_empty() {
+        return 0.0;
+    }
+    let total = limbs_digits(limbs);
+    let mag = total as i64 - i64::from(scale);
+    if mag > 40 {
+        return if neg {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        };
+    }
+    if mag < -47 {
+        return if neg { -0.0 } else { 0.0 };
+    }
+    // 130 significant digits exceeds the 112-digit exact worst case for IEEE-754 f32.
+    let mut s = String::with_capacity(150);
+    if neg {
+        s.push('-');
+    }
+    let sticky = write_sig_digits(limbs, total, 130, &mut s);
+    let kept = total.min(130);
+    let mut exp = total as i64 - kept as i64 - i64::from(scale);
+    if sticky {
+        s.push('1');
+        exp -= 1;
+    }
+    if exp != 0 {
+        use std::fmt::Write;
+        let _ = write!(s, "e{exp}");
+    }
+    s.parse::<f32>().unwrap_or(if neg {
+        f32::NEG_INFINITY
+    } else {
+        f32::INFINITY
+    })
+}
+
+/// Compare `a * 10^(-sa)` and `b * 10^(-sb)` (both unsigned, non-empty) without
+/// allocating.
+fn cmp_mag_scaled(a: &[u32], sa: u32, b: &[u32], sb: u32) -> Ordering {
+    let da = limbs_digits(a);
+    let db = limbs_digits(b);
+    let mag_a = da as i64 - i64::from(sa);
+    let mag_b = db as i64 - i64::from(sb);
+    if mag_a != mag_b {
+        return mag_a.cmp(&mag_b);
+    }
+    let n = da.max(db);
+    for i in 0..n {
+        let ca = digit_from_msb(a, da, i);
+        let cb = digit_from_msb(b, db, i);
+        if ca != cb {
+            return ca.cmp(&cb);
+        }
+    }
+    Ordering::Equal
+}
+
+fn parse_unsigned_digits_parts(hi: &[u8], lo: &[u8]) -> Vec<u32> {
+    let total = hi.len() + lo.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let byte_at = |idx: usize| -> u8 {
+        if idx < hi.len() {
+            hi[idx]
+        } else {
+            lo[idx - hi.len()]
+        }
+    };
+    let mut limbs = Vec::with_capacity(total.div_ceil(BASE_DIGITS));
+    let mut end = total;
+    while end > 0 {
+        let start = end.saturating_sub(BASE_DIGITS);
+        let mut val: u32 = 0;
+        for idx in start..end {
+            val = val * 10 + u32::from(byte_at(idx) - b'0');
+        }
+        limbs.push(val);
+        end = start;
+    }
+    trim_limbs(&mut limbs);
+    limbs
+}
+
+fn parse_unsigned_digits(digits: &str) -> Vec<u32> {
+    let stripped = digits.trim_start_matches('0');
+    parse_unsigned_digits_parts(&[], stripped.as_bytes())
+}
+
+fn write_limbs(limbs: &[u32], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let Some((&top, rest)) = limbs.split_last() else {
+        return f.write_str("0");
+    };
+    write!(f, "{top}")?;
+    for &limb in rest.iter().rev() {
+        write!(f, "{limb:09}")?;
+    }
+    Ok(())
+}
+
+impl BigInt {
+    pub fn zero() -> Self {
+        Self {
+            neg: false,
+            limbs: Vec::new(),
+        }
+    }
+
+    fn from_parts_limit(neg: bool, mut limbs: Vec<u32>, max_digits: usize) -> Option<Self> {
+        trim_limbs(&mut limbs);
+        if limbs_digits(&limbs) > max_digits {
+            return None;
+        }
+        let neg = neg && !limbs.is_empty();
+        Some(Self { neg, limbs })
+    }
+
+    fn from_parts(neg: bool, limbs: Vec<u32>) -> Option<Self> {
+        Self::from_parts_limit(neg, limbs, MAX_DIGITS)
+    }
+
+    fn from_parts_unchecked(neg: bool, mut limbs: Vec<u32>) -> Self {
+        trim_limbs(&mut limbs);
+        let neg = neg && !limbs.is_empty();
+        Self { neg, limbs }
+    }
+
+    pub fn from_i64(n: i64) -> Self {
+        Self::from_i128(i128::from(n))
+    }
+
+    pub fn from_u64(n: u64) -> Self {
+        Self::from_u128(u128::from(n))
+    }
+
+    pub fn from_i128(n: i128) -> Self {
+        let neg = n < 0;
+        let mut mag = n.unsigned_abs();
+        let mut limbs = Vec::new();
+        while mag > 0 {
+            limbs.push((mag % BASE_U128) as u32);
+            mag /= BASE_U128;
+        }
+        Self { neg, limbs }
+    }
+
+    pub fn from_u128(mut n: u128) -> Self {
+        let mut limbs = Vec::new();
+        while n > 0 {
+            limbs.push((n % BASE_U128) as u32);
+            n /= BASE_U128;
+        }
+        Self { neg: false, limbs }
+    }
+
+    /// Heap allocation upper bound (and exact retained [`BigInt::heap_bytes`] for valid
+    /// inputs) for [`BigInt::parse`], computed without allocating.
+    pub(crate) fn parse_scratch_bytes(lex: &str) -> u64 {
+        let digits = lex
+            .strip_prefix(['+', '-'])
+            .unwrap_or(lex)
+            .trim_start_matches('0')
+            .len()
+            .min(MAX_DIGITS);
+        let limbs_bytes = if digits == 0 {
+            0
+        } else {
+            (digits.div_ceil(BASE_DIGITS) * std::mem::size_of::<u32>()) as u64
+        };
+        limbs_bytes + 32
+    }
+
+    /// Strict XSD `xsd:integer` lexical parse (`(\+|-)?[0-9]+`).
+    pub fn parse(lex: &str) -> Option<Self> {
+        let (neg, digits) = match lex.as_bytes().first() {
+            Some(b'-') => (true, &lex[1..]),
+            Some(b'+') => (false, &lex[1..]),
+            Some(_) => (false, lex),
+            None => return None,
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let stripped = digits.trim_start_matches('0');
+        if stripped.len() > MAX_DIGITS {
+            return None;
+        }
+        let limbs = parse_unsigned_digits(stripped);
+        Some(Self::from_parts_unchecked(neg, limbs))
+    }
+
+    /// Exact truncation of a finite `f64` towards zero.
+    pub fn from_f64_trunc(x: f64) -> Option<Self> {
+        if !x.is_finite() {
+            return None;
+        }
+        if x.abs() < 1.0 {
+            return Some(Self::zero());
+        }
+        let bits = x.to_bits();
+        let neg = (bits >> 63) != 0;
+        let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+        let frac = bits & ((1u64 << 52) - 1);
+        // |x| >= 1.0 implies normal float (exp_bits >= 1023).
+        let mant = (1u64 << 52) | frac;
+        let exp = exp_bits - 1023 - 52;
+        if exp <= 0 {
+            let v = mant >> (-exp);
+            let mut out = Self::from_u64(v);
+            if neg && !out.is_zero() {
+                out.neg = true;
+            }
+            return Some(out);
+        }
+        // Multiply `mant` by 2^exp in chunks of 2^29 (fits cleanly in u32 < BASE).
+        let mut limbs = Self::from_u64(mant).limbs;
+        let mut shift = exp as u32;
+        while shift > 0 {
+            let step = shift.min(29);
+            limbs = mul_mag_u32(&limbs, 1u32 << step);
+            shift -= step;
+        }
+        Self::from_parts(neg, limbs)
+    }
+
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        self.limbs.is_empty()
+    }
+
+    #[inline]
+    pub fn is_negative(&self) -> bool {
+        self.neg
+    }
+
+    #[inline]
+    pub fn is_positive(&self) -> bool {
+        !self.neg && !self.limbs.is_empty()
+    }
+
+    #[inline]
+    pub fn is_even(&self) -> bool {
+        self.limbs.first().is_none_or(|&l| l.is_multiple_of(2))
+    }
+
+    pub fn decimal_digits(&self) -> usize {
+        limbs_digits(&self.limbs)
+    }
+
+    #[inline]
+    pub(crate) fn fits_limits(&self) -> bool {
+        self.decimal_digits() <= MAX_DIGITS
+    }
+
+    pub fn heap_bytes(&self) -> u64 {
+        (self.limbs.capacity() * std::mem::size_of::<u32>()) as u64 + 32
+    }
+
+    /// Exact byte length of `self`'s canonical decimal lexical form.
+    #[inline]
+    pub(crate) fn lexical_len(&self) -> usize {
+        if self.limbs.is_empty() {
+            1
+        } else {
+            self.decimal_digits() + usize::from(self.neg)
+        }
+    }
+
+    /// Format `self`'s canonical decimal lexical form into a single pre-sized buffer.
+    pub(crate) fn to_lexical_string(&self) -> String {
+        use std::fmt::Write;
+        let len = self.lexical_len();
+        let mut s = String::with_capacity(len);
+        let _ = write!(s, "{self}");
+        debug_assert_eq!(s.len(), len);
+        s
+    }
+
+    pub fn to_i64(&self) -> Option<i64> {
+        let v = self.to_i128()?;
+        i64::try_from(v).ok()
+    }
+
+    pub fn to_u64(&self) -> Option<u64> {
+        if self.neg {
+            return None;
+        }
+        let v = self.to_i128()?;
+        u64::try_from(v).ok()
+    }
+
+    pub fn to_i128(&self) -> Option<i128> {
+        let mut acc: u128 = 0;
+        for &limb in self.limbs.iter().rev() {
+            acc = acc.checked_mul(BASE_U128)?.checked_add(u128::from(limb))?;
+        }
+        if self.neg {
+            if acc == (i128::MAX as u128) + 1 {
+                Some(i128::MIN)
+            } else {
+                i128::try_from(acc).ok().map(|v| -v)
+            }
+        } else {
+            i128::try_from(acc).ok()
+        }
+    }
+
+    pub fn negated(&self) -> Self {
+        Self {
+            neg: !self.is_zero() && !self.neg,
+            limbs: self.limbs.clone(),
+        }
+    }
+
+    pub fn abs(&self) -> Self {
+        Self {
+            neg: false,
+            limbs: self.limbs.clone(),
+        }
+    }
+
+    pub fn checked_add(&self, rhs: &Self) -> Option<Self> {
+        self.checked_add_with_limit(rhs, MAX_DIGITS)
+    }
+
+    pub(crate) fn checked_add_with_limit(&self, rhs: &Self, max_digits: usize) -> Option<Self> {
+        if self.neg == rhs.neg {
+            Self::from_parts_limit(self.neg, add_mag(&self.limbs, &rhs.limbs), max_digits)
+        } else {
+            match cmp_mag(&self.limbs, &rhs.limbs) {
+                Ordering::Equal => Some(Self::zero()),
+                Ordering::Greater => {
+                    Self::from_parts_limit(self.neg, sub_mag(&self.limbs, &rhs.limbs), max_digits)
+                }
+                Ordering::Less => {
+                    Self::from_parts_limit(rhs.neg, sub_mag(&rhs.limbs, &self.limbs), max_digits)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn checked_mul_i64_with_limit(&self, n: i64, max_digits: usize) -> Option<Self> {
+        if self.is_zero() || n == 0 {
+            return Some(Self::zero());
+        }
+        let rhs = Self::from_i64(n);
+        if self.decimal_digits() + rhs.decimal_digits() > max_digits + 1 {
+            return None;
+        }
+        let limbs = mul_mag(&self.limbs, &rhs.limbs);
+        Self::from_parts_limit(self.neg != rhs.neg, limbs, max_digits)
+    }
+
+    pub fn checked_sub(&self, rhs: &Self) -> Option<Self> {
+        if self.neg != rhs.neg {
+            Self::from_parts(self.neg, add_mag(&self.limbs, &rhs.limbs))
+        } else {
+            match cmp_mag(&self.limbs, &rhs.limbs) {
+                Ordering::Equal => Some(Self::zero()),
+                Ordering::Greater => Self::from_parts(self.neg, sub_mag(&self.limbs, &rhs.limbs)),
+                Ordering::Less => Self::from_parts(!self.neg, sub_mag(&rhs.limbs, &self.limbs)),
+            }
+        }
+    }
+
+    pub fn checked_mul(&self, rhs: &Self) -> Option<Self> {
+        if self.is_zero() || rhs.is_zero() {
+            return Some(Self::zero());
+        }
+        if self.decimal_digits() + rhs.decimal_digits() > MAX_DIGITS + 1 {
+            return None;
+        }
+        let limbs = mul_mag(&self.limbs, &rhs.limbs);
+        Self::from_parts(self.neg != rhs.neg, limbs)
+    }
+
+    /// Truncating division towards zero: `self = q * rhs + r`, `|r| < |rhs|`, `r` carries
+    /// the sign of `self`. Returns `None` on division by zero.
+    pub fn checked_div_rem(&self, rhs: &Self) -> Option<(Self, Self)> {
+        if rhs.is_zero() {
+            return None;
+        }
+        if self.is_zero() {
+            return Some((Self::zero(), Self::zero()));
+        }
+        let (q, r) = div_rem_mag(&self.limbs, &rhs.limbs);
+        Some((
+            Self::from_parts_unchecked(self.neg != rhs.neg, q),
+            Self::from_parts_unchecked(self.neg, r),
+        ))
+    }
+
+    pub fn to_f64(&self) -> f64 {
+        to_f64_exact(self.neg, &self.limbs, 0)
+    }
+
+    pub fn to_f32(&self) -> f32 {
+        to_f32_exact(self.neg, &self.limbs, 0)
+    }
+}
+
+impl Ord for BigInt {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.neg, other.neg) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => cmp_mag(&self.limbs, &other.limbs),
+            (true, true) => cmp_mag(&other.limbs, &self.limbs),
+        }
+    }
+}
+
+impl PartialOrd for BigInt {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Display for BigInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.neg {
+            f.write_str("-")?;
+        }
+        write_limbs(&self.limbs, f)
+    }
+}
+
+/// Factor `limbs` (non-empty) as `r * 10^tz * 2^p2 * 5^p5` with `gcd(r, 10) == 1`.
+fn factor_out_2_5(limbs: &[u32]) -> (Vec<u32>, usize, usize, usize) {
+    let tz = trailing_zeros_mag(limbs);
+    let mut rem = if tz > 0 {
+        div_rem_mag_pow10(limbs, tz).0
+    } else {
+        limbs.to_vec()
+    };
+    let mut p2 = 0usize;
+    let mut p5 = 0usize;
+    // Since trailing zeros were stripped, `rem` is divisible by at most one of 2 or 5.
+    while !rem.is_empty() && rem[0].is_multiple_of(2) {
+        let k = if rem[0] == 0 {
+            9
+        } else {
+            rem[0].trailing_zeros().min(9)
+        };
+        let (q, r) = div_rem_mag_u32(&rem, 1u32 << k);
+        debug_assert_eq!(r, 0);
+        rem = q;
+        p2 += k as usize;
+    }
+    while !rem.is_empty() && rem[0].is_multiple_of(5) {
+        let mut div = 5u32;
+        let mut k = 1usize;
+        while k < 9 && rem[0].is_multiple_of(div * 5) {
+            div *= 5;
+            k += 1;
+        }
+        let (q, r) = div_rem_mag_u32(&rem, div);
+        debug_assert_eq!(r, 0);
+        rem = q;
+        p5 += k;
+    }
+    (rem, tz, p2, p5)
+}
+
+const POW5: [u32; 13] = [
+    1,
+    5,
+    25,
+    125,
+    625,
+    3_125,
+    15_625,
+    78_125,
+    390_625,
+    1_953_125,
+    9_765_625,
+    48_828_125,
+    244_140_625,
+];
+
+impl BigDec {
+    pub fn zero() -> Self {
+        Self {
+            mantissa: BigInt::zero(),
+            scale: 0,
+        }
+    }
+
+    fn normalize_limit(
+        neg: bool,
+        mut limbs: Vec<u32>,
+        mut scale: u32,
+        max_digits: usize,
+    ) -> Option<Self> {
+        trim_limbs(&mut limbs);
+        if limbs.is_empty() {
+            return Some(Self::zero());
+        }
+        if scale > 0 {
+            let tz = trailing_zeros_mag(&limbs).min(scale as usize);
+            if tz > 0 {
+                let (q, _) = div_rem_mag_pow10(&limbs, tz);
+                limbs = q;
+                scale -= tz as u32;
+            }
+        }
+        if scale > MAX_SCALE || limbs_digits(&limbs) > max_digits {
+            return None;
+        }
+        Some(Self {
+            mantissa: BigInt::from_parts_unchecked(neg, limbs),
+            scale,
+        })
+    }
+
+    fn normalize(neg: bool, limbs: Vec<u32>, scale: u32) -> Option<Self> {
+        Self::normalize_limit(neg, limbs, scale, MAX_DIGITS)
+    }
+
+    pub fn from_bigint(i: BigInt) -> Self {
+        Self {
+            mantissa: i,
+            scale: 0,
+        }
+    }
+
+    pub fn from_i64(n: i64) -> Self {
+        Self::from_bigint(BigInt::from_i64(n))
+    }
+
+    pub fn from_u64(n: u64) -> Self {
+        Self::from_bigint(BigInt::from_u64(n))
+    }
+
+    /// Exact mathematical value of a finite IEEE-754 `f64` (`±mant * 2^exp`), for
+    /// transitive numeric `ORDER BY` comparisons. Unlike [`BigDec::from_f64`], this does
+    /// not shorten the decimal representation.
+    pub(crate) fn from_exact_f64(x: f64) -> Option<Self> {
+        if !x.is_finite() {
+            return None;
+        }
+        if x == 0.0 {
+            return Some(Self::zero());
+        }
+        let bits = x.to_bits();
+        let neg = (bits >> 63) != 0;
+        let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+        let frac = bits & ((1u64 << 52) - 1);
+        let (mut mant, exp) = if exp_bits == 0 {
+            (frac, 1 - 1023 - 52)
+        } else {
+            ((1u64 << 52) | frac, exp_bits - 1023 - 52)
+        };
+        if exp >= 0 {
+            let mut limbs = BigInt::from_u64(mant).limbs;
+            let mut shift = exp as u32;
+            while shift > 0 {
+                let step = shift.min(29);
+                limbs = mul_mag_u32(&limbs, 1u32 << step);
+                shift -= step;
+            }
+            Self::normalize(neg, limbs, 0)
+        } else {
+            let mut k = (-exp) as u32;
+            let tz = mant.trailing_zeros().min(k);
+            mant >>= tz;
+            k -= tz;
+            let mut limbs = BigInt::from_u64(mant).limbs;
+            let mut rem5 = k as usize;
+            while rem5 > 0 {
+                let step = rem5.min(12);
+                limbs = mul_mag_u32(&limbs, POW5[step]);
+                rem5 -= step;
+            }
+            Self::normalize(neg, limbs, k)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn fits_limits(&self) -> bool {
+        self.scale <= MAX_SCALE && self.mantissa.fits_limits()
+    }
+
+    pub fn from_oxs_decimal(d: Decimal) -> Self {
+        let raw = i128::from_be_bytes(d.to_be_bytes());
+        let bi = BigInt::from_i128(raw);
+        Self::normalize(bi.neg, bi.limbs, OXS_DEC_SCALE)
+            .expect("oxsdatatypes::Decimal fits within MAX_DIGITS and MAX_SCALE")
+    }
+
+    /// Lossless conversion to `oxsdatatypes::Decimal` when the value fits its fixed
+    /// 18-fractional-digit `i128` representation.
+    pub fn to_oxs_decimal(&self) -> Option<Decimal> {
+        if self.scale > OXS_DEC_SCALE {
+            return None;
+        }
+        let m = self.mantissa.to_i128()?;
+        let factor = 10i128.pow(OXS_DEC_SCALE - self.scale);
+        let raw = m.checked_mul(factor)?;
+        Some(Decimal::from_be_bytes(raw.to_be_bytes()))
+    }
+
+    /// Heap allocation upper bound (and exact retained [`BigDec::heap_bytes`] for valid
+    /// inputs) for [`BigDec::parse`], computed without allocating.
+    pub(crate) fn parse_scratch_bytes(lex: &str) -> u64 {
+        let body = lex.strip_prefix(['+', '-']).unwrap_or(lex);
+        let digits = match body.split_once('.') {
+            Some((i, f)) => {
+                let i = i.trim_start_matches('0');
+                let f = f.trim_end_matches('0');
+                if i.is_empty() {
+                    f.trim_start_matches('0').len()
+                } else {
+                    i.len().saturating_add(f.len())
+                }
+            }
+            None => body.trim_start_matches('0').len(),
+        };
+        let capped = digits.min(MAX_DIGITS);
+        let limbs_bytes = if capped == 0 {
+            0
+        } else {
+            (capped.div_ceil(BASE_DIGITS) * std::mem::size_of::<u32>()) as u64
+        };
+        limbs_bytes + 40
+    }
+
+    /// Strict XSD `xsd:decimal` lexical parse (`(\+|-)?([0-9]+(\.[0-9]*)?|\.[0-9]+)`).
+    pub fn parse(lex: &str) -> Option<Self> {
+        let (neg, body) = match lex.as_bytes().first() {
+            Some(b'-') => (true, &lex[1..]),
+            Some(b'+') => (false, &lex[1..]),
+            Some(_) => (false, lex),
+            None => return None,
+        };
+        let (int_raw, frac_raw) = match body.split_once('.') {
+            Some((i, f)) => {
+                if f.contains('.') {
+                    return None;
+                }
+                (i, f)
+            }
+            None => (body, ""),
+        };
+        if int_raw.is_empty() && frac_raw.is_empty() {
+            return None;
+        }
+        if !int_raw.bytes().all(|b| b.is_ascii_digit())
+            || !frac_raw.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let int_trim = int_raw.trim_start_matches('0');
+        let frac_trim = frac_raw.trim_end_matches('0');
+        if int_trim.is_empty() && frac_trim.is_empty() {
+            return Some(Self::zero());
+        }
+        let scale = u32::try_from(frac_trim.len()).ok()?;
+        if scale > MAX_SCALE {
+            return None;
+        }
+        // Significant digits: if integer part is empty, strip leading zeros of fraction.
+        let sig_len = if int_trim.is_empty() {
+            frac_trim.trim_start_matches('0').len()
+        } else {
+            int_trim.len() + frac_trim.len()
+        };
+        if sig_len > MAX_DIGITS {
+            return None;
+        }
+        let limbs = if int_trim.is_empty() {
+            parse_unsigned_digits_parts(&[], frac_trim.trim_start_matches('0').as_bytes())
+        } else {
+            parse_unsigned_digits_parts(int_trim.as_bytes(), frac_trim.as_bytes())
+        };
+        Self::normalize(neg, limbs, scale)
+    }
+
+    /// Parse a shortest scientific decimal (`format!("{x:e}")`) from a finite float or
+    /// double into an exact `BigDec`.
+    fn parse_scientific(s: &str) -> Option<Self> {
+        let (neg, body) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s),
+        };
+        let (mant, exp) = match body.split_once(['e', 'E']) {
+            Some((m, e)) => (m, e.parse::<i64>().ok()?),
+            None => (body, 0),
+        };
+        let (int_part, frac_part) = mant.split_once('.').unwrap_or((mant, ""));
+        let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+        digits.push_str(int_part);
+        digits.push_str(frac_part);
+        let stripped = digits.trim_start_matches('0');
+        if stripped.is_empty() {
+            return Some(Self::zero());
+        }
+        let net_exp = exp - frac_part.len() as i64;
+        let limbs = parse_unsigned_digits(stripped);
+        if net_exp >= 0 {
+            let shift = usize::try_from(net_exp).ok()?;
+            if stripped.len() + shift > MAX_DIGITS {
+                return None;
+            }
+            let shifted = shift_mag_pow10(&limbs, shift);
+            Self::normalize(neg, shifted, 0)
+        } else {
+            let scale = u32::try_from(-net_exp).ok()?;
+            Self::normalize(neg, limbs, scale)
+        }
+    }
+
+    pub fn from_f64(x: f64) -> Option<Self> {
+        if !x.is_finite() {
+            return None;
+        }
+        Self::parse_scientific(&format!("{x:e}"))
+    }
+
+    pub fn from_f32(x: f32) -> Option<Self> {
+        if !x.is_finite() {
+            return None;
+        }
+        Self::parse_scientific(&format!("{x:e}"))
+    }
+
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        self.mantissa.is_zero()
+    }
+
+    #[inline]
+    pub fn is_negative(&self) -> bool {
+        self.mantissa.is_negative()
+    }
+
+    pub fn heap_bytes(&self) -> u64 {
+        self.mantissa.heap_bytes() + 8
+    }
+
+    /// Exact byte length of `self`'s canonical decimal lexical form.
+    #[inline]
+    pub(crate) fn lexical_len(&self) -> usize {
+        if self.is_zero() {
+            return 1;
+        }
+        let sign = usize::from(self.mantissa.neg);
+        if self.scale == 0 {
+            return sign + self.mantissa.decimal_digits();
+        }
+        let scale = self.scale as usize;
+        let digits = self.mantissa.decimal_digits();
+        if digits <= scale {
+            sign + 2 + scale
+        } else {
+            sign + digits + 1
+        }
+    }
+
+    /// Format `self`'s canonical decimal lexical form into a single pre-sized buffer.
+    pub(crate) fn to_lexical_string(&self) -> String {
+        use std::fmt::Write;
+        let len = self.lexical_len();
+        let mut s = String::with_capacity(len);
+        let _ = write!(s, "{self}");
+        debug_assert_eq!(s.len(), len);
+        s
+    }
+
+    pub fn negated(&self) -> Self {
+        Self {
+            mantissa: self.mantissa.negated(),
+            scale: self.scale,
+        }
+    }
+
+    pub fn abs(&self) -> Self {
+        Self {
+            mantissa: self.mantissa.abs(),
+            scale: self.scale,
+        }
+    }
+
+    /// Compare this `BigDec` with a `BigInt` without allocating.
+    pub fn cmp_bigint(&self, other: &BigInt) -> Ordering {
+        match (self.mantissa.neg, other.neg) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => match (self.is_zero(), other.is_zero()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => cmp_mag_scaled(&self.mantissa.limbs, self.scale, &other.limbs, 0),
+            },
+            (true, true) => cmp_mag_scaled(&other.limbs, 0, &self.mantissa.limbs, self.scale),
+        }
+    }
+
+    fn align_pair_limit(&self, rhs: &Self, lim: usize) -> Option<(Vec<u32>, Vec<u32>, u32)> {
+        let scale = self.scale.max(rhs.scale);
+        let shift_a = (scale - self.scale) as usize;
+        let shift_b = (scale - rhs.scale) as usize;
+        if (!self.is_zero() && self.mantissa.decimal_digits() + shift_a > lim)
+            || (!rhs.is_zero() && rhs.mantissa.decimal_digits() + shift_b > lim)
+        {
+            return None;
+        }
+        let a = shift_mag_pow10(&self.mantissa.limbs, shift_a);
+        let b = shift_mag_pow10(&rhs.mantissa.limbs, shift_b);
+        Some((a, b, scale))
+    }
+
+    fn align_pair(&self, rhs: &Self) -> Option<(Vec<u32>, Vec<u32>, u32)> {
+        // Allow up to MAX_DIGITS + 2 during intermediate alignment so cancelling additions
+        // at the boundary stay exact, while still bounding allocation strictly.
+        self.align_pair_limit(rhs, MAX_DIGITS + 2)
+    }
+
+    pub fn checked_add(&self, rhs: &Self) -> Option<Self> {
+        self.checked_add_with_limit(rhs, MAX_DIGITS)
+    }
+
+    pub(crate) fn checked_add_with_limit(&self, rhs: &Self, max_digits: usize) -> Option<Self> {
+        if self.is_zero() {
+            return Self::normalize_limit(
+                rhs.mantissa.neg,
+                rhs.mantissa.limbs.clone(),
+                rhs.scale,
+                max_digits,
+            );
+        }
+        if rhs.is_zero() {
+            return Self::normalize_limit(
+                self.mantissa.neg,
+                self.mantissa.limbs.clone(),
+                self.scale,
+                max_digits,
+            );
+        }
+        let (a, b, scale) = self.align_pair_limit(rhs, max_digits + 2)?;
+        if self.mantissa.neg == rhs.mantissa.neg {
+            Self::normalize_limit(self.mantissa.neg, add_mag(&a, &b), scale, max_digits)
+        } else {
+            match cmp_mag(&a, &b) {
+                Ordering::Equal => Some(Self::zero()),
+                Ordering::Greater => {
+                    Self::normalize_limit(self.mantissa.neg, sub_mag(&a, &b), scale, max_digits)
+                }
+                Ordering::Less => {
+                    Self::normalize_limit(rhs.mantissa.neg, sub_mag(&b, &a), scale, max_digits)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn checked_mul_i64_with_limit(&self, n: i64, max_digits: usize) -> Option<Self> {
+        if self.is_zero() || n == 0 {
+            return Some(Self::zero());
+        }
+        let rhs = BigInt::from_i64(n);
+        if self.mantissa.decimal_digits() + rhs.decimal_digits() > max_digits + 2 {
+            return None;
+        }
+        let limbs = mul_mag(&self.mantissa.limbs, &rhs.limbs);
+        Self::normalize_limit(self.mantissa.neg != rhs.neg, limbs, self.scale, max_digits)
+    }
+
+    pub fn checked_sub(&self, rhs: &Self) -> Option<Self> {
+        if rhs.is_zero() {
+            return Some(self.clone());
+        }
+        if self.is_zero() {
+            return Some(rhs.negated());
+        }
+        let (a, b, scale) = self.align_pair(rhs)?;
+        if self.mantissa.neg != rhs.mantissa.neg {
+            Self::normalize(self.mantissa.neg, add_mag(&a, &b), scale)
+        } else {
+            match cmp_mag(&a, &b) {
+                Ordering::Equal => Some(Self::zero()),
+                Ordering::Greater => Self::normalize(self.mantissa.neg, sub_mag(&a, &b), scale),
+                Ordering::Less => Self::normalize(!self.mantissa.neg, sub_mag(&b, &a), scale),
+            }
+        }
+    }
+
+    pub fn checked_mul(&self, rhs: &Self) -> Option<Self> {
+        if self.is_zero() || rhs.is_zero() {
+            return Some(Self::zero());
+        }
+        let scale = self.scale.checked_add(rhs.scale)?;
+        if self.mantissa.decimal_digits() + rhs.mantissa.decimal_digits() > MAX_DIGITS * 2 {
+            return None;
+        }
+        let limbs = mul_mag(&self.mantissa.limbs, &rhs.mantissa.limbs);
+        Self::normalize(self.mantissa.neg != rhs.mantissa.neg, limbs, scale)
+    }
+
+    /// Attempt an exact terminating decimal quotient within `(MAX_DIGITS, MAX_SCALE)`.
+    /// Returns `Some(q)` iff `self / rhs` terminates in base 10 and fits both caps.
+    fn try_exact_terminating_div(&self, rhs: &Self) -> Option<Self> {
+        let neg = self.mantissa.neg != rhs.mantissa.neg;
+        let (r_b, tz_b, mut p2, mut p5) = factor_out_2_5(&rhs.mantissa.limbs);
+        let mut q0 = if r_b.len() == 1 && r_b[0] == 1 {
+            self.mantissa.limbs.clone()
+        } else {
+            let (q, rem) = div_rem_mag(&self.mantissa.limbs, &r_b);
+            if !rem.is_empty() {
+                return None;
+            }
+            q
+        };
+        // Cancel common factors of 2 or 5 from q0 against p2 / p5.
+        while p2 > 0 && !q0.is_empty() && q0[0].is_multiple_of(2) {
+            let k = if q0[0] == 0 {
+                9usize
+            } else {
+                q0[0].trailing_zeros().min(9) as usize
+            }
+            .min(p2);
+            let (q, rem) = div_rem_mag_u32(&q0, 1u32 << k);
+            debug_assert_eq!(rem, 0);
+            q0 = q;
+            p2 -= k;
+        }
+        while p5 > 0 && !q0.is_empty() && q0[0].is_multiple_of(5) {
+            let mut div = 5u32;
+            let mut k = 1usize;
+            let max_k = p5.min(9);
+            while k < max_k && q0[0].is_multiple_of(div * 5) {
+                div *= 5;
+                k += 1;
+            }
+            let (q, rem) = div_rem_mag_u32(&q0, div);
+            debug_assert_eq!(rem, 0);
+            q0 = q;
+            p5 -= k;
+        }
+        // Strip trailing zeros of q0 before computing net exponent and multiplying by 5^p2 / 2^p5.
+        let tz_q = trailing_zeros_mag(&q0);
+        if tz_q > 0 {
+            q0 = div_rem_mag_pow10(&q0, tz_q).0;
+        }
+        // Note: if p2 > 0, q0 is now odd, so multiplying by 5^p2 produces no trailing zeros.
+        // If p5 > 0, q0 is not divisible by 5, so multiplying by 2^p5 produces no trailing zeros.
+        let exp = i64::from(rhs.scale) - i64::from(self.scale) + tz_q as i64
+            - tz_b as i64
+            - p2 as i64
+            - p5 as i64;
+        if exp < -(i64::from(MAX_SCALE)) {
+            return None;
+        }
+        if p2 > 0 {
+            let mut rem = p2;
+            while rem > 0 {
+                let step = rem.min(12);
+                q0 = mul_mag_u32(&q0, POW5[step]);
+                if limbs_digits(&q0) > MAX_DIGITS {
+                    return None;
+                }
+                rem -= step;
+            }
+        }
+        if p5 > 0 {
+            let mut rem = p5;
+            while rem > 0 {
+                let step = rem.min(29);
+                q0 = mul_mag_u32(&q0, 1u32 << step);
+                if limbs_digits(&q0) > MAX_DIGITS {
+                    return None;
+                }
+                rem -= step;
+            }
+        }
+        if exp >= 0 {
+            let shift = usize::try_from(exp).ok()?;
+            if limbs_digits(&q0) + shift > MAX_DIGITS {
+                return None;
+            }
+            let shifted = shift_mag_pow10(&q0, shift);
+            Self::normalize(neg, shifted, 0)
+        } else {
+            let scale = u32::try_from(-exp).ok()?;
+            Self::normalize(neg, q0, scale)
+        }
+    }
+
+    /// Exact decimal division: preserves terminating quotients whenever they fit within
+    /// [`MAX_DIGITS`] and [`MAX_SCALE`], and truncates non-terminating quotients towards
+    /// zero with at least 18 fractional digits (or 18 significant digits for sub-10^-18
+    /// quotients, and up to the dividend's scale), capped to fit [`MAX_DIGITS`] and
+    /// [`MAX_SCALE`]. A quotient smaller than the minimum nonzero magnitude truncates
+    /// to zero.
+    pub fn checked_div(&self, rhs: &Self) -> Option<Self> {
+        if rhs.is_zero() {
+            return None;
+        }
+        if self.is_zero() {
+            return Some(Self::zero());
+        }
+        if let Some(exact) = self.try_exact_terminating_div(rhs) {
+            return Some(exact);
+        }
+        let mag_a = self.mantissa.decimal_digits() as i64 - i64::from(self.scale);
+        let mag_b = rhs.mantissa.decimal_digits() as i64 - i64::from(rhs.scale);
+        let q_mag = mag_a - mag_b;
+        if q_mag > MAX_DIGITS as i64 {
+            return None;
+        }
+        let min_for_sig = (i64::from(MIN_DIV_SCALE) - q_mag.min(0)).min(i64::from(MAX_SCALE));
+        let requested_scale = self.scale.max(min_for_sig as u32);
+        let max_int_digits = (q_mag + 1).max(0) as usize;
+        let out_scale = if max_int_digits + requested_scale as usize <= MAX_DIGITS {
+            requested_scale
+        } else {
+            // Compare the significands at equal magnitude. When the dividend's
+            // significand is smaller, the quotient uses one fewer integer digit.
+            let fewer = max_int_digits > 0
+                && cmp_mag_scaled(
+                    &self.mantissa.limbs,
+                    self.mantissa.decimal_digits() as u32,
+                    &rhs.mantissa.limbs,
+                    rhs.mantissa.decimal_digits() as u32,
+                )
+                .is_lt();
+            let int_digits = max_int_digits - usize::from(fewer);
+            requested_scale.min(MAX_DIGITS.checked_sub(int_digits)? as u32)
+        };
+        let shift = i64::from(out_scale) + i64::from(rhs.scale) - i64::from(self.scale);
+        let max_work = MAX_DIGITS * 3;
+        let (q, _) = if shift >= 0 {
+            let shift = usize::try_from(shift).ok()?;
+            if self.mantissa.decimal_digits() + shift > max_work {
+                return None;
+            }
+            let num = shift_mag_pow10(&self.mantissa.limbs, shift);
+            div_rem_mag(&num, &rhs.mantissa.limbs)
+        } else {
+            let shift = usize::try_from(-shift).ok()?;
+            if rhs.mantissa.decimal_digits() + shift > max_work {
+                return None;
+            }
+            let den = shift_mag_pow10(&rhs.mantissa.limbs, shift);
+            div_rem_mag(&self.mantissa.limbs, &den)
+        };
+        Self::normalize(self.mantissa.neg != rhs.mantissa.neg, q, out_scale)
+    }
+
+    /// Divide an exact aggregate subtotal by its row count as ARQ does.
+    /// Terminating quotients stay exact. Repeating quotients round to 24 fractional
+    /// digits with half-even rounding. The normalized result must fit the value limits.
+    pub(crate) fn checked_avg(&self, rows: u64) -> Option<Self> {
+        if rows == 0 {
+            return None;
+        }
+        let twos = rows.trailing_zeros();
+        let mut rest = rows >> twos;
+        let mut fives = 0;
+        while rest.is_multiple_of(5) {
+            rest /= 5;
+            fives += 1;
+        }
+        // This many extra powers of ten remove all factors of 2 and 5 from the
+        // denominator. A nonzero remainder then proves the quotient repeats.
+        let scale = (self.scale + twos.max(fives)).max(AVG_DIV_SCALE + 1);
+        let numerator = shift_mag_pow10(&self.mantissa.limbs, (scale - self.scale) as usize);
+        let denominator = BigInt::from_u64(rows);
+        let (quotient, remainder) = div_rem_mag(&numerator, &denominator.limbs);
+        drop(numerator);
+        if remainder.is_empty() {
+            return Self::normalize(self.mantissa.neg, quotient, scale);
+        }
+
+        let discarded = (scale - AVG_DIV_SCALE) as usize;
+        let digits = limbs_digits(&quotient);
+        // An exact halfway value terminates, so a discarded 5 here has a nonzero
+        // digit after it. Rounding the magnitude works for both signs.
+        let round_up =
+            digits >= discarded && digit_from_msb(&quotient, digits, digits - discarded) >= 5;
+        let (mut rounded, _) = div_rem_mag_pow10(&quotient, discarded);
+        if round_up {
+            rounded = add_mag(&rounded, &[1]);
+        }
+        Self::normalize(self.mantissa.neg, rounded, AVG_DIV_SCALE)
+    }
+
+    /// `fn:numeric-mod` on decimals: remainder of truncating division.
+    pub fn checked_rem(&self, rhs: &Self) -> Option<Self> {
+        if rhs.is_zero() {
+            return None;
+        }
+        if self.is_zero() {
+            return Some(Self::zero());
+        }
+        match cmp_mag_scaled(
+            &self.mantissa.limbs,
+            self.scale,
+            &rhs.mantissa.limbs,
+            rhs.scale,
+        ) {
+            Ordering::Less => return Some(self.clone()),
+            Ordering::Equal => return Some(Self::zero()),
+            Ordering::Greater => {}
+        }
+        let (a, b, scale) = self.align_pair_limit(rhs, MAX_DIGITS + MAX_SCALE as usize)?;
+        let (_, r) = div_rem_mag(&a, &b);
+        Self::normalize(self.mantissa.neg, r, scale)
+    }
+
+    /// `fn:numeric-integer-divide` on decimals: integer quotient truncated towards zero.
+    pub fn checked_idiv(&self, rhs: &Self) -> Option<BigInt> {
+        if rhs.is_zero() {
+            return None;
+        }
+        if self.is_zero() {
+            return Some(BigInt::zero());
+        }
+        let neg = self.mantissa.neg != rhs.mantissa.neg;
+        match cmp_mag_scaled(
+            &self.mantissa.limbs,
+            self.scale,
+            &rhs.mantissa.limbs,
+            rhs.scale,
+        ) {
+            Ordering::Less => return Some(BigInt::zero()),
+            Ordering::Equal => return Some(BigInt::from_i64(if neg { -1 } else { 1 })),
+            Ordering::Greater => {}
+        }
+        let mag_a = self.mantissa.decimal_digits() as i64 - i64::from(self.scale);
+        let mag_b = rhs.mantissa.decimal_digits() as i64 - i64::from(rhs.scale);
+        if mag_a - mag_b > MAX_DIGITS as i64 + 1 {
+            return None;
+        }
+        let (a, b, _) = self.align_pair_limit(rhs, MAX_DIGITS + MAX_SCALE as usize)?;
+        let (q, _) = div_rem_mag(&a, &b);
+        BigInt::from_parts(neg, q)
+    }
+
+    /// Truncate towards zero to a [`BigInt`].
+    pub fn trunc_to_bigint(&self) -> BigInt {
+        if self.scale == 0 || self.is_zero() {
+            return self.mantissa.clone();
+        }
+        let (q, _) = div_rem_mag_pow10(&self.mantissa.limbs, self.scale as usize);
+        BigInt::from_parts_unchecked(self.mantissa.neg, q)
+    }
+
+    pub fn ceil(&self) -> Option<Self> {
+        if self.scale == 0 || self.is_zero() {
+            return Some(self.clone());
+        }
+        let (q, r) = div_rem_mag_pow10(&self.mantissa.limbs, self.scale as usize);
+        let q = BigInt::from_parts_unchecked(self.mantissa.neg, q);
+        if !self.mantissa.neg && !r.is_empty() {
+            Some(Self::from_bigint(q.checked_add(&BigInt::from_i64(1))?))
+        } else {
+            Some(Self::from_bigint(q))
+        }
+    }
+
+    pub fn floor(&self) -> Option<Self> {
+        if self.scale == 0 || self.is_zero() {
+            return Some(self.clone());
+        }
+        let (q, r) = div_rem_mag_pow10(&self.mantissa.limbs, self.scale as usize);
+        let q = BigInt::from_parts_unchecked(self.mantissa.neg, q);
+        if self.mantissa.neg && !r.is_empty() {
+            Some(Self::from_bigint(q.checked_sub(&BigInt::from_i64(1))?))
+        } else {
+            Some(Self::from_bigint(q))
+        }
+    }
+
+    /// SPARQL / XPath `ROUND` (half towards positive infinity).
+    pub fn round(&self) -> Option<Self> {
+        if self.scale == 0 || self.is_zero() {
+            return Some(self.clone());
+        }
+        let scale = self.scale as usize;
+        let (q, r) = div_rem_mag_pow10(&self.mantissa.limbs, scale);
+        let q_int = BigInt::from_parts_unchecked(self.mantissa.neg, q);
+        if r.is_empty() {
+            return Some(Self::from_bigint(q_int));
+        }
+        // Compare r (0 < r < 10^scale) against 5 * 10^(scale - 1).
+        let r_digits = limbs_digits(&r);
+        let cmp_half = if r_digits < scale {
+            Ordering::Less
+        } else {
+            debug_assert_eq!(r_digits, scale);
+            let top = digit_from_msb(&r, r_digits, 0);
+            match top.cmp(&5) {
+                Ordering::Less => Ordering::Less,
+                Ordering::Greater => Ordering::Greater,
+                Ordering::Equal => {
+                    // Check if any lower digit of `r` is nonzero.
+                    let (_, low) = div_rem_mag_pow10(&r, scale - 1);
+                    if low.is_empty() {
+                        Ordering::Equal
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+            }
+        };
+        let rounded = if !self.mantissa.neg {
+            if matches!(cmp_half, Ordering::Greater | Ordering::Equal) {
+                q_int.checked_add(&BigInt::from_i64(1))?
+            } else {
+                q_int
+            }
+        } else if cmp_half == Ordering::Greater {
+            q_int.checked_sub(&BigInt::from_i64(1))?
+        } else {
+            q_int
+        };
+        Some(Self::from_bigint(rounded))
+    }
+
+    pub fn to_f64(&self) -> f64 {
+        to_f64_exact(self.mantissa.neg, &self.mantissa.limbs, self.scale)
+    }
+
+    pub fn to_f32(&self) -> f32 {
+        to_f32_exact(self.mantissa.neg, &self.mantissa.limbs, self.scale)
+    }
+}
+
+impl Ord for BigDec {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.mantissa.neg, other.mantissa.neg) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => match (self.is_zero(), other.is_zero()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => cmp_mag_scaled(
+                    &self.mantissa.limbs,
+                    self.scale,
+                    &other.mantissa.limbs,
+                    other.scale,
+                ),
+            },
+            (true, true) => cmp_mag_scaled(
+                &other.mantissa.limbs,
+                other.scale,
+                &self.mantissa.limbs,
+                self.scale,
+            ),
+        }
+    }
+}
+
+impl PartialOrd for BigDec {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Display for BigDec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_zero() {
+            return f.write_str("0");
+        }
+        if self.mantissa.neg {
+            f.write_str("-")?;
+        }
+        if self.scale == 0 {
+            return write_limbs(&self.mantissa.limbs, f);
+        }
+        let scale = self.scale as usize;
+        let digits = self.mantissa.decimal_digits();
+        if digits <= scale {
+            f.write_str("0.")?;
+            for _ in 0..(scale - digits) {
+                f.write_str("0")?;
+            }
+            write_limbs(&self.mantissa.limbs, f)
+        } else {
+            let int_len = digits - scale;
+            for i in 0..int_len {
+                write!(f, "{}", digit_from_msb(&self.mantissa.limbs, digits, i))?;
+            }
+            f.write_str(".")?;
+            for i in int_len..digits {
+                write!(f, "{}", digit_from_msb(&self.mantissa.limbs, digits, i))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bigint_parse_format_and_ord() {
+        let a = BigInt::parse("99999999999999999999999").unwrap();
+        assert_eq!(a.to_string(), "99999999999999999999999");
+        assert_eq!(a.decimal_digits(), 23);
+        let b = BigInt::parse("+00099999999999999999999999").unwrap();
+        assert_eq!(a, b);
+        let c = BigInt::parse("-99999999999999999999999").unwrap();
+        assert!(c < BigInt::zero());
+        assert!(BigInt::zero() < a);
+        assert_eq!(BigInt::parse("-0").unwrap(), BigInt::zero());
+        assert!(BigInt::parse("").is_none());
+        assert!(BigInt::parse("1.0").is_none());
+        assert!(BigInt::parse(" 1").is_none());
+        // DoS digit cap
+        let too_long = "9".repeat(MAX_DIGITS + 1);
+        assert!(BigInt::parse(&too_long).is_none());
+        let exact_cap = "9".repeat(MAX_DIGITS);
+        assert!(BigInt::parse(&exact_cap).is_some());
+    }
+
+    #[test]
+    fn bigint_arithmetic_and_knuth_div_matches_i128() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let edges: &[i128] = &[
+            0,
+            1,
+            -1,
+            999_999_999,
+            1_000_000_000,
+            -1_000_000_000,
+            i64::MAX as i128,
+            i64::MIN as i128,
+            i128::MAX,
+            i128::MIN,
+        ];
+        let mut samples: Vec<i128> = edges.to_vec();
+        for _ in 0..200 {
+            let shift = rng.random_range(0..100);
+            samples.push(rng.random::<i128>() >> shift);
+        }
+        for &x in &samples {
+            let bx = BigInt::from_i128(x);
+            assert_eq!(bx.to_string(), x.to_string());
+            assert_eq!(bx.to_i128(), Some(x));
+            for &y in &samples[..30] {
+                let by = BigInt::from_i128(y);
+                assert_eq!(bx.cmp(&by), x.cmp(&y));
+                if let Some(s) = x.checked_add(y) {
+                    assert_eq!(bx.checked_add(&by).unwrap().to_i128(), Some(s));
+                }
+                if let Some(d) = x.checked_sub(y) {
+                    assert_eq!(bx.checked_sub(&by).unwrap().to_i128(), Some(d));
+                }
+                if let Some(p) = x.checked_mul(y) {
+                    assert_eq!(bx.checked_mul(&by).unwrap().to_i128(), Some(p));
+                }
+                if y != 0
+                    && let (Some(q), Some(r)) = (x.checked_div(y), x.checked_rem(y))
+                {
+                    let (bq, br) = bx.checked_div_rem(&by).unwrap();
+                    assert_eq!(bq.to_i128(), Some(q), "{x} / {y}");
+                    assert_eq!(br.to_i128(), Some(r), "{x} % {y}");
+                }
+            }
+        }
+        // Multi-limb Knuth D test beyond i128
+        let big_u = BigInt::parse("99999999999999999999999999999999999999999999999999").unwrap();
+        let big_v = BigInt::parse("123456789012345678901234567890").unwrap();
+        let (q, r) = big_u.checked_div_rem(&big_v).unwrap();
+        assert!(r < big_v && !r.is_negative());
+        assert_eq!(
+            q.checked_mul(&big_v).unwrap().checked_add(&r).unwrap(),
+            big_u
+        );
+    }
+
+    #[test]
+    fn bigdec_operations_and_rounding() {
+        let a = BigDec::parse("99999999999999999999999999999.25").unwrap();
+        let b = BigDec::parse("0.75").unwrap();
+        assert_eq!(
+            a.checked_add(&b).unwrap().to_string(),
+            "100000000000000000000000000000"
+        );
+        let tiny = BigDec::parse("0.0000000000000000001").unwrap();
+        assert_eq!(tiny.to_string(), "0.0000000000000000001");
+        assert!(tiny.to_oxs_decimal().is_none());
+        let ten = BigDec::from_i64(10);
+        assert_eq!(
+            tiny.checked_mul(&ten).unwrap().to_oxs_decimal(),
+            Some("0.000000000000000001".parse().unwrap())
+        );
+        assert_eq!(
+            BigDec::parse("2.5").unwrap().round().unwrap().to_string(),
+            "3"
+        );
+        assert_eq!(
+            BigDec::parse("-2.5").unwrap().round().unwrap().to_string(),
+            "-2"
+        );
+        assert_eq!(
+            BigDec::parse("-2.50000000000000000001")
+                .unwrap()
+                .round()
+                .unwrap()
+                .to_string(),
+            "-3"
+        );
+        assert_eq!(
+            BigDec::parse("99999999999999999999999.1")
+                .unwrap()
+                .ceil()
+                .unwrap()
+                .to_string(),
+            "100000000000000000000000"
+        );
+        assert_eq!(
+            BigDec::parse("-99999999999999999999999.1")
+                .unwrap()
+                .floor()
+                .unwrap()
+                .to_string(),
+            "-100000000000000000000000"
+        );
+        // Division of huge and tiny values
+        let one = BigDec::from_i64(1);
+        let pow25 = BigDec::parse("10000000000000000000000000").unwrap();
+        assert_eq!(
+            one.checked_div(&pow25).unwrap().to_string(),
+            "0.0000000000000000000000001"
+        );
+    }
+
+    #[test]
+    fn float_and_double_conversions() {
+        let huge = BigInt::parse(&format!("1{}", "0".repeat(400))).unwrap();
+        assert!(huge.to_f64().is_infinite() && huge.to_f64().is_sign_positive());
+        assert!(
+            huge.negated().to_f64().is_infinite() && huge.negated().to_f64().is_sign_negative()
+        );
+        assert!(huge.to_f32().is_infinite());
+
+        let exact = BigInt::from_f64_trunc(1e25).unwrap();
+        assert_eq!(exact.to_string(), "10000000000000000905969664");
+        assert_eq!(
+            BigDec::from_f64(1e25).unwrap().to_string(),
+            "10000000000000000000000000"
+        );
+        assert_eq!(
+            BigDec::from_f64(1e-25).unwrap().to_string(),
+            "0.0000000000000000000000001"
+        );
+    }
+
+    #[test]
+    fn knuth_algorithm_d_qhat_base_plus_one_witnesses() {
+        // Sol witness: qhat == BASE + 1 on the second quotient digit.
+        let u1 = BigInt::parse("500000000999999998000000000").unwrap();
+        let v1 = BigInt::parse("500000000999999999").unwrap();
+        let (q1, r1) = u1.checked_div_rem(&v1).unwrap();
+        assert_eq!(q1.to_string(), "999999999");
+        assert_eq!(r1.to_string(), "499999999999999999");
+        assert_eq!(q1.checked_mul(&v1).unwrap().checked_add(&r1).unwrap(), u1);
+
+        // Neon witness: 4-limb by 3-limb qhat == BASE + 1.
+        let u2 = BigInt::parse("500000000999999998000000000000000000").unwrap();
+        let v2 = BigInt::parse("500000000999999999000000000").unwrap();
+        let (q2, r2) = u2.checked_div_rem(&v2).unwrap();
+        assert_eq!(q2.to_string(), "999999999");
+        assert_eq!(r2.to_string(), "499999999999999999000000000");
+        assert_eq!(q2.checked_mul(&v2).unwrap().checked_add(&r2).unwrap(), u2);
+    }
+
+    #[test]
+    fn decimal_avg_rounds_repeating_quotients_and_keeps_terminating_ones_exact() {
+        for (sum, rows, expected) in [
+            ("1", 3, "0.333333333333333333333333"),
+            ("2", 3, "0.666666666666666666666667"),
+            ("-2", 3, "-0.666666666666666666666667"),
+            ("0.0000000000000000000000014", 3, "0"),
+            (
+                "0.0000000000000000000000016",
+                3,
+                "0.000000000000000000000001",
+            ),
+            (
+                "0.000000000000000000000001",
+                2,
+                "0.0000000000000000000000005",
+            ),
+            ("2.9999999999999999999999999", 3, "1"),
+            ("1", 10_000_000_000, "0.0000000001"),
+            ("1", u64::MAX, "0.00000000000000000005421"),
+        ] {
+            assert_eq!(
+                BigDec::parse(sum).unwrap().checked_avg(rows),
+                BigDec::parse(expected),
+                "{sum} / {rows}"
+            );
+        }
+        assert_eq!(BigDec::from_i64(1).checked_avg(0), None);
+    }
+
+    #[test]
+    fn decimal_avg_checks_bounds_after_dividing_and_normalizing() {
+        let tiny = format!("0.{}1", "0".repeat(MAX_SCALE as usize - 1));
+        let tiny = BigDec::parse(&tiny).unwrap();
+        let twice = tiny.checked_mul(&BigDec::from_i64(2)).unwrap();
+        assert_eq!(twice.checked_avg(2), Some(tiny.clone()));
+        assert_eq!(tiny.checked_avg(2), None);
+        assert_eq!(tiny.checked_avg(3), Some(BigDec::zero()));
+
+        let max = BigDec::parse(&"9".repeat(MAX_DIGITS)).unwrap();
+        let subtotal = max
+            .checked_add_with_limit(&max, AGG_MAX_DEC_DIGITS)
+            .unwrap();
+        assert!(!subtotal.fits_limits());
+        assert_eq!(subtotal.checked_avg(2), Some(max.clone()));
+        assert_eq!(max.checked_avg(7), None);
+    }
+
+    #[test]
+    fn terminating_and_extreme_scale_division_rem_and_idiv() {
+        // 1 / 2^100 terminates at scale 100 within both caps.
+        let one = BigDec::from_i64(1);
+        let two_pow_100 = BigDec::parse("1267650600228229401496703205376").unwrap();
+        let q = one.checked_div(&two_pow_100).unwrap();
+        assert_eq!(q.scale, 100);
+        assert_eq!(q.checked_mul(&two_pow_100).unwrap(), one);
+
+        // 10^-4096 / 1 succeeds and preserves exact scale 4096.
+        let tiny_cap =
+            BigDec::parse(&format!("0.{}1", "0".repeat(MAX_SCALE as usize - 1))).unwrap();
+        assert_eq!(tiny_cap.checked_div(&one).unwrap(), tiny_cap);
+
+        // A repeating quotient still has a nonzero digit at the scale cap.
+        let four_tiny = tiny_cap.checked_mul(&BigDec::from_i64(4)).unwrap();
+        assert_eq!(
+            four_tiny.checked_div(&BigDec::from_i64(3)),
+            Some(tiny_cap.clone())
+        );
+
+        assert_eq!(
+            tiny_cap.checked_div(&BigDec::from_i64(3)),
+            Some(BigDec::zero())
+        );
+
+        // High-scale repeating divisor: 100 / (3 + 10^-4095) succeeds.
+        let hundred = BigDec::from_i64(100);
+        let high_scale_div =
+            BigDec::parse(&format!("3.{}1", "0".repeat(MAX_SCALE as usize - 2))).unwrap();
+        let q_high = hundred.checked_div(&high_scale_div).unwrap();
+        assert_eq!(q_high.to_string(), "33.333333333333333333");
+
+        // Large integer divided by repeating divisor clamps scale to fit MAX_DIGITS.
+        let big_int = BigDec::parse(&format!("1{}", "0".repeat(4084))).unwrap();
+        let q_clamp = big_int.checked_div(&BigDec::from_i64(7)).unwrap();
+        assert!(q_clamp.fits_limits());
+        assert_eq!(q_clamp.scale, 12);
+        assert_eq!(q_clamp.mantissa.decimal_digits(), MAX_DIGITS);
+        assert!(q_clamp.to_string().starts_with("142857142857"));
+
+        // Bounded operands with 8192-digit scale gap for mod and idiv.
+        let big_pow = BigDec::parse(&format!("1{}", "0".repeat(MAX_DIGITS - 1))).unwrap();
+        assert_eq!(big_pow.checked_rem(&tiny_cap).unwrap(), BigDec::zero());
+        assert_eq!(tiny_cap.checked_idiv(&big_pow).unwrap(), BigInt::zero());
+        assert_eq!(tiny_cap.checked_rem(&big_pow).unwrap(), tiny_cap);
+
+        // Exact binary float conversion for transitive ORDER BY.
+        let d01 = BigDec::from_exact_f64(0.1).unwrap();
+        assert!(d01 > BigDec::parse("0.1").unwrap());
+        let d03 = BigDec::from_exact_f64(0.3).unwrap();
+        assert!(d03 < BigDec::parse("0.3").unwrap());
+        let d1e22 = BigDec::from_exact_f64(1e22).unwrap();
+        assert_eq!(d1e22, BigDec::parse("10000000000000000000000").unwrap());
+
+        for s in [
+            "0",
+            "1",
+            "-1",
+            "99999999999999999999999",
+            "-100000000000000000000001",
+        ] {
+            let bi = BigInt::parse(s).unwrap();
+            assert_eq!(bi.to_lexical_string(), bi.to_string(), "BigInt {s}");
+        }
+        for s in [
+            "0",
+            "1",
+            "-1",
+            "0.0001",
+            "-0.0001",
+            "123.45",
+            "-123.45",
+            &format!("0.{}1", "0".repeat(MAX_SCALE as usize - 1)),
+            &format!("-0.{}1", "0".repeat(MAX_SCALE as usize - 1)),
+            &format!("1{}.5", "0".repeat(3_997)),
+        ] {
+            let bd = BigDec::parse(s).unwrap();
+            assert_eq!(bd.to_lexical_string(), bd.to_string(), "BigDec {s}");
+        }
+    }
+}

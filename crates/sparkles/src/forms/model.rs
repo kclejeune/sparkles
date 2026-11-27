@@ -901,6 +901,7 @@ impl Built {
         Ok(Reader {
             snap: self.snap.clone(),
             access: self.access.as_deref(),
+            bound: None,
             masked: self.masked,
             limits: self.limits.clone(),
         })
@@ -1534,6 +1535,7 @@ fn value_constraints_json(
 struct Reader<'a> {
     snap: Arc<Snapshot>,
     access: Option<&'a GraphAccess>,
+    bound: Option<Arc<GraphAccess>>,
     /// `snap` is masked already
     masked: bool,
     limits: Limits,
@@ -1541,16 +1543,28 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn new(snap: &Arc<Snapshot>, access: Option<&'a GraphAccess>) -> Result<Reader<'a>> {
-        match access.filter(|a| a.hides_triples()) {
-            Some(a) => Ok(Reader {
-                snap: a.masked(snap)?,
-                access,
-                masked: true,
-                limits: Limits::default(),
-            }),
+        match access.filter(|a| !a.reads_everything()) {
+            Some(a) => {
+                let (bound, masked_snap) = if a.read.undecided() || a.write.undecided() {
+                    let b = Arc::new(a.clone()).bound(snap);
+                    let m = b.masked(snap)?;
+                    (Some(b), m)
+                } else {
+                    (None, a.masked(snap)?)
+                };
+                let masked = masked_snap.has_mask();
+                Ok(Reader {
+                    snap: masked_snap,
+                    access,
+                    bound,
+                    masked,
+                    limits: Limits::default(),
+                })
+            }
             None => Ok(Reader {
                 snap: snap.clone(),
                 access,
+                bound: None,
                 masked: false,
                 limits: Limits::default(),
             }),
@@ -1591,7 +1605,10 @@ impl<'a> Reader<'a> {
     }
 
     fn readable(&self, g: Option<&Term>) -> bool {
-        self.access.is_none_or(|a| a.readable(g))
+        self.bound
+            .as_deref()
+            .or(self.access)
+            .is_none_or(|a| a.readable(g))
     }
 
     /// The quads whose key in `perm` starts with `prefix`.

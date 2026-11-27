@@ -78,8 +78,8 @@ ranges live in `plan.rs`, not in the ARQ property functions.
 
 Three expression memos keep three admission policies. `exprcache.rs` admits per-value
 reuse from a Chao1 estimate of distinct inputs and a sample of 4,096 rows,
-`cursor/bind.rs` keeps the cursor's own exact id cache, admitted from a pilot over its
-first batch and from repetition it observes across later batches, and the EXISTS memo of `expr.rs` admits up to 100,000 entries within an
+`cursor/bind.rs` keeps the cursor's own exact id cache behind a pilot over its first
+4,096 rows, and the EXISTS memo of `expr.rs` admits up to 100,000 entries within an
 eighth of the budget. The decorrelated EXISTS key sets of `exists.rs` are shared.
 
 The result writers exist twice, and the design's two gaps have narrowed. The eager
@@ -117,10 +117,10 @@ path search, history changes, view reads, algorithm calls, the predicate-table
 unsupported shape, remote LATERAL, a registered property function whose registration does
 not declare `prefix_output`, and any node one of whose EXISTS patterns cannot itself be
 built without materialization, which `exists_streams` decides by building each pattern
-under the strict policy. The depth cap of four, the refusal of an EXISTS pattern that
+under the strict policy. The refusal of an EXISTS pattern that
 calls a SERVICE and the refusal of a LeftJoin condition with EXISTS belong to
 `streams_natively`, the admission predicate of automatic execution, and not to the
-fallback. An EXISTS inside a larger expression, such as IF, OR, an aggregate argument or
+fallback (item 1081 removed the earlier four-level nesting cap). An EXISTS inside a larger expression, such as IF, OR, an aggregate argument or
 an ORDER BY key, is admitted, with or without a key set. Several of these kinds have two forms. The `needs_input` methods
 of `TextSpec`, `VectorSpec`, `HybridSpec`, `HistorySpec`, `AlgoSpec`, `SpatialPfSpec` and
 `PathSearchSpec` say whether a node reads variables its input binds, and the planner
@@ -171,17 +171,17 @@ phases name are carried here as they stand at the base of this plan.
 | Join-kernel library, item 825 | Item 93. | Item 7's remaining work does not change joins, so item 825 does not wait for it. |
 | Grouping operator, item 826 | Item 93. | Item 7's grouping over key runs has shipped. Item 418 is outstanding, and the [schedule](#order-of-work) says how item 826 proceeds with and without it. |
 | Frontier kernel | Item 417. | Items 8 and 51. |
-| Expression memo, item 1095 | None. | Item 293, which has shipped. |
+| Expression memo | None. | Item 293. |
 | Columnar writers, item 828 | Item 240. | Items 91, 243 and 534. Item 828 carries items 243 and 91 as its own gates and the in-place route of item 534's hand-off plan. |
 | Mode-independent plans and pull-demand LIMIT and ASK, item 827 | None. | Item 7, for the EXISTS shapes that stay eager, which item 827 leaves to item 829. |
 | Native leaf cursors, item 829 | None. | Item 827 for the admission code, and item 825 for the operators that build over their input. |
-| The merge | Items 93, 240, 469 to 473. | Items 7, 243, 534 and 512, and items 825 to 829. |
+| The merge | Items 93, 240, 469 to 473. | Items 7, 243, 293, 534 and 512, and items 825 to 829. |
 | Demand seeding and one visitor | None. | Item 190. |
 
-Items 7, 243 and 534 are on the merge's critical path because the design puts them
-there, and this plan does not shorten that path. Item 243 lands inside item 828's work on
-the writers. Item 293 has settled the memo's admission, which item 1095 takes from
-`cursor/bind.rs` when it replaces the eager memo.
+Items 7, 243, 293 and 534 are on the merge's critical path because the design puts
+them there, and this plan does not shorten that path. Item 243 lands inside item 828's
+work on the writers, and item 293 settles the memo's admission before the merge deletes
+the eager memo.
 
 ## Order of work
 
@@ -198,8 +198,8 @@ ownership boundaries given below, and the rows are serial.
 | After 825 | Item 826 starts. Item 240 has shipped on item 534's measurement. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
 | After 827 and 825 | Item 829 starts. | Its leaf cursors land in the admission code that item 827 changes, and its operators that build over their input take item 825's hash kernel. |
 | After 240 | Item 828 can start, and item 534 opens the cursor in the producer's task. | The writers take the buffer that item 240 gave the cursor writers. |
-| After 293 | Item 1095 starts. | It takes the admission policy that item 293 settled. |
-| After 825 to 829, 512, 243, 534 and the remaining work of item 7 | The merge phase is numbered and starts. | The merge deletes the eager executor, so every kernel it keeps must already be one, and the reference evaluator must already be the oracle. |
+| After 293 | The expression memo phase is numbered and starts. | Its admission policy is item 293's open question. |
+| After 825 to 829, 512, 243, 293, 534 and the remaining work of item 7 | The merge phase is numbered and starts. | The merge deletes the eager executor, so every kernel it keeps must already be one, and the reference evaluator must already be the oracle. |
 | After the merge | The frontier kernel and the demand seeding phases are numbered and start, and so does [X15](../X15-join-algorithms-and-estimation/README.md). | Neither blocks the merge, and new algorithms land in one executor. |
 
 Item 826 defines the trait's `retract` method and leaves the view operator of
@@ -228,11 +228,13 @@ path meets the [acceptance gates](SPEC.md#acceptance-gates), measured as the
 
 ### Hierarchical budget, item 675
 
-The phase is landing. The maintainer decided that a graph result keeps the query's
-admitted high point charged to the pool until the result is dropped, as the design says
-for eager contexts until stage 6 leases every table. The seams it leaves open, native MCP
-frames, snapshot and mask escapes, deallocation proofs and the later milestones, stay
-recorded in its report and do not block stage 5.
+The foundation has landed, and item 675 is narrowed to giving the reasoner's budgets and
+incremental views parents in the query pool without blocking the merge. The maintainer
+decided that a graph result keeps the query's admitted high point charged to the pool
+until the result is dropped, as the design says for eager contexts until the merge leases
+every table. The remaining seams are tracked separately and do not block stage 5 or the
+merge: MCP native frames in item 1305, binding result buffers in item 1306, snapshot and
+access escapes in item 1307 and strict decoding across all callers in item 1308.
 
 ### Decoding twins, item 678
 
@@ -247,14 +249,16 @@ Item 827 removed the reads in `has_predicate` and `limited_input` that an earlie
 of this section listed. Before the change the test counts eight sites, the mode branch of
 `query_execution_with_plan`, the EXISTS key set accumulated across batches in
 `exists::prepare`, `envelope_refuses`, `string_order_mask` and the four direct reads.
+Item 1308 Wave 2 later removed `envelope_refuses`, lowering the bound to six.
 
 The floors decode inside the envelope, and `decode_for` decodes through the one sorted
 pre-decode. Floors cached per batch measured 24.8% and 33.4% slower than the direct
 comparison on streaming `str-pair-lt` and `str-pair-names` on atlas, so item 1069 gave
 the context a charged floor cache that lasts the query and serves both modes. Cursor
 batches now compare through the floors, the exclusion in `string_order_mask` is gone and
-the bound is seven. The [Outcome](SPEC.md#outcome) records the forge measurements, and
-items 1088, 1089 and 1140 hold the costs that remain.
+the bound is seven. The [Outcome](SPEC.md#outcome) records the forge and atlas measurements. Item 1140 has
+shipped sample-sized initial floor tables and direct entry migration on growth, and items
+1088 and 1089 hold the costs that remain.
 
 ## Stage 5: shared kernels
 
@@ -385,18 +389,32 @@ writers of `write_cursor_solutions`, the native JSON writer, the RDF writers of
 Thrift writer moves from `sparkles-server`'s `http.rs` into `sparkles-core` beside
 `ThriftResults`, so `cursor_format` and the streaming route's Thrift refusal go from the
 policy and the server. The ASK boolean is written through the same functions from a
-one-row source. Term decoding runs once per batch column through `decode_for` into
-prebuilt buffers, and the eager writers' row scratch of `results/output.rs` becomes the
-source's decode buffer. The `_counted` eager writers and the `Shared` adapter are
-deleted.
+one-row source. Term decoding runs once per batch in the source's sorted term decoding
+into prebuilt buffers, the cursor's term cache and the eager writer's decoded chunks, and the
+eager writers' row scratch of `results/output.rs` becomes the source's decode buffer. The
+expression decoding of `decode_for` builds value columns and is not the writers' decoder. The
+`_counted` writers are deleted. The SPARQL writers stop using the `Shared` adapter once they
+write rows themselves, and the graph writers keep it, since the RDF serializers they call own
+their writer and need it to flush after the first batch.
 
 The regression tests that fail before the change are a server test that a streaming
 request for a SELECT in Thrift streams rather than being refused and a differential test
-that every format's bytes for a result are equal whether written from the eager result or
-from a cursor at a batch size of one. The edge cases are an answer of zero rows in each format,
+that a SELECT in Thrift has the same bytes from the eager result and from a cursor at a batch
+size of one. Every writer keeps the bytes it writes today, checked against goldens recorded
+before the change. The eager and cursor writers already differ in some formats, in the native
+document's metadata and graph layout, in the Jena binary formats' triple and quad messages and
+in whether a graph answer honours `send`, so the differential test holds every pair that is
+equal today to staying equal, and unifying the rest is a separate change of the responses. The edge cases are an answer of zero rows in each format,
 a literal larger than the buffer, a graph answer whose last batch holds only labels, a
 decode refusal in the middle of a batch, which keeps its original error and the earlier
 complete rows as stage 4 decided, and a client that disconnects between batches.
+
+For a caller-supplied Rust writer, the acceptance boundary is the last byte of
+each row the writer took. A caller can opt into a completion callback that
+runs after the final drain and before successful cursor statistics. A cancellable
+size adapter can check a due byte checkpoint there without writing or flushing
+its sink. Streamed HTTP keeps completion and transport delivery in its response
+producer, and the in-place quick runner returns a whole response directly.
 
 Its gates are the server's budget, limit and quota tests, `mise run test:w3c:streaming`,
 `scripts/ci.sh --fast`, the end-to-end wall times of `export-500k`, `optional-chain`,
@@ -451,7 +469,11 @@ written so far to the producer on the pool. The hand-off needs a writer whose st
 move to another thread between batches, which item 828's writers over a batch source
 give, so the route lands with item 828 and is measured there. A cursor knows it has
 ended only when a pull returns no batch, so the loop pulls once more after the last
-batch, which costs a check of a finished cursor's state.
+batch, which costs a check of a finished cursor's state. The XML writer measures a row's
+encoded size before buffering it in place. It resumes serialization on the pool when
+escaping would put the row over the threshold. When the producer splits a buffered
+prefix across frames, the row ledger keeps the end offsets beyond the first frame
+under a query charge. It releases those marks once the corresponding bytes enqueue.
 
 The third would have let a request with `execution=streaming` take the in-place route
 too, and it is not taken. Such a request opens on the pool, so its work stops when its
@@ -484,28 +506,15 @@ and gets its number then. Item 417 has shipped, it depends on items 8 and 51 for
 path ranges and the graph-algorithm surface, and the cold-read rule of X07 applies to
 every copy once they are one.
 
-### Item 1095: the query-scoped expression memo
+### The query-scoped expression memo
 
 This phase replaces `exprcache`'s per-value reuse, the `Reuse` of `cursor/bind.rs` and the
 EXISTS memo of `expr.rs` with one charged memo keyed by expression and input value, with
-one admission policy fed by observed repetition. Item 293 settled that policy for sparse
-reuse. The memo's charge is a retained charge of stage 4, its bound is the EXISTS memo's eighth of
+one admission policy fed by observed repetition. It waits for item 293, whose question is
+the admission policy for sparse reuse, and gets its number when item 293 settles it. The
+memo's charge is a retained charge of stage 4, its bound is the EXISTS memo's eighth of
 the budget, and its oracle is the differential test of stage 4 that compares reuse with
 row-by-row evaluation on both sides of the 16,384-row threshold.
-
-Item 293 settled the policy that the memo takes from `cursor/bind.rs`. A sketch across
-batches observes one input in sixteen, chosen by a hash of its id, so that it sees every
-occurrence of the keys it samples, and holds at most as many keys as a full memo covers.
-A window of sampled rows admits the memo at one repeat in eight. The exact distinct count
-of the per-batch pass is a required second signal, since it sees hot keys that the
-sampled sketch can miss, and a policy that dropped the per-batch pass when the sketch saw
-no repetition made late hot keys up to 7.3 times slower. A full sketch without admission
-ends the observation. An admitted memo is judged once it has seen as many rows as its
-largest size, 65,536 entries, or filled, and is released when it answers fewer than one row in sixteen. Misses
-are evaluated once per distinct key as one batch, and a missed key holds a pending entry
-until the batch is evaluated, so its other rows cost one lookup. The sketch's keys and the
-memo's entries are charged in steps of the query's reservation, so that the optional
-memory never weakens the query's budget.
 
 ## Stage 6: the executor merge
 
@@ -525,10 +534,10 @@ and sampled filters planning choices that do not depend on the mode. The result 
 serves a cursor's subtree when the subtree is materialized anyway, and sampled filters
 prepare their samples once per plan. EXPLAIN then prints one plan for a query whatever
 the mode, which `plan_fidelity_tests.rs` checks, with a spill-configured DISTINCT over
-ORDER BY among its cases. After item 1069 the mode is read in seven places, the mode
-branch of `query_execution_with_plan`, the EXISTS key set of `exists::prepare`,
-`envelope_refuses` and the four direct reads in `ctx.rs`, and the bounded-reads test's
-bound is seven. The merge removes the rest.
+ORDER BY among its cases. After item 1069 the mode was read in seven places, and item 1308 Wave 2 removed
+`envelope_refuses` to bring the bounded-reads test down to six: the mode branch of
+`query_execution_with_plan`, the EXISTS key set of `exists::prepare` and the four direct
+reads in `ctx.rs`. The merge removes the rest.
 
 The phase then routes every ASK and unordered LIMIT through pull demand. A streaming
 request already pulls its ASK through the cursor, so the change is that automatic and
@@ -623,8 +632,8 @@ merge removes it with the eager executor. In both cases
 hold no such shape. The EXISTS shapes that automatic execution keeps eager through
 `streams_natively` are an admission choice rather than a fallback, and the merge removes
 the admission with the mode. A LeftJoin condition with EXISTS is item 570's work, since
-the cursor merges it but is slower than eager execution at higher fan-out, an
-EXISTS deeper than four levels is item 1081 and an EXISTS pattern that calls a SERVICE
+the cursor merges it but is slower than eager execution at higher fan-out, item 1081
+removed the earlier four-level nesting cap, and an EXISTS pattern that calls a SERVICE
 stays eager because a cursor cannot repeat its effects.
 
 The regression tests that fail before the change are a test in `tests/query_cursor.rs`
@@ -665,13 +674,13 @@ that it agrees with the engine on every W3C query test and on the seeded queries
 `tests/query_cursor.rs` at both modes.
 
 The evaluator has landed and passed this gate, apart from the disagreements that items
-1064, 1065 and 1071 hold. While those items are open, the tests compare the aggregates
-over errors and non-strings and the string functions over directional strings under the
-engine's reading, and leave out the queries that read longer numbers. The [spec's Outcome](SPEC.md#outcome) describes it.
+1064, 1065 and 1071 held. Items 1064 and 1071 have shipped; the tests compare the
+aggregates over errors and non-strings under the engine's default Jena reading and leave
+out the queries that read longer numbers under item 1065. The [spec's Outcome](SPEC.md#outcome) describes it.
 
 ### The merge
 
-The merge phase gets its number when items 825 to 829, 512, 243 and 534 have landed
+The merge phase gets its number when items 825 to 829, 512, 243, 293 and 534 have landed
 and the remaining work of item 7 is done or decided. It is the design's single
 morsel-driven executor, and it is judgment-sensitive throughout.
 

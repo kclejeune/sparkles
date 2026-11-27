@@ -181,6 +181,7 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         RECALL_PREFLIGHT => t.recall_preflight(args),
         "community_reports" => t.community_reports(args),
         "why_empty" => t.why_empty(args),
+        "ask" => t.ask(args),
         #[cfg(feature = "reasoning")]
         "explain_inference" => t.explain_inference(args),
         #[cfg(feature = "reasoning")]
@@ -673,6 +674,17 @@ impl Tools<'_> {
         }
     }
 
+    /// Effective absolute deadline for a tool call with `timeout`, clamped by any
+    /// absolute deadline cap on the enclosing [`McpServer`] so derived child calls never
+    /// widen their parent's deadline.
+    pub(super) fn deadline(&self, timeout: Duration) -> Instant {
+        let d = self.call.arrived + timeout;
+        match self.server.deadline() {
+            Some(cap) => d.min(cap),
+            None => d,
+        }
+    }
+
     /// Whether a call reads the materialized inferences (as the HTTP `reasoning`
     /// parameter: when the dataset has them and the argument is not false).
     pub(super) fn reasoning(ds: &Dataset, arg: Option<bool>) -> bool {
@@ -849,6 +861,10 @@ impl Tools<'_> {
                 if self.server.offers("graphql_query") && super::graphql_on(p, ds) {
                     j["graphql"] = true.into();
                 }
+                // ask queries this dataset
+                if self.server.offers("ask") && super::ask::ask_on(&self.server.state, p, ds) {
+                    j["ask"] = true.into();
+                }
                 j
             })
             .collect();
@@ -985,12 +1001,12 @@ impl Tools<'_> {
                     ));
                 }
                 let snap = self
-                    .snapshot(&ds, Some(cur.c), None, self.call.arrived + timeout)
+                    .snapshot(&ds, Some(cur.c), None, self.deadline(timeout))
                     .map_err(|_| stale(409, "the schema changed since the first page"))?;
                 (snap, Some(cur.a))
             }
             None => (
-                self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?,
+                self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.deadline(timeout))?,
                 None,
             ),
         };
@@ -1005,7 +1021,7 @@ impl Tools<'_> {
         )?;
         let include_builtin = a.include_builtin.unwrap_or(false);
         let mut terms = Terms::new(&prefixes, 500);
-        let deadline = self.call.arrived + timeout;
+        let deadline = self.deadline(timeout);
         let exact = report.basis.is_exact();
         let listed = |p: &PredicateEntry, terms: &mut Terms| -> Result<Value, ToolError> {
             let (objects, sampled) = self.entry_objects(&ds, &snap, &report, p, deadline, &ctx)?;
@@ -1109,7 +1125,7 @@ impl Tools<'_> {
                     graph: graph.clone(),
                     inferred_graph: Some(INFERRED_GRAPH.to_string()),
                     include_inferred: reasoning,
-                    deadline: Some(self.call.arrived + timeout),
+                    deadline: Some(self.deadline(timeout)),
                     ..Default::default()
                 };
                 let p = self.class_profiles(&ds, &snap, schema, profile_classes, &ctx)?;
@@ -1198,7 +1214,7 @@ impl Tools<'_> {
             .call
             .principal
             .view(&ds.name, crate::auth::Endpoint::Info);
-        let deadline = self.call.arrived + timeout;
+        let deadline = self.deadline(timeout);
         let opts = SchemaOptions {
             graph,
             declared_graph: None,
@@ -1320,7 +1336,8 @@ impl Tools<'_> {
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
+        let deadline = self.deadline(timeout);
+        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), deadline)?;
         let mode = Self::reasoning_mode(&ds, a.reasoning.as_ref())?;
         let reasoning = mode.reads_inferences() && ds.reasoning.read().is_some();
         let t0 = Instant::now();
@@ -1342,7 +1359,6 @@ impl Tools<'_> {
                 length: Some(offset.saturating_add(max_rows).saturating_add(1)),
             };
         }
-        let deadline = self.call.arrived + timeout;
         let mut opts = self
             .query_options(
                 &ds.name,
@@ -1396,17 +1412,19 @@ impl Tools<'_> {
             })
             .transpose()?;
         let derived = r.reasoning().and_then(|a| a.header());
-        let text = match r.kind {
-            QueryKind::Ask => match format {
-                Format::Table => render::ask_table(snap.commit, r.boolean, derived.as_deref()),
-                Format::Json => render::ask_json(
-                    &ds.name,
-                    snap.commit,
-                    r.boolean,
-                    elapsed_ms,
-                    derived.as_deref(),
-                ),
-            },
+        let budget = sparkles::sparql::output::NativeBudget::from_preparation(&controlled)
+            .map_err(|e| ctx.engine(e))?;
+        let rendered = match r.kind {
+            QueryKind::Ask => render::owned_ask(
+                &ds.name,
+                snap.commit,
+                r.boolean,
+                elapsed_ms,
+                derived.as_deref(),
+                format == Format::Json,
+                &budget,
+            )
+            .map_err(|e| ctx.engine(e))?,
             kind => {
                 let len = r.len();
                 let start = offset.min(len);
@@ -1433,13 +1451,12 @@ impl Tools<'_> {
                     elapsed_ms,
                     reasoning: derived.as_deref(),
                 };
-                match format {
-                    Format::Table => render::table(&page, &prefixes),
-                    Format::Json => render::json(&page, &prefixes),
-                }
+                render::owned_page(&page, &prefixes, format == Format::Json, &budget)
+                    .map_err(|e| ctx.engine(e))?
             }
         };
-        Ok((Outcome::Text(text), whole))
+        drop(r);
+        Ok((Outcome::Retained(rendered), whole))
     }
 
     // ------------------------------------------------------------- explain_query ------
@@ -1478,12 +1495,13 @@ impl Tools<'_> {
         let mode = Self::reasoning_mode(&ds, a.reasoning.as_ref())?;
         let reasoning = mode.reads_inferences() && ds.reasoning.read().is_some();
         let parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
+        let deadline = self.deadline(timeout);
         let mut opts = self
             .query_options(
                 &ds.name,
                 crate::auth::Endpoint::Query,
                 reasoning,
-                self.call.arrived + timeout,
+                deadline,
                 &prefix_map,
             )
             .map_err(|e| ctx.engine(e))?;
@@ -1513,7 +1531,7 @@ impl Tools<'_> {
                 depth: 0,
             });
         }
-        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
+        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), deadline)?;
         let (algebra, plan) =
             sparql::explain(snap.clone(), &a.query, &opts).map_err(|e| ctx.engine(e))?;
         // refused before the run, which a deeper plan than the notes read would waste
@@ -1531,12 +1549,7 @@ impl Tools<'_> {
                 let mut opts = opts.clone();
                 opts.union_default_graph = Some(false);
                 opts.default_graph_extra.clear();
-                super::memory::Reader {
-                    snap: snap.clone(),
-                    opts,
-                    deadline: self.call.arrived + timeout,
-                    reasoning,
-                }
+                super::memory::Reader::from_snapshot(snap.clone(), opts, deadline, reasoning)
             });
         // the planner's own notes first (spatial filters not pushed down, …)
         let mut warnings: Vec<Value> = plan
@@ -1719,9 +1732,9 @@ impl Tools<'_> {
         let timeout = self.cfg().default_timeout();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
         let resource = parse_iri(&a.iri, &prefix_map, true)?;
-        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
+        let deadline = self.deadline(timeout);
+        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), deadline)?;
         let reasoning = Self::reasoning(&ds, a.reasoning);
-        let deadline = self.call.arrived + timeout;
         let opts = self
             .query_options(
                 &ds.name,

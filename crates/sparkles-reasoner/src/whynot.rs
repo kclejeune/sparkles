@@ -24,7 +24,8 @@ use crate::builtins::BuiltinKind;
 use crate::demand::{head_slots, intensional};
 use crate::engine::{CHead, CRule, Eval, Mode, Slot};
 use crate::explain::{
-    DemandInput, ExplainOptions, demand_of, demand_session, search_session, session_error,
+    CallBytes, DemandInput, ExplainOptions, check_controls, demand_session, search_session,
+    session_error, write_call,
 };
 use crate::facts::Memo;
 use crate::graph::{Graph, Triple};
@@ -170,33 +171,6 @@ struct Unfold<'a> {
     work: crate::budget::Held,
 }
 
-struct CallBytes(usize);
-impl std::fmt::Write for CallBytes {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.0 = self.0.checked_add(s.len()).ok_or(std::fmt::Error)?;
-        Ok(())
-    }
-}
-
-fn write_call(
-    out: &mut impl std::fmt::Write,
-    name: &str,
-    args: &[Option<Term>],
-    sep: &str,
-) -> std::fmt::Result {
-    write!(out, "{name}(")?;
-    for (i, arg) in args.iter().enumerate() {
-        if i != 0 {
-            out.write_str(sep)?;
-        }
-        match arg {
-            Some(term) => write!(out, "{term}")?,
-            None => out.write_str("_")?,
-        }
-    }
-    out.write_str(")")
-}
-
 /// Measure before rendering, and retain one charged string without joined copies.
 fn blocker_call(
     terms: &Terms,
@@ -226,10 +200,10 @@ fn blocker_call_sep(
         decoded.push(term);
     }
     let mut bytes = CallBytes(0);
-    write_call(&mut bytes, name, &decoded, sep)?;
+    write_call(&mut bytes, "", name, &decoded, sep)?;
     retained.try_grow(bytes.0 + 2 * std::mem::size_of::<(String, Option<Triple>)>())?;
     let mut call = String::with_capacity(bytes.0);
-    write_call(&mut call, name, &decoded, sep)?;
+    write_call(&mut call, "", name, &decoded, sep)?;
     Ok(call)
 }
 
@@ -1096,25 +1070,34 @@ fn why_not_inner(
     opts: &WhyNotOptions,
 ) -> anyhow::Result<WhyNot> {
     let mut session = demand_session(input, &opts.explain, true)?;
+    let root = {
+        let terms = session.terms();
+        [
+            terms.try_id_for_controlled(&triple[0], || check_controls(&opts.explain))?,
+            terms.try_id_for_controlled(&triple[1], || check_controls(&opts.explain))?,
+            terms.try_id_for_controlled(&triple[2], || check_controls(&opts.explain))?,
+        ]
+    };
     session
-        .derive_all(&[demand_of(triple)])
+        .derive_ids(&[[Some(root[0]), Some(root[1]), Some(root[2])]])
         .map_err(session_error)?;
     let terms = session.terms();
-    let root = [
-        terms.try_id_for(&triple[0])?,
-        terms.try_id_for(&triple[1])?,
-        terms.try_id_for(&triple[2])?,
-    ];
     if session.graph().is_some_and(|g| g.contains(&root)) {
         return Ok(WhyNot::Entailed);
     }
-    let rdf_type = terms.id_for(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()))?;
-    let same_as = terms.id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-        "http://www.w3.org/2002/07/owl#sameAs",
-    )))?;
+    let rdf_type = terms.try_id_for_controlled(
+        &Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()),
+        || check_controls(&opts.explain),
+    )?;
+    let same_as = terms.try_id_for_controlled(
+        &Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+            "http://www.w3.org/2002/07/owl#sameAs",
+        )),
+        || check_controls(&opts.explain),
+    )?;
     let geo = session
         .geo_default()
-        .then(|| crate::geo_ids(session.terms()))
+        .then(|| crate::geo_ids_controlled(session.terms(), || check_controls(&opts.explain)))
         .transpose()?;
     let mut u = Unfold {
         geo,
@@ -1309,7 +1292,7 @@ fn add_hypothesis(
     if !session.geo_default() {
         return session.add_facts(facts.to_vec()).map_err(session_error);
     }
-    let (has, default) = crate::geo_ids(session.terms())?;
+    let (has, default) = crate::geo_ids_controlled(session.terms(), || check_controls(opts))?;
     let base = session
         .graph()
         .and_then(Graph::base_arc)
@@ -1420,7 +1403,9 @@ fn verify(
                 let term = from
                     .term(f[i])
                     .ok_or_else(|| anyhow::anyhow!("term {} is unknown", f[i]))?;
-                t[i] = s.terms().try_id_for(&term)?;
+                t[i] = s
+                    .terms()
+                    .try_id_for_controlled(&term, || check_controls(&verification_opts))?;
                 shown.push(term);
             }
         }
@@ -1429,7 +1414,15 @@ fn verify(
         missing.push([a, b, c]);
     }
     add_hypothesis(&mut s, &facts, &verification_opts)?;
-    match s.derive_all(&[demand_of(triple)]) {
+    let root = {
+        let terms = s.terms();
+        [
+            terms.try_id_for_controlled(&triple[0], || check_controls(&verification_opts))?,
+            terms.try_id_for_controlled(&triple[1], || check_controls(&verification_opts))?,
+            terms.try_id_for_controlled(&triple[2], || check_controls(&verification_opts))?,
+        ]
+    };
+    match s.derive_ids(&[[Some(root[0]), Some(root[1]), Some(root[2])]]) {
         Ok(()) => {}
         // a hypothesis whose program passes its size, such as one that adds equality
         // to rules with variable predicates, is not verified
@@ -1441,12 +1434,6 @@ fn verify(
         }
         Err(e) => return Err(session_error(e)),
     }
-    let terms = s.terms();
-    let root = [
-        terms.try_id_for(&triple[0])?,
-        terms.try_id_for(&triple[1])?,
-        terms.try_id_for(&triple[2])?,
-    ];
     if !s.graph().is_some_and(|g| g.contains(&root)) {
         return Ok(None);
     }

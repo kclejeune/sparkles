@@ -1,0 +1,2 @@
+507 application/json
+{"budget":"result-bytes","error":"response exceeds the result size budget of 68.4 KiB","limit":70000}

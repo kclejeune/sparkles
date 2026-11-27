@@ -349,6 +349,7 @@ fn propose_by(
             metadata: Default::default(),
             times: Default::default(),
             lineage: Default::default(),
+            was_revision_of: None,
         }],
         claims: vec![ClaimInput {
             version: RecordVersion::V1,
@@ -526,7 +527,7 @@ async fn reports_under_a_policy_cite_claims_and_decisions() {
     }
     assert!(!fp[0][0].contains(SOURCES), "{}", fp[0][0]);
     // the state records the policy and the pairs of each report
-    let st = e.s.state.graphrag.state("ev");
+    let st = e.s.state.graphrag.state(ds.store().dataset_id());
     let last = st.last_build.unwrap();
     assert_eq!(last.policy.as_ref().unwrap().name, "main");
     assert_eq!(last.pairs.len(), 2, "{:?}", last.pairs);
@@ -603,12 +604,10 @@ fn tool_as(s: &AuthServer, user: &str, name: &str, args: serde_json::Value) -> s
     };
     m.insert("dataset".into(), "ev".into());
     let server = crate::mcp::McpServer::new(s.state.clone(), crate::mcp::McpConfig::default());
-    match server.run_now(name, m, &mut call).unwrap() {
-        crate::mcp::Outcome::Structured(v) => v,
-        crate::mcp::Outcome::Text(t) => {
-            serde_json::from_str(&t).unwrap_or(serde_json::Value::String(t))
-        }
-    }
+    server
+        .run_now(name, m, &mut call)
+        .unwrap()
+        .into_json_value()
 }
 
 fn refused(r: Result<Outcome, RunError>) -> String {
@@ -893,11 +892,11 @@ async fn edits_keep_their_pairs_and_mismatches_are_rewritten() {
     assert_ne!(e.report_of("http://ex/x0"), edit);
     // a state that names another report than the graph links, as after a crash between
     // two level commits, rewrites it
-    let mut st = e.s.state.graphrag.state("ev");
+    let mut st = e.s.state.graphrag.state(ds.store().dataset_id());
     for c in &mut st.last_build.as_mut().unwrap().communities {
         c.report = Some("urn:uuid:00000000-0000-0000-0000-00000000dead".into());
     }
-    e.s.state.graphrag.set_state("ev", st);
+    e.s.state.graphrag.set_state(ds.store().dataset_id(), st);
     let (e2, s2) = (e.clone(), s.clone());
     let o = tokio::task::spawn_blocking(move || e2.run(s2, Mode::Refresh).unwrap())
         .await
@@ -1029,6 +1028,7 @@ async fn a_changed_evidence_configuration_stops_the_run() {
             None,
             Default::default(),
             Limits::default(),
+            &e2.ds().dataset.query_options(),
         )
         .unwrap()
         .unwrap();
@@ -1060,7 +1060,7 @@ async fn an_interrupted_policy_run_is_rewritten_without_the_policy() {
     tokio::task::spawn_blocking(move || e2.run(s2, Mode::Build).unwrap())
         .await
         .unwrap();
-    let before = e.s.state.graphrag.state("ev");
+    let before = e.s.state.graphrag.state(ds.store().dataset_id());
     let e2 = e.clone();
     tokio::task::spawn_blocking(move || {
         e2.run(
@@ -1072,7 +1072,9 @@ async fn an_interrupted_policy_run_is_rewritten_without_the_policy() {
     .await
     .unwrap();
     // the state as it was before the policy run saved its own
-    e.s.state.graphrag.set_state("ev", before);
+    e.s.state
+        .graphrag
+        .set_state(ds.store().dataset_id(), before);
     let (e2, s2) = (e.clone(), plain.clone());
     let o = tokio::task::spawn_blocking(move || e2.run(s2, Mode::Refresh).unwrap())
         .await
@@ -1137,7 +1139,7 @@ async fn private_checks_start_refreshes_only_for_changed_inputs() {
                 "SELECT ?s ?p ?o WHERE {{ GRAPH <{REPORTS}> {{ ?s ?p ?o }} }}"
             ))
         };
-        let state = || e.s.state.graphrag.state("ev");
+        let state = || e.s.state.graphrag.state(ds.store().dataset_id());
         let runs = |w: &HashMap<String, Watch>| w.get("ev").map_or(0, |w| w.private().runs);
         let sec = Duration::from_secs(1);
         let mut now = Instant::now();
@@ -1208,7 +1210,7 @@ async fn private_checks_start_refreshes_only_for_changed_inputs() {
         for c in &mut st.last_build.as_mut().unwrap().communities {
             c.report = Some("urn:uuid:00000000-0000-0000-0000-00000000dead".into());
         }
-        e.s.state.graphrag.set_state("ev", st);
+        e.s.state.graphrag.set_state(ds.store().dataset_id(), st);
         let mut w: HashMap<String, Watch> = HashMap::new();
         tick_once(&e.s.state, &mut w, now);
         assert_eq!(tasks().len(), 2, "{:?}", tasks());
@@ -1315,6 +1317,1578 @@ async fn failed_refreshes_after_checks_back_off() {
         assert_eq!(started.len(), 4, "{started:?}");
         let gaps: Vec<u32> = started.windows(2).map(|p| p[1] - p[0]).collect();
         assert!(gaps.windows(2).all(|g| g[1] > g[0]), "{started:?}");
+    })
+    .await
+    .unwrap();
+}
+
+/// A pooled server running a GraphRAG build under a review policy must share the
+/// catalog's memory pool instead of failing with query-memory: foreign-domain.
+#[tokio::test(flavor = "multi_thread")]
+async fn pooled_server_evidence_build_succeeds_and_returns_pool_credit() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = Arc::new(
+        crate::state::AppState::with_memory(
+            dir.path(),
+            sparkles::store::StoreOptions::default(),
+            std::time::Duration::from_secs(30),
+            Some(128 << 20),
+        )
+        .unwrap(),
+    );
+    let ds = st.attach("ev", DbType::Memory, None).unwrap();
+    let p = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.dataset
+        .store()
+        .activate_memory_configuration_history(&p)
+        .unwrap();
+    drop(p);
+    evidence::configure(&ds.dataset, &evidence_settings(1), &Control::none()).unwrap();
+    let mut org = crate::graphrag::build::tests::data(4);
+    org.push_str(&format!(
+        "<{ORG}> {{ <http://ex/y0> <http://ex/owns> <http://ex/y1> . }}\n"
+    ));
+    ds.store
+        .load(&[Source::from_bytes(
+            org.into_bytes(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let a = propose(&ds.dataset, "advisory", leads());
+    decide(&ds.dataset, &a, Disposition::Accepted, 1);
+    let mock = MockModel::start(|r, _| (200, mock::openai(&answer_all(r))));
+    st.models
+        .store(Some(Arc::new(crate::graphrag::build::tests::models_for(
+            &mock.url(),
+            &serde_json::json!({ "provider": "p", "model": "m" }),
+        ))));
+    crate::settings::store_runtime(
+        &st,
+        &ds,
+        &crate::settings::ASSISTANT,
+        &serde_json::json!({ "send": "rows" }),
+    )
+    .unwrap();
+    let s = settings(serde_json::json!({}));
+    crate::settings::store_runtime(
+        &st,
+        &ds,
+        &crate::settings::GRAPHRAG,
+        &serde_json::to_value(&s).unwrap(),
+    )
+    .unwrap();
+    let st_bg = st.clone();
+    let ds_bg = ds.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        build::run(&Run {
+            st: &st_bg,
+            ds: ds_bg,
+            settings: s,
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: "pooled-1".into(),
+            cancel: Default::default(),
+            limits: Limits::default(),
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(outcome.communities > 0);
+    assert_eq!(st.catalog.pool().unwrap().granted(), 0);
+
+    // Verify Evidence::admit keeps the 64 MiB selection ceiling distinct from the
+    // configured query_memory_bytes (> 64 MiB and unbounded None) without grabbing
+    // the entire pool during selection.
+    let big_pool = sparkles::sparql::pool::QueryPool::new(128 << 20);
+    {
+        let big_grant = Arc::new(big_pool.empty_grant());
+        let mut big_opts = ds.dataset.query_options();
+        big_opts.grant = Some(big_grant.clone());
+        big_opts.max_memory_bytes = Some(256 << 20);
+        let ev_big = Evidence::admit(
+            &ds,
+            Some("main"),
+            None,
+            Default::default(),
+            Limits::default(),
+            &big_opts,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            ev_big.preparation_limit(),
+            256 << 20,
+            "root execution limit must match configured query cap, not cap + VIEW_BYTES"
+        );
+        assert_eq!(ev_big.selection_limit(), 64 << 20);
+        assert!(
+            ev_big.available_execution_bytes() >= (256 << 20) - 4096,
+            "selection must not reduce usable execution headroom: available={}",
+            ev_big.available_execution_bytes()
+        );
+        assert!(
+            big_grant.peak() <= 64 << 20,
+            "selection temporary reservation exceeded 64 MiB ceiling: peak={}",
+            big_grant.peak()
+        );
+        let mut live_query_opts = big_opts.clone();
+        live_query_opts.graphs = Some(Arc::new(sparkles::access::GraphAccess::all()));
+        let live_res = sparkles::sparql::query_source(
+            ev_big.read_source(),
+            ds.dataset.store(),
+            "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1",
+            &live_query_opts,
+        )
+        .unwrap();
+        drop(live_res);
+        drop(ev_big);
+        assert_eq!(big_grant.used(), 0);
+    }
+    {
+        let unbounded_grant = Arc::new(big_pool.empty_grant());
+        let mut unbounded_opts = ds.dataset.query_options();
+        unbounded_opts.grant = Some(unbounded_grant.clone());
+        unbounded_opts.max_memory_bytes = None;
+        let ev_unbounded = Evidence::admit(
+            &ds,
+            Some("main"),
+            None,
+            Default::default(),
+            Limits::default(),
+            &unbounded_opts,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ev_unbounded.preparation_limit(), u64::MAX);
+        assert_eq!(ev_unbounded.selection_limit(), 64 << 20);
+        assert!(
+            unbounded_grant.peak() <= 64 << 20,
+            "unbounded query selection must not reserve the entire pool: peak={}",
+            unbounded_grant.peak()
+        );
+        drop(ev_unbounded);
+        assert_eq!(unbounded_grant.used(), 0);
+    }
+    assert_eq!(big_pool.granted(), 0);
+    assert_eq!(st.catalog.pool().unwrap().granted(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_drift_refuses_policy_build_and_refresh_before_model_calls() {
+    use crate::settings::{Declared, Providers};
+    let e = Arc::new(env(true));
+    let declared = Declared::parse(
+        r#"{"datasets":{"ev":{"evidence":{"enabled":true,"sourceRecords":["urn:ev:changed"],"proposals":["urn:ev:claims"]}}}}"#,
+        Providers::Unchecked,
+    ).unwrap();
+    e.s.state
+        .settings
+        .replace_declared_for_test(Arc::new(declared));
+
+    let runner = e.clone();
+    tokio::task::spawn_blocking(move || {
+        for mode in [Mode::Build, Mode::Refresh] {
+            let message = refused(runner.run(settings(serde_json::json!({})), mode));
+            assert!(message.starts_with("evidence-settings-drift"), "{message}");
+        }
+    })
+    .await
+    .unwrap();
+    assert!(e.mock.requests().is_empty());
+}
+
+/// Item 810: `POST /{ds}/claims/dependents` and MCP `find_evidence_dependents` return
+/// community reports (including human edits via `gr:editOf` and transitive parent
+/// reports) whose activity used a changed claim or decision, strictly through the
+/// C22 §6 disclosure guard and caller visibility without leaking protected reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_dependents_finds_guarded_reports_and_enforces_disclosure_guard() {
+    let e = Arc::new(env(true));
+    let ds = e.dataset();
+    let a = propose(&ds, "advisory", leads());
+    let l = propose(&ds, "badge", label());
+    let r = propose(&ds, "rumour", owns());
+    let dec_a = {
+        let mut o = ReviewOptions::new(iri("urn:principal:reviewer"));
+        o.if_head = Some(ds.store().head_commit().seq);
+        evidence::review(
+            None,
+            &ds,
+            &ds,
+            "main",
+            1,
+            &[DecisionInput {
+                key: "d".into(),
+                target: a.0.clone(),
+                target_digest: a.1,
+                disposition: Disposition::Accepted,
+                supersedes: None,
+            }],
+            &o,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap()
+        .decisions[0]
+            .iri
+            .clone()
+    };
+    decide(&ds, &l, Disposition::Accepted, 1);
+    decide(&ds, &r, Disposition::Rejected, 1);
+
+    let e2 = e.clone();
+    let o =
+        tokio::task::spawn_blocking(move || e2.run(settings(serde_json::json!({})), Mode::Build))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(o.stopped, None, "{o:?}");
+    let x_orig = e.report_of("http://ex/x0");
+    let x_comm = e.community_of("http://ex/x0");
+    let y_report = e.report_of("http://ex/y0");
+
+    // Edit community x's report so its current report has `gr:editOf` and no activity.
+    let edited = call(
+        &e.s.app,
+        "POST",
+        "/$/graphrag/ev/review",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({
+            "report": x_orig,
+            "status": "reviewed",
+            "title": "Edited community",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(edited.status, StatusCode::OK, "{}", edited.text());
+    let x_edit = e.report_of("http://ex/x0");
+    assert_ne!(x_edit, x_orig);
+
+    // Withdraw claim `a` and query `POST /ev/claims/dependents`.
+    withdraw(&ds, &a);
+    let body = serde_json::json!({ "changed": [a.0.as_str()], "transitive": true }).to_string();
+
+    // 1. Unrestricted readers see the policy-built report and its human edit.
+    for user in ["rad", "rp"] {
+        let res = call(
+            &e.s.app,
+            "POST",
+            "/ev/claims/dependents",
+            &[
+                ("authorization", &b(user)),
+                ("content-type", "application/json"),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{user}: {}", res.text());
+        let j = res.json();
+        let reps = j["reports"].as_array().unwrap();
+        let iris: Vec<&str> = reps.iter().map(|r| r["report"].as_str().unwrap()).collect();
+        assert!(iris.contains(&x_orig.as_str()), "{user}: {j}");
+        assert!(iris.contains(&x_edit.as_str()), "{user}: {j}");
+        assert!(!iris.contains(&y_report.as_str()), "{user}: {j}");
+        for item in reps {
+            assert_eq!(item["graph"], REPORTS);
+            assert_eq!(item["dependence"], "used");
+            if item["report"] == x_orig || item["report"] == x_edit {
+                assert_eq!(item["community"], x_comm);
+                assert_eq!(item["on"], a.0.as_str());
+                assert_eq!(item["depth"], 0);
+            }
+        }
+    }
+
+    // 2. Searching by the accepted decision IRI or by the uncited label claim `l` also
+    //    finds `x_orig` and `x_edit` and excludes `y_report`.
+    for changed_iri in [dec_a.as_str(), l.0.as_str()] {
+        let res = call(
+            &e.s.app,
+            "POST",
+            "/ev/claims/dependents",
+            &[
+                ("authorization", &b("rad")),
+                ("content-type", "application/json"),
+            ],
+            &serde_json::json!({ "changed": [changed_iri], "transitive": false }).to_string(),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+        let reps = res.json()["reports"].as_array().unwrap().clone();
+        let iris: Vec<&str> = reps.iter().map(|r| r["report"].as_str().unwrap()).collect();
+        assert!(iris.contains(&x_orig.as_str()), "{changed_iri}: {reps:?}");
+        assert!(iris.contains(&x_edit.as_str()), "{changed_iri}: {reps:?}");
+        assert!(
+            !iris.contains(&y_report.as_str()),
+            "{changed_iri}: {reps:?}"
+        );
+    }
+
+    // 3. Searching by rejected claim `r` (not used by any report activity) returns no reports.
+    let res = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::json!({ "changed": [r.0.as_str()], "transitive": true }).to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+    assert_eq!(res.json()["reports"], serde_json::json!([]));
+
+    // 4. Evidence-aware footprints require unrestricted read access, even for
+    //    `rhide` with grants on all currently used graphs.
+    for user in ["rnoclaims", "rnodec", "rhide"] {
+        let res = call(
+            &e.s.app,
+            "POST",
+            "/ev/claims/dependents",
+            &[
+                ("authorization", &b(user)),
+                ("content-type", "application/json"),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{user}: {}", res.text());
+        assert_eq!(
+            res.json()["reports"],
+            serde_json::json!([]),
+            "{user} must not see protected reports"
+        );
+    }
+
+    // 5. MCP `find_evidence_dependents` matches HTTP for both proven and unproven callers.
+    let e_mcp = e.clone();
+    let claim_iri = a.0.as_str().to_string();
+    let (mcp_proven, mcp_unproven) = tokio::task::spawn_blocking(move || {
+        let args = serde_json::json!({ "changed": [claim_iri], "transitive": true });
+        (
+            tool_as(&e_mcp.s, "rad", "find_evidence_dependents", args.clone()),
+            tool_as(&e_mcp.s, "rnoclaims", "find_evidence_dependents", args),
+        )
+    })
+    .await
+    .unwrap();
+    let http_proven = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await
+    .json();
+    assert_eq!(mcp_proven, http_proven);
+    assert_eq!(mcp_unproven["reports"], serde_json::json!([]));
+
+    // 6. A missing footprint preserves access for unrestricted readers only.
+    e.dataset()
+        .update(&format!(
+            "CLEAR GRAPH <{}>",
+            crate::graphrag::guard::DISCLOSURE_GRAPH
+        ))
+        .unwrap();
+    let rhide_after = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rhide")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(rhide_after.status, StatusCode::OK);
+    assert_eq!(rhide_after.json()["reports"], serde_json::json!([]));
+    let rad_after = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(rad_after.status, StatusCode::OK);
+    assert!(!rad_after.json()["reports"].as_array().unwrap().is_empty());
+}
+
+/// Item 810: A caller whose grants cover the footprint but omit the reports graph itself,
+/// or whose `?user` binding in a triple protection pattern differs from the build
+/// principal, never sees protected reports in `POST /{ds}/claims/dependents`.
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_dependents_denies_missing_report_grant_and_mismatched_user_pattern() {
+    let h = |u: &str| hash_password_with(&format!("{u}-pw"), 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"
+[[protections]]
+name = "owner-only"
+dataset = "ev"
+predicates = ["http://ex/secret"]
+graphs = ["{ORG}"]
+pattern = "?s <http://ex/owner> ?user"
+
+[[users]]
+name = "rad"
+password = "{}"
+datasets = {{ ev = "admin" }}
+[[users]]
+name = "rp"
+password = "{}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ORG}", "{CLAIMS}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}", "{REPORTS}"]
+[[users]]
+name = "other"
+password = "{}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ORG}", "{CLAIMS}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}", "{REPORTS}"]
+[[users]]
+name = "rnoreports"
+password = "{}"
+[[users.grants]]
+dataset = "ev"
+level = "read"
+graphs = ["{ORG}", "{CLAIMS}", "{DECISIONS}", "{SUPPORTS}", "{ACCEPTED}"]
+"#,
+            h("rad"),
+            h("rp"),
+            h("other"),
+            h("rnoreports"),
+        ),
+        ..Default::default()
+    });
+    let ds = s.state.attach("ev", DbType::Memory, None).unwrap();
+    let p = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.dataset
+        .store()
+        .activate_memory_configuration_history(&p)
+        .unwrap();
+    evidence::configure(&ds.dataset, &evidence_settings(1), &Control::none()).unwrap();
+    let org = crate::graphrag::build::tests::data(4);
+    ds.store
+        .load(&[Source::from_bytes(
+            org.into_bytes(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let mock = MockModel::start(|r, _| (200, mock::openai(&answer_all(r))));
+    s.state
+        .models
+        .store(Some(Arc::new(crate::graphrag::build::tests::models_for(
+            &mock.url(),
+            &serde_json::json!({ "provider": "p", "model": "m" }),
+        ))));
+    crate::settings::store_runtime(
+        &s.state,
+        &ds,
+        &crate::settings::ASSISTANT,
+        &serde_json::json!({ "send": "rows" }),
+    )
+    .unwrap();
+    let e = Arc::new(Env { s, mock });
+    let a = propose(&e.dataset(), "advisory", leads());
+    decide(&e.dataset(), &a, Disposition::Accepted, 1);
+
+    let e2 = e.clone();
+    let o = tokio::task::spawn_blocking(move || {
+        e2.run(
+            settings(serde_json::json!({"reviewPolicy": null})),
+            Mode::Build,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(o.stopped, None, "{o:?}");
+    let x = e.report_of("http://ex/x0");
+    // Keep an ordinary disclosure footprint so the caller and graph grants
+    // are what decide whether the stored provenance is visible.
+    e.dataset()
+        .update(&format!(
+            "INSERT {{ GRAPH <{REPORTS}> {{ ?activity <{PROV}used> <{}> }} }} \
+             WHERE {{ GRAPH <{REPORTS}> {{ <{x}> <{PROV}wasGeneratedBy> ?activity }} }}",
+            a.0.as_str()
+        ))
+        .unwrap();
+    let body = serde_json::json!({ "changed": [a.0.as_str()], "transitive": true }).to_string();
+
+    // Build principal `rp` matches the footprint and has the REPORTS grant -> sees `x`.
+    let rp_res = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rp")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(rp_res.status, StatusCode::OK, "{}", rp_res.text());
+    assert!(
+        rp_res.json()["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["report"] == x),
+        "{}",
+        rp_res.text()
+    );
+
+    // `other` has identical graph grants but a different `?user` binding in the
+    // protection pattern -> C22 §6 returns Unproven -> `reports: []`.
+    // `rnoreports` covers the footprint graphs but lacks the REPORTS graph grant -> `reports: []`.
+    for user in ["other", "rnoreports"] {
+        let res = call(
+            &e.s.app,
+            "POST",
+            "/ev/claims/dependents",
+            &[
+                ("authorization", &b(user)),
+                ("content-type", "application/json"),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{user}: {}", res.text());
+        assert_eq!(
+            res.json()["reports"],
+            serde_json::json!([]),
+            "{user} must not see protected reports"
+        );
+    }
+
+    e.dataset()
+        .update(&format!(
+            "CLEAR GRAPH <{}>",
+            crate::graphrag::guard::DISCLOSURE_GRAPH
+        ))
+        .unwrap();
+    let rp_without_footprint = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rp")),
+            ("content-type", "application/json"),
+        ],
+        &body,
+    )
+    .await;
+    assert_eq!(rp_without_footprint.status, StatusCode::OK);
+    assert_eq!(
+        rp_without_footprint.json()["reports"],
+        serde_json::json!([])
+    );
+}
+
+/// Item 810: Router-level HTTP and MCP `claims/dependents` return a higher-level parent
+/// report at `depth: 1` when `transitive: true`, omit it when `transitive: false`, and
+/// keep the entire hierarchy hidden from callers that fail the C22 §6 disclosure guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_dependents_transitive_parent_report_through_http_and_mcp() {
+    let e = Arc::new(env(true));
+    let ds = e.dataset();
+    let a = propose(&ds, "advisory", leads());
+    decide(&ds, &a, Disposition::Accepted, 1);
+
+    let e2 = e.clone();
+    let o =
+        tokio::task::spawn_blocking(move || e2.run(settings(serde_json::json!({})), Mode::Build))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(o.stopped, None, "{o:?}");
+    let leaf = e.report_of("http://ex/x0");
+    let leaf_comm = e.community_of("http://ex/x0");
+
+    // Reuse the real C22 §6 disclosure footprint committed by the build for a higher-level
+    // parent report whose generating activity used `leaf`.
+    let fp_rows = e.rows(&format!(
+        "SELECT ?fp WHERE {{ GRAPH <{REPORTS}> {{ <{leaf}> <{}> ?fp }} }}",
+        gr("disclosure")
+    ));
+    assert_eq!(fp_rows.len(), 1, "{fp_rows:?}");
+    let fp = fp_rows[0][0].trim_matches(['<', '>']).to_string();
+    let parent = "urn:uuid:11111111-2222-3333-4444-555555555555";
+    let parent_act = format!("{parent}#activity");
+    let parent_comm = "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{REPORTS}> {{ \
+         <{parent}> a <{}> ; <{}> <{parent_comm}> ; <{}> <{fp}> ; <{PROV}wasGeneratedBy> <{parent_act}> . \
+         <{parent_act}> a <{PROV}Activity> ; <{PROV}used> <{leaf}> . }} }}",
+        gr("Report"),
+        gr("community"),
+        gr("disclosure"),
+    ))
+    .unwrap();
+
+    // Direct query (`transitive: false`) returns only `leaf` at depth 0.
+    let direct_body =
+        serde_json::json!({ "changed": [a.0.as_str()], "transitive": false }).to_string();
+    let direct = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+        ],
+        &direct_body,
+    )
+    .await;
+    assert_eq!(direct.status, StatusCode::OK, "{}", direct.text());
+    let direct_reports = direct.json()["reports"].as_array().unwrap().clone();
+    assert_eq!(direct_reports.len(), 1, "{direct_reports:?}");
+    assert_eq!(direct_reports[0]["report"], leaf);
+    assert_eq!(direct_reports[0]["community"], leaf_comm);
+    assert_eq!(direct_reports[0]["depth"], 0);
+
+    // Transitive query (`transitive: true`) returns both `leaf` (depth 0) and `parent`
+    // (depth 1, `on: leaf`) via HTTP and MCP for unrestricted reader `rad`.
+    let trans_body =
+        serde_json::json!({ "changed": [a.0.as_str()], "transitive": true }).to_string();
+    let http_proven = call(
+        &e.s.app,
+        "POST",
+        "/ev/claims/dependents",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+        ],
+        &trans_body,
+    )
+    .await;
+    assert_eq!(http_proven.status, StatusCode::OK, "{}", http_proven.text());
+    let http_json = http_proven.json();
+    let reps = http_json["reports"].as_array().unwrap();
+    assert_eq!(reps.len(), 2, "{reps:?}");
+    assert_eq!(reps[0]["report"], leaf);
+    assert_eq!(reps[0]["on"], a.0.as_str());
+    assert_eq!(reps[0]["depth"], 0);
+    assert_eq!(reps[1]["report"], parent);
+    assert_eq!(reps[1]["community"], parent_comm);
+    assert_eq!(reps[1]["graph"], REPORTS);
+    assert_eq!(reps[1]["on"], leaf);
+    assert_eq!(reps[1]["dependence"], "used");
+    assert_eq!(reps[1]["depth"], 1);
+
+    let e_mcp = e.clone();
+    let claim_iri = a.0.as_str().to_string();
+    let (mcp_proven, mcp_unproven) = tokio::task::spawn_blocking(move || {
+        let args = serde_json::json!({ "changed": [claim_iri], "transitive": true });
+        (
+            tool_as(&e_mcp.s, "rad", "find_evidence_dependents", args.clone()),
+            tool_as(&e_mcp.s, "rhide", "find_evidence_dependents", args),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(mcp_proven, http_json);
+    assert_eq!(mcp_unproven["reports"], serde_json::json!([]));
+}
+
+/// With `reviewPolicy` and `refresh.mode: "auto"`, the internal F13 circuit excludes
+/// non-output evidence graphs even when a projection wildcard matches them, so a claim
+/// written to `CLAIMS` neither joins a community nor triggers an uncounted fallback.
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_circuit_counts_only_policy_readable_graphs_without_uncounted_fallback() {
+    use crate::graphrag::refresh::Watch;
+    let e = Arc::new(env(true));
+    let e2 = e.clone();
+    tokio::task::spawn_blocking(move || {
+        let e = e2;
+        let ds = e.dataset();
+        let a = propose(&ds, "advisory", leads());
+        decide(&ds, &a, Disposition::Accepted, 1);
+        let s = settings(serde_json::json!({
+            "projection": { "graphs": [ORG, "urn:ev:*"] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+        }));
+        e.run(s.clone(), Mode::Build).unwrap();
+        let srv_ds = e.ds();
+        assert_eq!(
+            srv_ds.dataset.inner_state().views.internal_count(),
+            1,
+            "auto mode under reviewPolicy attaches the internal circuit"
+        );
+        let mut w = Watch::default();
+        // Prime `note_private` baseline so `due` starts false after first sight.
+        assert_eq!(
+            crate::graphrag::refresh::due_reason(&e.s.state, &srv_ds, &s, &mut w).unwrap(),
+            None
+        );
+        // Clear initial first-sight private flag via `tick_once` pattern: we only check
+        // whether `propose_by` in excluded CLAIMS triggers `due_reason` or `uncounted`.
+        let mut w2 = Watch::default();
+        // Run once to initialize private watch at current head.
+        let _ = crate::graphrag::refresh::due_reason(&e.s.state, &srv_ds, &s, &mut w2).unwrap();
+        // Simulate private check already cleared for the initial build.
+        let mut watches = std::collections::HashMap::from([("ev".to_string(), w2)]);
+        let now = std::time::Instant::now();
+        crate::graphrag::refresh::tick_once(&e.s.state, &mut watches, now);
+        crate::graphrag::refresh::tick_once(
+            &e.s.state,
+            &mut watches,
+            now + std::time::Duration::from_secs(2),
+        );
+        assert!(!watches["ev"].private().due);
+        // Writing to excluded CLAIMS (which matches `urn:ev:*` wildcard!) must be ignored
+        // by the accumulator without triggering `uncounted` or joining a community.
+        propose_by(
+            &ds,
+            CLAIMS,
+            "memo",
+            Triple::new(ex("z0"), ex("knows"), ex("z1")),
+            ex("x0"),
+        );
+        let reason = crate::graphrag::refresh::due_reason(
+            &e.s.state,
+            &srv_ds,
+            &s,
+            watches.get_mut("ev").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reason, None);
+        assert!(
+            !watches["ev"].private().due,
+            "excluded CLAIMS write must be counted as 0 by the circuit, not fall back to uncounted"
+        );
+        // Writing an entity-joining edge into ORG IS counted by the circuit.
+        sparkles::sparql::update::update(
+            &srv_ds.store,
+            &format!(
+                "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/knows> <http://ex/fresh> }} }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let reason = crate::graphrag::refresh::due_reason(
+            &e.s.state,
+            &srv_ds,
+            &s,
+            watches.get_mut("ev").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("http://ex/fresh") && r.contains("joined")),
+            "{reason:?}"
+        );
+
+        // An attach-time failure under `reviewPolicy` must route through the C25 private
+        // check fallback (`Ok(None)` + `private.due = true`) rather than returning `Err`.
+        e.s.state.graphrag.detach_circuit("ev");
+        let views = &srv_ds.dataset.inner_state().views;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while views.internal_count() > 0 && std::time::Instant::now() < deadline {
+            views.settle(std::time::Duration::from_secs(2));
+        }
+        assert_eq!(
+            views.internal_count(),
+            0,
+            "old refresh circuit must be collected before inducing C25 attach failure"
+        );
+        let prev_opts = views.options();
+        let mut failing_opts = prev_opts.clone();
+        failing_opts.pass_timeout = std::time::Duration::ZERO;
+        views.set_options(failing_opts);
+        // Write to ORG (not an evidence graph), while `watches["ev"].private().due` is
+        // false, so only the attach failure can set `private.due = true`.
+        assert!(!watches["ev"].private().due);
+        sparkles::sparql::update::update(
+            &srv_ds.store,
+            &format!("INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <http://ex/note> \"af\" }} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        let r = crate::graphrag::refresh::due_reason(
+            &e.s.state,
+            &srv_ds,
+            &s,
+            watches.get_mut("ev").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            r, None,
+            "attach failure under reviewPolicy must not surface as a direct refresh reason"
+        );
+        assert!(
+            watches["ev"].private().due,
+            "attach failure under reviewPolicy must schedule the private check"
+        );
+        assert_eq!(
+            views.internal_count(),
+            0,
+            "failed attach must not leave a circuit attached"
+        );
+        assert!(!e.s.state.graphrag.has_refresh_circuit("ev", &srv_ds));
+        views.set_options(prev_opts);
+
+        // With `private.due == true`, acquiring a `Restore` reservation while `tick_once`
+        // is already processing `ev` must preserve `NotLive` through `due_outcome` so
+        // neither `private_check` nor `build::spawn` runs against the draining dataset.
+        let held_res: Arc<parking_lot::Mutex<Option<sparkles::catalog::Reservation>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let private_hook_hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held_hook = held_res.clone();
+        let private_hit_hook = private_hook_hit.clone();
+        let st_hook = e.s.state.clone();
+        let _guard = crate::graphrag::refresh::set_tick_hook(move |point, name| {
+            if point == crate::graphrag::refresh::TickHookPoint::BeforeDue && name == "ev" {
+                let r = st_hook
+                    .catalog
+                    .reserve(
+                        "ev",
+                        sparkles::catalog::ReservationKind::Restore,
+                        "c25-restore-mid-tick",
+                    )
+                    .unwrap();
+                *held_hook.lock() = Some(r);
+            } else if point == crate::graphrag::refresh::TickHookPoint::BeforePrivateCheck
+                && name == "ev"
+            {
+                private_hit_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        crate::graphrag::refresh::tick_once(
+            &e.s.state,
+            &mut watches,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        );
+        drop(_guard);
+        assert!(
+            held_res.lock().is_some(),
+            "test hook must have acquired restore reservation before due_outcome"
+        );
+        assert!(
+            !private_hook_hit.load(std::sync::atomic::Ordering::SeqCst),
+            "NotLive from due_outcome must skip private_check instead of falling through"
+        );
+        assert!(
+            !watches.contains_key("ev"),
+            "watch must be removed when due_outcome returns NotLive"
+        );
+        assert!(
+            e.s.state.tasks.lock().is_empty(),
+            "restore reservation mid-tick must not admit a C25 refresh task"
+        );
+        assert!(!e.s.state.graphrag.has_refresh_circuit("ev", &srv_ds));
+        drop(held_res.lock().take());
+
+        // Re-attach cleanly, then break `reviewPolicy` so `Evidence::admit` fails:
+        // `tick_once` must detach the previously attached internal circuit.
+        let now2 = std::time::Instant::now();
+        crate::graphrag::refresh::tick_once(&e.s.state, &mut watches, now2);
+        assert_eq!(views.internal_count(), 1);
+        let broken = settings(serde_json::json!({
+            "projection": { "graphs": [ORG, "urn:ev:*"] },
+            "reviewPolicy": "missing-policy",
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+        }));
+        crate::settings::store_runtime(
+            &e.s.state,
+            &srv_ds,
+            &crate::settings::GRAPHRAG,
+            &serde_json::to_value(&broken).unwrap(),
+        )
+        .unwrap();
+        crate::graphrag::refresh::tick_once(
+            &e.s.state,
+            &mut watches,
+            now2 + std::time::Duration::from_secs(1),
+        );
+        views.settle(std::time::Duration::from_secs(10));
+        assert!(
+            !e.s.state.graphrag.has_refresh_circuit("ev", &srv_ds),
+            "failing evidence admission must detach the stale internal circuit"
+        );
+        assert_eq!(views.internal_count(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+/// A `Restore` reservation acquired right before `Run::private_check`'s preparation
+/// admission boundary prevents entering `prepare`, and a reservation acquired once
+/// preparation has been admitted (outside `restore_admission`) does not block on the
+/// scan and cancels the in-flight check promptly.
+#[tokio::test(flavor = "multi_thread")]
+async fn private_check_preparation_is_ordered_with_restore_reservation() {
+    use crate::graphrag::build::{BuildHookPoint, set_build_hook};
+    use crate::graphrag::refresh::{Watch, tick_once};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let e = Arc::new(env(true));
+    let e2 = e.clone();
+    tokio::task::spawn_blocking(move || {
+        let e = e2;
+        let ds = e.dataset();
+        let a = propose(&ds, "advisory", leads());
+        decide(&ds, &a, Disposition::Accepted, 1);
+        let s = settings(serde_json::json!({
+            "projection": { "graphs": [ORG, "urn:ev:*"] },
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+        }));
+        e.run(s, Mode::Build).unwrap();
+
+        // 1. Reservation acquired right before private-check preparation admission must
+        // block entry into `prepare` and return `NotLive`.
+        let held_res: Arc<parking_lot::Mutex<Option<sparkles::catalog::Reservation>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let prepare_entered = Arc::new(AtomicBool::new(false));
+        let admit_hit = Arc::new(AtomicBool::new(false));
+        let held_hook = held_res.clone();
+        let prepare_hook = prepare_entered.clone();
+        let admit_hook = admit_hit.clone();
+        let st_hook = e.s.state.clone();
+        let _guard = set_build_hook(move |point, name| {
+            if point == BuildHookPoint::PrivateAdmit && name == "ev" {
+                admit_hook.store(true, Ordering::SeqCst);
+                let r = st_hook
+                    .reserve_restore("ev", "c25-before-private-admit")
+                    .unwrap();
+                *held_hook.lock() = Some(r);
+            } else if point == BuildHookPoint::PrivatePrepare && name == "ev" {
+                prepare_hook.store(true, Ordering::SeqCst);
+            }
+        });
+        let mut watches: HashMap<String, Watch> = HashMap::new();
+        let now = Instant::now();
+        tick_once(&e.s.state, &mut watches, now);
+        drop(_guard);
+        assert!(
+            admit_hit.load(Ordering::SeqCst),
+            "hook must fire right before private_check preparation admission"
+        );
+        assert!(
+            !prepare_entered.load(Ordering::SeqCst),
+            "restore reservation before private admission must prevent entering prepare"
+        );
+        assert!(
+            !watches.contains_key("ev"),
+            "watch must be removed when private check sees restore reservation"
+        );
+        assert!(e.s.state.tasks.lock().is_empty());
+        drop(held_res.lock().take());
+
+        // 2. Reservation acquired after private-check admission (before `prepare` scans)
+        // must succeed immediately (scan is outside `restore_admission`), set the
+        // registered cancellation flag via `cancel_private_checks`, and cause
+        // `Run::private_check` itself to return `Err(RunError::Cancelled)` before any
+        // outer liveness check runs.
+        withdraw(&ds, &a);
+        let state_ds = e.s.state.get("ev").unwrap();
+        let eff_s: GraphragSettings =
+            crate::settings::effective(&e.s.state, &state_ds, &crate::settings::GRAPHRAG);
+        let direct_cancel = Arc::new(AtomicBool::new(false));
+        let direct_cancel_hook = direct_cancel.clone();
+        let direct_res: Arc<parking_lot::Mutex<Option<sparkles::catalog::Reservation>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let direct_res_hook = direct_res.clone();
+        let direct_prepare_entered = Arc::new(AtomicBool::new(false));
+        let direct_prepare_hook = direct_prepare_entered.clone();
+        let st_direct_hook = e.s.state.clone();
+        let _guard_direct = set_build_hook(move |point, name| {
+            if point == BuildHookPoint::PrivatePrepare && name == "ev" {
+                direct_prepare_hook.store(true, Ordering::SeqCst);
+                assert!(
+                    !direct_cancel_hook.load(Ordering::Acquire),
+                    "private check cancel flag must be clear before reserve_restore"
+                );
+                // Must NOT deadlock: `restore_admission` has been released before `prepare`.
+                let r = st_direct_hook
+                    .reserve_restore("ev", "c25-during-private-prepare-direct")
+                    .unwrap();
+                assert!(
+                    direct_cancel_hook.load(Ordering::Acquire),
+                    "reserve_restore must set the registered private-check cancel flag"
+                );
+                *direct_res_hook.lock() = Some(r);
+            }
+        });
+        let direct_run = Run {
+            st: &e.s.state,
+            ds: state_ds.clone(),
+            settings: eff_s,
+            mode: Mode::Refresh,
+            confirmed: true,
+            task: None,
+            task_id: String::new(),
+            cancel: direct_cancel.clone(),
+            limits: Limits::default(),
+        };
+        let direct_outcome = direct_run.private_check();
+        drop(_guard_direct);
+        assert!(
+            direct_prepare_entered.load(Ordering::SeqCst),
+            "direct private_check must reach post-admission prepare hook"
+        );
+        assert!(
+            direct_res.lock().is_some(),
+            "reserve_restore must succeed without blocking on private_check preparation"
+        );
+        assert!(
+            direct_cancel.load(Ordering::Acquire),
+            "registered private-check cancel flag must remain set after reserve_restore"
+        );
+        assert!(
+            matches!(direct_outcome, Err(RunError::Cancelled)),
+            "Run::private_check must return Err(RunError::Cancelled) when cancelled by reserve_restore, got {direct_outcome:?}"
+        );
+        drop(direct_res.lock().take());
+
+        // 3. End-to-end through `tick_once`: the same post-admission restore reservation
+        // resolves as `NotLive`, drops the watch, and spawns no refresh task.
+        let held_res2: Arc<parking_lot::Mutex<Option<sparkles::catalog::Reservation>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let prepare_entered2 = Arc::new(AtomicBool::new(false));
+        let held_hook2 = held_res2.clone();
+        let prepare_hook2 = prepare_entered2.clone();
+        let st_hook2 = e.s.state.clone();
+        let _guard2 = set_build_hook(move |point, name| {
+            if point == BuildHookPoint::PrivatePrepare && name == "ev" {
+                prepare_hook2.store(true, Ordering::SeqCst);
+                let r = st_hook2
+                    .reserve_restore("ev", "c25-during-private-prepare")
+                    .unwrap();
+                *held_hook2.lock() = Some(r);
+            }
+        });
+        let mut watches2: HashMap<String, Watch> = HashMap::new();
+        tick_once(&e.s.state, &mut watches2, now + Duration::from_secs(5));
+        drop(_guard2);
+        assert!(
+            prepare_entered2.load(Ordering::SeqCst),
+            "end-to-end tick_once must reach post-admission prepare hook"
+        );
+        assert!(
+            held_res2.lock().is_some(),
+            "reserve_restore must succeed without blocking on private_check preparation"
+        );
+        assert!(
+            !watches2.contains_key("ev"),
+            "cancelled private check under restore reservation must resolve as NotLive"
+        );
+        assert!(
+            e.s.state.tasks.lock().is_empty(),
+            "cancelled private check must not spawn a refresh task"
+        );
+        drop(held_res2.lock().take());
+    })
+    .await
+    .unwrap();
+}
+
+/// Item 811: authenticated `POST /ev/ask` (global mode) and `community_reports` enforce
+/// `reviewPolicy` grants, `matchingPolicy` grants, configuration history activation, and
+/// the C22 disclosure footprint without leaking hidden reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn global_ask_and_community_reports_enforce_policy_and_footprint_authorization() {
+    use sparkles::evidence::{IdentityInput, IdentityRelation, MethodRef};
+
+    let models_all = |url: &str| {
+        let pair = serde_json::json!({ "provider": "p", "model": "m" });
+        let cfg = serde_json::json!({
+            "providers": { "p": { "kind": "openai", "endpoint": url, "requestTimeoutSecs": 5, "allowedModels": ["m"], "structuredOutput": "json-schema" } },
+            "roles": { "draft": [pair], "summarize": [pair], "community": [pair] }
+        });
+        Arc::new(crate::models::Models::new(
+            crate::models::ModelsConfig::parse(&cfg.to_string()).unwrap(),
+            Default::default(),
+            sparkles::outbound::OutboundPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        ))
+    };
+
+    // Unactivated store refuses global Ask with reviewPolicy before any model call.
+    let unact = Arc::new(env(false));
+    unact
+        .s
+        .state
+        .models
+        .store(Some(models_all(&unact.mock.url())));
+    crate::settings::store_runtime(
+        &unact.s.state,
+        &unact.ds(),
+        &crate::settings::ASSISTANT,
+        &serde_json::json!({ "enabled": true, "send": "rows" }),
+    )
+    .unwrap();
+    let res = call(
+        &unact.s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({
+            "question": "Summarize the dataset.",
+            "mode": "global",
+            "reviewPolicy": "main",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.text());
+    assert_eq!(
+        res.json()["error"]["code"],
+        "configuration-history-inactive"
+    );
+    assert!(unact.mock.requests().is_empty());
+
+    // Build real community reports under `reviewPolicy: "main"` with an accepted claim
+    // and an accepted identity match merging http://ex/x0 and http://ex/y0 under "people".
+    let e = Arc::new(env(true));
+    // Replace mock with one that serves community builds, global map/reduce, and fallback drafts.
+    let ask_mock = MockModel::start(|r, _| {
+        let body = r.body.to_string();
+        if body.contains("\"Points\"") || body.contains("pick out what bears") {
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "points": [{
+                            "text": "People collaborate in cluster X.",
+                            "score": 85,
+                            "reports": ["R1"],
+                            "findings": ["F1.1"]
+                        }]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if body.contains("\"GlobalAnswer\"") || body.contains("Points from the community reports") {
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "text": "Cluster X collaborates under main policy [1].",
+                        "citations": [1]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if body.contains("translate a person's question") {
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "query": "SELECT ?s WHERE { ?s <http://ex/owns> ?o }",
+                        "explanation": "Owned resources.",
+                        "assumptions": [],
+                        "clarify": { "question": "", "choices": [] },
+                        "graph": { "subject": "", "predicate": "", "object": "" }
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        if body.contains("rows of a query result") {
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "text": "Local fallback [1].",
+                        "citations": [1],
+                        "claimCitations": []
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        (200, mock::openai(&answer_all(r)))
+    });
+    e.s.state.models.store(Some(models_all(&ask_mock.url())));
+    crate::settings::store_runtime(
+        &e.s.state,
+        &e.ds(),
+        &crate::settings::ASSISTANT,
+        &serde_json::json!({ "enabled": true, "send": "rows" }),
+    )
+    .unwrap();
+
+    let ds = e.dataset();
+    let a = propose(&ds, "advisory", leads());
+    decide(&ds, &a, Disposition::Accepted, 1);
+
+    // Accept an identity match between x0 and y0 under matching policy "people".
+    let mut po = ProposeOptions::new(iri("urn:principal:matcher"));
+    po.identity_graph = Some(iri(IDENTITIES));
+    let prop = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &EvidenceInput {
+            identities: vec![IdentityInput {
+                version: RecordVersion::V1,
+                key: RecordKey::new("id1").unwrap(),
+                occurrence_key: RecordKey::new("occ-id1").unwrap(),
+                entities: vec![ex("x0"), ex("y0")],
+                relation: IdentityRelation::PossibleMatch,
+                preferred: Some(ex("x0")),
+                attributed_author: iri("urn:matcher"),
+                method: Some(MethodRef {
+                    method: iri("urn:method"),
+                    version: RecordKey::new("1").unwrap(),
+                }),
+            }],
+            ..Default::default()
+        },
+        &po,
+        &mut |_, _| Some(Arc::new(sparkles::access::GraphAccess::all())),
+        &Control::none(),
+    )
+    .unwrap();
+    let mut ro = ReviewOptions::new(iri("urn:principal:reviewer"));
+    ro.if_head = Some(ds.store().head_commit().seq);
+    evidence::review(
+        None,
+        &ds,
+        &ds,
+        "people",
+        1,
+        &[DecisionInput {
+            key: "did1".into(),
+            target: prop.records[0].iri.clone(),
+            target_digest: prop.records[0].digest,
+            disposition: Disposition::Accepted,
+            supersedes: None,
+        }],
+        &ro,
+        &mut |_, _| Some(Arc::new(sparkles::access::GraphAccess::all())),
+        &Control::none(),
+    )
+    .unwrap();
+
+    let e2 = e.clone();
+    let o =
+        tokio::task::spawn_blocking(move || e2.run(settings(serde_json::json!({})), Mode::Build))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(o.stopped, None, "{o:?}");
+    assert!(o.written >= 2, "{o:?}");
+
+    // 1) `community_reports` with both policies as `rad` returns filtered reports and
+    //    resolved identities.
+    let e3 = e.clone();
+    let tool_out = tokio::task::spawn_blocking(move || {
+        tool_as(
+            &e3.s,
+            "rad",
+            "community_reports",
+            serde_json::json!({ "reviewPolicy": "main", "matchingPolicy": "people" }),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(tool_out["available"], true, "{tool_out}");
+    assert_eq!(tool_out["reviewPolicy"]["name"], "main", "{tool_out}");
+    assert_eq!(tool_out["resolution"]["policy"], "people", "{tool_out}");
+    assert_eq!(tool_out["resolution"]["number"], 1, "{tool_out}");
+    let resolved_ents = tool_out["resolution"]["entities"].as_array().unwrap();
+    assert!(!resolved_ents.is_empty(), "{tool_out}");
+
+    // 2) `POST /ev/ask` in global mode as `rad` succeeds with policy-filtered reports
+    //    and resolved identities.
+    let res = call(
+        &e.s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({
+            "question": "What are the main communities?",
+            "mode": "global",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+    let j = res.json();
+    assert_eq!(j["outcome"], "answered", "{j}");
+    assert_eq!(j["mode"], "global", "{j}");
+    assert_eq!(j["global"]["reviewPolicy"]["name"], "main", "{j}");
+    assert_eq!(j["resolution"]["policy"], "people", "{j}");
+    assert_eq!(j["resolution"]["number"], 1, "{j}");
+    assert!(!j["reports"].as_array().unwrap().is_empty(), "{j}");
+
+    // 3) Unauthorized caller `rnodec` (lacks DECISIONS grant) is refused with 400
+    //    bad-argument for both reviewPolicy and matchingPolicy, with 0 model calls.
+    let before = ask_mock.requests().len();
+    for body in [
+        serde_json::json!({
+            "question": "What are the main communities?",
+            "mode": "global",
+            "reviewPolicy": "main",
+        }),
+        serde_json::json!({
+            "question": "What are the main communities?",
+            "mode": "global",
+            "matchingPolicy": "people",
+        }),
+    ] {
+        let res = call(
+            &e.s.app,
+            "POST",
+            "/ev/ask",
+            &[
+                ("authorization", &b("rnodec")),
+                ("content-type", "application/json"),
+                ("accept", "application/json"),
+            ],
+            &body.to_string(),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.text());
+        assert_eq!(res.json()["error"]["code"], "bad-argument");
+        assert!(
+            !res.text().contains("urn:ev:") && !res.text().contains("People who work together"),
+            "{}",
+            res.text()
+        );
+    }
+    assert_eq!(ask_mock.requests().len(), before);
+
+    // 4) `rnoclaims` has grants on DECISIONS, SUPPORTS, ACCEPTED (so reviewPolicy "main"
+    //    is authorized), but lacks CLAIMS (which is in the report build's footprint!).
+    //    The disclosure guard must hide the reports graph so no report leaks.
+    let before = ask_mock.requests().len();
+    let res = call(
+        &e.s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("rnoclaims")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({
+            "question": "What are the main communities?",
+            "mode": "global",
+            "reviewPolicy": "main",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+    let j = res.json();
+    assert_eq!(j["mode"], "local", "{j}");
+    assert!(j.get("reports").is_none(), "{j}");
+    assert!(
+        j["notes"]
+            .to_string()
+            .contains("summaries are unavailable to you"),
+        "{j}"
+    );
+    for req in &ask_mock.requests()[before..] {
+        let s = req.body.to_string();
+        assert!(!s.contains("People who work together"), "{s}");
+    }
+
+    // 5) Mid-flight authority reload during map/reduce is caught by AuthorityFence and
+    //    withholds the global answer with 403 forbidden.
+    let reload_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reload_flag = reload_done.clone();
+    let auth_reload = e.s.auth();
+    let fenced_mock = MockModel::start(move |r, _| {
+        let body = r.body.to_string();
+        if body.contains("\"Points\"") || body.contains("pick out what bears") {
+            if !reload_flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                auth_reload.reload().unwrap();
+            }
+            return (
+                200,
+                mock::openai(
+                    &serde_json::json!({
+                        "points": [{
+                            "text": "Should be withheld.",
+                            "score": 85,
+                            "reports": ["R1"],
+                            "findings": ["F1.1"]
+                        }]
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+        (
+            200,
+            mock::openai(
+                &serde_json::json!({ "text": "Should not reach reduce [1].", "citations": [1] })
+                    .to_string(),
+            ),
+        )
+    });
+    e.s.state.models.store(Some(models_all(&fenced_mock.url())));
+    let res = call(
+        &e.s.app,
+        "POST",
+        "/ev/ask",
+        &[
+            ("authorization", &b("rad")),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+        ],
+        &serde_json::json!({
+            "question": "What are the main communities?",
+            "mode": "global",
+            "reviewPolicy": "main",
+            "matchingPolicy": "people",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.text());
+    assert_eq!(res.json()["error"]["code"], "forbidden");
+    assert!(reload_done.load(std::sync::atomic::Ordering::SeqCst));
+    // AuthorityFence stopped reduce before calling the provider a second time.
+    assert_eq!(fenced_mock.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restricted_ordinary_auto_refresh_keeps_counts_with_evidence_enabled() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    tokio::task::spawn_blocking(|| {
+        for graph in [ORG, "urn:g:*"] {
+            let e = env(true);
+            let ds = e.ds();
+            let claim = propose(&ds.dataset, "advisory", leads());
+            decide(&ds.dataset, &claim, Disposition::Accepted, 1);
+            let settings = settings(serde_json::json!({
+                "principal": "rhide",
+                "reviewPolicy": null,
+                "projection": { "graphs": [graph] },
+                "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+            }));
+            e.run(settings, Mode::Build).unwrap();
+            let state = e.s.state.graphrag.state(ds.store.dataset_id());
+            let build = state.last_build.unwrap();
+            let community = build
+                .communities
+                .iter()
+                .find(|c| c.members.iter().any(|m| m == "<http://ex/x0>"))
+                .unwrap();
+            let fact_count = community.facts.len();
+            assert!(fact_count > 1);
+
+            let mut now = Instant::now();
+            let mut watches: HashMap<String, Watch> = HashMap::new();
+            let mut tick = || {
+                tick_once(&e.s.state, &mut watches, now);
+                now += Duration::from_secs(1);
+                tick_once(&e.s.state, &mut watches, now);
+                now += Duration::from_secs(1);
+                watches["ev"].private().runs
+            };
+            let tasks = || {
+                e.s.state
+                    .tasks
+                    .lock()
+                    .iter()
+                    .filter(|t| t.kind == build::TASK_KIND)
+                    .count()
+            };
+            let initial_checks = tick();
+            assert_eq!(tasks(), 0);
+
+            // This graph is outside the configured projection.
+            ds.dataset
+                .update("INSERT DATA { GRAPH <urn:other> { <http://ex/x0> <urn:note> 0 } }")
+                .unwrap();
+            let after_unrelated = tick();
+            assert_eq!(
+                tasks(),
+                0,
+                "an unrelated commit must leave the task list unchanged"
+            );
+            if graph == ORG {
+                assert_eq!(
+                    after_unrelated, initial_checks,
+                    "the exact graph can count changes"
+                );
+            } else {
+                assert!(
+                    after_unrelated > initial_checks,
+                    "the wildcard needs a private input check"
+                );
+            }
+
+            ds.dataset
+                .update(&format!(
+                    "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <urn:note> 1 }} }}"
+                ))
+                .unwrap();
+            let after_one_fact = tick();
+            assert_eq!(tasks(), 0, "one fact is below the configured threshold");
+            if graph == ORG {
+                assert_eq!(after_one_fact, initial_checks);
+            }
+
+            // Spread the facts across the community to stay inside the report's
+            // per-member literal cap, including when the private check rebuilds inputs.
+            let remaining = (2..=fact_count)
+                .map(|n| {
+                    let member = &community.members[(n - 1) % community.members.len()];
+                    format!("{member} <urn:note> {n} .")
+                })
+                .collect::<String>();
+            ds.dataset
+                .update(&format!(
+                    "INSERT DATA {{ GRAPH <{ORG}> {{ {remaining} }} }}"
+                ))
+                .unwrap();
+            let checks_at_threshold = tick();
+            assert_eq!(
+                tasks(),
+                1,
+                "{graph}: {fact_count} changes reached the threshold after {checks_at_threshold} private checks"
+            );
+            if graph == ORG {
+                assert_eq!(checks_at_threshold, initial_checks);
+            }
+        }
     })
     .await
     .unwrap();

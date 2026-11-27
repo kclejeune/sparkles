@@ -132,7 +132,20 @@ pub trait FactStore<F, R> {
 
     /// Return a charge that [`reserve`](Self::reserve) made.
     fn release(&self, _bytes: u64) {}
+
+    /// Charge persistent state growth (e.g. held provenance annotations) that outlives
+    /// the pass's transient scratch buffers until the circuit commits pass bytes.
+    fn reserve_pass(&self, _bytes: u64) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Return a persistent pass-state charge made by [`reserve_pass`](Self::reserve_pass).
+    fn release_pass(&self, _bytes: u64) {}
 }
+
+/// Output changes of a fixed-point pass paired with the reserved store bytes held for the
+/// returned vector until the caller consumes and releases it.
+pub(crate) type ChargedChanges<F> = (Vec<Change<F>>, u64);
 
 /// A store of facts in a hash map, charging nothing beyond the operator's `max_bytes`.
 #[derive(Clone, Debug)]
@@ -148,6 +161,14 @@ impl<F, R> HashStore<F, R> {
             map: FxHashMap::default(),
             fact_bytes,
         }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+
+    pub(crate) fn fact_bytes(&self) -> u64 {
+        self.fact_bytes
     }
 }
 
@@ -202,7 +223,7 @@ impl<F: Copy + Eq + Hash, R: Copy> FactStore<F, R> for HashStore<F, R> {
     }
 
     fn clear(&mut self) -> Result<()> {
-        self.map.clear();
+        self.map = FxHashMap::default();
         Ok(())
     }
 }
@@ -751,6 +772,13 @@ impl<P: Program> FixedPoint<P> {
         self.ann_bytes = 0;
     }
 
+    /// Clear all derived facts and annotations, releasing backing capacity.
+    pub fn clear_state(&mut self) {
+        let _ = self.store.clear();
+        self.ann = FxHashMap::default();
+        self.ann_bytes = 0;
+    }
+
     pub fn provenance(&self) -> Provenance {
         self.mode
     }
@@ -845,22 +873,44 @@ impl<P: Program> FixedPoint<P> {
     }
 
     /// Run `body` as one pass: refuse what the mode cannot keep, release what the pass
-    /// reserved and tell the program it ended, whether it succeeded or not.
-    fn pass<T>(
+    /// reserved except the returned output buffer's charge `keep`, and tell the program
+    /// it ended, whether it succeeded or not.
+    fn pass_keeping<T>(
         &mut self,
         cx: &mut P::Cx<'_>,
-        body: impl FnOnce(&mut Self, &mut P::Cx<'_>, &mut Charges) -> std::result::Result<T, P::Error>,
-    ) -> std::result::Result<T, P::Error> {
+        body: impl FnOnce(
+            &mut Self,
+            &mut P::Cx<'_>,
+            &mut Charges,
+        ) -> std::result::Result<(T, u64), P::Error>,
+    ) -> std::result::Result<(T, u64), P::Error> {
         let mut charges = Charges::default();
         let out = match self.refuse_annotations() {
             Ok(()) => body(self, cx, &mut charges),
             Err(e) => Err(e),
         };
-        self.store.release(charges.live);
+        let kept = match &out {
+            Ok((_, keep)) => (*keep).min(charges.live),
+            Err(_) => 0,
+        };
+        self.store.release(charges.live.saturating_sub(kept));
         let end = self.program.pass_end(cx);
-        let out = out?;
-        end?;
-        Ok(out)
+        let (val, keep) = match out {
+            Ok(v) => v,
+            Err(e) => {
+                if kept > 0 {
+                    self.store.release(kept);
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = end {
+            if kept > 0 {
+                self.store.release(kept);
+            }
+            return Err(e);
+        }
+        Ok((val, keep.min(kept)))
     }
 
     /// Make room in `h` for `add` more items, reserving the new allocation through the
@@ -1056,7 +1106,19 @@ impl<P: Program> FixedPoint<P> {
         cx: &mut P::Cx<'_>,
         max_bytes: Option<u64>,
     ) -> std::result::Result<Vec<Change<P::Fact>>, P::Error> {
-        self.pass(cx, |s, cx, charges| s.build_pass(cx, max_bytes, charges))
+        let (out, held) = self.build_charged(cx, max_bytes)?;
+        self.store.release(held);
+        Ok(out)
+    }
+
+    /// Like [`build`](Self::build), preserving the returned change vector's reservation
+    /// on `self.store` so the caller can release it after consuming the vector.
+    pub(crate) fn build_charged(
+        &mut self,
+        cx: &mut P::Cx<'_>,
+        max_bytes: Option<u64>,
+    ) -> std::result::Result<ChargedChanges<P::Fact>, P::Error> {
+        self.pass_keeping(cx, |s, cx, charges| s.build_pass(cx, max_bytes, charges))
     }
 
     fn build_pass(
@@ -1064,7 +1126,7 @@ impl<P: Program> FixedPoint<P> {
         cx: &mut P::Cx<'_>,
         max_bytes: Option<u64>,
         charges: &mut Charges,
-    ) -> std::result::Result<Vec<Change<P::Fact>>, P::Error> {
+    ) -> std::result::Result<ChargedChanges<P::Fact>, P::Error> {
         self.store.clear()?;
         self.ann.clear();
         self.ann_bytes = 0;
@@ -1095,7 +1157,7 @@ impl<P: Program> FixedPoint<P> {
             &mut order,
         )?;
         self.free(charges, queue);
-        let anns = if self.mode.is_none() {
+        let mut anns = if self.mode.is_none() {
             None
         } else {
             let mut dirty: Held<FxHashSet<P::Fact>> = Held::default();
@@ -1105,15 +1167,28 @@ impl<P: Program> FixedPoint<P> {
             self.free(charges, dirty);
             anns
         };
+        let base_ann = self.ann_state_bytes();
+        let mut ann_pass_reserved = 0u64;
         let mut out: Held<Vec<Change<P::Fact>>> = Held::default();
         self.room(charges, &mut out, order.len())?;
+        let mut out_ann_bytes = 0u64;
         for &f in order.iter() {
-            let ann = match anns.as_ref() {
+            let ann = match anns.as_mut() {
                 Some(m) => {
-                    let a = m.get(&f).cloned().ok_or_else(|| {
-                        Error::Corrupt("a fixed point did not annotate a fact it built".into())
-                    })?;
+                    let ab = m
+                        .get(&f)
+                        .ok_or_else(|| {
+                            Error::Corrupt("a fixed point did not annotate a fact it built".into())
+                        })?
+                        .bytes();
+                    // Pre-admit persistent `self.ann` growth before cloning the
+                    // already-charged `annotate` output, then move the original into
+                    // `Change.ann` so `out_ann_bytes` retains its scratch reservation.
+                    let target_ann = self.ann_state_bytes().saturating_add(ab).saturating_add(16);
+                    self.sync_ann_pass(base_ann, &mut ann_pass_reserved, target_ann)?;
+                    let a = m.remove(&f).expect("checked above");
                     self.store_ann(f, a.clone());
+                    out_ann_bytes = out_ann_bytes.saturating_add(ab);
                     Some(a)
                 }
                 None => None,
@@ -1125,7 +1200,31 @@ impl<P: Program> FixedPoint<P> {
             });
         }
         self.check(max_bytes, 0)?;
-        Ok(out.buf)
+        Ok((out.buf, out.bytes.saturating_add(out_ann_bytes)))
+    }
+
+    fn ann_state_bytes(&self) -> u64 {
+        self.ann_bytes.saturating_add(self.ann.len() as u64 * 16)
+    }
+
+    /// Reconcile net annotation growth above `base_ann` against `store.reserve_pass` /
+    /// `release_pass`, releasing only credit that this fixed point itself reserved in
+    /// the current pass (never credit belonging to memos, fact tables, or other ops).
+    fn sync_ann_pass(
+        &self,
+        base_ann: u64,
+        ann_pass_reserved: &mut u64,
+        target_ann_bytes: u64,
+    ) -> std::result::Result<(), P::Error> {
+        let needed = target_ann_bytes.saturating_sub(base_ann);
+        if needed > *ann_pass_reserved {
+            self.store.reserve_pass(needed - *ann_pass_reserved)?;
+            *ann_pass_reserved = needed;
+        } else if needed < *ann_pass_reserved {
+            self.store.release_pass(*ann_pass_reserved - needed);
+            *ann_pass_reserved = needed;
+        }
+        Ok(())
     }
 
     fn store_ann(&mut self, f: P::Fact, a: Ann) {
@@ -1230,7 +1329,12 @@ impl<P: Program> FixedPoint<P> {
                 };
                 self.store.release(refs);
                 charges.live = charges.live.saturating_sub(refs);
-                pending = pending.saturating_add(a.bytes() + 16);
+                let ann_b = a.bytes();
+                if ann_b > 0 {
+                    self.store.reserve(ann_b)?;
+                    charges.live = charges.live.saturating_add(ann_b);
+                }
+                pending = pending.saturating_add(ann_b + 16);
                 self.room(charges, &mut done, 1)?;
                 done.buf.insert(top, a);
                 open.buf.remove(&top);
@@ -1255,10 +1359,22 @@ impl<P: Program> FixedPoint<P> {
         cx: &mut P::Cx<'_>,
         max_bytes: Option<u64>,
     ) -> std::result::Result<Vec<Change<P::Fact>>, P::Error> {
+        let (out, held) = self.advance_charged(cx, max_bytes)?;
+        self.store.release(held);
+        Ok(out)
+    }
+
+    /// Like [`advance`](Self::advance), preserving the returned change vector's
+    /// reservation on `self.store` so the caller can release it after consuming it.
+    pub(crate) fn advance_charged(
+        &mut self,
+        cx: &mut P::Cx<'_>,
+        max_bytes: Option<u64>,
+    ) -> std::result::Result<ChargedChanges<P::Fact>, P::Error> {
         if P::EXACT {
-            self.pass(cx, |s, cx, charges| s.advance_exact(cx, max_bytes, charges))
+            self.pass_keeping(cx, |s, cx, charges| s.advance_exact(cx, max_bytes, charges))
         } else {
-            self.pass(cx, |s, cx, charges| {
+            self.pass_keeping(cx, |s, cx, charges| {
                 s.advance_one_step(cx, max_bytes, charges)
             })
         }
@@ -1270,7 +1386,7 @@ impl<P: Program> FixedPoint<P> {
         cx: &mut P::Cx<'_>,
         max_bytes: Option<u64>,
         charges: &mut Charges,
-    ) -> std::result::Result<Vec<Change<P::Fact>>, P::Error> {
+    ) -> std::result::Result<ChargedChanges<P::Fact>, P::Error> {
         let n = self.program.batch_len().max(1);
         self.program.prepare(cx, &mut self.store)?;
         let mut frontier: Held<Vec<P::Fact>> = Held::default();
@@ -1405,7 +1521,7 @@ impl<P: Program> FixedPoint<P> {
             ann: None,
         }));
         self.check(max_bytes, 0)?;
-        Ok(out.buf)
+        Ok((out.buf, out.bytes))
     }
 
     /// A pass of the one-step mode (see the module's documentation).
@@ -1414,7 +1530,9 @@ impl<P: Program> FixedPoint<P> {
         cx: &mut P::Cx<'_>,
         max_bytes: Option<u64>,
         charges: &mut Charges,
-    ) -> std::result::Result<Vec<Change<P::Fact>>, P::Error> {
+    ) -> std::result::Result<ChargedChanges<P::Fact>, P::Error> {
+        let base_ann = self.ann_state_bytes();
+        let mut ann_pass_reserved = 0u64;
         let n = self.program.batch_len().max(1);
         // 1. the broken facts, and every fact whose record depends on them, at the
         //    snapshot before the changes
@@ -1550,11 +1668,19 @@ impl<P: Program> FixedPoint<P> {
         self.free(charges, queue);
         // 5. the candidates without a derivation
         let mut out: Held<Vec<Change<P::Fact>>> = Held::default();
+        let mut out_ann_bytes = 0u64;
         for f in candidates.iter() {
             if pending.contains(f) {
+                let ab = self.ann.get(f).map_or(0, Ann::bytes);
+                if ab > 0 {
+                    self.store.reserve(ab)?;
+                    charges.live = charges.live.saturating_add(ab);
+                }
+                self.room(charges, &mut out, 1)?;
                 self.store.remove(f)?;
                 let ann = self.drop_ann(f).map(|a| a.scaled(-1));
-                self.room(charges, &mut out, 1)?;
+                self.sync_ann_pass(base_ann, &mut ann_pass_reserved, self.ann_state_bytes())?;
+                out_ann_bytes = out_ann_bytes.saturating_add(ab);
                 out.buf.push(Change {
                     fact: *f,
                     weight: -1,
@@ -1572,7 +1698,7 @@ impl<P: Program> FixedPoint<P> {
                 ann: None,
             }));
             self.check(max_bytes, 0)?;
-            return Ok(out.buf);
+            return Ok((out.buf, out.bytes));
         }
         // the annotations of the facts whose records changed, of the facts whose
         // recorded base facts moved, and of every fact whose record depends on them
@@ -1626,27 +1752,84 @@ impl<P: Program> FixedPoint<P> {
         self.free(charges, stack);
         self.free(charges, seen);
         self.free(charges, found);
-        let anns = self
+        let mut anns = self
             .annotate(cx, charges, &dirty, max_bytes)?
             .unwrap_or_default();
         let mut fresh: Held<FxHashSet<P::Fact>> = Held::default();
         self.room(charges, &mut fresh, added.len())?;
         fresh.buf.extend(added.iter().copied());
         for &f in dirty.iter() {
-            let Some(a) = anns.get(&f).cloned() else {
+            let Some(a) = anns.remove(&f) else {
                 continue;
             };
-            let old = self.ann.get(&f).cloned();
-            let d = match &old {
+            let ab = a.bytes();
+            let (old_bytes, has_old) = match self.ann.get(&f) {
+                Some(o) => (o.bytes(), true),
+                None => (0, false),
+            };
+            // Pre-admit the computed difference `d` before constructing it while both
+            // `a` (in `charges.live`) and any `old` (in `self.ann`) remain live.
+            let d_est = if has_old {
+                ab.saturating_add(old_bytes)
+            } else {
+                ab
+            };
+            if d_est > 0 {
+                self.store.reserve(d_est)?;
+                charges.live = charges.live.saturating_add(d_est);
+            }
+            let d = match self.ann.get(&f) {
                 Some(o) => a.sub(o),
                 None => a.clone(),
             };
+            let db = d.bytes();
+            if db > d_est {
+                let extra = db - d_est;
+                self.store.reserve(extra)?;
+                charges.live = charges.live.saturating_add(extra);
+            } else if db < d_est {
+                let excess = d_est - db;
+                self.store.release(excess);
+                charges.live = charges.live.saturating_sub(excess);
+            }
             let weight = i64::from(fresh.contains(&f));
             if weight == 0 && d.is_zero() {
+                drop(d);
+                if db > 0 {
+                    self.store.release(db);
+                    charges.live = charges.live.saturating_sub(db);
+                }
+                drop(a);
+                if ab > 0 {
+                    self.store.release(ab);
+                    charges.live = charges.live.saturating_sub(ab);
+                }
                 continue;
             }
-            self.store_ann(f, a);
             self.room(charges, &mut out, 1)?;
+            let new_entry = ab.saturating_add(16);
+            let old_entry = if has_old {
+                old_bytes.saturating_add(16)
+            } else {
+                0
+            };
+            let target_ann = self
+                .ann_state_bytes()
+                .saturating_sub(old_entry)
+                .saturating_add(new_entry);
+            // Pre-admit net persistent annotation growth before installing `a`; if
+            // `target_ann < self.ann_state_bytes()`, defer any shrink release until
+            // after `store_ann` drops the old entry.
+            if target_ann > self.ann_state_bytes() {
+                self.sync_ann_pass(base_ann, &mut ann_pass_reserved, target_ann)?;
+            }
+            self.store_ann(f, a);
+            if ab > 0 {
+                self.store.release(ab);
+                charges.live = charges.live.saturating_sub(ab);
+            }
+            self.sync_ann_pass(base_ann, &mut ann_pass_reserved, self.ann_state_bytes())?;
+            out_ann_bytes = out_ann_bytes.saturating_add(db);
             out.buf.push(Change {
                 fact: f,
                 weight,
@@ -1654,7 +1837,7 @@ impl<P: Program> FixedPoint<P> {
             });
         }
         self.check(max_bytes, 0)?;
-        Ok(out.buf)
+        Ok((out.buf, out.bytes.saturating_add(out_ann_bytes)))
     }
 
     /// Write the facts with their records, then their annotations in the same order.
@@ -1686,7 +1869,8 @@ impl<P: Program> FixedPoint<P> {
         self.ann.clear();
         self.ann_bytes = 0;
         let n = r.u64()?;
-        let mut order = Vec::with_capacity(n.min(1 << 20) as usize);
+        let mut order: Vec<P::Fact> = Vec::new();
+        let mut order_lease = super::budget::ScratchLease::new(r.budget_handle());
         for _ in 0..n {
             let (f, rec) = self.program.load(r)?;
             if !self.store.insert(f, rec)? {
@@ -1694,14 +1878,28 @@ impl<P: Program> FixedPoint<P> {
                     Error::Corrupt("a fixed point's state holds a fact twice".into()).into(),
                 );
             }
-            order.push(f);
+            if !self.mode.is_none() {
+                let next_cap = sparkles_budget::sizes::vec_grown(
+                    order.capacity(),
+                    order.len(),
+                    1,
+                    size_of::<P::Fact>(),
+                );
+                let need = (next_cap as u64).saturating_mul(size_of::<P::Fact>() as u64);
+                if need > order_lease.bytes() {
+                    order_lease.try_set(need)?;
+                }
+                order.push(f);
+            }
         }
         if !self.mode.is_none() {
             for f in order {
+                r.charge_state(16)?;
                 let a = Ann::load(r, self.mode)?;
                 self.store_ann(f, a);
             }
         }
+        drop(order_lease);
         Ok(())
     }
 }

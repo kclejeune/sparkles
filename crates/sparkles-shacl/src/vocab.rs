@@ -239,6 +239,7 @@ pub mod rdfs {
     use super::NamedNodeRef;
     terms! { "http://www.w3.org/2000/01/rdf-schema#";
         CLASS = "Class",
+        DATATYPE = "Datatype",
         SUB_CLASS_OF = "subClassOf",
         LABEL = "label",
         COMMENT = "comment",

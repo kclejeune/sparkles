@@ -5,7 +5,7 @@ use super::*;
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-pub(super) const COMPILER: &str = "f13-phase2-2";
+pub(crate) const COMPILER: &str = "f13-phase2-7";
 
 /// Whether `access` has protections that depend on the data, with the reason the
 /// whole query is then evaluated again (spec F13 §6.2).
@@ -14,6 +14,19 @@ pub fn whole_reason(access: Option<&Arc<GraphAccess>>) -> Option<&'static str> {
         .and_then(|a| a.triples.as_ref())
         .filter(|t| t.hides() && !t.state_independent())
         .map(|_| "protections that depend on the data")
+}
+
+/// Like [`whole_reason`], also forcing whole-query evaluation when `snap` has active
+/// or unavailable support-aware projection visibility for a restricted caller.
+pub fn whole_reason_on(
+    access: Option<&Arc<GraphAccess>>,
+    snap: &crate::store::Snapshot,
+) -> Option<&'static str> {
+    whole_reason(access).or_else(|| {
+        (access.is_some_and(|a| !a.reads_everything())
+            && snap.has_evidence_projection_or_unavailable())
+        .then_some("support-aware projection visibility")
+    })
 }
 
 /// A stable hash of what `access` lets a reader see: equal for equal grants. Guards a
@@ -51,7 +64,7 @@ pub fn covers(caller: Option<&Arc<GraphAccess>>, view: Option<&Arc<GraphAccess>>
 /// The query's text with the variables the parser names at random (aggregates' and
 /// others' that the source `text` does not hold) renamed in order of appearance, so
 /// that one query parsed twice gives one text.
-pub(super) fn normalized(q: &Query, text: &str) -> String {
+pub(in crate::incr) fn normalized(q: &Query, text: &str) -> String {
     let word = |c: char| c.is_alphanumeric() || c == '_';
     let in_source = |name: &str| {
         ['?', '$'].iter().any(|p| {
@@ -92,20 +105,30 @@ pub(super) fn normalized(q: &Query, text: &str) -> String {
     out
 }
 
-pub(super) fn key_of(
+pub(super) fn key_with_compiler(
+    compiler: &str,
     q: &Query,
     text: &str,
     access: Option<&Arc<GraphAccess>>,
     whole: Option<&str>,
 ) -> u64 {
     let mut h = Sha256::new();
-    h.update(COMPILER.as_bytes());
+    h.update(compiler.as_bytes());
     h.update([0]);
     h.update(normalized(q, text).as_bytes());
     h.update([0]);
     h.update(access_fingerprint(access).to_le_bytes());
     h.update(whole.unwrap_or("").as_bytes());
     u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
+}
+
+pub(super) fn key_of(
+    q: &Query,
+    text: &str,
+    access: Option<&Arc<GraphAccess>>,
+    whole: Option<&str>,
+) -> u64 {
+    key_with_compiler(COMPILER, q, text, access, whole)
 }
 
 #[cfg(test)]
@@ -134,6 +157,19 @@ mod compiler_tests {
         // AVG apart from values that are not numbers, for the readings of errors in
         // aggregates (item 1064)
         ("f13-phase2-2", "9910b68bd4b7e026"),
+        // ORDER BY with LIMIT and OFFSET compiles to the window operator (item 419)
+        ("f13-phase2-3", "33695b11351c501e"),
+        // an EXISTS whose LIMIT/OFFSET slice mentions an outer variable compiles to
+        // substitution (exists or recompute under GRAPH) instead of a match join (item 1121)
+        ("f13-phase2-4", "33695b11351c501e"),
+        // arbitrary-precision xsd:integer and xsd:decimal semantics, transitive numeric
+        // ORDER BY, and checkpointed big-number SUM/AVG state (item 1065)
+        ("f13-phase2-5", "33695b11351c501e"),
+        // the group operator runs over the shared Accumulator trait with versioned
+        // per-accumulator checkpoint state (item 1073)
+        ("f13-phase2-6", "33695b11351c501e"),
+        // emitted GROUP rows use ARQ's AVG precision (item 1084)
+        ("f13-phase2-7", "33695b11351c501e"),
     ];
 
     /// The variants of `ops::Op` as the source declares them, without comments or

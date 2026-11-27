@@ -9,14 +9,13 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::sparql::ctx::OwnedCharge;
-use crate::sparql::describe::DescribeOptions;
+use crate::sparql::describe::{DescribeOptions, DescribedBatch};
 use crate::sparql::{QueryKind, QueryOptions, depth};
 use crate::store::Snapshot;
 use oxrdf::{GraphName, Quad};
 use rustc_hash::FxHashSet;
 use spargebra::GraphTemplate;
 use spargebra::term::TriplePattern;
-use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -60,6 +59,67 @@ impl Spec {
             Self::Describe { .. } => QueryKind::Describe,
         }
     }
+
+    fn retained_bytes(&self) -> u64 {
+        fn named_bytes(pattern: &spargebra::term::NamedNodePattern) -> u64 {
+            match pattern {
+                spargebra::term::NamedNodePattern::NamedNode(n) => n.as_str().len() as u64,
+                spargebra::term::NamedNodePattern::Variable(v) => v.as_str().len() as u64,
+            }
+        }
+        fn term_bytes(pattern: &spargebra::term::TermPattern) -> u64 {
+            use spargebra::term::TermPattern as T;
+            match pattern {
+                T::NamedNode(n) => n.as_str().len() as u64,
+                T::BlankNode(b) => b.as_str().len() as u64,
+                T::Variable(v) => v.as_str().len() as u64,
+                T::Literal(l) => (l.value().len() as u64)
+                    .saturating_add(l.datatype().as_str().len() as u64)
+                    .saturating_add(l.language().map_or(0, |s| s.len() as u64)),
+                T::Triple(tp) => {
+                    (std::mem::size_of::<TriplePattern>() as u64).saturating_add(triple_bytes(tp))
+                }
+            }
+        }
+        fn triple_bytes(tp: &TriplePattern) -> u64 {
+            term_bytes(&tp.subject)
+                .saturating_add(named_bytes(&tp.predicate))
+                .saturating_add(term_bytes(&tp.object))
+        }
+        match self {
+            Self::Construct { template, graphs } => {
+                let mut bytes = (template
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<TriplePattern>())
+                    as u64)
+                    .saturating_add(
+                        graphs
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<GraphTemplate>())
+                            as u64,
+                    );
+                for tp in template {
+                    bytes = bytes.saturating_add(triple_bytes(tp));
+                }
+                for graph in graphs {
+                    bytes = bytes
+                        .saturating_add(term_bytes(&graph.name))
+                        .saturating_add(
+                            graph
+                                .triples
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<TriplePattern>())
+                                as u64,
+                        );
+                    for tp in &graph.triples {
+                        bytes = bytes.saturating_add(triple_bytes(tp));
+                    }
+                }
+                bytes
+            }
+            Self::Describe { .. } => 0,
+        }
+    }
 }
 
 /// Immutable decoded graph terms. Retained batches remain on the query budget
@@ -92,6 +152,110 @@ struct Pending {
     _charge: OwnedCharge,
 }
 
+/// CONSTRUCT views number repeated solutions before minting their template blanks.
+struct ViewBlanks {
+    columns: Vec<Option<usize>>,
+    counts: rustc_hash::FxHashMap<Vec<crate::id::Id>, i64>,
+    charge: OwnedCharge,
+}
+
+impl ViewBlanks {
+    fn occurrence(
+        &mut self,
+        ctx: &crate::sparql::ctx::Ctx,
+        table: &crate::sparql::table::Table,
+        row: usize,
+        scratch: &crate::sparql::ctx::Charge<'_>,
+    ) -> Result<(Vec<Vec<u8>>, Option<i64>)> {
+        use crate::id::{Id, Tag};
+        use sparkles_budget::sizes::{table_bytes, table_grown};
+        let width = self.columns.len();
+        scratch
+            .add((width * (std::mem::size_of::<Id>() + std::mem::size_of::<Vec<u8>>())) as u64)?;
+        let ids = self
+            .columns
+            .iter()
+            .map(|c| c.map_or(Id::UNDEF, |c| table.cols[c][row]))
+            .collect::<Vec<_>>();
+        let occurrence;
+        if let Some(n) = self.counts.get_mut(&ids) {
+            occurrence = *n;
+            *n = n
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid("template multiplicity overflows"))?;
+        } else {
+            let capacity = self.counts.capacity();
+            let grown = table_grown(capacity, self.counts.len(), 1);
+            let slot = std::mem::size_of::<(Vec<Id>, i64)>();
+            let old = table_bytes(capacity, slot) as u64;
+            let new = table_bytes(grown, slot) as u64;
+            let bytes = self
+                .charge
+                .bytes()
+                .saturating_add((width * std::mem::size_of::<Id>()) as u64);
+            self.charge.resize(if grown == capacity {
+                bytes
+            } else {
+                bytes.saturating_add(new)
+            })?;
+            self.counts.insert(ids.clone(), 1);
+            if grown != capacity {
+                self.charge
+                    .resize(self.charge.bytes().saturating_sub(old))?;
+            }
+            occurrence = 0;
+        }
+        let mut keys = Vec::with_capacity(width);
+        for id in ids {
+            ctx.check()?;
+            let key = match id.tag() {
+                Tag::Undef | Tag::Special => Vec::new(),
+                _ => {
+                    scratch.add(ctx.decoded_bytes(id)?.saturating_mul(2))?;
+                    ctx.reserved_batch_term(id)?
+                        .map_or_else(Vec::new, |term| crate::id::term_key(&term))
+                }
+            };
+            keys.push(key);
+        }
+        Ok((keys, (occurrence > 0).then_some(occurrence)))
+    }
+}
+
+impl Pending {
+    fn from_description(
+        mut described: DescribedBatch,
+        #[cfg(test)] ctx: &crate::sparql::ctx::Ctx,
+    ) -> Result<Self> {
+        let mut pending_bytes = 128u64;
+        for triple in &described.triples {
+            pending_bytes = pending_bytes
+                .saturating_add(crate::sparql::graph_triple_bytes(triple).saturating_add(256));
+        }
+        let quad_slots =
+            (described.triples.len() as u64).saturating_mul(std::mem::size_of::<Quad>() as u64);
+        // Keep the producer's charge while admitting the additional Quad slots.
+        let peak = described
+            .charge
+            .bytes()
+            .max(pending_bytes)
+            .saturating_add(quad_slots);
+        described.charge.resize(peak)?;
+        #[cfg(test)]
+        ctx.chunk_event("describe-quad-handoff", described.triples.len());
+        let pending = described
+            .triples
+            .into_iter()
+            .map(|triple| triple.in_graph(GraphName::DefaultGraph))
+            .collect::<Vec<_>>();
+        described.charge.resize(pending_bytes)?;
+        Ok(Self {
+            quads: pending.into_iter(),
+            _charge: described.charge,
+        })
+    }
+}
+
 pub struct GraphCursor {
     where_cursor: QueryCursor,
     spec: Spec,
@@ -100,6 +264,7 @@ pub struct GraphCursor {
     map: Vec<Option<usize>>,
     pending: Option<Pending>,
     seen: FxHashSet<Quad>,
+    view_blanks: Option<ViewBlanks>,
     seen_charge: OwnedCharge,
     seen_bytes: u64,
     base_bytes: u64,
@@ -142,6 +307,7 @@ pub(super) fn from_pattern(
             ._plan_charge
             .bytes()
             .saturating_mul(2)
+            .saturating_add(spec.retained_bytes())
             .saturating_add(where_cursor.ctx.nvars() as u64 * 16 + 4096);
         let seen_charge = OwnedCharge::new(&where_cursor.ctx, base_bytes)?;
         let map = where_cursor.variables.ids.iter().enumerate().fold(
@@ -172,6 +338,7 @@ pub(super) fn from_pattern(
             map,
             pending: None,
             seen: Default::default(),
+            view_blanks: None,
             seen_charge,
             seen_bytes: base_bytes,
             base_bytes,
@@ -192,6 +359,46 @@ impl GraphCursor {
     pub fn kind(&self) -> QueryKind {
         self.spec.kind()
     }
+    pub(super) fn for_view(
+        where_cursor: QueryCursor,
+        mut spec: Spec,
+        template_columns: Option<&[String]>,
+    ) -> Result<Self> {
+        use spargebra::term::TermPattern;
+        if let Spec::Construct { template, .. } = &mut spec {
+            // The maintained template does not instantiate nested triple patterns.
+            template.retain(|t| {
+                !matches!(t.subject, TermPattern::Triple(_))
+                    && !matches!(t.object, TermPattern::Triple(_))
+            });
+            template.shrink_to_fit();
+        }
+        let mut graph = from_pattern(where_cursor, spec, 0)?;
+        if let Some(template_columns) = template_columns {
+            let charge = OwnedCharge::new(
+                &graph.where_cursor.ctx,
+                (template_columns.len() * std::mem::size_of::<Option<usize>>()) as u64,
+            )?;
+            let columns = template_columns
+                .iter()
+                .map(|name| {
+                    graph
+                        .where_cursor
+                        .variables
+                        .names
+                        .iter()
+                        .position(|v| v == name)
+                })
+                .collect();
+            graph.view_blanks = Some(ViewBlanks {
+                columns,
+                counts: Default::default(),
+                charge,
+            });
+        }
+        Ok(graph)
+    }
+
     pub fn status(&self) -> CursorStatus {
         self.status
     }
@@ -209,6 +416,10 @@ impl GraphCursor {
     /// What query-time reasoning derived for the query (spec F17).
     pub fn reasoning(&self) -> Option<Arc<crate::sparql::reasoning::Applied>> {
         self.where_cursor.reasoning()
+    }
+    /// Whether this cursor's query calls a graph algorithm.
+    pub fn uses_algorithms(&self) -> bool {
+        self.where_cursor.uses_algorithms()
     }
     pub fn deadline(&self) -> Option<Instant> {
         self.where_cursor.deadline()
@@ -303,7 +514,7 @@ impl GraphCursor {
                         Some(buffer) => buffer,
                         None => Buffer::new(&ctx, &self.where_cursor.variables.ids, 0)?,
                     };
-                    let triples = crate::sparql::describe::describe_batch(
+                    let described = crate::sparql::describe::describe_batch(
                         &ctx,
                         &table.table,
                         options,
@@ -314,21 +525,11 @@ impl GraphCursor {
                     drop(table);
                     self.truncated = self.described.truncated();
                     self.described_all = last || self.truncated;
-                    let mut pending_bytes = 128u64;
-                    for triple in &triples {
-                        pending_bytes = pending_bytes.saturating_add(
-                            crate::sparql::graph_triple_bytes(triple).saturating_add(256),
-                        );
-                    }
-                    let pending_charge = OwnedCharge::new(&ctx, pending_bytes.saturating_mul(2))?;
-                    let pending = triples
-                        .into_iter()
-                        .map(|triple| triple.in_graph(GraphName::DefaultGraph))
-                        .collect::<Vec<_>>();
-                    self.pending = Some(Pending {
-                        quads: pending.into_iter(),
-                        _charge: pending_charge,
-                    });
+                    self.pending = Some(Pending::from_description(
+                        described,
+                        #[cfg(test)]
+                        &ctx,
+                    )?);
                 }
                 Spec::Construct { template, graphs } => {
                     if self.input.as_ref().is_none_or(|b| self.row == b.len()) {
@@ -343,6 +544,21 @@ impl GraphCursor {
                     let mut pending_charge = OwnedCharge::new(&ctx, 0)?;
                     let mut pending = Vec::new();
                     let mut pending_storage = 0u64;
+                    let scratch = ctx.charge(0)?;
+                    let skolem = self
+                        .view_blanks
+                        .as_mut()
+                        .map(|blanks| {
+                            blanks.occurrence(&ctx, batch.owned_table(), self.row, &scratch)
+                        })
+                        .transpose()?;
+                    let mint = |label: &str| {
+                        let (keys, occurrence) = skolem.as_ref().expect("view blank solution");
+                        let b = crate::incr::ops::template::skolem("", label, keys, *occurrence);
+                        crate::store::bnode_for(crate::id::Id::bnode(crate::id::default_bnode_id(
+                            &b,
+                        )))
+                    };
                     crate::sparql::construct_row(
                         &ctx,
                         batch.owned_table(),
@@ -350,6 +566,9 @@ impl GraphCursor {
                         self.row,
                         template,
                         graphs,
+                        skolem
+                            .as_ref()
+                            .map(|_| &mint as &dyn Fn(&str) -> oxrdf::BlankNode),
                         &mut self.template_work,
                         &mut |quad, incoming| {
                             if self.seen.contains(&quad) {
@@ -414,6 +633,7 @@ impl GraphCursor {
         depth::with_stack(self.where_cursor.depth, || {
             self.input = None;
             self.pending = None;
+            self.view_blanks = None;
             self.seen.clear();
             self.seen.shrink_to_fit();
             // what a DESCRIBE kept, with its charge; `truncated` stays
@@ -428,6 +648,10 @@ impl GraphCursor {
     pub(in crate::sparql) fn charge(&self, bytes: u64) -> Result<OwnedCharge> {
         OwnedCharge::new(&self.where_cursor.ctx, bytes)
     }
+    /// The query context that the output writer charges its buffer to.
+    pub(in crate::sparql) fn output_ctx(&self) -> Arc<crate::sparql::ctx::Ctx> {
+        self.where_cursor.ctx.clone()
+    }
     pub(crate) fn stack_depth(&self) -> usize {
         self.where_cursor.depth
     }
@@ -439,6 +663,104 @@ impl GraphCursor {
         if self.status == CursorStatus::Open {
             self.finish(CursorStatus::Stopped);
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn describe_handoff_credits_triples_and_refuses_extra_quad_slots() {
+    use crate::io::{RdfFormat, Source};
+    use crate::sparql::ctx::Ctx;
+    use crate::sparql::describe::{Streamed, describe_batch};
+    use crate::sparql::table::Table;
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{NamedNode, Term};
+    use std::fmt::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const ROWS: usize = 64;
+    let store = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::new();
+    for i in 0..ROWS {
+        writeln!(ttl, "<urn:s> <urn:p> \"value{i}\" .").unwrap();
+    }
+    store
+        .load(&[Source::from_bytes(
+            ttl.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.mem_limit = 1 << 20;
+    ctx.enable_cursor_accounting().unwrap();
+    let subject = ctx
+        .snap
+        .lookup_term(&Term::NamedNode(NamedNode::new_unchecked("urn:s")))
+        .unwrap();
+    let mut table = Table::new(vec![0]);
+    table.push_row(&[subject]);
+    let ctx = ctx.into_shared();
+
+    for refuse in [true, false] {
+        let mut state = Streamed::default();
+        let described = describe_batch(
+            &ctx,
+            &table,
+            &DescribeOptions::default(),
+            false,
+            &mut state,
+            true,
+        )
+        .unwrap();
+        assert_eq!(described.triples.len(), ROWS);
+        let producer_bytes = described.charge.bytes();
+        assert!(producer_bytes > 0);
+        let state_bytes = ctx.live_bytes() - producer_bytes;
+        let pending_bytes = 128
+            + described
+                .triples
+                .iter()
+                .map(|triple| crate::sparql::graph_triple_bytes(triple) + 256)
+                .sum::<u64>();
+        let held_at_conversion =
+            producer_bytes.max(pending_bytes) + (ROWS * std::mem::size_of::<Quad>()) as u64;
+        let observed = Arc::new(AtomicU64::new(0));
+        let output = observed.clone();
+        let weak = Arc::downgrade(&ctx);
+        *ctx.chunk_hook.lock() = Some(Arc::new(move |stage, count| {
+            if stage == "describe-quad-handoff" {
+                assert_eq!(count, ROWS);
+                output.store(weak.upgrade().unwrap().live_bytes(), Ordering::Relaxed);
+            }
+        }));
+        if refuse {
+            let hold = ctx
+                .charge(ctx.mem_limit - state_bytes - held_at_conversion + 1)
+                .unwrap();
+            let live = ctx.live_bytes();
+            let Err(err) = Pending::from_description(described, &ctx) else {
+                panic!("quad slots must refuse after triple decode");
+            };
+            assert!(
+                matches!(err, Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory && b.requested == ctx.mem_limit + 1)
+            );
+            assert_eq!(observed.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.live_bytes(), live - producer_bytes);
+            drop(hold);
+        } else {
+            let pending = Pending::from_description(described, &ctx).unwrap();
+            assert_eq!(
+                observed.load(Ordering::Relaxed),
+                state_bytes + held_at_conversion
+            );
+            assert_eq!(pending.quads.len(), ROWS);
+            assert_eq!(ctx.live_bytes(), state_bytes + pending_bytes);
+            drop(pending);
+            assert_eq!(ctx.live_bytes(), state_bytes);
+        }
+        *ctx.chunk_hook.lock() = None;
+        drop(state);
     }
 }
 impl Drop for GraphCursor {
@@ -464,91 +786,19 @@ pub fn write_cursor_graph(
     send: Option<usize>,
     prefixes: &[(String, String)],
 ) -> Result<CursorStats> {
-    write_cursor_graph_counted(cursor, format, output, send, prefixes, &Cell::new(0))
-}
-
-/// [`write_cursor_graph`], counting in `sent` the triples and quads that reached `output`
-/// whole, as the eager graph writers count them. The statements go out through the
-/// buffer of the eager writers.
-pub fn write_cursor_graph_counted(
-    cursor: &mut GraphCursor,
-    format: oxrdfio::RdfFormat,
-    output: &mut dyn std::io::Write,
-    send: Option<usize>,
-    prefixes: &[(String, String)],
-    sent: &Cell<u64>,
-) -> Result<CursorStats> {
-    let result = crate::sparql::results::write_buffered(output, sent, &mut |w, staged| {
-        graph_to(cursor, format, w, send, prefixes, staged)
-    });
-    if let Err(error) = result {
-        cursor.failure = Some(error.to_string());
-        cursor.finish(CursorStatus::Failed);
-        return Err(error);
-    }
-    Ok(cursor.stats())
-}
-
-/// [`write_cursor_graph_counted`] into the buffer of the eager writers.
-fn graph_to(
-    cursor: &mut GraphCursor,
-    format: oxrdfio::RdfFormat,
-    output: &mut crate::sparql::results::Buffered<'_>,
-    send: Option<usize>,
-    prefixes: &[(String, String)],
-    staged: &Cell<u64>,
-) -> Result<()> {
-    use std::io::Write as _;
-    depth::with_stack(cursor.where_cursor.depth, || {
-        let _serializer_charge = OwnedCharge::new(
-            &cursor.where_cursor.ctx,
-            (128 << 10)
-                + prefixes
-                    .iter()
-                    .map(|(a, b)| (a.len() + b.len()) as u64 * 4 + 128)
-                    .sum::<u64>(),
-        )?;
-        let serializer = crate::io::with_prefixes(
-            oxrdfio::RdfSerializer::from_format(format),
-            prefixes.iter().cloned(),
-        );
-        let shared = std::cell::RefCell::new(output);
-        let mut writer = serializer.for_writer(crate::sparql::results::Shared(&shared));
-        let mut sent = 0usize;
-        let mut first = true;
-        while send.is_none_or(|max| sent < max) {
-            let Some(batch) =
-                cursor.next_at_most(send.map_or(usize::MAX, |max| max.saturating_sub(sent)))?
-            else {
-                break;
-            };
-            for quad in batch.quads() {
-                if send.is_some_and(|max| sent == max) {
-                    break;
-                }
-                if sent.is_multiple_of(1024) {
-                    cursor.where_cursor.ctx.check()?;
-                }
-                if format.supports_datasets() || quad.graph_name == GraphName::DefaultGraph {
-                    writer
-                        .serialize_quad(quad)
-                        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-                    staged.set(staged.get() + 1);
-                }
-                sent += 1;
-            }
-            // what the first batch wrote reaches a writer that commits on a flush; a
-            // serializer that groups triples by subject may still hold the last ones
-            if std::mem::take(&mut first) {
-                shared.borrow_mut().flush()?;
-            }
-        }
-        if send.is_some_and(|max| sent >= max) {
-            cursor.close();
-        }
-        writer
-            .finish()
-            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-        Ok(())
-    })
+    let rows = crate::sparql::results::RowCount::new();
+    let options = crate::sparql::results::WriteOptions {
+        send,
+        prefixes,
+        ..crate::sparql::results::WriteOptions::new(
+            crate::sparql::results::Format::Rdf(format),
+            &rows,
+        )
+    };
+    crate::sparql::results::write(
+        crate::sparql::results::Source::Graph(cursor),
+        options,
+        output,
+    )
+    .map(|s| s.expect("cursor statistics"))
 }

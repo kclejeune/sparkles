@@ -1,4 +1,6 @@
-# Ontology workbench
+# U12: Ontology workbench
+
+> **Status:** implemented in part
 
 This spec covers ontology and thesaurus editors, a DL Query tab, a visual SHACL shape
 editor and an editable schema diagram. The ontology, thesaurus, DL Query and visual

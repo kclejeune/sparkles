@@ -1,0 +1,8 @@
+Declaration(Class(<http://ex.org/A>))
+Declaration(Class(<http://ex.org/B>))
+Declaration(Class(<http://ex.org/C>))
+Declaration(Class(<http://www.w3.org/2002/07/owl#Nothing>))
+Declaration(Class(<http://www.w3.org/2002/07/owl#Thing>))
+SubClassOf(<http://ex.org/A> <http://ex.org/C>)
+SubClassOf(<http://ex.org/B> <http://www.w3.org/2002/07/owl#Thing>)
+SubClassOf(<http://ex.org/C> <http://www.w3.org/2002/07/owl#Thing>)

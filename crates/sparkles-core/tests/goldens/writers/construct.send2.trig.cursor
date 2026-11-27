@@ -1,0 +1,2 @@
+@prefix ex: <urn:ex:> .
+ex:s1 ex:p true , 42 .

@@ -105,10 +105,10 @@ prefetch the exact front-coded blocks of their terms, and larger ones the groups
 which calls `Snapshot::lookup_key`, one after another. On a cold server each lookup in a
 new group waits for that group's read before the next constant is looked up.
 
-**Switches.** `SPARKLES_IO_HINTS=off` and `SPARKLES_SPARSE_VOCAB=off` turn the hints and
-the sparse index off for the process. BENCHMARKS.md shows that turning both on makes
+**Original ablation.** The measured build used `SPARKLES_IO_HINTS=off` and
+`SPARKLES_SPARSE_VOCAB=off` to turn off hints and the sparse index. Turning both on made
 sparse lookups 2.4× faster at 1.01B (`entity-facts-1`, 36.0–38.3 ms to 14.6–15.2 ms) and
-makes `label-regex` (66.4–68.5 ms to 119.5–130.8 ms) and `export-1m` (1,231–1,239 ms to
+made `label-regex` (66.4–68.5 ms to 119.5–130.8 ms) and `export-1m` (1,231–1,239 ms to
 1,883–1,956 ms) slower, because a dense pass over a random-access mapping loses the
 kernel's automatic read-ahead.
 
@@ -187,8 +187,8 @@ memory and asks for every group not yet hinted, in one pass over sorted groups, 
 returns. The lookups that follow find their pages arriving together. The delta
 vocabulary is in memory and needs nothing. `Ctx::intern_key` is unchanged.
 
-Without a sparse index (older generations, or `SPARKLES_SPARSE_VOCAB=off`), the batch
-does nothing.
+The batch skips a vocabulary without an in-memory sparse index, such as a historical
+read whose memory budget cannot hold it.
 
 ### 5.2 Plan-time prefetch
 
@@ -217,9 +217,8 @@ each other's mapping advice. The window size is swept in Phase 2 (1, 4 and 16 Mi
 moves that choice to the planner for the scans that know their density, and keeps
 `ahead_for` as the fallback when no policy is given.
 
-`SPARKLES_IO_HINTS` and `SPARKLES_SPARSE_VOCAB` remain for A/B runs. With the policy in
-place, their documented tradeoff disappears, and BENCHMARKS.md's table gains a third
-column, "per-scan policy".
+`SPARKLES_IO_HINTS` remains for the comparison in item 573. Item 513 removed
+`SPARKLES_SPARSE_VOCAB` after the sparse-index measurements.
 
 ### 5.4 Terms read during execution
 
@@ -557,9 +556,10 @@ Counter deltas use a snapshot taken at the start of the query and can be attribu
 one query only when no other query runs on the process. Page observations remain a
 best-effort sample.
 
-Phase 2 adds the following read optimizations. Four `Optimizations` flags control
-constant prefetch, first-scan prefetch, term prefetch and parallel decode. They are on
-by default. The `ReadAhead` and vocabulary windows use `SPARKLES_READ_WINDOW_KB`.
+Phase 2 added the following read optimizations. The original measurements selected
+them with four `Optimizations` flags and set the read window with
+`SPARKLES_READ_WINDOW_KB`. Item 513 moved prefetch and parallel decode overrides to
+tests and fixed the `ReadAhead` and vocabulary window target at 4 MiB.
 
 * `prefetch_constants` visits the constants of the algebra (`sparql/constkeys.rs`) and
   hints their vocabulary groups through `Vocab::key_prefetch` before the planner resolves
@@ -572,8 +572,8 @@ by default. The `ReadAhead` and vocabulary windows use `SPARKLES_READ_WINDOW_KB`
   end of planning. A count over the whole index and a plan-time decode were removed from
   this step after they cost 7 ms at 1M.
 * The read policy is a `ReadAhead` window owned by each scan pass and each cursor, not a
-  process-wide switch. The first request is about 1 MiB and the window doubles to 4 MiB
-  (`SPARKLES_READ_WINDOW_KB`, where 0 returns to per-block hints). No code calls
+  process-wide switch. The first request is about 1 MiB and the window doubles to a
+  target of 4 MiB. No code calls
   `madvise` on the mapping after it is opened, so one query's policy cannot change
   another's. This replaces the single block-count threshold of §5.3, on the advice of a
   review that found cursors, index joins and key probes also read blocks directly.

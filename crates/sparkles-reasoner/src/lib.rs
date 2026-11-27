@@ -58,11 +58,13 @@ pub use inputs::{
 };
 pub use maintain::{
     Cache, DEFAULT_CACHE_TRIPLES, FactWitnesses, literal_typings, literal_typings_controlled,
+    literal_typings_controlled_guarded,
 };
 pub use parser::{
     BuiltinCall, Clause, Direction, Node, RelationAtom, Rule, RuleParseError, TriplePattern,
     parse_rules, rules_text, uses_program,
 };
+pub use sparkles_budget::ParentHandle;
 
 use anyhow::Context as _;
 use budget::{Budget, Held, WorkingWarnings};
@@ -231,6 +233,8 @@ pub struct ReasonOptions {
     /// closure kept for the next run. Each is charged before it grows. The store's block
     /// cache is not counted. `None` sets no limit.
     pub max_memory: Option<usize>,
+    /// Parent memory handle that the run's budget reserves from in chunks (`None`: unpooled).
+    pub memory_parent: Option<ParentHandle>,
     /// Threads for rule evaluation: at most the size of [`pool`](Self::pool) when there
     /// is one. `None` uses the pool, or the caller's threads.
     pub threads: Option<usize>,
@@ -282,6 +286,7 @@ impl Default for ReasonOptions {
             progress: None,
             inputs: Inputs::default(),
             max_memory: None,
+            memory_parent: None,
             threads: None,
             pool: None,
             closure_operators: true,
@@ -302,6 +307,7 @@ impl fmt::Debug for ReasonOptions {
             .field("progress", &self.progress.as_ref().map(|_| "…"))
             .field("inputs", &self.inputs)
             .field("max_memory", &self.max_memory)
+            .field("memory_parent", &self.memory_parent.as_ref().map(|_| "…"))
             .field("threads", &self.threads)
             .field("pool", &self.pool.as_ref().map(|p| p.threads()))
             .field("closure_operators", &self.closure_operators)
@@ -452,12 +458,12 @@ struct Derivation {
     rules: usize,
     iterations: usize,
     warnings: WorkingWarnings,
-    /// the run's memory: the graph and the local terms stay charged to it
-    budget: Arc<Budget>,
     /// the GeoSPARQL default geometries the run added as facts, sorted, and their charge
     defaults: Option<(Vec<[u64; 3]>, Held)>,
     base_scans: u64,
     threads: usize,
+    /// the run's memory: declared last so every payload and `Held` drops before parent credit returns
+    budget: Arc<Budget>,
 }
 
 pub use pool::ReasoningPool;
@@ -507,15 +513,13 @@ fn derive_here(
 ) -> anyhow::Result<Derivation> {
     let rules = profile_rules(profile, extras)?;
     progress(opts, 0.0, "reading the input graphs");
-    let budget = Budget::new(opts.max_memory);
+    let budget = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
     let base = Arc::new(facts::Base::new(snap.clone(), graphs)?);
-    let mut g = graph::Graph::with_base(base.clone());
-    g.set_budget(&budget)?;
-    let mut terms = Terms::new(snap);
+    let mut g = graph::Graph::with_base_in(base.clone(), &budget)?;
+    let mut terms = Terms::new_in(snap, &budget)?;
     if let Some(context) = &opts.analysis {
         terms.set_analysis(context.clone())?;
     }
-    terms.set_budget(&budget)?;
     let mut defaults = None;
     if extras.geo_default_geometry {
         let d = default_geometries_for_run(&base, &terms, &budget, opts)?;
@@ -581,8 +585,7 @@ fn derive_here(
                 tracing::debug!("{e}");
                 limits.closures = false;
                 drop(g);
-                g = graph::Graph::with_base(base.clone());
-                g.set_budget(&budget)?;
+                g = graph::Graph::with_base_in(base.clone(), &budget)?;
                 if let Some(d) = &defaults {
                     g.try_add_batch(d.0.iter().copied())?;
                 }
@@ -614,6 +617,22 @@ fn geo_ids(terms: &Terms) -> Result<(u64, u64), budget::BudgetFailure> {
         ))))
     };
     Ok((iri("hasGeometry")?, iri("hasDefaultGeometry")?))
+}
+
+/// Controlled [`geo_ids`], admitting vocabulary lookup scratch and polling live controls.
+pub(crate) fn geo_ids_controlled(
+    terms: &Terms,
+    mut check: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(u64, u64)> {
+    let has = terms.try_id_for_controlled(
+        &Term::NamedNode(NamedNode::new_unchecked(format!("{GEO}hasGeometry"))),
+        &mut check,
+    )?;
+    let default = terms.try_id_for_controlled(
+        &Term::NamedNode(NamedNode::new_unchecked(format!("{GEO}hasDefaultGeometry"))),
+        &mut check,
+    )?;
+    Ok((has, default))
 }
 
 /// Room in `held` for one more key of a table of capacity `cap` with `len` keys of
@@ -681,7 +700,7 @@ fn default_geometries_controlled(
     mut check: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<(Vec<[u64; 3]>, Held)> {
     check()?;
-    let (has, default) = geo_ids(terms)?;
+    let (has, default) = geo_ids_controlled(terms, &mut check)?;
     let mut held = Held::new(budget);
     let mut refused = None;
     let mut stopped = None;
@@ -1015,7 +1034,10 @@ impl RunRules {
         }
         let budget = terms.budget();
         let info = engine::frontend::compile(rules, terms, warnings, false)?;
-        let mut lowered = info.program.lower(&budget)?;
+        let mut lowered = info
+            .program
+            .lower(&budget)
+            .map_err(ir::lower::LowerError::into_anyhow)?;
         let strata = lowered.strata.len();
         let part = info
             .program
@@ -1159,6 +1181,7 @@ fn incremental_rules(
     extras: &Extras,
     digest: u64,
     snap: &Arc<Snapshot>,
+    budget: &Arc<Budget>,
 ) -> anyhow::Result<(Arc<Vec<Rule>>, Option<String>)> {
     let kept = INCREMENTAL_RULES
         .lock()
@@ -1168,12 +1191,19 @@ fn incremental_rules(
         return Ok(found);
     }
     let rules = Arc::new(profile_rules(profile, extras)?);
-    let terms = Terms::new(snap.clone());
-    let mut w = WorkingWarnings::new(&terms.budget());
+    let terms = Terms::new_in(snap.clone(), budget)?;
+    let mut w = WorkingWarnings::new(budget);
     // a rule program that cannot be lowered, such as one with an existential head, has
-    // its error reported by the full run
+    // its error reported by the full run; transient memory or core refusals must propagate
+    // without poisoning the digest's cached incremental capability.
     let blocker = match RunRules::new(&rules, &terms, &mut w) {
         Ok(compiled) => compiled.blocker(&terms),
+        Err(e)
+            if budget::BudgetFailure::from_anyhow(&e).is_some()
+                || e.downcast_ref::<sparkles_core::Error>().is_some() =>
+        {
+            return Err(e);
+        }
         Err(e) if parser::uses_program(&rules) => Some(format!("{e:#}")),
         Err(e) => return Err(e),
     };
@@ -1208,12 +1238,6 @@ pub fn rules_digest(profile: &Profile, extras: &Extras) -> u64 {
     }
     fnv(&[extras.geo_default_geometry as u8], h)
 }
-
-/// A run that removes more than one explicit triple in this many (of 10,000 or more)
-/// runs in full: the search for other proofs of their consequences then costs more than
-/// deriving everything again (measured on the benchmark data: removing 10% of 100,000 triples
-/// took longer incrementally, removing 1% of 1,000,000 took a quarter of a full run).
-const LARGE_DELETION: u64 = 20;
 
 /// What an incremental run asks for.
 #[derive(Clone, Copy, Default)]
@@ -1256,8 +1280,8 @@ pub fn materialize_with(
 ///
 /// It needs the previous closure, from `inc.cache` or saved with a persistent dataset,
 /// the same rules (see [`rules_digest`]), and a commit the diff still reaches. Rules
-/// that are not monotonic, or that create blank nodes, need a full run, and so do RDF
-/// lists that change while the rules read lists. The run then materializes in full and
+/// that are not monotonic, or that create blank nodes, need a full run, and so do
+/// derived RDF lists while the rules read lists. The run then materializes in full and
 /// says why in [`ReasonReport::fallback`].
 ///
 /// A run is admitted to [`ReasonOptions::pool`] before it takes the writer lock, and a
@@ -1913,27 +1937,14 @@ fn update_closure(
     if since > snap.commit {
         return Err(Fallback("the store position moved backwards".into()).into());
     }
-    let (rules, blocker) = incremental_rules(profile, extras, digest, snap)?;
+    let budget = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
+    let (rules, blocker) = incremental_rules(profile, extras, digest, snap, &budget)?;
     if let Some(why) = blocker {
         return Err(Fallback(why).into());
     }
     let graphs = resolved.graph_set();
-    if let Ok(r) = &raw {
-        let removed = r.base_removed() as u64;
-        let mut explicit = removed;
-        for g in resolved.ids(snap) {
-            explicit += snap.count(Perm::Gspo, &[g.0])?;
-        }
-        if explicit >= 10_000 && removed * LARGE_DELETION > explicit {
-            return Err(Fallback(format!(
-                "{removed} of {explicit} explicit triples were removed, more than a full run handles faster"
-            ))
-            .into());
-        }
-    }
     laps.lap("rules");
     progress(opts, 0.0, "reading the previous closure");
-    let budget = Budget::new(opts.max_memory);
     // on the run's threads: this thread may stand in for a parked worker of the pool
     // that called, so its parallel work must not go to that pool
     let run_ids = resolved.ids(snap);
@@ -1970,7 +1981,7 @@ fn update_closure(
         deadline: None,
         progress: opts.progress.clone(),
         budget: budget.clone(),
-        closures: false,
+        closures: true,
         magic: None,
         sampled_planning: opts.sampled_planning,
     };
@@ -1996,12 +2007,14 @@ fn update_closure(
             Ok(())
         };
         let hook: Option<incremental::BeforeDelete<'_>> = if has { Some(&mut hook) } else { None };
-        let up = incremental::update_with(
+        let up = incremental::update_with_moved(
             &mut closure,
             &compiled,
             &limits,
             &ch.base_added,
             &ch.base_removed,
+            &ch.base_moved,
+            graphs.len() > 1,
             hook,
             rebuild,
         );
@@ -2375,7 +2388,7 @@ pub fn dred_overdeletion(
         cancel: None,
         deadline: None,
         progress: None,
-        budget: Budget::unlimited(),
+        budget: d.budget.clone(),
         closures: false,
         magic: None,
         sampled_planning: false,

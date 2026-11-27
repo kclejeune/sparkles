@@ -1,6 +1,6 @@
 # Synthetic suite
 
-The synthetic workload generates people, organisations, documents and typed literals with scripts/gen-data.py. scripts/bench.sh compares the same 28 SPARQL queries over HTTP, with separate warm, cold, changed-store and mixed-load modes.
+The synthetic workload generates people, organisations, documents and typed literals with `scripts/gen-data.py`. `scripts/bench.sh` compares the same 28 SPARQL queries over HTTP across separate warm, cold, changed-store and mixed-load modes.
 
 The [results](RESULTS.md) are a
 [manual report](../README.md#evidence-and-generated-reports). Read them with the

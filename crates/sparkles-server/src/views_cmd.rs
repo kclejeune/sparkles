@@ -295,10 +295,14 @@ fn row_text(r: &J) -> String {
         .map(term_text)
         .collect();
     let n = r["count"].as_u64().filter(|&n| n != 1);
-    match n {
+    let mut text = match n {
         Some(n) => format!("{}\t(x{n})", cells.join("\t")),
         None => cells.join("\t"),
+    };
+    if let Some(p) = r["position"].as_u64() {
+        text = format!("@{p}\t{text}");
     }
+    text
 }
 
 /// Print one event: JSON lines with `--results json`, else text blocks.

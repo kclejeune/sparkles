@@ -118,20 +118,32 @@ pub(crate) fn broken(rule: &'static str, message: impl Into<String>) -> Broken {
 }
 
 /// The rules of OWL 2 EL that one axiom breaks, without the global restriction on the
-/// ranges of property chains.
-pub(crate) fn el_axiom(ax: &AxiomKind) -> Vec<Broken> {
-    el::axiom_kind(ax)
+/// ranges of property chains and without the rule against anonymous individuals, which
+/// the classifier takes as fresh individuals that no answer names (roadmap item 1281).
+pub(crate) fn el_axiom_with_anonymous(ax: &AxiomKind) -> Vec<Broken> {
+    el::axiom_kind_with(ax, true)
 }
 
-/// The first rule of [`el_axiom`] that one axiom breaks, which allocates only for an
-/// axiom that the allocation-free check cannot pass, so that a classification checks
-/// its axioms without copying their names.
+/// The first rule of [`el_axiom_with_anonymous`] that one axiom breaks, which allocates
+/// only for an axiom that the allocation-free check cannot pass, so that a classification
+/// checks its axioms without copying their names. That check passes no anonymous
+/// individual, so an axiom that holds one takes the full check.
 pub(crate) fn el_first(ax: &AxiomKind) -> Option<Broken> {
     if el::certainly_el(ax) {
         None
     } else {
-        el_axiom(ax).into_iter().next()
+        el_axiom_with_anonymous(ax).into_iter().next()
     }
+}
+
+/// Whether `ax` breaks any rule of [`el_axiom_with_anonymous`], decided without
+/// allocating and polling `poll` every `poll_step` AST nodes.
+pub(crate) fn el_breaks_with_anonymous_polled<E>(
+    ax: &AxiomKind,
+    poll_step: usize,
+    poll: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    el::breaks_with_anonymous_polled(ax, poll_step, poll)
 }
 
 /// Checks axioms one at a time against several profiles. The ontology given to
@@ -406,9 +418,8 @@ pub(crate) fn individuals(ax: &AxiomKind) -> Vec<&Individual> {
             ce(a, &mut out);
             ce(b, &mut out);
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
-            cs.iter().for_each(|c| ce(c, &mut out))
-        }
+        K::EquivalentClasses(cs) => cs.iter().for_each(|c| ce(c, &mut out)),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().for_each(|c| ce(c, &mut out)),
         K::ObjectPropertyDomain(_, c)
         | K::ObjectPropertyRange(_, c)
         | K::DataPropertyDomain(_, c)
@@ -417,7 +428,8 @@ pub(crate) fn individuals(ax: &AxiomKind) -> Vec<&Individual> {
             ce(c, &mut out);
             out.push(i);
         }
-        K::SameIndividual(is) | K::DifferentIndividuals(is) => out.extend(is.iter()),
+        K::SameIndividual(is) => out.extend(is.iter()),
+        K::DifferentIndividuals(is) => out.extend(is.iter()),
         K::ObjectPropertyAssertion(_, a, b) | K::NegativeObjectPropertyAssertion(_, a, b) => {
             out.push(a);
             out.push(b);
@@ -536,7 +548,8 @@ mod el_first_tests {
         prop_oneof![
             4 => (class_expression(), class_expression()).prop_map(|(a, b)| K::SubClassOf(a, b)),
             2 => ces().prop_map(K::EquivalentClasses),
-            1 => ces().prop_map(K::DisjointClasses),
+            1 => prop::collection::vec(class_expression(), 1..3)
+                .prop_map(|v| K::DisjointClasses(v.into())),
             2 => (class_expression(), ind()).prop_map(|(c, i)| K::ClassAssertion(c, i)),
             1 => (ope(), ind(), ind()).prop_map(|(p, a, b)| K::ObjectPropertyAssertion(p, a, b)),
             1 => (ope(), ind(), ind()).prop_map(|(p, a, b)| K::NegativeObjectPropertyAssertion(p, a, b)),
@@ -544,7 +557,8 @@ mod el_first_tests {
             1 => (prop::collection::vec(ope(), 1..3), ope())
                 .prop_map(|(ps, b)| K::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), b)),
             1 => prop::collection::btree_set(ope(), 1..3).prop_map(K::EquivalentObjectProperties),
-            1 => prop::collection::btree_set(ope(), 1..3).prop_map(K::DisjointObjectProperties),
+            1 => prop::collection::vec(ope(), 1..3)
+                .prop_map(|v| K::DisjointObjectProperties(v.into())),
             1 => (ope(), class_expression()).prop_map(|(p, c)| K::ObjectPropertyDomain(p, c)),
             1 => (ope(), class_expression()).prop_map(|(p, c)| K::ObjectPropertyRange(p, c)),
             1 => ope().prop_map(K::TransitiveObjectProperty),
@@ -552,12 +566,21 @@ mod el_first_tests {
             1 => ope().prop_map(K::FunctionalObjectProperty),
             1 => ope().prop_map(K::SymmetricObjectProperty),
             1 => inds().prop_map(K::SameIndividual),
-            1 => inds().prop_map(K::DifferentIndividuals),
+            1 => prop::collection::vec(ind(), 1..3).prop_map(|v| K::DifferentIndividuals(v.into())),
             1 => datatype().prop_map(|d| K::Declaration(Entity::Datatype(d))),
             1 => (0..2u8).prop_map(|c| K::Declaration(Entity::Class(Class::new(format!("urn:c{c}"))))),
             1 => (dp(), data_range()).prop_map(|(p, r)| K::DataPropertyRange(p, r)),
+            1 => (datatype(), data_range()).prop_map(|(d, r)| K::DatatypeDefinition(d, r)),
             1 => (dp(), class_expression()).prop_map(|(p, c)| K::DataPropertyDomain(p, c)),
             1 => (dp(), ind(), literal()).prop_map(|(p, a, l)| K::DataPropertyAssertion(p, a, l)),
+            1 => (dp(), ind(), literal()).prop_map(|(p, a, l)| K::NegativeDataPropertyAssertion(p, a, l)),
+            1 => literal().prop_map(|l| {
+                K::AnnotationAssertion(
+                    AnnotationProperty::new("urn:ap"),
+                    AnnotationSubject::Iri(Iri::new("urn:s").unwrap()),
+                    AnnotationValue::Literal(l),
+                )
+            }),
             1 => (class_expression(), prop::collection::btree_set(ope(), 0..2))
                 .prop_map(|(c, ops)| K::HasKey(c, ops, BTreeSet::new())),
         ]
@@ -565,15 +588,19 @@ mod el_first_tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(4096))]
-        /// The allocation-free check passes only axioms that break no rule, and the first
-        /// rule broken is the full check's first, with its message.
+        /// The allocation-free check passes only axioms that break no rule, even with
+        /// the rule against anonymous individuals, and the first rule broken is the first
+        /// of the full check without that rule, with its message.
         #[test]
         fn el_first_matches_el_axiom(k in axiom()) {
-            let all = el_axiom(&k);
+            let strict = el::axiom_kind(&k);
             if el::certainly_el(&k) {
-                prop_assert!(all.is_empty(), "{k:?} passed but breaks {:?}", all[0].message);
+                prop_assert!(strict.is_empty(), "{k:?} passed but breaks {:?}", strict[0].message);
             }
+            let all = el_axiom_with_anonymous(&k);
             let first = el_first(&k);
+            let breaks = el_breaks_with_anonymous_polled(&k, 1, &mut || Ok::<(), ()>(())).unwrap();
+            prop_assert_eq!(breaks, !all.is_empty());
             prop_assert_eq!(
                 first.map(|b| (b.rule, b.message)),
                 all.into_iter().next().map(|b| (b.rule, b.message))

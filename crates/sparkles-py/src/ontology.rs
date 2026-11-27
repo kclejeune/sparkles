@@ -286,8 +286,10 @@ impl PyOntologies {
 #[pymethods]
 impl PyOntologies {
     /// The ontology header, the counts of entities by kind and of axioms by type, the
-    /// graphs read and the diagnostics of the read.
-    #[pyo3(signature=(graph=None, *, imports=true, mode="lenient", at=None, inferences=false, cancel=None, timeout=None))]
+    /// graphs read and the diagnostics of the read. `view="head"` answers the header, the
+    /// entity counts, the graphs and the imports alone, from bounded reads, without
+    /// mapping the whole graph into axioms.
+    #[pyo3(signature=(graph=None, *, imports=true, mode="lenient", at=None, inferences=false, view="full", cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn summary<'py>(
         &self,
@@ -297,11 +299,13 @@ impl PyOntologies {
         mode: &str,
         at: Option<&Bound<'py, PyAny>>,
         inferences: bool,
+        view: &str,
         cancel: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut a = base(graph, imports, mode, inferences)?;
         a.insert("at".into(), at_json(at)?);
+        a.insert("view".into(), serde_json::Value::from(view));
         let j = self.run(py, "summary", a, cancel, timeout, false)?;
         answer(py, j, &[])
     }
@@ -495,7 +499,9 @@ impl PyOntologies {
 
     /// Read an existing kept classification without classifying on a miss. Page
     /// continuations require its `result_id` and exact returned commit as `at`.
-    #[pyo3(signature=(graph=None, *, part="status", about=None, offset=0, limit=100, result_id=None, lang=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    /// With `el_only=True`, reads the kept EL-only (ELK) classification instead of
+    /// the default classification.
+    #[pyo3(signature=(graph=None, *, part="status", about=None, offset=0, limit=100, result_id=None, lang=None, el_only=false, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn kept_classification<'py>(
         &self,
@@ -507,6 +513,7 @@ impl PyOntologies {
         limit: usize,
         result_id: Option<&str>,
         lang: Option<&Bound<'py, PyAny>>,
+        el_only: bool,
         imports: bool,
         mode: &str,
         at: Option<&Bound<'py, PyAny>>,
@@ -522,6 +529,7 @@ impl PyOntologies {
         a.insert("limit".into(), json!(limit));
         a.insert("resultId".into(), json!(result_id));
         a.insert("lang".into(), names_json(lang)?);
+        a.insert("elOnly".into(), json!(el_only));
         let j = self.run(py, "keptClassification", a, cancel, timeout, false)?;
         answer(py, j, &[])
     }
@@ -724,16 +732,23 @@ impl PyOntologies {
     /// unsatisfiable classes, the axioms left out or used in part, and on request one
     /// class (`about`) and the taxonomy's nodes (`nodes`, `limit` from `offset`).
     /// `target` writes the taxonomy to that named graph in one commit. `partial` answers
-    /// what a run with the disjunctive rules proved when `timeout` or `cancel` stops it,
-    /// with `partial` true, the `incomplete` classes and the `consistency`, and
-    /// `expansion` (`cautious` or `eager`) picks those rules' expansion strategy.
-    #[pyo3(signature=(graph=None, *, assertions=false, about=None, nodes=false, limit=None, offset=None, threads=None, target=None, message=None, partial=false, expansion=None, projection=None, lang=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    /// what a run at any tier (EL, Horn, or disjunctive) proved when `timeout` or
+    /// `cancel` stops it after saturation begins, with `partial` true, the `incomplete`
+    /// classes and the `consistency`, and `expansion` (`cautious` or `eager`) picks the
+    /// disjunctive rules' expansion strategy.
+    /// `complete` is true only when the answer is complete for the whole ontology, and
+    /// `strict` raises `UnsupportedError`, with `code` `classification-incomplete`, when
+    /// the classifier would leave an axiom out or use one only in part. With
+    /// `el_only=True`, classifies by the OWL 2 EL rules alone, reproducing ELK's taxonomy
+    /// and caching separately from default runs.
+    #[pyo3(signature=(graph=None, *, assertions=false, el_only=false, about=None, nodes=false, limit=None, offset=None, threads=None, target=None, message=None, partial=false, strict=false, expansion=None, projection=None, lang=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn classify<'py>(
         &self,
         py: Python<'py>,
         graph: Option<&Bound<'py, PyAny>>,
         assertions: bool,
+        el_only: bool,
         about: Option<&Bound<'py, PyAny>>,
         nodes: bool,
         limit: Option<usize>,
@@ -742,6 +757,7 @@ impl PyOntologies {
         target: Option<&Bound<'py, PyAny>>,
         message: Option<String>,
         partial: bool,
+        strict: bool,
         expansion: Option<String>,
         projection: Option<String>,
         lang: Option<&Bound<'py, PyAny>>,
@@ -755,7 +771,9 @@ impl PyOntologies {
         a.remove("inferences");
         a.insert("at".into(), at_json(at)?);
         a.insert("assertions".into(), json!(assertions));
+        a.insert("elOnly".into(), json!(el_only));
         a.insert("partial".into(), json!(partial));
+        a.insert("strict".into(), json!(strict));
         a.insert("expansion".into(), json!(expansion));
         a.insert("projection".into(), json!(projection));
         a.insert("lang".into(), names_json(lang)?);
@@ -809,8 +827,10 @@ impl PyOntologies {
     /// (`syntax="functional"`) or the JSON form (a dict). The EL classifier answers
     /// inside OWL 2 EL and the RL rules by demand outside it; `reasoning` (`auto`, `el`
     /// or `rl`) chooses, and the answer's `reasoning` names the engine, whether the
-    /// answers are complete and the axioms that can make them incomplete.
-    #[pyo3(signature=(expression, graph=None, *, syntax=None, reasoning="auto", answers=None, limit=None, threads=None, max_derived=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
+    /// answers are complete and the axioms that can make them incomplete. With
+    /// `el_only=True`, runs the EL classifier in EL-only mode against the EL-only kept
+    /// saturation and refuses `reasoning="rl"` or expressions outside OWL 2 EL.
+    #[pyo3(signature=(expression, graph=None, *, syntax=None, reasoning="auto", el_only=false, answers=None, limit=None, threads=None, max_derived=None, imports=true, mode="lenient", at=None, cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn dl_query<'py>(
         &self,
@@ -819,6 +839,7 @@ impl PyOntologies {
         graph: Option<&Bound<'py, PyAny>>,
         syntax: Option<&str>,
         reasoning: &str,
+        el_only: bool,
         answers: Option<Vec<String>>,
         limit: Option<usize>,
         threads: Option<usize>,
@@ -840,6 +861,7 @@ impl PyOntologies {
         a.insert("expression".into(), e);
         a.insert("syntax".into(), json!(syntax));
         a.insert("reasoning".into(), json!(reasoning));
+        a.insert("elOnly".into(), json!(el_only));
         a.insert("answers".into(), json!(answers));
         a.insert("limit".into(), json!(limit));
         a.insert("threads".into(), json!(threads));

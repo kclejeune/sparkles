@@ -2,6 +2,9 @@
 //! `uparse`, `compare`, `iri`, `langtag`, `rset`, `load --check`, and `rsparql` and
 //! `rupdate` against a running server. Exit statuses are part of each command's contract.
 
+#[cfg(feature = "auth")]
+mod common;
+
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -694,46 +697,19 @@ fn rset_converts() {
     assert_eq!(out(&o), "?s\n<http://e/a>\n");
 }
 
-/// A free port in 5380–5399.
-#[cfg(feature = "auth")]
-fn port() -> u16 {
-    (5380..5400)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .expect("a free port in 5380-5399")
-}
-
 #[cfg(feature = "auth")]
 #[test]
 fn rsparql_and_rupdate_against_an_endpoint() {
-    use std::time::{Duration, Instant};
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();
-    let port = port();
-    let mut child = Command::new(BIN)
-        .args([
-            "serve",
-            "--port",
-            &port.to_string(),
-            "--mem",
-            "ds",
-            "--idle-release-ms",
-            "0",
-        ])
-        .arg("--data")
-        .arg(dir.join("data"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let (mut child, port) = common::ServerProcess::start(
+        common::serve()
+            .args(["--mem", "ds", "--idle-release-ms", "0"])
+            .arg("--data")
+            .arg(dir.join("data")),
+        &dir.join("server.log"),
+    );
     let base = format!("http://127.0.0.1:{port}");
-    let t0 = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(
-            t0.elapsed() < Duration::from_secs(30),
-            "server did not start"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
     wait_ready(port);
     let up = format!("{base}/ds/update");
     let q = format!("{base}/ds/sparql");

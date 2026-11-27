@@ -1,0 +1,5 @@
+200 text/turtle; charset=utf-8
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ex: <urn:ex:> .
+ex:s1 ex:p 42 , _:b0 , "]]> <&>" , "abc"^^xsd:integer , "ctl\u0001" , "en"@en , "plain" , "quote\" back\\ nl\n tab\t" , "rtl"@ar--rtl , "😀 é" , "" , <<( ex:a ex:b "t" )>> , ex:o .
+_:b0 ex:q ex:s1 .

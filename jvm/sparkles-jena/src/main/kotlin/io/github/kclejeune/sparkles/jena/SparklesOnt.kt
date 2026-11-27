@@ -662,15 +662,54 @@ public data class DlQuery @JvmOverloads public constructor(
     public val answers: List<String> = emptyList(),
     public val limit: Int = 1000,
     public val threads: Int = 0,
+    /** classify by the OWL 2 EL rules alone, as ELK does */
+    public val elOnly: Boolean = false,
 ) {
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
+    public constructor(
+        expression: String,
+        syntax: String?,
+        reasoning: String?,
+        answers: List<String>?,
+        limit: Int,
+        threads: Int,
+        mask: Int,
+        @Suppress("UNUSED_PARAMETER") marker: kotlin.jvm.internal.DefaultConstructorMarker?,
+    ) : this(
+        expression = expression,
+        syntax = if (mask and 0x2 != 0) "manchester" else syntax!!,
+        reasoning = if (mask and 0x4 != 0) "auto" else reasoning!!,
+        answers = if (mask and 0x8 != 0) emptyList() else answers!!,
+        limit = if (mask and 0x10 != 0) 1000 else limit,
+        threads = if (mask and 0x20 != 0) 0 else threads,
+        elOnly = false,
+    )
+
     init {
         require(limit > 0 && threads >= 0)
     }
+
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
+    public fun copy(
+        expression: String = this.expression,
+        syntax: String = this.syntax,
+        reasoning: String = this.reasoning,
+        answers: List<String> = this.answers,
+        limit: Int = this.limit,
+        threads: Int = this.threads,
+    ): DlQuery = copy(expression, syntax, reasoning, answers, limit, threads, this.elOnly)
 
     internal fun into(j: JsonObject) {
         j.put("expression", expression)
         j.put("syntax", syntax)
         j.put("reasoning", reasoning)
+        if (elOnly) j.put("elOnly", true)
         if (answers.isNotEmpty()) j.put("answers", JsonArray().also { a -> answers.forEach { a.add(it) } })
         j.put("limit", limit.toLong())
         j.put("threads", threads.toLong())
@@ -687,21 +726,103 @@ public data class ClassifyQuery @JvmOverloads public constructor(
     public val threads: Int = 0,
     public val target: String? = null,
     public val message: String? = null,
-    /** answer what a run with the disjunctive rules proved when the operation's deadline or cancellation stops it */
+    /** answer what the active EL, Horn or disjunctive run proved when the operation's deadline, cancellation or memory budget stops it after saturation begins */
     public val partial: Boolean = false,
     /** the expansion strategy of the disjunctive rules, `cautious` (the default) or `eager` */
     public val expansion: String? = null,
     /** `frame` returns bounded direct-parent/equivalence clauses instead of legacy arrays. */
     public val projection: String? = null,
     public val languages: List<String> = emptyList(),
+    /**
+     * refuse with [SparklesUnsupportedException], whose message names the axioms, when the
+     * classifier would leave an axiom out or use one only in part, as an OWL API reasoner
+     * such as HermiT throws on what it does not support; the answer's `complete` is then
+     * true whenever there is one
+     */
+    public val strict: Boolean = false,
+    /** classify by the OWL 2 EL rules alone, as ELK does */
+    public val elOnly: Boolean = false,
 ) {
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
+    public constructor(
+        assertions: Boolean,
+        about: String?,
+        nodes: Boolean,
+        limit: Int,
+        offset: Long,
+        threads: Int,
+        target: String?,
+        message: String?,
+        partial: Boolean,
+        expansion: String?,
+        projection: String?,
+        languages: List<String>?,
+        strict: Boolean,
+        mask: Int,
+        @Suppress("UNUSED_PARAMETER") marker: kotlin.jvm.internal.DefaultConstructorMarker?,
+    ) : this(
+        assertions = if (mask and 0x0001 != 0) false else assertions,
+        about = if (mask and 0x0002 != 0) null else about,
+        nodes = if (mask and 0x0004 != 0) false else nodes,
+        limit = if (mask and 0x0008 != 0) 100 else limit,
+        offset = if (mask and 0x0010 != 0) 0 else offset,
+        threads = if (mask and 0x0020 != 0) 0 else threads,
+        target = if (mask and 0x0040 != 0) null else target,
+        message = if (mask and 0x0080 != 0) null else message,
+        partial = if (mask and 0x0100 != 0) false else partial,
+        expansion = if (mask and 0x0200 != 0) null else expansion,
+        projection = if (mask and 0x0400 != 0) null else projection,
+        languages = if (mask and 0x0800 != 0) emptyList() else languages!!,
+        strict = if (mask and 0x1000 != 0) false else strict,
+        elOnly = false,
+    )
+
     init {
         require(limit > 0 && offset >= 0 && threads >= 0)
         require(expansion == null || expansion == "cautious" || expansion == "eager")
     }
 
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
+    public fun copy(
+        assertions: Boolean = this.assertions,
+        about: String? = this.about,
+        nodes: Boolean = this.nodes,
+        limit: Int = this.limit,
+        offset: Long = this.offset,
+        threads: Int = this.threads,
+        target: String? = this.target,
+        message: String? = this.message,
+        partial: Boolean = this.partial,
+        expansion: String? = this.expansion,
+        projection: String? = this.projection,
+        languages: List<String> = this.languages,
+        strict: Boolean = this.strict,
+    ): ClassifyQuery = copy(
+        assertions,
+        about,
+        nodes,
+        limit,
+        offset,
+        threads,
+        target,
+        message,
+        partial,
+        expansion,
+        projection,
+        languages,
+        strict,
+        this.elOnly,
+    )
+
     internal fun into(j: JsonObject) {
         j.put("assertions", assertions)
+        if (elOnly) j.put("elOnly", true)
         about?.let { j.put("about", it) }
         j.put("nodes", nodes)
         j.put("limit", limit.toLong())
@@ -710,6 +831,7 @@ public data class ClassifyQuery @JvmOverloads public constructor(
         target?.let { j.put("target", it) }
         message?.let { j.put("message", it) }
         if (partial) j.put("partial", true)
+        if (strict) j.put("strict", true)
         expansion?.let { j.put("expansion", it) }
         projection?.let { j.put("projection", it) }
         if (languages.isNotEmpty()) j.put("lang", languages.joinToString(","))
@@ -724,7 +846,45 @@ public data class KeptClassificationQuery @JvmOverloads public constructor(
     public val limit: Int = 100,
     public val resultId: String? = null,
     public val languages: List<String> = emptyList(),
+    /** read the kept EL-only classification instead of the default classification */
+    public val elOnly: Boolean = false,
 ) {
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
+    public constructor(
+        part: String?,
+        about: String?,
+        offset: Long,
+        limit: Int,
+        resultId: String?,
+        languages: List<String>?,
+        mask: Int,
+        @Suppress("UNUSED_PARAMETER") marker: kotlin.jvm.internal.DefaultConstructorMarker?,
+    ) : this(
+        part = if (mask and 0x01 != 0) "status" else part!!,
+        about = if (mask and 0x02 != 0) null else about,
+        offset = if (mask and 0x04 != 0) 0 else offset,
+        limit = if (mask and 0x08 != 0) 100 else limit,
+        resultId = if (mask and 0x10 != 0) null else resultId,
+        languages = if (mask and 0x20 != 0) emptyList() else languages!!,
+        elOnly = false,
+    )
+
+    @Deprecated(
+        message = "Binary compatibility with pre-elOnly callers.",
+        level = DeprecationLevel.HIDDEN,
+    )
+    public fun copy(
+        part: String = this.part,
+        about: String? = this.about,
+        offset: Long = this.offset,
+        limit: Int = this.limit,
+        resultId: String? = this.resultId,
+        languages: List<String> = this.languages,
+    ): KeptClassificationQuery = copy(part, about, offset, limit, resultId, languages, this.elOnly)
+
     internal fun into(j: JsonObject) {
         require(limit in 1..1000 && offset >= 0)
         j.put("part", part)
@@ -733,5 +893,6 @@ public data class KeptClassificationQuery @JvmOverloads public constructor(
         j.put("limit", limit.toLong())
         resultId?.let { j.put("resultId", it) }
         if (languages.isNotEmpty()) j.put("lang", languages.joinToString(","))
+        if (elOnly) j.put("elOnly", true)
     }
 }

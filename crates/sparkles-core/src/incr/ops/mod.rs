@@ -15,6 +15,7 @@ pub mod matching;
 pub mod path;
 pub mod recompute;
 pub mod template;
+pub mod window;
 
 use super::pass::Pass;
 use super::persist::{Reader, Writer};
@@ -24,6 +25,7 @@ use crate::error::Result;
 use crate::id::Id;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
+use std::convert::Infallible;
 
 /// Whether a node is maintained from the changes or evaluated again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -78,11 +80,12 @@ pub enum Op {
     Recompute(Box<recompute::Recompute>),
     Template(Box<template::Template>),
     Path(Box<path::PathOp>),
+    Window(Box<window::Window>),
 }
 
 impl Node {
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
-        p.control.check()?;
+        p.check_control()?;
         let schema = self.schema.clone();
         match &mut self.op {
             Op::Bgp(o) => o.init(p, &schema),
@@ -99,11 +102,12 @@ impl Node {
             Op::Recompute(o) => o.init(p, &schema),
             Op::Template(o) => o.init(p),
             Op::Path(o) => o.init(p, &schema),
+            Op::Window(o) => o.init(p),
         }
     }
 
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
-        p.control.check()?;
+        p.check_control()?;
         let schema = self.schema.clone();
         match &mut self.op {
             Op::Bgp(o) => o.delta(p),
@@ -120,13 +124,14 @@ impl Node {
             Op::Recompute(o) => o.delta(p, &schema),
             Op::Template(o) => o.delta(p),
             Op::Path(o) => o.delta(p, &schema),
+            Op::Window(o) => o.delta(p),
         }
     }
 
     /// [`init`](Self::init) with annotations (spec F13 §5): the rows with their
     /// weights and the annotations of the circuit's provenance setting.
     pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
-        p.control.check()?;
+        p.check_control()?;
         let schema = self.schema.clone();
         match &mut self.op {
             Op::Bgp(o) => o.init_a(p),
@@ -143,13 +148,14 @@ impl Node {
             Op::Recompute(o) => o.init_a(p, &schema),
             Op::Template(o) => o.init_a(p),
             Op::Path(o) => o.init_a(p, &schema),
+            Op::Window(o) => o.init_a(p),
         }
     }
 
     /// [`delta`](Self::delta) with annotations: each change carries the change of its
     /// row's annotation, and a change may move the annotation alone.
     pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
-        p.control.check()?;
+        p.check_control()?;
         let schema = self.schema.clone();
         match &mut self.op {
             Op::Bgp(o) => o.delta_a(p),
@@ -166,6 +172,7 @@ impl Node {
             Op::Recompute(o) => o.delta_a(p, &schema),
             Op::Template(o) => o.delta_a(p),
             Op::Path(o) => o.delta_a(p, &schema),
+            Op::Window(o) => o.delta_a(p),
         }
     }
 
@@ -263,6 +270,7 @@ impl Node {
             Op::Exists(o) => vec![&o.inner],
             Op::Group(o) => vec![&o.inner],
             Op::Template(o) => vec![&o.inner],
+            Op::Window(o) => vec![&o.inner],
         }
     }
 
@@ -279,11 +287,21 @@ impl Node {
             Op::Exists(o) => vec![&mut o.inner],
             Op::Group(o) => vec![&mut o.inner],
             Op::Template(o) => vec![&mut o.inner],
+            Op::Window(o) => vec![&mut o.inner],
         }
     }
 
     /// The approximate memory of the node's state and its children's.
     pub fn bytes(&self) -> u64 {
+        self.bytes_checked(&mut || Ok::<(), Infallible>(()))
+            .unwrap()
+    }
+
+    /// Account for operator state, checking read controls during each window scan.
+    pub(super) fn bytes_checked<E>(
+        &self,
+        check: &mut impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<u64, E> {
         let own = match &self.op {
             Op::Join(o) => o.bytes(),
             Op::Match(o) => o.bytes(),
@@ -293,9 +311,53 @@ impl Node {
             Op::Recompute(o) => o.bytes(self.schema.len()),
             Op::Template(o) => o.bytes(),
             Op::Path(o) => o.bytes(),
+            Op::Window(o) => o.bytes_checked(check)?,
             _ => 0,
         };
-        own + self.children().iter().map(|c| c.bytes()).sum::<u64>()
+        self.children()
+            .into_iter()
+            .try_fold(own, |bytes, c| Ok(bytes + c.bytes_checked(check)?))
+    }
+
+    /// Whether this node and every child keep no operator state across passes.
+    pub fn is_stateless(&self) -> bool {
+        match &self.op {
+            Op::Bgp(_)
+            | Op::Filter(_)
+            | Op::Extend(_)
+            | Op::Project(_)
+            | Op::Union(_)
+            | Op::Values(_) => self.children().iter().all(|c| c.is_stateless()),
+            Op::Join(_)
+            | Op::Match(_)
+            | Op::Distinct(_)
+            | Op::Exists(_)
+            | Op::Group(_)
+            | Op::Recompute(_)
+            | Op::Template(_)
+            | Op::Path(_)
+            | Op::Window(_) => false,
+        }
+    }
+
+    /// Free all operator state in this node and its children while keeping the compiled
+    /// plan structure intact for a future build.
+    pub fn clear(&mut self) {
+        match &mut self.op {
+            Op::Join(o) => o.clear(),
+            Op::Match(o) => o.clear(),
+            Op::Distinct(o) => o.clear(),
+            Op::Exists(o) => o.clear(),
+            Op::Group(o) => o.clear(),
+            Op::Recompute(o) => o.clear(),
+            Op::Template(o) => o.clear(),
+            Op::Path(o) => o.clear(),
+            Op::Window(o) => o.clear(),
+            _ => {}
+        }
+        for c in self.children_mut() {
+            c.clear();
+        }
     }
 
     /// Write the state of the node and its children, depth first.
@@ -309,6 +371,7 @@ impl Node {
             Op::Recompute(o) => o.save(w)?,
             Op::Template(o) => o.save(w)?,
             Op::Path(o) => o.save(w)?,
+            Op::Window(o) => o.save(w)?,
             _ => {}
         }
         for c in self.children() {
@@ -328,6 +391,7 @@ impl Node {
             Op::Recompute(o) => o.load(r)?,
             Op::Template(o) => o.load(r)?,
             Op::Path(o) => o.load(r)?,
+            Op::Window(o) => o.load(r)?,
             _ => {}
         }
         for c in self.children_mut() {
@@ -388,6 +452,7 @@ impl Node {
             Op::Recompute(o) => ("Recompute", Some(o.reason.clone()), Mode::Recompute),
             Op::Template(_) => ("Template", None, Mode::Incremental),
             Op::Path(o) => ("FixedPoint", Some(o.describe()), Mode::Incremental),
+            Op::Window(o) => ("Window", Some(o.describe(vars)), Mode::Incremental),
         };
         PlanNode {
             operator: operator.to_string(),
@@ -395,6 +460,30 @@ impl Node {
             vars: names(&self.schema),
             detail,
             children: self.children().iter().map(|c| c.plan(vars)).collect(),
+        }
+    }
+
+    /// The window that orders the node's rows: the node itself, or the window under a
+    /// projection that drops the window's key columns.
+    pub fn result_window(&self) -> Option<(&window::Window, Option<&[Option<usize>]>)> {
+        match &self.op {
+            Op::Window(w) => Some((w, None)),
+            Op::Project(p) => match &p.inner.op {
+                Op::Window(w) => Some((w, Some(&p.cols))),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn result_window_mut(&mut self) -> Option<&mut window::Window> {
+        match &mut self.op {
+            Op::Window(w) => Some(w),
+            Op::Project(p) => match &mut p.inner.op {
+                Op::Window(w) => Some(w),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -534,7 +623,7 @@ impl Arrangement {
 
     /// Remove every row.
     pub fn clear(&mut self) {
-        self.map.clear();
+        self.map = FxHashMap::default();
         self.len = 0;
     }
 
@@ -596,9 +685,10 @@ impl Arrangement {
     }
 
     pub fn load(&mut self, r: &mut Reader) -> Result<()> {
-        self.map.clear();
+        self.map = FxHashMap::default();
         self.len = 0;
         let n = r.u64()?;
+        let mut charged = 0u64;
         for _ in 0..n {
             let row = r.row()?;
             if row.len() != self.width {
@@ -607,6 +697,14 @@ impl Arrangement {
                 ));
             }
             let w = r.i64()?;
+            let next = self
+                .bytes()
+                .saturating_add(row_bytes(self.width))
+                .saturating_add(row_bytes(self.key.len()));
+            if next > charged {
+                r.charge_state(next - charged)?;
+                charged = next;
+            }
             self.add(&row, w);
         }
         Ok(())
@@ -628,6 +726,80 @@ fn describe(n: &Node, vars: &[String]) -> String {
         s
     }
     line(&plan)
+}
+
+/// Visit matching rows of one join side without cloning arrangement buckets, keeping any
+/// BGP probe's [`ScratchLease`](super::budget::ScratchLease) alive until the callback
+/// finishes consuming the probe vector.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn for_each_side_match(
+    p: &mut Pass,
+    node: &Node,
+    arr: Option<&Arrangement>,
+    which: super::pass::Which,
+    key: &[Id],
+    seed: &[(usize, Id)],
+    mut f: impl FnMut(&Row, i64, &Pass) -> Result<()>,
+) -> Result<()> {
+    match arr {
+        Some(a) => {
+            for (r, w) in a.get(key) {
+                f(r, w, p)?;
+            }
+            Ok(())
+        }
+        None => match node.as_bgp() {
+            Some(b) => {
+                let (rows, lease) = b.probe_charged(p, which, seed)?;
+                for (r, w) in &rows {
+                    f(r, *w, p)?;
+                }
+                drop(rows);
+                drop(lease);
+                Ok(())
+            }
+            None => Err(crate::error::Error::Corrupt(
+                "a join side without an arrangement is not a pattern".into(),
+            )),
+        },
+    }
+}
+
+/// Annotated counterpart of [`for_each_side_match`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn for_each_side_match_a(
+    p: &mut Pass,
+    node: &Node,
+    arr: Option<&Arrangement>,
+    ann: Option<&AnnMap>,
+    which: super::pass::Which,
+    key: &[Id],
+    seed: &[(usize, Id)],
+    mut f: impl FnMut(&Row, i64, &prov::Ann, &Pass) -> Result<()>,
+) -> Result<()> {
+    match (arr, ann) {
+        (Some(a), Some(m)) => {
+            for (r, w) in a.get(key) {
+                let ann = prov::get(m, r, p.prov);
+                f(r, w, &ann, p)?;
+            }
+            Ok(())
+        }
+        _ => match node.as_bgp() {
+            Some(b) => {
+                let (rows, lease) = b.probe_a_charged(p, which, seed)?;
+                for (r, w, ann) in &rows {
+                    f(r, *w, ann, p)?;
+                }
+                drop(rows);
+                drop(lease);
+                Ok(())
+            }
+            None => Err(crate::error::Error::Corrupt(
+                "a join side without annotated state is not a pattern".into(),
+            )),
+        },
+    }
 }
 
 /// [`side_matches`] with annotations: an arrangement's rows carry the annotations of
@@ -654,23 +826,6 @@ pub fn side_matches_a(
             )),
         },
     }
-}
-
-/// Add annotated changes to an arrangement and its annotations, returning the
-/// effective changes (one per change, in order).
-pub fn absorb_side(
-    arr: &mut Arrangement,
-    ann: &mut AnnMap,
-    c: AChanges,
-    mode: Provenance,
-) -> AChanges {
-    c.into_iter()
-        .map(|(r, w, a)| {
-            arr.add(&r, w);
-            let e = prov::absorb_row(ann, &r, a, mode);
-            (r, w, e)
-        })
-        .collect()
 }
 
 /// The rows of one side of a join that can match a row of the other side: from the

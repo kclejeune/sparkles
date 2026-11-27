@@ -1,0 +1,2 @@
+<urn:ex:s1> <urn:ex:p> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<urn:ex:s1> <urn:ex:p> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .

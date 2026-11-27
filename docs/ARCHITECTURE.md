@@ -1,16 +1,23 @@
 # Sparkles architecture
 
-Sparkles is an embeddable RDF database with a Rust storage and query engine, a
-Fuseki-compatible server, and language bindings. Its central choice is to preserve
-Jena's observable semantics and operational model while using QLever-style sorted
-indexes and columnar execution. Transactions, history, branches and derived indexes
-extend that foundation.
+Sparkles is a single-node, embeddable RDF database with a Rust storage and query engine, a
+Fuseki-compatible HTTP server, and Python, JVM and Node.js bindings. It pairs Apache
+Jena's observable semantics and operational model with QLever-style sorted indexes and
+columnar execution, adding durable commits, point-in-time history, branches and derived
+indexes on top.
 
-This document describes the current implementation and connects the architectural
-decisions across the [design specs](specs/README.md). Not every phase of every spec
-is implemented, and each spec's **Outcome** section says which parts are. [FEATURES](FEATURES.md) inventories behavior,
-[API](API.md) defines the HTTP surface, and [BENCHMARKS](BENCHMARKS.md)
-records performance evidence and reproduction instructions.
+This guide explains the current architecture and connects the design decisions across the
+[design specs](specs/README.md) (each spec's **Outcome** section records what shipped).
+See [FEATURES.md](FEATURES.md) for current capabilities, [API.md](API.md) for the HTTP
+contract, [internals/OPTIMIZATIONS.md](internals/OPTIMIZATIONS.md) for operator fast paths,
+and [BENCHMARKS.md](BENCHMARKS.md) for performance evidence.
+
+| Layer | Primary crates | Owns |
+|---|---|---|
+| Storage & query engine | `sparkles-core` | 64-bit term IDs, sorted vocabularies, 7 compressed permutations, MVCC deltas, WAL durability, access views, cost-based planner, eager/cursor executors and derived-index lifecycles |
+| Application facade & bindings | `sparkles`, `sparkles-py`, `sparkles-ffi`, `sparkles-node` | `Dataset` and `Catalog` handles, persisted dataset settings, write guards, admin handles and Python, JVM (Jena) and Node.js adapters |
+| Optional satellites | `sparkles-reasoner`, `sparkles-shacl`, `sparkles-shex`, `sparkles-owl`, `sparkles-graphql`, `sparkles-backup`, `sparkles-fmt` | Forward reasoning, SHACL/ShEx validation, OWL 2 axioms, GraphQL compilation, repository backups and syntax formatting/linting |
+| Server, CLI & tooling | `sparkles-server`, `sparkles-client`, `ui/` | HTTP/Fuseki endpoints, authentication, task queues, layered settings, MCP server, model orchestration, CLI tools and web UI |
 
 * [Compatibility, execution and reuse](#compatibility-execution-and-reuse)
 * [Library boundaries and entry points](#library-boundaries-and-entry-points)
@@ -24,9 +31,9 @@ records performance evidence and reproduction instructions.
 
 ## Compatibility, execution and reuse
 
-The phrase “Jena on QLever-style internals” describes a division of responsibilities.
-The Rust engine does not run Jena, Fuseki or QLever underneath it. The JVM binding
-does depend on Jena to expose its Java APIs and to support ARQ fallback.
+"Jena on QLever-style internals" describes a division of responsibilities, not a runtime
+dependency. The Rust engine does not embed Jena, Fuseki or QLever. Only the JVM binding
+depends on Apache Jena, to expose Jena's Java APIs and optional ARQ fallback.
 
 | Influence | What Sparkles takes from it | Where Sparkles makes its own choices |
 |---|---|---|
@@ -97,13 +104,12 @@ feature. `sparkles-client` and `js/client` instead talk to remote endpoints. The
 not embed another store. The formatter has a separate browser WASM build. The
 database engine itself has no WASM build.
 
-The library-first boundary is implemented, but the server is more than a thin
-transport wrapper. Its dataset object wraps the library's `Dataset` and
-dereferences a hidden `DatasetState` for the handlers that use it. Authentication, task
-queues, schedulers, layered operator settings, model providers and agent workflows
-remain process concerns. The parity map between HTTP and the library explicitly records these
-exceptions, and the bindings matrix includes intentional planned entries. A new
-HTTP endpoint therefore does not automatically imply a method in every binding.
+The library-first boundary keeps core invariants reusable, though the server adds process
+services beyond HTTP transport. Its dataset wrapper builds on the library's `Dataset` and
+exposes an internal `DatasetState` for server-only handlers. Authentication, task queues,
+schedulers, layered operator settings, model providers and agent workflows stay in the
+server process. The parity map between HTTP and the library records these intentional
+boundaries, so a new HTTP route does not automatically imply a method in every binding.
 
 Sources: [facade](../crates/sparkles/src/lib.rs),
 [Dataset](../crates/sparkles/src/dataset.rs), [Catalog](../crates/sparkles/src/catalog/mod.rs),
@@ -453,12 +459,12 @@ share one maintenance strategy.
 
 | Derived facility | How it relates to storage and execution | Consistency and cost decision |
 |---|---|---|
-| Full-text | Tantivy documents keyed by quad term keys. Jena's `text:query`, BM25 and highlighting | Writes stage documents in the commit path. Segment commits and checkpoints are deferred. Searches reconcile candidates with their snapshot. WAL recovery catches up or rebuilds the index. Historical search is unsupported. |
-| Vectors | Packed vectors and optional HNSW per generation. Exact delta overlay and `spk:vectorSearch` | Base builds run in the background and exact search remains available while HNSW builds. Compaction rebuilds the graph. Explicit approximate search trades recall for speed. Eligible ordinary cosine and dot-product top-k rewrites stay exact. |
-| Embeddings | Workers prepare source inputs, call an external provider or a local model on its own thread pool ([F12](specs/F12-local-embeddings.md)), then apply vectors as ordinary commits | Provider latency stays outside the original write. Apply rechecks changed inputs, stale work is discarded, and embedding commits do not schedule themselves. Catch-up and freshness are visible. |
-| Spatial | Parsed geometry column, packed R-tree base and snapshot overlays. GeoSPARQL and Jena spatial functions | Range, spatial-join and nearest-neighbor plans use the index. Index failure falls back to query evaluation without it. Rebuild restores acceleration. Compaction prebuilds geometry state to shorten its final switch. |
-| Schema | Exact observed class and predicate counts, graph scope, declarations and SHACL constraints | Reports can be maintained from changes and compared across commits. Draft shapes describe observations. Installing a write guard makes them an enforced contract. |
-| Inference | RDFS, OWL 2 RL and Jena rules materialized through semi-naive forward chaining. RDFS also available on read | Materialized runs record their source state and publish inferred data through guarded writes. Incremental maintenance falls back to a full run for unsupported rules or unavailable history. Stale inferences are reported rather than silently represented as current. |
+| Full-text | Tantivy documents keyed by quad term keys. Jena's `text:query`, BM25 and highlighting | Writes stage documents in the commit path with deferred segment commits and checkpoints, and searches reconcile candidates with their snapshot. WAL recovery catches up or rebuilds, and historical search is unsupported. |
+| Vectors | Packed vectors and optional HNSW per generation. Exact delta overlay and `spk:vectorSearch` | HNSW graphs build in the background and rebuild on compaction while exact search stays available. Explicit approximate search trades recall for speed, whereas eligible cosine and dot-product top-k rewrites stay exact. |
+| Embeddings | Workers prepare source inputs, call an external provider or a local model on its own thread pool ([F12](specs/F12-local-embeddings.md)), then apply vectors as ordinary commits | Provider latency stays outside the original write, while catch-up and freshness remain visible. Apply rechecks changed inputs, discards stale work, and never self-schedules embedding commits. |
+| Spatial | Parsed geometry column, packed R-tree base and snapshot overlays. GeoSPARQL and Jena spatial functions | Range, spatial-join, and nearest-neighbor plans use the index, falling back to unindexed evaluation on failure until rebuilt. Compaction prebuilds geometry state to shorten its final switch. |
+| Schema | Exact observed class and predicate counts, graph scope, declarations and SHACL constraints | Reports update from changes and compare across commits. Draft shapes describe observed data until installed as an enforced write guard. |
+| Inference | RDFS, OWL 2 RL and Jena rules materialized through semi-naive forward chaining. RDFS also available on read | Materialized runs record source state, publish via guarded writes, and report staleness rather than hiding it. Incremental maintenance falls back to full runs for unsupported rules or missing history. |
 
 Several details follow from making auxiliary data recoverable. Text documents use
 term keys rather than generation-local IDs, so compaction can preserve the text
@@ -592,14 +598,14 @@ matter when building on it:
 
 | Area | Current boundary |
 |---|---|
-| Distribution | RDF Patch application from F10 is implemented. Pull replicas, promotion workflows and clustering are not. A change feed is not a running replication system. |
-| History | Readability depends on retained generations. Full-text search at historical commits and automatic pin rebasing are not implemented. Branch backups are independent. There is no whole-server backup. |
-| Encryption | F11 partially implements optional encrypted backup repositories and operator key workflows. Live dataset files remain unencrypted by Sparkles. Content-defined chunking and KMS-backed dataset encryption are not implemented. |
-| Execution | Automatic execution streams many plans, and the rest run eagerly. Sorts, groupings, DISTINCT and joins spill to disk by default on the server, and `--spill off` turns it off. Eager operators still hold their whole state and can exceed a budget. |
-| Query languages | Read-only GraphQL is implemented with limitations on nested query cost. Cypher remains [specified only](specs/F01-cypher.md). There is no implemented property-graph frontend. |
-| Reasoning and shapes | Materialization plus RDFS on read is implemented, without a general backward rule engine or ontology object API. Incremental reasoning has full-run fallbacks. ShEx 2.2 and SHACL 1.2 node expressions are implemented within the [compatibility boundaries](FEATURES.md#compatibility-boundaries). |
-| Agents and settings | Model clients are tested against mock endpoints, and there is no evaluation matrix against real models. C18 Phase 6 is not built. |
-| Packaging and scale | Bindings are implemented but unpublished to package registries. The engine has no browser WASM build. Published measurements reach 1.24 billion triples on one machine. They do not establish larger or distributed behavior. |
+| Distribution | F10 RDF Patch application is implemented, whereas pull replicas, promotion workflows, and clustering are not. A change feed is not live replication. |
+| History | Historical reads require retained generations, without historical full-text search or automatic pin rebasing. Branch backups run independently, and there is no whole-server backup. |
+| Encryption | F11 provides optional encrypted backup repositories and operator key workflows while live dataset files remain unencrypted. Content-defined chunking and KMS-backed dataset encryption are not implemented. |
+| Execution | Automatic execution streams eligible plans while remaining eager operators hold their full state within budgets. Server sorts, groupings, `DISTINCT`, and joins spill to disk by default (`--spill off` disables spill). |
+| Query languages | Read-only GraphQL ships with nested-query cost limits. Cypher remains [specified only](specs/F01-cypher.md) with no property-graph frontend. |
+| Reasoning and shapes | Materialization with full-run fallbacks and RDFS on read ship without a general backward engine or ontology object API. ShEx 2.2 and SHACL 1.2 node expressions follow the [compatibility boundaries](FEATURES.md#compatibility-boundaries). |
+| Agents and settings | Model clients are tested against mock endpoints, with no evaluation matrix against live models. End-to-end live-model evaluation remains open ([C18](specs/C18-natural-language-questions-and-ingest/README.md)). |
+| Packaging and scale | Bindings remain unpublished to package registries and the engine has no browser WASM build. Published measurements reach 1.24 billion triples on one machine without establishing larger or distributed scale. |
 
 Architecture is checked through several complementary contracts. W3C query and update
 and RDF suites cover standards semantics. Jena contract and differential suites

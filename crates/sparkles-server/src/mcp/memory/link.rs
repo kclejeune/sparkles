@@ -262,7 +262,7 @@ impl Tools<'_> {
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let deadline = self.call.arrived + timeout;
+        let deadline = self.deadline(timeout);
         let r = self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?;
         let mut setup = self.link_setup(&ds, &r, labels, graphs, &ctx)?;
         if a.vectors == Some(false) {
@@ -323,7 +323,7 @@ impl Tools<'_> {
         }
         let mut value = json!({
             "dataset": ds.name,
-            "commit": r.snap.commit,
+            "commit": r.commit(),
             "search": { "text": text_used, "vector": vector_used },
             "prefixes": terms.used(),
         });
@@ -366,8 +366,14 @@ impl Tools<'_> {
                     else {
                         continue;
                     };
-                    let (objects, sampled) =
-                        self.entry_objects(ds, &r.snap, &rep, &rep.predicates[i], r.deadline, ctx)?;
+                    let (objects, sampled) = self.entry_objects(
+                        ds,
+                        r.snap(),
+                        &rep,
+                        &rep.predicates[i],
+                        r.deadline,
+                        ctx,
+                    )?;
                     languages_complete &= sampled.is_none()
                         && objects.literals.iter().all(|group| {
                             group.datatype
@@ -562,7 +568,7 @@ impl Tools<'_> {
             };
             match crate::ask::profile::nested(
                 crate::ask::profile::Stage::LinkerVectorSearch,
-                r.snap.commit,
+                r.commit(),
                 1,
                 || self.vector_hits(r, pred, &input, &setup.graphs),
             ) {

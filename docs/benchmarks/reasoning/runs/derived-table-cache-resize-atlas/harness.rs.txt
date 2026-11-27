@@ -1,0 +1,114 @@
+#![allow(dead_code)]
+
+extern crate self as sparkles_budget;
+mod qlrewrite {
+    pub fn clear() {}
+}
+mod reuse {
+    pub fn clear() {}
+}
+mod sizes;
+mod tables;
+
+use std::hint::black_box;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::time::Instant;
+
+use tables::{Key, Table};
+
+const ENTRIES: usize = 1024;
+const REMAINING: usize = 768;
+const READERS: usize = 3;
+
+fn key(i: usize) -> Key {
+    Key {
+        view: "test-view".into(),
+        digest: 1,
+        demand: "d".repeat(512),
+        seeds: (0, i as u64),
+    }
+}
+
+fn warm() -> Vec<Arc<Table>> {
+    tables::clear();
+    tables::set_capacity(16 << 20);
+    let mut callers = Vec::with_capacity(ENTRIES);
+    for i in 0..ENTRIES {
+        let table = Arc::new(Table {
+            chunks: vec![Arc::new(vec![[i as u64, 2, 3]; 8])],
+            keys: Vec::new(),
+        });
+        tables::put(key(i), table.clone());
+        callers.push(table);
+    }
+    assert_eq!(tables::snapshot().tables, ENTRIES);
+    callers
+}
+
+fn cap_for_resize() -> u64 {
+    let mut lo = 1;
+    let mut hi = {
+        let pins = warm();
+        let initial = tables::snapshot().estimated_bytes;
+        drop(pins);
+        initial
+    };
+    while hi - lo > 1 {
+        let cap = lo + (hi - lo) / 2;
+        let pins = warm();
+        tables::set_capacity(cap);
+        if tables::snapshot().tables > REMAINING {
+            hi = cap;
+        } else {
+            lo = cap;
+        }
+        drop(pins);
+    }
+    lo
+}
+
+fn main() {
+    let cap = cap_for_resize();
+    let hot = key(ENTRIES - 1);
+    println!("iterations,capacity_bytes,remaining,resize_ns,reader_max_ns,reader_hits,reader_misses");
+    for iteration in 0..24 {
+        let pins = warm();
+        let ready = Barrier::new(READERS + 1);
+        let running = AtomicBool::new(true);
+        let (resize, maximum, hits, misses) = std::thread::scope(|scope| {
+            let readers = (0..READERS).map(|_| scope.spawn(|| {
+                assert!(tables::get(&hot).is_some());
+                ready.wait();
+                let mut maximum = 0;
+                let mut hits = 0;
+                let mut misses = 0;
+                loop {
+                    let start = Instant::now();
+                    let value = black_box(tables::get(black_box(&hot)));
+                    maximum = maximum.max(start.elapsed().as_nanos());
+                    if value.is_some() { hits += 1 } else { misses += 1 }
+                    if !running.load(Ordering::Acquire) { break; }
+                }
+                (maximum, hits, misses)
+            })).collect::<Vec<_>>();
+            ready.wait();
+            let start = Instant::now();
+            tables::set_capacity(cap);
+            let elapsed = start.elapsed().as_nanos();
+            running.store(false, Ordering::Release);
+            let summaries = readers.into_iter().map(|r| r.join().unwrap()).collect::<Vec<_>>();
+            (
+                elapsed,
+                summaries.iter().map(|s| s.0).max().unwrap(),
+                summaries.iter().map(|s| s.1).sum::<usize>(),
+                summaries.iter().map(|s| s.2).sum::<usize>(),
+            )
+        });
+        let remaining = tables::snapshot().tables;
+        assert_eq!(remaining, REMAINING);
+        assert_eq!(misses, 0);
+        assert_eq!(pins.len(), ENTRIES);
+        println!("{iteration},{cap},{remaining},{resize},{maximum},{hits},{misses}");
+    }
+}

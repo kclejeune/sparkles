@@ -736,3 +736,274 @@ proptest! {
         let _ = data_range(&s, &v);
     }
 }
+
+#[test]
+fn punned_property_choose_prefers_exact_match_over_folded_across_kinds() {
+    // Regression test for R3-1 / R4: `ex:p` is both an object property and a data property;
+    // `right` matches a data property exactly while `RIGHT` matches an object property only
+    // after case folding. Exact match across all candidate property kinds must outrank a
+    // folded object-property match in both unbounded and bounded parsers.
+    let mut v = Vocabulary::new([("ex", "http://ex.org/")]);
+    v.add_entity(Entity::ObjectProperty(ObjectProperty::new(
+        "http://ex.org/p",
+    )));
+    v.add_entity(Entity::DataProperty(DataProperty::new("http://ex.org/p")));
+    v.add_entity(Entity::ObjectProperty(ObjectProperty::new(
+        "http://ex.org/RIGHT",
+    )));
+    v.add_entity(Entity::DataProperty(DataProperty::new(
+        "http://ex.org/right",
+    )));
+
+    let expected = Axiom::new(AxiomKind::SubDataPropertyOf(
+        DataProperty::new("http://ex.org/p"),
+        DataProperty::new("http://ex.org/right"),
+    ));
+    assert_eq!(axiom("ex:p SubPropertyOf right", &v).unwrap(), expected);
+    assert_eq!(
+        axiom_bounded("ex:p SubPropertyOf right", &v, 4096)
+            .unwrap()
+            .0,
+        expected
+    );
+}
+
+#[test]
+fn bounded_diagnostics_omit_candidates_and_bound_long_ontology_labels() {
+    // Regression test for R3-2 / R4: ambiguous and wrong-kind errors in bounded mode must
+    // not copy full ontology labels into the error message or clone them into `candidates`.
+    let mut v = Vocabulary::new([("ex", "http://ex.org/")]);
+    let huge_label_a = format!("Alpha {}", "A".repeat(20_000));
+    let huge_label_b = format!("Beta {}", "B".repeat(20_000));
+    v.add_entity(Entity::Class(Class::new("http://ex.org/a/Dup")));
+    v.add_label("http://ex.org/a/Dup", &huge_label_a);
+    v.add_entity(Entity::Class(Class::new("http://ex.org/b/Dup")));
+    v.add_label("http://ex.org/b/Dup", &huge_label_b);
+    v.add_entity(Entity::ObjectProperty(ObjectProperty::new(
+        "http://ex.org/ObjP",
+    )));
+    v.add_label("http://ex.org/ObjP", &huge_label_a);
+
+    // Unbounded parser retains rich candidates.
+    let rich_err = class_expression("Dup", &v).unwrap_err();
+    assert_eq!(rich_err.kind, ErrorKind::Ambiguous);
+    assert_eq!(rich_err.candidates.len(), 2);
+
+    // Bounded parser bounds message and omits unused candidates.
+    let BoundedError::Parse { error: amb_err, .. } =
+        class_expression_bounded("Dup", &v, 4096).unwrap_err()
+    else {
+        panic!("expected bounded ambiguous parse error");
+    };
+    assert_eq!(amb_err.kind, ErrorKind::Ambiguous);
+    assert!(
+        amb_err.candidates.is_empty(),
+        "bounded diagnostics must omit unused candidates"
+    );
+    assert!(
+        amb_err.message.len() <= 512,
+        "bounded ambiguous message too long: {}",
+        amb_err.message.len()
+    );
+    assert!(
+        amb_err.message.capacity() <= 640,
+        "bounded ambiguous message over-allocated: {}",
+        amb_err.message.capacity()
+    );
+
+    let BoundedError::Parse {
+        error: kind_err, ..
+    } = class_expression_bounded("ObjP", &v, 4096).unwrap_err()
+    else {
+        panic!("expected bounded kind parse error");
+    };
+    assert_eq!(kind_err.kind, ErrorKind::Kind);
+    assert!(
+        kind_err.candidates.is_empty(),
+        "bounded kind diagnostics must omit unused candidates"
+    );
+    assert!(kind_err.message.len() <= 512);
+}
+
+#[test]
+fn bounded_syntax_errors_stay_within_512_byte_limit() {
+    // Regression test for R5-P2: syntax errors (`done`, `expected`, invalid IRI, invalid
+    // number, invalid language tag) must never format unbounded token/IRI/literal text.
+    let mut v = Vocabulary::new([
+        ("ex", "http://ex.org/"),
+        ("bad", &format!("not a valid scheme/{}/", "b".repeat(4_000))),
+    ]);
+    v.add_entity(Entity::Class(Class::new("http://ex.org/Short")));
+    v.add_entity(Entity::AnnotationProperty(AnnotationProperty::new(
+        "http://ex.org/ann",
+    )));
+
+    // 1. Long trailing word in `done()` after resolving only a short class.
+    let long_trailing = format!("Short {}", "w".repeat(10_000));
+    let BoundedError::Parse { error: e_done, .. } =
+        class_expression_bounded(&long_trailing, &v, 256).unwrap_err()
+    else {
+        panic!("expected syntax error for long trailing word");
+    };
+    assert_eq!(e_done.kind, ErrorKind::Syntax);
+    assert!(
+        e_done.message.len() <= 512,
+        "done msg: {}",
+        e_done.message.len()
+    );
+    assert!(
+        e_done.message.capacity() <= 640,
+        "done cap: {}",
+        e_done.message.capacity()
+    );
+    assert!(e_done.message.contains("does not continue"));
+
+    // 2. Long unexpected string literal in `expected()` (also tests debug-escape streaming).
+    let long_str = format!("Short and \"{}\"", "q\n".repeat(5_000));
+    let BoundedError::Parse { error: e_exp, .. } =
+        class_expression_bounded(&long_str, &v, 256).unwrap_err()
+    else {
+        panic!("expected syntax error for long unexpected literal");
+    };
+    assert_eq!(e_exp.kind, ErrorKind::Syntax);
+    assert!(
+        e_exp.message.len() <= 512,
+        "expected msg: {}",
+        e_exp.message.len()
+    );
+    assert!(
+        e_exp.message.capacity() <= 640,
+        "expected cap: {}",
+        e_exp.message.capacity()
+    );
+
+    // 3. Long invalid expanded IRI in `resolve()` and `iri()`.
+    let BoundedError::Parse { error: e_iri, .. } =
+        class_expression_bounded("bad:X", &v, 10_000).unwrap_err()
+    else {
+        panic!("expected syntax error for invalid expanded IRI");
+    };
+    assert_eq!(e_iri.kind, ErrorKind::Syntax);
+    assert!(
+        e_iri.message.len() <= 512,
+        "iri msg: {}",
+        e_iri.message.len()
+    );
+    assert!(e_iri.message.contains("invalid IRI"));
+
+    let BoundedError::Parse {
+        error: e_ann_iri, ..
+    } = axiom_bounded("ann Domain bad:X", &v, 10_000).unwrap_err()
+    else {
+        panic!("expected syntax error for invalid annotation domain IRI");
+    };
+    assert_eq!(e_ann_iri.kind, ErrorKind::Syntax);
+    assert!(
+        e_ann_iri.message.len() <= 512,
+        "ann iri msg: {}",
+        e_ann_iri.message.len()
+    );
+    assert!(e_ann_iri.message.contains("invalid IRI"));
+
+    // 4. Long invalid number literal and long invalid language tag in `literal()`.
+    let long_num = format!("1{}", "a".repeat(5_000));
+    let BoundedError::Parse { error: e_num, .. } = literal_bounded(&long_num, &v, 256).unwrap_err()
+    else {
+        panic!("expected syntax error for long invalid number");
+    };
+    assert_eq!(e_num.kind, ErrorKind::Syntax);
+    assert!(
+        e_num.message.len() <= 512,
+        "num msg: {}",
+        e_num.message.len()
+    );
+
+    let long_lang = format!("\"hi\"@{}", "a".repeat(5_000));
+    let BoundedError::Parse { error: e_lang, .. } =
+        literal_bounded(&long_lang, &v, 256).unwrap_err()
+    else {
+        panic!("expected syntax error for long invalid language tag");
+    };
+    assert_eq!(e_lang.kind, ErrorKind::Syntax);
+    assert!(
+        e_lang.message.len() <= 512,
+        "lang msg: {}",
+        e_lang.message.len()
+    );
+}
+
+#[test]
+fn lookahead_uses_borrowed_prefix_components_across_hash_boundaries() {
+    // Regression test for R5-P2: `Vocabulary::kinds_concat` must match across short,
+    // 64-byte-boundary, and multi-chunk IRIs without allocating prefix expansions during
+    // punned-property lookahead under a long default namespace.
+    let ns_short = "http://ex.org/";
+    let ns_64 = format!("http://ex.org/{}/", "a".repeat(44)); // 14 + 44 + 1 = 59; + "Exact" = 64
+    // Omit a trailing `/`/`#` so `BigDt` is NOT indexed under `self.names` by `local_name`,
+    // forcing both `BigDt` (hit) and `Cls` (miss) through the empty-prefix fallback stage.
+    let ns_long = format!("http://ex.org/{}_", "z".repeat(20_000));
+    let dt_64 = format!("{ns_64}Exact");
+    assert_eq!(dt_64.len(), 64);
+    let dt_long = format!("{ns_long}BigDt");
+
+    let mut v = Vocabulary::new([
+        ("ex", ns_short),
+        ("b64", ns_64.as_str()),
+        ("", ns_long.as_str()),
+    ]);
+    v.add_entity(Entity::ObjectProperty(ObjectProperty::new(
+        "http://ex.org/p",
+    )));
+    v.add_entity(Entity::DataProperty(DataProperty::new("http://ex.org/p")));
+    v.add_entity(Entity::Class(Class::new("http://ex.org/Cls")));
+    v.add_entity(Entity::Datatype(Datatype::new(&dt_64)));
+    v.add_entity(Entity::Datatype(Datatype::new(&dt_long)));
+
+    assert_eq!(v.kinds_concat(ns_short, "Cls"), &[EntityKind::Class]);
+    assert_eq!(v.kinds_concat(&ns_64, "Exact"), &[EntityKind::Datatype]);
+    assert_eq!(v.kinds_concat(&ns_long, "BigDt"), &[EntityKind::Datatype]);
+    assert!(v.kinds_concat(&ns_long, "Missing").is_empty());
+
+    // Punned `p some Cls` with a 20 KiB default namespace: `data_ahead` checks `Cls` as a
+    // datatype via `lookup_kinds` without allocating `<default_ns>Cls`, then resolves `Cls`
+    // as an object restriction within a tight 256-byte budget.
+    let (ce_cls, used_cls) = class_expression_bounded("p some Cls", &v, 256).unwrap();
+    assert_eq!(
+        ce_cls,
+        ClassExpression::some(
+            ObjectProperty::new("http://ex.org/p"),
+            Class::new("http://ex.org/Cls"),
+        )
+    );
+    assert!(
+        used_cls < 128,
+        "lookahead must not charge unexpanded default namespace: used={used_cls}"
+    );
+
+    // Prefixed datatype at the exact 64-byte chunk boundary selects the data restriction.
+    let (ce_b64, _) = class_expression_bounded("p some b64:Exact", &v, 256).unwrap();
+    assert_eq!(
+        ce_b64,
+        ClassExpression::DataSomeValuesFrom(
+            vec![DataProperty::new("http://ex.org/p")],
+            DataRange::Datatype(Datatype::new(&dt_64)),
+        )
+    );
+
+    // Datatype reachable via the 20 KiB default namespace: lookahead identifies it as a
+    // datatype without allocating, and actual resolution enforces the budget.
+    let err = class_expression_bounded("p some BigDt", &v, 256).unwrap_err();
+    assert!(
+        matches!(err, BoundedError::Budget { .. }),
+        "resolving 20 KiB datatype via default prefix must still trip budget: {err:?}"
+    );
+    let (ce_big, used_big) = class_expression_bounded("p some BigDt", &v, 30_000).unwrap();
+    assert_eq!(
+        ce_big,
+        ClassExpression::DataSomeValuesFrom(
+            vec![DataProperty::new("http://ex.org/p")],
+            DataRange::Datatype(Datatype::new(&dt_long)),
+        )
+    );
+    assert!(used_big >= dt_long.len());
+}

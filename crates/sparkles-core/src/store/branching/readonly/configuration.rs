@@ -7,6 +7,7 @@ use crate::store::configuration_history::primary::Header;
 pub(super) struct PrimaryReader {
     root: std::path::PathBuf,
     header: Header,
+    family: Option<Arc<crate::store::family::Family>>,
 }
 
 /// The caller's cold buffers remain charged and unchanged during this loan.
@@ -51,7 +52,14 @@ impl PrimaryReader {
                 .saturating_mul(4)
                 .saturating_add(std::mem::size_of::<Self>() as u64)
                 .saturating_add(256);
-            Ok((Self { root, header }, retained))
+            Ok((
+                Self {
+                    root,
+                    header,
+                    family: Some(store.family.clone()),
+                },
+                retained,
+            ))
         })();
         match result {
             Ok((value, retained)) => {
@@ -74,7 +82,7 @@ impl PrimaryReader {
         )?;
         let result = (|| {
             let family_root = super::super::super::link::dataset_root_of(root)?;
-            let family = commit::read_dataset_file_controlled(&family_root, budget)?
+            let family = commit::read_dataset_file_with(&family_root, budget)?
                 .ok_or_else(|| Error::Corrupt("primary family identity is missing".into()))?;
             let bytes = budget.read_file(&root.join(BRANCH_FILE))?;
             let mut raw: Loaded<serde_json::Value> = budget.json(&bytes)?;
@@ -104,6 +112,7 @@ impl PrimaryReader {
                 Self {
                     root: family_root,
                     header,
+                    family: None,
                 },
                 retained,
             ))
@@ -126,6 +135,20 @@ impl PrimaryReader {
         budget: &ColdBudget<'_>,
     ) -> Result<()> {
         let temporary = preparation(budget)?;
+        if let crate::history::ConfigurationBinding::ImportedUnbound { source } =
+            generation.configuration
+        {
+            self.header
+                .check_imported_unbound_base(generation.base.seq, generation.configuration)?;
+            if let Some(family) = &self.family {
+                return crate::store::configuration_history::verify_imported_identity_for_family(
+                    &self.root, family, source, &temporary,
+                );
+            }
+            return crate::store::configuration_history::verify_imported_identity(
+                &self.root, source, &temporary,
+            );
+        }
         self.header.generation(
             &self.root,
             &temporary,

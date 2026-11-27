@@ -10,7 +10,7 @@ use std::{fs::File, io::Read, path::Path};
 
 mod linked;
 mod value;
-pub(super) use linked::{head_vocabulary_controlled, read_link_controlled};
+pub(super) use linked::{head_vocabulary_controlled, open_link_vocabulary, segment_dir};
 
 const CHUNK: usize = 64 << 10;
 // The input stays live while Serde owns its scratch and decoded containers. Metadata
@@ -79,7 +79,7 @@ impl<'a> ColdBudget<'a> {
         self.limit.holding(self.used)
     }
 
-    fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32]> {
+    pub(crate) fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
         let mut digest = Sha256::new();
         for chunk in bytes.chunks(CHUNK) {
@@ -437,12 +437,19 @@ impl super::Generation {
     /// Also accounts for a sealed generation first opened by the compatible
     /// unlimited API. Current live generations are handled as store-owned backing
     /// by the caller, rather than copied into each request's owned parse scope.
-    pub(crate) fn retained_bytes_limited(&self, limit: &ReadLimit<'_>) -> Result<u64> {
+    pub(crate) fn retained_bytes_with<C: crate::budgeted::Control>(
+        &self,
+        limit: &C,
+    ) -> Result<u64> {
+        if !C::ACCOUNTS {
+            return Ok(0);
+        }
         if self.cold_bytes != 0 {
             limit.check(self.cold_bytes)?;
             return Ok(self.cold_bytes);
         }
-        let mut budget = ColdBudget::new(*limit)?;
+        let read_limit = limit.read_limit();
+        let mut budget = ColdBudget::new(read_limit)?;
         budget.charge(
             std::mem::size_of::<Self>() as u64
                 + 256
@@ -450,7 +457,7 @@ impl super::Generation {
                 + self.dir.as_ref().map_or(0, |p| p.as_os_str().len()) as u64,
         )?;
         budget.charge(self.vocab.resident_bytes() + 64)?;
-        budget.charge(self.dvocab.resident_bytes_limited(limit)?)?;
+        budget.charge(self.dvocab.resident_bytes_with(&budget)?)?;
         budget.charge(
             self.perms.capacity() as u64 * std::mem::size_of::<crate::index::PermIndex>() as u64,
         )?;
@@ -485,6 +492,14 @@ impl super::Generation {
                 .as_ref()
                 .map_or(0, |s| s.len() as u64 + 64)
         })?;
+        budget.charge(if self.reifiers.file.is_some() {
+            std::mem::size_of::<crate::reifiers::ReifierFile>() as u64 + 64
+        } else {
+            self.reifiers
+                .missing
+                .as_ref()
+                .map_or(0, |s| s.len() as u64 + 64)
+        })?;
         if let Some(link) = &self.link {
             budget.charge(
                 std::mem::size_of::<super::link::Linked>() as u64
@@ -507,45 +522,41 @@ impl super::Generation {
         Ok(budget.used())
     }
 
-    /// Open immutable base files without a writer, recovery or mutable sidecars.
-    /// The caller keeps its history/origin retention guard until publication.
-    pub(crate) fn open_sealed_controlled(
+    /// Open immutable base files without a writer, recovery or mutable sidecars under
+    /// `control`. Under [`crate::budgeted::Unlimited`], all accounting compiles away.
+    pub(crate) fn open_sealed_with<C: crate::budgeted::BudgetControl>(
         dir: &Path,
         name: &str,
         written_by: Option<&str>,
-        budget: &mut ColdBudget<'_>,
+        control: &mut C,
     ) -> Result<Loaded<Self>> {
-        Self::open_base_controlled(dir, name, written_by, None, budget)
+        Self::open_base_with(dir, name, written_by, None, control)
     }
 
-    fn open_base_controlled(
+    pub(crate) fn open_base_with<C: crate::budgeted::BudgetControl>(
         dir: &Path,
         name: &str,
         written_by: Option<&str>,
         dvocab: Option<Loaded<crate::vocab::DeltaVocab>>,
-        budget: &mut ColdBudget<'_>,
+        control: &mut C,
     ) -> Result<Loaded<Self>> {
-        use crate::{
-            builder,
-            index::Perm,
-            vocab::{DeltaVocab, Vocab},
-        };
+        use crate::{builder, index::Perm};
         use std::sync::Arc;
-        let start = budget
+        let start = control
             .used()
             .checked_sub(dvocab.as_ref().map_or(0, |v| v.charge))
             .expect("supplied dictionary is admitted by the same cold budget");
         // Paths/names and wrapper allocations remain live with the generation.
-        budget.charge(
+        control.charge(
             std::mem::size_of::<Self>() as u64
                 + 256
                 + name.len() as u64
                 + dir.as_os_str().len() as u64,
         )?;
-        let bytes = budget.read_file(&dir.join("meta.json"))?;
+        let bytes = control.read_file(&dir.join("meta.json"))?;
         // Preserve the existing version-first refusal, including a future metadata
-        // shape. Both passes use the same controlled Serde reader.
-        let version: Loaded<serde_json::Value> = budget.json(&bytes)?;
+        // shape. Under accounting control, both passes use the same controlled reader.
+        let version: Loaded<serde_json::Value> = control.json(&bytes, "meta.json")?;
         let number = version
             .value
             .get("format_version")
@@ -554,62 +565,140 @@ impl super::Generation {
             .ok_or_else(|| {
                 Error::Corrupt("meta.json: format_version is missing or not a u32".into())
             })?;
-        crate::formats::INDEX.check("historical generation", number, written_by)?;
+        let dir_label = (!C::ACCOUNTS).then(|| dir.display().to_string());
+        let label = dir_label.as_deref().unwrap_or("historical generation");
+        crate::formats::INDEX.check(label, number, written_by)?;
         builder::check_features_listed(&version.value, "meta.json")?;
-        drop(version.value);
-        budget.release(version.charge);
-        let meta: Loaded<builder::IndexMeta> = budget.json(&bytes)?;
-        budget.drop_vec(bytes);
-        // check_features only allocates on an unsupported-feature error. Its
-        // payloads and output remain covered by the admitted metadata parse lease.
-        for feature in &meta.value.features {
-            budget.check()?;
-            builder::check_features(
-                "historical generation",
-                std::slice::from_ref(feature),
-                written_by,
-            )?;
-        }
-        let meta = retain_meta(meta, budget)?;
-        let bytes = budget.read_file(&dir.join("stats.json"))?;
-        let stats: Loaded<builder::Stats> = budget.json(&bytes)?;
-        budget.drop_vec(bytes);
-        let stats = retain_stats(stats, budget)?;
-        let vocab =
-            Vocab::open_controlled(dir, meta.has_feature(builder::FEATURE_FSST_VOCAB), budget)?;
-        budget.charge(64)?;
+        let meta: Loaded<builder::IndexMeta> = if C::ACCOUNTS {
+            drop(version.value);
+            control.release(version.charge);
+            let meta = control.json(&bytes, "meta.json")?;
+            control.drop_vec(bytes);
+            meta
+        } else {
+            control.drop_vec(bytes);
+            Loaded {
+                value: control.value(version.value, "meta.json")?,
+                charge: 0,
+            }
+        };
+        let meta = if C::ACCOUNTS {
+            // check_features only allocates on an unsupported-feature error. Its
+            // payloads and output remain covered by the admitted metadata parse lease.
+            for feature in &meta.value.features {
+                control.check(0)?;
+                builder::check_features(
+                    "historical generation",
+                    std::slice::from_ref(feature),
+                    written_by,
+                )?;
+            }
+            retain_meta(meta, control)?
+        } else {
+            builder::check_features(label, &meta.value.features, written_by)?;
+            meta.value
+        };
+        let bytes = control.read_file(&dir.join("stats.json"))?;
+        let stats: Loaded<builder::Stats> = control.json(&bytes, "stats.json")?;
+        control.drop_vec(bytes);
+        let stats = if C::ACCOUNTS {
+            retain_stats(stats, control)?
+        } else {
+            if let Some(why) = stats.value.correlations.refusal() {
+                tracing::warn!(target: "sparkles::store", "generation {name}: {why}");
+            }
+            stats.value
+        };
+        let vocab = crate::vocab::Vocab::open_with(
+            dir,
+            meta.has_feature(builder::FEATURE_FSST_VOCAB),
+            control,
+        )?;
+        control.charge(64)?;
         let vocab = Arc::new(vocab.value);
         let dvocab = match dvocab {
             Some(vocab) => vocab,
-            None => DeltaVocab::open_read_only_controlled(&dir.join("delta.vocab"), budget)?,
+            None => {
+                crate::vocab::DeltaVocab::open_read_only_with(&dir.join("delta.vocab"), control)?
+            }
         };
         let mut perms = Vec::new();
-        budget.reserve(&mut perms, Perm::ALL.len())?;
+        control.reserve(&mut perms, Perm::ALL.len())?;
         for perm in Perm::ALL {
-            budget.check()?;
-            perms.push(crate::index::PermIndex::open_controlled(dir, perm, budget)?.value);
+            control.check(0)?;
+            perms.push(crate::index::PermIndex::open_with(
+                dir, perm, true, control,
+            )?);
         }
         // Pattern opening maps immutable data and decodes at most two fixed table
         // descriptors. Bound its wrappers and optional diagnostic before opening.
-        let allowance = std::mem::size_of::<crate::patterns::PatternFile>() as u64
-            + 2048
-            + dir.as_os_str().len() as u64 * 3
-            + meta
-                .patterns
-                .as_ref()
-                .and_then(|p| p.skipped.as_ref())
-                .map_or(0, |s| s.len()) as u64;
-        budget.charge(allowance)?;
-        budget.check()?;
-        let patterns = crate::patterns::Loaded::open(dir, meta.patterns.as_ref());
-        budget.check()?;
-        let retained = if patterns.file.is_some() {
-            std::mem::size_of::<crate::patterns::PatternFile>() as u64 + 64
+        let patterns = if C::ACCOUNTS {
+            let allowance = std::mem::size_of::<crate::patterns::PatternFile>() as u64
+                + 2048
+                + dir.as_os_str().len() as u64 * 3
+                + meta
+                    .patterns
+                    .as_ref()
+                    .and_then(|p| p.skipped.as_ref())
+                    .map_or(0, |s| s.len()) as u64;
+            control.charge(allowance)?;
+            control.check(0)?;
+            let patterns = crate::patterns::Loaded::open(dir, meta.patterns.as_ref());
+            control.check(0)?;
+            let retained = if patterns.file.is_some() {
+                std::mem::size_of::<crate::patterns::PatternFile>() as u64 + 64
+            } else {
+                patterns.missing.as_ref().map_or(0, |s| s.len() as u64 + 64)
+            };
+            control.release(allowance - retained);
+            patterns
         } else {
-            patterns.missing.as_ref().map_or(0, |s| s.len() as u64 + 64)
+            crate::patterns::Loaded::open(dir, meta.patterns.as_ref())
         };
-        budget.release(allowance - retained);
-        let charge = budget.used() - start;
+        let reifiers = if C::ACCOUNTS {
+            let reifier_allowance = std::mem::size_of::<crate::reifiers::ReifierFile>() as u64
+                + 2048
+                + dir.as_os_str().len() as u64 * 3;
+            control.charge(reifier_allowance)?;
+            control.check(0)?;
+            let reifiers = crate::reifiers::Loaded::open_controlled(
+                dir,
+                meta.reifiers.as_ref(),
+                meta.quads,
+                || control.check(0),
+            )?;
+            control.check(0)?;
+            let reifier_retained = if reifiers.file.is_some() {
+                std::mem::size_of::<crate::reifiers::ReifierFile>() as u64 + 64
+            } else {
+                reifiers.missing.as_ref().map_or(0, |s| s.len() as u64 + 64)
+            };
+            if reifier_retained > reifier_allowance {
+                control.charge(reifier_retained - reifier_allowance)?;
+            } else {
+                control.release(reifier_allowance - reifier_retained);
+            }
+            reifiers
+        } else {
+            crate::reifiers::Loaded::open(dir, meta.reifiers.as_ref(), meta.quads)
+        };
+        let rdf_reifies = if C::ACCOUNTS {
+            crate::store::RDF_REIFIES_UNRESOLVED
+        } else {
+            vocab
+                .find(crate::reifiers::RDF_REIFIES_KEY)
+                .ok()
+                .map(crate::id::Id::vocab)
+                .or_else(|| {
+                    dvocab
+                        .value
+                        .find(crate::reifiers::RDF_REIFIES_KEY)
+                        .map(crate::id::Id::delta)
+                })
+                .unwrap_or(crate::id::Id::UNDEF)
+                .0
+        };
+        let charge = control.used() - start;
         let value = Self {
             uid: crate::index::next_uid(),
             name: name.to_owned(),
@@ -626,32 +715,34 @@ impl super::Generation {
             counts: Default::default(),
             charsets: Default::default(),
             patterns,
+            reifiers,
+            rdf_reifies: std::sync::atomic::AtomicU64::new(rdf_reifies),
             ill_typed_literals: parking_lot::Mutex::new(None),
             wal_index: parking_lot::Mutex::new(None),
             link: None,
             cold_bytes: charge,
         };
-        budget.check()?;
+        control.check(0)?;
         Ok(Loaded { value, charge })
     }
 }
 
-fn retain_meta(
+fn retain_meta<C: crate::budgeted::BudgetControl>(
     loaded: Loaded<crate::builder::IndexMeta>,
-    budget: &mut ColdBudget<'_>,
+    budget: &mut C,
 ) -> Result<crate::builder::IndexMeta> {
     let meta = &loaded.value;
     let mut retained = meta.created.capacity() as u64
         + meta.features.capacity() as u64 * std::mem::size_of::<String>() as u64
         + 256;
     for (key, value) in &meta.prefixes {
-        budget.check()?;
+        budget.check(0)?;
         retained = retained
             .checked_add(key.capacity() as u64 + value.capacity() as u64 + 256)
             .ok_or_else(|| budget.exhausted())?;
     }
     for feature in &meta.features {
-        budget.check()?;
+        budget.check(0)?;
         retained = retained
             .checked_add(feature.capacity() as u64)
             .ok_or_else(|| budget.exhausted())?;
@@ -664,16 +755,20 @@ fn retain_meta(
     retain_parse(loaded, retained, budget)
 }
 
-fn retain_stats(
+fn retain_stats<C: crate::budgeted::BudgetControl>(
     loaded: Loaded<crate::builder::Stats>,
-    budget: &mut ColdBudget<'_>,
+    budget: &mut C,
 ) -> Result<crate::builder::Stats> {
-    budget.check()?;
+    budget.check(0)?;
     let retained = loaded.value.heap_bytes();
     retain_parse(loaded, retained, budget)
 }
 
-fn retain_parse<T>(loaded: Loaded<T>, retained: u64, budget: &mut ColdBudget<'_>) -> Result<T> {
+pub(super) fn retain_parse<T, C: crate::budgeted::BudgetControl>(
+    loaded: Loaded<T>,
+    retained: u64,
+    budget: &mut C,
+) -> Result<T> {
     if retained > loaded.charge {
         budget.charge(retained - loaded.charge)?;
     } else {
@@ -756,7 +851,7 @@ mod tests {
             crate::annotations::seqs_controlled(root.path(), uuid::Uuid::new_v4(), &mut budget)
                 .map(|loaded| drop(loaded.value))
         } else {
-            crate::commit::walk_catalog_controlled(&path, &mut budget, |_, _| Ok(())).map(|_| ())
+            crate::commit::walk_catalog_with(&path, &mut budget, |_, _| Ok(())).map(|_| ())
         };
         writer.join().unwrap();
         assert!(
@@ -1104,7 +1199,7 @@ mod tests {
                 held: 0,
             })
             .unwrap();
-            let loaded = super::super::Generation::open_sealed_controlled(
+            let loaded = super::super::Generation::open_sealed_with(
                 dir.path(),
                 "gen-0001",
                 None,
@@ -1119,6 +1214,14 @@ mod tests {
             assert_eq!(
                 loaded.value.patterns.file.is_some(),
                 normal.patterns.file.is_some()
+            );
+            assert_eq!(
+                loaded.value.reifiers.file.is_some(),
+                normal.reifiers.file.is_some()
+            );
+            assert_eq!(
+                loaded.value.reifiers.is_indexed(),
+                normal.reifiers.is_indexed()
             );
             for perm in crate::index::Perm::ALL {
                 assert_eq!(loaded.value.perm(perm).rows, normal.perm(perm).rows);
@@ -1145,12 +1248,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            super::super::Generation::open_sealed_controlled(
-                dir.path(),
-                "gen-0001",
-                None,
-                &mut budget
-            ),
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget),
             Err(Error::BudgetExceeded(_))
         ));
         assert_eq!(before, durable_bytes(dir.path()));
@@ -1167,15 +1265,132 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            super::super::Generation::open_sealed_controlled(
-                dir.path(),
-                "gen-0001",
-                None,
-                &mut budget
-            ),
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget),
             Err(Error::Unsupported(_))
         ));
         assert_eq!(before, durable_bytes(dir.path()));
+    }
+
+    #[test]
+    fn cold_reifiers_parity_fallback_and_non_reifies_sentinel_resolution() {
+        use crate::{
+            builder::{BuildOptions, Builder},
+            io::{RdfFormat, Source},
+            reifiers::{FILE as REIFIERS_FILE, RDF_REIFIES},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let builder = Builder::new(
+            dir.path(),
+            BuildOptions {
+                threads: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let data = format!(
+            "<urn:c1> <{RDF_REIFIES}> <<( <urn:e1> <urn:p> <urn:o1> )>> <urn:g> .\n\
+             <urn:a1> <urn:ev:expectedTriple> <<( <urn:e2> <urn:p> <urn:o2> )>> <urn:g> .\n"
+        );
+        builder
+            .add_source(&Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            ))
+            .unwrap();
+        builder.finish().unwrap();
+
+        let normal = super::super::Generation::open_sealed(dir.path(), "gen-0001").unwrap();
+        assert!(normal.reifiers.file.is_some());
+        assert!(normal.reifiers.is_indexed());
+        let normal_rdf_reifies = normal.rdf_reifies.load(Ordering::Acquire);
+        // Release the mmap held by `normal` before later steps rewrite `reifiers.bin` on disk.
+        drop(normal);
+
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(16 << 20),
+            held: 0,
+        })
+        .unwrap();
+        let loaded =
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget)
+                .unwrap();
+        assert!(loaded.value.reifiers.file.is_some());
+        assert!(loaded.value.reifiers.is_indexed());
+        assert_eq!(
+            loaded.value.rdf_reifies.load(Ordering::Acquire),
+            crate::store::RDF_REIFIES_UNRESOLVED
+        );
+
+        // Encountering a non-rdf:reifies triple term resolves the sentinel once instead of
+        // leaving it unresolved and re-decoding on every subsequent triple-term quad.
+        let expected_pred =
+            crate::id::Id::vocab(loaded.value.vocab.find(b"<urn:ev:expectedTriple").unwrap());
+        let tt_id = (0..loaded.value.vocab.len())
+            .find(|&id| loaded.value.vocab.is_triple(id))
+            .map(crate::id::Id::vocab)
+            .unwrap();
+        let limit = budget.owned_limit().unwrap();
+        assert!(
+            loaded
+                .value
+                .is_rdf_reifies_triple_with(expected_pred, tt_id, &limit, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            loaded.value.rdf_reifies.load(Ordering::Acquire),
+            normal_rdf_reifies,
+            "cold generation should cache rdf:reifies on first triple-term encounter"
+        );
+        drop(loaded.value);
+        budget.release(loaded.charge);
+
+        // Cold unsupported-version fallback: opens without error and marks reifiers unindexed.
+        let path = dir.path().join(REIFIERS_FILE);
+        let orig = std::fs::read(&path).unwrap();
+        let mut future = orig.clone();
+        future[8..12].copy_from_slice(&99u32.to_le_bytes());
+        std::fs::write(&path, &future).unwrap();
+        let loaded =
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget)
+                .unwrap();
+        assert!(loaded.value.reifiers.file.is_none());
+        assert!(!loaded.value.reifiers.is_indexed());
+        assert!(
+            loaded
+                .value
+                .reifiers
+                .missing
+                .as_deref()
+                .unwrap()
+                .contains("version 99")
+        );
+        drop(loaded.value);
+        budget.release(loaded.charge);
+
+        // Cold checksum-mismatch fallback: payload tamper is caught and routed to fallback.
+        let mut damaged = orig;
+        damaged[32 + 16] ^= 1;
+        std::fs::write(&path, &damaged).unwrap();
+        let loaded =
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget)
+                .unwrap();
+        assert!(loaded.value.reifiers.file.is_none());
+        assert!(!loaded.value.reifiers.is_indexed());
+        assert!(
+            loaded
+                .value
+                .reifiers
+                .missing
+                .as_deref()
+                .unwrap()
+                .contains("checksum")
+        );
+        drop(loaded.value);
+        budget.release(loaded.charge);
     }
 
     #[test]
@@ -1237,5 +1452,60 @@ mod tests {
             held: 0,
         };
         assert!(matches!(ColdBudget::new(limit), Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn ordinary_open_matches_read_index_meta_duplicate_key_and_exact_small_capacities() {
+        use crate::{builder, index::Perm};
+        let dir = immutable_base(false);
+        let normal = super::super::Generation::open_sealed(dir.path(), "gen-0001").unwrap();
+        assert_eq!(normal.perms.capacity(), Perm::ALL.len());
+        for perm in Perm::ALL {
+            let p = normal.perm(perm);
+            assert_eq!(p.blocks.len(), 1);
+            assert_eq!(p.blocks.capacity(), 1);
+            let segs = p.segs.as_ref().expect("segmented");
+            assert_eq!(segs.start_len_and_capacity(), (2, 2));
+        }
+        let options = HistoryOptions::default();
+        let limit = ReadLimit {
+            options: &options,
+            memory: Some(16 << 20),
+            held: 0,
+        };
+        let retained_normal = normal.retained_bytes_with(&limit).unwrap();
+        let mut budget = ColdBudget::new(limit).unwrap();
+        let loaded =
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget)
+                .unwrap();
+        for perm in Perm::ALL {
+            assert_eq!(
+                normal.perm(perm).resident_bytes(),
+                loaded.value.perm(perm).resident_bytes()
+            );
+        }
+        let exact_cap = ReadLimit {
+            options: &options,
+            memory: Some(retained_normal),
+            held: 0,
+        };
+        assert_eq!(
+            normal.retained_bytes_with(&exact_cap).unwrap(),
+            retained_normal
+        );
+        drop(loaded.value);
+        budget.release(loaded.charge);
+
+        // Repeat a known JSON key ("quads") as `builder::read_index_meta` accepts via `Value`.
+        let meta_path = dir.path().join("meta.json");
+        let raw = std::fs::read_to_string(&meta_path).unwrap();
+        let needle = "\"quads\":";
+        let pos = raw.find(needle).expect("quads field present");
+        let duplicated = format!("{}\"quads\": 0, {}", &raw[..pos], &raw[pos..]);
+        std::fs::write(&meta_path, duplicated).unwrap();
+        let expected = builder::read_index_meta(dir.path(), None).unwrap();
+        let opened = super::super::Generation::open_sealed(dir.path(), "gen-0001").unwrap();
+        assert_eq!(opened.meta.quads, expected.quads);
+        assert_eq!(opened.meta.features, expected.features);
     }
 }

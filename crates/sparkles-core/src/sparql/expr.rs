@@ -11,7 +11,7 @@ use oxrdf::vocab::xsd;
 use oxrdf::{Literal, NamedNode, Term};
 use oxsdatatypes::*;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::{Expression, Function, GraphPattern};
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -43,17 +43,78 @@ pub struct ExistsSpec {
     memo_charge: Mutex<Option<super::ctx::RetainedCharge>>,
     /// the key set answering the EXISTS for every outer row (see [`super::exists`])
     pub decor: super::exists::Decor,
-    _held: Option<Reservation>,
+    /// Cached unsubstituted plan and streaming verdicts, separate from `decor` so
+    /// admission never mutates EXPLAIN notes or runtime decorrelation state.
+    pub(super) plan_cache: super::exists::PlanCache,
+    /// Native REDUCED / VALUES occurrences projected onto this spec's heap-pinned pattern.
+    view_patterns: Option<Arc<RetainedViewPatterns>>,
+    _held: BackingCredit,
 }
 
-// The ordinary owned pattern keeps its existing inline representation.
-#[allow(clippy::large_enum_variant)]
+enum BackingCredit {
+    None,
+    Reservation(Reservation),
+    Retained(super::ctx::RetainedCharge),
+}
+
+struct OrdinaryPattern {
+    syntax: GraphPattern,
+    bytes: u64,
+    _charge: Option<super::ctx::RetainedCharge>,
+}
+
+/// Shared projected view-pattern occurrence set with its own backing credit, so
+/// rebinding an [`ExistsSpec`] keeps the set charged for as long as any copy shares it.
+pub(super) struct RetainedViewPatterns {
+    patterns: super::viewsvc::ViewPatterns,
+    bytes: u64,
+    _charge: BackingCredit,
+}
+
+impl RetainedViewPatterns {
+    pub(super) fn from_reservation(
+        patterns: super::viewsvc::ViewPatterns,
+        charge: Reservation,
+    ) -> Self {
+        let bytes = charge.bytes();
+        Self {
+            patterns,
+            bytes,
+            _charge: BackingCredit::Reservation(charge),
+        }
+    }
+
+    pub(super) fn from_retained(
+        patterns: super::viewsvc::ViewPatterns,
+        bytes: u64,
+        charge: Option<super::ctx::RetainedCharge>,
+    ) -> Self {
+        Self {
+            patterns,
+            bytes,
+            _charge: charge.map_or(BackingCredit::None, BackingCredit::Retained),
+        }
+    }
+}
+
 enum ExistsPattern {
-    Ordinary(GraphPattern),
+    // Arc-pinned so moving or sharing ExistsSpec keeps the root GraphPattern address stable.
+    Ordinary(Arc<OrdinaryPattern>),
     Checked(Arc<super::checked_syntax::Pattern>),
 }
 
 impl ExistsSpec {
+    fn spec_bytes(vars: usize, bound: usize) -> u64 {
+        (size_of::<Self>() + 2 * size_of::<usize>())
+            .saturating_add(vars.saturating_mul(size_of::<VarId>()))
+            .saturating_add(bound.saturating_mul(size_of::<(VarId, Id)>())) as u64
+    }
+
+    fn ordinary_pattern_bytes(pattern: &GraphPattern) -> u64 {
+        super::checked_layout::pattern_bytes(pattern)
+            .saturating_add((size_of::<OrdinaryPattern>() + 2 * size_of::<usize>()) as u64)
+    }
+
     pub fn new(
         pattern: GraphPattern,
         graph: super::plan::ActiveGraph,
@@ -61,14 +122,241 @@ impl ExistsSpec {
         bound: Vec<(VarId, Id)>,
     ) -> ExistsSpec {
         let calls_service = super::cursor::calls_service(&pattern);
+        let bytes = Self::ordinary_pattern_bytes(&pattern);
         Self::from_pattern(
-            ExistsPattern::Ordinary(pattern),
+            ExistsPattern::Ordinary(Arc::new(OrdinaryPattern {
+                syntax: pattern,
+                bytes,
+                _charge: None,
+            })),
             calls_service,
             graph,
             vars,
             bound,
             None,
+            BackingCredit::None,
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_ordinary_charged(
+        ctx: &Ctx,
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+    ) -> Result<ExistsSpec> {
+        Self::new_ordinary_charged_with_admission(
+            ctx,
+            pattern,
+            view_patterns,
+            graph,
+            vars,
+            bound,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_ordinary_charged_with_admission(
+        ctx: &Ctx,
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+        admission: Option<&super::ctx::Charge<'_>>,
+    ) -> Result<ExistsSpec> {
+        ctx.check()?;
+        let pattern_bytes = Self::ordinary_pattern_bytes(pattern);
+        let pattern_charge = ctx.retained_charge(pattern_bytes)?;
+        if pattern_charge.is_none()
+            && let Some(held) = admission
+        {
+            held.add(pattern_bytes)?;
+        }
+        let owned = Arc::new(OrdinaryPattern {
+            syntax: pattern.clone(),
+            bytes: pattern_bytes,
+            _charge: pattern_charge,
+        });
+        let projected = match view_patterns {
+            Some(vp) => vp
+                .project_retained(pattern, &owned.syntax, ctx, admission)?
+                .map(|(projected, bytes, charge)| {
+                    Arc::new(RetainedViewPatterns::from_retained(
+                        projected, bytes, charge,
+                    ))
+                }),
+            None => None,
+        };
+        let spec_bytes = Self::spec_bytes(vars.capacity(), bound.capacity());
+        let spec_charge = ctx.retained_charge(spec_bytes)?;
+        if spec_charge.is_none()
+            && let Some(held) = admission
+        {
+            held.add(spec_bytes)?;
+        }
+        let calls_service = super::cursor::calls_service(&owned.syntax);
+        Ok(Self::from_pattern(
+            ExistsPattern::Ordinary(owned),
+            calls_service,
+            graph,
+            vars,
+            bound,
+            projected,
+            spec_charge.map_or(BackingCredit::None, BackingCredit::Retained),
+        ))
+    }
+
+    /// Compile an ordinary `EXISTS` spec from `pattern` and `subst`, reserving the
+    /// syntax clone, deduplicated variable scratch, and spec vectors before allocating.
+    pub(super) fn compile_ordinary_with_admission(
+        ctx: &Ctx,
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        subst: &FxHashMap<VarId, Id>,
+        admission: Option<&super::ctx::Charge<'_>>,
+    ) -> Result<ExistsSpec> {
+        ctx.check()?;
+        let pattern_bytes = Self::ordinary_pattern_bytes(pattern);
+        let pattern_charge = ctx.retained_charge(pattern_bytes)?;
+        let pattern_admission = if pattern_charge.is_none()
+            && let Some(held) = admission
+        {
+            let part = held.part();
+            part.add(pattern_bytes)?;
+            Some(part)
+        } else {
+            None
+        };
+        let scratch = match admission {
+            Some(held) => Some(held.part()),
+            None if ctx.shared().is_some() => Some(ctx.charge(0)?),
+            None => None,
+        };
+        let mut seen = super::exists::VarSet::new(scratch.as_ref());
+        let mut steps = 0usize;
+        super::plan::try_visit_pattern_vars(pattern, &mut |name| -> Result<()> {
+            steps += 1;
+            if steps.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            seen.insert(ctx.var(name))
+        })?;
+        let vars_len = seen.ids.len();
+        let bound_len = seen.ids.iter().filter(|v| subst.contains_key(v)).count();
+        let spec_bytes = Self::spec_bytes(vars_len, bound_len);
+        let spec_charge = ctx.retained_charge(spec_bytes)?;
+        let spec_admission = if spec_charge.is_none()
+            && let Some(held) = admission
+        {
+            let part = held.part();
+            part.add(spec_bytes)?;
+            Some(part)
+        } else {
+            None
+        };
+        let mut vars = Vec::with_capacity(vars_len);
+        vars.extend(seen.ids.iter().copied());
+        drop(seen);
+        vars.sort_unstable();
+        let mut bound = Vec::with_capacity(bound_len);
+        for &v in &vars {
+            if let Some(&id) = subst.get(&v) {
+                bound.push((v, id));
+            }
+        }
+        drop(scratch);
+        let actual_spec_bytes = Self::spec_bytes(vars.capacity(), bound.capacity());
+        if actual_spec_bytes > spec_bytes {
+            if let Some(mut charge) = spec_charge {
+                charge.resize(actual_spec_bytes)?;
+                // Re-bind below after moving out of the Option.
+                return Self::finish_ordinary_compiled(
+                    ctx,
+                    pattern,
+                    view_patterns,
+                    graph,
+                    vars,
+                    bound,
+                    admission,
+                    pattern_bytes,
+                    pattern_charge,
+                    pattern_admission,
+                    Some(charge),
+                    spec_admission,
+                );
+            } else if let Some(part) = spec_admission.as_ref() {
+                part.resize(actual_spec_bytes)?;
+            }
+        }
+        Self::finish_ordinary_compiled(
+            ctx,
+            pattern,
+            view_patterns,
+            graph,
+            vars,
+            bound,
+            admission,
+            pattern_bytes,
+            pattern_charge,
+            pattern_admission,
+            spec_charge,
+            spec_admission,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_ordinary_compiled(
+        ctx: &Ctx,
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+        admission: Option<&super::ctx::Charge<'_>>,
+        pattern_bytes: u64,
+        pattern_charge: Option<super::ctx::RetainedCharge>,
+        mut pattern_admission: Option<super::ctx::Charge<'_>>,
+        spec_charge: Option<super::ctx::RetainedCharge>,
+        mut spec_admission: Option<super::ctx::Charge<'_>>,
+    ) -> Result<ExistsSpec> {
+        let owned = Arc::new(OrdinaryPattern {
+            syntax: pattern.clone(),
+            bytes: pattern_bytes,
+            _charge: pattern_charge,
+        });
+        let projected = match view_patterns {
+            Some(vp) => vp
+                .project_retained(pattern, &owned.syntax, ctx, admission)?
+                .map(|(projected, bytes, charge)| {
+                    Arc::new(RetainedViewPatterns::from_retained(
+                        projected, bytes, charge,
+                    ))
+                }),
+            None => None,
+        };
+        if let Some(held) = admission {
+            if pattern_admission.is_some() {
+                held.adopt_charge(&mut pattern_admission)?;
+            }
+            if spec_admission.is_some() {
+                held.adopt_charge(&mut spec_admission)?;
+            }
+        }
+        let calls_service = super::cursor::calls_service(&owned.syntax);
+        Ok(Self::from_pattern(
+            ExistsPattern::Ordinary(owned),
+            calls_service,
+            graph,
+            vars,
+            bound,
+            projected,
+            spec_charge.map_or(BackingCredit::None, BackingCredit::Retained),
+        ))
     }
 
     fn from_pattern(
@@ -77,7 +365,8 @@ impl ExistsSpec {
         graph: super::plan::ActiveGraph,
         vars: Vec<VarId>,
         bound: Vec<(VarId, Id)>,
-        held: Option<Reservation>,
+        view_patterns: Option<Arc<RetainedViewPatterns>>,
+        held: BackingCredit,
     ) -> Self {
         Self {
             pattern,
@@ -89,6 +378,8 @@ impl ExistsSpec {
             unbound: Default::default(),
             memo_charge: Mutex::new(None),
             decor: Default::default(),
+            plan_cache: Default::default(),
+            view_patterns,
             _held: held,
         }
     }
@@ -98,6 +389,7 @@ impl ExistsSpec {
         graph: super::plan::ActiveGraph,
         vars: Vec<VarId>,
         bound: Vec<(VarId, Id)>,
+        view_patterns: Option<Arc<RetainedViewPatterns>>,
         held: Reservation,
     ) -> Self {
         let calls_service = pattern.calls_service;
@@ -107,7 +399,8 @@ impl ExistsSpec {
             graph,
             vars,
             bound,
-            Some(held),
+            view_patterns,
+            BackingCredit::Reservation(held),
         )
     }
 
@@ -127,9 +420,44 @@ impl ExistsSpec {
     /// The immutable algebra of this EXISTS, before per-row substitution.
     pub fn pattern(&self) -> &GraphPattern {
         match &self.pattern {
-            ExistsPattern::Ordinary(pattern) => pattern,
+            ExistsPattern::Ordinary(pattern) => &pattern.syntax,
             ExistsPattern::Checked(pattern) => &pattern.syntax,
         }
+    }
+
+    /// Native REDUCED and VALUES occurrences projected onto [`Self::pattern`].
+    pub(super) fn view_patterns(&self) -> Option<&super::viewsvc::ViewPatterns> {
+        self.view_patterns.as_deref().map(|vp| &vp.patterns)
+    }
+
+    /// Bytes owned by this spec and its shared backing that are not already covered by
+    /// an active [`RetainedCharge`] or [`Reservation`] (for `plan_bytes` when a spec was
+    /// built before `ctx.attach_owner()`).
+    pub(super) fn uncharged_retained_bytes(
+        &self,
+        seen_patterns: &mut FxHashSet<usize>,
+        seen_view_patterns: &mut FxHashSet<usize>,
+    ) -> u64 {
+        let mut bytes = 0u64;
+        if let ExistsPattern::Ordinary(pattern) = &self.pattern
+            && pattern._charge.is_none()
+            && seen_patterns.insert(Arc::as_ptr(pattern) as usize)
+        {
+            bytes = bytes.saturating_add(pattern.bytes);
+        }
+        if let Some(vp) = &self.view_patterns
+            && matches!(vp._charge, BackingCredit::None)
+            && seen_view_patterns.insert(Arc::as_ptr(vp) as usize)
+        {
+            bytes = bytes.saturating_add(vp.bytes);
+        }
+        if matches!(self._held, BackingCredit::None) {
+            bytes = bytes.saturating_add(Self::spec_bytes(
+                self.vars.capacity(),
+                self.bound.capacity(),
+            ));
+        }
+        bytes.saturating_add(self.plan_cache.uncharged_admit_bytes())
     }
 
     /// Memoize the answer for `key`, charging the entry first, in both accounting modes.
@@ -178,45 +506,86 @@ impl ExistsSpec {
 
     /// The same EXISTS with `v` substituted by `c` as well.
     pub fn with_bound(&self, v: VarId, c: Id) -> Self {
-        let mut bound = self.bound.clone();
+        let mut vars = Vec::with_capacity(self.vars.len());
+        vars.extend_from_slice(&self.vars);
+        let mut bound = Vec::with_capacity(self.bound.len().saturating_add(1));
+        bound.extend_from_slice(&self.bound);
         bound.push((v, c));
-        Self::new(
-            self.pattern().clone(),
+        let pattern = match &self.pattern {
+            ExistsPattern::Ordinary(pattern) => ExistsPattern::Ordinary(pattern.clone()),
+            ExistsPattern::Checked(pattern) => ExistsPattern::Checked(pattern.clone()),
+        };
+        Self::from_pattern(
+            pattern,
+            self.calls_service,
             self.graph.clone(),
-            self.vars.clone(),
+            vars,
             bound,
+            self.view_patterns.clone(),
+            BackingCredit::None,
         )
     }
 
     pub(super) fn with_bound_checked(&self, v: VarId, c: Id) -> Result<Self> {
-        let ExistsPattern::Checked(pattern) = &self.pattern else {
-            return Ok(self.with_bound(v, c));
-        };
-        let preparation = self._held.as_ref().expect("checked EXISTS").preparation();
-        let new_len = self
-            .bound
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| preparation.exhausted())?;
-        let held = Self::reserve_checked(preparation, self.vars.len(), new_len)?;
-        let mut bound = Vec::with_capacity(new_len);
-        for part in self.bound.chunks(1024) {
-            preparation.check()?;
-            bound.extend_from_slice(part);
+        match &self.pattern {
+            ExistsPattern::Checked(pattern) => {
+                let BackingCredit::Reservation(held) = &self._held else {
+                    unreachable!("checked EXISTS must hold a reservation");
+                };
+                let preparation = held.preparation();
+                let new_len = self
+                    .bound
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(|| preparation.exhausted())?;
+                let held = Self::reserve_checked(preparation, self.vars.len(), new_len)?;
+                let mut bound = Vec::with_capacity(new_len);
+                for part in self.bound.chunks(1024) {
+                    preparation.check()?;
+                    bound.extend_from_slice(part);
+                }
+                bound.push((v, c));
+                let mut vars = Vec::with_capacity(self.vars.len());
+                for part in self.vars.chunks(1024) {
+                    preparation.check()?;
+                    vars.extend_from_slice(part);
+                }
+                Ok(Self::new_checked(
+                    pattern.clone(),
+                    self.graph.clone(),
+                    vars,
+                    bound,
+                    self.view_patterns.clone(),
+                    held,
+                ))
+            }
+            ExistsPattern::Ordinary(pattern) => {
+                let new_len = self.bound.len().saturating_add(1);
+                let credit = match &self._held {
+                    BackingCredit::Retained(held) => match held.owner() {
+                        Some(ctx) => ctx
+                            .retained_charge(Self::spec_bytes(self.vars.len(), new_len))?
+                            .map_or(BackingCredit::None, BackingCredit::Retained),
+                        None => BackingCredit::None,
+                    },
+                    BackingCredit::None | BackingCredit::Reservation(_) => BackingCredit::None,
+                };
+                let mut vars = Vec::with_capacity(self.vars.len());
+                vars.extend_from_slice(&self.vars);
+                let mut bound = Vec::with_capacity(new_len);
+                bound.extend_from_slice(&self.bound);
+                bound.push((v, c));
+                Ok(Self::from_pattern(
+                    ExistsPattern::Ordinary(pattern.clone()),
+                    self.calls_service,
+                    self.graph.clone(),
+                    vars,
+                    bound,
+                    self.view_patterns.clone(),
+                    credit,
+                ))
+            }
         }
-        bound.push((v, c));
-        let mut vars = Vec::with_capacity(self.vars.len());
-        for part in self.vars.chunks(1024) {
-            preparation.check()?;
-            vars.extend_from_slice(part);
-        }
-        Ok(Self::new_checked(
-            pattern.clone(),
-            self.graph.clone(),
-            vars,
-            bound,
-            held,
-        ))
     }
 
     /// The value of `v` in the outer solution of `row`: its column, else the constant
@@ -441,29 +810,54 @@ impl Expr {
     /// Deeper expressions are evaluated on the query's thread, whose stack
     /// [`super::depth::with_stack`] sized for the whole algebra.
     pub fn parallel(&self) -> bool {
-        !self.has_exists() && self.within(PARALLEL_DEPTH)
+        self.within(PARALLEL_DEPTH, &|_| true)
     }
 
-    /// Whether this expression nests at most `levels` levels (recursing no deeper).
-    fn within(&self, levels: usize) -> bool {
+    /// Geometry constructors charge the query even if the resulting key is
+    /// discarded. Worker scratch or unused reservation credit can make the
+    /// constructor fail with a type error. Evaluate keys that can call them
+    /// serially and admit their retained payload exactly.
+    pub(super) fn parallel_order_key(&self) -> bool {
+        #[cfg(feature = "geo")]
+        {
+            self.within(PARALLEL_DEPTH, &|f| {
+                let iri = match f {
+                    Func::Ext(iri) => iri.as_str(),
+                    Func::Builtin(Function::Custom(iri)) => iri.as_str(),
+                    _ => return true,
+                };
+                // These calls can select a geometry constructor at runtime.
+                iri.strip_prefix(FN) != Some("apply")
+                    && iri.strip_prefix(AFN) != Some("eval")
+                    && !crate::geo::functions::charges_geometry_result(iri)
+            })
+        }
+        #[cfg(not(feature = "geo"))]
+        self.parallel()
+    }
+
+    /// Whether this expression fits within the stack depth and call restrictions
+    /// for a parallel evaluation.
+    fn within(&self, levels: usize, allowed: &impl Fn(&Func) -> bool) -> bool {
         if levels == 0 {
             return false;
         }
         let n = levels - 1;
+        let within = |e: &Expr| e.within(n, allowed);
         match self {
-            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) | Expr::Exists(_) => {
-                true
-            }
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => true,
+            Expr::Exists(_) => false,
             Expr::Or(a, b)
             | Expr::And(a, b)
             | Expr::Eq(a, b)
             | Expr::SameTerm(a, b)
             | Expr::Cmp(a, b, _)
-            | Expr::Arith(a, b, _) => a.within(n) && b.within(n),
-            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => a.within(n),
-            Expr::In(a, l) => a.within(n) && l.iter().all(|e| e.within(n)),
-            Expr::If(a, b, c) => a.within(n) && b.within(n) && c.within(n),
-            Expr::Coalesce(l) | Expr::Call(_, l) => l.iter().all(|e| e.within(n)),
+            | Expr::Arith(a, b, _) => within(a) && within(b),
+            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => within(a),
+            Expr::In(a, l) => within(a) && l.iter().all(within),
+            Expr::If(a, b, c) => within(a) && within(b) && within(c),
+            Expr::Coalesce(l) => l.iter().all(within),
+            Expr::Call(f, args) => allowed(f) && args.iter().all(within),
         }
     }
 
@@ -474,11 +868,60 @@ impl Expr {
         text
     }
 
-    /// The same rendering for ordinary strings and admitted diagnostic buffers.
-    pub(super) fn write_description(
+    /// Count the rendered bytes without allocating the description. Dictionary
+    /// reconstruction and each temporary term must fit before they are decoded.
+    pub(super) fn description_bytes(&self, ctx: &Ctx) -> Result<usize> {
+        use std::fmt::Write;
+
+        struct Count(usize);
+        impl Write for Count {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0 = self.0.saturating_add(s.len());
+                Ok(())
+            }
+        }
+        let mut text = Count(0);
+        let mut error = None;
+        let written = self.write_description_with(ctx, &mut text, &mut |id, text| {
+            let rendered = (|| {
+                let scratch = ctx.charge(0)?;
+                let term = ctx.covered_batch_term(id, |bytes| scratch.add(bytes))?;
+                Ok(match term {
+                    Some(term) => write!(text, "{term}"),
+                    None => text.write_str("UNDEF"),
+                })
+            })();
+            match rendered {
+                Ok(written) => written,
+                Err(e) => {
+                    error = Some(e);
+                    Err(std::fmt::Error)
+                }
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        written.expect("counting filter description bytes");
+        Ok(text.0)
+    }
+
+    pub(super) fn write_description<W: std::fmt::Write + ?Sized>(
         &self,
         ctx: &Ctx,
-        text: &mut (impl std::fmt::Write + ?Sized),
+        text: &mut W,
+    ) -> std::fmt::Result {
+        self.write_description_with(ctx, text, &mut |id, text| match ctx.plan_term(id) {
+            Some(term) => write!(text, "{term}"),
+            None => text.write_str("UNDEF"),
+        })
+    }
+
+    fn write_description_with<W: std::fmt::Write + ?Sized>(
+        &self,
+        ctx: &Ctx,
+        text: &mut W,
+        term: &mut impl FnMut(Id, &mut W) -> std::fmt::Result,
     ) -> std::fmt::Result {
         fn binary<W: std::fmt::Write + ?Sized>(
             ctx: &Ctx,
@@ -486,24 +929,26 @@ impl Expr {
             a: &Expr,
             op: &str,
             b: &Expr,
+            term: &mut impl FnMut(Id, &mut W) -> std::fmt::Result,
         ) -> std::fmt::Result {
             text.write_char('(')?;
-            a.write_description(ctx, text)?;
+            a.write_description_with(ctx, text, term)?;
             write!(text, " {op} ")?;
-            b.write_description(ctx, text)?;
+            b.write_description_with(ctx, text, term)?;
             text.write_char(')')
         }
         fn arguments<W: std::fmt::Write + ?Sized>(
             ctx: &Ctx,
             text: &mut W,
             args: &[Expr],
+            term: &mut impl FnMut(Id, &mut W) -> std::fmt::Result,
         ) -> std::fmt::Result {
             text.write_char('(')?;
             for (index, arg) in args.iter().enumerate() {
                 if index > 0 {
                     text.write_str(", ")?;
                 }
-                arg.write_description(ctx, text)?;
+                arg.write_description_with(ctx, text, term)?;
             }
             text.write_char(')')
         }
@@ -518,14 +963,11 @@ impl Expr {
         }
 
         match self {
-            Expr::Const(id) | Expr::Lit(id, _) => match ctx.term(*id) {
-                Some(term) => write!(text, "{term}"),
-                None => text.write_str("UNDEF"),
-            },
+            Expr::Const(id) | Expr::Lit(id, _) => term(*id, text),
             Expr::Var(var) => write!(text, "?{}", ctx.var_names.read()[*var as usize]),
-            Expr::Or(a, b) => binary(ctx, text, a, "||", b),
-            Expr::And(a, b) => binary(ctx, text, a, "&&", b),
-            Expr::Eq(a, b) => binary(ctx, text, a, "=", b),
+            Expr::Or(a, b) => binary(ctx, text, a, "||", b, term),
+            Expr::And(a, b) => binary(ctx, text, a, "&&", b, term),
+            Expr::Eq(a, b) => binary(ctx, text, a, "=", b, term),
             Expr::Cmp(a, b, op) => binary(
                 ctx,
                 text,
@@ -537,6 +979,7 @@ impl Expr {
                     CmpOp::Ge => ">=",
                 },
                 b,
+                term,
             ),
             Expr::Arith(a, b, op) => binary(
                 ctx,
@@ -549,39 +992,40 @@ impl Expr {
                     ArithOp::Div => "/",
                 },
                 b,
+                term,
             ),
             Expr::Not(a) => {
                 text.write_char('!')?;
-                a.write_description(ctx, text)
+                a.write_description_with(ctx, text, term)
             }
             Expr::Neg(a) => {
                 text.write_char('-')?;
-                a.write_description(ctx, text)
+                a.write_description_with(ctx, text, term)
             }
-            Expr::Pos(a) => a.write_description(ctx, text),
+            Expr::Pos(a) => a.write_description_with(ctx, text, term),
             Expr::Bound(var) => write!(text, "BOUND(?{})", ctx.var_names.read()[*var as usize]),
             Expr::Exists(_) => text.write_str("EXISTS{…}"),
             Expr::SameTerm(a, b) => {
                 text.write_str("sameTerm")?;
-                binary(ctx, text, a, ",", b)
+                binary(ctx, text, a, ",", b, term)
             }
             Expr::In(a, list) => {
-                a.write_description(ctx, text)?;
+                a.write_description_with(ctx, text, term)?;
                 text.write_str(" IN ")?;
-                arguments(ctx, text, list)
+                arguments(ctx, text, list, term)
             }
             Expr::If(a, b, c) => {
                 text.write_str("IF(")?;
-                a.write_description(ctx, text)?;
+                a.write_description_with(ctx, text, term)?;
                 text.write_str(", ")?;
-                b.write_description(ctx, text)?;
+                b.write_description_with(ctx, text, term)?;
                 text.write_str(", ")?;
-                c.write_description(ctx, text)?;
+                c.write_description_with(ctx, text, term)?;
                 text.write_char(')')
             }
             Expr::Coalesce(args) => {
                 text.write_str("COALESCE")?;
-                arguments(ctx, text, args)
+                arguments(ctx, text, args, term)
             }
             Expr::Call(function, args) => {
                 match function {
@@ -595,17 +1039,19 @@ impl Expr {
                     )?,
                     Func::Ext(iri) => write!(text, "<{iri}>")?,
                 }
-                arguments(ctx, text, args)
+                arguments(ctx, text, args, term)
             }
         }
     }
 }
 
 /// Access to the current solution.
+#[repr(C, align(16))]
 pub struct Row<'a> {
+    // Align the slice's 16-byte stack store so it cannot cross a 64-byte cache line.
+    pub map: &'a [Option<usize>],
     pub table: &'a Table,
     pub i: usize,
-    pub map: &'a [Option<usize>],
     /// values decoded up front for this operator, per table column and row
     pub dec: Option<&'a DecodedCols>,
     /// the answers of EXISTS patterns from their key sets, for this row's table
@@ -686,6 +1132,9 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
             if x == Ok(true) {
                 return Ok(b(true));
             }
+            if x.is_err() && ctx.has_memory_failure() {
+                return Err(TypeError);
+            }
             let y = ebv(c, row, ctx);
             match (x, y) {
                 (_, Ok(true)) => Ok(b(true)),
@@ -697,6 +1146,9 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
             let x = ebv(a, row, ctx);
             if x == Ok(false) {
                 return Ok(b(false));
+            }
+            if x.is_err() && ctx.has_memory_failure() {
+                return Err(TypeError);
             }
             let y = ebv(c, row, ctx);
             match (x, y) {
@@ -713,7 +1165,13 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         }
         Expr::SameTerm(a, c) => {
             let x = eval(a, row, ctx)?.into_id(ctx);
+            if ctx.has_memory_failure() {
+                return Err(TypeError);
+            }
             let y = eval(c, row, ctx)?.into_id(ctx);
+            if ctx.has_memory_failure() {
+                return Err(TypeError);
+            }
             Ok(b(x == y))
         }
         Expr::Cmp(a, c, op) => {
@@ -737,7 +1195,12 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
                 match eval(e, row, ctx).and_then(|y| val_eq(x.clone(), y, ctx)) {
                     Ok(true) => return Ok(b(true)),
                     Ok(false) => {}
-                    Err(_) => err = true,
+                    Err(_) => {
+                        if ctx.has_memory_failure() {
+                            return Err(TypeError);
+                        }
+                        err = true;
+                    }
                 }
             }
             if err { Err(TypeError) } else { Ok(b(false)) }
@@ -831,8 +1294,14 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         Expr::Neg(a) => {
             let x = eval(a, row, ctx)?.value(ctx)?;
             Ok(Val::V(match Num::of(&x)? {
-                Num::Integer(i) => Value::Integer(i.checked_neg().ok_or(TypeError)?),
-                Num::Decimal(d) => Value::Decimal(d.checked_neg().ok_or(TypeError)?),
+                Num::Integer(i) => i.checked_neg().map(Value::Integer).unwrap_or_else(|| {
+                    Value::from_bigint(super::bignum::BigInt::from_i64(i64::from(i)).negated())
+                }),
+                Num::BigInteger(i) => Value::from_bigint(i.negated()),
+                Num::Decimal(d) => d.checked_neg().map(Value::Decimal).unwrap_or_else(|| {
+                    Value::from_bigdec(super::bignum::BigDec::from_oxs_decimal(d).negated())
+                }),
+                Num::BigDecimal(d) => Value::from_bigdec(d.negated()),
                 Num::Float(f) => Value::Float(-f),
                 Num::Double(d) => Value::Double(-d),
             }))
@@ -851,8 +1320,10 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         }
         Expr::Coalesce(l) => {
             for e in l {
-                if let Ok(v) = eval(e, row, ctx) {
-                    return Ok(v);
+                match eval(e, row, ctx) {
+                    Ok(v) => return Ok(v),
+                    Err(_) if ctx.has_memory_failure() => return Err(TypeError),
+                    Err(_) => {}
                 }
             }
             Err(TypeError)
@@ -980,6 +1451,9 @@ fn val_cmp(x: Val, y: Val, ctx: &Ctx) -> EvalResult<Option<Ordering>> {
                 if let Some(o) = ctx.simple_literal_cmp(a, c) {
                     return Ok(Some(o));
                 }
+                if ctx.has_memory_failure() {
+                    return Err(TypeError);
+                }
             }
             _ => {}
         }
@@ -995,10 +1469,11 @@ fn s(v: impl Into<Arc<str>>) -> Val {
     Val::V(Value::Str(v.into()))
 }
 
-/// Result string with the same "string-ness" (lang tag) as the argument.
-fn same_kind(lang: Option<&str>, v: String) -> Val {
+/// Result string with the same "string-ness" (language tag and base direction) as the argument.
+fn same_kind(lang: super::value::StringLang<'_>, v: String) -> Val {
     match lang {
-        Some(l) => Val::V(Value::Lang(v.into(), l.into())),
+        Some((l, Some(d))) => Val::V(Value::LangDir(v.into(), l.into(), d)),
+        Some((l, None)) => Val::V(Value::Lang(v.into(), l.into())),
         None => s(v),
     }
 }
@@ -1029,11 +1504,11 @@ pub(crate) fn arg<'r>(
     }
 }
 
-/// SPARQL 17.4.3.1.2 argument compatibility.
-pub(crate) fn compatible(a: Option<&str>, b: Option<&str>) -> bool {
+/// SPARQL 17.4.3.1.2 argument compatibility, including RDF 1.2 base direction.
+pub(crate) fn compatible(a: super::value::StringLang<'_>, b: super::value::StringLang<'_>) -> bool {
     match (a, b) {
         (_, None) => true,
-        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        (Some((lx, dx)), Some((ly, dy))) => lx.eq_ignore_ascii_case(ly) && dx == dy,
         (None, Some(_)) => false,
     }
 }
@@ -1046,27 +1521,17 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Translate an XPath pattern and SPARQL `REGEX` / `REPLACE` flags into a Rust `regex`
+/// pattern string. Returns `None` if `flags` contains an unsupported flag.
+pub fn translate_xpath_pattern(pattern: &str, flags: &str) -> Option<String> {
+    super::query_regex::translate_xpath_pattern(pattern, flags)
+}
+
 /// Compile an XPath pattern with SPARQL `REGEX` flags into a `regex::Regex`, for
-/// callers outside query evaluation, such as SHACL and ShEx shapes, which compile each
-/// pattern once. Query evaluation uses the query's own programs instead.
+/// callers outside query evaluation, such as ShEx shapes, which compile each pattern
+/// once. Query evaluation uses the query's own programs instead.
 pub fn compile_regex(pattern: &str, flags: &str) -> EvalResult<regex::Regex> {
-    let mut b = String::new();
-    let mut literal = false;
-    for f in flags.chars() {
-        match f {
-            'i' => b.push_str("(?i)"),
-            's' => b.push_str("(?s)"),
-            'm' => b.push_str("(?m)"),
-            'x' => b.push_str("(?x)"),
-            'q' => literal = true,
-            _ => return Err(TypeError),
-        }
-    }
-    if literal {
-        b.push_str(&regex::escape(pattern));
-    } else {
-        b.push_str(pattern);
-    }
+    let b = translate_xpath_pattern(pattern, flags).ok_or(TypeError)?;
     regex::RegexBuilder::new(&b)
         .size_limit(1 << 22)
         .build()
@@ -1151,11 +1616,20 @@ fn registered(
         .map_err(|e| fail(e.into()))?;
     let mut terms = Vec::with_capacity(args.len());
     let mut bytes = 0u64;
+    let mut target = input.bytes();
     for arg in args {
         let val = eval(arg, row, ctx)?;
         let term = match val {
-            Val::Id(id) | Val::Dec(id, _) => ctx.term(id).ok_or(TypeError)?,
-            Val::V(v) => v.to_term(),
+            Val::Id(id) | Val::Dec(id, _) => ctx
+                .term_checked_into(id, &input)
+                .map_err(|e| fail(e.into()))?
+                .ok_or(TypeError)?,
+            Val::V(v) => {
+                input
+                    .add(super::ctx::ValueCache::entry_bytes(&v))
+                    .map_err(|e| fail(e.into()))?;
+                v.to_term()
+            }
         };
         let cost = super::extensions::term_bytes(&term).map_err(fail)?;
         bytes = bytes.saturating_add(cost);
@@ -1164,9 +1638,8 @@ fn registered(
                 "callback input exceeds batch byte ceiling".into(),
             )));
         }
-        input
-            .add(cost.saturating_sub(std::mem::size_of::<Term>() as u64))
-            .map_err(|e| fail(e.into()))?;
+        target = target.saturating_add(cost.saturating_sub(std::mem::size_of::<Term>() as u64));
+        input.resize(target).map_err(|e| fail(e.into()))?;
         terms.push(term);
     }
     let context = ScalarContext { ctx };
@@ -1196,6 +1669,7 @@ fn registered(
     let id = ctx
         .intern_callback_term(&term, &arguments[0])
         .map_err(|e| fail(e.into()))?;
+    drop(arguments);
     drop(input);
     Ok(Val::Id(id))
 }
@@ -1205,15 +1679,22 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
     let a0 = || arg(args, 0, row, ctx);
     let a1 = || arg(args, 1, row, ctx);
     let a2 = || arg(args, 2, row, ctx);
-    let id0 =
-        || -> EvalResult<Id> { Ok(eval(args.first().ok_or(TypeError)?, row, ctx)?.into_id(ctx)) };
+    let id0 = || -> EvalResult<Id> {
+        let id = eval(args.first().ok_or(TypeError)?, row, ctx)?.into_id(ctx);
+        if ctx.has_memory_failure() {
+            return Err(TypeError);
+        }
+        Ok(id)
+    };
     Ok(match f {
         F::Str => {
             let v = eval(&args[0], row, ctx)?;
-            if let Some(id) = v.id()
-                && let Some(Term::Literal(l)) = ctx.term(id)
-            {
-                return Ok(s(l.value()));
+            if let Some(id) = v.id() {
+                match ctx.term(id) {
+                    Some(Term::Literal(l)) => return Ok(s(l.value())),
+                    None if ctx.has_memory_failure() => return Err(TypeError),
+                    _ => {}
+                }
             }
             s(v.value(ctx)?.lexical()?)
         }
@@ -1272,31 +1753,68 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                             && id.payload() & Id::LOCAL_BNODE_BIT != 0)
                     })
                     .collect();
-                Val::Id(ctx.bnode_for_row(key, st))
+                let id = ctx.bnode_for_row(key, st);
+                if ctx.has_memory_failure() {
+                    return Err(TypeError);
+                }
+                Val::Id(id)
             }
         }
         F::Rand => Val::V(Value::Double(rand::random::<f64>().into())),
         F::Abs => Val::V(match Num::of(&*a0()?)? {
-            Num::Integer(i) => Value::Integer(i.checked_abs().ok_or(TypeError)?),
-            Num::Decimal(d) => Value::Decimal(d.checked_abs().ok_or(TypeError)?),
+            Num::Integer(i) => i.checked_abs().map(Value::Integer).unwrap_or_else(|| {
+                Value::from_bigint(super::bignum::BigInt::from_i64(i64::from(i)).abs())
+            }),
+            Num::BigInteger(i) => Value::from_bigint(i.abs()),
+            Num::Decimal(d) => d.checked_abs().map(Value::Decimal).unwrap_or_else(|| {
+                Value::from_bigdec(super::bignum::BigDec::from_oxs_decimal(d).abs())
+            }),
+            Num::BigDecimal(d) => Value::from_bigdec(d.abs()),
             Num::Float(f) => Value::Float(f.abs()),
             Num::Double(d) => Value::Double(d.abs()),
         }),
         F::Ceil => Val::V(match Num::of(&*a0()?)? {
             Num::Integer(i) => Value::Integer(i),
-            Num::Decimal(d) => Value::Decimal(d.checked_ceil().ok_or(TypeError)?),
+            Num::BigInteger(i) => Value::from_bigint(i.clone()),
+            Num::Decimal(d) => match d.checked_ceil() {
+                Some(v) => Value::Decimal(v),
+                None => Value::from_bigdec(
+                    super::bignum::BigDec::from_oxs_decimal(d)
+                        .ceil()
+                        .ok_or(TypeError)?,
+                ),
+            },
+            Num::BigDecimal(d) => Value::from_bigdec(d.ceil().ok_or(TypeError)?),
             Num::Float(f) => Value::Float(f.ceil()),
             Num::Double(d) => Value::Double(d.ceil()),
         }),
         F::Floor => Val::V(match Num::of(&*a0()?)? {
             Num::Integer(i) => Value::Integer(i),
-            Num::Decimal(d) => Value::Decimal(d.checked_floor().ok_or(TypeError)?),
+            Num::BigInteger(i) => Value::from_bigint(i.clone()),
+            Num::Decimal(d) => match d.checked_floor() {
+                Some(v) => Value::Decimal(v),
+                None => Value::from_bigdec(
+                    super::bignum::BigDec::from_oxs_decimal(d)
+                        .floor()
+                        .ok_or(TypeError)?,
+                ),
+            },
+            Num::BigDecimal(d) => Value::from_bigdec(d.floor().ok_or(TypeError)?),
             Num::Float(f) => Value::Float(f.floor()),
             Num::Double(d) => Value::Double(d.floor()),
         }),
         F::Round => Val::V(match Num::of(&*a0()?)? {
             Num::Integer(i) => Value::Integer(i),
-            Num::Decimal(d) => Value::Decimal(d.checked_round().ok_or(TypeError)?),
+            Num::BigInteger(i) => Value::from_bigint(i.clone()),
+            Num::Decimal(d) => match d.checked_round() {
+                Some(v) => Value::Decimal(v),
+                None => Value::from_bigdec(
+                    super::bignum::BigDec::from_oxs_decimal(d)
+                        .round()
+                        .ok_or(TypeError)?,
+                ),
+            },
+            Num::BigDecimal(d) => Value::from_bigdec(d.round().ok_or(TypeError)?),
             Num::Float(f) => Value::Float((round_half_up_double(f64::from(f)) as f32).into()),
             Num::Double(d) => Value::Double(round_half_up_double(d.into()).into()),
         }),
@@ -1304,32 +1822,28 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             // the result keeps a language tag (and base direction) only if every
             // argument has the same one
             let mut out = String::new();
-            type Tag = (Option<Arc<str>>, Option<oxrdf::BaseDirection>);
+            type Tag = Option<(Arc<str>, Option<oxrdf::BaseDirection>)>;
             let mut tag: Option<Tag> = None;
             for i in 0..args.len() {
                 let v = arg(args, i, row, ctx)?;
-                let (st, l) = v.string_arg()?;
+                let (st, ld) = v.string_arg_dir()?;
                 out.push_str(st);
-                let dir = match &*v {
-                    Value::LangDir(_, _, d) => Some(*d),
-                    _ => None,
-                };
-                let t: Tag = (l.map(Into::into), dir);
+                let t: Tag = ld.map(|(l, d)| (l.into(), d));
                 tag = match tag {
                     None => Some(t),
                     Some(prev) if prev == t => Some(prev),
-                    Some(_) => Some((None, None)),
+                    Some(_) => Some(None),
                 };
             }
             match tag {
-                Some((Some(l), Some(d))) => Val::V(Value::LangDir(out.into(), l, d)),
-                Some((l, _)) => same_kind(l.as_deref(), out),
-                None => s(out),
+                Some(Some((l, Some(d)))) => Val::V(Value::LangDir(out.into(), l, d)),
+                Some(Some((l, None))) => Val::V(Value::Lang(out.into(), l)),
+                _ => s(out),
             }
         }
         F::SubStr => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             let start = Num::of(&*a1()?)?.to_double();
             let len = if args.len() > 2 {
                 Some(f64::from(Num::of(&*a2()?)?.to_double()))
@@ -1362,7 +1876,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         F::Replace => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             let p = a1()?;
             let r = a2()?;
             let f = if args.len() > 3 {
@@ -1374,13 +1888,23 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 .as_deref()
                 .map_or(Some(""), Value::as_str)
                 .ok_or(TypeError)?;
-            let rep = xpath_replacement(r.as_str().ok_or(TypeError)?)?;
+            let rep_str = r.as_str().ok_or(TypeError)?;
+            let literal_rep = flags.contains('q');
+            let rep: Cow<'_, str> = if literal_rep {
+                Cow::Borrowed(rep_str)
+            } else {
+                Cow::Owned(xpath_replacement(rep_str)?)
+            };
             let output = ctx
                 .with_regex(p.as_str().ok_or(TypeError)?, flags, |re| {
                     if re.matches_empty() {
                         return Ok(None);
                     }
-                    re.replace(ctx, st, &rep).map(Some)
+                    if literal_rep {
+                        re.replace_literal(ctx, st, &rep).map(Some)
+                    } else {
+                        re.replace(ctx, st, &rep).map(Some)
+                    }
                 })
                 .and_then(|output| output.transpose())
                 .map_err(|error| {
@@ -1393,12 +1917,12 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         F::UCase => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             same_kind(l, st.to_uppercase())
         }
         F::LCase => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             same_kind(l, st.to_lowercase())
         }
         F::EncodeForUri => {
@@ -1414,8 +1938,8 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         F::Contains | F::StrStarts | F::StrEnds | F::StrBefore | F::StrAfter => {
             let x = a0()?;
             let y = a1()?;
-            let (xs, xl) = x.string_arg()?;
-            let (ys, yl) = y.string_arg()?;
+            let (xs, xl) = x.string_arg_dir()?;
+            let (ys, yl) = y.string_arg_dir()?;
             if !compatible(xl, yl) {
                 return Err(TypeError);
             }
@@ -1569,11 +2093,30 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         F::Custom(iri) => return extension(iri.as_str(), args, row, ctx),
         // ---- SPARQL 1.2 -------------------------------------------------------------
         F::Triple => {
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
             let term = |i: usize| -> EvalResult<Term> {
                 let v = eval(&args[i], row, ctx)?;
                 match v.id() {
-                    Some(id) => ctx.term(id).ok_or(TypeError),
-                    None => Ok(v.value(ctx)?.to_term()),
+                    Some(id) => ctx
+                        .term_checked_into(id, &decode)
+                        .map_err(|e| {
+                            ctx.fail_memory(&e);
+                            TypeError
+                        })?
+                        .ok_or(TypeError),
+                    None => {
+                        let val = v.value(ctx)?;
+                        decode
+                            .add(super::ctx::ValueCache::entry_bytes(&val))
+                            .map_err(|e| {
+                                ctx.fail_memory(&e);
+                                TypeError
+                            })?;
+                        Ok(val.to_term())
+                    }
                 }
             };
             let s = match term(0)? {
@@ -1585,12 +2128,27 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 return Err(TypeError);
             };
             let o = term(2)?;
-            Val::V(Value::Triple(Arc::new(oxrdf::Triple::new(s, p, o))))
+            let tr = Arc::new(oxrdf::Triple::new(s, p, o));
+            let bytes = super::graph_triple_bytes(&tr);
+            if !ctx.reserve_decode(usize::try_from(bytes).unwrap_or(usize::MAX)) {
+                drop(tr);
+                drop(decode);
+                return Err(TypeError);
+            }
+            drop(decode);
+            Val::V(Value::Triple(tr))
         }
         F::Subject | F::Predicate | F::Object => {
             let v = eval(&args[0], row, ctx)?;
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
             let t = match v.id() {
-                Some(id) => match ctx.term(id) {
+                Some(id) => match ctx.term_checked_into(id, &decode).map_err(|e| {
+                    ctx.fail_memory(&e);
+                    TypeError
+                })? {
                     Some(Term::Triple(t)) => *t,
                     _ => return Err(TypeError),
                 },
@@ -1604,7 +2162,13 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 F::Predicate => Term::NamedNode(t.predicate),
                 _ => t.object,
             };
-            Val::Id(ctx.intern_term(&c))
+            let id = ctx.intern_term(&c);
+            drop(c);
+            drop(decode);
+            if ctx.has_memory_failure() {
+                return Err(TypeError);
+            }
+            Val::Id(id)
         }
         F::IsTriple => {
             let v = eval(&args[0], row, ctx)?;
@@ -1729,6 +2293,24 @@ where
     }))
 }
 
+/// Exact binary truncation of a finite `f64` towards zero for XPath float/double-to-integer
+/// casts, avoiding `oxsdatatypes`'s intermediate `10^18` float scaling.
+fn float_to_integer(x: f64) -> EvalResult<Value> {
+    if !x.is_finite() {
+        return Err(TypeError);
+    }
+    let t = x.trunc();
+    // -2^63 is exact in f64 (i64::MIN); +2^63 is strictly above i64::MAX, so every finite
+    // truncated f64 in [-2^63, 2^63) converts losslessly via `as i64`.
+    if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&t) {
+        Ok(Value::Integer(Integer::from(t as i64)))
+    } else {
+        Ok(Value::from_bigint(
+            super::bignum::BigInt::from_f64_trunc(t).ok_or(TypeError)?,
+        ))
+    }
+}
+
 /// XSD casts (SPARQL 17.5).
 pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
     let local = dt.as_str().strip_prefix(XSD).ok_or(TypeError)?;
@@ -1742,10 +2324,18 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
             Err(TypeError)
         };
     }
+    if local == "string" {
+        return Ok(match &v {
+            Value::Float(f) => s(super::value::float_to_xpath_string(f32::from(*f))),
+            Value::Double(d) => s(super::value::double_to_xpath_string(f64::from(*d))),
+            _ => s(v.lexical()?),
+        });
+    }
     let lex = v.lexical()?;
     let from_str = matches!(v, Value::Str(_) | Value::Other { .. });
     let parsed = |dt: NamedNodeRef<'_>| -> EvalResult<Val> {
-        let val = Value::from_literal(&Literal::new_typed_literal(lex.trim(), dt));
+        let trimmed = lex.trim_matches([' ', '\t', '\n', '\r']);
+        let val = Value::from_literal(&Literal::new_typed_literal(trimmed, dt));
         if matches!(val, Value::Other { .. }) {
             Err(TypeError)
         } else {
@@ -1755,10 +2345,9 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
     use oxrdf::NamedNodeRef;
     let num = Num::of(&v).ok();
     Ok(match local {
-        "string" => s(lex),
         "boolean" => match (&v, num) {
             (Value::Bool(x), _) => b(*x),
-            (_, Some(n)) => b(Value::Double(n.to_double()).ebv().unwrap_or(false)),
+            (_, Some(_)) => b(v.ebv().unwrap_or(false)),
             _ if from_str => return parsed(xsd::BOOLEAN),
             _ => return Err(TypeError),
         },
@@ -1768,34 +2357,40 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
             let r = match (&v, num) {
                 (Value::Bool(x), _) => Value::Integer((*x as i64).into()),
                 (_, Some(Num::Integer(i))) => Value::Integer(i),
-                (_, Some(Num::Decimal(d))) => {
-                    Value::Integer(Integer::try_from(d).map_err(|_| TypeError)?)
-                }
-                (_, Some(Num::Float(f))) => {
-                    Value::Integer(Integer::try_from(f).map_err(|_| TypeError)?)
-                }
-                (_, Some(Num::Double(d))) => {
-                    Value::Integer(Integer::try_from(d).map_err(|_| TypeError)?)
-                }
+                (_, Some(Num::BigInteger(i))) => Value::from_bigint(i.clone()),
+                (_, Some(Num::Decimal(d))) => Integer::try_from(d)
+                    .map(Value::Integer)
+                    .unwrap_or_else(|_| {
+                        Value::from_bigint(
+                            super::bignum::BigDec::from_oxs_decimal(d).trunc_to_bigint(),
+                        )
+                    }),
+                (_, Some(Num::BigDecimal(d))) => Value::from_bigint(d.trunc_to_bigint()),
+                (_, Some(Num::Float(f))) => float_to_integer(f64::from(f32::from(f)))?,
+                (_, Some(Num::Double(d))) => float_to_integer(f64::from(d))?,
                 _ if from_str => match parsed(xsd::INTEGER)? {
                     Val::V(v) => v,
                     _ => return Err(TypeError),
                 },
                 _ => return Err(TypeError),
             };
-            match integer_range(local) {
-                None => Val::V(r),
-                Some((lo, hi)) => {
-                    // the derived type's range, and the literal keeps its datatype
-                    let Value::Integer(i) = r else {
-                        return Err(TypeError);
-                    };
-                    if !(lo..=hi).contains(&i128::from(i64::from(i))) {
-                        return Err(TypeError);
-                    }
-                    let lit = Literal::new_typed_literal(i.to_string(), dt.clone());
-                    Val::Dec(ctx.intern_term(&Term::Literal(lit)), r)
+            if local == "integer" {
+                Val::V(r)
+            } else {
+                // the derived type's range, and the literal keeps its datatype
+                let in_range = match &r {
+                    Value::Integer(i) => match integer_range(local) {
+                        Some((lo, hi)) => (lo..=hi).contains(&i128::from(i64::from(*i))),
+                        None => false,
+                    },
+                    Value::BigInteger(i) => super::value::integer_in_derived_range(i, dt.as_str()),
+                    _ => return Err(TypeError),
+                };
+                if !in_range {
+                    return Err(TypeError);
                 }
+                let lit = Literal::new_typed_literal(r.lexical()?.as_ref(), dt.clone());
+                Val::Dec(ctx.intern_term(&Term::Literal(lit)), r)
             }
         }
         "anyURI" => match &v {
@@ -1817,18 +2412,28 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
         "decimal" => match (&v, num) {
             (Value::Bool(x), _) => Val::V(Value::Decimal((*x as i64).into())),
             (_, Some(Num::Integer(i))) => Val::V(Value::Decimal(i.into())),
+            (_, Some(Num::BigInteger(i))) => Val::V(Value::from_bigdec(
+                super::bignum::BigDec::from_bigint(i.clone()),
+            )),
             (_, Some(Num::Decimal(d))) => Val::V(Value::Decimal(d)),
+            (_, Some(Num::BigDecimal(d))) => Val::V(Value::from_bigdec(d.clone())),
             (_, Some(Num::Float(f))) => {
-                Val::V(Value::Decimal(Decimal::try_from(f).map_err(|_| TypeError)?))
+                let x = f32::from(f);
+                let dec = super::bignum::BigDec::from_f32(x).ok_or(TypeError)?;
+                Val::V(Value::from_bigdec(dec))
             }
             (_, Some(Num::Double(d))) => {
-                Val::V(Value::Decimal(Decimal::try_from(d).map_err(|_| TypeError)?))
+                let x = f64::from(d);
+                let dec = super::bignum::BigDec::from_f64(x).ok_or(TypeError)?;
+                Val::V(Value::from_bigdec(dec))
             }
             _ if from_str => return parsed(xsd::DECIMAL),
             _ => return Err(TypeError),
         },
         "float" => match (&v, num) {
             (Value::Bool(x), _) => Val::V(Value::Float(if *x { 1.0f32 } else { 0.0 }.into())),
+            (_, Some(Num::BigInteger(i))) => Val::V(Value::Float(Float::from(i.to_f32()))),
+            (_, Some(Num::BigDecimal(d))) => Val::V(Value::Float(Float::from(d.to_f32()))),
             (_, Some(n)) => Val::V(Value::Float(Float::from(n.to_double()))),
             _ if from_str => return parsed(xsd::FLOAT),
             _ => return Err(TypeError),
@@ -2020,7 +2625,7 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             "timezone-from-dateTime" => fb(Function::Timezone),
             "normalize-space" => {
                 let v = a(0)?;
-                let (st, l) = v.string_arg()?;
+                let (st, l) = v.string_arg_dir()?;
                 Ok(same_kind(
                     l,
                     st.split_whitespace().collect::<Vec<_>>().join(" "),
@@ -2046,6 +2651,10 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
                 }
                 let value = match Num::of(&*a(0)?)? {
                     Num::Integer(i) => super::fnformat::FormatValue::Integer(i64::from(i).into()),
+                    Num::BigInteger(i) => match i.to_i128() {
+                        Some(v) => super::fnformat::FormatValue::Integer(v),
+                        None => super::fnformat::FormatValue::Double(i.to_f64()),
+                    },
                     n => super::fnformat::FormatValue::Double(f64::from(n.to_double())),
                 };
                 let picture = a(1)?;
@@ -2121,6 +2730,7 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             "struuid" => fb(Function::StrUuid),
             "evenInteger" => match Num::of(&*a(0)?)? {
                 Num::Integer(n) => Ok(b(i64::from(n) % 2 == 0)),
+                Num::BigInteger(n) => Ok(b(n.is_even())),
                 _ => Err(TypeError),
             },
             "langeq" => {
@@ -2268,7 +2878,12 @@ fn sprintf_arg(v: &Value) -> super::fnformat::Arg {
     use super::fnformat::Arg;
     match v {
         Value::Integer(i) => Arg::Integer(i64::from(*i).into()),
+        Value::BigInteger(i) => match i.to_i128() {
+            Some(v) => Arg::Integer(v),
+            None => Arg::Double(i.to_f64()),
+        },
         Value::Decimal(d) => Arg::Decimal(*d),
+        Value::BigDecimal(d) => Arg::Double(d.to_f64()),
         Value::Double(d) => Arg::Double(f64::from(*d)),
         Value::Float(f) => Arg::Float(f32::from(*f)),
         Value::DateTime(d) => Arg::Date(*d),
@@ -2321,6 +2936,13 @@ pub(super) fn compile_expression<T>(
     admit(e)?;
     let compile = |e: &Expression| compile_expression(ctx, subst, exists, admit, variable, e);
     let bx = |e: &Expression| compile(e).map(Box::new);
+    let compile_list = |items: &[Expression]| -> std::result::Result<Vec<Expr>, T> {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(compile(item)?);
+        }
+        Ok(out)
+    };
     Ok(match e {
         E::NamedNode(n) => Expr::Const(ctx.intern_term(&Term::NamedNode(n.clone()))),
         E::Literal(l) => {
@@ -2347,12 +2969,7 @@ pub(super) fn compile_expression<T>(
         E::GreaterOrEqual(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Ge),
         E::Less(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Lt),
         E::LessOrEqual(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Le),
-        E::In(a, l) => Expr::In(
-            bx(a)?,
-            l.iter()
-                .map(&compile)
-                .collect::<std::result::Result<_, T>>()?,
-        ),
+        E::In(a, l) => Expr::In(bx(a)?, compile_list(l)?),
         E::Add(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Add),
         E::Subtract(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Sub),
         E::Multiply(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Mul),
@@ -2370,16 +2987,9 @@ pub(super) fn compile_expression<T>(
             }
         }
         E::If(a, c, d) => Expr::If(bx(a)?, bx(c)?, bx(d)?),
-        E::Coalesce(l) => Expr::Coalesce(
-            l.iter()
-                .map(&compile)
-                .collect::<std::result::Result<_, T>>()?,
-        ),
+        E::Coalesce(l) => Expr::Coalesce(compile_list(l)?),
         E::FunctionCall(f, args) => {
-            let args: Vec<Expr> = args
-                .iter()
-                .map(&compile)
-                .collect::<std::result::Result<_, T>>()?;
+            let args = compile_list(args)?;
             let f = match f {
                 Function::Custom(n) if is_cast(n.as_str()) => Func::Cast(n.clone()),
                 Function::Custom(n) => {
@@ -2393,4 +3003,45 @@ pub(super) fn compile_expression<T>(
             Expr::Call(f, args)
         }
     })
+}
+
+#[cfg(test)]
+mod exists_admission_tests {
+    use super::*;
+
+    #[test]
+    fn deep_exists_nested_variable_rehash_refuses_before_allocating_the_new_table() {
+        use sparkles_budget::sizes::{table_bytes, table_capacity};
+        let variables: Vec<_> = (0..3_600)
+            .map(|i| oxrdf::Variable::new_unchecked(format!("v{i}")))
+            .collect();
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        for var in &variables {
+            ctx.var(var.as_str());
+        }
+        let pattern = GraphPattern::Values {
+            variables,
+            bindings: Vec::new(),
+        };
+        let old = table_bytes(table_capacity(3_584), size_of::<VarId>());
+        let new = table_bytes(table_capacity(3_585), size_of::<VarId>());
+        let scratch_room = 56 << 10;
+        assert!(old < scratch_room && old + new > scratch_room);
+        ctx.mem_limit = ExistsSpec::ordinary_pattern_bytes(&pattern) + scratch_room as u64;
+        let admission = ctx.charge(0).unwrap();
+        let largest = crate::test_alloc::record_largest(|| {
+            let spec = ExistsSpec::compile_ordinary_with_admission(
+                &ctx,
+                &pattern,
+                None,
+                super::super::plan::ActiveGraph::Default,
+                &FxHashMap::default(),
+                Some(&admission),
+            );
+            assert!(matches!(spec, Err(crate::error::Error::BudgetExceeded(_))));
+        });
+        assert!(largest < new, "rehash allocated {largest} bytes");
+        assert_eq!(ctx.live_bytes(), 0);
+    }
 }

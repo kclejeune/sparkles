@@ -138,24 +138,24 @@ mod on {
     use std::sync::Arc;
 
     /// The end of a triple: a variable, a node of the data, or a geometry literal.
-    fn end(p: &Planner<'_>, t: &TermPattern) -> RelateEnd {
+    fn end(p: &Planner<'_>, t: &TermPattern) -> Result<RelateEnd> {
         let id = match p.term_pattern(t) {
-            PT::V(v) => return RelateEnd::Var(v),
+            PT::V(v) => return Ok(RelateEnd::Var(v)),
             PT::C(id) => id,
         };
         let cfg = config(p.ctx);
-        if let Some(Value::Other { lex, dt }) = p.ctx.value(id)
+        if let Some(Value::Other { lex, dt }) = p.ctx.value_checked(id)?
             && vocab::is_geometry_datatype(&dt)
             && let Ok(g) = crate::geo::parse_limited(&lex, &dt, cfg.max_vertices)
         {
-            return RelateEnd::Geometry(id, Arc::new(g));
+            return Ok(RelateEnd::Geometry(id, Arc::new(g)));
         }
         // an ill-typed geometry literal is a term like any other (it relates to nothing)
-        if id.tag() == Tag::Local {
+        Ok(if id.tag() == Tag::Local {
             RelateEnd::Absent
         } else {
             RelateEnd::Node(id)
-        }
+        })
     }
 
     fn text(p: &Planner<'_>, e: &RelateEnd) -> String {
@@ -179,8 +179,8 @@ mod on {
 
     pub(super) fn rewrite_leaf(p: &Planner<'_>, c: RewriteCall, g: &ActiveGraph) -> Result<Node> {
         let ctx = p.ctx;
-        let subject = end(p, &c.subject);
-        let object = end(p, &c.object);
+        let subject = end(p, &c.subject)?;
+        let object = end(p, &c.object)?;
         let mut vars = Vec::new();
         for e in [&subject, &object] {
             if let RelateEnd::Var(v) = e

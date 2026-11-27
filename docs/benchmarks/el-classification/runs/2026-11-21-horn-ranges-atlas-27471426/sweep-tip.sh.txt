@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# sweep-tip.sh OUT: the rule arm of sweep.sh with bin/tip4 (1580ce54),
+# held-out third skipped) on one thread with the disjunctive attempt bounded at 1, by the
+# tip with the rule (covered) and with SPARKLES_HORN_RANGES=keep, three files at a time.
+set -u
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/lanes/horn-ranges-693
+DEV=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/archived-worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev
+FIN=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/lanes/outside-census/final/data
+H=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/lanes/outside-census/HELD-OUT-DO-NOT-RUN.txt
+O=$L/out/${1:-sweep}; mkdir -p $O; : > $O/log.txt
+one() {
+  f=$1; n=$(basename $f .owl)
+  if grep -qxF "$n.owl" $H; then echo "$n SEALED-SKIP"; return; fi
+  for arm in covered; do
+    e=SPARKLES_HORN_RANGES=$arm
+    env $e systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=0 -p OOMPolicy=continue \
+      timeout 600 $L/bin/tip4 --threads 1 --dl-attempt-work 1 --taxonomy $O/$n.$arm.tax $f > $O/$n.$arm.json 2> $O/$n.$arm.err
+    st=$?
+    sha=$(LC_ALL=C sort $O/$n.$arm.tax 2>/dev/null | sha256sum | cut -c1-16)
+    rm -f $O/$n.$arm.tax
+    echo "$n $arm $st $sha $(grep '^{' $O/$n.$arm.json | jq -c '[.tier,.conclusions,.conjunctions,.hornRangesLeftOut,.classifyMs[0]]')"
+  done
+}
+export -f one; export L O H
+ls $DEV/*.owl $FIN/*.owl | xargs -P 3 -I{} bash -c 'one {}' >> $O/log.txt
+echo SWEEP-DONE >> $O/log.txt

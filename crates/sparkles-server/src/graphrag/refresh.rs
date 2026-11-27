@@ -1,56 +1,83 @@
-//! Automatic refresh from the change feed (spec C22 §5, Phase 3).
+//! Automatic refresh with an internal F13 accumulator circuit (spec C22 §5, F13 §3.6).
 //!
 //! A loop on the server's runtime looks at every dataset whose GraphRAG settings have
-//! `refresh.mode: "auto"` once a [`TICK`]. A dataset is due after `debounceSeconds`
-//! without a new commit, or after ten debounce periods while commits continue. A due
-//! dataset reads the change feed from the commit of its last build or refresh, through
-//! the settings' principal's view, and counts the changed facts of each community from
-//! the communities the build stored. When a community's changed facts reach
-//! `minChangedFraction` of the facts its report was written from, when an entity joins a
-//! community, or when the feed cannot list the changes, the loop starts a refresh task.
-//! The refresh compares the fact digests of every report, as a manual refresh does, so
-//! it rewrites exactly the reports that changed enough and keeps the rest. It needs no
-//! confirmation, and the daily token budget bounds it.
+//! `refresh.mode: "auto"` once a [`TICK`]. For each such dataset with a build on `main`,
+//! the server attaches an internal F13 accumulator circuit (`graphrag-refresh`) over the
+//! projection's graphs and predicates, read through the settings' principal's view. The
+//! views worker advances the accumulator incrementally on every commit and checkpoints it
+//! under `<db>/circuits/graphrag-refresh/main/`.
 //!
-//! The loop never starts a first build, never runs on a branch other than main, and
-//! leaves a dataset alone while one of its GraphRAG tasks is queued or running. A run
-//! that the budget stopped with pending communities is retried once a day.
+//! A dataset is due after `debounceSeconds` without a new commit, or after ten debounce
+//! periods while commits continue. A due dataset reads the accumulator's counts since the
+//! commit of its last build or refresh and totals them per stored community. When a
+//! community's changed facts reach `minChangedFraction` of the facts its report was
+//! written from, when an entity joins a community, or when the accumulator cannot cover
+//! every commit (a bulk commit, a change-log gap, memory eviction, a circuit failure, or
+//! data-dependent protections), the loop can start a refresh task. The refresh compares the
+//! fact digests of every report, as a manual refresh does, so it rewrites exactly the
+//! reports that changed enough and keeps the rest, then discards the acted-on counts. It
+//! needs no confirmation, and the daily token budget bounds it.
+//!
+//! The loop never starts a first build, never runs on a branch other than main, detaches
+//! the internal circuit when automatic refresh is disabled or a dataset is removed or
+//! replaced, and leaves a dataset alone while one of its GraphRAG tasks is queued or
+//! running. A run that the budget stopped with pending communities is retried once a day.
 //!
 //! Under a review policy, a report's input can change without any change that the
-//! principal's feed lists (spec C25, "Refresh"). The loop then runs a private check in
+//! principal's view lists (spec C25, "Refresh"). The loop then runs a private check in
 //! place of a refresh: when a commit changes the policy's decisions or supports graph or
-//! adds a withdrawal to a proposal graph, which it reads from the feed without the
-//! principal's view, when the selected evidence configuration or the access policy's
+//! changes a withdrawal in a proposal graph, which it checks with a bounded raw history
+//! probe, when the selected evidence configuration or the access policy's
 //! generation differs from the one it last checked, when it first sees the dataset, and
-//! when the principal's feed cannot list the changes. The check is a refresh's
-//! preparation and plan with no model call, commit, state change or task, and it starts
-//! a refresh only for a change of a report's input. It keeps its own backoff, so a check
-//! that fails never holds back what the principal's feed starts.
+//! when the accumulator cannot cover every commit. The check is a refresh's preparation
+//! and plan with no model call, commit, state change or task, and it starts a refresh
+//! only for a change of a report's input. It keeps its own backoff, so a check that fails
+//! never holds back what the principal's view starts. The loop also checks privately
+//! when an evidence-enabled dataset's restricted circuit loses its count range without
+//! a configured review policy.
 
 use super::build::{self, Mode};
+use super::runtime::RefreshCircuit;
 use super::settings::{GraphragSettings, RefreshMode};
 use super::state::BuildState;
 use crate::auth::Endpoint;
 use crate::state::{AppState, Dataset, task_state};
-use oxrdf::{GraphName, NamedOrBlankNode, Term};
+#[cfg(test)]
+use oxrdf::GraphName;
+use oxrdf::Term;
 use sparkles::commit::CommitKind;
+use sparkles::incr::{Counts, InternalAccess, InternalCircuit, InternalSpec};
+#[cfg(test)]
 use sparkles::store::ChangesOptions;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use sparkles::store::HistoryPattern;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 /// How often the loop looks at the datasets.
 pub const TICK: Duration = Duration::from_secs(1);
 
-/// The most commits one page of the feed lists.
-const PAGE_COMMITS: usize = 1000;
+/// The internal F13 circuit identifier used for GraphRAG change counting.
+pub(crate) const CIRCUIT_ID: &str = "graphrag-refresh";
 
-/// The most changes one page of the feed lists. A commit with more is listed with its
-/// counts only, and the loop then refreshes rather than counting.
-const PAGE_QUADS: u64 = 200_000;
+/// The default memory budget of the refresh accumulator circuit (64 MiB), further
+/// bounded by `--views-memory` when configured.
+const CIRCUIT_MEMORY_BYTES: u64 = 64 << 20;
 
-/// How long one reading of the feed may take.
-const FEED_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a due check waits for the views worker to catch up to the head commit.
+const CIRCUIT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long replacing an existing refresh circuit waits for the worker to collect the
+/// dropped handle before re-attaching under the same id.
+const CIRCUIT_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most exact graph IRIs expanded into a per-graph `UNION` so the F13 footprint
+/// skips commits to unrelated graphs in one hash probe.
+const MAX_EXACT_GRAPHS_UNION: usize = 16;
+
+/// Work and time allowed for one private evidence history probe.
+const EVIDENCE_PROBE_WORK: u64 = 200_000;
+const EVIDENCE_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 
 const RDF_TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
 
@@ -60,6 +87,9 @@ const WITHDRAWAL: &str = "urn:x-sparkles:evidence:Withdrawal";
 /// What the loop remembers of one dataset.
 #[derive(Debug, Default)]
 pub struct Watch {
+    /// the dataset instance this watch tracks, so an in-place restore or recreate resets it
+    dataset_id: Option<uuid::Uuid>,
+    runtime: Option<Weak<sparkles::incr::Runtime>>,
     /// the head commit seen last
     seen: Option<u64>,
     /// when the last new commit was seen
@@ -79,6 +109,12 @@ pub struct Watch {
     /// commit, and whether the last build read under one
     policy_checked: Option<Instant>,
     had_policy: bool,
+    /// what the eager circuit attachment last synced against, avoiding disk I/O on idle ticks
+    attached_settings: Option<GraphragSettings>,
+    attached_epoch: Option<u64>,
+    attached_head: Option<u64>,
+    attached_uncountable: bool,
+    no_build_head: Option<u64>,
     /// the private check under a review policy: whether one is due, the head through
     /// which the evidence graphs' changes were read, the evidence configuration and the
     /// access policy's generation it last saw, and its own backoff
@@ -127,6 +163,32 @@ impl Private {
 }
 
 impl Watch {
+    /// A fresh watch bound to `ds`.
+    fn for_dataset(ds: &Dataset) -> Self {
+        Self {
+            dataset_id: Some(ds.store.dataset_id()),
+            runtime: Some(Arc::downgrade(&ds.dataset.inner_state().views)),
+            ..Default::default()
+        }
+    }
+
+    /// Whether this watch still tracks the exact same open dataset instance.
+    fn same_dataset(&self, ds: &Dataset) -> bool {
+        self.dataset_id == Some(ds.store.dataset_id())
+            && self.runtime.as_ref().is_some_and(|w| {
+                w.strong_count() > 0
+                    && Weak::ptr_eq(w, &Arc::downgrade(&ds.dataset.inner_state().views))
+            })
+    }
+
+    /// Clear cached attachment tracking so the next tick re-evaluates attachment state.
+    fn clear_attached(&mut self) {
+        self.attached_settings = None;
+        self.attached_epoch = None;
+        self.attached_head = None;
+        self.attached_uncountable = false;
+    }
+
     /// The private check's record, for tests.
     pub(crate) fn private(&self) -> &Private {
         &self.private
@@ -236,20 +298,103 @@ pub fn start(st: &Arc<AppState>, h: &tokio::runtime::Handle) {
     });
 }
 
-/// One look at every dataset: start the refreshes that are due.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TickHookPoint {
+    BeforeRetain,
+    AfterSettings,
+    BeforeEnsureLock,
+    BeforeDue,
+    BeforePrivateCheck,
+    BeforeSpawn,
+}
+
+#[cfg(test)]
+type TickHook = Box<dyn FnMut(TickHookPoint, &str)>;
+
+#[cfg(test)]
+thread_local! {
+    static TICK_HOOK: std::cell::RefCell<Option<TickHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TickHookGuard;
+
+#[cfg(test)]
+impl Drop for TickHookGuard {
+    fn drop(&mut self) {
+        TICK_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_tick_hook(f: impl FnMut(TickHookPoint, &str) + 'static) -> TickHookGuard {
+    TICK_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    TickHookGuard
+}
+
+#[cfg(test)]
+fn fire_tick_hook(point: TickHookPoint, name: &str) {
+    let f = TICK_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = f {
+        f(point, name);
+        TICK_HOOK.with(|h| {
+            if h.borrow().is_none() {
+                *h.borrow_mut() = Some(f);
+            }
+        });
+    }
+}
+
+/// One look at every dataset: keep refresh circuits attached and start the refreshes that
+/// are due.
 pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: Instant) {
     let datasets = st.datasets();
     watches.retain(|name, _| datasets.contains_key(name));
+    #[cfg(test)]
+    fire_tick_hook(TickHookPoint::BeforeRetain, "");
+    st.graphrag.retain_circuits(
+        |name| datasets.contains_key(name),
+        |name, dataset_id, runtime| is_live_owner(st, name, dataset_id, runtime),
+    );
     for (name, ds) in datasets {
+        if !is_live_dataset(st, &ds) {
+            watches.remove(&name);
+            detach_if_not_live(st, &ds);
+            continue;
+        }
         let settings: GraphragSettings =
             crate::settings::effective(st, &ds, &crate::settings::GRAPHRAG);
+        #[cfg(test)]
+        fire_tick_hook(TickHookPoint::AfterSettings, &name);
         if !settings.enabled || settings.refresh.mode != RefreshMode::Auto {
             watches.remove(&name);
+            detach_if_not_auto(st, &ds);
             continue;
         }
         let head = ds.store.head_commit().seq;
+        let w = watches
+            .entry(name.clone())
+            .or_insert_with(|| Watch::for_dataset(&ds));
+        if !w.same_dataset(&ds) {
+            *w = Watch::for_dataset(&ds);
+            st.graphrag
+                .detach_if_not_live_owner(&name, |n, dataset_id, runtime| {
+                    is_live_owner(st, n, dataset_id, runtime)
+                });
+        }
+        // Keep the internal F13 accumulator attached ahead of the debounce window so
+        // commits arriving after startup, settings updates or policy reloads are counted
+        // incrementally rather than falling back.
+        let (settings, head) = match ensure_attached(st, &ds, &settings, head, w) {
+            AttachState::Active(s, h) => (*s, h),
+            AttachState::Inactive | AttachState::NotLive => {
+                watches.remove(&name);
+                continue;
+            }
+        };
         let debounce = Duration::from_secs(settings.refresh.debounce_seconds);
-        let w = watches.entry(name.clone()).or_default();
         // the refresh this loop started: wait for it, and back off when it failed
         if let Some(id) = &w.task {
             let state = st
@@ -270,9 +415,7 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
                 .is_none_or(|t| now.duration_since(t) >= debounce);
         // a private check that failed is retried after its own backoff, which an
         // outstanding backoff of the loop holds back as well
-        let private_retry = settings.review_policy.is_some()
-            && w.private.ready(now)
-            && w.retry_at.is_none_or(|t| now >= t);
+        let private_retry = w.private.ready(now) && w.retry_at.is_none_or(|t| now >= t);
         if !w.wants_check(head, now, debounce, build::today()) && !policy_due && !private_retry {
             continue;
         }
@@ -282,8 +425,15 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
         }
         w.checked();
         w.policy_checked = Some(now);
-        let reason = match due_reason(st, &ds, &settings, w) {
-            Ok(r) => r,
+        #[cfg(test)]
+        fire_tick_hook(TickHookPoint::BeforeDue, &name);
+        let (reason, settings) = match due_outcome(st, &ds, &settings, w, true) {
+            Ok(DueOutcome::Reason(r, live)) => (Some(r), *live),
+            Ok(DueOutcome::None(live)) => (None, *live),
+            Ok(DueOutcome::NotLive | DueOutcome::NotAuto) => {
+                watches.remove(&name);
+                continue;
+            }
             Err(e) => {
                 tracing::warn!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {e}");
                 w.failed(now, debounce);
@@ -292,7 +442,18 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
         };
         let reason = match reason {
             Some(r) => Some(r),
-            None => private_check(st, &ds, &settings, w, now, debounce),
+            None => {
+                #[cfg(test)]
+                fire_tick_hook(TickHookPoint::BeforePrivateCheck, &name);
+                match private_check(st, &ds, &settings, w, now, debounce) {
+                    PrivateOutcome::Reason(r) => Some(r),
+                    PrivateOutcome::None => None,
+                    PrivateOutcome::NotLive => {
+                        watches.remove(&name);
+                        continue;
+                    }
+                }
+            }
         };
         // the failures in a row end only when no refresh is needed, so the refreshes
         // that private checks start back off as the others do
@@ -300,9 +461,24 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
             w.failures = 0;
             continue;
         };
-        tracing::info!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {reason}");
-        match build::spawn(st, ds.clone(), settings, Mode::Refresh, true, Some(reason)) {
-            Ok(t) => w.task = Some(t.id),
+        #[cfg(test)]
+        fire_tick_hook(TickHookPoint::BeforeSpawn, &name);
+        match build::spawn(
+            st,
+            ds.clone(),
+            settings,
+            Mode::Refresh,
+            true,
+            Some(reason.clone()),
+        ) {
+            Ok(t) => {
+                tracing::info!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {reason}");
+                w.task = Some(t.id);
+            }
+            Err(_) if !is_live_dataset(st, &ds) => {
+                watches.remove(&name);
+                detach_if_not_live(st, &ds);
+            }
             // a build or refresh started meanwhile: check again after it
             Err(_) => w.retry_at = Some(now + debounce),
         }
@@ -313,7 +489,13 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
 /// record and no trigger, since the change may be one the principal cannot see.
 pub const CHECK_REASON: &str = "a check under the review policy found reports whose input changed";
 
-/// Run the private check when one is due and its backoff has passed. `Some` when it
+enum PrivateOutcome {
+    Reason(String),
+    None,
+    NotLive,
+}
+
+/// Run the private check when one is due and its backoff has passed. `Reason` when it
 /// found a change of a report's input; nothing else the check does is visible.
 fn private_check(
     st: &Arc<AppState>,
@@ -322,9 +504,13 @@ fn private_check(
     w: &mut Watch,
     now: Instant,
     debounce: Duration,
-) -> Option<String> {
-    if settings.review_policy.is_none() || !w.private.ready(now) {
-        return None;
+) -> PrivateOutcome {
+    if !is_live_dataset(st, ds) {
+        detach_if_not_live(st, ds);
+        return PrivateOutcome::NotLive;
+    }
+    if !w.private.ready(now) {
+        return PrivateOutcome::None;
     }
     w.private.runs += 1;
     let head = ds.store.head_commit().seq;
@@ -341,19 +527,36 @@ fn private_check(
     };
     match r.private_check() {
         Ok(None) => {
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return PrivateOutcome::NotLive;
+            }
             w.private.done();
             w.private.covered = Some(head);
-            None
+            PrivateOutcome::None
         }
         Ok(Some(why)) => {
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return PrivateOutcome::NotLive;
+            }
             // the refresh it starts clears the check once it ends well
             tracing::debug!(target: "sparkles::graphrag", dataset = %ds.name, "automatic refresh check: {why}");
-            Some(CHECK_REASON.into())
+            let reason = if settings.review_policy.is_some() {
+                CHECK_REASON
+            } else {
+                "a private check found reports whose input changed"
+            };
+            PrivateOutcome::Reason(reason.into())
         }
         Err(e) => {
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return PrivateOutcome::NotLive;
+            }
             tracing::warn!(target: "sparkles::graphrag", dataset = %ds.name, "automatic refresh check: {e}");
             w.private.failed(now, debounce);
-            None
+            PrivateOutcome::None
         }
     }
 }
@@ -361,15 +564,15 @@ fn private_check(
 /// Note what makes a private check due under the review policy `e`: the dataset seen
 /// for the first time, as when the server starts, another evidence configuration or
 /// access policy generation, and a commit since the last look that changed the
-/// policy's decisions or supports graph or added a withdrawal to a proposal graph, read
-/// from the feed without the principal's view.
+/// policy's decisions or supports graph or a withdrawal in a proposal graph. The
+/// probe uses raw history because the eventual input check enforces the principal's view.
 fn note_private(st: &AppState, ds: &Dataset, e: &super::evidence::Evidence, w: &mut Watch) {
     let p = &mut w.private;
     if p.configuration.as_deref() != Some(e.policy.configuration.as_str()) {
         p.configuration = Some(e.policy.configuration.clone());
         p.due = true;
     }
-    let access = st.auth.as_ref().map_or(0, |a| a.epoch());
+    let access = st.access_epoch();
     if p.access != Some(access) {
         p.access = Some(access);
         p.due = true;
@@ -384,62 +587,613 @@ fn note_private(st: &AppState, ds: &Dataset, e: &super::evidence::Evidence, w: &
         return;
     }
     p.evidence_seen = Some(head);
-    if !p.due && evidence_changed(ds, e, after, head) {
+    if !p.due
+        && evidence_changed(
+            &ds.store,
+            &e.policy.decisions,
+            &e.policy.supports,
+            &e.proposals,
+            after,
+            head,
+        )
+    {
         p.due = true;
     }
 }
 
 /// Whether a commit in `after..=head` changed the decisions or supports graph of `e`'s
-/// policy or added a withdrawal to a proposal graph, or may have when the feed cannot
-/// list it.
-fn evidence_changed(ds: &Dataset, e: &super::evidence::Evidence, after: u64, head: u64) -> bool {
-    use sparkles::access::{GraphAccess, GraphRule, Graphs};
-    let mut names: Vec<&str> = vec![&e.policy.decisions, &e.policy.supports];
-    names.extend(e.proposals.iter().map(String::as_str));
-    let o = ChangesOptions {
-        max_commits: PAGE_COMMITS,
-        max_quads: PAGE_QUADS,
-        cancel: None,
-        deadline: Some(Instant::now() + FEED_DEADLINE),
-        graphs: Some(Arc::new(GraphAccess::graphs(
-            Graphs::Only(GraphRule::new(names, &[])),
-            Graphs::none(),
-        ))),
-    };
-    let mut after = after;
-    while after < head {
-        let Ok(page) = ds.store.changes(after, &o) else {
-            return true;
-        };
-        for c in &page.commits {
-            if c.commit.seq > head {
-                return false;
+/// policy or changed a withdrawal in a proposal graph, or may have when history is
+/// unavailable or the probe exhausts its budget.
+fn evidence_changed(
+    store: &sparkles::store::Store,
+    decisions: &str,
+    supports: &str,
+    proposals: &[String],
+    after: u64,
+    head: u64,
+) -> bool {
+    let patterns = [decisions, supports]
+        .into_iter()
+        .map(|graph| HistoryPattern {
+            graph,
+            predicate_object: None,
+        })
+        .chain(proposals.iter().map(|graph| HistoryPattern {
+            graph,
+            predicate_object: Some((super::store::RDF_TYPE, WITHDRAWAL)),
+        }));
+    // Unavailable history or a spent budget also makes a private check due.
+    !matches!(
+        store.probe_raw_history(
+            after,
+            head,
+            patterns,
+            EVIDENCE_PROBE_WORK,
+            Instant::now() + EVIDENCE_PROBE_DEADLINE,
+        ),
+        Ok(Some(false))
+    )
+}
+
+/// The memory cap of the refresh accumulator circuit on `st`.
+fn circuit_memory_bytes(st: &AppState) -> u64 {
+    st.views_options
+        .views_memory
+        .map_or(CIRCUIT_MEMORY_BYTES, |m| m.min(CIRCUIT_MEMORY_BYTES))
+}
+
+/// Escape `s` as a double-quoted SPARQL string literal.
+fn sparql_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04X}", c as u32);
             }
-            if !c.complete() {
-                return true;
-            }
-            for (_, q) in c.iter() {
-                let GraphName::NamedNode(g) = &q.graph_name else {
-                    continue;
-                };
-                let g = g.as_str();
-                if g == e.policy.decisions || g == e.policy.supports {
-                    return true;
-                }
-                if q.predicate.as_str() == super::store::RDF_TYPE
-                    && matches!(&q.object, Term::NamedNode(o) if o.as_str() == WITHDRAWAL)
-                {
-                    return true;
-                }
-            }
+            c => out.push(c),
         }
-        let next = page.next();
-        if page.commits.is_empty() || next >= head.min(page.head.seq) {
-            break;
-        }
-        after = next;
     }
-    false
+    out.push('"');
+    out
+}
+
+/// Build the canonical SPARQL query and key columns for the internal F13 accumulator
+/// circuit of `(settings, extra)` (spec C22 §5, F13 §3.6).
+///
+/// The accumulator keeps the changed fact's identity (`?g`, `?p`, `?o`) through to the
+/// sink so churn across commits and replacements within one commit never cancel, while
+/// keying by `(?s, ?peer)` (and `?nonfact` when `rdf:type` is not excluded) so literal
+/// changes fold onto one key per subject and IRI-to-IRI edges still identify entities
+/// joining a stored community. Returns `None` when no graph can match.
+pub(crate) fn build_accumulator_query(
+    settings: &GraphragSettings,
+    extra: &super::projection::Extra<'_>,
+) -> Option<(String, Vec<&'static str>)> {
+    let mut exact_graphs: BTreeSet<String> = BTreeSet::new();
+    let mut prefix_graphs: BTreeSet<String> = BTreeSet::new();
+    for g in &settings.projection.graphs {
+        if let Some(stem) = g.strip_suffix('*') {
+            prefix_graphs.insert(stem.to_string());
+        } else if extra.reads(settings, g) {
+            exact_graphs.insert(g.clone());
+        }
+    }
+    if let Some(out) = extra.output
+        && extra.reads(settings, out)
+    {
+        exact_graphs.insert(out.to_string());
+    }
+    if exact_graphs.is_empty() && prefix_graphs.is_empty() {
+        return None;
+    }
+
+    let excluded_preds: BTreeSet<String> = settings
+        .projection
+        .exclude
+        .iter()
+        .filter_map(|p| oxrdf::NamedNode::new(p.as_str()).ok())
+        .map(|n| n.to_string())
+        .collect();
+    let rdf_type_excluded = excluded_preds.contains(RDF_TYPE);
+
+    let mut pred_filters: Vec<String> = Vec::new();
+    if !excluded_preds.is_empty() {
+        let list: Vec<&str> = excluded_preds.iter().map(String::as_str).collect();
+        pred_filters.push(format!("?p NOT IN ({})", list.join(", ")));
+    }
+    if rdf_type_excluded {
+        pred_filters.push("isIRI(?s) && (isIRI(?o) || isLiteral(?o))".into());
+    } else {
+        pred_filters.push(format!(
+            "isIRI(?s) && ((?p != {RDF_TYPE} && (isIRI(?o) || isLiteral(?o))) || (isIRI(?o) && ?s != ?o))"
+        ));
+    }
+
+    let peer_bind = "BIND(IF(isIRI(?o) && ?s != ?o, ?o, ?_unset) AS ?peer)";
+    let (key_select, keys, nonfact_bind) = if rdf_type_excluded {
+        ("?s ?peer", vec!["s", "peer"], String::new())
+    } else {
+        (
+            "?s ?peer ?nonfact",
+            vec!["s", "peer", "nonfact"],
+            format!(" BIND(IF(?p = {RDF_TYPE}, false, ?_unset) AS ?nonfact)"),
+        )
+    };
+
+    // Route `urn:x-arq:*` IRIs through the `GRAPH ?g` filter path: F13 compiles constant
+    // `GRAPH <urn:x-arq:...>` clauses to `Recompute` (scanning and retaining rows), and
+    // the SPARQL planner interprets `UnionGraph`/`DefaultGraph` as aliases rather than
+    // physical named graphs.
+    let exact_iris: Option<Vec<String>> = if prefix_graphs.is_empty()
+        && exact_graphs.len() <= MAX_EXACT_GRAPHS_UNION
+        && !exact_graphs.iter().any(|g| g.starts_with("urn:x-arq:"))
+    {
+        exact_graphs
+            .iter()
+            .map(|g| {
+                oxrdf::NamedNode::new(g.as_str())
+                    .ok()
+                    .map(|n| n.to_string())
+            })
+            .collect()
+    } else {
+        None
+    };
+
+    let query = match exact_iris {
+        Some(iris) if iris.len() == 1 => {
+            let g = &iris[0];
+            format!(
+                "SELECT {key_select} ?p ?o WHERE {{ GRAPH {g} {{ ?s ?p ?o }} FILTER({}) {peer_bind}{nonfact_bind} }}",
+                pred_filters.join(" && ")
+            )
+        }
+        Some(iris) => {
+            let branches: Vec<String> = iris
+                .iter()
+                .map(|g| format!("{{ GRAPH {g} {{ ?s ?p ?o }} BIND({g} AS ?g) }}"))
+                .collect();
+            format!(
+                "SELECT {key_select} ?g ?p ?o WHERE {{ {} FILTER({}) {peer_bind}{nonfact_bind} }}",
+                branches.join(" UNION "),
+                pred_filters.join(" && ")
+            )
+        }
+        None => {
+            let mut graph_terms: Vec<String> = Vec::new();
+            for g in &exact_graphs {
+                graph_terms.push(format!("STR(?g) = {}", sparql_string(g)));
+            }
+            for stem in &prefix_graphs {
+                graph_terms.push(format!("STRSTARTS(STR(?g), {})", sparql_string(stem)));
+            }
+            let mut all_filters = Vec::with_capacity(pred_filters.len() + 3);
+            all_filters.push(format!(
+                "!STRSTARTS(STR(?g), {})",
+                sparql_string(super::settings::GUARDED_PREFIX)
+            ));
+            all_filters.push(format!("({})", graph_terms.join(" || ")));
+            if let Some(excl) = extra.excluded
+                && !excl.is_empty()
+            {
+                let list: Vec<String> = excl.iter().map(|g| sparql_string(g)).collect();
+                all_filters.push(format!("STR(?g) NOT IN ({})", list.join(", ")));
+            }
+            all_filters.extend(pred_filters);
+            format!(
+                "SELECT {key_select} ?g ?p ?o WHERE {{ GRAPH ?g {{ ?s ?p ?o }} FILTER({}) {peer_bind}{nonfact_bind} }}",
+                all_filters.join(" && ")
+            )
+        }
+    };
+    Some((query, keys))
+}
+
+enum CircuitPlan {
+    Empty,
+    Uncountable(&'static str),
+    Attach {
+        spec: InternalSpec,
+        access: Option<Arc<sparkles::access::GraphAccess>>,
+        access_fp: u64,
+    },
+}
+
+enum EnsureCircuit {
+    Attached(InternalCircuit),
+    NotLive,
+    Failed(String),
+}
+
+/// Whether `ds` is still the live, non-restoring dataset registered under `ds.name`.
+pub(crate) fn is_live_dataset(st: &AppState, ds: &Dataset) -> bool {
+    if st.catalog.restoring_by(&ds.name).is_some() {
+        return false;
+    }
+    st.get(&ds.name).is_some_and(|cur| {
+        cur.store.dataset_id() == ds.store.dataset_id()
+            && Arc::ptr_eq(
+                &cur.dataset.inner_state().views,
+                &ds.dataset.inner_state().views,
+            )
+    })
+}
+
+/// Whether `(dataset_id, runtime)` is still the live, non-restoring dataset registered
+/// under `name`.
+fn is_live_owner(
+    st: &AppState,
+    name: &str,
+    dataset_id: uuid::Uuid,
+    runtime: &Weak<sparkles::incr::Runtime>,
+) -> bool {
+    if st.catalog.restoring_by(name).is_some() {
+        return false;
+    }
+    runtime.strong_count() > 0
+        && st.get(name).is_some_and(|cur| {
+            cur.store.dataset_id() == dataset_id
+                && Weak::ptr_eq(runtime, &Arc::downgrade(&cur.dataset.inner_state().views))
+        })
+}
+
+/// Detach `ds`'s circuit under `circuit_lock` only if `ds` is still non-live.
+fn detach_if_not_live(st: &AppState, ds: &Dataset) {
+    let lock = st.graphrag.circuit_lock(&ds.name);
+    let _held = lock.lock();
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+    }
+}
+
+/// Detach `ds`'s circuit under `circuit_lock` only if `ds` is non-live or live settings
+/// are still disabled / non-auto.
+fn detach_if_not_auto(st: &AppState, ds: &Dataset) {
+    let lock = st.graphrag.circuit_lock(&ds.name);
+    let _held = lock.lock();
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        return;
+    }
+    let live: GraphragSettings = crate::settings::effective(st, ds, &crate::settings::GRAPHRAG);
+    if !live.enabled || live.refresh.mode != RefreshMode::Auto {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+    }
+}
+
+fn is_internal_conflict(e: &sparkles::Error) -> bool {
+    matches!(e, sparkles::Error::Component(c) if c.code == "internal-conflict")
+}
+
+fn resolve_evidence(
+    st: &AppState,
+    ds: &Dataset,
+    settings: &GraphragSettings,
+) -> Result<Option<super::evidence::Evidence>, String> {
+    let Some(name) = &settings.review_policy else {
+        return Ok(None);
+    };
+    crate::settings::evidence::require_reconciled(st, ds)
+        .map_err(|e| super::evidence::engine(e).to_string())?;
+    super::evidence::Evidence::admit(
+        ds,
+        Some(name),
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Default::default(),
+        &ds.dataset.query_options(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Plan the internal F13 accumulator circuit for `ds` under `settings` and `evidence`,
+/// detaching any existing handle for `ds` when authorization fails or the projection is
+/// empty or uncountable. Caller must hold `st.graphrag.circuit_lock(&ds.name)`.
+fn plan_circuit_locked(
+    st: &AppState,
+    ds: &Dataset,
+    settings: &GraphragSettings,
+    evidence: Option<&super::evidence::Evidence>,
+) -> Result<CircuitPlan, String> {
+    let principal = match build::authorized_principal(st, ds, &settings.principal) {
+        Ok(p) => p,
+        Err(e) => {
+            st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+            return Err(e);
+        }
+    };
+    let access = principal.view(&ds.name, Endpoint::Query);
+    if let Some(reason) = sparkles::incr::runtime::whole_reason(access.as_ref()) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        return Ok(CircuitPlan::Uncountable(reason));
+    }
+    let extra = super::projection::Extra {
+        output: evidence.map(|e| e.policy.output.as_str()),
+        excluded: evidence.map(|e| &e.excluded),
+    };
+    let Some((query, keys)) = build_accumulator_query(settings, &extra) else {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        return Ok(CircuitPlan::Empty);
+    };
+    let spec =
+        InternalSpec::accumulator(CIRCUIT_ID, query, keys).with_memory(circuit_memory_bytes(st));
+    let access_fp = sparkles::incr::runtime::access_fingerprint(access.as_ref());
+    Ok(CircuitPlan::Attach {
+        spec,
+        access,
+        access_fp,
+    })
+}
+
+/// Return the attached refresh circuit matching `(spec, access_fp)`, replacing any
+/// stale handle for `ds.name` after waiting for the worker to collect it. Caller must
+/// hold `st.graphrag.circuit_lock(&ds.name)`.
+fn ensure_circuit_locked(
+    st: &AppState,
+    ds: &Dataset,
+    settings: &GraphragSettings,
+    access_epoch: u64,
+    spec: InternalSpec,
+    access: Option<Arc<sparkles::access::GraphAccess>>,
+    access_fp: u64,
+) -> EnsureCircuit {
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        return EnsureCircuit::NotLive;
+    }
+    if let Some(handle) = st.graphrag.refresh_circuit_sync_locked(
+        &ds.name,
+        ds,
+        settings,
+        access_epoch,
+        &spec,
+        access_fp,
+    ) {
+        return EnsureCircuit::Attached(handle);
+    }
+    let views = &ds.dataset.inner_state().views;
+    let deadline = Instant::now() + CIRCUIT_SETTLE_TIMEOUT;
+    if let Some(old) = st.graphrag.take_refresh_circuit_locked(&ds.name) {
+        let same_store = old.same_store(ds);
+        drop(old);
+        if same_store && !views.is_closed() {
+            views.settle(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+    let handle = loop {
+        if !is_live_dataset(st, ds) {
+            return EnsureCircuit::NotLive;
+        }
+        let internal_access = match &access {
+            Some(g) => InternalAccess::reading(g.clone()),
+            None => InternalAccess::everything(),
+        };
+        match ds.dataset.attach_internal(spec.clone(), internal_access) {
+            Ok(h) => break h,
+            Err(e) if is_internal_conflict(&e) && !views.is_closed() => {
+                // A single `settle()` can finish an in-flight round that had already
+                // passed `collect_internal`, or follow an earlier unsettled detach; retry
+                // across subsequent rounds until collection completes or the budget ends.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return EnsureCircuit::Failed(e.to_string());
+                }
+                views.settle(remaining);
+            }
+            Err(e) => return EnsureCircuit::Failed(e.to_string()),
+        }
+    };
+    if !is_live_dataset(st, ds) {
+        drop(handle);
+        return EnsureCircuit::NotLive;
+    }
+    let displaced = st.graphrag.set_refresh_circuit_locked(
+        &ds.name,
+        RefreshCircuit::new(
+            ds,
+            settings.clone(),
+            access_epoch,
+            spec,
+            access_fp,
+            handle.clone(),
+        ),
+    );
+    drop(displaced);
+    EnsureCircuit::Attached(handle)
+}
+
+/// Sync the refresh circuit right after a build or refresh saves its state on `main`,
+/// discarding counts that the completed run already covers. Always reads live settings,
+/// access epoch and review policy under the per-dataset circuit lock so a finishing
+/// build never clobbers a newer projection or re-attaches during a restore or delete.
+pub(crate) fn after_build(st: &AppState, ds: &Dataset, source_commit: u64) {
+    if ds.branch.is_some() {
+        return;
+    }
+    let lock = st.graphrag.circuit_lock(&ds.name);
+    let _held = lock.lock();
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        return;
+    }
+    let settings: GraphragSettings = crate::settings::effective(st, ds, &crate::settings::GRAPHRAG);
+    let epoch = st.access_epoch();
+    if !settings.enabled || settings.refresh.mode != RefreshMode::Auto {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        return;
+    }
+    let evidence = match resolve_evidence(st, ds, &settings) {
+        Ok(e) => e,
+        Err(e) => {
+            st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+            tracing::warn!(
+                target: "sparkles::graphrag",
+                dataset = %ds.name,
+                "automatic refresh circuit: {e}"
+            );
+            return;
+        }
+    };
+    match plan_circuit_locked(st, ds, &settings, evidence.as_ref()) {
+        Ok(CircuitPlan::Attach {
+            spec,
+            access,
+            access_fp,
+        }) => match ensure_circuit_locked(st, ds, &settings, epoch, spec, access, access_fp) {
+            EnsureCircuit::Attached(handle) => {
+                let head = ds.store.head_commit().seq;
+                let through = advance_past_graphrag(&ds.store, source_commit, head);
+                handle.discard_through(through);
+            }
+            EnsureCircuit::NotLive => {}
+            EnsureCircuit::Failed(e) => {
+                tracing::warn!(
+                    target: "sparkles::graphrag",
+                    dataset = %ds.name,
+                    "automatic refresh circuit: {e}"
+                );
+            }
+        },
+        Ok(CircuitPlan::Empty | CircuitPlan::Uncountable(_)) => {}
+        Err(e) => {
+            tracing::warn!(
+                target: "sparkles::graphrag",
+                dataset = %ds.name,
+                "automatic refresh circuit: {e}"
+            );
+        }
+    }
+}
+
+enum AttachState {
+    Active(Box<GraphragSettings>, u64),
+    Inactive,
+    NotLive,
+}
+
+enum DueOutcome {
+    Reason(String, Box<GraphragSettings>),
+    None(Box<GraphragSettings>),
+    NotAuto,
+    NotLive,
+}
+
+/// Keep the internal accumulator attached ahead of the debounce window whenever `ds` has
+/// a `main` build, without reading `state.json` on idle ticks.
+fn ensure_attached(
+    st: &AppState,
+    ds: &Dataset,
+    settings: &GraphragSettings,
+    head: u64,
+    w: &mut Watch,
+) -> AttachState {
+    let epoch = st.access_epoch();
+    let settings_same = w.attached_settings.as_ref() == Some(settings);
+    let epoch_same = w.attached_epoch == Some(epoch);
+    let evidence_moved = settings.review_policy.is_some() && w.attached_head != Some(head);
+    let has_matching = st
+        .graphrag
+        .has_matching_circuit(&ds.name, ds, settings, epoch);
+    if settings_same
+        && epoch_same
+        && !evidence_moved
+        && (has_matching
+            || (w.attached_uncountable && !st.graphrag.has_refresh_circuit(&ds.name, ds)))
+    {
+        return AttachState::Active(Box::new(settings.clone()), head);
+    }
+    if !st.graphrag.has_refresh_circuit(&ds.name, ds)
+        && w.no_build_head == Some(head)
+        && settings_same
+        && epoch_same
+    {
+        return AttachState::Active(Box::new(settings.clone()), head);
+    }
+    #[cfg(test)]
+    fire_tick_hook(TickHookPoint::BeforeEnsureLock, &ds.name);
+    let lock = st.graphrag.circuit_lock(&ds.name);
+    let _held = lock.lock();
+    if !is_live_dataset(st, ds) {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        w.clear_attached();
+        return AttachState::NotLive;
+    }
+    // Re-read live settings, access epoch, head and build state under the circuit lock so
+    // an older tick snapshot never clobbers or detaches a circuit published by a newer
+    // build or settings change.
+    let live_settings: GraphragSettings =
+        crate::settings::effective(st, ds, &crate::settings::GRAPHRAG);
+    if !live_settings.enabled || live_settings.refresh.mode != RefreshMode::Auto {
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        w.clear_attached();
+        return AttachState::Inactive;
+    }
+    let epoch = st.access_epoch();
+    let head = ds.store.head_commit().seq;
+    let Ok(state) = build::state_of(st, ds) else {
+        return AttachState::Active(Box::new(live_settings), head);
+    };
+    let Some(b) = state
+        .last_build
+        .as_ref()
+        .filter(|b| b.branch == sparkles::branch::MAIN)
+    else {
+        w.no_build_head = Some(head);
+        w.attached_settings = Some(live_settings.clone());
+        w.attached_epoch = Some(epoch);
+        w.attached_head = Some(head);
+        w.attached_uncountable = false;
+        st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+        return AttachState::Active(Box::new(live_settings), head);
+    };
+    w.no_build_head = None;
+    let evidence = match resolve_evidence(st, ds, &live_settings) {
+        Ok(e) => e,
+        Err(_) => {
+            st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+            w.clear_attached();
+            return AttachState::Active(Box::new(live_settings), head);
+        }
+    };
+    match plan_circuit_locked(st, ds, &live_settings, evidence.as_ref()) {
+        Ok(CircuitPlan::Attach {
+            spec,
+            access,
+            access_fp,
+        }) => match ensure_circuit_locked(st, ds, &live_settings, epoch, spec, access, access_fp) {
+            EnsureCircuit::Attached(handle) => {
+                let through = advance_past_graphrag(&ds.store, b.source_commit, head);
+                handle.discard_through(through);
+                w.attached_settings = Some(live_settings.clone());
+                w.attached_epoch = Some(epoch);
+                w.attached_head = Some(head);
+                w.attached_uncountable = false;
+                AttachState::Active(Box::new(live_settings), head)
+            }
+            EnsureCircuit::NotLive => {
+                w.clear_attached();
+                AttachState::NotLive
+            }
+            EnsureCircuit::Failed(_) => {
+                w.clear_attached();
+                AttachState::Active(Box::new(live_settings), head)
+            }
+        },
+        Ok(CircuitPlan::Empty | CircuitPlan::Uncountable(_)) | Err(_) => {
+            w.attached_settings = Some(live_settings.clone());
+            w.attached_epoch = Some(epoch);
+            w.attached_head = Some(head);
+            w.attached_uncountable = true;
+            AttachState::Active(Box::new(live_settings), head)
+        }
+    }
 }
 
 /// Why the dataset needs a refresh now, if it does.
@@ -449,138 +1203,334 @@ pub(crate) fn due_reason(
     settings: &GraphragSettings,
     w: &mut Watch,
 ) -> Result<Option<String>, String> {
-    let state = build::state_of(st, ds)?;
-    let Some(b) = &state.last_build else {
-        return Ok(None);
-    };
-    if b.branch != sparkles::branch::MAIN {
-        return Ok(None);
+    match due_outcome(st, ds, settings, w, false)? {
+        DueOutcome::Reason(r, _) => Ok(Some(r)),
+        DueOutcome::None(_) | DueOutcome::NotAuto | DueOutcome::NotLive => Ok(None),
     }
-    w.has_pending = !b.pending.is_empty();
-    w.had_policy = b.policy.is_some();
-    // the policy the reports read under: enabling, switching or removing it, or a new
-    // version, rewrites every report (spec C25, "Reports on accepted evidence")
-    let evidence = match &settings.review_policy {
-        Some(name) => Some(
-            super::evidence::Evidence::admit(
-                ds,
-                Some(name),
-                None,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Default::default(),
-            )
-            .map_err(|e| e.to_string())?
-            .expect("a named policy"),
-        ),
-        None => None,
-    };
-    if let Some(e) = &evidence {
-        note_private(st, ds, e, w);
+}
+
+fn due_outcome(
+    st: &AppState,
+    ds: &Dataset,
+    _settings: &GraphragSettings,
+    w: &mut Watch,
+    require_auto: bool,
+) -> Result<DueOutcome, String> {
+    struct WaitStep {
+        live_settings: GraphragSettings,
+        state: BuildState,
+        evidence: Option<super::evidence::Evidence>,
+        head: u64,
+        effective_after: u64,
+        handle: InternalCircuit,
     }
-    match (&evidence, &b.policy) {
-        (None, None) => {}
-        (None, Some(_)) => {
-            return Ok(Some(
-                "the reports no longer read under a review policy".into(),
-            ));
+
+    enum LockStep {
+        Early {
+            outcome: DueOutcome,
+            evidence: Option<Box<super::evidence::Evidence>>,
+        },
+        Fallback {
+            live_settings: Box<GraphragSettings>,
+            evidence: Option<Box<super::evidence::Evidence>>,
+            head: u64,
+            msg: String,
+        },
+        Wait(Box<WaitStep>),
+    }
+
+    let step = {
+        let lock = st.graphrag.circuit_lock(&ds.name);
+        let _held = lock.lock();
+        if !is_live_dataset(st, ds) {
+            st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+            w.clear_attached();
+            return Ok(DueOutcome::NotLive);
         }
-        (Some(e), stored) => {
-            if !stored.as_ref().is_some_and(|p| {
+        let live_settings: GraphragSettings =
+            crate::settings::effective(st, ds, &crate::settings::GRAPHRAG);
+        if !live_settings.enabled
+            || (require_auto && live_settings.refresh.mode != RefreshMode::Auto)
+        {
+            st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+            w.clear_attached();
+            return Ok(DueOutcome::NotAuto);
+        }
+        let state = build::state_of(st, ds)?;
+        let Some(b) = &state.last_build else {
+            return Ok(DueOutcome::None(Box::new(live_settings)));
+        };
+        if b.branch != sparkles::branch::MAIN {
+            return Ok(DueOutcome::None(Box::new(live_settings)));
+        }
+        w.has_pending = !b.pending.is_empty();
+        w.had_policy = b.policy.is_some();
+        // the policy the reports read under: enabling, switching or removing it, or a new
+        // version, rewrites every report (spec C25, "Reports on accepted evidence")
+        let evidence = match resolve_evidence(st, ds, &live_settings) {
+            Ok(e) => e,
+            Err(e) => {
+                st.graphrag.detach_circuit_for_locked(&ds.name, ds);
+                w.clear_attached();
+                return Err(e);
+            }
+        };
+        let policy_reason = match (&evidence, &b.policy) {
+            (None, None) => None,
+            (None, Some(_)) => Some("the reports no longer read under a review policy".into()),
+            (Some(e), stored) => (!stored.as_ref().is_some_and(|p| {
                 p.name == e.policy.name && p.iri == e.policy.iri && p.version == e.policy.version
-            }) {
-                return Ok(Some(format!(
+            }))
+            .then(|| {
+                format!(
                     "the reports read under review policy {} at version {}",
                     e.policy.name, e.policy.version
-                )));
-            }
-        }
-    }
-    if !b.pending.is_empty() {
-        let today = build::today();
-        if w.retried_day != Some(today) {
-            w.retried_day = Some(today);
-            return Ok(Some(format!(
-                "{} communities are pending from an earlier run",
-                b.pending.len()
-            )));
-        }
-    }
-    // only GraphRAG's own commits since then: nothing the reports read changed, which
-    // also keeps a refresh from following its own commit when the feed is unavailable
-    if !source_changed(&ds.store, b.source_commit) {
-        return Ok(None);
-    }
-    let principal = build::authorized_principal(st, ds, &settings.principal)?;
-    let o = ChangesOptions {
-        max_commits: PAGE_COMMITS,
-        max_quads: PAGE_QUADS,
-        cancel: None,
-        deadline: Some(Instant::now() + FEED_DEADLINE),
-        graphs: principal.view(&ds.name, Endpoint::Query),
-    };
-    let mut counter = Counter::new(&state, settings);
-    let mut after = b.source_commit;
-    loop {
-        let page = match ds.store.changes(after, &o) {
-            Ok(p) => p,
-            // the feed cannot list what changed, so the digests decide
-            Err(
-                e @ (sparkles::Error::HistoryGone(_)
-                | sparkles::Error::NotPermitted(_)
-                | sparkles::Error::NotFound(_)),
-            ) => {
-                // under a review policy, the private check decides
-                if evidence.is_some() {
-                    w.private.uncounted(ds.store.head_commit().seq);
-                    return Ok(None);
-                }
-                return Ok(Some(format!(
-                    "the change feed cannot list the changes: {e}"
-                )));
-            }
-            Err(e) => return Err(e.to_string()),
+                )
+            }),
         };
-        for c in &page.commits {
-            if c.commit.kind == CommitKind::Graphrag {
-                continue;
+        if let Some(reason) = policy_reason {
+            LockStep::Early {
+                outcome: DueOutcome::Reason(reason, Box::new(live_settings)),
+                evidence: evidence.map(Box::new),
             }
-            if !c.complete() {
-                if evidence.is_some() {
-                    w.private.uncounted(ds.store.head_commit().seq);
-                    return Ok(None);
-                }
-                return Ok(Some(format!(
-                    "commit {} changed too many facts to count",
-                    c.commit.seq
-                )));
+        } else if !b.pending.is_empty() && w.retried_day != Some(build::today()) {
+            w.retried_day = Some(build::today());
+            LockStep::Early {
+                outcome: DueOutcome::Reason(
+                    format!(
+                        "{} communities are pending from an earlier run",
+                        b.pending.len()
+                    ),
+                    Box::new(live_settings),
+                ),
+                evidence: evidence.map(Box::new),
             }
-            for (_, q) in c.iter() {
-                let GraphName::NamedNode(g) = &q.graph_name else {
-                    continue;
-                };
-                // a decision, support or withdrawal, seen or not, is the private
-                // check's to weigh (`note_private`)
-                // the graphs the preparation reads: the projection's and the output
-                // graph, without the other graphs of an evidence role
-                let extra = super::projection::Extra {
-                    output: evidence.as_ref().map(|e| e.policy.output.as_str()),
-                    excluded: evidence.as_ref().map(|e| &e.excluded),
-                };
-                if !extra.reads(settings, g.as_str()) {
-                    continue;
-                }
-                if let Some(r) = counter.change(&q.subject, &q.predicate.to_string(), &q.object) {
-                    return Ok(Some(r));
+        } else if !source_changed(&ds.store, b.source_commit) {
+            // only GraphRAG's own commits since then: nothing the reports read changed,
+            // which also keeps a refresh from following its own commit when counts are
+            // unavailable
+            LockStep::Early {
+                outcome: DueOutcome::None(Box::new(live_settings)),
+                evidence: evidence.map(Box::new),
+            }
+        } else {
+            let head = ds.store.head_commit().seq;
+            let effective_after = advance_past_graphrag(&ds.store, b.source_commit, head);
+            let epoch = st.access_epoch();
+            match plan_circuit_locked(st, ds, &live_settings, evidence.as_ref())? {
+                CircuitPlan::Empty => LockStep::Early {
+                    outcome: DueOutcome::None(Box::new(live_settings)),
+                    evidence: evidence.map(Box::new),
+                },
+                CircuitPlan::Uncountable(why) => LockStep::Fallback {
+                    live_settings: Box::new(live_settings),
+                    evidence: evidence.map(Box::new),
+                    head,
+                    msg: format!("the incremental refresh circuit cannot count the changes: {why}"),
+                },
+                CircuitPlan::Attach {
+                    spec,
+                    access,
+                    access_fp,
+                } => {
+                    if live_settings.refresh.mode == RefreshMode::Auto {
+                        match ensure_circuit_locked(
+                            st,
+                            ds,
+                            &live_settings,
+                            epoch,
+                            spec,
+                            access,
+                            access_fp,
+                        ) {
+                            EnsureCircuit::Attached(handle) => {
+                                w.no_build_head = None;
+                                w.attached_settings = Some(live_settings.clone());
+                                w.attached_epoch = Some(epoch);
+                                w.attached_head = Some(head);
+                                w.attached_uncountable = false;
+                                LockStep::Wait(Box::new(WaitStep {
+                                    live_settings,
+                                    state,
+                                    evidence,
+                                    head,
+                                    effective_after,
+                                    handle,
+                                }))
+                            }
+                            EnsureCircuit::NotLive => {
+                                w.clear_attached();
+                                return Ok(DueOutcome::NotLive);
+                            }
+                            EnsureCircuit::Failed(e) => {
+                                w.clear_attached();
+                                LockStep::Fallback {
+                                    live_settings: Box::new(live_settings),
+                                    evidence: evidence.map(Box::new),
+                                    head,
+                                    msg: format!(
+                                        "the incremental refresh circuit could not attach: {e}"
+                                    ),
+                                }
+                            }
+                        }
+                    } else {
+                        match st.graphrag.refresh_circuit(&ds.name, ds, &spec, access_fp) {
+                            Some(handle) => LockStep::Wait(Box::new(WaitStep {
+                                live_settings,
+                                state,
+                                evidence,
+                                head,
+                                effective_after,
+                                handle,
+                            })),
+                            None => LockStep::Fallback {
+                                live_settings: Box::new(live_settings),
+                                evidence: evidence.map(Box::new),
+                                head,
+                                msg:
+                                    "the incremental refresh circuit is not attached in manual mode"
+                                        .into(),
+                            },
+                        }
+                    }
                 }
             }
         }
-        let next = page.next();
-        if page.commits.is_empty() || next >= page.head.seq {
-            break;
+    };
+
+    let fallback = |w: &mut Watch,
+                    has_evidence: bool,
+                    head: u64,
+                    live_settings: Box<GraphragSettings>,
+                    msg: String|
+     -> Result<DueOutcome, String> {
+        // A restricted circuit can lose its count range when it may read a
+        // support-gated graph, even without a configured review policy. Check
+        // the principal's report inputs before making that loss observable.
+        let private = has_evidence
+            || (require_auto
+                && (ds.store.configuration_history_activated()
+                    || ds.store.snapshot().has_evidence_projection_or_unavailable())
+                && build::authorized_principal(st, ds, &live_settings.principal)?
+                    .view(&ds.name, Endpoint::Query)
+                    .is_some_and(|access| !access.reads_everything()));
+        if private {
+            let access = st.access_epoch();
+            if w.private.access != Some(access) {
+                w.private.access = Some(access);
+                w.private.covered = None;
+            }
+            w.private.uncounted(head);
+            Ok(DueOutcome::None(live_settings))
+        } else {
+            Ok(DueOutcome::Reason(msg, live_settings))
         }
-        after = next;
+    };
+
+    match step {
+        LockStep::Early { outcome, evidence } => {
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return Ok(DueOutcome::NotLive);
+            }
+            if let Some(e) = &evidence {
+                note_private(st, ds, e, w);
+            }
+            Ok(outcome)
+        }
+        LockStep::Fallback {
+            live_settings,
+            evidence,
+            head,
+            msg,
+        } => {
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return Ok(DueOutcome::NotLive);
+            }
+            if let Some(e) = &evidence {
+                note_private(st, ds, e, w);
+            }
+            fallback(w, evidence.is_some(), head, live_settings, msg)
+        }
+        LockStep::Wait(wait) => {
+            let WaitStep {
+                live_settings,
+                state,
+                evidence,
+                head,
+                effective_after,
+                handle,
+            } = *wait;
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return Ok(DueOutcome::NotLive);
+            }
+            if let Some(e) = &evidence {
+                note_private(st, ds, e, w);
+            }
+            let caught_up = handle.wait(head, CIRCUIT_WAIT_TIMEOUT);
+            if !is_live_dataset(st, ds) {
+                detach_if_not_live(st, ds);
+                return Ok(DueOutcome::NotLive);
+            }
+            match handle.counts(effective_after) {
+                Ok(counts) if caught_up && counts.through >= head => {
+                    if let Some(why) = counts.unknown {
+                        fallback(
+                            w,
+                            evidence.is_some(),
+                            head,
+                            Box::new(live_settings),
+                            format!(
+                                "the incremental refresh circuit cannot count every commit: {why}"
+                            ),
+                        )
+                    } else {
+                        let mut counter = Counter::new(&state, &live_settings);
+                        if let Some(joined) = counter.apply_counts(&counts) {
+                            return Ok(DueOutcome::Reason(joined, Box::new(live_settings)));
+                        }
+                        match counter.verdict(live_settings.refresh.min_changed_fraction) {
+                            Some(reason) => Ok(DueOutcome::Reason(reason, Box::new(live_settings))),
+                            None => Ok(DueOutcome::None(Box::new(live_settings))),
+                        }
+                    }
+                }
+                Ok(_) => Err(format!(
+                    "the incremental refresh circuit did not reach commit {head} in time (at {})",
+                    handle.commit()
+                )),
+                Err(e) => {
+                    handle.rebuild();
+                    fallback(
+                        w,
+                        evidence.is_some(),
+                        head,
+                        Box::new(live_settings),
+                        format!("the incremental refresh circuit failed: {e}"),
+                    )
+                }
+            }
+        }
     }
-    Ok(counter.verdict(settings.refresh.min_changed_fraction))
+}
+
+/// Advance `after` past any contiguous GraphRAG-only commits starting at `after + 1`.
+/// GraphRAG commits write only to guarded graphs, which the projection never reads, so
+/// skipping them aligns an accumulator attached after a build with its baseline without
+/// skipping any source commit.
+fn advance_past_graphrag(store: &sparkles::store::Store, after: u64, head: u64) -> u64 {
+    let mut cur = after;
+    let limit = head.min(after.saturating_add(MAX_KIND_CHECKS));
+    while cur < limit {
+        match store.commit(cur + 1) {
+            Some(c) if c.kind == CommitKind::Graphrag => cur += 1,
+            _ => break,
+        }
+    }
+    cur
 }
 
 /// Whether a commit after `after` other than GraphRAG's own may have changed data. A
@@ -608,16 +1558,20 @@ struct Counter<'a> {
     of: HashMap<&'a str, Vec<usize>>,
     /// every member of a stored community
     known: HashSet<&'a str>,
+    #[cfg(test)]
     excluded: HashSet<String>,
     changed: Vec<usize>,
 }
 
 impl<'a> Counter<'a> {
     fn new(state: &'a BuildState, settings: &GraphragSettings) -> Counter<'a> {
+        #[cfg(not(test))]
+        let _ = settings;
         let mut c = Counter {
             communities: Vec::new(),
             of: HashMap::new(),
             known: HashSet::new(),
+            #[cfg(test)]
             excluded: settings
                 .projection
                 .exclude
@@ -644,9 +1598,52 @@ impl<'a> Counter<'a> {
         c
     }
 
-    /// Count one added or removed quad. `Some` when an entity joins a stored community:
-    /// an edge between resources links a member with an entity no community holds.
-    fn change(&mut self, s: &NamedOrBlankNode, p: &str, o: &Term) -> Option<String> {
+    /// Total the accumulator's per-key counts onto each stored community. Returns `Some`
+    /// when an IRI-to-IRI edge links a stored community member with an entity no stored
+    /// community holds, choosing the lexicographically smallest joining entity.
+    fn apply_counts(&mut self, counts: &Counts) -> Option<String> {
+        let mut joined: Option<String> = None;
+        for (key, n) in &counts.keys {
+            if *n == 0 {
+                continue;
+            }
+            let Some(Some(s_term)) = key.first() else {
+                continue;
+            };
+            let st = s_term.to_string();
+            // Key layout: `[s, peer]` when rdf:type is excluded, or `[s, peer, nonfact]`
+            // where `nonfact` is bound (`Some(false)`) only for non-excluded rdf:type.
+            let is_fact = key.get(2).is_none_or(Option::is_none);
+            if is_fact && let Some(cs) = self.of.get(st.as_str()) {
+                let delta = usize::try_from(*n).unwrap_or(usize::MAX);
+                for &i in cs {
+                    self.changed[i] = self.changed[i].saturating_add(delta);
+                }
+            }
+            if let Some(Some(Term::NamedNode(peer))) = key.get(1)
+                && matches!(s_term, Term::NamedNode(_))
+            {
+                let ot = peer.to_string();
+                if st != ot {
+                    let (a, b) = (
+                        self.known.contains(st.as_str()),
+                        self.known.contains(ot.as_str()),
+                    );
+                    if a != b {
+                        let new = if a { ot } else { st };
+                        if joined.as_ref().is_none_or(|cur| new < *cur) {
+                            joined = Some(new);
+                        }
+                    }
+                }
+            }
+        }
+        joined.map(|new| format!("{new} joined a community"))
+    }
+
+    /// Count one added or removed quad (reference oracle used by tests).
+    #[cfg(test)]
+    fn change(&mut self, s: &oxrdf::NamedOrBlankNode, p: &str, o: &Term) -> Option<String> {
         if self.excluded.contains(p) {
             return None;
         }
@@ -659,7 +1656,7 @@ impl<'a> Counter<'a> {
                 self.changed[i] += 1;
             }
         }
-        if let (NamedOrBlankNode::NamedNode(_), Term::NamedNode(_)) = (s, o) {
+        if let (oxrdf::NamedOrBlankNode::NamedNode(_), Term::NamedNode(_)) = (s, o) {
             let ot = o.to_string();
             if st != ot {
                 let (a, b) = (
@@ -690,6 +1687,7 @@ mod tests {
     use super::*;
     use crate::graphrag::settings::is_guarded;
     use crate::graphrag::state::{BuildRecord, StoredCommunity};
+    use oxrdf::NamedOrBlankNode;
 
     fn state() -> BuildState {
         BuildState {
@@ -720,6 +1718,53 @@ mod tests {
 
     fn iri(s: &str) -> oxrdf::NamedNode {
         oxrdf::NamedNode::new(s).unwrap()
+    }
+
+    #[test]
+    fn evidence_history_skips_a_large_unrelated_memory_commit() {
+        let store = sparkles::store::Store::in_memory(Default::default());
+        store
+            .set_retention(sparkles::history::Retention {
+                keep_commits: Some(5),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut txn = store.write();
+        let s = txn.intern(&iri("urn:s").into()).unwrap();
+        let p = txn.intern(&iri("urn:p").into()).unwrap();
+        let unrelated = txn.intern(&iri("urn:unrelated").into()).unwrap();
+        let decisions = txn.intern(&iri("urn:decisions").into()).unwrap();
+        txn.insert([s, p, sparkles::id::Id::from_i64(-1).unwrap(), decisions])
+            .unwrap();
+        txn.commit().unwrap();
+        let after = store.head_commit().seq;
+        let mut txn = store.write();
+        for n in 0..200_001 {
+            txn.insert([s, p, sparkles::id::Id::from_i64(n).unwrap(), unrelated])
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        let head = store.head_commit().seq;
+        assert!(!evidence_changed(
+            &store,
+            "urn:decisions",
+            "urn:supports",
+            &[],
+            after,
+            head,
+        ));
+        let mut txn = store.write();
+        txn.insert([s, p, sparkles::id::Id::from_i64(0).unwrap(), decisions])
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(evidence_changed(
+            &store,
+            "urn:decisions",
+            "urn:supports",
+            &[],
+            head,
+            store.head_commit().seq,
+        ));
     }
 
     #[test]
@@ -1051,5 +2096,436 @@ mod tests {
             assert!(!w.due(6 + i, start + Duration::from_secs(i * 9), d), "{i}");
         }
         assert!(w.due(16, start + d * 10, d));
+    }
+
+    /// `build_accumulator_query` + `Counter::apply_counts` match the reference feed
+    /// counter across single-graph, multi-graph UNION, wildcard-prefix, excluded-graph,
+    /// custom-exclude (`rdf:type` included), multi-community and entity-join workloads.
+    #[test]
+    fn accumulator_query_matches_feed_counter_across_projection_shapes() {
+        use sparkles::incr::{InternalAccess, InternalSpec, OpenHost, Runtime};
+        use sparkles::io::{RdfFormat, Source};
+
+        let multi_state = BuildState {
+            last_build: Some(BuildRecord {
+                source_commit: 1,
+                branch: "main".into(),
+                finished_at: String::new(),
+                communities: vec![
+                    StoredCommunity {
+                        depth: 0,
+                        iri: "urn:x-sparkles:graphrag:ds:0:c1".into(),
+                        parent: None,
+                        members: vec!["<http://ex/a>".into(), "<http://ex/b>".into()],
+                        report: None,
+                        facts: (0..10).collect(),
+                        policy: false,
+                        pairs: None,
+                    },
+                    StoredCommunity {
+                        depth: 0,
+                        iri: "urn:x-sparkles:graphrag:ds:0:c2".into(),
+                        parent: None,
+                        members: vec!["<http://ex/c>".into(), "<http://ex/d>".into()],
+                        report: None,
+                        facts: (0..10).collect(),
+                        policy: false,
+                        pairs: None,
+                    },
+                ],
+                pending: Vec::new(),
+                tokens: 0,
+                reports_graph: String::new(),
+                footprint: String::new(),
+                policy: None,
+                pairs: Vec::new(),
+            }),
+            ..Default::default()
+        };
+
+        struct Shape<'a> {
+            label: &'a str,
+            graphs: &'a [&'a str],
+            exclude: &'a [&'a str],
+            output: Option<&'a str>,
+            excluded_graphs: &'a [&'a str],
+        }
+        let shapes = [
+            Shape {
+                label: "single-exact",
+                graphs: &["urn:g:a"],
+                exclude: &["http://www.w3.org/1999/02/22-rdf-syntax-ns#type"],
+                output: None,
+                excluded_graphs: &[],
+            },
+            Shape {
+                label: "multi-exact-union",
+                graphs: &["urn:g:a", "urn:g:b"],
+                exclude: &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://ex/ignored",
+                ],
+                output: None,
+                excluded_graphs: &[],
+            },
+            Shape {
+                label: "wildcard-with-policy-extra",
+                graphs: &["urn:g:*"],
+                exclude: &["http://www.w3.org/1999/02/22-rdf-syntax-ns#type"],
+                output: Some("urn:ev:out"),
+                excluded_graphs: &["urn:g:excluded"],
+            },
+            Shape {
+                label: "rdf-type-not-excluded",
+                graphs: &["urn:g:a", "urn:g:b"],
+                exclude: &["http://ex/ignored"],
+                output: None,
+                excluded_graphs: &[],
+            },
+        ];
+
+        let updates: &[&str] = &[
+            // insertions & deletions across both communities
+            "INSERT DATA { GRAPH <urn:g:a> { <http://ex/a> <http://ex/p> 1 . <http://ex/c> <http://ex/p> 2 } }",
+            "DELETE DATA { GRAPH <urn:g:a> { <http://ex/a> <http://ex/p> 1 } }",
+            // replacement within one commit and cross-graph move
+            "DELETE { GRAPH <urn:g:a> { <http://ex/b> <http://ex/name> \"B\" } } \
+             INSERT { GRAPH <urn:g:b> { <http://ex/b> <http://ex/name> \"B2\" } } WHERE {}",
+            // add+delete same quad in one commit (net 0)
+            "INSERT DATA { GRAPH <urn:g:a> { <http://ex/d> <http://ex/tmp> 9 } } ; \
+             DELETE DATA { GRAPH <urn:g:a> { <http://ex/d> <http://ex/tmp> 9 } }",
+            // ignored predicate, guarded graph, excluded graph, self-loop, blank object
+            "INSERT DATA { \
+               GRAPH <urn:g:a> { <http://ex/a> <http://ex/ignored> 1 . <http://ex/a> <http://ex/self> <http://ex/a> . <http://ex/a> <http://ex/bn> _:b1 } \
+               GRAPH <urn:x-sparkles:graphrag:reports> { <http://ex/a> <http://ex/p> 99 } \
+               GRAPH <urn:g:excluded> { <http://ex/a> <http://ex/p> 99 } \
+               GRAPH <urn:ev:out> { <http://ex/c> <http://ex/outProp> \"ok\" } \
+             }",
+            // rdf:type on a known member to another known member (never counts as a fact)
+            "INSERT DATA { GRAPH <urn:g:a> { <http://ex/a> a <http://ex/b> } }",
+        ];
+
+        for Shape {
+            label,
+            graphs,
+            exclude,
+            output,
+            excluded_graphs,
+        } in shapes
+        {
+            let mut settings = GraphragSettings::default();
+            settings.projection.graphs = graphs.iter().map(|s| s.to_string()).collect();
+            settings.projection.exclude = exclude.iter().map(|s| s.to_string()).collect();
+            let excl_set: BTreeSet<String> =
+                excluded_graphs.iter().map(|s| s.to_string()).collect();
+            let extra = super::super::projection::Extra {
+                output,
+                excluded: (!excl_set.is_empty()).then_some(&excl_set),
+            };
+            let (query, keys) = build_accumulator_query(&settings, &extra).unwrap();
+
+            for per_commit in [true, false] {
+                let s = sparkles::store::Store::in_memory(Default::default());
+                s.load(&[Source::from_bytes(
+                    b"<urn:g:a> { <http://ex/a> <http://ex/name> \"A\" . <http://ex/b> <http://ex/name> \"B\" . } \
+                      <urn:g:b> { <http://ex/c> <http://ex/name> \"C\" . }"
+                        .to_vec(),
+                    RdfFormat::TriG,
+                    None,
+                )])
+                .unwrap();
+                let rt = Runtime::open(None, s.dataset_id(), Default::default());
+                rt.set_host(Arc::new(OpenHost));
+                let c = rt
+                    .attach_internal(
+                        &s,
+                        InternalSpec::accumulator(CIRCUIT_ID, query.clone(), keys.clone()),
+                        InternalAccess::everything(),
+                    )
+                    .unwrap();
+                let after = s.head_commit().seq;
+                let opts = sparkles::sparql::QueryOptions::default();
+                for u in updates {
+                    sparkles::sparql::update::update(&s, u, &opts).unwrap();
+                    if per_commit {
+                        rt.round(&s);
+                    }
+                }
+                rt.round(&s);
+                let counts = c.counts(after).unwrap();
+                assert!(counts.complete(), "{label}: {counts:?}");
+
+                let mut acc_counter = Counter::new(&multi_state, &settings);
+                let acc_joined = acc_counter.apply_counts(&counts);
+
+                let mut ref_counter = Counter::new(&multi_state, &settings);
+                let mut ref_joined = None;
+                let page = s.changes(after, &ChangesOptions::default()).unwrap();
+                for commit in &page.commits {
+                    for (_, q) in commit.iter() {
+                        let GraphName::NamedNode(g) = &q.graph_name else {
+                            continue;
+                        };
+                        if !extra.reads(&settings, g.as_str()) {
+                            continue;
+                        }
+                        if let Some(j) =
+                            ref_counter.change(&q.subject, &q.predicate.to_string(), &q.object)
+                            && ref_joined.is_none()
+                        {
+                            ref_joined = Some(j);
+                        }
+                    }
+                }
+                assert_eq!(acc_joined, ref_joined, "{label} per_commit={per_commit}");
+                assert_eq!(
+                    acc_counter.changed, ref_counter.changed,
+                    "{label} per_commit={per_commit}"
+                );
+                assert!(
+                    acc_counter.changed.iter().any(|&n| n > 0),
+                    "{label} should observe changed facts"
+                );
+            }
+        }
+
+        // Verify entity joining in both directions (`member -> new` and `new -> member`),
+        // and that `unknown -> unknown` does not trigger a join.
+        for (update, want_join) in [
+            (
+                "INSERT DATA { GRAPH <urn:g:a> { <http://ex/a> <http://ex/knows> <http://ex/new1> } }",
+                Some("<http://ex/new1> joined a community"),
+            ),
+            (
+                "INSERT DATA { GRAPH <urn:g:a> { <http://ex/new2> <http://ex/knows> <http://ex/c> } }",
+                Some("<http://ex/new2> joined a community"),
+            ),
+            (
+                "INSERT DATA { GRAPH <urn:g:a> { <http://ex/u1> <http://ex/knows> <http://ex/u2> } }",
+                None,
+            ),
+        ] {
+            let mut settings = GraphragSettings::default();
+            settings.projection.graphs = vec!["urn:g:a".into()];
+            let (query, keys) =
+                build_accumulator_query(&settings, &super::super::projection::Extra::default())
+                    .unwrap();
+            let s = sparkles::store::Store::in_memory(Default::default());
+            let rt = Runtime::open(None, s.dataset_id(), Default::default());
+            rt.set_host(Arc::new(OpenHost));
+            let c = rt
+                .attach_internal(
+                    &s,
+                    InternalSpec::accumulator(CIRCUIT_ID, query, keys),
+                    InternalAccess::everything(),
+                )
+                .unwrap();
+            let after = s.head_commit().seq;
+            sparkles::sparql::update::update(&s, update, &Default::default()).unwrap();
+            rt.round(&s);
+            let counts = c.counts(after).unwrap();
+            assert!(counts.complete());
+            let mut counter = Counter::new(&multi_state, &settings);
+            assert_eq!(
+                counter.apply_counts(&counts).as_deref(),
+                want_join,
+                "{update}"
+            );
+        }
+    }
+
+    /// Exact `urn:x-arq:*` graph IRIs must route through `GRAPH ?g` physical-name
+    /// filtering rather than `GRAPH <iri>`, staying stateless (no `Recompute` scan) and
+    /// never counting quads from unrelated named graphs or the default graph.
+    #[test]
+    fn accumulator_query_routes_arq_special_graphs_through_physical_filter() {
+        use sparkles::incr::{InternalAccess, InternalSpec, OpenHost, Runtime};
+        use sparkles::io::{RdfFormat, Source};
+
+        let mut settings = GraphragSettings::default();
+        settings.projection.graphs = vec![
+            "urn:x-arq:UnionGraph".into(),
+            "urn:x-arq:DefaultGraph".into(),
+            "urn:x-arq:custom".into(),
+        ];
+        let (query, keys) =
+            build_accumulator_query(&settings, &super::super::projection::Extra::default())
+                .unwrap();
+        assert!(
+            query.contains("GRAPH ?g"),
+            "urn:x-arq:* IRIs must use physical GRAPH ?g filter: {query}"
+        );
+        let s = sparkles::store::Store::in_memory(Default::default());
+        s.load(&[Source::from_bytes(
+            b"<urn:other> { <http://ex/a> <http://ex/name> \"A\" . } \
+              <http://ex/a> <http://ex/def> \"D\" ."
+                .to_vec(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+        let rt = Runtime::open(None, s.dataset_id(), Default::default());
+        rt.set_host(Arc::new(OpenHost));
+        let c = rt
+            .attach_internal(
+                &s,
+                InternalSpec::accumulator(CIRCUIT_ID, query, keys),
+                InternalAccess::everything(),
+            )
+            .unwrap();
+        assert_eq!(
+            c.bytes(),
+            0,
+            "urn:x-arq:* filter path must compile statelessly with zero retained state"
+        );
+        let after = s.head_commit().seq;
+        // Writes to unrelated named graphs and the default graph must NOT be counted
+        // despite `urn:x-arq:UnionGraph` and `urn:x-arq:DefaultGraph` in projection.graphs.
+        sparkles::sparql::update::update(
+            &s,
+            "INSERT DATA { \
+               GRAPH <urn:unrelated> { <http://ex/a> <http://ex/p> \"u\" } \
+               <http://ex/a> <http://ex/p> \"d\" \
+             }",
+            &Default::default(),
+        )
+        .unwrap();
+        rt.round(&s);
+        let counts = c.counts(after).unwrap();
+        assert!(counts.complete());
+        assert!(
+            counts.keys.is_empty(),
+            "unrelated named graph and default graph must not match ARQ aliases: {counts:?}"
+        );
+        // Writes to the physical named graph `<urn:x-arq:custom>` ARE counted.
+        sparkles::sparql::update::update(
+            &s,
+            "INSERT DATA { GRAPH <urn:x-arq:custom> { <http://ex/a> <http://ex/p> \"hit\" } }",
+            &Default::default(),
+        )
+        .unwrap();
+        rt.round(&s);
+        let counts = c.counts(after).unwrap();
+        assert!(counts.complete());
+        let st = state();
+        let mut counter = Counter::new(&st, &settings);
+        counter.apply_counts(&counts);
+        assert_eq!(counter.changed, vec![1]);
+    }
+
+    /// Blank-node subjects are filtered out by `isIRI(?s)` so they never pollute the
+    /// bounded accumulator tally under either `rdf:type` exclusion setting.
+    #[test]
+    fn accumulator_query_excludes_blank_node_subjects_from_tally() {
+        use sparkles::incr::{InternalAccess, InternalSpec, OpenHost, Runtime};
+
+        for exclude in [
+            vec!["http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string()],
+            Vec::new(),
+        ] {
+            let mut settings = GraphragSettings::default();
+            settings.projection.graphs = vec!["urn:g:a".into()];
+            settings.projection.exclude = exclude;
+            let (query, keys) =
+                build_accumulator_query(&settings, &super::super::projection::Extra::default())
+                    .unwrap();
+            let s = sparkles::store::Store::in_memory(Default::default());
+            let rt = Runtime::open(None, s.dataset_id(), Default::default());
+            rt.set_host(Arc::new(OpenHost));
+            let c = rt
+                .attach_internal(
+                    &s,
+                    InternalSpec::accumulator(CIRCUIT_ID, query, keys),
+                    InternalAccess::everything(),
+                )
+                .unwrap();
+            let after = s.head_commit().seq;
+            sparkles::sparql::update::update(
+                &s,
+                "INSERT DATA { GRAPH <urn:g:a> { \
+                   _:b1 <http://ex/name> \"anon\" . \
+                   _:b2 <http://ex/knows> <http://ex/a> . \
+                   _:b3 a <http://ex/Thing> \
+                 } }",
+                &Default::default(),
+            )
+            .unwrap();
+            rt.round(&s);
+            let counts = c.counts(after).unwrap();
+            assert!(counts.complete());
+            assert!(
+                counts.keys.is_empty(),
+                "blank-node subjects must not enter the accumulator tally: {counts:?}"
+            );
+        }
+    }
+
+    /// Exact graph lists compile to per-graph `UNION` up to 16 distinct IRIs (after
+    /// deduplication and `extra.output` insertion) and switch to `GRAPH ?g` at 17, while
+    /// both produce identical counts.
+    #[test]
+    fn accumulator_query_exact_graph_cutoff_at_16_and_17() {
+        use sparkles::incr::{InternalAccess, InternalSpec, OpenHost, Runtime};
+
+        // 15 unique graphs + 1 duplicate + 1 distinct extra.output => 16 unique IRIs (UNION).
+        let mut settings16 = GraphragSettings::default();
+        settings16.projection.graphs = (0..15).map(|i| format!("urn:g:{i}")).collect();
+        settings16.projection.graphs.push("urn:g:0".into());
+        let extra16 = super::super::projection::Extra {
+            output: Some("urn:ev:out"),
+            excluded: None,
+        };
+        let (q16, k16) = build_accumulator_query(&settings16, &extra16).unwrap();
+        assert!(
+            !q16.contains("GRAPH ?g") && q16.contains("UNION"),
+            "16 distinct exact graphs should compile to per-graph UNION: {q16}"
+        );
+
+        // 16 unique graphs + 1 distinct extra.output => 17 unique IRIs (GRAPH ?g filter).
+        let mut settings17 = GraphragSettings::default();
+        settings17.projection.graphs = (0..16).map(|i| format!("urn:g:{i}")).collect();
+        let extra17 = super::super::projection::Extra {
+            output: Some("urn:ev:out"),
+            excluded: None,
+        };
+        let (q17, k17) = build_accumulator_query(&settings17, &extra17).unwrap();
+        assert!(
+            q17.contains("GRAPH ?g"),
+            "17 distinct exact graphs should compile to GRAPH ?g filter: {q17}"
+        );
+
+        let st = state();
+        for (label, settings, query, keys) in [
+            ("16-exact", &settings16, q16, k16),
+            ("17-exact", &settings17, q17, k17),
+        ] {
+            let s = sparkles::store::Store::in_memory(Default::default());
+            let rt = Runtime::open(None, s.dataset_id(), Default::default());
+            rt.set_host(Arc::new(OpenHost));
+            let c = rt
+                .attach_internal(
+                    &s,
+                    InternalSpec::accumulator(CIRCUIT_ID, query, keys),
+                    InternalAccess::everything(),
+                )
+                .unwrap();
+            let after = s.head_commit().seq;
+            sparkles::sparql::update::update(
+                &s,
+                "INSERT DATA { \
+                   GRAPH <urn:g:0> { <http://ex/a> <http://ex/p> \"1\" } \
+                   GRAPH <urn:ev:out> { <http://ex/a> <http://ex/p> \"2\" } \
+                   GRAPH <urn:outside> { <http://ex/a> <http://ex/p> \"3\" } \
+                 }",
+                &Default::default(),
+            )
+            .unwrap();
+            rt.round(&s);
+            let counts = c.counts(after).unwrap();
+            assert!(counts.complete(), "{label}");
+            let mut counter = Counter::new(&st, settings);
+            counter.apply_counts(&counts);
+            assert_eq!(counter.changed, vec![2], "{label}");
+        }
     }
 }

@@ -48,6 +48,8 @@ fn resource_members() -> J {
 fn version_members() -> J {
     json!({
         "version": with_desc(string(), "1 to 64 letters, digits, `.`, `_`, `+` and `-`."),
+        "versionIri": with_desc(string(), "Optional absolute IRI identifying this version, unique across the catalog."),
+        "snapshot": with_desc(string(), "Optional point-in-time selector (`snapshot:NAME`, `commit:N`, `N`, `time:<RFC 3339>` or `head`) pinning reads of this version."),
         "issued": with_desc(string(), "A date (`YYYY-MM-DD`) or an RFC 3339 time."),
         "notes": string(),
         "license": with_desc(string(), "The version's SPDX licence expression, which overrides the resource's."),
@@ -268,6 +270,42 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
             ),
             "The prefixes an install bound.",
             "vocabulary-resources",
+        ),
+    );
+    put(
+        "RecipeExport",
+        doc(
+            obj(
+                &[
+                    "resource",
+                    "kind",
+                    "baseUrl",
+                    "namespaces",
+                    "versions",
+                    "content",
+                ],
+                json!({
+                    "resource": string(),
+                    "kind": string_enum(&["w3id", "htaccess", "purl"]),
+                    "baseUrl": string(),
+                    "mount": with_desc(string(), "Relative `.htaccess` directory mount stripped from `RewriteRule` patterns, when set."),
+                    "namespaces": array(obj(&["prefix", "iri", "style", "targetUrl"], json!({
+                        "prefix": string(),
+                        "iri": string(),
+                        "style": string_enum(&["slash", "hash"]),
+                        "targetUrl": string(),
+                    }))),
+                    "versions": array(obj(&["version", "versionIri", "targetUrl"], json!({
+                        "version": string(),
+                        "versionIri": string(),
+                        "snapshot": string(),
+                        "targetUrl": string(),
+                    }))),
+                    "content": with_desc(string(), "The generated `.htaccess` or PURL redirection rules."),
+                }),
+            ),
+            "Redirection recipes for a hosted vocabulary's namespaces and version IRIs.",
+            "linked-data-publishing",
         ),
     );
 }
