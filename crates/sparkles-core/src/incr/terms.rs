@@ -28,16 +28,18 @@ impl Key {
         (self.bytes.len() + std::mem::size_of::<Self>() + 32) as u64
     }
 
-    fn freeze(self: &Arc<Self>, pool: Option<&Arc<AtomicU64>>) -> FrozenKey {
+    fn freeze(
+        self: &Arc<Self>,
+        pool: Option<&Arc<AtomicU64>>,
+        credit: &mut impl FnMut(u64) -> Option<sparkles_budget::MemoryLease>,
+    ) -> FrozenKey {
         let published = pool.map(|pool| {
             let mut last = self.published.lock();
             if let Some(held) = last.upgrade() {
                 return held;
             }
-            let held = Arc::new(PublishedBytes::new(
-                pool,
-                self.retained_bytes() + (std::mem::size_of::<PublishedBytes>() + 16) as u64,
-            ));
+            let bytes = self.retained_bytes() + (std::mem::size_of::<PublishedBytes>() + 16) as u64;
+            let held = Arc::new(PublishedBytes::new(pool, bytes, credit(bytes)));
             *last = Arc::downgrade(&held);
             held
         });
@@ -96,6 +98,15 @@ impl ViewTerms {
         }
     }
 
+    pub(crate) fn term_budgeted(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        lease: &mut super::budget::ScratchLease,
+    ) -> crate::error::Result<Option<Term>> {
+        term_budgeted(|i| self.key_bytes(i), snap, id, lease)
+    }
+
     /// The bytes owned by the table, excluding the shared key backings.
     pub(crate) fn table_bytes(&self) -> u64 {
         (std::mem::size_of::<Self>() + self.keys.len() * std::mem::size_of::<FrozenKey>() + 16)
@@ -134,6 +145,38 @@ pub(super) fn decoded_key_heap_bytes(key: &[u8]) -> u64 {
         // The row's slots are already admitted. Encoded scalar keys cover
         // the value, language and datatype strings that decoding owns.
         _ => key.len() as u64,
+    }
+}
+
+pub(super) fn term_budgeted<'a>(
+    local_key: impl FnOnce(usize) -> Option<&'a [u8]>,
+    snap: &Snapshot,
+    i: Id,
+    lease: &mut super::budget::ScratchLease,
+) -> crate::error::Result<Option<Term>> {
+    if matches!(i.tag(), Tag::Undef | Tag::Special) {
+        return Ok(None);
+    }
+    let mut scratch = lease.sibling();
+    let decode = |key: &[u8]| {
+        lease.try_reserve(decoded_key_heap_bytes(key))?;
+        Ok::<_, crate::error::Error>(id::key_to_term(key))
+    };
+    match i.tag() {
+        Tag::Local => local_key(i.payload() as usize).map(decode).transpose(),
+        Tag::Delta => snap
+            .generation
+            .dvocab
+            .with(|v| v.get(i.payload()).map(decode).transpose()),
+        Tag::Vocab => snap
+            .generation
+            .vocab
+            .get_with_checked(i.payload(), |bytes| scratch.try_set(bytes as u64), decode)?
+            .transpose(),
+        _ => {
+            lease.try_reserve(144)?;
+            Ok(snap.term(i))
+        }
     }
 }
 
@@ -208,12 +251,20 @@ impl Terms {
             .ok_or_else(|| super::budget::budget_error(sparkles_budget::ParentRefused::Overflow))
     }
 
-    /// Freeze the current local term table into an immutable snapshot.
-    pub fn snapshot(&self) -> ViewTerms {
-        self.snapshot_in(None)
+    pub(crate) fn new_publication_key_bytes(&self) -> u64 {
+        self.keys.iter().map(|key| key.retained_bytes()).sum()
     }
 
-    pub(crate) fn snapshot_in(&self, pool: Option<&Arc<AtomicU64>>) -> ViewTerms {
+    /// Freeze the current local term table into an immutable snapshot.
+    pub fn snapshot(&self) -> ViewTerms {
+        self.snapshot_in(None, |_| None)
+    }
+
+    pub(crate) fn snapshot_in(
+        &self,
+        pool: Option<&Arc<AtomicU64>>,
+        mut credit: impl FnMut(u64) -> Option<sparkles_budget::MemoryLease>,
+    ) -> ViewTerms {
         if self.keys.is_empty() {
             return ViewTerms::default();
         }
@@ -223,7 +274,7 @@ impl Terms {
             .keys
             .iter()
             .map(|key| {
-                let frozen = key.freeze(pool);
+                let frozen = key.freeze(pool, &mut credit);
                 key_bytes += key.retained_bytes();
                 published_key_bytes += frozen.published.as_deref().map_or(0, PublishedBytes::bytes);
                 frozen
@@ -326,36 +377,35 @@ impl Terms {
     pub(crate) fn term_budgeted(
         &self,
         snap: &Snapshot,
-        i: Id,
+        id: Id,
         lease: &mut super::budget::ScratchLease,
     ) -> crate::error::Result<Option<Term>> {
-        if matches!(i.tag(), Tag::Undef | Tag::Special) {
-            return Ok(None);
-        }
+        term_budgeted(|i| self.key_bytes(i), snap, id, lease)
+    }
+
+    pub(crate) fn key_budgeted(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        lease: &mut super::budget::ScratchLease,
+    ) -> crate::error::Result<Option<Vec<u8>>> {
         let mut scratch = lease.sibling();
-        let mut decode = |key: &[u8]| {
-            lease.try_reserve(decoded_key_heap_bytes(key))?;
-            Ok::<_, crate::error::Error>(id::key_to_term(key))
+        let copy = |key: &[u8]| {
+            lease.try_reserve(key.len() as u64)?;
+            Ok::<_, crate::error::Error>(key.to_vec())
         };
-        match i.tag() {
-            Tag::Local => self
-                .keys
-                .get(i.payload() as usize)
-                .map(|key| decode(&key.bytes))
-                .transpose(),
+        match id.tag() {
+            Tag::Local => self.key_bytes(id.payload() as usize).map(copy).transpose(),
             Tag::Delta => snap
                 .generation
                 .dvocab
-                .with(|v| v.get(i.payload()).map(decode).transpose()),
+                .with(|v| v.get(id.payload()).map(copy).transpose()),
             Tag::Vocab => snap
                 .generation
                 .vocab
-                .get_with_checked(i.payload(), |bytes| scratch.try_set(bytes as u64), decode)?
+                .get_with_checked(id.payload(), |bytes| scratch.try_set(bytes as u64), copy)?
                 .transpose(),
-            _ => {
-                lease.try_reserve(144)?;
-                Ok(snap.term(i))
-            }
+            _ => Ok(self.key(snap, id)),
         }
     }
 

@@ -130,6 +130,68 @@ fn build_rewound(
     Ok(rewound)
 }
 
+fn columns_bytes(columns: &[String]) -> u64 {
+    (std::mem::size_of_val(columns) + columns.iter().map(String::len).sum::<usize>()) as u64
+}
+
+type WeightedRow = (Vec<Option<Term>>, i64);
+type HistoryOverlay<'a> = (&'a mut FxHashMap<Vec<Option<Term>>, i64>, &'a [WeightedRow]);
+
+fn decode_rows(
+    budget: &crate::incr::budget::ViewBudget,
+    version: &ViewVersion,
+    commit: u64,
+    mut rewind: Option<HistoryOverlay<'_>>,
+    control: &Control,
+) -> Result<ViewRows> {
+    let mut lease = budget.scratch_lease();
+    let removed = rewind.as_ref().map_or(&[][..], |(_, removed)| *removed);
+    let slots = version.table.len().saturating_add(removed.len());
+    lease.try_reserve(
+        columns_bytes(&version.columns)
+            .saturating_add(slots.saturating_mul(std::mem::size_of::<WeightedRow>()) as u64),
+    )?;
+    let columns = version.columns.to_vec();
+    let mut rows = Vec::with_capacity(slots);
+    for i in 0..version.table.len() {
+        control.check()?;
+        let (ids, weight) = version.table.row(i);
+        let before = lease.bytes();
+        lease.try_reserve((ids.len() * std::mem::size_of::<Option<Term>>()) as u64)?;
+        let mut terms = Vec::with_capacity(ids.len());
+        for &id in ids {
+            terms.push(version.terms.term_budgeted(&version.snap, id, &mut lease)?);
+        }
+        let weight = rewind
+            .as_mut()
+            .and_then(|(added, _)| added.get_mut(&terms))
+            .map_or(weight, |added| {
+                let consumed = weight.min(*added);
+                *added -= consumed;
+                weight - consumed
+            });
+        if weight > 0 {
+            rows.push((terms, weight));
+        } else {
+            drop(terms);
+            lease.try_set(before)?;
+        }
+    }
+    for (terms, weight) in removed {
+        control.check()?;
+        lease.try_reserve(row_retained_bytes(terms))?;
+        rows.push((terms.clone(), *weight));
+    }
+    let lease = budget.detach_scratch_lease(&mut lease);
+    Ok(ViewRows {
+        columns,
+        rows,
+        commit,
+        evaluated_under: version.evaluated_under,
+        lease,
+    })
+}
+
 fn history_weight_overflow() -> Error {
     crate::incr::error("view-failed", "view history multiplicity overflows")
 }
@@ -155,42 +217,26 @@ impl Runtime {
             deadline: r.deadline,
             ..Control::none()
         };
-        let opened = self.open_view(&open, &|| control.check(), &mut |_| Ok(()))?;
+        let (pool, parent) = self.resolve_fallback_budget(r)?;
+        let budget = crate::incr::budget::ViewBudget::new(r.max_memory_bytes, parent.clone());
+        let mut scratch = budget.scratch_lease();
+        let opened = self.open_view(&open, &|| control.check(), &mut |bytes| {
+            scratch.try_reserve(bytes.saturating_sub(scratch.bytes()))
+        })?;
         match opened {
-            OpenedView::Shared(v) | OpenedView::Owned(v) => Ok(v.to_view_rows()),
+            OpenedView::Shared(version) | OpenedView::Owned(version) => {
+                decode_rows(&budget, &version, version.commit, None, &control)
+            }
             OpenedView::Rows(rows) => Ok(rows),
-            OpenedView::Rewound(rewound) => {
-                let columns = rewound.version.columns.to_vec();
-                let mut added = rewound.added;
-                let mut rows = Vec::new();
-                for i in 0..rewound.version.table.len() {
-                    let (ids, w) = rewound.version.table.row(i);
-                    let terms: Vec<Option<Term>> = ids
-                        .iter()
-                        .map(|&id| rewound.version.terms.term(&rewound.version.snap, id))
-                        .collect();
-                    let emit = if let Some(d) = added.get_mut(&terms) {
-                        let take = w.min(*d);
-                        *d -= take;
-                        if *d == 0 {
-                            added.remove(&terms);
-                        }
-                        w - take
-                    } else {
-                        w
-                    };
-                    if emit > 0 {
-                        rows.push((terms, emit));
-                    }
-                }
-                rows.extend(rewound.removed);
-                Ok(ViewRows {
-                    columns,
-                    rows,
-                    commit: rewound.commit,
-                    evaluated_under: None,
-                    lease: None,
-                })
+            OpenedView::Rewound(mut rewound) => {
+                scratch.try_set(rewound.retained_bytes())?;
+                decode_rows(
+                    &budget,
+                    &rewound.version,
+                    rewound.commit,
+                    Some((&mut rewound.added, &rewound.removed)),
+                    &control,
+                )
             }
             OpenedView::Rebuild(rebuild) => {
                 let whole = whole_reason(rebuild.access.as_ref())
@@ -203,7 +249,6 @@ impl Runtime {
                 c.inference = rebuild.inference.clone();
                 c.aggregate_errors = Some(rebuild.aggregate_errors);
                 c.max_memory_bytes = rebuild.max_memory_bytes;
-                let (pool, parent) = self.resolve_fallback_budget(r)?;
                 c.set_pool(pool, parent);
                 if let Some(limit) = r.max_memory_bytes {
                     let effective = c.max_memory_bytes.map_or(limit, |m| m.min(limit));
@@ -221,7 +266,9 @@ impl Runtime {
                     },
                 );
                 c.build(snap, &control)?;
-                let (rows, lease) = c.rows_budgeted()?;
+                let (rows, mut lease) = c.rows_charged()?;
+                lease.try_reserve(columns_bytes(&rebuild.columns))?;
+                let lease = c.detach_scratch_lease(&mut lease);
                 Ok(ViewRows {
                     columns: rebuild.columns.to_vec(),
                     rows,

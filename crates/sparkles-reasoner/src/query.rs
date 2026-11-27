@@ -231,7 +231,19 @@ impl QueryReasoner {
     /// Under `owl-ql`, the OWL 2 QL TBox of the input graphs that the caller of `req`
     /// reads, with the axioms the rewriting ignores (spec F17 §7). `None` for the other
     /// profiles.
+    ///
+    /// The raw payload is caller-owned after construction. Use
+    /// [`Self::owl_ql_tbox_guarded`] to keep admission for its full lifetime.
     pub fn owl_ql_tbox(&self, req: &SessionRequest) -> Result<Option<Arc<crate::qlrewrite::Tbox>>> {
+        Ok(self.owl_ql_tbox_guarded(req)?.map(|c| c.tbox))
+    }
+
+    /// Keep a TBox admitted while it is used.
+    pub fn owl_ql_tbox_guarded(
+        &self,
+        req: &SessionRequest,
+    ) -> Result<Option<crate::qlrewrite::ChargedTbox>> {
+        (req.stop)()?;
         if self.shared.profile != Profile::OwlQl {
             return Ok(None);
         }
@@ -240,7 +252,7 @@ impl QueryReasoner {
             req.max_memory.map(|m| m.min(usize::MAX as u64) as usize),
             parent,
         );
-        crate::qlrewrite::tbox_charged(req, &self.shared.inputs, &budget).map(|c| Some(c.tbox))
+        crate::qlrewrite::tbox_charged(req, &self.shared.inputs, &budget).map(Some)
     }
 
     /// The limit of derived facts per query.

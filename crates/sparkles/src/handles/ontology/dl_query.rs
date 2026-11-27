@@ -42,12 +42,12 @@
 //! ```
 
 use super::classify::{admit, logical_axioms, saturate};
-use super::{Ontologies, OntologyRequest, Opened};
+use super::{Ontologies, OntologyRequest, Opened, check};
 use crate::Dataset;
 use crate::error::{Error, Result};
 use crate::reasoning::{Demand, ReasoningMode};
 use crate::sparql::QueryOptions;
-use oxrdf::{GraphName, Quad, Term};
+use oxrdf::{GraphName, Term};
 use sparkles_core::algo::pool::Par;
 use sparkles_owl::classify::{Changes, Description, Excluded, Gap, Saturation};
 use sparkles_owl::manchester::{self, Parsed, Vocabulary, What};
@@ -722,14 +722,6 @@ const RETRY_ENTITIES: usize = 256;
 const COPY_BYTES_PER_TRIPLE: u64 = 256;
 
 /// Bytes charged to a memory grant, released when it drops.
-struct Charged(std::sync::Arc<sparkles_core::sparql::pool::PoolGrant>, u64);
-
-impl Drop for Charged {
-    fn drop(&mut self) {
-        self.0.release(self.1);
-    }
-}
-
 /// A query under the OWL 2 RL rules by demand reasoning, over a copy in memory of the
 /// terminology with the defining axiom, and with the assertions when instances are
 /// asked for.
@@ -740,49 +732,30 @@ fn rl(
     why: String,
     opts: &QueryOptions,
 ) -> Result<DlQueryAnswer> {
-    let mut quads: Vec<Quad> = o
-        .ontology
-        .triples
-        .iter()
-        .map(|t| t.clone().in_graph(GraphName::DefaultGraph))
-        .collect();
+    let mut memory = crate::reasoning::memory::Memory::query(opts);
+    let mut quads = Vec::new();
+    let mut push = |triple: &oxrdf::Triple| -> Result<()> {
+        check(opts)?;
+        let terms = crate::explain::term_bytes(&Term::from(triple.subject.clone()))
+            + triple.predicate.as_str().len()
+            + crate::explain::term_bytes(&triple.object);
+        memory.grow(COPY_BYTES_PER_TRIPLE.saturating_add((terms as u64).saturating_mul(4)))?;
+        quads.push(triple.clone().in_graph(GraphName::DefaultGraph));
+        Ok(())
+    };
+    for t in &o.ontology.triples {
+        push(t)?;
+    }
     let prefix = format!("dlq{}x", uuid::Uuid::new_v4().simple());
-    quads.extend(
-        write::axiom_triples(ax, &mut write::counter(&prefix))
-            .into_iter()
-            .map(|t| t.in_graph(GraphName::DefaultGraph)),
-    );
+    for t in write::axiom_triples(ax, &mut write::counter(&prefix)) {
+        push(&t)?;
+    }
     if q.answers.instances {
         o.assertions(opts, |_, t, _| {
-            quads.push(t.clone().in_graph(GraphName::DefaultGraph));
+            push(t)?;
             Ok(true)
         })?;
     }
-    let bytes = quads.len() as u64 * COPY_BYTES_PER_TRIPLE;
-    if let Some(limit) = opts.max_memory_bytes
-        && bytes > limit
-    {
-        return Err(Error::BudgetExceeded(crate::Budget {
-            kind: crate::BudgetKind::Memory,
-            limit,
-            requested: bytes,
-        }));
-    }
-    // the copy is charged to the server's memory pool for as long as it lives, and the
-    // queries over it charge their own working memory to the same grant
-    let _charge = match &opts.grant {
-        Some(g) => {
-            g.charge(bytes).map_err(|_| {
-                Error::BudgetExceeded(crate::Budget {
-                    kind: crate::BudgetKind::ServerMemory,
-                    limit: g.granted(),
-                    requested: bytes,
-                })
-            })?;
-            Some(Charged(g.clone(), bytes))
-        }
-        None => None,
-    };
     let mem = Dataset::memory();
     mem.extend(quads.iter().map(|q| q.as_ref()))?;
     drop(quads);

@@ -225,7 +225,7 @@ fn an_abandoned_rewriting_releases_its_memory() {
         "PREFIX ex: <{EX}> SELECT * {{ {} }}",
         groups.join(" UNION ")
     ));
-    let r = rewrite_query(&q, &[], &t, 50, Some(64 * 1024), &|| Ok(()))
+    let r = rewrite_query(&q, &[], &t, 50, Some(128 * 1024), &|| Ok(()))
         .unwrap()
         .unwrap();
     assert_eq!(r.derive.len(), 20);
@@ -419,7 +419,8 @@ fn projection_names_move_into_emitted_credit() {
     ));
     // One shared projection name, two temporary patterns, and two emitted patterns fit.
     // Charging the shared name a second time while those patterns overlap does not fit.
-    let cap = 5 * name.len() + 16 * 1024;
+    // The original algebra estimate and the name table also overlap the branches.
+    let cap = 8 * name.len() + 24 * 1024;
     let pool = sparkles_core::sparql::pool::QueryPool::new(cap as u64);
     let budget = crate::budget::Budget::with_parent(Some(cap * 2), Some(pool.work_parent()));
     let rewritten =
@@ -431,5 +432,33 @@ fn projection_names_move_into_emitted_credit() {
     assert_eq!(branches(&payload), vec![2]);
     assert_eq!(budget.used(), 0);
     drop(budget);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn values_only_rewrite_reserves_unchanged_algebra() {
+    let query = parse(r#"SELECT ?x WHERE { VALUES ?x { "one" "two" "three" } }"#);
+    let pool = sparkles_core::sparql::pool::QueryPool::new(1 << 20);
+    let sibling = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let tbox = Tbox::default();
+    let rewrite = || {
+        rewrite_query_guarded_with_parent(
+            &query,
+            &[],
+            &tbox,
+            DEFAULT_MAX_UNION,
+            None,
+            Some(pool.work_parent()),
+            &|| Ok(()),
+        )
+    };
+    let error = rewrite().expect_err("VALUES clone needs memory");
+    assert!(matches!(error, sparkles_core::Error::BudgetExceeded(b)
+        if b.kind == sparkles_core::BudgetKind::ServerMemory));
+    assert_eq!(pool.granted(), sibling.bytes());
+    drop(sibling);
+    let result = rewrite().unwrap().unwrap();
+    assert!(pool.granted() > 0);
+    drop(result);
     assert_eq!(pool.granted(), 0);
 }

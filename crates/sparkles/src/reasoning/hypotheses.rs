@@ -47,10 +47,17 @@ fn copy_visible(
     snapshot: &Arc<Snapshot>,
     options: crate::store::StoreOptions,
     control: &AnalysisControl,
+    parent: Option<sparkles_budget::ParentHandle>,
     include: impl FnMut(&[crate::id::Id; 4]) -> Result<bool>,
 ) -> Result<crate::store::Store> {
     store
-        .copy_view_to_memory(snapshot, options, &control.write_options(), include)
+        .copy_view_to_memory_with_parent(
+            snapshot,
+            options,
+            &control.write_options(),
+            parent,
+            include,
+        )
         .map_err(|error| control.error(error))
 }
 
@@ -187,9 +194,14 @@ pub fn check_consistency(
             ..Default::default()
         };
         let base = Dataset::from_store_with(
-            copy_visible(dataset.store(), &view, copy_options, &control, |quad| {
-                Ok(graphs.contains(&quad[3]))
-            })?,
+            copy_visible(
+                dataset.store(),
+                &view,
+                copy_options,
+                &control,
+                pool.as_ref().map(|p| p.work_parent()),
+                |quad| Ok(graphs.contains(&quad[3])),
+            )?,
             crate::DatasetOptions {
                 pool: pool.clone(),
                 ..Default::default()
@@ -244,6 +256,7 @@ pub fn check_consistency(
                     &base_snapshot,
                     candidate_copy_options.clone(),
                     &control,
+                    pool.as_ref().map(|p| p.work_parent()),
                     |_| Ok(true),
                 )?,
                 crate::DatasetOptions {
@@ -331,6 +344,7 @@ mod tests {
             &snapshot,
             Default::default(),
             &control,
+            None,
             |_| Ok(true),
         );
         let error = match result {
@@ -350,6 +364,7 @@ mod tests {
             &snapshot,
             Default::default(),
             &control,
+            None,
             |_| Ok(true),
         );
         let error = match result {

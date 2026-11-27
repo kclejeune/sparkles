@@ -1296,7 +1296,7 @@ impl Ontologies {
             .iter()
             .map(|g| g.id(&view).filter(|id| readable(*id)))
             .collect();
-        let (ontology, inner) = read_store(&view, &graph_ids, requested, req.mode, opts)?;
+        let (ontology, inner) = read_store(&view, &graph_ids, requested, req.mode, opts, None)?;
         check(opts)?;
         let ontology = Arc::new(ontology);
         let inner = Arc::new(inner);
@@ -2073,7 +2073,12 @@ fn read_store(
     requested: usize,
     mode: Mode,
     opts: &QueryOptions,
+    memory: Option<&mut crate::reasoning::memory::Memory>,
 ) -> Result<(read::Ontology, Inner)> {
+    let mut memory = memory;
+    if let Some(memory) = &mut memory {
+        memory.grow((graph_ids.len() * 128 + 8192) as u64)?;
+    }
     let graph_of_id: FxHashMap<Id, u32> = graph_ids
         .iter()
         .enumerate()
@@ -2085,6 +2090,7 @@ fn read_store(
         quads: Vec::new(),
         seen: FxHashSet::default(),
         opts,
+        memory,
     };
     let mut terminological: FxHashSet<Id> = FxHashSet::default();
     let mut class_nodes: FxHashSet<Id> = FxHashSet::default();
@@ -2165,18 +2171,13 @@ fn read_store(
             check(opts)?;
             for g in &graphs {
                 let q = [s, p, o, *g];
-                if !terminological.contains(&p) && snap.contains(&q)? && c.seen.insert(q) {
-                    c.quads.push(q);
+                if !terminological.contains(&p) && snap.contains(&q)? && c.push(q)? {
                     mains.insert(q);
                 }
             }
         }
     }
-    let quads = c.quads;
-    finish(
-        snap,
-        quads,
-        &graph_of_id,
+    c.finish(
         graph_ids.len(),
         requested,
         mode,
@@ -2191,23 +2192,36 @@ struct Collect<'a> {
     quads: Vec<[Id; 4]>,
     seen: FxHashSet<[Id; 4]>,
     opts: &'a QueryOptions,
+    memory: Option<&'a mut crate::reasoning::memory::Memory>,
 }
 
 impl Collect<'_> {
+    fn push(&mut self, quad: [Id; 4]) -> Result<bool> {
+        if self.seen.contains(&quad) {
+            return Ok(false);
+        }
+        if let Some(memory) = &mut self.memory {
+            memory.grow(512)?;
+        }
+        self.seen.insert(quad);
+        self.quads.push(quad);
+        Ok(true)
+    }
+
     fn prefix(&mut self, prefix: &[u64]) -> Result<()> {
         let mut n = 0usize;
-        let (graphs, seen, quads, opts) = (self.graphs, &mut self.seen, &mut self.quads, self.opts);
+        let (snap, graphs, opts) = (self.snap, self.graphs, self.opts);
         let mut each = |q: [Id; 4]| -> Result<()> {
             n += 1;
             if n.is_multiple_of(4096) {
                 check(opts)?;
             }
-            if graphs.contains_key(&q[3]) && seen.insert(q) {
-                quads.push(q);
+            if graphs.contains_key(&q[3]) {
+                self.push(q)?;
             }
             Ok(())
         };
-        self.snap.scan(Perm::Pos, prefix, |c| {
+        snap.scan(Perm::Pos, prefix, |c| {
             match c {
                 Chunk::Block(b, s, e) => {
                     for i in s..e {
@@ -2219,55 +2233,75 @@ impl Collect<'_> {
             Ok(true)
         })
     }
-}
-
-fn finish(
-    snap: &Snapshot,
-    quads: Vec<[Id; 4]>,
-    graph_of_id: &FxHashMap<Id, u32>,
-    graphs: usize,
-    requested: usize,
-    mode: Mode,
-    (terminological, mains, class_nodes): (FxHashSet<Id>, FxHashSet<[Id; 4]>, FxHashSet<Id>),
-) -> Result<(read::Ontology, Inner)> {
-    let mut triples = Vec::with_capacity(quads.len());
-    let mut graph_of = Vec::with_capacity(quads.len());
-    let mut kept = Vec::with_capacity(quads.len());
-    for q in quads {
-        if let Some(t) = triple_of(snap, &q) {
-            triples.push(t);
-            graph_of.push(graph_of_id[&q[3]]);
-            kept.push(q);
+    fn finish(
+        self,
+        graph_count: usize,
+        requested: usize,
+        mode: Mode,
+        (terminological, mains, class_nodes): (FxHashSet<Id>, FxHashSet<[Id; 4]>, FxHashSet<Id>),
+    ) -> Result<(read::Ontology, Inner)> {
+        let Self {
+            snap,
+            quads,
+            graphs: graph_of_id,
+            opts,
+            mut memory,
+            ..
+        } = self;
+        let mut triples = Vec::with_capacity(quads.len());
+        let mut graph_of = Vec::with_capacity(quads.len());
+        let mut kept = Vec::with_capacity(quads.len());
+        for q in quads {
+            let triple = match &mut memory {
+                None => triple_of(snap, &q),
+                Some(memory) => {
+                    let mut decode =
+                        |i| crate::reasoning::memory::term(snap, q[i], memory, &mut || check(opts));
+                    match (decode(0)?, decode(1)?, decode(2)?) {
+                        (Some(s), Some(Term::NamedNode(p)), Some(o)) => {
+                            NamedOrBlankNode::try_from(s)
+                                .ok()
+                                .map(|s| Triple::new(s, p, o))
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(t) = triple {
+                triples.push(t);
+                graph_of.push(graph_of_id[&q[3]]);
+                kept.push(q);
+            }
         }
+        let primary: Vec<u32> = (0..requested.min(graph_count) as u32).collect();
+        let o = read::read(
+            triples,
+            graph_of,
+            &primary,
+            ReadOptions {
+                mode,
+                terminology_only: true,
+                max_diagnostics: 0,
+            },
+        );
+        let graph_ids = {
+            let mut ids = vec![None; graph_count];
+            for (id, n) in graph_of_id {
+                ids[*n as usize] = Some(*id);
+            }
+            ids
+        };
+        Ok((
+            o,
+            Inner {
+                quads: kept,
+                graph_ids,
+                terminological,
+                mains,
+                class_nodes,
+            },
+        ))
     }
-    let primary: Vec<u32> = (0..requested.min(graphs) as u32).collect();
-    let o = read::read(
-        triples,
-        graph_of,
-        &primary,
-        ReadOptions {
-            mode,
-            terminology_only: true,
-            max_diagnostics: 0,
-        },
-    );
-    let graph_ids = {
-        let mut ids = vec![None; graphs];
-        for (id, n) in graph_of_id {
-            ids[*n as usize] = Some(*id);
-        }
-        ids
-    };
-    Ok((
-        o,
-        Inner {
-            quads: kept,
-            graph_ids,
-            terminological,
-            mains,
-            class_nodes,
-        },
-    ))
 }
 
 /// The most changed quads an ontology diff reads from the store's diff.
@@ -2665,7 +2699,17 @@ pub fn rl_warnings(
     let resolved = sparkles_reasoner::inputs::resolve_readable(snap, &inputs, &|_| true);
     let graph_ids: Vec<Option<Id>> = resolved.graphs.iter().map(|g| g.id(snap)).collect();
     let requested = inputs.data_graphs.len();
-    let (ontology, _) = read_store(snap, &graph_ids, requested, Mode::Lenient, opts)?;
+    check(opts)?;
+    let mut memory = crate::reasoning::memory::Memory::query(opts);
+    let (ontology, _) = read_store(
+        snap,
+        &graph_ids,
+        requested,
+        Mode::Lenient,
+        opts,
+        Some(&mut memory),
+    )?;
+    check(opts)?;
     let part = sparkles_owl::profiles::partition(&ontology, Profile::Rl);
     let render = sparkles_owl::ofn::Renderer::new(prefixes.clone());
     let mut out = Vec::new();

@@ -224,7 +224,7 @@ Each phase keeps the stage 4 rules that the maintainer settled, which the
 path meets the [acceptance gates](SPEC.md#acceptance-gates), measured as the
 [measurement section](#how-the-gates-are-measured) describes.
 
-## Stage 4 remainder
+## Stage 4 accounting and decoding
 
 ### Hierarchical budget, item 675
 

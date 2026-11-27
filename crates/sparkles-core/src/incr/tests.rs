@@ -1430,7 +1430,7 @@ fn view_aggregates_agree_with_fresh_queries_across_inserts_updates_and_deletes()
                 let mut restored = Circuit::new(compile(&parsed, None).unwrap(), None);
                 restored.aggregate_errors = Some(AggregateErrors::Jena);
                 restored.decode(&encoded, &snap).expect("decode");
-                restored.set_applied(c.applied);
+                restored.set_applied(c.applied).unwrap();
                 assert_eq!(
                     result(&restored),
                     result(&c),

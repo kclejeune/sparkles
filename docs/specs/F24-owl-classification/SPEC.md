@@ -1168,12 +1168,14 @@ storage remains counted until the last alias drops. Index copies, functional-dat
 groups and key scratch admit overlapping storage before growth. A numeric memory,
 cancellation or deadline refusal stays a typed classification error through the Horn
 and DL paths. It does not turn the value into an opaque atom or a completed fallback.
-Standalone XML lexical validation uses its own scratch space.
+Standalone XML lexical validation scratch is uncharged.
 A counting allocator measured each run's peak heap within 15% of the estimate on GO,
 ChEBI lite and the largest ORE 2015 EL ontologies. A run that stops before its saturation ends
 drops its contexts, since the next run starts again. In the handle the threads come from the
-algorithm pool, the budget from the query's memory budget and the server's memory pool
-grant, and a run past the budget answers `507` with `budget: "memory"`.
+algorithm pool, and memory comes from the local limit and the request's grant or pool.
+A live result and a kept saturation own separate credit. The dataset's retained branch
+backs cached classifications when configured. Otherwise the shared work pool covers the
+cache. A run past the memory budget answers `507` with `budget: "memory"`.
 
 **Surfaces.** `Ontologies::classify` and `OntologyScope::classify` classify an open
 ontology. `POST /$/ontology/{ds}/classify`, the `classify` operation of the shared JSON

@@ -375,6 +375,7 @@ fn retention_counts_auxiliary_bytes_once_and_taxonomy_eviction_releases_owners()
             excluded: p.excluded.clone(),
             content_fingerprint: p.content_fingerprint.clone(),
             auxiliary_bytes: CACHE_MAX_BYTES - base,
+            _memory: crate::reasoning::memory::Memory::new(None, None),
         };
         assert_eq!(classification_retained_bytes(e, &fake), CACHE_MAX_BYTES);
         fake.auxiliary_bytes += 1;

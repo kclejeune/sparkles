@@ -1617,10 +1617,12 @@ fn failed_take_for_does_not_restore_after_interleaved_clear() {
     });
 
     let worker_pool = crate::thread_pool(1).unwrap();
-    // Reserve nearly all of rpool's work capacity so transfer_budget refuses on Scope::Work,
-    // while leaving room if `incremental_rules` runs cold before `take_for`.
-    let blocker = rpool.empty_grant();
-    blocker.charge((16 * MIB - 128) as u64).unwrap();
+    // Leave exact headroom for change staging and cold rules, but not the
+    // cache transfer. A PoolGrant would round the sibling up to the ceiling.
+    let blocker = rpool
+        .work_parent()
+        .reserve(rpool.capacity() - 32 * 1024)
+        .unwrap();
     let err = crate::materialize_incremental(
         &store,
         &crate::Profile::RdfsSimple,
@@ -2707,4 +2709,118 @@ fn public_diagnostic_summary_skips_unsupported_local_class_keys() {
         "http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral"
     );
     assert!(peak < 64 * 1024, "summary reader allocated {peak} bytes");
+}
+
+#[test]
+fn shacl_sparql_rule_admits_query_without_a_local_limit() {
+    let store = Store::in_memory(StoreOptions::default());
+    // The query sorts many rows but emits one triple. This lets the sibling fill
+    // the pool after admission of the rule workspace and before query evaluation.
+    let mut data = String::from(
+        r#"
+        @prefix ex: <http://ex.org/> .
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        ex:Rule a sh:NodeShape ; sh:targetNode ex:x ; sh:rule [
+            a sh:SPARQLRule ;
+            sh:construct """CONSTRUCT { $this <http://ex.org/copied> ?o } WHERE {
+                { SELECT ?o WHERE { ?s <http://ex.org/value> ?o } ORDER BY DESC(?o) LIMIT 1 }
+            }"""
+        ] .
+    "#,
+    );
+    use std::fmt::Write;
+    for i in 1..=16_384 {
+        writeln!(data, "ex:r{i} ex:value {i} .").unwrap();
+    }
+    load_turtle(&store, &data);
+    let pool = QueryPool::new(8 * MIB as u64);
+    let sibling = Arc::new(parking_lot::Mutex::new(None));
+    let observed = pool.clone();
+    let held = sibling.clone();
+    let mut opts = crate::ReasonOptions {
+        memory_parent: Some(pool.work_parent()),
+        progress: Some(Arc::new(move |_, stage| {
+            if stage.starts_with("SHACL rules of order") {
+                let mut held = held.lock();
+                if held.is_none() {
+                    *held = Some(
+                        observed
+                            .work_parent()
+                            .reserve(observed.capacity() - observed.granted())
+                            .unwrap(),
+                    );
+                }
+            }
+        })),
+        ..Default::default()
+    };
+    let profile = crate::Profile::ShaclAf(crate::shacl_af::ShaclAf::default());
+    let before = store.head_commit().seq;
+    let error = crate::materialize(&store, &profile, &opts).unwrap_err();
+    assert!(is_server_memory_anyhow(&error), "{error:#}");
+    assert_eq!(store.head_commit().seq, before);
+    let held = sibling.lock().take().expect("SHACL round started");
+    assert_eq!(pool.granted(), held.bytes());
+    drop(held);
+    assert_eq!(pool.granted(), 0);
+    opts.progress = None;
+    assert_eq!(
+        crate::materialize(&store, &profile, &opts)
+            .unwrap()
+            .inferred,
+        1
+    );
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn incremental_delta_staging_refuses_before_claiming_the_kept_closure() {
+    let store = Store::in_memory(StoreOptions::default());
+    load_turtle(
+        &store,
+        "@prefix ex: <http://ex.org/> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        ex:A rdfs:subClassOf ex:B . ex:x a ex:A .",
+    );
+    let cache = crate::Cache::new(10_000);
+    let profile = crate::Profile::RdfsSimple;
+    let first = crate::materialize_incremental(
+        &store,
+        &profile,
+        &Default::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    let since = first.receipt.unwrap().commit.seq;
+    load_turtle(&store, "<http://ex.org/y> a <http://ex.org/A> .");
+    let pool = QueryPool::new(8 * MIB as u64);
+    let sibling = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let opts = crate::ReasonOptions {
+        memory_parent: Some(pool.work_parent()),
+        ..Default::default()
+    };
+    let run = || {
+        crate::materialize_incremental(
+            &store,
+            &profile,
+            &Default::default(),
+            crate::Incremental {
+                since: Some(since),
+                cache: Some(&cache),
+            },
+            &opts,
+        )
+    };
+    let before = store.head_commit().seq;
+    let error = run().unwrap_err();
+    assert!(is_server_memory_anyhow(&error), "{error:#}");
+    assert_eq!(store.head_commit().seq, before);
+    assert_eq!(pool.granted(), sibling.bytes());
+    drop(sibling);
+    assert_eq!(run().unwrap().method, crate::Method::Incremental);
+    assert_eq!(pool.granted(), 0);
 }

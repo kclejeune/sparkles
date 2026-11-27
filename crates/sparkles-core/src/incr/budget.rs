@@ -59,6 +59,8 @@ pub(crate) fn budget_error(err: ParentRefused) -> Error {
 struct BudgetState {
     local_limit: u64,
     state_bytes: u64,
+    /// The current immutable publication has detached parent credit.
+    published_local: u64,
     external_bytes: u64,
     pass_bytes: u64,
     scratch_bytes: u64,
@@ -84,6 +86,7 @@ impl BudgetState {
         Self {
             local_limit: local_limit.unwrap_or(u64::MAX),
             state_bytes: 0,
+            published_local: 0,
             external_bytes: 0,
             pass_bytes: 0,
             scratch_bytes: 0,
@@ -100,6 +103,7 @@ impl BudgetState {
     #[inline]
     fn local_live(&self) -> u64 {
         self.state_bytes
+            .saturating_add(self.published_local)
             .saturating_add(self.external_bytes)
             .saturating_add(self.pass_bytes)
             .saturating_add(self.scratch_bytes)
@@ -108,7 +112,9 @@ impl BudgetState {
 
     #[inline]
     fn total_live(&self) -> u64 {
-        self.local_live().saturating_add(self.pool_scratch_bytes)
+        self.local_live()
+            .saturating_sub(self.published_local)
+            .saturating_add(self.pool_scratch_bytes)
     }
 
     fn reclaim(&mut self, needed: u64) -> u64 {
@@ -650,6 +656,28 @@ impl ViewBudget {
         s.parent = parent;
     }
 
+    pub(crate) fn backs_publication(&self) -> bool {
+        self.inner.lock().credit.is_some()
+    }
+
+    /// Move bytes from an already admitted publication peak to its independent owner.
+    pub(crate) fn detach_publication(&self, bytes: u64) -> Option<MemoryLease> {
+        let mut s = self.inner.lock();
+        let lease = s
+            .credit
+            .as_mut()?
+            .split_live(bytes)
+            .expect("publication bytes were admitted before allocation");
+        let from_pass = bytes.min(s.pass_bytes);
+        s.pass_bytes -= from_pass;
+        s.state_bytes -= bytes - from_pass;
+        Some(lease.into_lease())
+    }
+
+    pub(crate) fn set_publication_local(&self, bytes: u64) {
+        self.inner.lock().published_local = bytes;
+    }
+
     pub(crate) fn set_local_limit(&self, limit: Option<u64>) {
         self.inner.lock().local_limit = limit.unwrap_or(u64::MAX);
     }
@@ -821,6 +849,7 @@ impl ViewBudget {
         let mut s = self.inner.lock();
         let drop_bytes = s.state_bytes.saturating_add(s.pass_bytes);
         s.state_bytes = 0;
+        s.published_local = 0;
         s.pass_bytes = 0;
         s.release_raw(drop_bytes);
         if s.total_live() == 0 {

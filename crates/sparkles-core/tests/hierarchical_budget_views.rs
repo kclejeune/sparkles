@@ -328,12 +328,25 @@ fn standalone_circuit_uses_its_pool_without_an_explicit_parent() {
     circuit.set_pool(Some(pool.clone()), None);
     circuit.build(store.snapshot(), &Control::none()).unwrap();
     assert!(pool.granted() > 0);
+    let occupied = pool
+        .work_parent()
+        .reserve(pool.capacity() - pool.granted())
+        .unwrap();
+    let error = circuit.encode(&store.snapshot()).unwrap_err();
+    assert!(matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory));
+    assert_eq!(pool.granted(), pool.capacity());
+    drop(occupied);
     let control = Control::none();
     control.cancel.cancel();
     assert!(matches!(
         circuit.build(store.snapshot(), &control),
         Err(Error::Cancelled)
     ));
+    assert_eq!(
+        pool.granted(),
+        0,
+        "a cancelled build leaves the circuit alive"
+    );
     drop(circuit);
     assert_eq!(pool.granted(), 0);
 }
@@ -988,6 +1001,8 @@ fn slot_history_evicts_under_pressure_and_active_state_takes_priority() {
     );
 
     rt.close(&store);
+    assert_eq!(pool.granted(), past_ok.lease.as_ref().unwrap().bytes());
+    drop(past_ok);
     assert_eq!(pool.granted(), 0);
 }
 
@@ -1157,33 +1172,45 @@ fn service_view_read_lazy_parent_and_unpooled_fallback_uses_runtime_pool() {
     let baseline = pool.granted();
     assert!(baseline > 0);
 
-    // 1. Ready-cache hit must NEVER invoke the lazy `memory_parent` supplier.
+    // A shared streaming open must not promote the requesting query's ledger.
+    // Decoding owned rows from that same version uses the reader's allowance.
     let snap = store.snapshot();
     let calls = AtomicUsize::new(0);
     let supplier = || {
         calls.fetch_add(1, Ordering::SeqCst);
         Ok(pool.work_parent())
     };
-    let rows = rt
-        .read(&ViewRead {
-            name: "v",
-            at: snap.commit,
-            snap: Some(&snap),
-            allow_stale: false,
-            caller: None,
-            deadline: None,
-            aggregate_errors: Some(AggregateErrors::Jena),
-            memory_parent: Some(&supplier),
-            memory_pool: Some(&pool),
-            max_memory_bytes: None,
-        })
+    let read = || ViewRead {
+        name: "v",
+        at: snap.commit,
+        snap: Some(&snap),
+        allow_stale: false,
+        caller: None,
+        deadline: None,
+        aggregate_errors: Some(AggregateErrors::Jena),
+        memory_parent: Some(&supplier),
+        memory_pool: Some(&pool),
+        max_memory_bytes: None,
+    };
+    let opened = rt
+        .open_view(
+            &sparkles_core::sparql::viewsvc::ViewOpen { read: read() },
+            &|| Ok(()),
+            &mut |_| Ok(()),
+        )
         .unwrap();
+    assert!(matches!(
+        &opened,
+        sparkles_core::sparql::viewsvc::OpenedView::Shared(_)
+    ));
+    drop(opened);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let rows = rt.read(&read()).unwrap();
     assert_eq!(rows.rows.len(), 300);
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "Ready view read must not call memory_parent supplier or promote Ctx ledger"
-    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(pool.granted() > baseline);
+    drop(rows);
+    assert_eq!(pool.granted(), baseline);
 
     // 2. Fallback (`evaluate_under`) invokes the lazy supplier once and keeps its
     //    decoded rows leased until `rows2` drops.
@@ -1202,7 +1229,7 @@ fn service_view_read_lazy_parent_and_unpooled_fallback_uses_runtime_pool() {
         })
         .unwrap();
     assert_eq!(rows2.rows.len(), 300);
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(
         pool.granted() > baseline,
         "fallback ViewRows must keep its decoded rows leased until dropped"
@@ -2408,5 +2435,113 @@ fn unpooled_streaming_rebuild_enforces_combined_outer_and_child_memory_limit() {
     assert_eq!(pool.granted(), baseline);
 
     rt.close(&store);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn owned_and_published_view_rows_hold_distinct_credit() {
+    use sparkles_core::sparql::viewsvc::{OpenedView, ViewOpen, ViewRead, ViewRows, ViewSource};
+
+    #[derive(Debug)]
+    struct EagerViews(Arc<Runtime>);
+    impl ViewSource for EagerViews {
+        fn read_view(&self, read: &ViewRead<'_>) -> Result<ViewRows> {
+            self.0.read(read)
+        }
+    }
+
+    let store = Store::in_memory(StoreOptions::default());
+    load_rows(&store, "owned", 128, 64);
+    let pool = QueryPool::new(8 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    rt.set_host(Arc::new(OpenHost));
+    rt.put(
+        &store,
+        "items",
+        ViewDef::table("SELECT ?s ?o WHERE { ?s <urn:p> ?o }"),
+    )
+    .unwrap();
+    rt.round(&store);
+    let old = store.snapshot();
+    upd(&store, "INSERT DATA { <urn:later> <urn:p> <urn:later> }");
+    rt.round(&store);
+    let head = store.snapshot();
+    assert_eq!(rt.get(&store, "items").unwrap().state, ViewState::Current);
+
+    let read = |at| ViewRead {
+        name: "items",
+        at,
+        snap: None,
+        allow_stale: false,
+        caller: None,
+        deadline: None,
+        aggregate_errors: None,
+        memory_parent: None,
+        memory_pool: Some(&pool),
+        max_memory_bytes: None,
+    };
+    let baseline = pool.granted();
+    let sibling = pool
+        .work_parent()
+        .reserve(pool.capacity() - baseline)
+        .unwrap();
+    for at in [old.commit, head.commit] {
+        let error = rt
+            .read(&read(at))
+            .err()
+            .expect("owned read must be admitted");
+        assert!(
+            matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory),
+            "{error:?}"
+        );
+        assert_eq!(pool.granted(), pool.capacity());
+    }
+    let query = r#"PREFIX view: <urn:x-sparkles:view#>
+        SELECT ?s WHERE { SERVICE view:read { [] view:name "items" ; view:bind ?s . } }"#;
+    let outcome = sparql::query(
+        head.clone(),
+        query,
+        &QueryOptions {
+            views: Some(Arc::new(EagerViews(rt.clone()))),
+            no_cache: true,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory));
+    assert_eq!(pool.granted(), pool.capacity());
+    drop(sibling);
+    assert_eq!(pool.granted(), baseline);
+    let older = rt.read(&read(old.commit)).unwrap();
+    assert_eq!(older.rows.len(), 128);
+    assert!(pool.granted() > baseline);
+    drop(older);
+    assert_eq!(pool.granted(), baseline);
+    let current = rt.read(&read(head.commit)).unwrap();
+    assert_eq!(current.rows.len(), 129);
+    assert!(pool.granted() > baseline);
+    drop(current);
+    assert_eq!(pool.granted(), baseline);
+
+    let version = rt
+        .open_view(
+            &ViewOpen {
+                read: read(head.commit),
+            },
+            &|| Ok(()),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    let OpenedView::Shared(version) = version else {
+        panic!("a current view opens by reference");
+    };
+    rt.delete("items").unwrap();
+    assert!(pool.granted() > 0);
+    assert_eq!(version.table.len(), 129);
+    drop(version);
     assert_eq!(pool.granted(), 0);
 }

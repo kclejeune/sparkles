@@ -80,8 +80,10 @@ impl Runtime {
                 self.checkpoint(store);
             }
         }
-        *self.epoch.lock() += 1;
-        self.cv.notify_all();
+        if !self.worker_round.load(Ordering::Acquire) {
+            drop(_operation);
+            self.complete_round();
+        }
         worked
     }
 
@@ -670,7 +672,7 @@ impl Runtime {
                 continue;
             };
             let kind = persist::view_kind(st.circuit.has_fixpoint());
-            let r = st.circuit.encode(&snap).and_then(|body| {
+            let r = st.circuit.encode_charged(&snap).and_then(|(body, _lease)| {
                 persist::write_as(
                     kind,
                     &views::dir(&root, &name).join(BRANCH),

@@ -1,5 +1,6 @@
 //! Shared controls and isolated states for entailment diffs and justifications.
 
+use super::memory::Memory;
 use crate::Dataset;
 use crate::access::GraphAccess;
 use crate::error::{ComponentError, Error, Result};
@@ -260,6 +261,31 @@ pub(crate) struct State {
     pub diagnostics: sparkles_reasoner::diagnostics::DiagnosticsReport,
     pub bytes: usize,
     pub warnings: Vec<String>,
+    _memory: Memory,
+    _diagnostics_memory: sparkles_reasoner::diagnostics::DiagnosticMemory,
+}
+
+fn hold_state(
+    limit: Option<usize>,
+    bytes: &mut usize,
+    memory: &mut Memory,
+    additional: usize,
+) -> Result<()> {
+    hold(limit, bytes, additional)?;
+    memory.grow(additional as u64)
+}
+
+fn decode_fact(
+    snapshot: &Snapshot,
+    quad: &[crate::id::Id; 4],
+    control: &AnalysisControl,
+    scratch: &mut Memory,
+) -> Result<[oxrdf::Term; 3]> {
+    let mut term = |i| {
+        super::memory::term(snapshot, quad[i], scratch, &mut || control.check())?
+            .ok_or_else(|| Error::Corrupt("an entailment fact has an unknown term".into()))
+    };
+    Ok([term(0)?, term(1)?, term(2)?])
 }
 
 pub(crate) fn hold(limit: Option<usize>, bytes: &mut usize, additional: usize) -> Result<()> {
@@ -286,6 +312,10 @@ pub(crate) fn stored(
 ) -> Result<State> {
     use sparkles_reasoner::diagnostics::{DiagnoseOptions, DiagnosticControls, MAX_LIMIT};
     let pool = dataset.state().pool.clone();
+    let parent = pool
+        .as_ref()
+        .map(crate::sparql::pool::QueryPool::work_parent);
+    let mut memory = Memory::new(None, parent.clone());
     let cache = &dataset.state().closure;
     let share = options.max_memory.map(|limit| {
         limit
@@ -317,7 +347,7 @@ pub(crate) fn stored(
             128 + literal.to_string().len() * 2 + datatype.as_str().len() * 2
         })
         .sum();
-    hold(share, &mut bytes, 0)?;
+    hold_state(share, &mut bytes, &mut memory, 0)?;
     let (graphs, graphs_bytes) = input_graphs_controlled(
         snapshot,
         program,
@@ -326,7 +356,7 @@ pub(crate) fn stored(
         share.map(|limit| limit.saturating_sub(bytes)),
         pool.as_ref().map(|p| p.work_parent()),
     )?;
-    hold(share, &mut bytes, graphs_bytes)?;
+    hold_state(share, &mut bytes, &mut memory, graphs_bytes)?;
     let inferred = snapshot.lookup_iri(super::INFERRED_GRAPH);
     snapshot.for_each_quad(|quad| {
         control.check()?;
@@ -334,18 +364,21 @@ pub(crate) fn stored(
         if !input && Some(quad[3]) != inferred {
             return Ok(());
         }
-        let triple = [
-            snapshot.term(quad[0]).unwrap(),
-            snapshot.term(quad[1]).unwrap(),
-            snapshot.term(quad[2]).unwrap(),
-        ];
+        let mut scratch = Memory::new(share.map(|n| n as u64), parent.clone());
+        let triple = decode_fact(snapshot, quad, control, &mut scratch)?;
+        scratch.grow(triple.iter().map(crate::explain::term_bytes).sum::<usize>() as u64 * 2)?;
         let key = fact_key(&triple);
         if input && !asserted.contains_key(&key) {
-            hold(share, &mut bytes, fact_bytes(&key, &triple))?;
+            hold_state(share, &mut bytes, &mut memory, fact_bytes(&key, &triple))?;
             asserted.insert(key.clone(), triple.clone());
         }
         if let std::collections::btree_map::Entry::Vacant(entry) = closure.entry(key) {
-            hold(share, &mut bytes, fact_bytes(entry.key(), &triple))?;
+            hold_state(
+                share,
+                &mut bytes,
+                &mut memory,
+                fact_bytes(entry.key(), &triple),
+            )?;
             entry.insert(triple);
         }
         Ok(())
@@ -358,7 +391,7 @@ pub(crate) fn stored(
         pool.as_ref().map(|p| p.work_parent()),
         control,
     )?;
-    hold(share, &mut bytes, names_bytes)?;
+    hold_state(share, &mut bytes, &mut memory, names_bytes)?;
     let mut names: Vec<_> = graph_refs
         .into_iter()
         .map(|graph| match graph {
@@ -377,26 +410,27 @@ pub(crate) fn stored(
             }
         }
     }
-    let mut diagnostics = sparkles_reasoner::diagnostics::diagnose_controlled(
-        snapshot.clone(),
-        &DiagnoseOptions {
-            graphs: names,
-            inferences: true,
-            limit: MAX_LIMIT,
-            timeout: control.remaining(),
-            grant: pool.as_ref().map(|p| Arc::new(p.empty_grant())),
-            ..Default::default()
-        },
-        Some(&typings),
-        &DiagnosticControls {
-            deadline: control.deadline,
-            cancel: Some(control.cancel.clone()),
-            max_memory: share.map(|bytes| bytes as u64 / 2),
-            access: options.access.clone(),
-            memory_parent: pool.as_ref().map(|p| p.work_parent()),
-        },
-    )
-    .map_err(|error| control.error(crate::handles::from_anyhow(error)))?;
+    let (mut diagnostics, diagnostics_memory) =
+        sparkles_reasoner::diagnostics::diagnose_controlled_guarded(
+            snapshot.clone(),
+            &DiagnoseOptions {
+                graphs: names,
+                inferences: true,
+                limit: MAX_LIMIT,
+                timeout: control.remaining(),
+                grant: pool.as_ref().map(|p| Arc::new(p.empty_grant())),
+                ..Default::default()
+            },
+            Some(&typings),
+            &DiagnosticControls {
+                deadline: control.deadline,
+                cancel: Some(control.cancel.clone()),
+                max_memory: share.map(|bytes| bytes as u64 / 2),
+                access: options.access.clone(),
+                memory_parent: pool.as_ref().map(|p| p.work_parent()),
+            },
+        )
+        .map_err(|error| control.error(crate::handles::from_anyhow(error)))?;
     if !summary_complete
         && let Some(check) = diagnostics
             .checks
@@ -424,6 +458,8 @@ pub(crate) fn stored(
         diagnostics,
         bytes,
         warnings: Vec::new(),
+        _memory: memory,
+        _diagnostics_memory: diagnostics_memory,
     })
 }
 
@@ -484,6 +520,10 @@ fn analyze_with_cache_limit(
         })
         .transpose()?;
     let pool = dataset.state().pool.clone();
+    let parent = pool
+        .as_ref()
+        .map(crate::sparql::pool::QueryPool::work_parent);
+    let mut memory = Memory::new(None, parent.clone());
     // The data copy, reasoner, diagnostic query and retained output each have a
     // separate share. Their overlapping lifetimes stay inside one request grant.
     let share = available.map(|bytes| bytes / 8);
@@ -497,7 +537,7 @@ fn analyze_with_cache_limit(
     )?;
     let copied = dataset
         .store()
-        .copy_view_to_memory(
+        .copy_view_to_memory_with_parent(
             &snapshot,
             crate::store::StoreOptions {
                 max_memory_bytes: share.map(|bytes| bytes as u64),
@@ -507,6 +547,7 @@ fn analyze_with_cache_limit(
                 ..Default::default()
             },
             &control.write_options(),
+            parent.clone(),
             |quad| {
                 Ok(graphs.contains(&quad[3]) && subset.is_none_or(|subset| subset.contains(quad)))
             },
@@ -540,24 +581,27 @@ fn analyze_with_cache_limit(
     let copied = Dataset::from_store_with(
         copied,
         crate::DatasetOptions {
-            closure_cache_triples: cache_limit.unwrap_or(super::DEFAULT_CLOSURE_CACHE_TRIPLES),
+            closure_cache_triples: cache_limit.unwrap_or(0),
             ..Default::default()
         },
     );
     let before = copied.store().snapshot();
     let mut asserted = Facts::new();
     let mut bytes = 0;
-    hold(share, &mut bytes, graphs_bytes)?;
+    hold_state(share, &mut bytes, &mut memory, graphs_bytes)?;
     before.for_each_quad(|quad| {
         control.check()?;
-        let triple = [
-            before.term(quad[0]).unwrap(),
-            before.term(quad[1]).unwrap(),
-            before.term(quad[2]).unwrap(),
-        ];
+        let mut scratch = Memory::new(share.map(|n| n as u64), parent.clone());
+        let triple = decode_fact(&before, quad, control, &mut scratch)?;
+        scratch.grow(triple.iter().map(crate::explain::term_bytes).sum::<usize>() as u64 * 2)?;
         let key = fact_key(&triple);
         if let std::collections::btree_map::Entry::Vacant(entry) = asserted.entry(key) {
-            hold(share, &mut bytes, fact_bytes(entry.key(), &triple))?;
+            hold_state(
+                share,
+                &mut bytes,
+                &mut memory,
+                fact_bytes(entry.key(), &triple),
+            )?;
             entry.insert(triple);
         }
         Ok(())
@@ -571,7 +615,7 @@ fn analyze_with_cache_limit(
         pool.as_ref().map(|p| p.work_parent()),
         control,
     )?;
-    hold(share, &mut bytes, selected_bytes)?;
+    hold_state(share, &mut bytes, &mut memory, selected_bytes)?;
     if selected.is_empty() {
         selected.push(GraphRef::Default);
     }
@@ -579,9 +623,10 @@ fn analyze_with_cache_limit(
     for graph in &selected {
         control.check()?;
         let name = graph.as_str();
-        hold(
+        hold_state(
             share,
             &mut bytes,
+            &mut memory,
             std::mem::size_of::<String>() + name.len(),
         )?;
         input_names.push(name.to_string());
@@ -610,7 +655,9 @@ fn analyze_with_cache_limit(
         &program.extras,
         sparkles_reasoner::Incremental {
             since: None,
-            cache: Some(&copied.state().closure),
+            cache: cache_limit
+                .filter(|limit| *limit > 0)
+                .map(|_| &copied.state().closure),
         },
         &request,
     )
@@ -620,14 +667,17 @@ fn analyze_with_cache_limit(
     let mut closure = Facts::new();
     snapshot.for_each_quad(|quad| {
         control.check()?;
-        let triple = [
-            snapshot.term(quad[0]).unwrap(),
-            snapshot.term(quad[1]).unwrap(),
-            snapshot.term(quad[2]).unwrap(),
-        ];
+        let mut scratch = Memory::new(share.map(|n| n as u64), parent.clone());
+        let triple = decode_fact(&snapshot, quad, control, &mut scratch)?;
+        scratch.grow(triple.iter().map(crate::explain::term_bytes).sum::<usize>() as u64 * 2)?;
         let key = fact_key(&triple);
         if let std::collections::btree_map::Entry::Vacant(entry) = closure.entry(key) {
-            hold(share, &mut bytes, fact_bytes(entry.key(), &triple))?;
+            hold_state(
+                share,
+                &mut bytes,
+                &mut memory,
+                fact_bytes(entry.key(), &triple),
+            )?;
             entry.insert(triple);
         }
         Ok(())
@@ -635,9 +685,10 @@ fn analyze_with_cache_limit(
     let typings = context
         .take_literal_typings_guarded(snapshot.commit)
         .ok_or_else(|| budget("the analysis did not retain its generalized diagnostics"))?;
-    hold(
+    hold_state(
         share,
         &mut bytes,
+        &mut memory,
         typings
             .facts
             .iter()
@@ -646,28 +697,29 @@ fn analyze_with_cache_limit(
             })
             .sum(),
     )?;
-    let diagnostics = sparkles_reasoner::diagnostics::diagnose_controlled(
-        snapshot,
-        &sparkles_reasoner::diagnostics::DiagnoseOptions {
-            checks: checks.to_vec(),
-            inferences: true,
-            graphs: input_names,
-            limit: sparkles_reasoner::diagnostics::MAX_LIMIT,
-            timeout: control.remaining(),
-            prefixes: dataset.store().prefixes().into_iter().collect(),
-            grant: pool.as_ref().map(|p| Arc::new(p.empty_grant())),
-            ..Default::default()
-        },
-        Some(&typings),
-        &sparkles_reasoner::diagnostics::DiagnosticControls {
-            deadline: control.deadline,
-            cancel: Some(control.cancel.clone()),
-            max_memory: available.map(|bytes| (bytes / 16) as u64),
-            access: None,
-            memory_parent: pool.as_ref().map(|p| p.work_parent()),
-        },
-    )
-    .map_err(|error| control.error(crate::handles::from_anyhow(error)))?;
+    let (diagnostics, diagnostics_memory) =
+        sparkles_reasoner::diagnostics::diagnose_controlled_guarded(
+            snapshot,
+            &sparkles_reasoner::diagnostics::DiagnoseOptions {
+                checks: checks.to_vec(),
+                inferences: true,
+                graphs: input_names,
+                limit: sparkles_reasoner::diagnostics::MAX_LIMIT,
+                timeout: control.remaining(),
+                prefixes: dataset.store().prefixes().into_iter().collect(),
+                grant: pool.as_ref().map(|p| Arc::new(p.empty_grant())),
+                ..Default::default()
+            },
+            Some(&typings),
+            &sparkles_reasoner::diagnostics::DiagnosticControls {
+                deadline: control.deadline,
+                cancel: Some(control.cancel.clone()),
+                max_memory: available.map(|bytes| (bytes / 16) as u64),
+                access: None,
+                memory_parent: pool.as_ref().map(|p| p.work_parent()),
+            },
+        )
+        .map_err(|error| control.error(crate::handles::from_anyhow(error)))?;
     control.check()?;
     for finding in &diagnostics.findings {
         let mut size = 256 + finding.message.len() + crate::explain::term_bytes(&finding.focus);
@@ -690,6 +742,8 @@ fn analyze_with_cache_limit(
         diagnostics,
         bytes,
         warnings: outcome.warnings,
+        _memory: memory,
+        _diagnostics_memory: diagnostics_memory,
     })
 }
 

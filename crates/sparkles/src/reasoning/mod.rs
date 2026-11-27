@@ -18,6 +18,8 @@ pub mod freshness;
 pub mod hypotheses;
 #[cfg(feature = "reasoning")]
 pub mod justify;
+#[cfg(feature = "reasoning")]
+pub(crate) mod memory;
 pub mod mode;
 pub mod rdfs;
 #[cfg(feature = "reasoning")]

@@ -230,6 +230,27 @@ impl Budget {
     pub fn parent(&self) -> Option<ParentHandle> {
         self.parent.as_ref().map(|p| p.parent.clone())
     }
+    /// Back a query's checked preparation by this run's live allowance. Its ledger
+    /// has no independent grant, so the preparation belongs to the unpooled domain.
+    pub fn query_parent(self: &Arc<Self>) -> ParentHandle {
+        let take = self.clone();
+        let give = self.clone();
+        sparkles_budget::MemoryDomain::unpooled().parent(
+            move |bytes| {
+                take.try_charge(usize::try_from(bytes).map_err(|_| ParentRefused::Overflow)?)
+                    .map_err(|err| match err {
+                        BudgetFailure::Local(err) => ParentRefused::Limit {
+                            limit: err.limit as u64,
+                            requested: (take.used() as u64).saturating_add(bytes),
+                            scope: Scope::Local,
+                        },
+                        BudgetFailure::Parent { refusal, .. } => refusal,
+                    })
+            },
+            move |bytes| give.release(bytes as usize),
+        )
+    }
+
     pub fn domain(&self) -> DomainId {
         self.parent.as_ref().map_or_else(
             || sparkles_budget::MemoryDomain::unpooled().id(),

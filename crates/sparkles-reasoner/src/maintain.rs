@@ -426,22 +426,82 @@ pub(crate) fn changes(
     snap: &Arc<Snapshot>,
     cache: Option<&Cache>,
     inputs: &[GraphRef],
-) -> Result<RawChanges, String> {
+    budget: &Arc<Budget>,
+    cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<Result<RawChanges, String>> {
+    let admission = Staging::new(budget, cancel);
     // the log of the snapshot's generation gives the changes as its ids, without their
     // terms; other histories give them as terms
-    if let Ok(Some(r)) = logged_ids(store, since, snap, inputs) {
-        return Ok(r);
+    match logged_ids(store, since, snap, inputs, &admission) {
+        Ok(Some(raw)) => return Ok(Ok(admission.finish(raw))),
+        Ok(None) => {}
+        Err(e) => refuse_staging_error(&e)?,
     }
-    let e = match logged_changes(store, since, snap.commit, inputs) {
-        Ok(r) => return Ok(r),
-        Err(e) => e,
+    drop(admission);
+    let admission = Staging::new(budget, cancel);
+    let e = match logged_changes(store, since, snap.commit, inputs, &admission) {
+        Ok(raw) => return Ok(Ok(admission.finish(raw))),
+        Err(e) => {
+            refuse_staging_error(&e)?;
+            e
+        }
     };
-    match kept_changes(store, since, snap, cache, inputs) {
-        Some(r) => r,
-        None => Err(format!(
+    drop(admission);
+    match kept_changes(store, since, snap, cache, inputs, budget, cancel)? {
+        Some(raw) => Ok(raw),
+        None => Ok(Err(format!(
             "commit {since} cannot be compared with the head: {e:#}"
-        )),
+        ))),
     }
+}
+
+fn refuse_staging_error(error: &anyhow::Error) -> anyhow::Result<()> {
+    if let Some(error) = BudgetFailure::from_anyhow(error) {
+        return Err(error.into());
+    }
+    match error.downcast_ref::<sparkles_core::Error>() {
+        Some(sparkles_core::Error::BudgetExceeded(b)) => {
+            Err(sparkles_core::Error::BudgetExceeded(*b).into())
+        }
+        Some(sparkles_core::Error::Cancelled) => Err(sparkles_core::Error::Cancelled.into()),
+        _ => Ok(()),
+    }
+}
+
+struct Staging {
+    held: std::cell::RefCell<Held>,
+    opts: DiffOptions,
+}
+
+impl Staging {
+    fn new(budget: &Arc<Budget>, cancel: Option<&Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        Self {
+            held: std::cell::RefCell::new(Held::new(budget)),
+            opts: DiffOptions {
+                cancel: cancel.cloned(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn admit(&self, bytes: u64) -> sparkles_core::Result<()> {
+        self.held
+            .borrow_mut()
+            .try_grow(bytes as usize)
+            .map_err(|e| crate::query::memory_error(e, "staging materialization changes"))
+    }
+
+    fn finish(self, data: RawChangeData) -> RawChanges {
+        RawChanges {
+            data,
+            held: self.held.into_inner(),
+        }
+    }
+}
+
+pub(crate) struct RawChanges {
+    data: RawChangeData,
+    held: Held,
 }
 
 /// The changes from `since` to `snap` from the deltas of the closure kept for `since`,
@@ -452,7 +512,9 @@ pub(crate) fn kept_changes(
     snap: &Arc<Snapshot>,
     cache: Option<&Cache>,
     inputs: &[GraphRef],
-) -> Option<Result<RawChanges, String>> {
+    budget: &Arc<Budget>,
+    cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<Option<Result<RawChanges, String>>> {
     let old = cache.and_then(|c| {
         let slot = c.kept.lock();
         slot.kept
@@ -463,8 +525,18 @@ pub(crate) fn kept_changes(
                     && Arc::ptr_eq(&k.snap.generation, &snap.generation)
             })
             .map(|k| k.snap.clone())
-    })?;
-    Some(delta_changes(&old, snap, inputs).map_err(|e| e.to_string()))
+    });
+    let Some(old) = old else {
+        return Ok(None);
+    };
+    let admission = Staging::new(budget, cancel);
+    match delta_changes(&old, snap, inputs, &admission) {
+        Ok(raw) => Ok(Some(Ok(admission.finish(raw)))),
+        Err(e) => {
+            refuse_staging_error(&e)?;
+            Ok(Some(Err(e.to_string())))
+        }
+    }
 }
 
 /// The heap of a set of facts.
@@ -543,7 +615,7 @@ pub(crate) fn previous(
         let old_lookups = closure.set_inputs(snap.clone(), run_ids)?;
         remap_set(&mut generalized, &moved, None)?;
         held.set(set_bytes(&generalized))?;
-        let changes = raw.resolve(&closure.terms, snap, &ids)?;
+        let changes = raw.resolve(&closure.terms, snap, &ids, &mut held)?;
         // the remembered lookups follow the changes: with one input graph they take them
         // in, and with several the answers they touch are dropped
         if let Some(mut l) = old_lookups {
@@ -565,7 +637,6 @@ pub(crate) fn previous(
             }
             closure.put_lookups(l);
         }
-        held.grow(changes.heap_bytes())?;
         closure.settle()?;
         budget.check()?;
         return Ok(Previous {
@@ -593,9 +664,8 @@ pub(crate) fn previous(
     };
     let raw = raw.map_err(Fallback)?;
     let terms = Terms::new_in(snap.clone(), budget)?;
-    let changes = raw.resolve(&terms, snap, &ids)?;
     let mut held = Held::new(budget);
-    held.grow(changes.heap_bytes())?;
+    let changes = raw.resolve(&terms, snap, &ids, &mut held)?;
     held.try_grow(table_bytes(table_capacity(keys.len()), size_of::<Triple>()))?;
     let generalized: FxHashSet<Triple> = keys
         .iter()
@@ -715,7 +785,7 @@ fn reconstruct(
 }
 
 /// Changes as the commit diff reports them, or as ids of one generation.
-pub(crate) enum RawChanges {
+enum RawChangeData {
     Quads {
         /// the changes of each input graph
         base: Vec<(DiffOp, oxrdf::Quad)>,
@@ -728,12 +798,26 @@ pub(crate) enum RawChanges {
 }
 
 impl RawChanges {
+    pub(crate) fn budget(&self) -> Arc<Budget> {
+        self.held.budget().clone()
+    }
+
     /// The changes as ids of `terms`, whose snapshot is `snap`; `inputs` are the ids of
     /// the input graphs in it.
-    fn resolve(self, terms: &Terms, snap: &Snapshot, inputs: &[Id]) -> anyhow::Result<Changes> {
-        Ok(match self {
-            RawChanges::Ids(c) => c,
-            RawChanges::Quads {
+    fn resolve(
+        self,
+        terms: &Terms,
+        snap: &Snapshot,
+        inputs: &[Id],
+        held: &mut Held,
+    ) -> anyhow::Result<Changes> {
+        let RawChanges {
+            data,
+            held: mut staged,
+        } = self;
+        let changes = match data {
+            RawChangeData::Ids(c) => c,
+            RawChangeData::Quads {
                 base,
                 inferred,
                 union,
@@ -779,7 +863,10 @@ impl RawChanges {
                 }
                 c
             }
-        })
+        };
+        staged.try_set(changes.heap_bytes())?;
+        held.try_merge(&mut staged)?;
+        Ok(changes)
     }
 }
 
@@ -838,13 +925,14 @@ pub(crate) fn input_ids(snap: &Snapshot, other: Option<&Snapshot>, inputs: &[Gra
 /// generation, when that log holds every commit between them (see
 /// [`Store::changed_ids`]). The log holds ids, so this reads no term, where the commit
 /// diff of [`logged_changes`] turns every changed quad into terms that
-/// [`RawChanges::resolve`] then looks up again.
+/// [`RawChangeData::resolve`] then looks up again.
 fn logged_ids(
     store: &Store,
     since: u64,
     snap: &Snapshot,
     inputs: &[GraphRef],
-) -> anyhow::Result<Option<RawChanges>> {
+    stage: &Staging,
+) -> anyhow::Result<Option<RawChangeData>> {
     let ids = input_ids(snap, None, inputs);
     let inferred = snap.lookup_iri(INFERRED_GRAPH);
     if inferred.is_some_and(|g| ids.contains(&g)) {
@@ -852,7 +940,14 @@ fn logged_ids(
     }
     let mut graphs = ids.clone();
     graphs.extend(inferred);
-    let Some(found) = store.changed_ids(since, snap, &graphs, &DiffOptions::default())? else {
+    let Some(found) = store.changed_ids_with_admission(
+        since,
+        snap,
+        &graphs,
+        &stage.opts,
+        Some(&|bytes| stage.admit(bytes)),
+    )?
+    else {
         return Ok(None);
     };
     let mut c = Changes::default();
@@ -874,7 +969,7 @@ fn logged_ids(
         }
     }
     union_changes(by_triple, snap, &ids, &mut c)?;
-    Ok(Some(RawChanges::Ids(c)))
+    Ok(Some(RawChangeData::Ids(c)))
 }
 
 /// The changes between two commits from the store's commit diff.
@@ -883,16 +978,25 @@ fn logged_changes(
     since: u64,
     head: u64,
     inputs: &[GraphRef],
-) -> anyhow::Result<RawChanges> {
+    stage: &Staging,
+) -> anyhow::Result<RawChangeData> {
     if since == head {
-        return Ok(RawChanges::Ids(Changes::default()));
+        return Ok(RawChangeData::Ids(Changes::default()));
     }
     let diff = |g: GraphName| -> anyhow::Result<Vec<(DiffOp, oxrdf::Quad)>> {
         let o = DiffOptions {
             graph: Some(g),
-            ..Default::default()
+            ..stage.opts.clone()
         };
-        let d = store.diff(&At::Commit(since), &At::Commit(head), &o)?;
+        let d = store.diff_with_admission(
+            &At::Commit(since),
+            &At::Commit(head),
+            &o,
+            Some(&|bytes| stage.admit(bytes)),
+        )?;
+        for (_, keys) in d.keys() {
+            stage.admit(512 + keys.iter().map(|key| key.len() as u64 * 8).sum::<u64>())?;
+        }
         Ok(d.iter().collect())
     };
     let mut base = Vec::new();
@@ -902,7 +1006,7 @@ fn logged_changes(
             GraphRef::Named(n) => GraphName::NamedNode(NamedNode::new_unchecked(n.as_str())),
         })?);
     }
-    Ok(RawChanges::Quads {
+    Ok(RawChangeData::Quads {
         base,
         inferred: diff(GraphName::NamedNode(NamedNode::new_unchecked(
             INFERRED_GRAPH,
@@ -916,7 +1020,8 @@ fn delta_changes(
     old: &Snapshot,
     new: &Snapshot,
     inputs: &[GraphRef],
-) -> anyhow::Result<RawChanges> {
+    stage: &Staging,
+) -> anyhow::Result<RawChangeData> {
     let i = Perm::Gspo.index();
     let inferred = new
         .lookup_iri(INFERRED_GRAPH)
@@ -942,8 +1047,19 @@ fn delta_changes(
     ] {
         for k in set.iter() {
             let base = ids.binary_search(&Id(k[0])).is_ok();
-            if !(base || inferred.is_some_and(|g| g.0 == k[0])) || !seen.insert(*k) {
+            if !(base || inferred.is_some_and(|g| g.0 == k[0])) || seen.contains(k) {
                 continue;
+            }
+            stage.admit(256)?;
+            seen.insert(*k);
+            if seen.len().is_multiple_of(1024)
+                && stage
+                    .opts
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Err(sparkles_core::Error::Cancelled.into());
             }
             let q = Perm::Gspo.to_quad(k);
             let t = [q[0].0, q[1].0, q[2].0];
@@ -975,7 +1091,7 @@ fn delta_changes(
             }
         }
     }
-    Ok(RawChanges::Ids(c))
+    Ok(RawChangeData::Ids(c))
 }
 
 /// Keep the closure after the run's commit: in the cache, while the commit kept the

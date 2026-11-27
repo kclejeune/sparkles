@@ -1314,7 +1314,9 @@ fn materialize_admitted(
     t0: Instant,
 ) -> anyhow::Result<ReasonReport> {
     let mut laps = Laps::new(t0);
-    let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs, &mut laps);
+    let staging = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
+    let (mut txn, raw, resolved) = lock_with_changes(store, inc, opts, &staging, &mut laps)?;
+    drop(staging);
     let snap = txn.base().clone();
     let inspected = match &opts.inspect {
         Some(f) => {
@@ -1475,6 +1477,12 @@ fn materialize_admitted(
     )
 }
 
+type LockedChanges<'s> = (
+    sparkles_core::store::WriteTxn<'s>,
+    Option<Result<maintain::RawChanges, String>>,
+    Resolved,
+);
+
 /// Take the writer lock, with the input graphs resolved in the state it locks, and the
 /// changes since `inc.since` up to that state.
 ///
@@ -1487,13 +1495,11 @@ fn materialize_admitted(
 fn lock_with_changes<'s>(
     store: &'s Store,
     inc: Incremental<'_>,
-    inputs: &Inputs,
+    opts: &ReasonOptions,
+    budget: &Arc<Budget>,
     laps: &mut Laps,
-) -> (
-    sparkles_core::store::WriteTxn<'s>,
-    Option<Result<maintain::RawChanges, String>>,
-    Resolved,
-) {
+) -> anyhow::Result<LockedChanges<'s>> {
+    let inputs = &opts.inputs;
     let locked = |txn: sparkles_core::store::WriteTxn<'s>| {
         let r = inputs::resolve(txn.base(), inputs);
         (txn, r)
@@ -1501,12 +1507,20 @@ fn lock_with_changes<'s>(
     let Some(since) = inc.since else {
         let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
         laps.lap("lock");
-        return (txn, None, r);
+        return Ok((txn, None, r));
     };
     for _ in 0..3 {
         let live = store.snapshot();
         let graphs = inputs::resolve(&live, inputs).graph_set();
-        let raw = maintain::changes(store, since, &live, inc.cache, &graphs);
+        let raw = maintain::changes(
+            store,
+            since,
+            &live,
+            inc.cache,
+            &graphs,
+            budget,
+            opts.cancel.as_ref(),
+        )?;
         laps.lap("changes");
         let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
         laps.lap("lock");
@@ -1514,24 +1528,30 @@ fn lock_with_changes<'s>(
             Err("the input graphs changed while the changes were read".into())
         } else if txn.base().commit == live.commit {
             raw
-        } else if let Some(raw) =
-            maintain::kept_changes(store, since, txn.base(), inc.cache, &graphs)
-        {
+        } else if let Some(raw) = maintain::kept_changes(
+            store,
+            since,
+            txn.base(),
+            inc.cache,
+            &graphs,
+            budget,
+            opts.cancel.as_ref(),
+        )? {
             raw
         } else {
             continue;
         };
-        return (txn, Some(raw), r);
+        return Ok((txn, Some(raw), r));
     }
     let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
     laps.lap("lock");
-    (
+    Ok((
         txn,
         Some(Err(
             "commits kept arriving while the changes were read".into()
         )),
         r,
-    )
+    ))
 }
 
 /// The closure a run ends with, for the next incremental run.
@@ -1937,7 +1957,10 @@ fn update_closure(
     if since > snap.commit {
         return Err(Fallback("the store position moved backwards".into()).into());
     }
-    let budget = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
+    let budget = raw.as_ref().map_or_else(
+        |_| Budget::with_parent(opts.max_memory, opts.memory_parent.clone()),
+        maintain::RawChanges::budget,
+    );
     let (rules, blocker) = incremental_rules(profile, extras, digest, snap, &budget)?;
     if let Some(why) = blocker {
         return Err(Fallback(why).into());

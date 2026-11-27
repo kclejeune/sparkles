@@ -27,7 +27,7 @@ fn reserve(id: Id, next: &mut u64, ordinals: &mut u64) -> Result<()> {
     Ok(())
 }
 
-const APPEND_VOCAB_ENTRY_BYTES: u64 = 48;
+pub(super) const APPEND_VOCAB_ENTRY_BYTES: u64 = 48;
 
 fn split_triple_key(key: &[u8]) -> Result<(&[u8], &[u8], &[u8])> {
     let malformed = || Error::Corrupt("invalid vocabulary triple-term key".into());
@@ -144,7 +144,7 @@ fn copy_key_into(
     if let Some(existing) = transaction.lookup_key(key) {
         return Ok(existing);
     }
-    let mem_budget = if let Some(max) = copied.opts.max_memory_bytes {
+    let mem_budget = if copied.opts.max_memory_bytes.is_some() || copied.private_memory.is_some() {
         let base = transaction.memory_size().saturating_add(scratch_bytes);
         let base_total = copied.memory_with_configuration(base)?;
         copied.check_memory_total(
@@ -152,7 +152,7 @@ fn copy_key_into(
                 .saturating_add(key.len() as u64)
                 .saturating_add(APPEND_VOCAB_ENTRY_BYTES),
         )?;
-        Some((base_total, max))
+        copied.opts.max_memory_bytes.map(|max| (base_total, max))
     } else {
         None
     };
@@ -210,6 +210,18 @@ impl Store {
         control: &WriteOptions,
         keep: impl FnMut(&[Id; 4]) -> Result<bool>,
     ) -> Result<Store> {
+        self.copy_view_to_memory_with_parent(view, options, control, None, keep)
+    }
+
+    /// Copy a request-local snapshot under its operation's storage admission.
+    pub fn copy_view_to_memory_with_parent(
+        &self,
+        view: &Snapshot,
+        options: StoreOptions,
+        control: &WriteOptions,
+        parent: Option<sparkles_budget::ParentHandle>,
+        keep: impl FnMut(&[Id; 4]) -> Result<bool>,
+    ) -> Result<Store> {
         control.check()?;
         if view.dataset_id != self.owner_dataset_id() {
             return Err(Error::invalid(
@@ -224,7 +236,7 @@ impl Store {
             ..Default::default()
         };
         let next = self.lock_writer(&write)?.next_bnode;
-        self.copy_view_with_allocator(view, options, &write, next, keep)
+        self.copy_private_view(view, options, &write, next, parent, keep)
     }
 
     /// The writer already holds admission while freezing a rollback candidate.
@@ -234,6 +246,18 @@ impl Store {
         options: StoreOptions,
         control: &WriteOptions,
         next: u64,
+        keep: impl FnMut(&[Id; 4]) -> Result<bool>,
+    ) -> Result<Store> {
+        self.copy_private_view(view, options, control, next, None, keep)
+    }
+
+    fn copy_private_view(
+        &self,
+        view: &Snapshot,
+        options: StoreOptions,
+        control: &WriteOptions,
+        next: u64,
+        parent: Option<sparkles_budget::ParentHandle>,
         mut keep: impl FnMut(&[Id; 4]) -> Result<bool>,
     ) -> Result<Store> {
         control.check()?;
@@ -243,7 +267,7 @@ impl Store {
             deadline: control.deadline,
             ..Default::default()
         };
-        let copied = Store::in_memory(options);
+        let copied = Store::private_memory(options, parent)?;
         let mut next_ordinal = self
             .branching
             .next_ordinal
@@ -286,7 +310,9 @@ impl Store {
                             )
                         })?,
                         crate::id::Tag::Vocab => {
-                            let base_mem = if copied.opts.max_memory_bytes.is_some() {
+                            let base_mem = if copied.opts.max_memory_bytes.is_some()
+                                || copied.private_memory.is_some()
+                            {
                                 transaction.memory_size()
                             } else {
                                 0
@@ -297,7 +323,9 @@ impl Store {
                                 .get_with_controlled_capacity_checked(
                                     id.payload(),
                                     |old, new| {
-                                        if copied.opts.max_memory_bytes.is_some() {
+                                        if copied.opts.max_memory_bytes.is_some()
+                                            || copied.private_memory.is_some()
+                                        {
                                             copied.check_memory(
                                                 base_mem
                                                     .saturating_add(old as u64)
@@ -309,7 +337,9 @@ impl Store {
                                     |cap| {
                                         let cap = cap as u64;
                                         scratch_bytes.set(cap);
-                                        if copied.opts.max_memory_bytes.is_some() {
+                                        if copied.opts.max_memory_bytes.is_some()
+                                            || copied.private_memory.is_some()
+                                        {
                                             copied.check_memory(base_mem.saturating_add(cap))?;
                                         }
                                         Ok(())

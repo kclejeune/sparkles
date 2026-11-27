@@ -131,7 +131,7 @@ impl Runtime {
             st.recompute_local_limit();
             if was_empty {
                 st.circuit
-                    .set_version_pool(Some(self.published_views.clone()));
+                    .set_version_pool(Some(self.published_views.clone()))?;
                 let mut info = cell.info.lock();
                 info.bytes = st.circuit.bytes();
                 info.published_bytes = st
@@ -211,9 +211,12 @@ impl Runtime {
                     && h.fingerprint == st.fingerprint(cell.key)
                     && commit <= snap.commit
                 {
-                    match st.circuit.decode_with_input_charged(body, &snap) {
+                    match st
+                        .circuit
+                        .decode_with_input_charged(body, &snap)
+                        .and_then(|()| st.circuit.set_applied(h.commit))
+                    {
                         Ok(()) => {
-                            st.circuit.set_applied(h.commit);
                             self.seen.fetch_max(h.commit, Ordering::AcqRel);
                             self.counters.loaded.fetch_add(1, Ordering::Relaxed);
                             let mut info = cell.info.lock();

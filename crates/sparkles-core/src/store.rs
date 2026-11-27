@@ -963,7 +963,7 @@ impl Snapshot {
     /// scratch growth (`old_cap`, `new_cap`), settled scratch capacity (`cap`),
     /// coexisting scratch and decoded-output bytes (`scratch_cap`, `key_len`), and
     /// live request-control checkpoints.
-    pub(crate) fn term_controlled_owned(
+    pub fn term_controlled_owned(
         &self,
         id: Id,
         grow: &mut dyn FnMut(usize, usize) -> Result<()>,
@@ -2140,6 +2140,8 @@ pub struct Store {
     control_refusal: Mutex<Option<fn() -> Error>>,
     /// the published control state (spec C26 §2.1), when the keyspace is enabled
     control: arc_swap::ArcSwapOption<crate::control::ControlState>,
+    /// Private stores used for reasoning keep their storage credit through teardown.
+    private_memory: Option<Mutex<sparkles_budget::LiveCredit>>,
     /// Keep exclusion through Drop and every other owned field's destructor.
     /// Fields drop in declaration order. Only the family root lease follows this.
     _lock: Option<Arc<ProcessLock>>,
@@ -2373,6 +2375,38 @@ impl Store {
         )
     }
 
+    /// An isolated, request-owned store whose snapshots must stay inside the request.
+    pub fn private_memory(
+        mut opts: StoreOptions,
+        parent: Option<sparkles_budget::ParentHandle>,
+    ) -> Result<Store> {
+        if let Some(parent) = parent {
+            let mut memory = sparkles_budget::LiveCredit::new(parent);
+            memory
+                .try_add(16 << 10)
+                .map_err(crate::access::preparation::parent_error)?;
+            // The private copy needs neither a larger rebuilt generation nor a change log.
+            opts.bulk_threshold = u64::MAX;
+            opts.change_log = false;
+            let mut store = Self::in_memory(opts);
+            store.private_memory = Some(Mutex::new(memory));
+            return Ok(store);
+        }
+        Ok(Self::in_memory(opts))
+    }
+
+    fn admit_private_storage(&self, bytes: u64) -> Result<()> {
+        if let Some(memory) = &self.private_memory {
+            let mut memory = memory.lock();
+            let target = bytes.saturating_add(16 << 10);
+            let growth = target.saturating_sub(memory.live());
+            memory
+                .try_add(growth)
+                .map_err(crate::access::preparation::parent_error)?;
+        }
+        Ok(())
+    }
+
     /// An in-memory store whose base is the generation `gen_` (built in a temporary
     /// directory it owns), with root commit `root`: a new store, or an in-memory clone.
     pub(crate) fn in_memory_from(
@@ -2460,6 +2494,7 @@ impl Store {
             _lock: None,
             family: family.clone(),
             _close_complete: Arc::new(()),
+            private_memory: None,
             dataset_id,
             forked_mem: forked_from,
             catalog: Arc::new(Mutex::new(Catalog::memory(root, opts.memory_commit_ring))),
@@ -3009,6 +3044,7 @@ impl Store {
             _lock: Some(lock.clone()),
             family: family.clone(),
             _close_complete: Arc::new(()),
+            private_memory: None,
             dataset_id,
             forked_mem: None,
             catalog: Arc::new(Mutex::new(catalog)),
@@ -5649,6 +5685,7 @@ impl Store {
     /// `StorageFull` when an in-memory store's data with its configuration's history,
     /// `size` bytes, would pass its limit.
     fn check_memory_total(&self, size: u64) -> Result<()> {
+        self.admit_private_storage(size)?;
         match self.opts.max_memory_bytes {
             Some(max) if self.root.is_none() && size > max => {
                 let h = crate::error::human_bytes;
@@ -7646,6 +7683,13 @@ impl WriteTxn<'_> {
         if let Ok(i) = self.base.generation.vocab.find(key) {
             return Ok(Id::vocab(i));
         }
+        if self.store.private_memory.is_some() && self.lookup_key(key).is_none() {
+            self.store.admit_private_storage(
+                self.memory_size()
+                    .saturating_add(key.len() as u64 * 2)
+                    .saturating_add(simulation::APPEND_VOCAB_ENTRY_BYTES),
+            )?;
+        }
         Ok(Id::delta(self.base.generation.dvocab.insert(key)?))
     }
 
@@ -7784,7 +7828,16 @@ impl WriteTxn<'_> {
         let Some(ib) = self.change_base(&q, true)? else {
             return Ok(false);
         };
-        // re-adding a quad this transaction deleted cancels that deletion
+        if self.store.private_memory.is_some() {
+            self.store.admit_private_storage(
+                self.memory_size()
+                    .saturating_add(DELTA_QUAD_BYTES)
+                    .saturating_add(
+                        ((self.log.len() + 1) * (2 * std::mem::size_of::<(u8, [Id; 4])>())) as u64,
+                    ),
+            )?;
+        }
+        // Re-adding a quad this transaction deleted cancels that deletion.
         if self.present_at_start(&q, ib) {
             self.net_del -= 1;
         } else {

@@ -81,6 +81,7 @@ pub(crate) fn checkpoint_fingerprint_for_compiler(compiler: &str, q: &Query, tex
 }
 use stats::Counters;
 pub use stats::{RuntimeStats, ViewStat};
+pub(crate) use worker::Operation as RuntimeOperation;
 pub use worker::WorkerPause;
 
 /// Payloads and retired leases collected while holding runtime/cell locks.

@@ -267,6 +267,16 @@ pub(super) fn consistency(cl: &Classification) -> &'static str {
     }
 }
 
+pub(super) fn cache_parent(
+    pool: &Arc<sparkles_core::sparql::pool::QueryPool>,
+) -> sparkles_budget::ParentHandle {
+    if pool.domain_stats().retained_capacity > 0 {
+        pool.retained_parent()
+    } else {
+        pool.work_parent()
+    }
+}
+
 /// One immutable computation, published only when the retained policy permits it.
 pub(super) struct KeptClassification {
     pub id: Uuid,
@@ -275,6 +285,7 @@ pub(super) struct KeptClassification {
     pub excluded: Arc<Vec<Excluded>>,
     pub content_fingerprint: String,
     pub(super) auxiliary_bytes: usize,
+    _memory: crate::reasoning::memory::Memory,
 }
 impl KeptClassification {
     pub(super) fn capture(
@@ -286,6 +297,14 @@ impl KeptClassification {
         excluded: Arc<Vec<Excluded>>,
         opts: &QueryOptions,
     ) -> Result<Arc<Self>> {
+        let parent = h.ds.pool().map(cache_parent).or_else(|| {
+            opts.grant
+                .as_ref()
+                .map(|g| g.memory_parent())
+                .or_else(|| opts.pool.as_ref().map(|p| p.work_parent()))
+        });
+        let mut memory = crate::reasoning::memory::Memory::new(None, parent);
+        memory.grow(classification.stats.taxonomy_memory as u64)?;
         let controls = super::classify::result_options(
             opts,
             !super::classify::acknowledged_stop(&classification),
@@ -297,6 +316,7 @@ impl KeptClassification {
             .saturating_add(source.owned_bytes())
             .saturating_add(sparkles_owl::classify::excluded_copy_bytes(&excluded))
             .saturating_add(content_fingerprint.capacity());
+        memory.grow(auxiliary_bytes as u64)?;
         Ok(Arc::new(Self {
             id: Uuid::new_v4(),
             source,
@@ -304,6 +324,7 @@ impl KeptClassification {
             excluded,
             content_fingerprint,
             auxiliary_bytes,
+            _memory: memory,
         }))
     }
     pub fn identity(&self) -> J {

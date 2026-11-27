@@ -237,7 +237,9 @@ Standalone runs and maintained circuits use the pool's work parent. Children gro
 reservations in 64 KiB chunks and can request the exact shortfall when a rounded
 reservation fails. Dropping a child returns its full reservation after releasing its
 payloads. Retained view versions can outlive the circuit and hold their own credit until
-their last reader drops them. Regression tests hold a live query result, a reasoning run
+their last reader drops them. A kept materialization closure uses the configured pool's
+retained branch. A pool with no retained allowance may reuse saved persistent closure
+state for the next run. Regression tests hold a live query result, a reasoning run
 and a view together under one pool ceiling and check exact credit return on completion,
 refusal, cancellation and unwind.
 

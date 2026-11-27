@@ -57,6 +57,8 @@ pub struct ValidateOptions {
     /// The memory budget of each SPARQL query that a constraint, a node expression or a
     /// rule runs, in bytes. `None` keeps the query engine's default.
     pub query_memory: Option<u64>,
+    /// Admission shared by queries embedded in an enclosing rules run.
+    pub query_memory_parent: Option<sparkles_budget::ParentHandle>,
 }
 
 /// The default of [`ValidateOptions::max_expr_nodes`].
@@ -91,6 +93,7 @@ impl Default for ValidateOptions {
             max_results: None,
             max_expr_nodes: DEFAULT_MAX_EXPR_NODES,
             query_memory: None,
+            query_memory_parent: None,
         }
     }
 }
@@ -421,6 +424,7 @@ pub(crate) struct Engine<'a> {
     /// the memory budget of each query ([`ValidateOptions::query_memory`])
     pub query_memory: Option<u64>,
     pub query_limits: Option<sparkles_core::sparql::QueryOptions>,
+    pub query_memory_parent: Option<sparkles_budget::ParentHandle>,
     report_bytes: Option<sparkles_core::validation::ReportBytes>,
     /// results collected so far (checked against `max_results`)
     collected: AtomicUsize,
@@ -516,6 +520,7 @@ impl<'a> Engine<'a> {
             max_expr_nodes: opts.max_expr_nodes,
             query_memory: opts.query_memory,
             query_limits: None,
+            query_memory_parent: opts.query_memory_parent.clone(),
             report_bytes: None,
             collected: AtomicUsize::new(0),
             query_calls: Default::default(),

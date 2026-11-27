@@ -412,6 +412,8 @@ impl Dataset {
             let source: Arc<dyn crate::store::DefinitionSource> = views.clone();
             s.register_definitions(Arc::downgrade(&source));
         }
+        #[cfg(feature = "reasoning")]
+        let retained_parent = opts.pool.as_ref().map(|pool| pool.retained_parent());
         let inner = Arc::new_cyclic(|weak| DatasetState {
             reference: StateReference {
                 link: crate::store::lifecycle::WeakLink::new(weak.clone()),
@@ -430,7 +432,8 @@ impl Dataset {
             graphql,
             reasoning: RwLock::new(reasoning),
             #[cfg(feature = "reasoning")]
-            closure: sparkles_reasoner::Cache::new(opts.closure_cache_triples),
+            closure: sparkles_reasoner::Cache::new(opts.closure_cache_triples)
+                .with_retained_parent(retained_parent),
             rdfs: RwLock::new(rdfs),
             query_reasoning: RwLock::new(query_reasoning),
             validation: RwLock::new(validation),
@@ -676,6 +679,26 @@ impl Dataset {
         if !matches!(setting.profile()?, Some(sparkles_reasoner::Profile::OwlQl)) {
             return Ok(None);
         }
+        let opts = crate::overview::one_deadline(opts)?;
+        let cancel = opts.cancel.clone();
+        let cancellation = opts.cancellation.clone();
+        let deadline = opts.deadline;
+        let stop = move || {
+            if cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Err(crate::Error::Cancelled);
+            }
+            if let Some(cancellation) = &cancellation {
+                cancellation.check()?;
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Err(crate::Error::Timeout);
+            }
+            Ok(())
+        };
+        stop()?;
         let reasoner = self.query_reasoner(None)?;
         let snap = self.snapshot();
         let readable = opts
@@ -692,12 +715,12 @@ impl Dataset {
         let req = SessionRequest {
             snap,
             readable,
-            stop: Arc::new(|| Ok(())),
+            stop: Arc::new(stop),
             max_memory: opts.max_memory_bytes,
             memory_parent,
-            no_cache: false,
+            no_cache: opts.no_cache,
         };
-        let Some(t) = reasoner.owl_ql_tbox(&req)? else {
+        let Some(t) = reasoner.owl_ql_tbox_guarded(&req)? else {
             return Ok(None);
         };
         Ok(Some(serde_json::json!({

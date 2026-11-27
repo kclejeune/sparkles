@@ -96,10 +96,18 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     let mut fetch_warnings = Vec::new();
     if req.inputs.imports == ImportMode::Fetch || req.refresh_imports {
         ctl.progress.report(0.02, "fetching imports");
-        let qopts = QueryOptions {
-            cancel: Some(cancel.clone()),
-            ..req.load.clone()
-        };
+        let mut qopts = req.load.clone();
+        qopts.cancel = Some(cancel.clone());
+        qopts.deadline = ctl.deadline.into_iter().chain(qopts.deadline).min();
+        qopts.max_memory_bytes = req
+            .max_memory
+            .map(|bytes| bytes as u64)
+            .into_iter()
+            .chain(qopts.max_memory_bytes)
+            .min();
+        if qopts.pool.is_none() && qopts.grant.is_none() {
+            qopts.pool = state.pool.clone();
+        }
         let refresh = if req.refresh_imports {
             fetched_before
         } else {
@@ -133,12 +141,19 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             .unwrap_or(sparkles_reasoner::DEFAULT_MAX_INFERRED),
         pool: super::reason_pool(),
         // the input graphs' axioms outside OWL 2 RL, in the state the run reads
-        inspect: rl_inspector(store, req, ctl),
+        inspect: rl_inspector(ds, req, ctl),
         ..Default::default()
     };
     let superseded = AtomicBool::new(false);
     let done = AtomicBool::new(false);
     let result = std::thread::scope(|s| {
+        struct SignalDone<'a>(&'a AtomicBool);
+        impl Drop for SignalDone<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _signal = SignalDone(&done);
         if req.yield_to_writers {
             // a newer write waiting for the lock supersedes this run
             s.spawn(|| {
@@ -162,15 +177,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             since,
             cache: Some(&state.closure),
         };
-        let r = sparkles_reasoner::materialize_incremental(
-            store,
-            &req.profile,
-            &req.extras,
-            inc,
-            &opts,
-        );
-        done.store(true, Ordering::Relaxed);
-        r
+        sparkles_reasoner::materialize_incremental(store, &req.profile, &req.extras, inc, &opts)
     });
     let report = match result {
         Ok(r) => r,
@@ -206,7 +213,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
 /// OWL 2 RL and those whose rules the rule subset lacks. Other profiles have none, and
 /// so does a library built without the `ontology` feature.
 fn rl_inspector(
-    store: &Store,
+    ds: &Dataset,
     req: &ReasonRequest,
     ctl: &Control,
 ) -> Option<sparkles_reasoner::InspectFn> {
@@ -215,15 +222,17 @@ fn rl_inspector(
         let opts = QueryOptions {
             cancel: Some(ctl.cancel.flag()),
             deadline: ctl.deadline,
+            max_memory_bytes: req.max_memory.map(|bytes| bytes as u64),
+            pool: ds.pool().cloned(),
             ..Default::default()
         };
         return Some(crate::handles::ontology::rl_inspector(
-            store,
+            ds.store(),
             &req.inputs,
             opts,
         ));
     }
-    let _ = (store, req, ctl);
+    let _ = (ds, req, ctl);
     None
 }
 

@@ -254,6 +254,7 @@ pub struct CacheEntry {
     /// the taxonomy of the ontology at `commit`, once a classification computed it,
     /// which a DL query's run over the saturation leaves as it is
     pub(super) result: Option<Arc<KeptClassification>>,
+    memory: Option<crate::reasoning::memory::Memory>,
 }
 
 impl CacheEntry {
@@ -267,6 +268,7 @@ impl CacheEntry {
             extra: Vec::new(),
             saturation: Saturation::new(),
             result: None,
+            memory: None,
         }
     }
     /// The estimated bytes of the kept taxonomy, 0 when none is kept.
@@ -278,6 +280,31 @@ impl CacheEntry {
     /// Lets both flight finalization and the next classification know it has gone.
     pub(super) fn drop_taxonomy(&mut self) {
         self.result = None;
+    }
+
+    /// Keep immutable taxonomy credit with the publication and mutable saturation
+    /// credit with this cache entry. A cache miss is safe if retention is refused.
+    fn admit_retention(
+        &mut self,
+        pool: Option<&Arc<sparkles_core::sparql::pool::QueryPool>>,
+    ) -> bool {
+        let Some(pool) = pool else { return true };
+        let bytes = self
+            .retained_bytes
+            .saturating_sub(self.taxonomy_memory())
+            .saturating_sub(self.result.as_ref().map_or(0, |p| p.auxiliary_bytes))
+            as u64;
+        if self
+            .memory
+            .as_ref()
+            .is_some_and(|held| held.bytes() >= bytes)
+        {
+            return true;
+        }
+        let held = self.memory.get_or_insert_with(|| {
+            crate::reasoning::memory::Memory::new(None, Some(super::kept::cache_parent(pool)))
+        });
+        held.grow(bytes - held.bytes()).is_ok()
     }
 
     /// Runs `go` on the kept saturation over the logical axioms of `o` and `extra`, with
@@ -609,6 +636,7 @@ impl Ontologies {
         let mut flight = KeptFlight::begin(state, lock, key, el_only, o.snapshot.commit, kind);
         match f(flight.entry()) {
             Ok((out, keep)) => {
+                let keep = keep && flight.entry().admit_retention(state.pool.as_ref());
                 flight.finish(keep);
                 Ok(out)
             }
@@ -962,7 +990,10 @@ fn bounded<T>(
 ) -> Result<T> {
     let cancel = opts.cancel.clone();
     let cancellation = opts.cancellation.clone();
-    let grant = opts.grant.clone();
+    // The classifier reports growth of its admitted peak. Own that debit here so
+    // success, refusal and unwind all restore the enclosing grant's live usage.
+    let memory = parking_lot::Mutex::new(crate::reasoning::memory::Memory::query(opts));
+    let pooled = opts.grant.is_some() || opts.pool.is_some();
     let limits = Limits {
         el_only: false,
         threads: par.threads(),
@@ -972,8 +1003,8 @@ fn bounded<T>(
             cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
                 || cancellation.as_ref().is_some_and(|c| c.check().is_err())
         })),
-        charge: grant.map(|g| {
-            Arc::new(move |bytes: usize| g.charge(bytes as u64).is_ok())
+        charge: pooled.then(|| {
+            Arc::new(move |bytes: usize| memory.lock().grow(bytes as u64).is_ok())
                 as Arc<dyn Fn(usize) -> bool + Send + Sync>
         }),
         partial: false,
@@ -991,7 +1022,7 @@ fn bounded<T>(
         sparkles_owl::classify::Error::Memory { limit, used } => {
             let over_budget = opts.max_memory_bytes.is_some_and(|m| used as u64 > m);
             Error::BudgetExceeded(Budget {
-                kind: if over_budget || opts.grant.is_none() {
+                kind: if over_budget || !pooled {
                     BudgetKind::Memory
                 } else {
                     BudgetKind::ServerMemory

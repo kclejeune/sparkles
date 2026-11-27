@@ -623,7 +623,9 @@ impl Cell {
         st.view_limits.remove(name);
         st.recompute_local_limit();
         if st.view_limits.is_empty() {
-            st.circuit.set_version_pool(None);
+            st.circuit
+                .set_version_pool(None)
+                .expect("detaching a version cannot grow state");
         }
         st.view_limits.len()
     }

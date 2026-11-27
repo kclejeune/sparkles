@@ -714,8 +714,13 @@ impl Engine<'_> {
     }
 
     fn run_query_on(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Arc<Ctx>)> {
-        let ctx = if let Some(opts) = &self.query_limits {
-            sparkles_core::sparql::validation_query_context(
+        let defaults = sparkles_core::sparql::QueryOptions::default();
+        let ctx = if let Some(opts) = self
+            .query_limits
+            .as_ref()
+            .or_else(|| self.query_memory_parent.as_ref().map(|_| &defaults))
+        {
+            sparkles_core::sparql::validation_query_context_with_parent(
                 self.data,
                 sparkles_core::sparql::QueryOptions {
                     deadline: self.controls.deadline,
@@ -731,6 +736,7 @@ impl Engine<'_> {
                     work: opts.work.clone(),
                     ..Default::default()
                 },
+                self.query_memory_parent.clone(),
             )?
         } else {
             let mut ctx = Ctx::new(self.data.snap.clone());

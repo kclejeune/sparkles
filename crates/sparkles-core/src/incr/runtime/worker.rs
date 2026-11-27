@@ -24,12 +24,24 @@ thread_local! {
 }
 
 /// Declare before operation-local guards, so cleanup runs after their locks drop.
-pub(super) struct Operation;
+pub(crate) struct Operation;
 
 impl Operation {
     pub(super) fn enter() -> Self {
         OPERATIONS.with(|s| s.borrow_mut().depth += 1);
         Operation
+    }
+
+    pub(crate) fn release_publication(credit: MemoryLease) {
+        let mut credit = Some(credit);
+        let _ = OPERATIONS.try_with(|s| {
+            let mut s = s.borrow_mut();
+            if s.depth != 0 {
+                let credit = credit.take().unwrap();
+                s.close.push(Box::new(move || drop(credit)));
+            }
+        });
+        drop(credit);
     }
 }
 
@@ -219,6 +231,7 @@ impl Runtime {
                     drop(active);
                     drop(s);
                 }
+                runtime.complete_round();
                 drop(runtime);
                 let gone = exec.block_on(async {
                     let mut changed = std::pin::pin!(commits.changed());
@@ -241,6 +254,11 @@ impl Runtime {
         })
     }
 
+    pub(super) fn complete_round(&self) {
+        *self.epoch.lock() += 1;
+        self.cv.notify_all();
+    }
+
     /// Whether a worker round or its synchronized shutdown is in progress.
     pub fn worker_busy(&self) -> bool {
         self.worker.is_locked()
@@ -249,13 +267,22 @@ impl Runtime {
     /// Run a round on the worker and wait for it, at most `timeout`: views defined in
     /// the dataset are then attached and recovered.
     pub fn settle(&self, timeout: Duration) {
+        self.settle_checked(timeout);
+    }
+
+    /// Kick the worker and report whether a round completed.
+    pub fn settle_checked(&self, timeout: Duration) -> bool {
+        let epoch = self.epoch.lock();
         self.kick();
-        self.wait_round(Instant::now() + timeout);
+        self.wait_epoch(epoch, Instant::now() + timeout)
     }
 
     /// Wait until a round has finished after this call, at most until `until`.
     pub(super) fn wait_round(&self, until: Instant) -> bool {
-        let mut e = self.epoch.lock();
+        self.wait_epoch(self.epoch.lock(), until)
+    }
+
+    fn wait_epoch(&self, mut e: parking_lot::MutexGuard<'_, u64>, until: Instant) -> bool {
         let start = *e;
         while *e == start {
             if self.cv.wait_until(&mut e, until).timed_out() {

@@ -312,8 +312,12 @@ fn query_reasoning_and_view_share_one_capacity() {
     ds.views()
         .put("types", ViewDef::table("SELECT ?s ?t WHERE { ?s a ?t }"))
         .unwrap();
-    ds.views().wait_built("types", wait).unwrap();
-    ds.views().settle(wait);
+    use sparkles::incr::views::ViewState;
+    assert_eq!(
+        ds.views().wait_built("types", wait).unwrap().state,
+        ViewState::Current
+    );
+    assert!(ds.views().settle_checked(wait));
     let view_bytes = pool.granted();
     assert!(view_bytes > 0, "the maintained view must hold credit");
 
@@ -374,8 +378,7 @@ fn query_reasoning_and_view_share_one_capacity() {
     drop(grant);
     assert_eq!(pool.granted(), view_bytes);
     assert!(ds.views().delete("types").unwrap());
-    ds.views().settle(wait);
-    ds.views().settle(wait);
+    assert!(ds.views().settle_checked(wait));
     assert_eq!(pool.granted(), 0);
 }
 
@@ -404,8 +407,21 @@ fn owl_ql_status_uses_the_request_pool_and_releases_its_credit() {
     assert_eq!(request_pool.granted(), full.bytes());
     assert_eq!(dataset_pool.granted(), 0);
 
+    let cancelled = QueryOptions {
+        cancel: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        ..opts.clone()
+    };
+    assert!(matches!(
+        ds.owl_ql_status(&cancelled),
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(request_pool.granted(), full.bytes());
     drop(full);
     assert!(ds.owl_ql_status(&opts).unwrap().is_some());
+    assert!(matches!(
+        ds.owl_ql_status(&cancelled),
+        Err(Error::Cancelled)
+    ));
     assert_eq!(request_pool.granted(), 0);
     assert_eq!(dataset_pool.granted(), 0);
 }
@@ -533,4 +549,175 @@ fn only_unguarded_payloads_implement_clone() {
         (query.payload_is_clone(), typings.payload_is_clone()),
         (true, true)
     );
+}
+
+#[test]
+fn materialization_unwind_joins_writer_monitor_and_refunds_credit() {
+    use sparkles::task::{Control, Progress};
+    struct Interrupted;
+
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    let observed = pool.clone();
+    let control = Control {
+        progress: Progress::new(move |_, stage| {
+            if stage == "reasoning" {
+                assert!(observed.granted() > 0);
+                std::panic::panic_any(Interrupted);
+            }
+        }),
+        ..Control::none()
+    };
+    let before = ds.store().head_commit().seq;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ds.reasoning().run_with(
+            &ReasonRequest {
+                profile: Profile::RdfsSimple,
+                yield_to_writers: true,
+                incremental: false,
+                ..Default::default()
+            },
+            &control,
+        )
+    }));
+    assert!(outcome.unwrap_err().is::<Interrupted>());
+    assert_eq!(ds.store().head_commit().seq, before);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn cold_rl_inspector_refuses_a_full_pool_before_materialization() {
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    let sibling = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let before = ds.store().head_commit().seq;
+    let error = ds
+        .reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::OwlRl,
+            incremental: false,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(is_server_memory(&error), "{error:?}");
+    assert_eq!(ds.store().head_commit().seq, before);
+    assert_eq!(pool.granted(), sibling.bytes());
+    drop(sibling);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn classifier_and_rl_dl_query_respect_pool_without_explicit_grant() {
+    use sparkles::handles::ontology::{
+        OntologyRequest,
+        classify::ClassifyRequest,
+        dl_query::{DlQueryRequest, DlReasoning},
+    };
+    use sparkles::owl::Class;
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    let req = OntologyRequest::default();
+    let classify = ClassifyRequest {
+        assertions: true,
+        ..Default::default()
+    };
+    let sibling = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let error = ds
+        .ontology()
+        .classify(&req, &classify, &Default::default())
+        .err()
+        .expect("classification must see the dataset pool");
+    assert!(is_server_memory(&error), "{error:?}");
+
+    let mut dl = DlQueryRequest::new(Class::new("http://ex.org/A").into());
+    dl.reasoning = DlReasoning::Rl;
+    let error = ds
+        .ontology()
+        .dl_query(&req, &dl, &Default::default())
+        .err()
+        .expect("RL private copy must see the dataset pool");
+    assert!(is_server_memory(&error), "{error:?}");
+    assert_eq!(pool.granted(), sibling.bytes());
+    drop(sibling);
+    assert_eq!(pool.granted(), 0);
+
+    let grant = Arc::new(pool.empty_grant());
+    grant.charge(128).unwrap();
+    let answer = ds
+        .ontology()
+        .classify(
+            &req,
+            &classify,
+            &QueryOptions {
+                grant: Some(grant.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(grant.used(), 128);
+    drop(answer);
+    drop(grant);
+    assert_eq!(pool.granted(), 0);
+
+    let kept = ds
+        .ontology()
+        .classify(&req, &Default::default(), &Default::default())
+        .unwrap();
+    assert!(pool.granted() > 0);
+    drop(ds);
+    assert!(
+        pool.granted() > 0,
+        "the published taxonomy outlives its dataset"
+    );
+    drop(kept);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn kept_materialization_owns_its_configured_retained_branch() {
+    use sparkles::store::{Store, StoreOptions};
+
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 4 * MIB).unwrap();
+    let ds = Dataset::from_store_with(
+        Store::in_memory(StoreOptions::default()),
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        },
+    );
+    ds.update(
+        "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        INSERT DATA { <urn:A> rdfs:subClassOf <urn:B> . <urn:s> a <urn:A> }",
+    )
+    .unwrap();
+    let report = ds
+        .reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::RdfsSimple,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(report.report.inferred > 0);
+    assert_eq!(pool.granted(), 0);
+    assert!(pool.domain_stats().retained_reserved > 0);
+    drop(ds);
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
+}
+
+#[test]
+fn cold_rdfs_explanation_respects_the_dataset_pool() {
+    use sparkles::reasoning::rdfs::NewSchema;
+
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    ds.reasoning()
+        .rdfs()
+        .set(NewSchema::Graph("default".into()))
+        .unwrap();
+    let mut req = ExplainRequest::new([ex("x"), rdf_type(), ex("C")]);
+    req.source = Some(ExplainSource::RdfsOnRead);
+    let sibling = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let err = ds.reasoning().explain(&req).unwrap_err();
+    assert!(is_server_memory(&err), "{err:?}");
+    assert_eq!(pool.granted(), sibling.bytes());
+    drop(sibling);
+    ds.reasoning().explain(&req).unwrap();
+    assert_eq!(pool.granted(), 0);
 }
