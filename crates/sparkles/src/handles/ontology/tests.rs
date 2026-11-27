@@ -2613,7 +2613,10 @@ mod classification {
         assert_eq!(j["complete"], json!(part.complete()));
         assert_eq!(j["incompleteCount"], json!(cl.incomplete.len()));
         let consistency = j["consistency"].as_str().unwrap();
-        if cl.complete_for_taken {
+        // A deadline that stops the modules' pass after the saturation answers in full
+        // for the axioms it took, with every class open and the consistency unknown, so
+        // it is checked as a stopped answer.
+        if cl.complete_for_taken && !cl.stats.coverage_stopped {
             assert!(everything || got == want);
             assert!(part.complete());
             assert_eq!(j["incomplete"], json!([]));

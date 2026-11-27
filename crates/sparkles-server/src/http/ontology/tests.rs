@@ -1123,6 +1123,15 @@ fn server_with_memory(data: &str, memory: Option<u64>) -> Server {
             None,
         )])
         .unwrap();
+    if memory.is_some() {
+        // A budget comes from the classifier's estimate, which leaves out reading the
+        // ontology. Read it once without a budget so that the budget stops the run in
+        // its saturation, as the handle's budget tests do.
+        ds.dataset
+            .ontology()
+            .open(&Default::default(), &Default::default())
+            .unwrap();
+    }
     let app = router(state.clone());
     Server {
         _dir: dir,
@@ -1194,7 +1203,9 @@ async fn stopped_over_http(
     };
     let j = r.json();
     assert_eq!(j["classes"], full["classes"], "{j}");
-    if j["partial"] == false {
+    // A deadline that stops the modules' pass after the saturation answers in full for
+    // the axioms it took, with every class open and the consistency unknown.
+    if j["partial"] == false && j["stats"]["coverageStopped"] != true {
         if j["complete"] == false {
             // a budget past the one of the disjunctive rules runs the EL rules instead,
             // whose answer leaves the disjunctive axioms out
