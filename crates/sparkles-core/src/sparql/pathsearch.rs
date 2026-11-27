@@ -1578,38 +1578,57 @@ impl ReverseAlternatives {
                 .get(&u)
                 .map_or(std::slice::from_ref(&parent), |b| b.hops.as_slice());
             let next_prefix = prefix + 1;
-            for &v in hops {
-                poll()?;
-                if v == source {
-                    continue;
-                }
-                let suffix = tree.dist[&v];
-                let Some(lower) = next_prefix.checked_add(suffix) else {
-                    continue;
-                };
-                if lower > max_len || second.is_some_and(|len| len <= lower) {
-                    continue;
-                }
-                let certified = match cheap_certificate(v, suffix) {
-                    Some(false) if !self.branches.contains_key(&v) => continue,
-                    Some(avoids) => avoids,
-                    // Queued nodes are descendants of the source. Across a
-                    // tree edge a deeper neighbor is in that subtree too.
-                    None if v == parent || parents[&(v, suffix)].node == u => false,
-                    None => tree.suffix_avoids(ctx, v, source, poll)?,
-                };
-                if certified {
-                    if u != source {
-                        if lower == lower_bound {
-                            return Ok(Some(lower));
-                        }
-                        second = Some(lower);
+            // Revisit only the tail starting at the first hop that needs
+            // intervals, after checking the shallow exits at this prefix.
+            let mut deferred: &[u64] = &[];
+            for deep_pass in [false, true] {
+                let pass = if deep_pass { deferred } else { hops };
+                for (j, &v) in pass.iter().enumerate() {
+                    poll()?;
+                    if v == source {
+                        continue;
                     }
-                } else {
-                    let (new, next) = insert_hb_set(&mut seen, v, &mut scratch, base)?;
-                    base = next;
-                    if new {
-                        base = push_vec(&mut queue, (v, next_prefix), &mut scratch, base)?;
+                    let suffix = tree.dist[&v];
+                    let Some(lower) = next_prefix.checked_add(suffix) else {
+                        continue;
+                    };
+                    if lower > max_len || second.is_some_and(|len| len <= lower) {
+                        continue;
+                    }
+                    let cheap = match cheap_certificate(v, suffix) {
+                        Some(false) if !self.branches.contains_key(&v) => continue,
+                        // Queued nodes are descendants of the source. Across a
+                        // tree edge a deeper neighbor is in that subtree too.
+                        None if v == parent || parents[&(v, suffix)].node == u => Some(false),
+                        other => other,
+                    };
+                    let certified = match (deep_pass, cheap) {
+                        (false, Some(avoids)) => avoids,
+                        (true, None) => tree.suffix_avoids(ctx, v, source, poll)?,
+                        (false, None) => {
+                            if deferred.is_empty() {
+                                deferred = &hops[j..];
+                            }
+                            continue;
+                        }
+                        (true, Some(_)) => continue,
+                    };
+                    if certified {
+                        if u != source {
+                            if lower == lower_bound {
+                                return Ok(Some(lower));
+                            }
+                            second = Some(lower);
+                            // At this prefix every deferred suffix is longer
+                            // than a shallow exit, so none can improve it.
+                            deferred = &[];
+                        }
+                    } else {
+                        let (new, next) = insert_hb_set(&mut seen, v, &mut scratch, base)?;
+                        base = next;
+                        if new {
+                            base = push_vec(&mut queue, (v, next_prefix), &mut scratch, base)?;
+                        }
                     }
                 }
             }
@@ -14594,26 +14613,57 @@ mod tree_tests {
 
     #[test]
     fn reverse_first_row_settles_shallow_hops_before_indexing() {
-        use std::fmt::Write as _;
-
         // The reverse search records a's hops in cost order: t, then h, then y.
         // The route through y settles the competing length without indexing h.
+        assert_shallow_first_row(
+            "ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:a ex:p ex:h, ex:y . \
+             ex:h ex:p ex:z . ex:z ex:p ex:w . ex:w ex:p ex:t . \
+             ex:y ex:p ex:t {| ex:w 10e0 |} . ",
+            4,
+            8,
+            8,
+        );
+    }
+
+    #[test]
+    fn reverse_walk_settles_shallow_hops_before_indexing() {
+        // At u the walk sees the return to a, then the deep exit through h,
+        // then the exit through z that attains the three-edge lower bound.
+        assert_shallow_first_row(
+            "ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:a ex:p ex:u {| ex:w 2e0 |} . \
+             ex:u ex:p ex:a, ex:z . ex:u ex:p ex:h {| ex:w 2e0 |} . \
+             ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . \
+             ex:z ex:p ex:t {| ex:w 10e0 |} . ",
+            5,
+            9,
+            12,
+        );
+    }
+
+    fn assert_shallow_first_row(edges: &str, max_len: u32, visits: usize, max_steps: usize) {
+        use std::fmt::Write as _;
+
         for n in [1, 1024] {
-            let mut ttl = String::from(
-                "@prefix ex: <http://example.org/> . \
-                 ex:a ex:p ex:t {| ex:w 0.5e0 |} . ex:a ex:p ex:h, ex:y . \
-                 ex:h ex:p ex:z . ex:z ex:p ex:w . ex:w ex:p ex:t . \
-                 ex:y ex:p ex:t {| ex:w 10e0 |} . ",
-            );
+            let mut ttl = format!("@prefix ex: <http://example.org/> . {edges}");
             for i in 0..n {
                 write!(ttl, "ex:b{i} ex:p ex:t {{| ex:w 1e12 |}} . ").unwrap();
             }
-            let properties = format!(
-                "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
-                 path:weight ex:w ; path:maxLength 4 ; path:maxVisited {}",
-                n + 8
-            );
-            let rows = reverse_first_rows(ttl, &properties, None);
+            let properties = |cap| {
+                format!(
+                    "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+                     path:weight ex:w ; path:maxLength {max_len} ; path:maxVisited {cap}"
+                )
+            };
+            let cap = n + visits;
+            // A competing route requires the forward ranking visits for a and t.
+            for (result, _) in reverse_first_batches(ttl.clone(), &properties(cap - 1), None, 1) {
+                let err = result.unwrap_err().to_string();
+                assert!(
+                    err.contains(&format!("visited more than {} nodes", cap - 1)),
+                    "{err}"
+                );
+            }
+            let rows = reverse_first_rows(ttl, &properties(cap), None);
             for (first, _) in &rows {
                 assert_eq!(
                     first,
@@ -14622,7 +14672,7 @@ mod tree_tests {
             }
             let steps = rows.map(|(_, steps)| steps);
             assert!(
-                steps.iter().all(|&count| count <= 8),
+                steps.iter().all(|&count| count <= max_steps),
                 "eager and cursor suffix steps with {n} unrelated sources: {steps:?}"
             );
         }

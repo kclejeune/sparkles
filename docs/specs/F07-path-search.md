@@ -289,8 +289,9 @@ check builds a preorder interval for each real node in the shortest-hop tree. La
 checks take constant time. A neighbor outside the branch's interval has a shortest
 suffix that avoids it. The search starts a breadth-first walk only if an unresolved hop
 could supply a second route or improve the certified threshold. It excludes the branch
-and prunes over-budget prefixes. At each hop the walk uses the same depth, parent and
-ancestry checks. It enqueues only nodes whose shortest suffix returns to the branch.
+and prunes over-budget prefixes. At each queued node the walk checks shallow exits and
+shortest-hop tree edges before consulting the intervals for deeper hops that can still
+improve the threshold. It enqueues only nodes whose shortest suffix returns to the branch.
 A deeper neighbor joined to a queued node by a shortest-hop tree edge also lies in
 that subtree. The walk visits each queued node at most once and stops when it attains
 the lower bound on the unresolved hops. The virtual endpoint represents a
