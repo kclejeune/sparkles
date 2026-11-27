@@ -451,14 +451,14 @@ pub(crate) fn changes(
     match logged_ids(store, since, snap, inputs, &admission) {
         Ok(Some(raw)) => return Ok(Ok(admission.finish(raw))),
         Ok(None) => {}
-        Err(e) => refuse_staging_error(&e)?,
+        Err(e) => admission.refuse(&e)?,
     }
     drop(admission);
     let admission = Staging::new(budget, cancel);
     let e = match logged_changes(store, since, snap.commit, inputs, &admission) {
         Ok(raw) => return Ok(Ok(admission.finish(raw))),
         Err(e) => {
-            refuse_staging_error(&e)?;
+            admission.refuse(&e)?;
             e
         }
     };
@@ -487,6 +487,9 @@ fn refuse_staging_error(error: &anyhow::Error) -> anyhow::Result<()> {
 struct Staging {
     held: std::cell::RefCell<Held>,
     opts: DiffOptions,
+    /// The run's own limit refused a charge. The diff callbacks can only return a
+    /// core error, so the run's error is kept here for [`Staging::refuse`].
+    local_refusal: std::cell::RefCell<Option<crate::budget::MemoryExceeded>>,
 }
 
 impl Staging {
@@ -497,16 +500,28 @@ impl Staging {
                 cancel: cancel.cloned(),
                 ..Default::default()
             },
+            local_refusal: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Whether a failed staging attempt must fail the run. A refusal of the run's
+    /// own limit fails it with the run's memory error, as other charges of the run do.
+    fn refuse(&self, error: &anyhow::Error) -> anyhow::Result<()> {
+        if let Some(local) = self.local_refusal.borrow_mut().take() {
+            return Err(BudgetFailure::Local(local).into());
+        }
+        refuse_staging_error(error)
     }
 
     fn admit(&self, bytes: u64) -> sparkles_core::Result<()> {
         let mut held = self.held.borrow_mut();
         held.try_grow(bytes as usize).map_err(|error| match error {
             BudgetFailure::Local(local) => {
+                let limit = local.limit;
+                self.local_refusal.borrow_mut().get_or_insert(local);
                 sparkles_core::Error::BudgetExceeded(sparkles_core::error::Budget {
                     kind: sparkles_core::error::BudgetKind::Memory,
-                    limit: local.limit as u64,
+                    limit: limit as u64,
                     requested: (held.budget().used() as u64).saturating_add(bytes),
                 })
             }
@@ -560,7 +575,7 @@ pub(crate) fn kept_changes(
     match delta_changes(&old, snap, inputs, &admission) {
         Ok(raw) => Ok(Some(Ok(admission.finish(raw)))),
         Err(e) => {
-            refuse_staging_error(&e)?;
+            admission.refuse(&e)?;
             Ok(Some(Err(e.to_string())))
         }
     }
