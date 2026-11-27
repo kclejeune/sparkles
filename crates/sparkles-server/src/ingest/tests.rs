@@ -3399,7 +3399,7 @@ async fn preview_registration_refuses_a_write_between_read_and_commit() {
 }
 
 #[tokio::test]
-async fn preview_approval_keeps_resolved_destinations_after_prefix_rebind() {
+async fn preview_approval_keeps_resolved_destinations_and_entities_after_prefix_rebind() {
     for extract in [false, true] {
         let model = proposals_mock();
         let (st, app) = app(Some([&model.url(), &model.url()]));
@@ -3409,11 +3409,20 @@ async fn preview_approval_keeps_resolved_destinations_after_prefix_rebind() {
             req(
                 "PATCH",
                 "/$/settings/org/prefixes",
-                json!({"doc": "urn:approved:"}),
+                json!({"doc": "urn:approved:", "ent": "http://example.org/"}),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
+        let seed = Request::post("/org/update")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from(
+                r#"INSERT DATA { GRAPH <https://example.org/hr> {
+                    <urn:redirected:ana> a <http://schema.org/Person> .
+                } }"#,
+            ))
+            .unwrap();
+        assert!(send(&app, seed).await.0.is_success());
         let v = ingest(
             &app,
             req(
@@ -3430,13 +3439,17 @@ async fn preview_approval_keeps_resolved_destinations_after_prefix_rebind() {
         assert_eq!(v["result"]["prefixes"]["doc"], "urn:approved:", "{v}");
         assert_eq!(v["result"]["source"], "doc:source", "{v}");
         assert_eq!(v["result"]["graph"], "doc:graph", "{v}");
+        if extract {
+            assert_eq!(v["result"]["proposed"], 1, "{v}");
+            assert_eq!(v["result"]["entities"]["linked"], 1, "{v}");
+        }
         let before = head(&st);
         let (status, changed) = send(
             &app,
             req(
                 "PATCH",
                 "/$/settings/org/prefixes",
-                json!({"doc": "urn:redirected:"}),
+                json!({"doc": "urn:redirected:", "ent": "urn:redirected:"}),
             ),
         )
         .await;
@@ -3448,6 +3461,14 @@ async fn preview_approval_keeps_resolved_destinations_after_prefix_rebind() {
         assert!(ask(&app, "ASK { GRAPH <urn:approved:graph> { <urn:approved:source> <urn:x-sparkles:rendition> ?r } }").await);
         assert!(!ask(&app, "ASK { GRAPH <urn:redirected:graph> { ?s ?p ?o } }").await);
         if extract {
+            let expected = format!(
+                "ASK {{ GRAPH <urn:approved:graph> {{ <http://example.org/ana> <{MEMBER_OF}> ?team }} }}"
+            );
+            let redirected = format!(
+                "ASK {{ GRAPH <urn:approved:graph> {{ <urn:redirected:ana> <{MEMBER_OF}> ?team }} }}"
+            );
+            assert!(ask(&app, &expected).await, "{approved}");
+            assert!(!ask(&app, &redirected).await, "{approved}");
             assert!(ask(&app, "ASK { GRAPH <urn:approved:graph> { ?r <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ?t } }").await);
         }
     }

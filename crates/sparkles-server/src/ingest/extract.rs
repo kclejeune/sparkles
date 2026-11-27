@@ -14,7 +14,7 @@
 //! moves to the next pair of the role's list for the rest of the run. Each chunk records
 //! the pair that answered it.
 
-use super::pipeline::{Failed, Run};
+use super::pipeline::{Failed, Run, expand_iri};
 use crate::mcp::memory::ingest::fold_ws;
 use crate::models::{Models, OutputSchema, Pair, Part, Prompt, Role, StepError};
 use serde_json::{Map, Value, json};
@@ -741,6 +741,7 @@ pub(super) struct Linker {
     entities: Vec<(String, String)>,
     links: Vec<Link>,
     prefixes: Value,
+    resolve_candidates: bool,
 }
 
 fn norm(s: &str) -> String {
@@ -754,6 +755,7 @@ impl Linker {
             entities: Vec::new(),
             links: Vec::new(),
             prefixes: json!({}),
+            resolve_candidates: false,
         }
     }
 
@@ -835,7 +837,14 @@ impl Linker {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter_map(|c| c["iri"].as_str().map(str::to_string))
+                    .filter_map(|c| c["iri"].as_str())
+                    .map(|iri| {
+                        if self.resolve_candidates {
+                            absolute_iri(iri, &out["prefixes"])
+                        } else {
+                            iri.to_string()
+                        }
+                    })
                     .collect();
                 self.links.push(match m["verdict"].as_str() {
                     Some("exact") if !cands.is_empty() => Link::Existing(cands[0].clone()),
@@ -878,11 +887,21 @@ fn used(ex: &Extraction) -> std::collections::BTreeSet<&String> {
 }
 
 /// Link the entities of `ex` with `link_entities`, as the caller, on `branch`.
-pub(super) fn link(r: &mut Run, ex: &Extraction, branch: Option<&str>) -> Result<Linked, Failed> {
+fn link(
+    r: &mut Run,
+    ex: &Extraction,
+    branch: Option<&str>,
+    preview: bool,
+) -> Result<Linked, Failed> {
     r.ctx.progress.status(super::Status::Linking, 0.82, None);
     let mut linker = Linker::new();
+    linker.resolve_candidates = preview;
     linker.update(r, ex, branch)?;
     Ok(linker.linked(ex))
+}
+
+fn absolute_iri(iri: &str, prefixes: &Value) -> String {
+    format!("<{}>", expand_iri(iri, prefixes))
 }
 
 /// Link the extraction's entities and write its facts on `branch` (or, for a preview,
@@ -901,7 +920,26 @@ pub fn propose(
         entity_of,
         links,
         ..
-    } = link(r, ex, if preview { None } else { branch })?;
+    } = link(r, ex, if preview { None } else { branch }, preview)?;
+    let profile_iri = |iri: &str| {
+        if preview {
+            absolute_iri(iri, &v.prefixes)
+        } else {
+            iri.to_string()
+        }
+    };
+    let literal_prefixes: Vec<_> = if preview {
+        let ds = r.ctx.server.dataset(r.ctx.principal, Some(&r.dataset))?;
+        let mut prefixes = crate::mcp::tools::dataset_prefixes(&ds);
+        for (p, ns) in v.prefixes.as_object().into_iter().flatten() {
+            if let Some(ns) = ns.as_str() {
+                prefixes.insert(p.clone(), ns.to_string());
+            }
+        }
+        prefixes.into_iter().collect()
+    } else {
+        Vec::new()
+    };
     r.ctx.progress.status(super::Status::Writing, 0.9, None);
     let rendition = super::pipeline::registered_iri(registered, "rendition");
     let graph = super::pipeline::registered_iri(registered, "graph");
@@ -910,13 +948,16 @@ pub fn propose(
         .as_str()
         .unwrap_or("")
         .trim_matches(['<', '>']);
-    let label = |text: &str| match &v.language {
-        Some(l) => literal(&Lit {
-            value: text.to_string(),
-            datatype: None,
-            lang: Some(l.clone()),
-        }),
-        None => text.to_string(),
+    let label = |text: &str| {
+        if preview || v.language.is_some() {
+            literal(&Lit {
+                value: text.to_string(),
+                datatype: None,
+                lang: v.language.clone(),
+            })
+        } else {
+            text.to_string()
+        }
     };
     // the facts in batches; a new entity is declared in the first batch that uses it,
     // and later batches use the IRI that batch minted
@@ -986,7 +1027,7 @@ pub fn propose(
             .map(|e| {
                 let (text, class) = &entities[*e];
                 let mut j =
-                    json!({ "key": format!("_:e{e}"), "label": label(text), "types": [class] });
+                    json!({ "key": format!("_:e{e}"), "label": label(text), "types": [profile_iri(class)] });
                 if let Link::New(c) = &links[*e]
                     && !c.is_empty()
                 {
@@ -1001,11 +1042,21 @@ pub fn propose(
             .map(|(i, f)| {
                 let o = match &f.o {
                     Obj::Key(k) => term(k, &minted),
-                    Obj::Lit(l) => literal(l),
+                    Obj::Lit(l) => {
+                        let written = literal(l);
+                        if preview && l.datatype.is_some() {
+                            crate::mcp::memory::assert::sparql_term(&written, &literal_prefixes)
+                                .map(|term| term.to_string())
+                                // Keep rejection independent of any new prefix bindings.
+                                .unwrap_or_else(|_| "\"\"^^".into())
+                        } else {
+                            written
+                        }
+                    }
                 };
                 let mut j = json!({
                     "s": term(&f.s, &minted),
-                    "p": f.p,
+                    "p": profile_iri(&f.p),
                     "o": o,
                     "quote": f.quote.chars().take(1000).collect::<String>(),
                     "span": { "rendition": rendition, "start": f.start, "end": f.end },
@@ -1077,13 +1128,27 @@ pub fn propose(
                     break;
                 }
                 Err(e) => {
-                    let errors: Vec<Value> = e
+                    let mut errors: Vec<Value> = e
                         .data
                         .as_ref()
                         .and_then(|d| d["errors"].as_array().cloned())
                         .unwrap_or_default();
                     if errors.is_empty() {
                         return Err(e.into());
+                    }
+                    if preview && let Some(data) = &e.data {
+                        for error in &mut errors {
+                            for candidate in error
+                                .get_mut("candidates")
+                                .and_then(Value::as_array_mut)
+                                .into_iter()
+                                .flatten()
+                            {
+                                if let Some(iri) = candidate.as_str() {
+                                    *candidate = absolute_iri(iri, &data["prefixes"]).into();
+                                }
+                            }
+                        }
                     }
                     if !fix(&errors, &mut ent_args, &mut fact_args, &facts, &mut failed) {
                         return Err(e.into());

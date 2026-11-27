@@ -368,19 +368,135 @@ fn memory_redaction_refusal_keeps_an_existing_source_without_a_cache() {
 }
 
 #[test]
+fn memory_redaction_refusal_keeps_an_existing_source_after_path_policy_changes() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let args = ["import", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    f.write_mem(
+        "staging-db.md",
+        "---\nname: staging-postgres\ndescription: The staging database runs on port 5433\n---\nUse the staging database.\n",
+    );
+    let first = mem_json(&f, &s, "ana", &args);
+    let source = report(&first, "staging-db.md");
+    assert_eq!(source["status"], "new", "{first:#}");
+    let graph = source["graph"].as_str().unwrap();
+    let retained = format!(
+        "ASK {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . \
+         ?m <http://schema.org/description> \"The staging database runs on port 5433\" . \
+         FILTER NOT EXISTS {{ <{graph}> <http://www.w3.org/ns/prov#invalidatedAtTime> ?t }} }} }}"
+    );
+    assert!(s.ask(&retained));
+    let before = s.head();
+    std::fs::remove_dir_all(f.state()).unwrap();
+    let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(status, 200);
+    settings["redaction"] = json!({"patterns": [
+        {"name": "budget", "regex": "budget-marker"},
+        {"name": "filename", "regex": "staging-db[.]md"}
+    ]});
+    let (status, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(status, 200, "{output:#}");
+    f.write_mem("staging-db.md", &"budget-marker ".repeat(32_769));
+    let again = mem_json(&f, &s, "ana", &args);
+    let skipped = report(&again, "staging-db.md");
+    assert_eq!(skipped["status"], "skipped", "{again:#}");
+    assert_eq!(skipped["reason"], "redaction-too-large", "{again:#}");
+    assert_eq!(
+        report(&again, "MEMORY.md")["reason"],
+        "linked-redaction-too-large"
+    );
+    assert!(s.ask(&retained));
+    assert_eq!(s.head(), before);
+}
+
+#[test]
+fn memory_redaction_refusal_keeps_imports_hidden_by_a_refused_instruction_file() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let args = ["import", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(status, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "budget", "regex": "budget-marker"}]});
+    let (status, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(status, 200, "{output:#}");
+
+    let first = mem_json(&f, &s, "ana", &args);
+    let graph = report(&first, "docs/testing.md")["graph"].as_str().unwrap();
+    let live = format!(
+        "ASK {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . ?i a <urn:x-sparkles:mem:Instructions> . \
+         FILTER NOT EXISTS {{ <{graph}> <http://www.w3.org/ns/prov#invalidatedAtTime> ?t }} }} }}"
+    );
+    assert!(s.ask(&live));
+    let head = s.head();
+    std::fs::write(
+        p.join("CLAUDE.md"),
+        format!(
+            "# Shop\n@docs/testing.md\n{}",
+            "budget-marker ".repeat(32_769)
+        ),
+    )
+    .unwrap();
+    let again = mem_json(&f, &s, "ana", &args);
+    assert_eq!(report(&again, "CLAUDE.md")["reason"], "redaction-too-large");
+    assert!(s.ask(&live), "{again:#}");
+    assert_eq!(s.head(), head);
+
+    // A subsequent complete scan resumes deletion reconciliation.
+    std::fs::write(p.join("CLAUDE.md"), "# Shop\n").unwrap();
+    std::fs::remove_file(p.join("docs/testing.md")).unwrap();
+    let complete = mem_json(&f, &s, "ana", &args);
+    assert!(!s.ask(&live), "{complete:#}");
+}
+
+#[test]
 fn memory_project_commands_resolve_the_imported_redacted_identity() {
+    check_redacted_project_commands(None);
+}
+
+#[test]
+fn memory_project_commands_resolve_identities_from_per_run_redaction() {
+    for flag in ["--redact-patterns", "--redact-known-values"] {
+        check_redacted_project_commands(Some(flag));
+    }
+}
+
+fn check_redacted_project_commands(flag: Option<&str>) {
     let s = start_server(&["--mem", DS]);
     let f = Fixture::new();
     let p = f.project();
     let p = p.to_str().unwrap();
     mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
-    let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
-    assert_eq!(status, 200);
-    settings["redaction"] =
-        json!({"patterns": [{"name": "project", "regex": "github[.]com/acme/shop"}]});
-    let (status, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
-    assert_eq!(status, 200, "{output:#}");
-    let import = mem_json(&f, &s, "ana", &["import", "claude-code", "--project", p]);
+    let mut args = vec!["import", "claude-code", "--project", p];
+    let policy_file = f.dir.path().join("redaction-input");
+    match flag {
+        Some(flag) => {
+            let text = if flag == "--redact-patterns" {
+                "project github[.]com/acme/shop\n"
+            } else {
+                "github.com/acme/shop\n"
+            };
+            std::fs::write(&policy_file, text).unwrap();
+            args.extend([flag, policy_file.to_str().unwrap()]);
+        }
+        None => {
+            let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+            assert_eq!(status, 200);
+            settings["redaction"] =
+                json!({"patterns": [{"name": "project", "regex": "github[.]com/acme/shop"}]});
+            let (status, output) =
+                s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+            assert_eq!(status, 200, "{output:#}");
+        }
+    }
+    let import = mem_json(&f, &s, "ana", &args);
+    if flag.is_some() {
+        std::fs::remove_file(policy_file).unwrap();
+        std::fs::remove_dir_all(f.state()).unwrap();
+    }
     assert_eq!(import["failed"], 0, "{import:#}");
     let graph = report(&import, "staging-db.md")["graph"].as_str().unwrap();
     assert!(graph.contains("/redacted-project."), "{graph}");
@@ -429,6 +545,16 @@ fn memory_project_commands_resolve_the_imported_redacted_identity() {
         brief["text"].as_str().unwrap().contains("port 5433"),
         "{brief:#}"
     );
+    let status = mem_json(&f, &s, "ana", &["status", "--project", p]);
+    assert_eq!(status["project"], key, "{status:#}");
+    assert!(
+        status["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| { file["source"] == graph && file["status"] == "imported" }),
+        "{status:#}"
+    );
     let out = f.dir.path().join("export-redacted");
     let export = mem_json(
         &f,
@@ -446,6 +572,15 @@ fn memory_project_commands_resolve_the_imported_redacted_identity() {
         ],
     );
     assert!(out.join("staging-db.md").is_file(), "{export:#}");
+    let forgotten = mem_json(&f, &s, "ana", &["forget", "--project", p, "--yes"]);
+    assert!(
+        forgotten["deleted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == graph),
+        "{forgotten:#}"
+    );
 }
 
 #[test]

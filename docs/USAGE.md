@@ -4305,7 +4305,12 @@ false in the dataset settings to turn off environment matching. To add local val
 explicitly, pass `--redact-known-values FILE` or set
 `known-values = ["path/to/values.txt"]` in `memory.toml`. Each file holds one value per
 line. Blank lines, comments beginning with `#` and values shorter than eight characters
-are skipped. A direct registration under the import base, or in any graph when
+are skipped. Directory selectors can find the redacted project identity recorded by
+an earlier import, including one that used either per-run flag. When a file exceeds
+the redaction budget, sync keeps existing sources in the affected part of the scan
+until it can determine which files are gone.
+
+A direct registration under the import base, or in any graph when
 `redaction.everywhere` is true, fails with `secret-detected` when the server detects a
 match. Redaction coverage depends on the configured detectors.
 

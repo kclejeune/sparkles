@@ -334,7 +334,7 @@ impl Minter {
 
 /// A literal or an IRI written in SPARQL syntax (`"x"@en`, `"5"^^xsd:integer`, `5`,
 /// `true`, `ex:a`), read by the SPARQL parser with the dataset's prefixes.
-fn sparql_term(s: &str, prefixes: &[(String, String)]) -> Result<Term, String> {
+pub(crate) fn sparql_term(s: &str, prefixes: &[(String, String)]) -> Result<Term, String> {
     let q = format!("SELECT * WHERE {{ VALUES ?o {{ {s} }} }}");
     let parsed = sparkles::sparql::parse_query(&q, None, prefixes).map_err(|e| e.to_string())?;
     let spargebra::Query::Select { pattern, .. } = parsed else {

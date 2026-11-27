@@ -49,13 +49,15 @@ impl Project {
                 .file_name()
                 .is_some_and(|n| matches(&n.to_string_lossy()));
         if local_name_matches || matches(&self.key) || matches(&self.segment()) {
-            let digest = crate::ids::digest(self.key.as_bytes());
-            return Cow::Owned(format!(
-                "redacted-project.{}",
-                digest.trim_start_matches("sha256:")
-            ));
+            return Cow::Owned(self.redacted_alias());
         }
         Cow::Borrowed(&self.key)
+    }
+
+    /// The identity any policy that redacts this project publishes.
+    pub fn redacted_alias(&self) -> String {
+        let digest = crate::ids::digest(self.key.as_bytes());
+        format!("redacted-project.{}", digest.trim_start_matches("sha256:"))
     }
 
     /// The key as one graph segment: `/` turned into `.`.

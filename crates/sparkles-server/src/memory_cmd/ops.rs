@@ -1448,17 +1448,52 @@ fn harness_filter(h: Option<&str>) -> Result<Option<Harness>, CmdError> {
     }
 }
 
-/// Use the same project identity as an import under the configured policy.
-fn import_project_key(env: &Env, settings: &Value, project: &Project) -> Result<String, CmdError> {
-    let policy = redaction_policy(env, settings, &ImportFlags::default())?;
-    Ok(project.redacted_key(&policy).into_owned())
+/// Use the project identity published by imports, including imports with per-run policies.
+fn effective_project_key(
+    conn: &Conn,
+    settings: &Value,
+    project: &Project,
+    policy: &redact::Policy,
+) -> Result<String, CmdError> {
+    let key = project.redacted_key(policy);
+    let Some(base) = settings["imports"]["base"].as_str() else {
+        return Ok(key.into_owned());
+    };
+    if key != project.key {
+        return Ok(key.into_owned());
+    }
+    let alias = project.redacted_alias();
+    let lit = sparkles_memory_import::quoted;
+    let q = format!(
+        "SELECT ?g WHERE {{ GRAPH ?g {{ ?g <{}> ?d ; <{MEM}project> ?p . ?p <{}> {} }} \
+         FILTER(STRSTARTS(STR(?g), {})) }} LIMIT 1",
+        vocab::SPK_CONTENT_DIGEST,
+        vocab::RDFS_LABEL,
+        lit(&alias),
+        lit(base)
+    );
+    if conn.select(&q)?.rows.is_empty() {
+        Ok(key.into_owned())
+    } else {
+        Ok(alias)
+    }
 }
 
-/// Resolve a directory through the import policy. An explicit key is already an identity.
-fn project_key_of(env: &Env, settings: &Value, p: &str) -> Result<String, CmdError> {
+fn import_project_key(
+    env: &Env,
+    conn: &Conn,
+    settings: &Value,
+    project: &Project,
+) -> Result<String, CmdError> {
+    let policy = redaction_policy(env, settings, &ImportFlags::default())?;
+    effective_project_key(conn, settings, project, &policy)
+}
+
+/// Resolve a directory using prior imports. An explicit key is already an identity.
+fn project_key_of(env: &Env, conn: &Conn, settings: &Value, p: &str) -> Result<String, CmdError> {
     let path = Path::new(p);
     if path.is_dir() {
-        import_project_key(env, settings, &Project::of(path))
+        import_project_key(env, conn, settings, &Project::of(path))
     } else {
         Ok(p.to_string())
     }
@@ -1623,7 +1658,7 @@ fn sources(
     let base = base_of(&conn, &settings)?;
     let pk = project
         .as_deref()
-        .map(|p| project_key_of(env, &settings, p))
+        .map(|p| project_key_of(env, &conn, &settings, p))
         .transpose()?;
     let all = list_all_sources(&conn, &base)?;
     let list: Vec<Value> = all
@@ -1671,8 +1706,9 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
     let conn = env.connect()?;
     let (ctx, settings) = context(&conn)?;
     let policy = redaction_policy(env, &settings, &ImportFlags::default())?;
+    let project_key = effective_project_key(&conn, &settings, &project, &policy)?;
     let roots = env.roots();
-    let scan = sparkles_memory_import::scan_with_policy(
+    let scan = sparkles_memory_import::scan_with_project_key(
         &sparkles_memory_import::Request {
             ctx: &ctx,
             roots: &roots,
@@ -1684,6 +1720,7 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
             patterns: &policy.patterns,
         },
         &policy,
+        Some(project_key.clone()),
     );
     let files: Vec<_> = scan
         .files
@@ -1696,7 +1733,7 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
         sparkles_memory_import::ids::segment(&ctx.principal)
     );
     let (listed, _) = sync::list_sources(&conn, &prefix)?;
-    let seg = sparkles_memory_import::project::segment_of(&project.redacted_key(&policy));
+    let seg = sparkles_memory_import::project::segment_of(&project_key);
     let areas: Vec<String> = scan
         .areas
         .iter()
@@ -1758,7 +1795,7 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
     let cache = Cache::load(&dir.join(format!("{key}.json")));
     let out = json!({
         "dataset": conn.dataset,
-        "project": project.key,
+        "project": project_key,
         "principal": ctx.principal,
         "files": on_disk,
         "sourcesWithoutFile": missing,
@@ -1769,7 +1806,7 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
         "transcripts": transcript_status(env, &conn, &settings, &project, &roots, &prefix)?,
     });
     env.out(&out, || {
-        let mut t = format!("project {} ({})\n", project.key, ctx.principal);
+        let mut t = format!("project {} ({})\n", project_key, ctx.principal);
         for f in &on_disk {
             t.push_str(&format!(
                 "  {}: {}\n",
@@ -1889,6 +1926,7 @@ fn brief_request(env: &Env, conn: &Conn, b: &BriefArgs) -> Result<Value, CmdErro
             Some(k) => k.clone(),
             None => import_project_key(
                 env,
+                conn,
                 &conn.memory_settings()?,
                 &project_of(b.project.as_deref())?,
             )?,
@@ -2219,7 +2257,7 @@ fn forget(
     if project.is_some() || h.is_some() || sessions {
         let pk = project
             .as_deref()
-            .map(|p| project_key_of(env, &settings, p))
+            .map(|p| project_key_of(env, &conn, &settings, p))
             .transpose()?;
         for s in list_all_sources(&conn, &base)? {
             let g = s["source"].as_str().unwrap_or("").to_string();
@@ -2573,7 +2611,7 @@ fn inbox_items(
     let project = flt
         .project
         .as_deref()
-        .map(|p| project_key_of(env, &settings, p))
+        .map(|p| project_key_of(env, conn, &settings, p))
         .transpose()?
         .map(|key| seg(&sparkles_memory_import::project::segment_of(&key)));
     let mut items = Vec::new();
@@ -3065,8 +3103,8 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
         sparkles_memory_import::ids::segment(&ctx.principal)
     );
     let key = match &a.project {
-        Some(p) => project_key_of(env, &settings, p)?,
-        None => import_project_key(env, &settings, &project_of(None)?)?,
+        Some(p) => project_key_of(env, &conn, &settings, p)?,
+        None => import_project_key(env, &conn, &settings, &project_of(None)?)?,
     };
     let lit = sparkles_memory_import::quoted;
     let q = format!(

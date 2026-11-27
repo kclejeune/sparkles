@@ -152,9 +152,6 @@ pub struct Skipped {
     pub path: PathBuf,
     /// Why the file was skipped, including when redaction refused a linked file.
     pub reason: String,
-    /// For a redaction refusal, the source's graph prefix and redacted relative path.
-    /// A memory's full graph can depend on frontmatter that the scan could not redact.
-    pub prior_source: Option<(String, String)>,
 }
 
 /// The files of one scan.
@@ -165,27 +162,34 @@ pub struct Scan {
     /// graph prefixes this scan listed in full: a source under one of them without a
     /// file was deleted
     pub areas: Vec<String>,
+    /// Prefixes where a redaction refusal prevented the scan from establishing absence.
+    pub incomplete_areas: HashSet<String>,
 }
 
 /// Run the adapters of `req`.
 pub fn scan(req: &Request) -> Scan {
-    scan_inner(req, &redact::Policy::from_patterns(req.patterns.to_vec()))
+    scan_with_policy(req, &redact::Policy::from_patterns(req.patterns.to_vec()))
 }
 
 /// Run the adapters of `req` with a full redaction [`redact::Policy`] instead of
 /// `req.patterns`.
 pub fn scan_with_policy(req: &Request, policy: &redact::Policy) -> Scan {
-    scan_inner(req, policy)
+    scan_with_project_key(req, policy, None)
 }
 
-fn scan_inner(req: &Request, policy: &redact::Policy) -> Scan {
+/// Scan with an optional override for the published identity of the requested project.
+pub fn scan_with_project_key(
+    req: &Request,
+    policy: &redact::Policy,
+    project_key: Option<String>,
+) -> Scan {
     let mut s = Scanner {
         req,
         policy,
         project_key: req
             .project
             .as_ref()
-            .map(|p| p.redacted_key(policy).into_owned()),
+            .map(|p| project_key.unwrap_or_else(|| p.redacted_key(policy).into_owned())),
         out: Scan::default(),
         seen: HashSet::new(),
     };
@@ -370,14 +374,11 @@ impl Scanner<'_> {
     }
 
     /// Read a file: the size limit, UTF-8, the generated marker, then redaction.
-    fn read(&mut self, path: &Path, graph_prefix: &str, rel_path: &str) -> Option<Read> {
+    fn read(&mut self, path: &Path, graph_prefix: &str) -> Option<Read> {
         let skip = |me: &mut Self, reason: &str| {
-            let prior_source = (reason == "redaction-too-large")
-                .then(|| (graph_prefix.to_owned(), me.redact(rel_path).text));
             me.out.skipped.push(Skipped {
                 path: path.to_path_buf(),
                 reason: reason.into(),
-                prior_source,
             });
             None
         };
@@ -402,6 +403,7 @@ impl Scanner<'_> {
             || Ok(()),
             || "redaction-too-large",
         ) else {
+            self.out.incomplete_areas.insert(graph_prefix.to_owned());
             return skip(self, "redaction-too-large");
         };
         Some(Read {
@@ -559,7 +561,7 @@ impl Scanner<'_> {
         let area = self
             .ctx()
             .graph(harness.segment(), project_segment, "memory/");
-        let Some(read) = self.read(path, &area, &rel_path) else {
+        let Some(read) = self.read(path, &area) else {
             return;
         };
         let doc = frontmatter::parse(&read.text);
@@ -689,7 +691,7 @@ impl Scanner<'_> {
             .ctx()
             .graph(harness.segment(), project_segment, "index");
         let rel_path = rel(path, memdir);
-        let Some(read) = self.read(path, &graph, &rel_path) else {
+        let Some(read) = self.read(path, &graph) else {
             return;
         };
         let mut facts = Vec::new();
@@ -723,15 +725,15 @@ impl Scanner<'_> {
                 .out
                 .skipped
                 .iter()
-                .any(|s| s.prior_source.is_some() && s.path == file)
+                .any(|s| s.reason == "redaction-too-large" && s.path == file)
             {
                 // A refused target might have had a different imported key. Keep
                 // the prior index until the target can be read again.
                 self.out.skipped.push(Skipped {
                     path: path.to_path_buf(),
                     reason: "linked-redaction-too-large".into(),
-                    prior_source: Some((graph, self.redact(&rel_path).text)),
                 });
+                self.out.incomplete_areas.insert(graph);
                 return;
             }
             position += 1;
@@ -824,15 +826,30 @@ impl Scanner<'_> {
             };
             let rel_path = rel(&path, &root);
             let key = format!("{key_prefix}{}", self.path_key(&rel_path));
-            let graph = self.ctx().graph(
-                harness.segment(),
-                &project_segment,
-                &format!("instructions/{}", ids::segment(&key)),
-            );
+            let area = self
+                .ctx()
+                .graph(harness.segment(), &project_segment, "instructions/");
+            let graph = format!("{area}{}", ids::segment(&key));
             if self.seen.contains(&graph) {
                 continue;
             }
-            let Some(read) = self.read(&path, &graph, &rel_path) else {
+            let Some(read) = self.read(&path, &area) else {
+                // A refused file can hide imports in either instruction scope.
+                if follow_imports
+                    && self
+                        .out
+                        .skipped
+                        .last()
+                        .is_some_and(|s| s.reason == "redaction-too-large")
+                {
+                    let other = if user {
+                        self.project_segment()
+                    } else {
+                        "user".to_string()
+                    };
+                    let area = self.ctx().graph(harness.segment(), &other, "instructions/");
+                    self.out.incomplete_areas.insert(area);
+                }
                 continue;
             };
             let doc = frontmatter::parse(&read.text);
@@ -1208,7 +1225,6 @@ impl Scanner<'_> {
                 self.out.skipped.push(Skipped {
                     path: p,
                     reason: "unreadable".into(),
-                    prior_source: None,
                 });
                 continue;
             }

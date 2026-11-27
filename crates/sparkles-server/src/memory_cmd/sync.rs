@@ -621,14 +621,6 @@ pub fn sync(
     // Sources that lost their file: under a scanned area and absent from the scan.
     let mut gone: BTreeSet<String> = BTreeSet::new();
     if only.is_none() {
-        let refusals: Vec<_> = scan
-            .skipped
-            .iter()
-            .filter_map(|s| {
-                let source = s.prior_source.as_ref()?;
-                Some((source, cache.files.get(s.path.to_string_lossy().as_ref())))
-            })
-            .collect();
         for (g, l) in &listed {
             // a transcript stays when the harness deletes its file
             if l.deleted || scanned.contains_key(g.as_str()) || g.contains("/sessions/") {
@@ -638,10 +630,8 @@ pub fn sync(
             if !in_area || (opts.instructions_only && !g.contains("/instructions/")) {
                 continue;
             }
-            if refusals.iter().any(|((prefix, path), cached)| {
-                cached.is_some_and(|entry| &entry.graph == g)
-                    || (g.starts_with(prefix) && l.file_path.as_deref() == Some(path.as_str()))
-            }) {
+            // A refusal can obscure a source's old key or leave imports undiscovered.
+            if scan.incomplete_areas.iter().any(|area| g.starts_with(area)) {
                 continue;
             }
             gone.insert(g.clone());
@@ -942,7 +932,7 @@ fn entry(f: &FileImport, stamp: Option<(i128, u64)>) -> CacheEntry {
 /// Whether the cache says no scanned file changed since the last sync, so a sync may
 /// skip the server entirely (files only; deletions are found by the listing).
 pub fn unchanged_by_cache(scan: &Scan, cache: &Cache) -> bool {
-    scan.skipped.iter().all(|s| s.prior_source.is_none())
+    scan.incomplete_areas.is_empty()
         && scan.files.iter().all(|f| {
             cache
                 .files
