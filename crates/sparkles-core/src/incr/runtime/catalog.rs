@@ -36,10 +36,11 @@ impl Runtime {
         compile(&q, whole_reason(access.as_ref()))?;
         let mut deferred = DeferredDrops::default();
         let mut need_gc = false;
+        self.refresh_mode();
         let (res, target, lagging) = {
             let mut reg = self.reg.lock();
             reg.writable()?;
-            let (target, lagging) = self.note_mode(&mut reg);
+            let (target, lagging) = self.lagging_cells(&mut reg);
             // a new definition is the operator's: it runs, and no longer waits for a check
             if let Some(root) = &self.root {
                 views::write(root, name, &def)?;
@@ -125,6 +126,18 @@ impl Runtime {
     }
 
     pub(super) fn info(&self, name: &str, e: &ViewEntry, head: u64, reg: &Registry) -> ViewInfo {
+        let snapshot = e.cell.as_ref().map(|cell| cell.info.lock().clone());
+        self.info_from_snapshot(name, e, head, reg, snapshot)
+    }
+
+    fn info_from_snapshot(
+        &self,
+        name: &str,
+        e: &ViewEntry,
+        head: u64,
+        reg: &Registry,
+        snapshot: Option<cell::Info>,
+    ) -> ViewInfo {
         let mut v = ViewInfo {
             name: name.to_string(),
             definition: e.def.clone(),
@@ -148,11 +161,10 @@ impl Runtime {
         } else if let Some(err) = &e.error {
             v.state = ViewState::Failed { error: err.clone() };
         }
-        let Some(cell) = &e.cell else {
+        let Some(i) = snapshot else {
             return v;
         };
-        let i = cell.info.lock().clone();
-        let stale_mode = i.mode_gen < reg.mode_gen;
+        let stale_mode = !self.mode_is_current(i.mode_gen, reg.host_seq);
         if i.status_ready() && !stale_mode {
             v.commit = Some(i.applied);
         }
@@ -178,8 +190,8 @@ impl Runtime {
         v.pass_ms = i.pass_time.as_secs_f64() * 1e3;
         v.recompute_ms = i.recompute_time.as_secs_f64() * 1e3;
         v.state = match i.status {
+            _ if stale_mode => ViewState::Building,
             Status::Building => ViewState::Building,
-            Status::Ready if stale_mode => ViewState::Building,
             Status::Ready if i.applied >= head => ViewState::Current,
             Status::Ready => ViewState::Behind {
                 commits: head - i.applied,
@@ -247,24 +259,28 @@ impl Runtime {
             } else {
                 self.reg.try_lock_until((now + read::WAIT_STEP).min(until))
             };
-            let observed = if let Some(mut reg) = reg_guard {
-                self.record_mode(&mut reg);
+            let observed = if let Some(reg) = reg_guard {
                 let e = reg.view(name)?;
-                let mode_gen = reg.mode_gen;
-                let head = e.cell.as_ref().map_or(0, |c| c.info.lock().applied);
-                let info = self.info(name, e, head, &reg);
-                let done = e.suspended.is_some()
-                    || e.error.is_some()
-                    || e.cell.as_ref().is_some_and(|c| {
-                        let i = c.info.lock();
-                        i.mode_gen >= mode_gen && i.status != Status::Building
-                    });
-                Some((info, done))
+                let snapshot = e
+                    .cell
+                    .as_ref()
+                    .and_then(|c| c.info.try_lock().map(|i| i.clone()));
+                if snapshot.is_some() || e.cell.is_none() {
+                    let head = snapshot.as_ref().map_or(0, |i| i.applied);
+                    let info = self.info_from_snapshot(name, e, head, &reg, snapshot);
+                    #[cfg(test)]
+                    if let Some(hook) = self.wait_info_hook.lock().clone() {
+                        hook();
+                    }
+                    Some(info)
+                } else {
+                    None
+                }
             } else {
                 None
             };
-            if let Some((info, done)) = observed {
-                if done {
+            if let Some(info) = observed {
+                if info.state != ViewState::Building {
                     return Ok(info);
                 }
                 last_info = Some(info);
@@ -274,13 +290,10 @@ impl Runtime {
             }
             self.kick();
             let step = (Instant::now() + read::WAIT_STEP).min(until);
-            let woke = self.wait_round_since(round_start, step);
-            if Instant::now() >= until {
-                if !woke {
-                    return last_info.ok_or(Error::Timeout);
-                }
-                final_check = true;
-            }
+            #[cfg(test)]
+            self.before_observer_wait(until);
+            self.wait_round_since(round_start, step);
+            final_check = Instant::now() >= until;
         }
     }
 }

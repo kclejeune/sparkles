@@ -141,11 +141,22 @@ impl Runtime {
     }
 
     /// Like [`read`](Self::read), polling `check` cooperatively while waiting for the
-    /// view or rewinding history so eager queries honor cancellation as well as deadlines.
+    /// view, rewinding history or evaluating a fallback.
     pub fn read_with_check(
         &self,
         r: &ViewRead<'_>,
         check: &dyn Fn() -> Result<()>,
+    ) -> Result<ViewRows> {
+        self.read_controlled(r, check, &crate::task::Cancellation::default)
+    }
+
+    /// Read with the query's cancellation flags for nested SPARQL in a fallback circuit.
+    #[doc(hidden)]
+    pub fn read_controlled(
+        &self,
+        r: &ViewRead<'_>,
+        check: &dyn Fn() -> Result<()>,
+        cancellation: &dyn Fn() -> crate::task::Cancellation,
     ) -> Result<ViewRows> {
         let open = ViewOpen {
             read: ViewRead {
@@ -210,6 +221,12 @@ impl Runtime {
                 })
             }
             OpenedView::Rebuild(rebuild) => {
+                let cancellation = cancellation();
+                let check_fallback = || {
+                    cancellation.check()?;
+                    combined()
+                };
+                check_fallback()?;
                 let whole = whole_reason(rebuild.access.as_ref())
                     .map(str::to_string)
                     .or_else(|| rebuild.inference.as_ref().map(|i| i.reason().to_string()));
@@ -237,8 +254,16 @@ impl Runtime {
                         ..Default::default()
                     },
                 );
-                c.build(snap, &control)?;
-                let (rows, lease) = c.rows_budgeted()?;
+                c.build_checked(
+                    snap,
+                    &control,
+                    Some(crate::incr::pass::BuildChecks {
+                        check: &check_fallback,
+                        cancellation: &cancellation,
+                    }),
+                )?;
+                let (rows, lease) = c.rows_budgeted(&check_fallback)?;
+                check_fallback()?;
                 Ok(ViewRows {
                     columns: rebuild.columns.to_vec(),
                     rows,
@@ -275,12 +300,11 @@ impl Runtime {
             } else {
                 self.reg.try_lock_until((now + WAIT_STEP).min(until))
             };
-            let entry = if let Some(mut reg) = reg_guard {
+            let entry = if let Some(reg) = reg_guard {
                 check()?;
                 if r.deadline.is_some_and(|d| Instant::now() >= d) {
                     return Err(Error::Timeout);
                 }
-                self.record_mode(&mut reg);
                 let e = reg.view(r.name)?;
                 Some((
                     e.cell.clone(),
@@ -289,11 +313,12 @@ impl Runtime {
                     e.error.clone(),
                     reg.aggregate_errors,
                     reg.mode_gen,
+                    reg.host_seq,
                 ))
             } else {
                 None
             };
-            if let Some((cell, access, suspended, error, errors, mode_gen)) = entry {
+            if let Some((cell, access, suspended, error, errors, mode_gen, host_seq)) = entry {
                 if let Some(why) = suspended {
                     return Err(crate::incr::error(
                         "view-suspended",
@@ -313,17 +338,17 @@ impl Runtime {
                             format!("the view {:?} reads data your grants do not cover", r.name),
                         ));
                     }
-                    #[cfg(test)]
-                    if let Some(hook) = self.after_reg_hook.lock().clone() {
-                        hook();
-                    }
                     // The mode generation, reading and status are checked against the
                     // current runtime mode generation under the state lock so a delayed
                     // reader never accepts an old-generation version published after a
                     // newer mode was recorded.
-                    if self.mode_gen.load(Ordering::Acquire) == mode_gen
-                        && cell.info.lock().mode_gen == mode_gen
+                    if self.mode_is_current(mode_gen, host_seq)
+                        && cell.info.try_lock().is_some_and(|i| i.mode_gen == mode_gen)
                     {
+                        #[cfg(test)]
+                        if let Some(hook) = self.before_read_state_hook.lock().clone() {
+                            hook();
+                        }
                         let now = Instant::now();
                         let st_guard = if final_check || now >= until {
                             cell.state.try_lock()
@@ -335,8 +360,7 @@ impl Runtime {
                             if r.deadline.is_some_and(|d| Instant::now() >= d) {
                                 return Err(Error::Timeout);
                             }
-                            let cur_gen = self.mode_gen.load(Ordering::Acquire);
-                            if cur_gen == mode_gen && st.mode_gen == mode_gen {
+                            if self.mode_is_current(mode_gen, host_seq) && st.mode_gen == mode_gen {
                                 let held = st.circuit.aggregate_errors.unwrap_or(errors);
                                 // another reading of errors than the view's: evaluate the
                                 // view's query at the reader's snapshot without touching
@@ -399,23 +423,14 @@ impl Runtime {
             }
             self.kick();
             let step = (Instant::now() + WAIT_STEP).min(until);
-            let woke = self.wait_round_since(round_start, step);
+            #[cfg(test)]
+            self.before_observer_wait(until);
+            self.wait_round_since(round_start, step);
             check()?;
             if r.deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(Error::Timeout);
             }
-            if Instant::now() >= until {
-                if !woke {
-                    return Err(crate::incr::error(
-                        "view-behind",
-                        format!(
-                            "the view {:?} has not reached commit {} yet; retry, or read it with view:allowStale true",
-                            r.name, r.at
-                        ),
-                    ));
-                }
-                final_check = true;
-            }
+            final_check = Instant::now() >= until;
         }
     }
 
@@ -580,37 +595,18 @@ impl Runtime {
 }
 
 impl Runtime {
-    /// The reading of errors in aggregates that view `name` keeps: the dataset's
-    /// current reading, which a read waits for the view to be built under. `None`
-    /// without such a view, or when the registry stays locked past `deadline` or the
-    /// read wait.
-    ///
-    /// Planning asks this only to note a read that evaluates the view's query, so it
-    /// asks the host for its reading instead of switching the circuits to it, which
-    /// would wait for the passes of every view.
+    /// The published aggregate-error reading for an optional planning warning.
     pub fn view_reading(
         &self,
         name: &str,
         deadline: Option<Instant>,
     ) -> Option<crate::sparql::AggregateErrors> {
-        // the host's callback can drop the last handle, so the close waits for the
-        // operation's end
-        let _operation = Operation::enter();
-        let wait = Instant::now() + self.opts.read().view_wait;
-        let until = deadline.map_or(wait, |d| d.min(wait));
-        let reg = self.reg.try_lock_until(until)?;
-        let host_reading = loop {
-            let (seq, host) = self.current_host();
-            let Some(host) = host else {
-                break None;
-            };
-            let reading = host.aggregate_errors();
-            if self.host_seq() == seq {
-                break Some(reading);
-            }
-        };
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return None;
+        }
+        let reg = self.reg.try_lock()?;
         reg.view(name).ok()?;
-        Some(host_reading.unwrap_or(reg.aggregate_errors))
+        (reg.host_seq == self.host_seq()).then_some(reg.aggregate_errors)
     }
 }
 
@@ -622,8 +618,9 @@ impl ViewSource for Runtime {
         &self,
         r: &ViewRead<'_>,
         check: &dyn Fn() -> Result<()>,
+        cancellation: &dyn Fn() -> crate::task::Cancellation,
     ) -> Result<ViewRows> {
-        self.read_with_check(r, check)
+        self.read_controlled(r, check, cancellation)
     }
     fn streams_views(&self) -> bool {
         true

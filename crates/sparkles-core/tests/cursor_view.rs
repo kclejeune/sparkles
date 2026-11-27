@@ -1762,6 +1762,7 @@ fn view_cursor_honors_deadline_and_cancel_across_mode_change() {
         Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
         Vec::new(),
     );
+    rt.mode_changed();
 
     let q_agg = format!(
         "{P}SELECT ?m {{ SERVICE view:read {{ [] view:name 'agg'; view:bind ?m; view:allowStale true }} }}"
@@ -1819,16 +1820,21 @@ fn view_cursor_honors_deadline_and_cancel_across_mode_change() {
             &self,
             r: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
             check: &dyn Fn() -> Result<()>,
+            cancellation: &dyn Fn() -> sparkles_core::task::Cancellation,
         ) -> Result<sparkles_core::sparql::viewsvc::ViewRows> {
             let calls = std::cell::Cell::new(0usize);
-            self.inner.read_with_check(r, &|| {
-                let n = calls.get() + 1;
-                calls.set(n);
-                if n >= 2 {
-                    self.signal();
-                }
-                check()
-            })
+            self.inner.read_controlled(
+                r,
+                &|| {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    if n >= 4 {
+                        self.signal();
+                    }
+                    check()
+                },
+                cancellation,
+            )
         }
         fn streams_views(&self) -> bool {
             true
@@ -1845,7 +1851,7 @@ fn view_cursor_honors_deadline_and_cancel_across_mode_change() {
                 &|| {
                     let n = calls.get() + 1;
                     calls.set(n);
-                    if n >= 2 {
+                    if n >= 4 {
                         self.signal();
                     }
                     check()

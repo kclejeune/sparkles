@@ -1737,37 +1737,36 @@ never holds the registry lock across another view's running pass or waits past i
 deadline or cancellation.
 
 The registry tracks a monotonically increasing mode generation alongside the dataset's
-inference, aggregate-error reading, and host installation sequence, mirroring the mode
-generation atomically on the runtime. Recording a host mode change samples the installed
-host under the registry lock without locking any circuit state and retries if a
-replacement host is installed concurrently so an older host cannot supersede a newer one.
-Idle circuits recompile outside the registry lock, and both worker rounds and live-query
-joins drop replaced operators and retired budget leases outside all locks before starting
-a replacement build. Worker rounds process idle circuits in a first pass before waiting
-on busy circuits in bounded steps that rotate out to a new round when the host mode
-changes, and drop their busy-cell references before garbage collection and checkpointing.
-View reads revalidate the runtime mode generation inside the circuit lock before accepting
-a version or preparing a fallback, bound wait loops independently of unrelated round
-completions, honor deadlines with `Timeout` and cancellation with `Cancelled` on both
-streaming (`open_view`) and eager (`read_view_with_check`) paths even when `allowStale`
-is set, refuse missing views immediately with `view-not-found`, and never return rows
-from an earlier mode. Metadata calls (`get`, `list`, and `wait_built`) report lagging
-busy circuits as `building` without exposing an obsolete plan or row count, bound
-`wait_built` registry access and waiting to its timeout without synchronous recompilation,
-and garbage collection preserves the live-query switch boundary when dropping an
-unswitched dead circuit.
+inference, aggregate-error reading, and host revision. Mode sampling runs outside the
+registry lock. A host replacement or settings change invalidates the published mode until
+a fresh sample is recorded. Timed readers use the published mode without calling the host,
+and planning uses it only when the registry is immediately available.
 
-Deterministic tests cover each boundary: a failpoint test pauses the worker inside an
-unrelated view's changed pass (`view-pass-applied`) across aggregate-error and
-RDFS-on-read changes to verify `read`, `open_view`, `get`, `list`, and `wait_built`; a
-busy-cell rotation test starts a round under the old mode while an unrelated cell lock is
-held, confirms Pass 2 waits on that cell before toggling the mode, and checks that idle
-views still switch and rebuild; a worker-pause cursor test uses a hooked `ViewSource` to
-verify streaming and eager `SERVICE view:read` timeouts and mid-wait cancellation; and
-targeted runtime regressions cover tight-pool pre-rebuild credit release on worker and
-live paths, busy-cell release before GC and checkpointing, reader revalidation across a
-registry-to-state barrier, host replacement ordering, held-registry `wait_built` timeouts,
-and wait-loop expiration under continuous epoch advances.
+Idle circuits recompile outside the registry lock. A worker or live join can start a
+replacement build after the old operators have been dropped and their detached budget
+leases have returned credit to the pool. Worker rounds process idle circuits before busy
+circuits and recheck the host mode after waiting for a busy circuit. A new RDFS setting
+with an unchanged checkpoint key still starts a new mode generation. Rounds release their
+busy-cell references before garbage collection and checkpointing.
+
+View reads revalidate the runtime mode inside the circuit lock before accepting a version
+or preparing a fallback. Both streaming and eager reads honor deadlines and cancellation,
+including while waiting for an `allowStale` read and during a fallback evaluation. A missing
+view returns `view-not-found` when the registry entry is checked. Metadata for a view waiting
+on a mode change reports a build in progress and omits the previous plan and row count.
+`wait_built` uses one metadata snapshot to decide whether the build completed and returns
+current metadata with the commit and row count published by that pass. Its timeout bounds
+the wait and it does not run a build. Garbage collection preserves the live-query switch
+boundary when dropping an unswitched dead circuit.
+
+Tests synchronize competing worker and live-join builds while the old pool credit is still
+held, pause mode sampling while timed operations run, replace an equal-schema RDFS setting
+during Pass 2, and change the reading between the Pass 2 probe and admission. They complete a
+build between the catalog's snapshot and its return decision, check metadata while worker and
+live builders are about to publish, and cancel an eager fallback as it allocates work. Other
+tests synchronize GC ownership release before checkpointing, change mode after the reader's
+first generation check, advance the epoch at expiration, and cancel eager and streaming
+queries after an incomplete view read has waited.
 
 ### Scope changes
 

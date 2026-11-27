@@ -138,6 +138,6 @@ pub fn set(ds: &Dataset, new: Option<NewSchema>) -> Result<()> {
     };
     *state.rdfs.write() = r.map(Arc::new);
     // views and live queries switch to the new setting
-    state.views.kick();
+    state.views.mode_changed();
     Ok(())
 }

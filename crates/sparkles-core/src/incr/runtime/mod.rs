@@ -94,6 +94,25 @@ pub(super) struct DeferredDrops {
     pub(super) cells: Vec<Arc<Cell>>,
     pub(super) queued: Vec<super::live::QueuedEvent>,
     pub(super) retired: Vec<MemoryLease>,
+    // Drop these guards after the retired leases have returned their credit.
+    pub(super) retirements: Vec<Retirement>,
+}
+
+pub(super) struct Retirement {
+    completion: Arc<RetirementCompletion>,
+    kick: Arc<tokio::sync::Notify>,
+}
+
+pub(super) struct RetirementCompletion {
+    owner: std::thread::ThreadId,
+    released: std::sync::OnceLock<()>,
+}
+
+impl Drop for Retirement {
+    fn drop(&mut self) {
+        let _ = self.completion.released.set(());
+        self.kick.notify_one();
+    }
 }
 
 /// The branch whose state Phase 1 keeps.
@@ -143,7 +162,9 @@ impl Default for RuntimeOptions {
     }
 }
 
-/// What the runtime asks of its host.
+/// What the runtime asks of its host. After changing the installed host's inference
+/// or aggregate-error settings, call [`Runtime::mode_changed`] so timed reads reject
+/// the previous mode until the runtime publishes the change.
 pub trait Host: Send + Sync {
     /// The view of the dataset that `principal` reads (`None`: every quad). `None` as
     /// the principal is a view without one, which reads every quad.
@@ -192,11 +213,10 @@ impl Host for OpenHost {
     }
 }
 
-#[derive(Default)]
-struct InstalledHost {
-    seq: u64,
-    host: Option<Arc<dyn Host>>,
-}
+#[cfg(test)]
+type TestHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type WaitHook = Arc<dyn Fn(Instant) + Send + Sync>;
 
 /// The views and live queries of one dataset.
 pub struct Runtime {
@@ -204,7 +224,11 @@ pub struct Runtime {
     root: Option<PathBuf>,
     dataset: uuid::Uuid,
     pool: Option<Arc<QueryPool>>,
-    host: RwLock<InstalledHost>,
+    host: RwLock<Option<Arc<dyn Host>>>,
+    /// Invalidates the published mode on host replacement and settings changes.
+    host_seq: AtomicU64,
+    /// Orders mode observations taken concurrently outside the registry.
+    next_mode_sample: AtomicU64,
     reg: Mutex<Registry>,
     /// Atomic mirror of `reg.mode_gen` updated under `reg` so readers and rounds can
     /// detect a newer recorded mode generation without reacquiring `reg` under `cell.state`.
@@ -241,7 +265,17 @@ pub struct Runtime {
     switched: AtomicU64,
     /// Test hook invoked in `open_view` between releasing `reg` and acquiring `cell.state`.
     #[cfg(test)]
-    after_reg_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    before_read_state_hook: Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    observer_wait_hook: Mutex<Option<WaitHook>>,
+    #[cfg(test)]
+    busy_locked_hook: Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    wait_info_hook: Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    note_pass_hook: Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    retirement_wait_hook: Mutex<Option<TestHook>>,
     /// Test counter incremented whenever `round` waits on a busy cell in Pass 2.
     #[cfg(test)]
     busy_waits: AtomicUsize,
@@ -276,7 +310,9 @@ impl Runtime {
             root,
             dataset,
             pool,
-            host: RwLock::new(InstalledHost::default()),
+            host: RwLock::new(None),
+            host_seq: AtomicU64::new(0),
+            next_mode_sample: AtomicU64::new(0),
             reg: Mutex::new(reg),
             mode_gen: AtomicU64::new(0),
             defs,
@@ -297,9 +333,19 @@ impl Runtime {
             seen: AtomicU64::new(0),
             switched: AtomicU64::new(0),
             #[cfg(test)]
-            after_reg_hook: Mutex::new(None),
+            before_read_state_hook: Mutex::new(None),
             #[cfg(test)]
             busy_waits: AtomicUsize::new(0),
+            #[cfg(test)]
+            observer_wait_hook: Mutex::new(None),
+            #[cfg(test)]
+            busy_locked_hook: Mutex::new(None),
+            #[cfg(test)]
+            wait_info_hook: Mutex::new(None),
+            #[cfg(test)]
+            note_pass_hook: Mutex::new(None),
+            #[cfg(test)]
+            retirement_wait_hook: Mutex::new(None),
         })
     }
 
@@ -322,8 +368,9 @@ impl Runtime {
         let _operation = Operation::enter();
         let old = {
             let mut slot = self.host.write();
-            slot.seq += 1;
-            slot.host.replace(host)
+            let old = slot.replace(host);
+            self.host_seq.fetch_add(1, Ordering::AcqRel);
+            old
         };
         drop(old);
         self.kick();
@@ -331,28 +378,34 @@ impl Runtime {
 
     pub(super) fn current_host(&self) -> (u64, Option<Arc<dyn Host>>) {
         let slot = self.host.read();
-        (slot.seq, slot.host.clone())
+        (self.host_seq(), slot.clone())
     }
 
     pub(super) fn host_seq(&self) -> u64 {
-        self.host.read().seq
+        self.host_seq.load(Ordering::Acquire)
+    }
+
+    /// Invalidate the published mode after changing the installed host's settings.
+    /// Timed view reads wait for a fresh publication before accepting cached rows.
+    pub fn mode_changed(&self) {
+        self.host_seq.fetch_add(1, Ordering::AcqRel);
+        self.kick();
     }
 
     /// The host, or a host without access control before one is set.
     fn host_or_open(&self) -> Arc<dyn Host> {
         self.host
             .read()
-            .host
             .clone()
             .unwrap_or_else(|| Arc::new(OpenHost))
     }
 
     pub fn has_host(&self) -> bool {
-        self.host.read().host.is_some()
+        self.host.read().is_some()
     }
 
     fn host(&self) -> Result<Arc<dyn Host>> {
-        self.host.read().host.clone().ok_or_else(|| {
+        self.host.read().clone().ok_or_else(|| {
             super::error(
                 "views-unavailable",
                 "the views of this dataset have not started",
@@ -368,6 +421,13 @@ impl Runtime {
     /// Wake the worker for a round.
     pub fn kick(&self) {
         self.kick.notify_one();
+    }
+
+    #[cfg(test)]
+    fn before_observer_wait(&self, until: Instant) {
+        if let Some(hook) = self.observer_wait_hook.lock().clone() {
+            hook(until);
+        }
     }
 
     fn parse(&self, host: &dyn Host, text: &str) -> Result<Query> {

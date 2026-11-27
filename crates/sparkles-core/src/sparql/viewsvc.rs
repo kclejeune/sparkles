@@ -734,11 +734,13 @@ pub trait ViewSource: Send + Sync + std::fmt::Debug {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows>;
 
     /// Like [`read_view`](Self::read_view), polling `check` cooperatively while waiting
-    /// so eager queries honor cancellation alongside deadlines.
+    /// so eager queries honor cancellation alongside deadlines. A fallback that runs
+    /// nested SPARQL can obtain the caller's cancellation flags from `cancellation`.
     fn read_view_with_check(
         &self,
         r: &ViewRead<'_>,
         _check: &dyn Fn() -> Result<()>,
+        _cancellation: &dyn Fn() -> crate::task::Cancellation,
     ) -> Result<ViewRows> {
         self.read_view(r)
     }
@@ -891,6 +893,13 @@ pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
     let get_parent = || ctx.memory_parent();
     let memory_pool = ctx.grant().map(|g| g.pool());
     let max_memory_bytes = (ctx.mem_limit != u64::MAX).then_some(ctx.mem_limit);
+    let cancellation = || {
+        let primary = crate::task::Cancellation::from_flags([ctx.cancel.clone()]);
+        match &ctx.cancellation {
+            Some(other) => primary.combine(other),
+            None => primary,
+        }
+    };
     let rows = source.read_view_with_check(
         &ViewRead {
             name: &spec.name,
@@ -905,6 +914,7 @@ pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
             max_memory_bytes,
         },
         &|| ctx.check(),
+        &cancellation,
     )?;
     if let Some(m) = rows.evaluated_under {
         ctx.warn(evaluated(&spec.name, m));

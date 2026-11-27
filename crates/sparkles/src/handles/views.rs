@@ -112,6 +112,7 @@ impl ViewSource for Source {
         &self,
         r: &ViewRead<'_>,
         check: &dyn Fn() -> Result<()>,
+        cancellation: &dyn Fn() -> crate::task::Cancellation,
     ) -> Result<ViewRows> {
         let state = self
             .state
@@ -120,7 +121,7 @@ impl ViewSource for Source {
         start(&state, None);
         let rt = state.views.clone();
         drop(state);
-        rt.read_with_check(r, check)
+        rt.read_controlled(r, check, cancellation)
     }
     fn streams_views(&self) -> bool {
         true
@@ -146,10 +147,7 @@ impl ViewSource for Source {
         deadline: Option<std::time::Instant>,
     ) -> Option<crate::sparql::AggregateErrors> {
         let state = self.state.try_upgrade().ok()??;
-        start(&state, None);
-        let rt = state.views.clone();
-        drop(state);
-        rt.view_reading(name, deadline)
+        state.views.view_reading(name, deadline)
     }
 }
 
@@ -600,16 +598,12 @@ mod tests {
         let mut cases = vec![
             ("list", "inference", 1),
             ("get", "inference", 1),
-            ("wait", "inference", 1),
-            ("read", "inference", 1),
             ("live", "inference", 1),
             ("explain", "inference", 1),
             ("put", "inference", 1),
             ("round", "inference", 1),
             ("round", "epoch", 1),
             ("list", "aggregate-errors", 1),
-            ("read", "aggregate-errors", 1),
-            ("view-reading", "aggregate-errors", 1),
         ];
         for method in ["access", "prefixes", "stored-query"] {
             cases.push(("put", method, 1));
@@ -635,23 +629,6 @@ mod tests {
                     "get" => {
                         let _ = state.views.get(&state.store, "v");
                     }
-                    "wait" => {
-                        let _ = state.views.wait_built("v", Duration::ZERO);
-                    }
-                    "read" => {
-                        let _ = state.views.read(&ViewRead {
-                            name: "v",
-                            at: 0,
-                            snap: None,
-                            allow_stale: false,
-                            caller: None,
-                            deadline: None,
-                            aggregate_errors: None,
-                            memory_parent: None,
-                            memory_pool: None,
-                            max_memory_bytes: None,
-                        });
-                    }
                     "live" => {
                         let _ = state.views.live(
                             &state.store,
@@ -675,9 +652,6 @@ mod tests {
                     }
                     "round" => {
                         state.views.round(&state.store);
-                    }
-                    "view-reading" => {
-                        state.views.view_reading("v", None);
                     }
                     _ => unreachable!(),
                 }
@@ -821,11 +795,7 @@ mod tests {
             let (done_tx, done) = std::sync::mpsc::channel();
             let reader = std::thread::spawn(move || {
                 let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if method == "inference" {
-                        state.views.list(&state.store);
-                    } else {
-                        state.views.view_reading("v", None);
-                    }
+                    state.views.list(&state.store);
                 }));
                 assert!(panic.is_err());
                 assert!(state.views.is_closed());

@@ -20,6 +20,13 @@ pub(super) fn failure(e: &Error) -> (String, String) {
     (code.to_string(), e.to_string())
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum PassKind {
+    Build,
+    Advance,
+    Skip,
+}
+
 enum CellPass {
     Done,
     Busy,
@@ -51,7 +58,7 @@ impl Runtime {
         // circuit cannot delay unrelated views from switching mode and rebuilding.
         for cell in &cells {
             if self.closed.load(Ordering::Acquire)
-                || self.mode_gen.load(Ordering::Acquire) != target.generation
+                || !self.mode_is_current(target.generation, target.host_seq)
             {
                 mode_rotated = true;
                 break;
@@ -73,18 +80,8 @@ impl Runtime {
         if !mode_rotated {
             for cell in busy.drain(..) {
                 let outcome = {
-                    let st = loop {
-                        if self.closed.load(Ordering::Acquire) || self.mode_changed_since(&target) {
-                            mode_rotated = true;
-                            break None;
-                        }
-                        if let Some(st) = cell.state.try_lock_for(read::WAIT_STEP) {
-                            break Some(st);
-                        }
-                        #[cfg(test)]
-                        self.busy_waits.fetch_add(1, Ordering::Release);
-                    };
-                    let Some(st) = st else {
+                    let Some(st) = self.wait_for_busy_cell(&cell, &target) else {
+                        mode_rotated = true;
                         break;
                     };
                     self.round_cell_locked(
@@ -156,44 +153,65 @@ impl Runtime {
         self.round_cell_locked(store, cell, st, target, deltas, worked, false)
     }
 
+    fn wait_for_busy_cell<'a>(
+        &self,
+        cell: &'a Cell,
+        target: &TargetMode,
+    ) -> Option<parking_lot::MutexGuard<'a, Slot>> {
+        loop {
+            if self.closed.load(Ordering::Acquire) || self.mode_changed_since(target) {
+                return None;
+            }
+            if let Some(st) = cell.state.try_lock_for(read::WAIT_STEP) {
+                #[cfg(test)]
+                if let Some(hook) = self.busy_locked_hook.lock().clone() {
+                    hook();
+                }
+                return (!self.mode_changed_since(target)).then_some(st);
+            }
+            #[cfg(test)]
+            self.busy_waits.fetch_add(1, Ordering::Release);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn round_cell_locked<'a>(
         &self,
         store: &Store,
         cell: &'a Arc<Cell>,
-        mut st: parking_lot::MutexGuard<'a, Slot>,
+        state: parking_lot::MutexGuard<'a, Slot>,
         target: &TargetMode,
         deltas: &mut FxHashMap<u64, Arc<DeltaSet>>,
         worked: &mut bool,
         blocking: bool,
     ) -> CellPass {
+        // Declare deferred drops first so an unwind releases the state lock before
+        // returning retired credit, which may synchronously wake a pool waiter.
+        let mut deferred = DeferredDrops::default();
+        let mut st = state;
         // Release replaced operators and detached budget leases outside `cell.state`
         // before starting the replacement build so tight shared pools can recycle the
         // freed credit instead of failing with `over-budget`.
+        if st.pending_retirement().is_some() {
+            return CellPass::Busy;
+        }
         if st.mode_gen < target.generation {
-            let mut deferred = DeferredDrops::default();
             let switched = self.switch_cell(cell, &mut st, target, &mut deferred);
             drop(st);
-            drop(deferred);
+            drop(std::mem::take(&mut deferred));
             if switched {
                 *worked = true;
             }
             if self.closed.load(Ordering::Acquire)
-                || self.mode_gen.load(Ordering::Acquire) != target.generation
+                || !self.mode_is_current(target.generation, target.host_seq)
             {
                 return CellPass::Rotated;
             }
             st = if blocking {
-                loop {
-                    if self.closed.load(Ordering::Acquire) || self.mode_changed_since(target) {
-                        return CellPass::Rotated;
-                    }
-                    if let Some(st) = cell.state.try_lock_for(read::WAIT_STEP) {
-                        break st;
-                    }
-                    #[cfg(test)]
-                    self.busy_waits.fetch_add(1, Ordering::Release);
-                }
+                let Some(st) = self.wait_for_busy_cell(cell, target) else {
+                    return CellPass::Rotated;
+                };
+                st
             } else {
                 let Some(st) = cell.state.try_lock() else {
                     return CellPass::Busy;
@@ -205,14 +223,16 @@ impl Runtime {
         // Revalidate that no newer mode generation was recorded before starting a build
         // or advance pass under `target`.
         if self.closed.load(Ordering::Acquire)
-            || self.mode_gen.load(Ordering::Acquire) != target.generation
+            || !self.mode_is_current(target.generation, target.host_seq)
             || st.mode_gen < target.generation
         {
             drop(st);
             return CellPass::Rotated;
         }
 
-        let mut deferred = DeferredDrops::default();
+        if st.pending_retirement().is_some() {
+            return CellPass::Busy;
+        }
         // Prune departed or explicitly closed live subscribers before admitting
         // a build or advance pass so the first pass uses the exact active ceiling.
         st.prune_dead_subs();
@@ -250,18 +270,28 @@ impl Runtime {
         }
     }
 
-    pub(super) fn note_pass(&self, cell: &Cell, st: &Slot, took: Duration, skipped: bool) {
+    pub(super) fn note_pass(&self, cell: &Cell, st: &Slot, took: Duration, kind: PassKind) {
         self.seen.fetch_max(st.circuit.applied, Ordering::AcqRel);
-        let mut info = cell.info.lock();
-        info.applied = st.circuit.applied;
-        info.rows = st.circuit.result.total().max(0) as u64;
-        info.bytes = st.circuit.bytes();
-        info.published_bytes = st
+        let rows = st.circuit.result.total().max(0) as u64;
+        let bytes = st.circuit.bytes();
+        let published_bytes = st
             .circuit
             .version
             .as_ref()
             .map_or(0, |v| v.published_bytes());
-        if skipped {
+        #[cfg(test)]
+        if let Some(hook) = self.note_pass_hook.lock().clone() {
+            hook();
+        }
+        let mut info = cell.info.lock();
+        info.applied = st.circuit.applied;
+        info.rows = rows;
+        info.bytes = bytes;
+        info.published_bytes = published_bytes;
+        if matches!(kind, PassKind::Build) {
+            info.status = Status::Ready;
+        }
+        if matches!(kind, PassKind::Skip) {
             info.skipped += 1;
             self.counters.skipped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -327,8 +357,7 @@ impl Runtime {
         // a rebuild's change reaches live queries
         match st.evaluate(snap, &self.control()) {
             Ok(change) => {
-                cell.info.lock().status = Status::Ready;
-                self.note_pass(cell, st, t0.elapsed(), false);
+                self.note_pass(cell, st, t0.elapsed(), PassKind::Build);
                 self.live_budgets(st, deferred);
                 if let Some((c, c_lease)) = change {
                     self.publish(st, before, c, c_lease, true, deferred);
@@ -372,13 +401,13 @@ impl Runtime {
         let took = t0.elapsed();
         match r {
             Ok(crate::incr::circuit::ChargedAdvance::Skipped) => {
-                self.note_pass(cell, st, took, true);
+                self.note_pass(cell, st, took, PassKind::Skip);
                 let to = st.circuit.applied;
                 let max = self.opts.read().history_commits;
                 st.remember(from, to, Arc::from(Vec::new()), max);
             }
             Ok(crate::incr::circuit::ChargedAdvance::Changed(c, c_lease)) => {
-                self.note_pass(cell, st, took, false);
+                self.note_pass(cell, st, took, PassKind::Advance);
                 self.publish(st, from, c, c_lease, false, deferred);
             }
             Ok(crate::incr::circuit::ChargedAdvance::Reset(c, c_lease)) => {
@@ -390,8 +419,7 @@ impl Runtime {
                         st.circuit.applied
                     );
                 }
-                cell.info.lock().status = Status::Ready;
-                self.note_pass(cell, st, took, false);
+                self.note_pass(cell, st, took, PassKind::Build);
                 self.publish(st, from, c, c_lease, true, deferred);
             }
             Err(e) => {

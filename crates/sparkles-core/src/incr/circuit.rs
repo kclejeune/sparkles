@@ -1328,6 +1328,15 @@ impl Circuit {
 
     /// Evaluate the circuit from scratch at `snap`.
     pub fn build(&mut self, snap: Arc<Snapshot>, control: &Control) -> Result<()> {
+        self.build_checked(snap, control, None)
+    }
+
+    pub(super) fn build_checked(
+        &mut self,
+        snap: Arc<Snapshot>,
+        control: &Control,
+        checks: Option<super::pass::BuildChecks<'_>>,
+    ) -> Result<()> {
         self.clear_moves();
         self.root.clear();
         self.result = ZSet::new();
@@ -1341,6 +1350,7 @@ impl Circuit {
         self.budget.shrink_state_to(0);
         let vis = Vis::new(self.access.as_ref(), &snap);
         let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
+        p.build_checks = checks;
         let width = root.schema.len();
         let budget = p.budget_handle();
         let res = if p.prov.is_none() {
@@ -1835,8 +1845,9 @@ impl Circuit {
     #[allow(clippy::type_complexity)]
     pub(crate) fn rows_budgeted(
         &self,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, Option<MemoryLease>)> {
-        let (rows, mut lease) = self.rows_charged()?;
+        let (rows, mut lease) = self.rows_charged_checked(check)?;
         Ok((rows, self.budget.detach_scratch_lease(&mut lease)))
     }
 
@@ -1844,12 +1855,23 @@ impl Circuit {
     pub(crate) fn rows_charged(
         &self,
     ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, super::budget::ScratchLease)> {
+        self.rows_charged_checked(&|| Ok(()))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn rows_charged_checked(
+        &self,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, super::budget::ScratchLease)> {
         let mut lease = self.budget.scratch_lease();
         let Some(snap) = &self.snap else {
             return Ok((Vec::new(), lease));
         };
         let mut out = Vec::new();
         let mut push_decoded = |cols, row: &Row, w: i64| -> Result<()> {
+            if out.len().is_multiple_of(256) {
+                check()?;
+            }
             reserve_vec_slot(&out, &mut lease)?;
             let decoded = self.decode_row_budgeted(snap, cols, row, &mut lease)?;
             out.push((decoded, w));

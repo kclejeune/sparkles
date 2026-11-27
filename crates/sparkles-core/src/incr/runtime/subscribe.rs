@@ -23,6 +23,7 @@ impl Runtime {
             .max_memory_bytes
             .unwrap_or(self.opts.read().live_memory_bytes);
         let shared = Arc::new(Shared::new(budget));
+        self.refresh_mode();
         let (cell, mut target, mut has_lagging) = {
             let mut reg = self.reg.lock();
             if self.is_closed() {
@@ -31,7 +32,7 @@ impl Runtime {
                     "the dataset is closing",
                 ));
             }
-            let (target, lagging) = self.note_mode(&mut reg);
+            let (target, lagging) = self.lagging_cells(&mut reg);
             let res = self.cell_for(&mut reg, q, query, access, Some(budget));
             if let Ok((cell, _)) = &res {
                 cell.pending.fetch_add(1, Ordering::AcqRel);
@@ -64,7 +65,25 @@ impl Runtime {
                         self.0.recompute_local_limit();
                     }
                 }
-                let mut guard = LimitGuard(cell.state.lock());
+                let mut state = cell.state.lock();
+                if let Some(completion) = state.pending_retirement().cloned() {
+                    drop(state);
+                    // Returning pool credit can invoke a wake callback synchronously.
+                    // A reentrant join cannot wait for its own thread to finish the release.
+                    if completion.owner == std::thread::current().id() {
+                        break Err(crate::incr::error(
+                            "view-behind",
+                            "the circuit is still releasing its previous state; retry",
+                        ));
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = self.retirement_wait_hook.lock().clone() {
+                        hook();
+                    }
+                    completion.released.wait();
+                    continue;
+                }
+                let mut guard = LimitGuard(state);
                 let st = &mut *guard.0;
                 // Provisionally allow the joining subscriber's budget while building or
                 // constructing its initial event; `LimitGuard` restores the exact
@@ -76,14 +95,14 @@ impl Runtime {
                             "the dataset is closing",
                         ));
                     }
+                    if !self.mode_is_current(target.generation, target.host_seq) {
+                        retry_mode = true;
+                        return Ok(());
+                    }
                     if st.mode_gen < target.generation {
                         if self.switch_cell(&cell, st, &target, &mut deferred_state) {
                             has_lagging = true;
                         }
-                        retry_mode = true;
-                        return Ok(());
-                    }
-                    if self.mode_gen.load(Ordering::Acquire) > st.mode_gen {
                         retry_mode = true;
                         return Ok(());
                     }
@@ -136,8 +155,8 @@ impl Runtime {
             };
             drop(deferred_state);
             if retry_mode {
-                let cur_gen = self.mode_gen.load(Ordering::Acquire);
-                if cur_gen > target.generation {
+                if !self.mode_is_current(target.generation, target.host_seq) {
+                    self.refresh_mode();
                     target = self.reg.lock().target_mode();
                     has_lagging = true;
                 }
@@ -220,8 +239,7 @@ impl Runtime {
             }
             return Err(e);
         }
-        cell.info.lock().status = Status::Ready;
-        self.note_pass(cell, st, t0.elapsed(), false);
+        self.note_pass(cell, st, t0.elapsed(), round::PassKind::Build);
         if std::mem::take(&mut st.rebased) {
             st.clear_history();
         }

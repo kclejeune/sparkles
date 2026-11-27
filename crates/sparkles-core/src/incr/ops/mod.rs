@@ -84,7 +84,7 @@ pub enum Op {
 
 impl Node {
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
-        p.control.check()?;
+        p.check_control()?;
         let schema = self.schema.clone();
         match &mut self.op {
             Op::Bgp(o) => o.init(p, &schema),
@@ -106,7 +106,7 @@ impl Node {
     }
 
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
-        p.control.check()?;
+        p.check_control()?;
         let schema = self.schema.clone();
         match &mut self.op {
             Op::Bgp(o) => o.delta(p),
@@ -130,7 +130,7 @@ impl Node {
     /// [`init`](Self::init) with annotations (spec F13 §5): the rows with their
     /// weights and the annotations of the circuit's provenance setting.
     pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
-        p.control.check()?;
+        p.check_control()?;
         let schema = self.schema.clone();
         match &mut self.op {
             Op::Bgp(o) => o.init_a(p),
@@ -154,7 +154,7 @@ impl Node {
     /// [`delta`](Self::delta) with annotations: each change carries the change of its
     /// row's annotation, and a change may move the annotation alone.
     pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
-        p.control.check()?;
+        p.check_control()?;
         let schema = self.schema.clone();
         match &mut self.op {
             Op::Bgp(o) => o.delta_a(p),

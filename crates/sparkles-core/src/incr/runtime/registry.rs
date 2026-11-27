@@ -40,8 +40,9 @@ pub(super) struct Registry {
     /// monotonically increasing generation bumped whenever `inference` or
     /// `aggregate_errors` changes
     pub(super) mode_gen: u64,
-    /// highest `InstalledHost::seq` whose mode has been recorded on `reg`
+    /// host revision whose mode has been recorded on `reg`
     pub(super) host_seq: u64,
+    pub(super) mode_sample: u64,
     /// highest `mode_gen` known to have been applied to every cell in `cells`
     pub(super) switched_gen: u64,
     /// the dataset's inference that every circuit is compiled for

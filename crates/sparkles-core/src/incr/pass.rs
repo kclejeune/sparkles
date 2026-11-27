@@ -124,6 +124,12 @@ pub struct PassStats {
     pub recomputes: u64,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct BuildChecks<'a> {
+    pub check: &'a dyn Fn() -> Result<()>,
+    pub cancellation: &'a crate::task::Cancellation,
+}
+
 pub struct Pass<'a> {
     pub new: Arc<Snapshot>,
     /// `new` before the changes (absent when the pass builds from scratch)
@@ -134,7 +140,8 @@ pub struct Pass<'a> {
     pub terms: &'a mut Terms,
     pub vis: &'a Vis,
     pub access: Option<Arc<GraphAccess>>,
-    pub control: &'a Control,
+    control: &'a Control,
+    pub(super) build_checks: Option<BuildChecks<'a>>,
     /// the circuit's variable names
     pub vars: &'a [String],
     pub stats: PassStats,
@@ -222,6 +229,14 @@ impl EffectiveChanges {
 }
 
 impl<'a> Pass<'a> {
+    pub(super) fn check_control(&self) -> Result<()> {
+        self.control.check()?;
+        if let Some(checks) = self.build_checks {
+            (checks.check)()?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         new: Arc<Snapshot>,
@@ -245,6 +260,7 @@ impl<'a> Pass<'a> {
             vis,
             access,
             control,
+            build_checks: None,
             vars,
             stats: PassStats::default(),
             full,
@@ -274,7 +290,7 @@ impl<'a> Pass<'a> {
     pub fn tick(&mut self) -> Result<()> {
         self.work += 1;
         if self.work.is_multiple_of(1024) {
-            self.control.check()?;
+            self.check_control()?;
         }
         Ok(())
     }
@@ -660,6 +676,7 @@ impl<'a> Pass<'a> {
             c.base_iri = self.base.clone();
             c.deadline = self.control.deadline;
             c.cancel = self.control.cancel.flag();
+            c.cancellation = self.build_checks.map(|checks| checks.cancellation.clone());
             if let Some(m) = self
                 .budget
                 .as_ref()
@@ -694,6 +711,7 @@ impl<'a> Pass<'a> {
             c.base_iri = self.base.clone();
             c.deadline = self.control.deadline;
             c.cancel = self.control.cancel.flag();
+            c.cancellation = self.build_checks.map(|checks| checks.cancellation.clone());
             if let Some(m) = self
                 .budget
                 .as_ref()
@@ -944,6 +962,7 @@ impl<'a> Pass<'a> {
             graphs: self.access.clone(),
             deadline: self.control.deadline,
             cancel: Some(self.control.cancel.flag()),
+            cancellation: self.build_checks.map(|checks| checks.cancellation.clone()),
             no_cache: true,
             max_memory_bytes,
             grant,
@@ -1006,7 +1025,7 @@ impl<'a> Pass<'a> {
                 self.sync_op_state(&mut terms_tracked, now_terms)?;
             }
             if i % 4096 == 4095 {
-                self.control.check()?;
+                self.check_control()?;
             }
         }
         let now_terms = self.terms.bytes();

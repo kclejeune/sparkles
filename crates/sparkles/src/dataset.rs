@@ -247,7 +247,7 @@ impl DatasetState {
         }
         *self.reasoning.write() = record;
         // views and live queries switch to the new default graph
-        self.views.kick();
+        self.views.mode_changed();
         Ok(())
     }
 }

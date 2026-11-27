@@ -198,7 +198,7 @@ impl Window {
         if !self.stale {
             return Ok(());
         }
-        p.control.check()?;
+        p.check_control()?;
         let base_state = self.bytes();
         let mut used = base_state;
         let len = self.kept.len();
@@ -224,7 +224,7 @@ impl Window {
             }
             self.kept[i].keys = k;
         }
-        if let Err(e) = p.control.check() {
+        if let Err(e) = p.check_control() {
             for e in &mut self.kept {
                 e.keys = Vec::new();
             }
@@ -243,7 +243,7 @@ impl Window {
     /// The changes with their rows' keys.
     #[allow(clippy::type_complexity)]
     fn keyed(&self, p: &mut Pass, c: Changes) -> Result<Vec<(Row, i64, Vec<SortKey>)>> {
-        p.control.check()?;
+        p.check_control()?;
         let width = self.inner.schema.len();
         let slot = std::mem::size_of::<(Row, i64, Vec<SortKey>)>() as u64;
         let base_state = self.bytes();
@@ -257,7 +257,7 @@ impl Window {
             charge(p, used, base_state)?;
             out.push((r, w, k));
         }
-        p.control.check()?;
+        p.check_control()?;
         Ok(out)
     }
 
@@ -491,7 +491,7 @@ impl Window {
     /// total, a consistent state, and the runtime then fails the view, which a rebuild
     /// starts again from `init`.
     fn fill(&mut self, p: &mut Pass, rows: Changes, keep: bool) -> Result<()> {
-        p.control.check()?;
+        p.check_control()?;
         let cap = usize::try_from(self.cap()).unwrap_or(usize::MAX);
         let width = self.inner.schema.len();
         let mut top: TopK<(Row, i64, Option<usize>)> = TopK::new(cap, self.asc.clone());
@@ -574,9 +574,9 @@ impl Window {
                 .saturating_add(sorting),
             base_state,
         )?;
-        p.control.check()?;
+        p.check_control()?;
         let sorted = top.into_sorted();
-        p.control.check()?;
+        p.check_control()?;
         let placed = if keep && !partial {
             self.reconcile(p, sorted, &counts)
         } else {
@@ -618,7 +618,7 @@ impl Window {
                 serial: self.next_serial(),
             });
         }
-        p.control.check()?;
+        p.check_control()?;
         self.kept = kept;
         self.held = held;
         drop(place_lease);
@@ -704,7 +704,7 @@ impl Window {
                 serial: self.next_serial(),
             });
         }
-        p.control.check()?;
+        p.check_control()?;
         self.kept = kept;
         self.held = held;
         drop(extra);
