@@ -4415,6 +4415,43 @@ fn streaming_top_k_matches_eager_in_order_at_every_batch_size() {
 }
 
 #[test]
+fn streaming_top_k_matches_eager_with_compacted_iris_and_offset() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        b"<urn:a> <urn:p> <urn:b> . <urn:c> <urn:p> <urn:d> . <urn:e> <urn:p> <urn:f> .".to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.compact().unwrap();
+    let query_text = "SELECT ?row WHERE {
+        VALUES (?rank ?iri ?row) {
+            (2 <urn:d> 0) (2 <urn:f> 1) (2 <urn:e> 2)
+            (2 <urn:c> 3) (2 <urn:e> 4) (2 <urn:b> 5)
+            (2 <urn:f> 6) (1 <urn:f> 7) (2 <urn:a> 8) (2 <urn:d> 9)
+        }
+    } ORDER BY ?rank ?iri LIMIT 2 OFFSET 1";
+    let expected = query(s.snapshot(), query_text, &Default::default())
+        .unwrap()
+        .application_rows();
+    assert_eq!(
+        expected,
+        [8, 5].map(|row: i32| vec![Some(Term::Literal(row.into()))]),
+    );
+    for rows in [1, 2, 3, 10] {
+        let cursor = select_cursor(
+            s.snapshot(),
+            query_text,
+            &Default::default(),
+            &options(rows),
+        )
+        .unwrap();
+        assert!(!cursor.plan().has_materialization());
+        assert_eq!(all(cursor), expected, "batch {rows}");
+    }
+}
+
+#[test]
 fn streaming_top_k_keeps_only_its_rows_within_the_memory_budget() {
     let s = store(200_000);
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) LIMIT 5";
