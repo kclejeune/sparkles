@@ -297,9 +297,10 @@ intervals first if the next scan would exceed that allowance or the children are
 too deep to reach a shallow exit. The walk keeps offsets into a node's hop list for
 its deeper tree children, pending interval checks and hops whose indexed suffix
 returns to the branch. It settles exits before enqueuing those returning hops, so
-a shorter exit can discard the whole group. At equal bounds it follows the remaining
-indexed returns before expanding tree children. Each node expands at its shortest
-prefix. The walk stops when the remaining bounds cannot improve the threshold.
+a shorter exit can discard the whole group. Once the index exists, the walk starts
+the shorter hop slice first when two new groups tie. Each group schedules one visit
+and then waits behind other groups at the same bound before scheduling another.
+Each node expands at its shortest prefix. The walk stops when the remaining bounds cannot improve the threshold.
 The virtual endpoint represents a completed cycle and can only appear as a source of
 recorded hops. The query memory budget covers retained hops and intervals, the
 temporary child links used to build the intervals, the queue and the shortest known

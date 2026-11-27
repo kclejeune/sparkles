@@ -1570,27 +1570,29 @@ impl ReverseAlternatives {
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
         enum Work {
             Visit,
-            // At equal bounds, follow surviving cross-tree returns before
-            // expanding the tree children. A return may lead to an exit.
             IndexedReturns,
             TreeChildren,
             CheckIntervals,
         }
         let mut queue = BinaryHeap::new();
         let mut intervals = BinaryHeap::new();
+        // Once the index exists, groups take turns behind visits at each bound.
+        // Before then the tie budget admits each cheap scan as a whole.
+        let mut turn = 0u64;
         let mut tie_budget = tree.dist.len();
         let mut prefixes = HbMap::default();
         let mut base = push_heap(
             &mut queue,
-            Reverse((depth, Work::Visit, source, 0u32, 0usize)),
+            Reverse((depth, 0, Work::Visit, source, 0u32, (0, usize::MAX))),
             &mut scratch,
             0,
         )?;
         loop {
             let next = match (queue.peek(), intervals.peek()) {
-                (Some(Reverse((bound, work, u, _, start))), Some(Reverse((check, _, _, _, _))))
-                    if bound == check =>
-                {
+                (
+                    Some(Reverse((bound, _, work, u, _, (start, end)))),
+                    Some(Reverse((check, _, _, _, _, _))),
+                ) if bound == check => {
                     // Below a child of this depth even the shallowest neighbor
                     // needs intervals. Otherwise allow cheap scans up to the
                     // cost of one index, counting the pop and its whole slice.
@@ -1599,7 +1601,7 @@ impl ReverseAlternatives {
                     let hops = self.branches.get(u).map_or(1, |b| b.hops.len());
                     if tree.ancestry.is_none()
                         && can_exit
-                        && let Some(left) = tie_budget.checked_sub(1 + (hops - start))
+                        && let Some(left) = tie_budget.checked_sub(1 + (hops.min(*end) - start))
                     {
                         tie_budget = left;
                         queue.pop()
@@ -1613,14 +1615,14 @@ impl ReverseAlternatives {
                 (Some(_), _) => queue.pop(),
                 (None, _) => intervals.pop(),
             };
-            let Some(Reverse((bound, work, u, prefix, start))) = next else {
+            let Some(Reverse((bound, _, work, u, prefix, (start, end)))) = next else {
                 break;
             };
             poll()?;
             if second.is_some_and(|len| len <= bound) {
                 break;
             }
-            if work == Work::Visit && prefixes.get(&u).is_some_and(|&best| best < prefix) {
+            if prefixes.get(&u).is_some_and(|&best| best < prefix) {
                 continue;
             }
             let parent = parents[&(u, tree.dist[&u])].node;
@@ -1629,16 +1631,17 @@ impl ReverseAlternatives {
                 .get(&u)
                 .map_or(std::slice::from_ref(&parent), |b| b.hops.as_slice());
             let next_prefix = prefix + 1;
-            // Store a slice offset per group rather than a queue entry for
-            // every child or cross-tree hop. Recheck the bound at dispatch.
+            // Keep the first and last possible hop of each group. Recheck
+            // the bound and the shortest known prefix when dispatching it.
             let mut children = None;
             let mut deferred = None;
             let mut indexed_returns = None;
-            let record_group = |group: &mut Option<(u32, usize)>, lower: u32, offset| {
-                let (min, _) = group.get_or_insert((lower, offset));
+            let record_group = |group: &mut Option<(u32, usize, usize)>, lower: u32, offset| {
+                let (min, _, end) = group.get_or_insert((lower, offset, offset + 1));
                 *min = (*min).min(lower);
+                *end = offset + 1;
             };
-            for (offset, &v) in hops.iter().enumerate().skip(start) {
+            for (offset, &v) in hops.iter().enumerate().take(end).skip(start) {
                 poll()?;
                 if v == source {
                     continue;
@@ -1655,7 +1658,7 @@ impl ReverseAlternatives {
                 let needs_index = cheap.is_none() && !child && v != parent;
                 let avoids = match work {
                     Work::Visit if child => {
-                        children.get_or_insert((lower, offset));
+                        record_group(&mut children, lower, offset);
                         continue;
                     }
                     Work::Visit if needs_index && tree.ancestry.is_none() => {
@@ -1694,27 +1697,43 @@ impl ReverseAlternatives {
                     (_, base) = insert_hb_map(&mut prefixes, v, next_prefix, &mut scratch, base)?;
                     base = push_heap(
                         &mut queue,
-                        Reverse((lower, Work::Visit, v, next_prefix, 0)),
+                        Reverse((lower, 0, Work::Visit, v, next_prefix, (0, usize::MAX))),
                         &mut scratch,
                         base,
                     )?;
+                    let remainder = match work {
+                        Work::TreeChildren if tree.ancestry.is_some() => &mut children,
+                        Work::IndexedReturns => &mut indexed_returns,
+                        _ => continue,
+                    };
+                    if offset + 1 < end {
+                        *remainder = Some((bound, offset + 1, end));
+                    }
+                    break;
                 }
             }
-            for (kind, group) in [
+            // Start the narrower of two new slices first. In particular, a
+            // singleton can expose its exit before a tied clique grows the heap.
+            let mut groups = [
                 (Work::TreeChildren, children),
                 (Work::IndexedReturns, indexed_returns),
                 (Work::CheckIntervals, deferred),
-            ] {
-                if let Some((lower, start)) = group
+            ];
+            groups.sort_unstable_by_key(|(_, group)| group.map(|(_, start, end)| end - start));
+            for (kind, group) in groups {
+                if let Some((lower, start, end)) = group
                     && second.is_none_or(|len| lower < len)
                 {
+                    if tree.ancestry.is_some() {
+                        turn = turn.saturating_add(1);
+                    }
                     base = push_heap(
                         if kind == Work::CheckIntervals {
                             &mut intervals
                         } else {
                             &mut queue
                         },
-                        Reverse((lower, kind, u, prefix, start)),
+                        Reverse((lower, turn, kind, u, prefix, (start, end))),
                         &mut scratch,
                         base,
                     )?;
@@ -14766,6 +14785,7 @@ mod tree_tests {
         assert_dense_first_row(
             "ex:a ex:p ex:b {| ex:w 2e0 |} . ex:b ex:p ex:a, ex:u . ex:u ex:p ex:b, ex:h . \
              ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . ",
+            "u",
             1024,
             7,
             10,
@@ -14778,6 +14798,7 @@ mod tree_tests {
         assert_dense_first_row(
             "ex:a ex:p ex:b {| ex:w 2e0 |} . ex:b ex:p ex:a, ex:u . ex:u ex:p ex:b, ex:h . \
              ex:h ex:p ex:c1 {| ex:w 0.1e0 |} . ex:c1 ex:p ex:c2 . ex:c2 ex:p ex:d . ex:d ex:p ex:t . ",
+            "u",
             128,
             7,
             11,
@@ -14793,6 +14814,7 @@ mod tree_tests {
             "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:b, ex:v . ex:b ex:p ex:a . \
              ex:v ex:p ex:r, ex:z . ex:r ex:p ex:b . ex:z ex:p ex:y . ex:y ex:p ex:x . \
              ex:x ex:p ex:t {| ex:w 10e0 |} . ",
+            "u",
             128,
             6,
             12,
@@ -14801,10 +14823,43 @@ mod tree_tests {
     }
 
     #[test]
+    fn reverse_walk_tree_child_reaches_exit_before_tied_indexed_returns() {
+        // At u the clique suffixes return through r. The tree child v can
+        // instead take the exit through z at the same six-edge bound.
+        assert_dense_first_row(
+            "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:b, ex:v . ex:b ex:p ex:a . \
+             ex:v ex:p ex:u, ex:z . ex:r ex:p ex:b . ex:z ex:p ex:y . ex:y ex:p ex:x . \
+             ex:x ex:p ex:t {| ex:w 10e0 |} . ",
+            "r",
+            128,
+            6,
+            12,
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn reverse_walk_tied_clique_yields_after_one_visit() {
+        // The reverse costs put the clique between the two indexed returns
+        // in u's hop list. Its shorter slice starts first, then yields to v.
+        assert_dense_first_row(
+            "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:b, ex:v, ex:s . ex:b ex:p ex:a . \
+             ex:v ex:p ex:r {| ex:w 0.25e0 |}, ex:z . ex:s ex:p ex:r {| ex:w 2e0 |} . \
+             ex:r ex:p ex:b . ex:z ex:p ex:y . ex:y ex:p ex:x . ex:x ex:p ex:t {| ex:w 10e0 |} . ",
+            "u",
+            128,
+            6,
+            13,
+            Some(4),
+        );
+    }
+
+    #[test]
     fn reverse_walk_tied_shallow_children_have_bounded_work() {
         assert_dense_first_row(
             "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:a, ex:h . \
              ex:h ex:p ex:c {| ex:w 0.1e0 |} . ex:c ex:p ex:d . ex:d ex:p ex:t . ",
+            "u",
             128,
             5,
             9,
@@ -14857,6 +14912,7 @@ mod tree_tests {
 
     fn assert_dense_first_row(
         edges: &str,
+        clique_parent: &str,
         n: usize,
         max_len: u32,
         visits: usize,
@@ -14869,7 +14925,7 @@ mod tree_tests {
              ex:w ex:p ex:t {{| ex:w 1e12 |}} . {edges}"
         );
         for i in 0..n {
-            write!(ttl, "ex:u ex:p ex:v{i} . ex:v{i} ex:p ex:u").unwrap();
+            write!(ttl, "ex:u ex:p ex:v{i} . ex:v{i} ex:p ex:{clique_parent}").unwrap();
             for j in 0..n {
                 if i != j {
                     write!(ttl, ", ex:v{j}").unwrap();
@@ -14883,14 +14939,16 @@ mod tree_tests {
             n + visits
         );
         test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.set(0));
-        for (first, steps) in reverse_first_rows(ttl, &properties, None) {
+        let rows = reverse_first_rows(ttl, &properties, None);
+        let steps = rows.each_ref().map(|(_, steps)| *steps);
+        assert!(
+            steps.iter().all(|&count| count <= 6 * n + 64),
+            "eager and cursor suffix steps {steps:?} for {n} clique nodes"
+        );
+        for (first, _) in rows {
             assert_eq!(
                 first,
                 Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap())
-            );
-            assert!(
-                steps <= 6 * n + 64,
-                "{steps} suffix steps for {n} descendants"
             );
         }
         if let Some(per_engine) = enqueues {
