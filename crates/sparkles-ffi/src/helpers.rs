@@ -468,7 +468,7 @@ impl FfiDataset {
                 (asked, limit) => asked.or(limit),
             };
             request.analysis.cancel = Some(operation.control.cancel.flag());
-            let result = self.inner.ds.reasoning().diff(&request)?;
+            let result = self.inner.ds.reasoning().diff_admitted(&request)?;
             operation.control.check()?;
             encode(&result.to_json())
         }

@@ -43,6 +43,14 @@ impl Memory {
         )
     }
 
+    pub fn parent(&self) -> Option<ParentHandle> {
+        self.credit.as_ref().map(LiveCredit::parent)
+    }
+
+    pub fn remaining(&self) -> Option<u64> {
+        self.limit.map(|limit| limit.saturating_sub(self.bytes))
+    }
+
     pub fn limit(&self) -> Option<u64> {
         self.limit
     }
@@ -97,17 +105,23 @@ impl Memory {
     }
 
     pub fn grow(&mut self, bytes: u64) -> Result<()> {
+        self.grow_with_overlap(bytes, 0)
+    }
+
+    /// The overlapping bytes are already charged to the parent by their owner.
+    pub fn grow_with_overlap(&mut self, bytes: u64, overlap: u64) -> Result<()> {
         let next = self
             .bytes
             .checked_add(bytes)
             .ok_or_else(|| parent_error(ParentRefused::Overflow))?;
+        let requested = next.saturating_add(overlap);
         if let Some(limit) = self.limit
-            && next > limit
+            && requested > limit
         {
             return Err(Error::BudgetExceeded(Budget {
                 kind: BudgetKind::Memory,
                 limit,
-                requested: next,
+                requested,
             }));
         }
         if let Some(credit) = &mut self.credit {

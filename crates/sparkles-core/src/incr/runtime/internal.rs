@@ -909,6 +909,7 @@ impl Runtime {
             let Some(snap) = st.circuit.snap.clone() else {
                 continue;
             };
+            let credit = CheckpointCredit(&st.circuit);
             let r = st
                 .circuit
                 .encode_charged(&snap)
@@ -942,6 +943,7 @@ impl Runtime {
                         || store.failpoint("internal-checkpoint-written"),
                     )
                 });
+            drop(credit);
             match r {
                 Ok(()) => {
                     st.checkpointed = applied;

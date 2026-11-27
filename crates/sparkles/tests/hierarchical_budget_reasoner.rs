@@ -160,7 +160,10 @@ fn facade_reasoning_operations_return_exact_pool_credit_to_zero() {
     assert_eq!(pool.granted(), 0, "why-not explain must return credit");
 
     // 6. Entailment diff, justify, diagnostics
-    let diff = ds.reasoning().diff(&DiffRequest::new("1", "head")).unwrap();
+    let diff = ds
+        .reasoning()
+        .diff_admitted(&DiffRequest::new("1", "head"))
+        .unwrap();
     assert!(diff.added > 0);
     assert!(
         pool.granted() > 0,
@@ -882,4 +885,293 @@ fn fetching_resolved_imports_polls_and_admits_discovery_without_load() {
     );
     assert_eq!(ds.head_commit().seq, before.seq);
     assert_eq!(pool.granted(), 0);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn shared_expression_growth_refuses_after_the_cold_ontology_fits() {
+    use sparkles::handles::ontology::OntologyRequest;
+    let ds = Dataset::memory();
+    let mut turtle = String::from(
+        "@prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         <urn:A> rdfs:subClassOf _:shared . _:shared owl:intersectionOf (",
+    );
+    for i in 0..16 {
+        turtle.push_str(&format!("<urn:{}:{i}> ", "x".repeat(2048)));
+    }
+    turtle.push_str(") .");
+    ds.load_str(&turtle, RdfFormat::Turtle).unwrap();
+    let opts = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(MIB),
+        ..Default::default()
+    };
+    let request = OntologyRequest::default();
+    let handle = ds.ontology();
+    assert!(!handle.open(&request, &opts).unwrap().ontology.is_empty());
+    let additions = (0..64)
+        .map(|i| format!("<urn:C{i}> <http://www.w3.org/2000/01/rdf-schema#subClassOf> _:shared ."))
+        .collect::<String>();
+    // Reload the shared node in a single document so it has the same RDF identity.
+    ds.update("CLEAR DEFAULT").unwrap();
+    ds.load_str(&(turtle + &additions), RdfFormat::Turtle)
+        .unwrap();
+    assert!(
+        matches!(handle.open(&request, &opts), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
+    );
+    assert!(
+        handle
+            .open(
+                &request,
+                &QueryOptions {
+                    max_memory_bytes: Some(8 * MIB),
+                    ..opts
+                }
+            )
+            .unwrap()
+            .ontology
+            .len()
+            >= 64
+    );
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn terminology_only_coverage_refuses_an_assertion_after_opening_fits() {
+    use sparkles::handles::ontology::OntologyRequest;
+    let ds = Dataset::memory();
+    ds.update(&format!(
+        "INSERT DATA {{ <urn:A> a <http://www.w3.org/2002/07/owl#Class> .
+         <urn:s> <urn:assertion> \"{}\" }}",
+        "a".repeat(64 << 10)
+    ))
+    .unwrap();
+    let request = OntologyRequest::default();
+    let handle = ds.ontology();
+    let opts = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(128 << 10),
+        ..Default::default()
+    };
+    assert_eq!(
+        handle.open(&request, &opts).unwrap().ontology.triples.len(),
+        1
+    );
+    let error = handle
+        .classify(&request, &Default::default(), &opts)
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory));
+    let answer = handle
+        .classify(
+            &request,
+            &Default::default(),
+            &QueryOptions {
+                max_memory_bytes: Some(8 * MIB),
+                ..opts
+            },
+        )
+        .unwrap();
+    assert!(!answer.complete());
+    assert!(!answer.excluded.is_empty() || answer.classification.unmapped.count > 0);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn detached_classification_and_exclusions_keep_their_caller_grant() {
+    use sparkles::handles::ontology::{OntologyRequest, classify::ClassifyRequest};
+    let ds = Dataset::memory();
+    ds.update(
+        "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        INSERT DATA { <urn:A> rdfs:subClassOf [ owl:unionOf ( <urn:B> <urn:C> ) ] . }",
+    )
+    .unwrap();
+    let pool = QueryPool::new(16 * MIB);
+    let grant = Arc::new(pool.empty_grant());
+    for keep_classification in [true, false] {
+        let answer = ds
+            .ontology()
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest {
+                    el_only: true,
+                    ..Default::default()
+                },
+                &QueryOptions {
+                    grant: Some(grant.clone()),
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let classification: Arc<sparkles::owl::classify::Classification> =
+            answer.classification.clone();
+        let excluded = answer.excluded.clone();
+        assert!(!excluded.is_empty());
+        drop(answer);
+        assert!(grant.used() > 0);
+        if keep_classification {
+            drop(excluded);
+            assert!(grant.used() > 0);
+            drop(classification);
+        } else {
+            drop(classification);
+            assert!(grant.used() > 0);
+            drop(excluded);
+        }
+        assert_eq!(grant.used(), 0);
+    }
+}
+
+#[test]
+fn invalid_import_warning_text_is_admitted_and_owned_after_fetch() {
+    use sparkles::reasoning::reasoner::inputs::{ImportMode, Inputs, fetch_imports_admitted};
+    let ds = Dataset::memory();
+    let pool = QueryPool::new(16 * MIB);
+    let grant = Arc::new(pool.empty_grant());
+    let refresh: Vec<_> = (0..4).map(|i| format!("urn:import:{i}")).collect();
+    let mut inputs = Inputs {
+        imports: ImportMode::Fetch,
+        ..Default::default()
+    };
+    for iri in &refresh {
+        inputs
+            .location_mapping
+            .names
+            .insert(iri.clone(), "x".repeat(32 << 10));
+    }
+    let opts = QueryOptions {
+        grant: Some(grant.clone()),
+        max_memory_bytes: Some(160 << 10),
+        ..Default::default()
+    };
+    let error = fetch_imports_admitted(ds.store(), &inputs, &refresh, &opts).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("keeping import warnings"),
+        "{error:#}"
+    );
+    assert_eq!(grant.used(), 0);
+    let (report, credit) = fetch_imports_admitted(
+        ds.store(),
+        &inputs,
+        &refresh,
+        &QueryOptions {
+            max_memory_bytes: Some(MIB),
+            ..opts
+        },
+    )
+    .unwrap();
+    assert_eq!(report.warnings.len(), refresh.len());
+    assert!(grant.used() >= report.warnings.iter().map(|s| s.len() as u64).sum());
+    drop(report);
+    drop(credit);
+    assert_eq!(grant.used(), 0);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn public_owl_and_entailment_structs_allow_downstream_literals_and_patterns() {
+    use sparkles::handles::ontology::{
+        OntologyRequest,
+        dl_query::{DlQueryAnswer, DlQueryRequest},
+    };
+    use sparkles::owl::{Class, read::Ontology};
+    use sparkles::reasoning::diff::{DiffState, EntailmentDiff};
+
+    let ontology = Ontology {
+        error_count: 1,
+        ..Ontology::default()
+    };
+    let Ontology {
+        header: _,
+        header_graph: _,
+        other_headers: _,
+        axioms: _,
+        triples: _,
+        graph_of: _,
+        unmapped: _,
+        diagnostics: _,
+        diagnostics_dropped: _,
+        error_count,
+        typing: _,
+        mode: _,
+        terminology_only: _,
+        reification_nodes: _,
+        ontology_nodes: _,
+    } = ontology;
+    assert_eq!(error_count, 1);
+
+    let state = DiffState {
+        selector: "head".into(),
+        commit: 0,
+    };
+    let diff = EntailmentDiff {
+        from: state.clone(),
+        to: state,
+        added: 0,
+        removed: 0,
+        added_triples: Vec::new(),
+        removed_triples: Vec::new(),
+        by_predicate: Default::default(),
+        by_class: Default::default(),
+        new_findings: Vec::new(),
+        findings_complete: true,
+        sample_truncated: false,
+        warnings: Vec::new(),
+    };
+    let EntailmentDiff {
+        from: _,
+        to: _,
+        added,
+        removed,
+        added_triples: _,
+        removed_triples: _,
+        by_predicate: _,
+        by_class: _,
+        new_findings: _,
+        findings_complete: _,
+        sample_truncated: _,
+        warnings: _,
+    } = diff;
+    assert_eq!(added + removed, 0);
+
+    let ds = Dataset::memory();
+    let request = DlQueryRequest::new(Class::thing().into());
+    let answer = ds
+        .ontology()
+        .dl_query(&OntologyRequest::default(), &request, &Default::default())
+        .unwrap();
+    let DlQueryAnswer {
+        opened,
+        expression,
+        reasoning,
+        satisfiable,
+        consistent,
+        equivalents,
+        superclasses,
+        direct_superclasses,
+        subclasses,
+        direct_subclasses,
+        instances,
+        incremental,
+        elapsed,
+    } = answer;
+    let reconstructed = DlQueryAnswer {
+        opened,
+        expression,
+        reasoning,
+        satisfiable,
+        consistent,
+        equivalents,
+        superclasses,
+        direct_superclasses,
+        subclasses,
+        direct_subclasses,
+        instances,
+        incremental,
+        elapsed,
+    };
+    assert_eq!(reconstructed.expression, request.expression);
 }

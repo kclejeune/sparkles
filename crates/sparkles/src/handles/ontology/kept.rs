@@ -2,7 +2,7 @@
 //!
 //! The retained estimate is a between-run policy. Old reader Arcs and a publication
 //! visible during a new flight can extend peak lifetime beyond that estimate.
-use super::classify::{CACHE_MAX_BYTES, CacheEntry, ClassifyRequest};
+use super::classify::{CACHE_MAX_BYTES, CacheEntry, ClassifiedExclusions, ClassifyRequest};
 use super::{Ontologies, OntologyRequest, Opened, check};
 use crate::dataset::DatasetState;
 use crate::error::{Error, Result};
@@ -302,10 +302,11 @@ pub(super) struct KeptClassification {
     pub id: Uuid,
     pub source: Arc<Provenance>,
     pub classification: Arc<Classification>,
-    pub excluded: Arc<Vec<Excluded>>,
+    pub excluded: Arc<ClassifiedExclusions>,
     pub content_fingerprint: String,
     pub(super) auxiliary_bytes: usize,
-    _memory: crate::reasoning::memory::Memory,
+    memory: Option<crate::reasoning::memory::Memory>,
+    _lease: Option<Arc<sparkles_budget::MemoryLease>>,
 }
 impl KeptClassification {
     pub(super) fn capture(
@@ -334,6 +335,7 @@ impl KeptClassification {
         let auxiliary_bytes = size_of::<Self>()
             .saturating_add(source.owned_bytes())
             .saturating_add(excluded_bytes)
+            .saturating_add(super::classify::unmapped_bytes(&classification.unmapped))
             .saturating_add(content_fingerprint.capacity());
         let memory = working
             .lock()
@@ -342,10 +344,11 @@ impl KeptClassification {
             id: Uuid::new_v4(),
             source,
             classification: Arc::new(classification),
-            excluded: Arc::new(excluded),
+            excluded: Arc::new(ClassifiedExclusions::new(excluded)),
             content_fingerprint,
             auxiliary_bytes,
-            _memory: memory,
+            memory: Some(memory),
+            _lease: None,
         })
     }
 
@@ -354,7 +357,30 @@ impl KeptClassification {
         opts: &QueryOptions,
         pool: Option<&Arc<sparkles_core::sparql::pool::QueryPool>>,
     ) -> bool {
-        pool.is_none_or(|pool| admit_cached_memory(opts, pool, &mut self._memory))
+        pool.is_none_or(|pool| {
+            admit_cached_memory(
+                opts,
+                pool,
+                self.memory.as_mut().expect("unpublished memory"),
+            )
+        })
+    }
+
+    pub(super) fn seal(mut self) -> Arc<Self> {
+        let memory = self
+            .memory
+            .take()
+            .and_then(|memory| memory.into_lease())
+            .map(Arc::new);
+        Arc::get_mut(&mut self.classification)
+            .expect("unpublished classification")
+            .taxonomy
+            .keep_memory(memory.clone());
+        Arc::get_mut(&mut self.excluded)
+            .expect("unpublished exclusions")
+            .memory = memory.clone();
+        self._lease = memory;
+        Arc::new(self)
     }
 
     pub fn identity(&self) -> J {

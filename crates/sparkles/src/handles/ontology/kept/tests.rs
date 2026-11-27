@@ -341,6 +341,7 @@ fn mutation_errors_and_unwinds_discard_both_owners_but_not_a_read_arc() {
                         false,
                         &opts(),
                         &super::super::classify::working(&opts(), &o),
+                        0,
                     )?;
                     if panic {
                         panic!("controlled mutation unwind");
@@ -383,7 +384,8 @@ fn retention_counts_auxiliary_bytes_once_and_taxonomy_eviction_releases_owners()
             excluded: p.excluded.clone(),
             content_fingerprint: p.content_fingerprint.clone(),
             auxiliary_bytes: CACHE_MAX_BYTES - base,
-            _memory: crate::reasoning::memory::Memory::new(None, None),
+            memory: None,
+            _lease: None,
         };
         assert_eq!(classification_retained_bytes(e, &fake), CACHE_MAX_BYTES);
         fake.auxiliary_bytes += 1;
@@ -1934,4 +1936,149 @@ fn el_only_and_full_classifications_are_keyed_separately_and_never_clobber() {
             surviving.retained_bytes
         );
     }
+}
+
+#[test]
+fn a_waiter_reenters_only_after_classifier_flight_and_work_unlock() {
+    use sparkles_core::sparql::pool::QueryPool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let ds = ds(":A a owl:Class .");
+    let handle = ds.ontology();
+    let request = req();
+    let opened = handle.open(&request, &opts()).unwrap();
+    for unwind in [false, true] {
+        let pool = QueryPool::new(4 << 20);
+        let work = super::super::classify::working(
+            &QueryOptions {
+                pool: Some(pool.clone()),
+                ..opts()
+            },
+            &opened,
+        );
+        work.lock().grow(2 << 20).unwrap();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let ticket = pool.enter(
+            pool.capacity(),
+            Some(Arc::new({
+                let (ds, work, observed) = (ds.clone(), work.clone(), observed.clone());
+                move || {
+                    let unlocked = ds.state().classify_flight.try_lock().is_some()
+                        && work.try_lock().is_some();
+                    if observed
+                        .compare_exchange(
+                            0,
+                            if unlocked { 1 } else { 2 },
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                        && unlocked
+                        && ds
+                            .ontology()
+                            .classify(&req(), &ClassifyRequest::default(), &opts())
+                            .is_ok()
+                    {
+                        observed.store(3, Ordering::SeqCst);
+                    }
+                }
+            })),
+        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle
+                .with_kept(&opened, &request, false, &opts(), "classify", |_| {
+                    work.lock().shrink_to(0);
+                    assert!(!unwind, "injected flight unwind");
+                    Ok(((), false))
+                })
+                .unwrap();
+        }));
+        assert_eq!(outcome.is_err(), unwind);
+        assert_eq!(observed.load(Ordering::SeqCst), 3);
+        drop(ticket);
+    }
+}
+
+#[test]
+fn edited_kept_ontology_charges_only_incremental_saturation_growth() {
+    use crate::DatasetOptions;
+    use crate::store::Store;
+    use sparkles_core::sparql::pool::QueryPool;
+
+    let mut data = String::new();
+    for i in 0..1800 {
+        data.push_str(&format!(":C{i} rdfs:subClassOf :Top . "));
+    }
+    let prepare = || {
+        let pool = QueryPool::with_retained_capacity(64 << 20, 64 << 20).unwrap();
+        let ds = Dataset::from_store_with(
+            Store::in_memory(Default::default()),
+            DatasetOptions {
+                pool: Some(pool.clone()),
+                ..Default::default()
+            },
+        );
+        ds.update(&format!("{BASE} INSERT DATA {{ {data} }}"))
+            .unwrap();
+        let classifier = ClassifyRequest {
+            threads: 1,
+            el_only: true,
+            ..Default::default()
+        };
+        let initial = ds
+            .ontology()
+            .classify(&req(), &classifier, &opts())
+            .unwrap();
+        assert!(initial.retained);
+        let old_bytes = ds
+            .state()
+            .classify_cache
+            .lock()
+            .slot(true)
+            .entry
+            .as_ref()
+            .unwrap()
+            .reused_credit();
+        ds.update(&format!(
+            "{BASE} INSERT DATA {{ :New rdfs:subClassOf :Top . }}"
+        ))
+        .unwrap();
+        ds.ontology().open(&req(), &opts()).unwrap();
+        (ds, classifier, old_bytes)
+    };
+    let (measure, classifier, old_bytes) = prepare();
+    let measured = measure
+        .ontology()
+        .classify(&req(), &classifier, &opts())
+        .unwrap();
+    let actual_peak = measured.classification.stats.peak_memory as u64;
+    // Allow the façade's old/new axiom pointers and delta staging alongside
+    // the classifier's incremental portion of that peak.
+    let cap = actual_peak.saturating_sub(old_bytes) + 400_000;
+    assert!(
+        cap < actual_peak,
+        "fixture must leave less than an extra saturation's worth of work ({cap} / {actual_peak})"
+    );
+    drop((measured, measure));
+
+    let (ds, classifier, _) = prepare();
+    let edited = ds
+        .ontology()
+        .classify(
+            &req(),
+            &classifier,
+            &QueryOptions {
+                max_memory_bytes: Some(cap),
+                ..opts()
+            },
+        )
+        .unwrap();
+    assert!(edited.retained);
+    assert!(
+        edited
+            .classification
+            .taxonomy
+            .node_of(&sparkles_owl::Class::new("http://ex.org/New"))
+            .is_some()
+    );
 }

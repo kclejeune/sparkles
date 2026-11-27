@@ -1103,3 +1103,57 @@ fn changed_id_admission_reuses_capacity_across_cancelled_wal_toggles() {
     assert!(changes[0].1);
     assert!(held.get() > size_of::<([Id; 4], bool)>() as u64);
 }
+
+#[test]
+fn changed_id_table_admits_both_backings_at_resize_and_returns_table_credit() {
+    use sparkles_budget::sizes::table_bytes_for;
+    use sparkles_core::id::Id;
+    type Row = ([Id; 4], bool);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        &dir.path().join("db"),
+        StoreOptions {
+            bulk_threshold: 10_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = store.snapshot().commit;
+    update(
+        &store,
+        "INSERT DATA { <urn:a> <urn:p> 1, 2, 3, 4 }",
+        &Default::default(),
+    )
+    .unwrap();
+    let head = store.snapshot();
+    let live = std::cell::Cell::new(0u64);
+    let peak = std::cell::Cell::new(0u64);
+    let limit = std::cell::Cell::new(table_bytes_for::<Row>(7) as u64);
+    let admit = |bytes| {
+        let next = live.get() + bytes;
+        if next > limit.get() {
+            return Err(Error::invalid("resize cannot fit both tables"));
+        }
+        live.set(next);
+        peak.set(peak.get().max(next));
+        Ok(())
+    };
+    let release = |bytes| live.set(live.get() - bytes);
+    let run = || {
+        store.changed_ids_metered(
+            before,
+            &head,
+            &[Id::DEFAULT_GRAPH],
+            &DiffOptions::default(),
+            Some(&admit),
+            &release,
+        )
+    };
+    assert!(run().unwrap_err().to_string().contains("both tables"));
+    assert_eq!(live.replace(0), table_bytes_for::<Row>(3) as u64);
+    limit.set(4096);
+    let result = run().unwrap().unwrap();
+    assert_eq!(result.len(), 4);
+    assert!(peak.get() >= (table_bytes_for::<Row>(3) + table_bytes_for::<Row>(7)) as u64);
+    assert_eq!(live.get(), (result.capacity() * size_of::<Row>()) as u64);
+}

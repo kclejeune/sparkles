@@ -485,10 +485,21 @@ impl Staging {
     }
 
     fn admit(&self, bytes: u64) -> sparkles_core::Result<()> {
-        self.held
-            .borrow_mut()
-            .try_grow(bytes as usize)
-            .map_err(|e| crate::query::memory_error(e, "staging materialization changes"))
+        let mut held = self.held.borrow_mut();
+        held.try_grow(bytes as usize).map_err(|error| match error {
+            BudgetFailure::Local(local) => {
+                sparkles_core::Error::BudgetExceeded(sparkles_core::error::Budget {
+                    kind: sparkles_core::error::BudgetKind::Memory,
+                    limit: local.limit as u64,
+                    requested: (held.budget().used() as u64).saturating_add(bytes),
+                })
+            }
+            error => crate::query::memory_error(error, "staging materialization changes"),
+        })
+    }
+
+    fn release(&self, bytes: u64) {
+        self.held.borrow_mut().shrink(bytes as usize);
     }
 
     fn finish(self, data: RawChangeData) -> RawChanges {
@@ -881,28 +892,38 @@ fn union_changes(
     c: &mut Changes,
 ) -> anyhow::Result<()> {
     for (t, changed) in by_triple {
-        let stored = t
-            .iter()
-            .all(|&x| Id(x).tag() != sparkles_core::id::Tag::Local);
-        let (mut before, mut after) = (false, false);
-        for &g in inputs {
-            let now = stored && snap.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])?;
-            after |= now;
-            before |= match changed.iter().find(|(cg, _)| *cg == Some(g)) {
-                Some((_, added)) => !added,
-                None => now,
-            };
-        }
-        // a graph the snapshot no longer names held the triple before when the diff
-        // removed it there
-        before |= changed.iter().any(|(cg, added)| cg.is_none() && !added);
-        match (before, after) {
-            (false, true) => c.base_added.push(t),
-            (true, false) => c.base_removed.push(t),
-            _ => c.base_moved.push(t),
-        }
+        union_change(t, changed.iter().copied(), snap, inputs, c)?.push(t);
     }
     Ok(())
+}
+
+fn union_change<'a>(
+    t: Triple,
+    changed: impl Iterator<Item = (Option<Id>, bool)> + Clone,
+    snap: &Snapshot,
+    inputs: &[Id],
+    c: &'a mut Changes,
+) -> anyhow::Result<&'a mut Vec<Triple>> {
+    let stored = t
+        .iter()
+        .all(|&x| Id(x).tag() != sparkles_core::id::Tag::Local);
+    let (mut before, mut after) = (false, false);
+    for &g in inputs {
+        let now = stored && snap.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])?;
+        after |= now;
+        before |= match changed.clone().find(|(cg, _)| *cg == Some(g)) {
+            Some((_, added)) => !added,
+            None => now,
+        };
+    }
+    // a graph the snapshot no longer names held the triple before when the diff
+    // removed it there
+    before |= changed.clone().any(|(cg, added)| cg.is_none() && !added);
+    Ok(match (before, after) {
+        (false, true) => &mut c.base_added,
+        (true, false) => &mut c.base_removed,
+        _ => &mut c.base_moved,
+    })
 }
 
 /// The ids of the input graphs in `snap` (or in `other`, for a graph only it names).
@@ -919,6 +940,23 @@ pub(crate) fn input_ids(snap: &Snapshot, other: Option<&Snapshot>, inputs: &[Gra
     ids.sort_unstable();
     ids.dedup();
     ids
+}
+
+fn push_logged_change(
+    out: &mut Vec<Triple>,
+    triple: Triple,
+    stage: &Staging,
+) -> Result<(), sparkles_core::Error> {
+    if out.len() == out.capacity() {
+        let slot = size_of::<Triple>();
+        let old = out.capacity();
+        let capacity = sparkles_budget::sizes::vec_grown(old, out.len(), 1, slot);
+        stage.admit((capacity * slot) as u64)?;
+        out.reserve_exact(capacity - out.len());
+        stage.release((old * slot) as u64);
+    }
+    out.push(triple);
+    Ok(())
 }
 
 /// The changes from commit `since` to `snap` as ids of `snap`, from the log of its
@@ -940,35 +978,53 @@ fn logged_ids(
     }
     let mut graphs = ids.clone();
     graphs.extend(inferred);
-    let Some(found) = store.changed_ids_with_admission(
+    let Some(mut found) = store.changed_ids_metered(
         since,
         snap,
         &graphs,
         &stage.opts,
         Some(&|bytes| stage.admit(bytes)),
+        &|bytes| stage.release(bytes),
     )?
     else {
         return Ok(None);
     };
     let mut c = Changes::default();
-    let mut by_triple: FxHashMap<Triple, Vec<(Option<Id>, bool)>> = FxHashMap::default();
-    for (q, added) in found {
-        let t = [q[0].0, q[1].0, q[2].0];
-        if Some(q[3]) == inferred {
-            if added {
-                c.inferred_added.push(t);
-            } else {
-                c.inferred_removed.push(t);
+    let found_bytes = (found.capacity() * size_of::<([Id; 4], bool)>()) as u64;
+    if ids.len() <= 1 {
+        for &(q, added) in &found {
+            let out = match (Some(q[3]) == inferred, added) {
+                (true, true) => &mut c.inferred_added,
+                (true, false) => &mut c.inferred_removed,
+                (false, true) => &mut c.base_added,
+                (false, false) => &mut c.base_removed,
+            };
+            push_logged_change(out, [q[0].0, q[1].0, q[2].0], stage)?;
+        }
+    } else {
+        found.sort_unstable_by_key(|(q, _)| [q[0], q[1], q[2], q[3]]);
+        for group in found.chunk_by(|(a, _), (b, _)| a[..3] == b[..3]) {
+            let q = group[0].0;
+            let t = [q[0].0, q[1].0, q[2].0];
+            if let Some((_, added)) = group.iter().find(|(q, _)| Some(q[3]) == inferred) {
+                let out = if *added {
+                    &mut c.inferred_added
+                } else {
+                    &mut c.inferred_removed
+                };
+                push_logged_change(out, t, stage)?;
             }
-        } else if ids.len() > 1 {
-            by_triple.entry(t).or_default().push((Some(q[3]), added));
-        } else if added {
-            c.base_added.push(t);
-        } else {
-            c.base_removed.push(t);
+            let changed = group
+                .iter()
+                .filter_map(|(q, added)| (Some(q[3]) != inferred).then_some((Some(q[3]), *added)));
+            if changed.clone().next().is_some() {
+                let out = union_change(t, changed, snap, &ids, &mut c)?;
+                push_logged_change(out, t, stage)?;
+            }
         }
     }
-    union_changes(by_triple, snap, &ids, &mut c)?;
+    drop(found);
+    stage.release(found_bytes);
     Ok(Some(RawChangeData::Ids(c)))
 }
 
@@ -1619,6 +1675,91 @@ pub(crate) fn remove_saved(store: &Store) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logged_ids_admits_multigraph_conversion_after_the_wal_rows_fit() {
+        use sparkles_core::sparql::update::update;
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            &dir.path().join("db"),
+            sparkles_core::store::StoreOptions {
+                bulk_threshold: 10_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let since = store.snapshot().commit;
+        let mut text = String::from("INSERT DATA {");
+        for (graph, nodes) in [("urn:g1", 0..1300), ("urn:g2", 1100..1500)] {
+            text.push_str(&format!("GRAPH <{graph}> {{ "));
+            for i in nodes {
+                text.push_str(&format!("<urn:s{i}> <urn:p> 1 ."));
+            }
+            text.push_str(" }");
+        }
+        text.push('}');
+        update(&store, &text, &Default::default()).unwrap();
+        let snapshot = store.snapshot();
+        let inputs = [
+            GraphRef::Named("urn:g1".into()),
+            GraphRef::Named("urn:g2".into()),
+        ];
+        let live = Cell::new(0);
+        let peak = Cell::new(0);
+        let found = store
+            .changed_ids_metered(
+                since,
+                &snapshot,
+                &input_ids(&snapshot, None, &inputs),
+                &Default::default(),
+                Some(&|bytes| {
+                    live.set(live.get() + bytes);
+                    peak.set(peak.get().max(live.get()));
+                    Ok(())
+                }),
+                &|bytes| live.set(live.get() - bytes),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.len(), 1700);
+        let limited = Budget::new(Some(peak.get() as usize + 4096));
+        let stage = Staging::new(&limited, None);
+        let found = store
+            .changed_ids_metered(
+                since,
+                &snapshot,
+                &input_ids(&snapshot, None, &inputs),
+                &Default::default(),
+                Some(&|bytes| stage.admit(bytes)),
+                &|bytes| stage.release(bytes),
+            )
+            .unwrap()
+            .unwrap();
+        // A sibling can take shared budget after the WAL table is freed but
+        // while the returned ID vector still overlaps the conversion.
+        let sibling = Held::try_new_exact(&limited, limited.available() - 64).unwrap();
+        let mut converted = Vec::new();
+        let q = found[0].0;
+        let error =
+            push_logged_change(&mut converted, [q[0].0, q[1].0, q[2].0], &stage).unwrap_err();
+        assert!(matches!(error, sparkles_core::Error::BudgetExceeded(b)
+            if b.kind == sparkles_core::error::BudgetKind::Memory));
+        assert_eq!(converted.capacity(), 0);
+        drop((found, sibling, stage));
+
+        let wide = Budget::new(None);
+        let stage = Staging::new(&wide, None);
+        let RawChangeData::Ids(changes) = logged_ids(&store, since, &snapshot, &inputs, &stage)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected ID changes");
+        };
+        assert_eq!(changes.base_added.len(), 1500);
+        assert_eq!(stage.held.borrow().bytes(), changes.heap_bytes());
+    }
 
     fn key(s: &str) -> Keys {
         [s.as_bytes().to_vec(), b"p".to_vec(), b"o".to_vec()]

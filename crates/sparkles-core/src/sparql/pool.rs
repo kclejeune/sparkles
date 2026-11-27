@@ -77,6 +77,11 @@ impl std::fmt::Debug for QueryPool {
     }
 }
 
+thread_local! {
+    static DEFERRED_RELEASE_WAKES: std::cell::RefCell<Option<Vec<Arc<QueryPool>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// A snapshot of the pool for `/$/server/memory` and the metrics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolStats {
@@ -136,8 +141,48 @@ impl QueryPool {
         // waiter that did not see the freed memory.
         self.granted.fetch_sub(bytes, Ordering::SeqCst);
         if self.waiting.load(Ordering::SeqCst) > 0 {
-            self.wake();
+            let deferred = DEFERRED_RELEASE_WAKES
+                .try_with(|pending| {
+                    let mut pending = pending.borrow_mut();
+                    let Some(pools) = pending.as_mut() else {
+                        return false;
+                    };
+                    if !pools.iter().any(|pool| Arc::ptr_eq(pool, self)) {
+                        pools.push(self.clone());
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !deferred {
+                self.wake();
+            }
         }
+    }
+
+    /// Run work that releases query credit under an outer lock. Credit is immediately
+    /// available for admission. Waiter callbacks run once the work and its guards
+    /// have left scope, including on unwind.
+    #[doc(hidden)]
+    pub fn with_deferred_release_wakes<T>(work: impl FnOnce() -> T) -> T {
+        struct Drain;
+        impl Drop for Drain {
+            fn drop(&mut self) {
+                let pools = DEFERRED_RELEASE_WAKES.with(|pending| pending.borrow_mut().take());
+                for pool in pools.into_iter().flatten() {
+                    pool.wake();
+                }
+            }
+        }
+        let _drain = DEFERRED_RELEASE_WAKES.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            if pending.is_some() {
+                None
+            } else {
+                *pending = Some(Vec::new());
+                Some(Drain)
+            }
+        });
+        work()
     }
 
     fn wake(&self) {

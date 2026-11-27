@@ -2785,11 +2785,14 @@ mod classification {
         let mut partial = Vec::new();
         for k in 1..20 {
             let ds = dataset(&body);
+            // These ceilings come from the classifier peak. Prepare the
+            // input before exercising a stop during saturation.
+            ds.ontology().open(&req, &opts()).unwrap();
             let o = QueryOptions {
                 max_memory_bytes: Some(peak * k / 20),
                 ..opts()
             };
-            // a budget under the size of the ontology and its index refuses the run
+            // A budget under the size of the classifier's index refuses the run.
             let Ok(part) = ds.ontology().classify(&req, &partial_request(), &o) else {
                 continue;
             };
@@ -2914,6 +2917,7 @@ mod classification {
         let (ds, part) = (1..20)
             .find_map(|k| {
                 let ds = dataset(&body);
+                ds.ontology().open(&req, &opts()).unwrap();
                 let o = QueryOptions {
                     max_memory_bytes: Some(peak * k / 20),
                     ..opts()
@@ -3167,6 +3171,9 @@ mod classification {
         let (ds, part) = (1..20)
             .find_map(|k| {
                 let ds = dataset(&body);
+                // These ceilings come from the classifier peak. Prepare the
+                // input before exercising a stop during saturation.
+                ds.ontology().open(&req, &opts()).unwrap();
                 let o = QueryOptions {
                     max_memory_bytes: Some(peak * k / 20),
                     ..opts()

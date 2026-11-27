@@ -43,30 +43,16 @@ impl Runtime {
             let old = reg
                 .views
                 .insert(name.to_string(), ViewEntry::new(name, def, None));
-            let result = self
-                .attach(store, &mut reg, name, &mut deferred.retired)
-                .and_then(|()| {
+            let result =
+                self.attach_persisting(store, &mut reg, name, &mut deferred.retired, |def| {
                     if let Some(root) = &self.root {
-                        views::write(root, name, &reg.views[name].def)?;
+                        store.failpoint("view-definition-writing");
+                        views::write(root, name, def)?;
                     }
                     Ok(())
                 });
             if result.is_err() {
-                let failed = reg.views.remove(name).expect("staged definition");
-                if let Some(cell) = failed.cell {
-                    if let Some(previous) = old
-                        .as_ref()
-                        .filter(|entry| entry.cell.as_ref().is_some_and(|c| Arc::ptr_eq(c, &cell)))
-                    {
-                        let mut st = cell.state.lock();
-                        st.view_limits
-                            .insert(name.to_string(), previous.def.memory_bytes);
-                        st.recompute_local_limit();
-                    } else {
-                        need_gc = cell.release_view(name, &mut deferred.retired) == 0;
-                    }
-                    deferred.cells.push(cell);
-                }
+                reg.views.remove(name).expect("staged definition");
                 if let Some(old) = old {
                     reg.views.insert(name.to_string(), old);
                 }
@@ -84,7 +70,7 @@ impl Runtime {
             }
             result
         };
-        drop(deferred);
+        Operation::after(move || drop(deferred));
         if need_gc {
             self.gc();
         }

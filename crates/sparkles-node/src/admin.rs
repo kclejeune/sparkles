@@ -1115,7 +1115,7 @@ fn run_admin(
                 (asked, limit) => asked.or(limit),
             };
             request.analysis.cancel = Some(ctl.cancel.flag());
-            ds.reasoning().diff(&request)?.to_json()
+            ds.reasoning().diff_admitted(&request)?.to_json()
         }
         #[cfg(feature = "reasoning")]
         "reasoning.justify" => {

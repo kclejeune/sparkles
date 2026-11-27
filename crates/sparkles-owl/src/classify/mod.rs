@@ -1133,7 +1133,6 @@ pub struct Saturated {
 pub struct Classification {
     /// false when the ontology has no model; every class is then unsatisfiable
     pub consistent: bool,
-    pub taxonomy: Taxonomy,
     pub stats: Stats,
     /// whether every subsumption between named classes and every unsatisfiable class
     /// that the whole ontology entails is in the taxonomy: false when the run left an
@@ -1163,6 +1162,7 @@ pub struct Classification {
     /// [`Stats::unmapped`] counts, in the order the input gave them, and whether there are
     /// more ([`Classification::leave_out_unmapped`])
     pub unmapped: Unmapped,
+    pub taxonomy: Taxonomy,
 }
 
 /// A [`Classification`] paired with the originating run's [`Limits`] and memory admission
@@ -3456,6 +3456,16 @@ fn held_bytes_of(ax: &AxiomKind) -> usize {
     bytes
 }
 
+#[doc(hidden)]
+pub fn class_expression_heap_bytes(expression: &ClassExpression) -> usize {
+    dl_reduce::ce_retained_bytes(expression)
+}
+
+#[doc(hidden)]
+pub fn data_range_heap_bytes(range: &DataRange) -> usize {
+    dl_reduce::dr_retained_bytes(range)
+}
+
 /// The size of an owned logical axiom, including its nested allocations.
 #[doc(hidden)]
 pub fn axiom_copy_bytes(axiom: &AxiomKind) -> usize {
@@ -3653,7 +3663,7 @@ impl Classifier {
     /// passes enforce the same memory cap and pool accounting.
     pub fn classify_admitted(&mut self, limits: &Limits) -> Result<AdmittedClassification, Error> {
         let res = self.with_held(limits, |sat, held, changes, held_bytes| {
-            sat.classify_with(held, Some(changes), held_bytes, limits)
+            sat.classify_with(held, Some(changes), held_bytes, 0, limits)
         });
         self.sat.emit_adaptive_classify_outcome(
             res.as_ref().map(AdmittedClassification::classification),
@@ -3666,7 +3676,7 @@ impl Classifier {
     /// then answers for one class from the saturated contexts.
     pub fn saturate(&mut self, limits: &Limits) -> Result<Saturated, Error> {
         let res = self.with_held(limits, |sat, held, changes, held_bytes| {
-            sat.run_with(held, Some(changes), held_bytes, limits, false)
+            sat.run_with(held, Some(changes), held_bytes, 0, limits, false)
                 .map(|(consistent, _, stats)| Saturated { consistent, stats })
         });
         self.sat.emit_adaptive_saturate_outcome(&res);
@@ -3837,7 +3847,20 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         limits: &Limits,
     ) -> Result<AdmittedClassification, Error> {
-        let res = self.classify_with(axioms, changes, 0, limits);
+        self.classify_with_credit(axioms, changes, limits, 0)
+    }
+
+    /// Classify while a caller continues to back the existing saturation throughout
+    /// this run. Draw only additional credit from the run's charge callback.
+    #[doc(hidden)]
+    pub fn classify_with_credit(
+        &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        limits: &Limits,
+        reused_credit: usize,
+    ) -> Result<AdmittedClassification, Error> {
+        let res = self.classify_with(axioms, changes, 0, reused_credit, limits);
         self.emit_adaptive_classify_outcome(
             res.as_ref().map(AdmittedClassification::classification),
         );
@@ -3849,9 +3872,10 @@ impl Saturation {
         axioms: &[&AxiomKind],
         changes: Option<Changes<'_>>,
         held_bytes: usize,
+        reused_credit: usize,
         limits: &Limits,
     ) -> Result<AdmittedClassification, Error> {
-        let result = self.run_with(axioms, changes, held_bytes, limits, true);
+        let result = self.run_with(axioms, changes, held_bytes, reused_credit, limits, true);
         let partial = self.partial.take();
         let (consistent, taxonomy, stats) = result?;
         let out = Classification::new(consistent, taxonomy, stats, partial);
@@ -3878,8 +3902,20 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         limits: &Limits,
     ) -> Result<Saturated, Error> {
+        self.saturate_with_credit(axioms, changes, limits, 0)
+    }
+
+    /// Like [Self::saturate], drawing on caller-backed saturation credit.
+    #[doc(hidden)]
+    pub fn saturate_with_credit(
+        &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        limits: &Limits,
+        reused_credit: usize,
+    ) -> Result<Saturated, Error> {
         let res = self
-            .run_with(axioms, changes, 0, limits, false)
+            .run_with(axioms, changes, 0, reused_credit, limits, false)
             .map(|(consistent, _, stats)| Saturated { consistent, stats });
         self.emit_adaptive_saturate_outcome(&res);
         res
@@ -3892,6 +3928,7 @@ impl Saturation {
         axioms: &[&AxiomKind],
         changes: Option<Changes<'_>>,
         held_bytes: usize,
+        reused_credit: usize,
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
@@ -3909,18 +3946,20 @@ impl Saturation {
         // the class assertions that another one stands for add nothing (roadmap item
         // 1281), and the run reads the other axioms, whose list it holds beside the
         // caller's
-        let (kept, scratch) = match interchangeable(axioms, held_bytes, limits) {
-            Ok(k) => k,
-            Err(e) => {
-                // the caller has applied its changes, which a later run must still read
-                self.dirty = true;
-                return Err(e);
-            }
-        };
+        let (kept, scratch) =
+            match interchangeable(axioms, held_bytes.saturating_add(reused_credit), limits) {
+                Ok(k) => k,
+                Err(e) => {
+                    // the caller has applied its changes, which a later run must still read
+                    self.dirty = true;
+                    return Err(e);
+                }
+            };
         // Track exact bytes approved by the caller's pool callback across `interchangeable`,
         // retries, fallbacks, retained admission, and taxonomy build, so post-classification
         // coverage admission charges only genuine growth above the run's paid high-water mark.
-        let paid_to_caller = std::sync::Arc::new(AtomicUsize::new(scratch));
+        let paid_to_caller =
+            std::sync::Arc::new(AtomicUsize::new(reused_credit.saturating_add(scratch)));
         let tracked;
         let limits = match &limits.charge {
             Some(f) => {
@@ -3946,7 +3985,14 @@ impl Saturation {
             None => limits,
         };
         let mut r = match kept {
-            None => self.run_with_all(axioms, changes, held_bytes, limits, with_taxonomy),
+            None => self.run_with_all(
+                axioms,
+                changes,
+                held_bytes,
+                reused_credit,
+                limits,
+                with_taxonomy,
+            ),
             Some(kept) => {
                 let kept_bytes = kept.capacity() * std::mem::size_of::<&AxiomKind>();
                 // a run that reads them all counts the caller's axioms as added
@@ -3955,6 +4001,7 @@ impl Saturation {
                     &kept,
                     changes,
                     held_bytes + kept_bytes,
+                    reused_credit,
                     limits,
                     with_taxonomy,
                 );
@@ -3963,7 +4010,11 @@ impl Saturation {
             }
         };
         if let Ok((_, _, stats)) = &mut r {
-            stats.peak_memory = stats.peak_memory.max(held_bytes + scratch);
+            stats.peak_memory = stats.peak_memory.max(
+                held_bytes
+                    .saturating_add(reused_credit)
+                    .saturating_add(scratch),
+            );
             self.last_paid = if limits.charge.is_some() {
                 paid_to_caller.load(Ordering::Relaxed)
             } else {
@@ -6903,17 +6954,19 @@ impl Saturation {
     }
 
     /// [`run_with`](Saturation::run_with) over every axiom it is given.
+    #[allow(clippy::too_many_arguments)]
     fn run_with_all(
         &mut self,
         axioms: &[&AxiomKind],
         changes: Option<Changes<'_>>,
         held_bytes: usize,
+        reused_credit: usize,
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
         // what a pool admitted for a run that may fall back or start again, so that the
         // later run charges only what it needs beyond that
-        let admitted = std::sync::Arc::new(AtomicUsize::new(0));
+        let admitted = std::sync::Arc::new(AtomicUsize::new(reused_credit));
         self.reused = false;
         self.merge.clear();
         self.canon_want = None;

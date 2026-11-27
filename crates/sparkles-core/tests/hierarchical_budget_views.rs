@@ -2616,3 +2616,74 @@ fn refused_named_view_attachment_restores_the_live_only_circuit() {
     drop(version);
     assert_eq!(pool.granted(), 0);
 }
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn idle_runtime_checkpoints_return_named_and_internal_scratch() {
+    use std::sync::atomic::AtomicU64;
+
+    for internal in [false, true] {
+        let store = Store::in_memory(Default::default());
+        load_rows(&store, "checkpoint_scratch", 4_000, 256);
+        let root = tempfile::tempdir().unwrap();
+        let pool = QueryPool::new(64 * MB);
+        let runtime = Runtime::open_with_pool(
+            Some(root.path().to_path_buf()),
+            store.dataset_id(),
+            RuntimeOptions::default(),
+            Some(pool.clone()),
+        );
+        runtime.set_host(Arc::new(OpenHost));
+        let query = "SELECT DISTINCT ?s ?o WHERE { ?s <urn:p> ?o }";
+        let handle = if internal {
+            Some(
+                runtime
+                    .attach_internal(
+                        &store,
+                        InternalSpec::rows("items", query),
+                        InternalAccess::everything(),
+                    )
+                    .unwrap(),
+            )
+        } else {
+            runtime.put(&store, "items", ViewDef::table(query)).unwrap();
+            runtime.round(&store);
+            None
+        };
+        let before = pool.granted();
+        let peak = Arc::new(AtomicU64::new(0));
+        let stage = if internal {
+            "internal-checkpoint-written"
+        } else {
+            "view-checkpoint-written"
+        };
+        store.set_failpoint(
+            stage,
+            Some(Arc::new(|_| panic!("injected checkpoint unwind"))),
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.checkpoint(&store);
+        }));
+        assert!(caught.is_err());
+        assert!(pool.granted() <= before + sparkles_budget::LIVE_STEP);
+        store.set_failpoint(
+            stage,
+            Some(Arc::new({
+                let pool = pool.clone();
+                let peak = peak.clone();
+                move |_| peak.store(pool.granted(), Ordering::Relaxed)
+            })),
+        );
+        runtime.checkpoint(&store);
+        assert!(
+            peak.load(Ordering::Relaxed) > before + MB,
+            "checkpoint should use substantial scratch"
+        );
+        assert!(
+            pool.granted() <= before + sparkles_budget::LIVE_STEP,
+            "checkpoint retained scratch (internal={internal})"
+        );
+        store.set_failpoint(stage, None);
+        drop(handle);
+    }
+}

@@ -515,6 +515,10 @@ impl LiveCredit {
         }
     }
 
+    pub fn parent(&self) -> ParentHandle {
+        self.lease.parent.clone()
+    }
+
     pub fn live(&self) -> u64 {
         self.live
     }

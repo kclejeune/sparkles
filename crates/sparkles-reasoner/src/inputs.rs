@@ -1649,6 +1649,31 @@ pub struct Fetched {
     pub warnings: Vec<String>,
 }
 
+fn push_fetch_warning(
+    out: &mut Fetched,
+    held: &mut Held,
+    warning: std::fmt::Arguments<'_>,
+) -> anyhow::Result<()> {
+    use std::fmt::Write;
+    #[derive(Default)]
+    struct Len(usize);
+    impl Write for Len {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 = self.0.saturating_add(s.len());
+            Ok(())
+        }
+    }
+    let mut len = Len::default();
+    len.write_fmt(warning)?;
+    // The facade copies the report once into the persisted record.
+    held.try_grow(len.0.saturating_mul(2).saturating_add(128))
+        .map_err(|e| crate::query::memory_error(e, "keeping import warnings"))?;
+    let mut text = String::with_capacity(len.0);
+    text.write_fmt(warning)?;
+    out.warnings.push(text);
+    Ok(())
+}
+
 /// Whether a location is a document `LOAD` can read.
 fn fetchable(location: &str) -> bool {
     ["http://", "https://", "file:"]
@@ -1671,13 +1696,46 @@ pub fn fetch_imports(
     refresh: &[String],
     opts: &sparkles_core::sparql::QueryOptions,
 ) -> anyhow::Result<Fetched> {
+    fetch_imports_admitted(store, inputs, refresh, opts).map(|(fetched, _)| fetched)
+}
+
+/// Live credit for the strings in a fetch report.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FetchMemory(Held);
+
+impl FetchMemory {
+    pub fn bytes(&self) -> usize {
+        self.0.bytes()
+    }
+}
+
+/// Fetch imports and return the report's credit separately so a caller can
+/// transfer the strings into a larger report while preserving their credit.
+#[doc(hidden)]
+pub fn fetch_imports_admitted(
+    store: &Store,
+    inputs: &Inputs,
+    refresh: &[String],
+    opts: &sparkles_core::sparql::QueryOptions,
+) -> anyhow::Result<(Fetched, FetchMemory)> {
+    let parent = opts
+        .grant
+        .as_ref()
+        .map(|grant| grant.memory_parent())
+        .or_else(|| opts.pool.as_ref().map(|pool| pool.work_parent()));
+    let budget = Budget::with_parent(opts.max_memory_bytes.map(|bytes| bytes as usize), parent);
+    let mut report = Held::new(&budget);
     let mut out = Fetched::default();
     if inputs.imports != ImportMode::Fetch {
         if !refresh.is_empty() {
-            out.warnings
-                .push("imports are fetched only with imports: fetch; nothing was refreshed".into());
+            push_fetch_warning(
+                &mut out,
+                &mut report,
+                format_args!("imports are fetched only with imports: fetch; nothing was refreshed"),
+            )?;
         }
-        return Ok(out);
+        return Ok((out, FetchMemory(report)));
     }
     let mut opts = opts.clone();
     opts.outbound_budget = Some(sparkles_core::outbound::RequestBudget::new(&opts.outbound));
@@ -1704,12 +1762,6 @@ pub fn fetch_imports(
         }
         Ok(())
     };
-    let parent = opts
-        .grant
-        .as_ref()
-        .map(|grant| grant.memory_parent())
-        .or_else(|| opts.pool.as_ref().map(|pool| pool.work_parent()));
-    let budget = Budget::with_parent(opts.max_memory_bytes.map(|bytes| bytes as usize), parent);
     let mut held = Held::new(&budget);
     let mut attempted: BTreeSet<String> = BTreeSet::new();
     // `Ok(true)`: a new attempt (whatever its outcome)
@@ -1726,9 +1778,11 @@ pub fn fetch_imports(
         )
         .map_err(|e| crate::query::memory_error(e, "staging an import load"))?;
         if !fetchable(location) || oxrdf::NamedNode::new(location).is_err() {
-            out.warnings.push(format!(
-                "owl:imports <{iri}>: <{location}> is not an http, https or file URL"
-            ));
+            push_fetch_warning(
+                out,
+                &mut report,
+                format_args!("owl:imports <{iri}>: <{location}> is not an http, https or file URL"),
+            )?;
             return Ok(true);
         }
         let u = if replace {
@@ -1743,6 +1797,9 @@ pub fn fetch_imports(
         match sparkles_core::sparql::update::update(store, &u, &load_opts) {
             Ok(_) => {
                 tracing::info!(import = iri, location, "fetched an import");
+                report
+                    .try_grow(iri.len() + 128)
+                    .map_err(|e| crate::query::memory_error(e, "keeping fetched imports"))?;
                 out.fetched.push(iri.to_string());
                 Ok(true)
             }
@@ -1753,8 +1810,11 @@ pub fn fetch_imports(
                 | sparkles_core::Error::Cancelled),
             ) => Err(anyhow::Error::new(e).context(format!("fetching owl:imports <{iri}>"))),
             Err(e) => {
-                out.warnings
-                    .push(format!("owl:imports <{iri}> could not be fetched: {e}"));
+                push_fetch_warning(
+                    out,
+                    &mut report,
+                    format_args!("owl:imports <{iri}> could not be fetched: {e}"),
+                )?;
                 Ok(true)
             }
         }
@@ -1808,7 +1868,7 @@ pub fn fetch_imports(
             )?;
         }
         if !tried {
-            return Ok(out);
+            return Ok((out, FetchMemory(report)));
         }
     }
 }

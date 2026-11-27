@@ -968,6 +968,22 @@ impl Store {
         o: &DiffOptions,
         admission: Option<DiffAdmission<'_>>,
     ) -> Result<Option<Vec<IdChange>>> {
+        self.changed_ids_metered(after, to, graphs, o, admission, &|_| {})
+    }
+
+    /// Read changed IDs with admission for simultaneous allocations and return
+    /// temporary table credit as each backing is freed. The caller owns the
+    /// remaining vector credit and releases it on error or after consuming the result.
+    #[doc(hidden)]
+    pub fn changed_ids_metered(
+        &self,
+        after: u64,
+        to: &Snapshot,
+        graphs: &[Id],
+        o: &DiffOptions,
+        admission: Option<DiffAdmission<'_>>,
+        release: &dyn Fn(u64),
+    ) -> Result<Option<Vec<IdChange>>> {
         if self.history.is_none() || after > to.commit {
             return Ok(None);
         }
@@ -1003,15 +1019,28 @@ impl Store {
         }
         let mut net: FxHashMap<[Id; 4], bool> = FxHashMap::default();
         let mut table_bytes = 0;
+        let mut table_capacity = 0;
         walk_wal(&mut cursor, after, to.commit, o, &mut |op, q| {
             if !graphs.contains(&q[3]) || net.remove(&q).is_some() {
                 return Ok(());
             }
-            if let Some(admit) = admission {
-                use sparkles_budget::sizes::{table_bytes_for, table_capacity};
-                let needed = table_bytes_for::<IdChange>(table_capacity(net.len() + 1));
-                if needed > table_bytes {
-                    admit((needed - table_bytes) as u64)?;
+            if let Some(admit) = admission
+                && net.len() == net.capacity()
+            {
+                use sparkles_budget::sizes::{table_bytes_for, table_grown};
+                let wanted = net.len() + 1;
+                // Hashbrown clears tombstones in place when the live entries plus
+                // this insert fit in half the allocated table.
+                if wanted <= table_capacity / 2 {
+                    net.reserve(1);
+                } else {
+                    let capacity = table_grown(table_capacity, net.len(), 1);
+                    let needed = table_bytes_for::<IdChange>(capacity);
+                    admit(needed as u64)?;
+                    net.reserve(1);
+                    debug_assert_eq!(net.capacity(), capacity);
+                    release(table_bytes as u64);
+                    table_capacity = capacity;
                     table_bytes = needed;
                 }
             }
@@ -1027,6 +1056,7 @@ impl Store {
         }
         let mut changes = Vec::with_capacity(net.len());
         changes.extend(net);
+        release(table_bytes as u64);
         changes.sort_unstable_by_key(|(q, added)| (*added, [q[3].0, q[0].0, q[1].0, q[2].0]));
         Ok(Some(changes))
     }

@@ -143,6 +143,15 @@ impl Reasoning {
         crate::reasoning::diff::diff(&self.ds, request)
     }
 
+    /// Compare selected states with an owner that retains the output memory credit.
+    #[cfg(feature = "reasoning")]
+    pub fn diff_admitted(
+        &self,
+        request: &crate::reasoning::diff::DiffRequest,
+    ) -> Result<crate::reasoning::diff::AdmittedEntailmentDiff> {
+        crate::reasoning::diff::diff_admitted(&self.ds, request)
+    }
+
     /// Compute an entailment delta over the actual complete states of a write preview.
     #[cfg(feature = "reasoning")]
     pub fn diff_preview(
@@ -151,6 +160,16 @@ impl Reasoning {
         request: &crate::reasoning::diff::DiffRequest,
     ) -> Result<crate::reasoning::diff::EntailmentDiff> {
         crate::reasoning::diff::preview(&self.ds, preview, request)
+    }
+
+    /// Compare preview states with an owner that retains the output memory credit.
+    #[cfg(feature = "reasoning")]
+    pub fn diff_preview_admitted(
+        &self,
+        preview: &crate::preview::Preview,
+        request: &crate::reasoning::diff::DiffRequest,
+    ) -> Result<crate::reasoning::diff::AdmittedEntailmentDiff> {
+        crate::reasoning::diff::preview_admitted(&self.ds, preview, request)
     }
 
     /// Find minimal asserted supports for a diagnostic finding or an unsatisfiable class.

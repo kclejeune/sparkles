@@ -94,6 +94,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         .unwrap_or_default();
     let mut fetched = fetched_before.clone();
     let mut fetch_warnings = Vec::new();
+    let mut fetch_memory = None;
     if req.inputs.imports == ImportMode::Fetch || req.refresh_imports {
         ctl.progress.report(0.02, "fetching imports");
         let mut qopts = req.load.clone();
@@ -113,8 +114,10 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         } else {
             Vec::new()
         };
-        let f = sparkles_reasoner::fetch_imports(store, &req.inputs, &refresh, &qopts)
-            .map_err(|e| from_anyhow(e.context("fetching imports")))?;
+        let (f, memory) =
+            sparkles_reasoner::inputs::fetch_imports_admitted(store, &req.inputs, &refresh, &qopts)
+                .map_err(|e| from_anyhow(e.context("fetching imports")))?;
+        fetch_memory = Some(memory);
         fetched.extend(f.fetched);
         fetch_warnings = f.warnings;
     }
@@ -134,7 +137,9 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         cancel: Some(cancel),
         inputs: req.inputs.clone(),
         threads: req.threads,
-        max_memory: req.max_memory,
+        max_memory: req.max_memory.map(|limit| {
+            limit.saturating_sub(fetch_memory.as_ref().map_or(0, |memory| memory.bytes()))
+        }),
         memory_parent: state.pool.as_ref().map(|p| p.work_parent()),
         max_inferred: req
             .max_inferred

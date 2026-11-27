@@ -1172,16 +1172,24 @@ impl Circuit {
     }
 
     pub(crate) fn set_version_pool(&mut self, pool: Option<Arc<AtomicU64>>) -> Result<()> {
-        if pool.is_none() {
-            self.version_pool = None;
-            self.version = None;
-            self.publication_installed();
-            self.budget.abort_pass(self.accounted_bytes());
-            return Ok(());
+        if let Some(pool) = pool {
+            return self.attach_version_pool(pool, || Ok(()));
         }
+        self.version_pool = None;
+        self.version = None;
+        self.publication_installed();
+        self.budget.abort_pass(self.accounted_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn attach_version_pool(
+        &mut self,
+        pool: Arc<AtomicU64>,
+        persist: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         // A live-only circuit already has a version, so preserve it if new publication
         // admission fails when the first named view attaches.
-        let old_pool = std::mem::replace(&mut self.version_pool, pool);
+        let old_pool = self.version_pool.replace(pool);
         let old_bytes = self.version_bytes();
         let old_version = self.version.take();
         self.publication_installed();
@@ -1200,7 +1208,10 @@ impl Circuit {
                 self.publication_installed();
             })
         })();
-        if let Err(error) = publish.and_then(|()| self.budget.commit_pass(self.accounted_bytes())) {
+        let committed = publish
+            .and_then(|()| self.budget.commit_pass(self.accounted_bytes()))
+            .and_then(|()| persist());
+        if let Err(error) = committed {
             self.version_pool = old_pool;
             self.version = old_version;
             self.publication_installed();

@@ -165,7 +165,7 @@ impl Tools<'_> {
         let result = dataset
             .dataset
             .reasoning()
-            .diff(&request)
+            .diff_admitted(&request)
             .map_err(|error| {
                 self.ctx(&[], request.analysis.timeout.unwrap().as_secs_f64())
                     .engine(error)

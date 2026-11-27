@@ -560,17 +560,14 @@ impl Runtime {
         let mut detached = DeferredDrops::default();
         {
             let mut reg = self.reg.lock();
-            let mut seen = rustc_hash::FxHashSet::default();
-            let mut state: u64 = reg
-                .views
-                .values()
-                .filter_map(|e| e.cell.as_ref())
-                .filter(|cell| seen.insert(cell.key))
-                .map(|cell| {
+            let mut contributions = FxHashMap::default();
+            for cell in reg.views.values().filter_map(|entry| entry.cell.as_ref()) {
+                contributions.entry(cell.key).or_insert_with(|| {
                     let info = cell.info.lock();
                     info.bytes.saturating_sub(info.published_bytes)
-                })
-                .sum();
+                });
+            }
+            let mut state: u64 = contributions.values().sum();
             let pool = self.opts.read().views_memory;
             for (cell, bytes) in cells {
                 let total = state.saturating_add(self.published_views.load(Ordering::Relaxed));
@@ -598,9 +595,7 @@ impl Runtime {
                     e.suspended = Some(why);
                     if let Some(c) = e.cell.take() {
                         if c.release_view(&n, &mut detached.retired) == 0 {
-                            let info = c.info.lock();
-                            state = state
-                                .saturating_sub(info.bytes.saturating_sub(info.published_bytes));
+                            state = state.saturating_sub(contributions.remove(&c.key).unwrap_or(0));
                         }
                         detached.cells.push(c);
                     }
@@ -640,6 +635,7 @@ impl Runtime {
 
     /// Checkpoint every view whose state moved since its last checkpoint.
     pub fn checkpoint(&self, store: &Store) {
+        let _operation = Operation::enter();
         let Some(root) = self.root.clone() else {
             return;
         };
@@ -667,6 +663,7 @@ impl Runtime {
             let Some(snap) = st.circuit.snap.clone() else {
                 continue;
             };
+            let credit = CheckpointCredit(&st.circuit);
             let kind = persist::view_kind(st.circuit.has_fixpoint());
             let r = st.circuit.encode_charged(&snap).and_then(|(body, _lease)| {
                 persist::write_as(
@@ -681,6 +678,7 @@ impl Runtime {
                     || store.failpoint("view-checkpoint-written"),
                 )
             });
+            drop(credit);
             drop(st);
             match r {
                 Ok(()) => {
@@ -696,5 +694,99 @@ impl Runtime {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_regressions {
+    use super::*;
+
+    #[test]
+    fn suspension_subtracts_the_original_mutable_contribution() {
+        let store = Store::in_memory(Default::default());
+        let runtime = Runtime::open(None, store.dataset_id(), RuntimeOptions::default());
+        runtime.set_host(Arc::new(OpenHost));
+        let large = format!(
+            r#"SELECT ?key WHERE {{ BIND(UCASE("{}") AS ?key) }}"#,
+            "a".repeat(128 << 10)
+        );
+        for (name, query) in [
+            ("first", large.as_str()),
+            ("second", "SELECT ?x WHERE { BIND(1 AS ?x) }"),
+        ] {
+            runtime.put(&store, name, ViewDef::table(query)).unwrap();
+        }
+        assert!(runtime.round(&store));
+        let cell = |name: &str| runtime.reg.lock().views[name].cell.clone().unwrap();
+        let first = cell("first");
+        let second = cell("second");
+        let pinned = first.state.lock().circuit.version.clone().unwrap();
+        let first_bytes = first.info.lock().bytes;
+        let (second_bytes, second_published) = {
+            let info = second.info.lock();
+            (info.bytes, info.published_bytes)
+        };
+        let publications = runtime.published_views.load(Ordering::Relaxed);
+        assert!(publications > 128 << 10);
+        runtime.set_options(RuntimeOptions {
+            views_memory: Some(second_bytes - second_published + publications - 1),
+            ..runtime.options()
+        });
+        runtime.budgets(&[(first, first_bytes), (second, second_bytes)]);
+        for name in ["first", "second"] {
+            assert!(
+                matches!(
+                    runtime.get(&store, name).unwrap().state,
+                    ViewState::Suspended { .. }
+                ),
+                "{name}"
+            );
+        }
+        drop(pinned);
+    }
+
+    #[test]
+    fn a_failed_definition_write_keeps_the_previous_limit_and_pending_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::in_memory(Default::default());
+        let runtime = Runtime::open(
+            Some(root.path().to_path_buf()),
+            store.dataset_id(),
+            RuntimeOptions::default(),
+        );
+        runtime.set_host(Arc::new(OpenHost));
+        let query = "SELECT ?s WHERE { ?s <urn:p> ?o }";
+        let def = ViewDef::table(query);
+        runtime.put(&store, "items", def.clone()).unwrap();
+        runtime.round(&store);
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:new> <urn:p> 1 }",
+            &Default::default(),
+        )
+        .unwrap();
+        let cell = runtime.reg.lock().views["items"].cell.clone().unwrap();
+        let path = views::dir(root.path(), "items").join("view.json");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        store.set_failpoint(
+            "view-definition-writing",
+            Some(Arc::new(move |_| {
+                // A round that already copied this cell cannot observe a staged limit.
+                assert!(cell.state.try_lock().is_none());
+            })),
+        );
+        let mut replacement = def.clone();
+        replacement.memory_bytes = 1;
+        assert!(runtime.put(&store, "items", replacement).is_err());
+        store.set_failpoint("view-definition-writing", None);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(path, original).unwrap();
+        assert!(runtime.round(&store));
+        let after = runtime.get(&store, "items").unwrap();
+        assert_eq!(after.definition.memory_bytes, def.memory_bytes);
+        assert_eq!(after.rows, 1);
+        assert!(matches!(after.state, ViewState::Current));
     }
 }

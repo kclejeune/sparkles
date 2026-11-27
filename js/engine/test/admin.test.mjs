@@ -1273,6 +1273,8 @@ async function budgetAnswers(t, inconsistent) {
     await ds.update(whole.body);
     let r;
     try {
+      // The cap comes from the classifier peak. Prepare the ontology first.
+      await ds.ontology.summary();
       r = await ds.ontology.classify({
         partial: true,
         threads: 1,
@@ -1280,7 +1282,7 @@ async function budgetAnswers(t, inconsistent) {
         maxMemoryBytes: Math.floor((estimate * k) / 20),
       });
     } catch (e) {
-      // a budget under the size of the ontology and its index refuses the run
+      // A budget under the size of the classifier's index refuses the run.
       if (e instanceof BudgetExceededError) continue;
       throw e;
     } finally {

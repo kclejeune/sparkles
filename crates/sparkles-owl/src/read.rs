@@ -441,17 +441,9 @@ pub struct Ontology {
     /// ontology nodes, which are never anonymous individuals
     pub reification_nodes: FxHashSet<BlankNode>,
     pub ontology_nodes: FxHashSet<NamedOrBlankNode>,
-    memory: Option<std::sync::Arc<sparkles_budget::MemoryLease>>,
 }
 
 impl Ontology {
-    /// Keep decoding credit with the shared ontology, including when the caller
-    /// takes just this part of an opened ontology.
-    #[doc(hidden)]
-    pub fn keep_memory(&mut self, memory: Option<std::sync::Arc<sparkles_budget::MemoryLease>>) {
-        self.memory = memory;
-    }
-
     /// The ontology of axioms that a structural syntax gives, as the functional-style
     /// syntax does, read as one graph: the header in graph 0, each axiom once with an
     /// origin that names no triple, and the declared typing. A read of the same axioms
@@ -702,6 +694,29 @@ pub(crate) fn read_scoped(
     opts: ReadOptions,
     scope: Scope,
 ) -> Ontology {
+    read_inner(triples, graph_of, primary, opts, scope, None).expect("unlimited read")
+}
+
+/// Read RDF with an admission callback for parser allocations. A false return
+/// stops allocation and discards the partial parse.
+pub fn read_admitted(
+    triples: Vec<Triple>,
+    graph_of: Vec<u32>,
+    primary: &[u32],
+    opts: ReadOptions,
+    admit: &dyn Fn(usize) -> bool,
+) -> Option<Ontology> {
+    read_inner(triples, graph_of, primary, opts, Scope::All, Some(admit))
+}
+
+fn read_inner(
+    triples: Vec<Triple>,
+    graph_of: Vec<u32>,
+    primary: &[u32],
+    opts: ReadOptions,
+    scope: Scope,
+    admit: Option<&dyn Fn(usize) -> bool>,
+) -> Option<Ontology> {
     assert_eq!(triples.len(), graph_of.len());
     let (triples, graph_of) = if scope == Scope::Terminology {
         // a triple and its copy in another graph are one statement of the terminology,
@@ -715,8 +730,24 @@ pub(crate) fn read_scoped(
     } else {
         (triples, graph_of)
     };
-    let mut p = Parser::new(&triples, &graph_of, opts, scope);
+    // The indexes, typing, diagnostics and flat axiom/origin inventory each
+    // scale with the RDF input. Structural expansion is charged as it happens.
+    if let Some(admit) = admit {
+        for group in triples.chunks(256) {
+            let bytes = group
+                .iter()
+                .map(|triple| 1024 + triple_payload(triple).saturating_mul(8))
+                .sum();
+            if !admit(bytes) {
+                return None;
+            }
+        }
+    }
+    let mut p = Parser::new(&triples, &graph_of, opts, scope, admit);
     p.run(primary);
+    if p.refused.get() {
+        return None;
+    }
     let Parser {
         axioms,
         used,
@@ -743,7 +774,7 @@ pub(crate) fn read_scoped(
         Some((g, h)) => (Some(g), h),
         None => (None, Header::default()),
     };
-    Ontology {
+    Some(Ontology {
         header,
         header_graph,
         other_headers: others,
@@ -759,8 +790,7 @@ pub(crate) fn read_scoped(
         terminology_only: opts.terminology_only,
         reification_nodes: rind,
         ontology_nodes: onodes,
-        memory: None,
-    }
+    })
 }
 
 /// Read the triples of one graph.
@@ -789,6 +819,40 @@ struct Parsed<T> {
     triples: Vec<usize>,
 }
 
+fn term_payload(mut term: &Term) -> usize {
+    let mut nested = 0usize;
+    loop {
+        let bytes = match term {
+            Term::NamedNode(iri) => iri.as_str().len(),
+            Term::BlankNode(node) => node.as_str().len(),
+            Term::Literal(lit) => {
+                lit.value().len()
+                    + lit.datatype().as_str().len()
+                    + lit.language().map_or(0, str::len)
+            }
+            Term::Triple(triple) => {
+                nested = nested.saturating_add(size_of::<Triple>() + triple_head_payload(triple));
+                term = &triple.object;
+                continue;
+            }
+        };
+        return nested.saturating_add(bytes);
+    }
+}
+
+fn triple_head_payload(triple: &Triple) -> usize {
+    let subject = match &triple.subject {
+        NamedOrBlankNode::NamedNode(iri) => iri.as_str(),
+        NamedOrBlankNode::BlankNode(node) => node.as_str(),
+    };
+    subject.len() + triple.predicate.as_str().len()
+}
+
+#[doc(hidden)]
+pub fn triple_payload(triple: &Triple) -> usize {
+    triple_head_payload(triple) + term_payload(&triple.object)
+}
+
 type Key = NamedOrBlankNode;
 
 fn key_of(t: &Term) -> Option<Key> {
@@ -808,6 +872,8 @@ fn term_of(k: &Key) -> Term {
 
 struct Parser<'a> {
     t: &'a [Triple],
+    admission: Option<&'a dyn Fn(usize) -> bool>,
+    refused: std::cell::Cell<bool>,
     g: &'a [u32],
     opts: ReadOptions,
     strict: bool,
@@ -856,7 +922,13 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(t: &'a [Triple], g: &'a [u32], opts: ReadOptions, scope: Scope) -> Parser<'a> {
+    fn new(
+        t: &'a [Triple],
+        g: &'a [u32],
+        opts: ReadOptions,
+        scope: Scope,
+        admission: Option<&'a dyn Fn(usize) -> bool>,
+    ) -> Parser<'a> {
         let mut by_s: FxHashMap<Key, Vec<usize>> = FxHashMap::default();
         let mut by_p: FxHashMap<&'a str, Vec<usize>> = FxHashMap::default();
         let mut refs: FxHashMap<BlankNode, Vec<usize>> = FxHashMap::default();
@@ -874,6 +946,8 @@ impl<'a> Parser<'a> {
         }
         Parser {
             t,
+            admission,
+            refused: std::cell::Cell::new(false),
             g,
             opts,
             strict: opts.mode == Mode::Strict,
@@ -909,6 +983,15 @@ impl<'a> Parser<'a> {
             reach: Vec::new(),
             accounted: Vec::new(),
         }
+    }
+
+    fn admit(&self, bytes: usize) -> bool {
+        if self.refused.get() {
+            return false;
+        }
+        let ok = self.admission.is_none_or(|admit| admit(bytes));
+        self.refused.set(!ok);
+        ok
     }
 
     fn diag(
@@ -1063,14 +1146,32 @@ impl<'a> Parser<'a> {
         self.declarations();
         if !self.strict {
             self.infer();
+            if self.refused.get() {
+                return;
+            }
         }
         self.reification_nodes();
         self.annotations();
         self.annotated_axioms();
+        if self.refused.get() {
+            return;
+        }
         self.blank_axioms();
+        if self.refused.get() {
+            return;
+        }
         self.plain_axioms();
+        if self.refused.get() {
+            return;
+        }
         self.annotation_assertions();
+        if self.refused.get() {
+            return;
+        }
         self.header_annotations();
+        if self.refused.get() {
+            return;
+        }
         if self.terms {
             let lost: Vec<usize> = (0..self.t.len())
                 .filter(|i| self.roots[*i] && !self.accounted[*i])
@@ -1477,12 +1578,18 @@ impl<'a> Parser<'a> {
         let mut cur = head.clone();
         let mut seen = FxHashSet::default();
         while let Term::BlankNode(b) = &cur {
+            if !self.admit(128 + b.as_str().len() * 4) {
+                break;
+            }
             if !seen.insert(b.clone()) {
                 break;
             }
             let k: Key = b.clone().into();
             match (self.one(&k, v::RDF_FIRST), self.one(&k, v::RDF_REST)) {
                 (Some((_, f)), Some((_, r))) => {
+                    if !self.admit(term_payload(f) + term_payload(r)) {
+                        break;
+                    }
                     out.push(f.clone());
                     cur = r.clone();
                 }
@@ -1752,6 +1859,9 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let tr = &self.t[i];
+            if !self.admit(512 + triple_payload(tr).saturating_mul(4)) {
+                break;
+            }
             let Some(value) = annotation_value(&tr.object) else {
                 continue;
             };
@@ -1761,7 +1871,11 @@ impl<'a> Parser<'a> {
                 tr.predicate.as_str().to_string(),
                 tr.object.clone(),
             );
-            let ws = self.ann_nodes.get(&key).cloned().unwrap_or_default();
+            let ws = self
+                .ann_nodes
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             if ws.is_empty() {
                 out.push(Parsed {
                     value: Annotation::new(property.clone(), value.clone()),
@@ -1769,6 +1883,9 @@ impl<'a> Parser<'a> {
                 });
             }
             for w in ws {
+                if !self.admit(512 + triple_payload(tr).saturating_mul(2)) {
+                    break;
+                }
                 let wk: Key = w.clone().into();
                 let mut triples = vec![i];
                 for p in [
@@ -1842,6 +1959,9 @@ impl<'a> Parser<'a> {
             match &cur {
                 Term::NamedNode(n) if n.as_str() == v::RDF_NIL => break,
                 Term::BlankNode(b) => {
+                    if !self.admit(256 + b.as_str().len().saturating_mul(4)) {
+                        return None;
+                    }
                     if !seen.insert(b.clone()) {
                         return None;
                     }
@@ -1864,6 +1984,9 @@ impl<'a> Parser<'a> {
                     let k: Key = b.clone().into();
                     let (fi, f) = self.one(&k, v::RDF_FIRST)?;
                     let (ri, r) = self.one(&k, v::RDF_REST)?;
+                    if !self.admit(term_payload(f).saturating_mul(4) + term_payload(r)) {
+                        return None;
+                    }
                     triples.push(fi);
                     triples.push(ri);
                     items.push(f.clone());
@@ -1946,6 +2069,9 @@ impl<'a> Parser<'a> {
     }
 
     fn data_range(&mut self, t: &Term) -> Option<Parsed<DataRange>> {
+        if self.refused.get() {
+            return None;
+        }
         match t {
             Term::NamedNode(n) if self.typing.is(n.as_str(), EntityKind::Datatype) => {
                 Some(Parsed {
@@ -1955,6 +2081,16 @@ impl<'a> Parser<'a> {
             }
             Term::BlankNode(b) => {
                 if let Some(m) = self.dr_memo.get(b) {
+                    if let Some(parsed) = m
+                        && self.admission.is_some()
+                        && !self.admit(
+                            crate::classify::data_range_heap_bytes(&parsed.value)
+                                + parsed.triples.len() * size_of::<usize>()
+                                + 128,
+                        )
+                    {
+                        return None;
+                    }
                     let m = m.clone();
                     return self.reuse(b, Grammar::Data, m);
                 }
@@ -1965,6 +2101,16 @@ impl<'a> Parser<'a> {
                     None
                 };
                 if self.leave(b, Grammar::Data, failures, r.is_some()) {
+                    if let Some(parsed) = &r
+                        && self.admission.is_some()
+                        && !self.admit(
+                            crate::classify::data_range_heap_bytes(&parsed.value)
+                                + parsed.triples.len() * size_of::<usize>()
+                                + 128,
+                        )
+                    {
+                        return None;
+                    }
                     self.dr_memo.insert(b.clone(), r.clone());
                 }
                 r
@@ -2093,6 +2239,9 @@ impl<'a> Parser<'a> {
     }
 
     fn class_expression(&mut self, t: &Term) -> Option<Parsed<ClassExpression>> {
+        if self.refused.get() {
+            return None;
+        }
         match t {
             Term::NamedNode(n) if self.typing.is(n.as_str(), EntityKind::Class) => Some(Parsed {
                 value: ClassExpression::Class(Class(n.clone())),
@@ -2100,6 +2249,16 @@ impl<'a> Parser<'a> {
             }),
             Term::BlankNode(b) => {
                 if let Some(m) = self.ce_memo.get(b) {
+                    if let Some(parsed) = m
+                        && self.admission.is_some()
+                        && !self.admit(
+                            crate::classify::class_expression_heap_bytes(&parsed.value)
+                                + parsed.triples.len() * size_of::<usize>()
+                                + 128,
+                        )
+                    {
+                        return None;
+                    }
                     let m = m.clone();
                     return self.reuse(b, Grammar::Class, m);
                 }
@@ -2110,6 +2269,16 @@ impl<'a> Parser<'a> {
                     None
                 };
                 if self.leave(b, Grammar::Class, failures, r.is_some()) {
+                    if let Some(parsed) = &r
+                        && self.admission.is_some()
+                        && !self.admit(
+                            crate::classify::class_expression_heap_bytes(&parsed.value)
+                                + parsed.triples.len() * size_of::<usize>()
+                                + 128,
+                        )
+                    {
+                        return None;
+                    }
                     self.ce_memo.insert(b.clone(), r.clone());
                 }
                 r
@@ -2422,6 +2591,9 @@ impl<'a> Parser<'a> {
     /// The axiom whose main triple is `i` (Tables 16 and 18), with the triples of its
     /// expressions and side triples.
     fn axiom_of_main(&mut self, i: usize, annotated: bool) -> Option<(AxiomKind, Vec<usize>)> {
+        if self.refused.get() {
+            return None;
+        }
         let tr = &self.t[i];
         let s = term_of(&tr.subject);
         let o = tr.object.clone();
@@ -3028,6 +3200,9 @@ impl<'a> Parser<'a> {
     /// Table 16 for the triples left.
     fn plain_axioms(&mut self) {
         for i in 0..self.t.len() {
+            if self.refused.get() {
+                return;
+            }
             if self.used[i] {
                 continue;
             }

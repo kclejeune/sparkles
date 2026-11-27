@@ -41,7 +41,7 @@
 //! # Ok::<_, sparkles::Error>(())
 //! ```
 
-use super::classify::{admit, logical_axioms, saturate};
+use super::classify::{Working, admit, logical_axioms, saturate, working};
 use super::{Ontologies, OntologyRequest, Opened, check};
 use crate::Dataset;
 use crate::error::{Error, Result};
@@ -53,6 +53,8 @@ use sparkles_owl::classify::{Changes, Description, Excluded, Gap, Saturation};
 use sparkles_owl::manchester::{self, Parsed, Vocabulary, What};
 use sparkles_owl::profiles::{self, Profile};
 use sparkles_owl::{Axiom, AxiomKind, Class, ClassExpression, EntityKind, Individual, write};
+use std::collections::BTreeSet;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -256,7 +258,6 @@ pub struct DlReasoningUsed {
 /// The answer of a DL query. Each list the query asked for is `Some`, sorted by IRI.
 #[derive(Clone)]
 pub struct DlQueryAnswer {
-    pub opened: Opened,
     pub expression: ClassExpression,
     pub reasoning: DlReasoningUsed,
     /// false when the expression is unsatisfiable; `None` when the reasoning cannot tell
@@ -274,7 +275,7 @@ pub struct DlQueryAnswer {
     /// again only what the query reaches
     pub incremental: bool,
     pub elapsed: Duration,
-    _memory: Option<Arc<crate::reasoning::memory::Memory>>,
+    pub opened: Opened,
 }
 
 /// The query's defining axiom.
@@ -436,7 +437,7 @@ impl Ontologies {
     ) -> Result<DlQueryAnswer> {
         let start = Instant::now();
         let defaults = self.ds.with_query_defaults(opts);
-        let opts = &defaults;
+        let opts = defaults.as_ref();
         if req.inferences {
             return Err(Error::invalid(
                 "a DL query reasons over the asserted axioms: leave out 'inferences'",
@@ -447,7 +448,13 @@ impl Ontologies {
                 "the ontology uses <{QUERY_CLASS}>, the class a DL query defines"
             )));
         }
+        let mut preparation = crate::reasoning::memory::Memory::query_after(opts, o.request_bytes);
+        let expression_bytes =
+            sparkles_owl::classify::class_expression_heap_bytes(&q.expression) as u64;
+        let defining_bytes = 1024 + expression_bytes;
+        preparation.grow(defining_bytes)?;
         let ax = defining(&q.expression);
+        preparation.grow(profile_scratch(&ax))?;
         let expression_el = profiles::axiom_violations(&ax, Profile::El);
         if q.el_only && q.reasoning == DlReasoning::Rl {
             return Err(Error::invalid(
@@ -499,12 +506,15 @@ impl Ontologies {
                         format!("the expression is outside OWL 2 EL ({rule}: {message})"),
                     )
                 } else {
-                    let outside = o
-                        .ontology
-                        .axiom_set()
-                        .filter(|a| logical(&a.kind))
-                        .filter(|a| !profiles::axiom_violations(a, Profile::El).is_empty())
-                        .count();
+                    let mut outside = 0;
+                    for axiom in o.ontology.axiom_set().filter(|axiom| logical(&axiom.kind)) {
+                        check(opts)?;
+                        let base = preparation.bytes();
+                        preparation.grow(profile_scratch(axiom))?;
+                        outside +=
+                            usize::from(!profiles::axiom_violations(axiom, Profile::El).is_empty());
+                        preparation.shrink_to(base);
+                    }
                     if outside > 0 {
                         (
                             DlEngine::Rl,
@@ -523,9 +533,17 @@ impl Ontologies {
                 }
             }
         };
+        drop(expression_el);
+        preparation.shrink_to(defining_bytes);
+        let opts = QueryOptions {
+            max_memory_bytes: opts
+                .max_memory_bytes
+                .map(|limit| limit.saturating_sub(defining_bytes)),
+            ..opts.clone()
+        };
         let mut a = match engine {
-            DlEngine::El => self.el(&o, req, q, &ax, why, opts)?,
-            DlEngine::Rl => rl(&o, q, &ax, why, opts)?,
+            DlEngine::El => self.el(&o, req, q, &ax, why, &opts)?,
+            DlEngine::Rl => rl(o, q, &ax, why, &opts)?,
         };
         a.elapsed = start.elapsed();
         Ok(a)
@@ -540,7 +558,29 @@ impl Ontologies {
         why: String,
         opts: &QueryOptions,
     ) -> Result<DlQueryAnswer> {
-        use super::classify::{copy_excluded, stage_assertion, stage_axioms, working};
+        use super::classify::{copy_excluded, stage_assertion, stage_axioms};
+        let expression_bytes = 1024
+            + why.len()
+            + o.source_bytes()
+            + o.closure
+                .iter()
+                .map(|edge| {
+                    128 + edge.from.as_str().len()
+                        + edge.iri.len()
+                        + edge.graphs.iter().map(String::len).sum::<usize>()
+                })
+                .sum::<usize>()
+            + sparkles_owl::classify::class_expression_heap_bytes(&q.expression);
+        let mut expression_memory =
+            crate::reasoning::memory::Memory::query_after(opts, o.request_bytes);
+        expression_memory.grow(expression_bytes as u64)?;
+        let opts = QueryOptions {
+            max_memory_bytes: opts
+                .max_memory_bytes
+                .map(|limit| limit.saturating_sub(expression_bytes as u64)),
+            ..opts.clone()
+        };
+        let opts = &opts;
         let work = working(opts, o);
         let mut retained = 0;
         let qc = Class::new(QUERY_CLASS);
@@ -566,19 +606,29 @@ impl Ontologies {
             instances: None,
             incremental: false,
             elapsed: Duration::ZERO,
-            _memory: None,
         };
         // saturates `axioms` with the defining axiom and describes the query class, on
         // the threads of the request
         let describe = |s: &mut Saturation,
                         axioms: &[&AxiomKind],
                         changes: Option<Changes<'_>>,
-                        par: Par|
+                        par: Par,
+                        reused_credit: u64|
          -> Result<(bool, Description, Vec<Excluded>, u64)> {
             let staged = work.lock().bytes();
-            let r = saturate(s, axioms, changes, par, q.el_only, opts, &work)?;
-            work.lock()
-                .shrink_to(staged.saturating_add(r.stats.memory as u64));
+            let r = saturate(
+                s,
+                axioms,
+                changes,
+                par,
+                q.el_only,
+                opts,
+                &work,
+                reused_credit,
+            )?;
+            work.lock().shrink_to(
+                staged.saturating_add((r.stats.memory as u64).saturating_sub(reused_credit)),
+            );
             work.lock().grow(s.description_memory() as u64)?;
             let d = s.describe(&qc).ok_or_else(|| {
                 Error::invalid("the classifier holds no saturation of the query class")
@@ -600,13 +650,22 @@ impl Ontologies {
                     // the threads come first: a wait that ends at the deadline leaves the
                     // kept state as it was
                     let par = admit(q.threads, opts)?;
+                    let pool = self.ds.pool();
+                    e.bind_work(pool, opts, &work);
+                    let reused_credit = e.reused_credit();
                     e.stage_input(o, 1, &work)?;
                     stage_assertion(&work, ax)?;
                     let (c, d, ex, memory) =
                         e.run_over(o, vec![ax.kind.clone()], |s, axioms, changes| {
-                            describe(s, axioms, changes, par)
+                            describe(s, axioms, changes, par, reused_credit)
                         })?;
-                    let keep = super::kept::retain_dl(e, memory as usize);
+                    let keep = super::kept::retain_dl(e, memory as usize)
+                        && e.reconcile(
+                            pool,
+                            opts,
+                            &work,
+                            memory + super::kept::entry_aux_bytes(e) as u64,
+                        );
                     Ok(((c, d, ex), keep))
                 })?
             } else {
@@ -614,7 +673,7 @@ impl Ontologies {
                 let mut axioms = logical_axioms(&o.ontology);
                 axioms.push(&ax.kind);
                 let par = admit(q.threads, opts)?;
-                let (c, d, ex, _) = describe(&mut Saturation::new(), &axioms, None, par)?;
+                let (c, d, ex, _) = describe(&mut Saturation::new(), &axioms, None, par, 0)?;
                 (c, d, ex)
             };
             answer.consistent = Some(consistent);
@@ -684,7 +743,7 @@ impl Ontologies {
             axioms.push(&ax.kind);
             let par = admit(q.threads, opts)?;
             let (consistent, d, excluded, _) =
-                describe(&mut Saturation::new(), &axioms, None, par)?;
+                describe(&mut Saturation::new(), &axioms, None, par, 0)?;
             answer.consistent = Some(consistent);
             if answer.satisfiable.is_none() {
                 answer.satisfiable = Some(d.satisfiable);
@@ -709,7 +768,10 @@ impl Ontologies {
                 answer.reasoning.complete = excluded.is_empty();
             }
         }
-        answer._memory = Some(Arc::new(work.lock().split(retained as u64)?));
+        answer.opened.answer_memory = Some(Arc::new([
+            work.lock().split(retained as u64)?,
+            expression_memory,
+        ]));
         Ok(answer)
     }
 }
@@ -761,25 +823,24 @@ const RETRY_ENTITIES: usize = 256;
 /// The bytes a copy in memory of a triple takes, roughly, for the memory budget.
 const COPY_BYTES_PER_TRIPLE: u64 = 256;
 
-/// Bytes charged to a memory grant, released when it drops.
-/// A query under the OWL 2 RL rules by demand reasoning, over a copy in memory of the
-/// terminology with the defining axiom, and with the assertions when instances are
-/// asked for.
+/// A query under the OWL 2 RL rules by demand reasoning, over a private copy of
+/// the terminology with the defining axiom and, for instance answers, the assertions.
 fn rl(
-    o: &Opened,
+    o: Opened,
     q: &DlQueryRequest,
     ax: &Axiom,
     why: String,
     opts: &QueryOptions,
 ) -> Result<DlQueryAnswer> {
-    let mut memory = crate::reasoning::memory::Memory::query_after(opts, o.request_bytes);
+    let work = working(opts, &o);
+    let (count, bytes) = write::axiom_projection_cost(ax);
+    work.lock().grow((2048 + count * 256 + bytes * 4) as u64)?;
     let mut quads = Vec::new();
     let mut push = |triple: &oxrdf::Triple| -> Result<()> {
         check(opts)?;
-        let terms = crate::explain::term_bytes(&Term::from(triple.subject.clone()))
-            + triple.predicate.as_str().len()
-            + crate::explain::term_bytes(&triple.object);
-        memory.grow(COPY_BYTES_PER_TRIPLE.saturating_add((terms as u64).saturating_mul(4)))?;
+        let terms = sparkles_owl::read::triple_payload(triple) as u64;
+        work.lock()
+            .grow(COPY_BYTES_PER_TRIPLE + terms.saturating_mul(4))?;
         quads.push(triple.clone().in_graph(GraphName::DefaultGraph));
         Ok(())
     };
@@ -791,7 +852,7 @@ fn rl(
         push(&t)?;
     }
     if q.answers.instances {
-        o.assertions(opts, |_, t, _| {
+        o.assertion_triples_with_memory(opts, Some(&work), |t, _| {
             push(t)?;
             Ok(true)
         })?;
@@ -807,187 +868,127 @@ fn rl(
     qo.deadline = opts.deadline;
     qo.cancel = opts.cancel.clone();
     qo.cancellation = opts.cancellation.clone();
-    qo.max_memory_bytes = opts.max_memory_bytes;
     qo.grant = opts.grant.clone();
     qo.pool = opts.pool.clone();
-    let select = |sparql: &str| -> Result<crate::dataset::Solutions> {
-        let r = mem.query_with(sparql, &qo)?;
-        crate::dataset::Solutions::from_result(&r)
-    };
-    let iri = |t: Option<&Term>| match t {
-        Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
-        _ => None,
-    };
+
     let rdfs = sparkles_owl::vocab::RDFS_SUB_CLASS_OF;
     let nothing = sparkles_owl::vocab::OWL_NOTHING;
-    let is_class = |i: &str| {
-        i != QUERY_CLASS
-            && (o.ontology.kinds(i).contains(&EntityKind::Class)
-                || i == sparkles_owl::vocab::OWL_THING)
+    let is_class = |iri: &str| {
+        iri != QUERY_CLASS
+            && (o.ontology.kinds(iri).contains(&EntityKind::Class)
+                || iri == sparkles_owl::vocab::OWL_THING)
     };
     let a = &q.answers;
-    // the equivalents are the superclasses that are subclasses too, and each strict list
-    // leaves them out, so any class answer needs both directions
-    let want_supers = a.equivalents
-        || a.superclasses
-        || a.direct_superclasses
-        || a.subclasses
-        || a.direct_subclasses;
-    let want_subs = want_supers;
-    let mut supers: Vec<String> = Vec::new();
-    let mut subs: Vec<String> = Vec::new();
-    if want_supers || want_subs {
-        for s in &select(&format!(
-            "SELECT DISTINCT ?c WHERE {{ <{QUERY_CLASS}> <{rdfs}> ?c }}"
-        ))? {
-            if let Some(c) = iri(s.get("c")).filter(|c| is_class(c)) {
-                supers.push(c);
-            }
+    let mut supers = Vec::new();
+    let mut subs = Vec::new();
+    if a.classes() {
+        // Any class answer needs both directions to distinguish equivalence.
+        for (pattern, target) in [
+            (format!("<{QUERY_CLASS}> <{rdfs}> ?c"), &mut supers),
+            (format!("?c <{rdfs}> <{QUERY_CLASS}>"), &mut subs),
+        ] {
+            rl_select(
+                &mem,
+                &qo,
+                &work,
+                &format!("SELECT DISTINCT ?c WHERE {{ {pattern} }}"),
+                |row, overlap| {
+                    if let Some(iri) =
+                        named_iri(row.values()[0].as_ref()).filter(|iri| is_class(iri))
+                    {
+                        work.lock()
+                            .grow_with_overlap((96 + iri.len()) as u64, overlap)?;
+                        target.push(iri.to_string());
+                    }
+                    Ok(())
+                },
+            )?;
+            target.sort_unstable();
+            target.dedup();
         }
+        subs.retain(|iri| iri != nothing);
     }
-    if want_subs {
-        for s in &select(&format!(
-            "SELECT DISTINCT ?c WHERE {{ ?c <{rdfs}> <{QUERY_CLASS}> }}"
-        ))? {
-            if let Some(c) = iri(s.get("c")).filter(|c| is_class(c) && c != nothing) {
-                subs.push(c);
-            }
-        }
-    }
-    supers.sort();
-    supers.dedup();
-    subs.sort();
-    subs.dedup();
-    let sub_set: std::collections::BTreeSet<&String> = subs.iter().collect();
-    let equivalents: Vec<String> = supers
+
+    work.lock()
+        .grow(((supers.len() + subs.len()) * 3 * size_of::<&str>()) as u64)?;
+    let equivalents: Vec<_> = supers
         .iter()
-        .filter(|c| sub_set.contains(c))
-        .cloned()
+        .filter(|iri| subs.binary_search(iri).is_ok())
+        .map(String::as_str)
         .collect();
-    let eq_set: std::collections::BTreeSet<&String> = equivalents.iter().collect();
-    let strict_supers: Vec<String> = supers
+    let strict_supers: Vec<_> = supers
         .iter()
-        .filter(|c| !eq_set.contains(c) && c.as_str() != nothing)
-        .cloned()
+        .filter(|iri| iri.as_str() != nothing && subs.binary_search(iri).is_err())
+        .map(String::as_str)
         .collect();
-    let strict_subs: Vec<String> = subs
+    let strict_subs: Vec<_> = subs
         .iter()
-        .filter(|c| !eq_set.contains(c))
-        .cloned()
+        .filter(|iri| supers.binary_search(iri).is_err())
+        .map(String::as_str)
         .collect();
-    // the subsumptions between the classes found, for the direct ones
-    let pairs = |vs: &[String]| -> Result<Vec<(String, String)>> {
-        if vs.len() < 2 {
-            return Ok(Vec::new());
-        }
-        let values: String = vs.iter().map(|c| format!("<{c}> ")).collect();
-        let mut out = Vec::new();
-        for s in &select(&format!(
-            "SELECT ?a ?b WHERE {{ VALUES ?a {{ {values}}} VALUES ?b {{ {values}}} ?a <{rdfs}> ?b FILTER(?a != ?b) }}"
-        ))? {
-            if let (Some(x), Some(y)) = (iri(s.get("a")), iri(s.get("b"))) {
-                out.push((x, y));
-            }
-        }
-        Ok(out)
-    };
-    let direct = |vs: &[String], up: bool| -> Result<Vec<String>> {
-        let ps: std::collections::BTreeSet<(String, String)> = pairs(vs)?.into_iter().collect();
-        let below = |a: &String, b: &String| ps.contains(&(a.clone(), b.clone()));
-        Ok(vs
-            .iter()
-            .filter(|s| {
-                !vs.iter().any(|t| {
-                    t != *s
-                        && if up {
-                            // a superclass with another one strictly below it
-                            below(t, s) && !below(s, t)
-                        } else {
-                            // a subclass with another one strictly above it
-                            below(s, t) && !below(t, s)
-                        }
-                })
-            })
-            .cloned()
-            .collect())
-    };
-    let classes = |v: Vec<String>| v.into_iter().map(Class::new).collect::<Vec<_>>();
+
+    let mut retained = 2048
+        + why.len() as u64
+        + sparkles_owl::classify::class_expression_heap_bytes(&q.expression) as u64;
+    work.lock().grow(retained)?;
     let mut instances = None;
     if a.instances {
-        let mut is: Vec<Individual> = Vec::new();
-        for s in &select(&format!(
-            "SELECT DISTINCT ?x WHERE {{ ?x a <{QUERY_CLASS}> }}"
-        ))? {
-            if let Some(x) = iri(s.get("x")) {
-                is.push(Individual::named(x));
-            }
-        }
-        is.sort();
-        instances = Some(is);
+        let mut values = Vec::new();
+        rl_select(
+            &mem,
+            &qo,
+            &work,
+            &format!("SELECT DISTINCT ?x WHERE {{ ?x a <{QUERY_CLASS}> }}"),
+            |row, overlap| {
+                if let Some(iri) = named_iri(row.values()[0].as_ref()) {
+                    let bytes = (96 + iri.len()) as u64;
+                    work.lock().grow_with_overlap(bytes, overlap)?;
+                    retained += bytes;
+                    values.push(Individual::named(iri));
+                }
+                Ok(())
+            },
+        )?;
+        values.sort();
+        instances = Some(values);
     }
-    // what the RL rules may miss: the axioms outside OWL 2 RL, and the expression where
-    // it falls outside the profile on the side the answer needs
-    let part = profiles::partition(&o.ontology, Profile::Rl);
-    let mut gaps: Vec<DlGap> = part
-        .outside
-        .iter()
-        .map(|v| DlGap {
-            axiom: v.axiom.clone(),
-            rule: Some(v.rule.clone()),
-            message: v.message.clone(),
-            partial: false,
+    let (gaps, instances_complete, gap_bytes) = rl_gaps(&o, q, &work, opts)?;
+    retained += gap_bytes;
+    let direct_supers = if a.direct_superclasses {
+        Some(rl_direct(&mem, &qo, &work, &strict_supers, true)?)
+    } else {
+        None
+    };
+    let direct_subs = if a.direct_subclasses {
+        Some(rl_direct(&mem, &qo, &work, &strict_subs, false)?)
+    } else {
+        None
+    };
+    let mut classes = |iris: Option<&[&str]>| -> Result<Option<Vec<Class>>> {
+        iris.map(|iris| {
+            let bytes = iris
+                .iter()
+                .map(|iri| size_of::<Class>() + iri.len())
+                .sum::<usize>();
+            work.lock().grow(bytes as u64)?;
+            retained += bytes as u64;
+            Ok(iris.iter().map(|&iri| Class::new(iri)).collect())
         })
-        .collect();
-    // axioms in OWL 2 RL that need a rule the rule set covers only up to a size, such as
-    // chains of more than three properties
-    let mut subset_gaps = 0;
-    for (rule, max, what) in super::rl_gaps() {
-        for ax in part
-            .inside
-            .iter()
-            .filter(|ax| super::gap_size(rule, ax).is_some_and(|n| n > max))
-        {
-            subset_gaps += 1;
-            gaps.push(DlGap {
-                axiom: Some((*ax).clone()),
-                rule: Some(rule.to_string()),
-                message: format!(
-                    "needs rule {rule} for more than {max} {what}, which the rule set does not have"
-                ),
-                partial: true,
-            });
-        }
-    }
-    let qc: ClassExpression = Class::new(QUERY_CLASS).into();
-    let as_sub = profiles::axiom_violations(
-        &Axiom::sub_class_of(q.expression.clone(), qc.clone()),
-        Profile::Rl,
-    );
-    let as_sup =
-        profiles::axiom_violations(&Axiom::sub_class_of(qc, q.expression.clone()), Profile::Rl);
-    for (rule, message, side) in as_sub
-        .iter()
-        .map(|(r, m)| (r, m, "subclass"))
-        .chain(as_sup.iter().map(|(r, m)| (r, m, "superclass")))
-    {
-        gaps.push(DlGap {
-            axiom: None,
-            rule: Some(rule.clone()),
-            message: format!("the query expression as a {side} expression: {message}"),
-            partial: false,
-        });
-    }
+        .transpose()
+    };
+    let equivalents_answer = classes(a.equivalents.then_some(equivalents.as_slice()))?;
+    let supers_answer = classes(a.superclasses.then_some(strict_supers.as_slice()))?;
+    let subs_answer = classes(a.subclasses.then_some(strict_subs.as_slice()))?;
+    let direct_supers_answer = classes(direct_supers.as_deref())?;
+    let direct_subs_answer = classes(direct_subs.as_deref())?;
     let notes = vec![
         "the OWL 2 RL rules derive subsumptions between classes only in part, so the class answers can miss entailed ones".to_string(),
         "OWL 2 RL cannot tell whether the expression is satisfiable or the ontology consistent".to_string(),
     ];
-    // Theorem PR1 of OWL 2 Profiles: the rules derive every entailed assertion of an
-    // ontology inside OWL 2 RL
-    let instances_complete = a
-        .instances
-        .then_some(part.outside.is_empty() && as_sub.is_empty() && subset_gaps == 0);
+    let mut opened = o;
+    opened.answer_memory = Some(Arc::new([work.lock().split(retained)?]));
     Ok(DlQueryAnswer {
-        opened: o.clone(),
+        opened,
         expression: q.expression.clone(),
         reasoning: DlReasoningUsed {
             engine: DlEngine::Rl,
@@ -1000,24 +1001,192 @@ fn rl(
         },
         satisfiable: None,
         consistent: None,
-        equivalents: a.equivalents.then(|| classes(equivalents.clone())),
-        superclasses: a.superclasses.then(|| classes(strict_supers.clone())),
-        direct_superclasses: if a.direct_superclasses {
-            Some(classes(direct(&strict_supers, true)?))
-        } else {
-            None
-        },
-        subclasses: a.subclasses.then(|| classes(strict_subs.clone())),
-        direct_subclasses: if a.direct_subclasses {
-            Some(classes(direct(&strict_subs, false)?))
-        } else {
-            None
-        },
+        equivalents: equivalents_answer,
+        superclasses: supers_answer,
+        direct_superclasses: direct_supers_answer,
+        subclasses: subs_answer,
+        direct_subclasses: direct_subs_answer,
         instances,
         incremental: false,
         elapsed: Duration::ZERO,
-        _memory: None,
     })
+}
+
+fn rl_select(
+    dataset: &Dataset,
+    opts: &QueryOptions,
+    work: &Working,
+    sparql: &str,
+    mut visit: impl FnMut(crate::sparql::output::RowRef<'_>, u64) -> Result<()>,
+) -> Result<()> {
+    let opts = QueryOptions {
+        max_memory_bytes: work.lock().remaining(),
+        ..opts.clone()
+    };
+    let result = dataset.query_with(sparql, &opts)?;
+    let rows = result.rows()?;
+    let overlap = result.live_memory_bytes();
+    for i in 0..rows.len() {
+        check(&opts)?;
+        visit(rows.row(i)?, overlap)?;
+    }
+    Ok(())
+}
+
+fn named_iri(term: Option<&Term>) -> Option<&str> {
+    match term {
+        Some(Term::NamedNode(iri)) => Some(iri.as_str()),
+        _ => None,
+    }
+}
+
+fn rl_direct<'a>(
+    dataset: &Dataset,
+    opts: &QueryOptions,
+    work: &Working,
+    classes: &[&'a str],
+    up: bool,
+) -> Result<Vec<&'a str>> {
+    if classes.len() < 2 {
+        work.lock().grow(size_of_val(classes) as u64)?;
+        return Ok(classes.to_vec());
+    }
+    let start = work.lock().bytes();
+    let values_bytes = classes.iter().map(|iri| iri.len() + 3).sum::<usize>();
+    work.lock().grow((values_bytes * 3 + 256) as u64)?;
+    let mut values = String::with_capacity(values_bytes);
+    for iri in classes {
+        write!(values, "<{iri}> ").expect("writing to a String");
+    }
+    let rdfs = sparkles_owl::vocab::RDFS_SUB_CLASS_OF;
+    let mut pairs = BTreeSet::new();
+    rl_select(
+        dataset,
+        opts,
+        work,
+        &format!(
+            "SELECT ?a ?b WHERE {{ VALUES ?a {{ {values}}} VALUES ?b {{ {values}}} ?a <{rdfs}> ?b FILTER(?a != ?b) }}"
+        ),
+        |row, overlap| {
+            if let (Some(a), Some(b)) = (
+                named_iri(row.values()[0].as_ref()),
+                named_iri(row.values()[1].as_ref()),
+            ) && let (Ok(a), Ok(b)) = (classes.binary_search(&a), classes.binary_search(&b))
+                && !pairs.contains(&(a, b))
+            {
+                work.lock().grow_with_overlap(96, overlap)?;
+                pairs.insert((a, b));
+            }
+            Ok(())
+        },
+    )?;
+    let view_bytes = size_of_val(classes) as u64;
+    work.lock().grow(view_bytes)?;
+    let mut direct = Vec::with_capacity(classes.len());
+    for (i, &iri) in classes.iter().enumerate() {
+        check(opts)?;
+        if !(0..classes.len()).any(|j| {
+            let (a, b) = if up { (j, i) } else { (i, j) };
+            pairs.contains(&(a, b)) && !pairs.contains(&(b, a))
+        }) {
+            direct.push(iri);
+        }
+    }
+    drop((values, pairs));
+    work.lock().shrink_to(start + view_bytes);
+    Ok(direct)
+}
+
+fn profile_scratch(axiom: &Axiom) -> u64 {
+    let (nodes, bytes) = write::axiom_projection_cost(axiom);
+    (1024 + nodes.saturating_mul(512) + bytes) as u64
+}
+
+fn rl_gaps(
+    o: &Opened,
+    q: &DlQueryRequest,
+    work: &Working,
+    opts: &QueryOptions,
+) -> Result<(Vec<DlGap>, Option<bool>, u64)> {
+    let mut outside = Vec::new();
+    let mut subset = Vec::new();
+    let mut retained = 0u64;
+    let rules = super::rl_gaps();
+    for axiom in o.ontology.axiom_set() {
+        check(opts)?;
+        let (_, bytes) = write::axiom_projection_cost(axiom);
+        let scratch = profile_scratch(axiom);
+        work.lock().grow(scratch)?;
+        let violations = profiles::axiom_violations(axiom, Profile::Rl);
+        let copy = sparkles_owl::classify::axiom_copy_bytes(&axiom.kind) as u64
+            + (bytes as u64).saturating_mul(4)
+            + 256;
+        if violations.is_empty() {
+            for &(rule, max, what) in &rules {
+                if super::gap_size(rule, axiom).is_some_and(|n| n > max) {
+                    work.lock().grow(copy + 256)?;
+                    retained += copy + 256;
+                    subset.push(DlGap {
+                        axiom: Some(axiom.clone()),
+                        rule: Some(rule.to_string()),
+                        message: format!("needs rule {rule} for more than {max} {what}, which the rule set does not have"),
+                        partial: true,
+                    });
+                }
+            }
+        } else {
+            for (rule, message) in violations {
+                let bytes = copy + (rule.len() + message.len()) as u64;
+                work.lock().grow(bytes)?;
+                retained += bytes;
+                outside.push(DlGap {
+                    axiom: Some(axiom.clone()),
+                    rule: Some(rule),
+                    message,
+                    partial: false,
+                });
+            }
+        }
+        let mut memory = work.lock();
+        let live = memory.bytes() - scratch;
+        memory.shrink_to(live);
+    }
+    let complete = outside.is_empty() && subset.is_empty();
+    // Retain the partition's outside entries first, then subset gaps in rule order.
+    subset.sort_by_key(|gap| {
+        rules
+            .iter()
+            .position(|(rule, _, _)| Some(*rule) == gap.rule.as_deref())
+    });
+    outside.extend(subset);
+    let qc: ClassExpression = Class::new(QUERY_CLASS).into();
+    let scratch =
+        2048 + sparkles_owl::classify::class_expression_heap_bytes(&q.expression) as u64 * 16;
+    work.lock().grow(scratch)?;
+    let as_sub = profiles::axiom_violations(
+        &Axiom::sub_class_of(q.expression.clone(), qc.clone()),
+        Profile::Rl,
+    );
+    let as_sup =
+        profiles::axiom_violations(&Axiom::sub_class_of(qc, q.expression.clone()), Profile::Rl);
+    let complete = complete && as_sub.is_empty();
+    for (violations, side) in [(as_sub, "subclass"), (as_sup, "superclass")] {
+        for (rule, message) in violations {
+            let bytes = 256 + (rule.len() + message.len()) as u64;
+            work.lock().grow(bytes)?;
+            retained += bytes;
+            outside.push(DlGap {
+                axiom: None,
+                rule: Some(rule),
+                message: format!("the query expression as a {side} expression: {message}"),
+                partial: false,
+            });
+        }
+    }
+    let mut memory = work.lock();
+    let live = memory.bytes() - scratch;
+    memory.shrink_to(live);
+    Ok((outside, q.answers.instances.then_some(complete), retained))
 }
 
 #[cfg(test)]

@@ -525,6 +525,12 @@ impl QueryResult {
             .collect()
     }
 
+    /// Query-owned bytes still live, including any result rows decoded by this owner.
+    #[doc(hidden)]
+    pub fn live_memory_bytes(&self) -> u64 {
+        self.inner.ctx.live_bytes()
+    }
+
     pub fn variables(&self) -> &[String] {
         self.inner
             .variables

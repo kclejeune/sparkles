@@ -67,7 +67,30 @@ pub struct EntailmentDiff {
     pub findings_complete: bool,
     pub sample_truncated: bool,
     pub warnings: Vec<String>,
-    _memory: Option<Arc<Memory>>,
+}
+
+/// A diff whose output continues to hold its request memory credit.
+#[derive(Clone, Debug)]
+pub struct AdmittedEntailmentDiff(Arc<DiffBacking>);
+
+#[derive(Debug)]
+struct DiffBacking {
+    value: EntailmentDiff,
+    _memory: Memory,
+}
+
+impl AdmittedEntailmentDiff {
+    fn into_value(self) -> EntailmentDiff {
+        Arc::into_inner(self.0).expect("unshared diff").value
+    }
+}
+
+impl std::ops::Deref for AdmittedEntailmentDiff {
+    type Target = EntailmentDiff;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.value
+    }
 }
 
 // Includes evidence containers and expansion when RDF terms and the key are escaped.
@@ -256,6 +279,11 @@ pub(crate) fn resolve(
 }
 
 pub fn diff(dataset: &Dataset, request: &DiffRequest) -> Result<EntailmentDiff> {
+    diff_admitted(dataset, request).map(AdmittedEntailmentDiff::into_value)
+}
+
+/// Compare selected states and keep the output's memory credit with the result.
+pub fn diff_admitted(dataset: &Dataset, request: &DiffRequest) -> Result<AdmittedEntailmentDiff> {
     let control = AnalysisControl::new(&request.analysis)?;
     let from = resolve_state(dataset, &request.from, &control)?;
     let to = resolve_state(dataset, &request.to, &control)?;
@@ -305,7 +333,7 @@ pub(crate) fn compare(
     to: &Arc<Snapshot>,
     request: &DiffRequest,
     control: &AnalysisControl,
-) -> Result<EntailmentDiff> {
+) -> Result<AdmittedEntailmentDiff> {
     compare_resolved(dataset, from, to, request, control, None)
 }
 
@@ -316,7 +344,7 @@ fn compare_resolved(
     request: &DiffRequest,
     control: &AnalysisControl,
     pinned: Option<(Dataset, Dataset)>,
-) -> Result<EntailmentDiff> {
+) -> Result<AdmittedEntailmentDiff> {
     let program = analysis::program(dataset, &request.analysis)?;
     let mut from_options = request.analysis.clone();
     from_options.access = request.from_access.clone().or(from_options.access);
@@ -370,7 +398,7 @@ fn delta(
     request: &DiffRequest,
     control: &AnalysisControl,
     parent: Option<sparkles_budget::ParentHandle>,
-) -> Result<EntailmentDiff> {
+) -> Result<AdmittedEntailmentDiff> {
     let retained = a
         .bytes
         .checked_add(b.bytes)
@@ -414,7 +442,6 @@ fn delta(
         findings_complete: true,
         sample_truncated: false,
         warnings: a.warnings.clone(),
-        _memory: None,
     };
     result.warnings.extend(b.warnings.iter().cloned());
     result.warnings.sort();
@@ -531,8 +558,10 @@ fn delta(
         .all(|outcome| matches!(outcome.status, CheckStatus::None | CheckStatus::Violations));
     drop(known);
     drop(scratch);
-    result._memory = Some(Arc::new(output));
-    Ok(result)
+    Ok(AdmittedEntailmentDiff(Arc::new(DiffBacking {
+        value: result,
+        _memory: output,
+    })))
 }
 
 impl DiffRequest {
@@ -560,6 +589,15 @@ pub fn preview(
     preview: &crate::preview::Preview,
     request: &DiffRequest,
 ) -> Result<EntailmentDiff> {
+    preview_admitted(dataset, preview, request).map(AdmittedEntailmentDiff::into_value)
+}
+
+/// Compare preview states and keep the output's memory credit with the result.
+pub fn preview_admitted(
+    dataset: &Dataset,
+    preview: &crate::preview::Preview,
+    request: &DiffRequest,
+) -> Result<AdmittedEntailmentDiff> {
     let states = preview
         .states
         .as_ref()
@@ -571,7 +609,9 @@ pub fn preview(
 #[cfg(test)]
 mod review_regressions {
     use super::*;
-    fn same_snapshot_after_interposed_write(profile: sparkles_reasoner::Profile) -> EntailmentDiff {
+    fn same_snapshot_after_interposed_write(
+        profile: sparkles_reasoner::Profile,
+    ) -> AdmittedEntailmentDiff {
         let dataset = Dataset::memory();
         dataset
             .update("INSERT DATA {<urn:trigger> <urn:p> 1}")
@@ -761,7 +801,6 @@ mod review_regressions {
             findings_complete: true,
             sample_truncated: false,
             warnings: vec![],
-            _memory: None,
         };
         assert_eq!(
             diff.to_patch().unwrap(),

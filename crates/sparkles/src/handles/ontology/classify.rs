@@ -193,11 +193,49 @@ pub struct Classified {
     // hold a dataset owner or query memory-pool grant for projection reads.
     pub(super) read_options: QueryOptions,
     /// the axioms left out, as outside OWL 2 EL, or used only in part
-    pub excluded: Arc<Vec<Excluded>>,
+    pub excluded: Arc<ClassifiedExclusions>,
     /// whether the dataset's kept classification of the same state answered
     pub reused: bool,
     /// the edit that wrote the taxonomy to the target graph
     pub written: Option<EditOutcome>,
+}
+
+/// A classification's exclusions, sharing the credit for their backing data.
+#[derive(Debug)]
+pub struct ClassifiedExclusions {
+    values: Vec<Excluded>,
+    pub(super) memory: Option<Arc<sparkles_budget::MemoryLease>>,
+}
+
+impl ClassifiedExclusions {
+    pub(super) fn new(values: Vec<Excluded>) -> Self {
+        Self {
+            values,
+            memory: None,
+        }
+    }
+}
+
+impl PartialEq for ClassifiedExclusions {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+
+impl Eq for ClassifiedExclusions {}
+
+impl std::ops::Deref for ClassifiedExclusions {
+    type Target = Vec<Excluded>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl AsRef<Vec<Excluded>> for ClassifiedExclusions {
+    fn as_ref(&self) -> &Vec<Excluded> {
+        &self.values
+    }
 }
 
 impl Classified {
@@ -246,7 +284,7 @@ pub struct CacheEntry {
     pub(super) el_only: bool,
     pub(super) retained_bytes: usize,
     pub(super) mutated: bool,
-    ontology: Option<Arc<sparkles_owl::read::Ontology>>,
+    ontology: Option<Arc<super::SharedOntology>>,
     /// the axioms beyond the ontology's that the saturation last read, such as a DL
     /// query's defining axiom, which the next run removes unless it reads them again
     extra: Vec<AxiomKind>,
@@ -284,6 +322,7 @@ impl CacheEntry {
 
     /// Keep immutable taxonomy credit with the publication and mutable saturation
     /// credit with this cache entry. A cache miss is safe if retention is refused.
+    #[cfg(test)]
     fn admit_retention(
         &mut self,
         pool: Option<&Arc<sparkles_core::sparql::pool::QueryPool>>,
@@ -310,6 +349,75 @@ impl CacheEntry {
         }
         held.shrink_to(bytes);
         true
+    }
+
+    fn credit(&self) -> u64 {
+        self.memory.as_ref().map_or(0, |memory| memory.bytes())
+    }
+
+    pub(super) fn reused_credit(&self) -> u64 {
+        self.credit()
+            .saturating_sub(super::kept::entry_aux_bytes(self) as u64)
+    }
+
+    // A work-only cache can take over its own working credit without asking
+    // the same pool to fund another copy. Caller grants must remain independent.
+    fn shares_work(
+        pool: Option<&Arc<sparkles_core::sparql::pool::QueryPool>>,
+        opts: &QueryOptions,
+    ) -> bool {
+        opts.grant.is_none()
+            && pool.is_some_and(|pool| {
+                pool.domain_stats().retained_capacity == 0
+                    && opts
+                        .pool
+                        .as_ref()
+                        .is_some_and(|work| Arc::ptr_eq(work, pool))
+            })
+    }
+
+    pub(super) fn bind_work(
+        &self,
+        pool: Option<&Arc<sparkles_core::sparql::pool::QueryPool>>,
+        opts: &QueryOptions,
+        work: &Working,
+    ) {
+        if Self::shares_work(pool, opts)
+            && let Some(parent) = self.memory.as_ref().and_then(|memory| memory.parent())
+        {
+            let mut work = work.lock();
+            if work.bytes() == 0 {
+                *work = crate::reasoning::memory::Memory::new(work.limit(), Some(parent));
+            }
+        }
+    }
+
+    pub(super) fn reconcile(
+        &mut self,
+        pool: Option<&Arc<sparkles_core::sparql::pool::QueryPool>>,
+        opts: &QueryOptions,
+        work: &Working,
+        bytes: u64,
+    ) -> bool {
+        if !Self::shares_work(pool, opts) {
+            return self.admit_retention_bytes(pool, bytes);
+        }
+        let old = self.credit();
+        if old >= bytes {
+            if let Some(held) = &mut self.memory {
+                held.shrink_to(bytes);
+            }
+            return true;
+        }
+        let Ok(mut extra) = work.lock().split(bytes - old) else {
+            return false;
+        };
+        if let Some(held) = &mut self.memory {
+            held.absorb(&mut extra).is_ok()
+        } else {
+            self.memory = Some(extra);
+            true
+        }
     }
 
     pub(super) fn stage_input(&self, o: &Opened, extra: usize, work: &Working) -> Result<()> {
@@ -487,28 +595,28 @@ impl Ontologies {
             axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
             let (out, excluded) = {
                 let seen = RefCell::new(None);
-                let mut dropped = dropped_assertions(&o, &opts, &seen);
+                let refused = RefCell::new(None);
+                stage_unmapped(&o, &unread, &work)?;
+                let mut dropped = dropped_assertions(&o, &opts, &seen, &work, &refused);
                 let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
                 let unmapped = || unmapped_of(&o.ontology, &unread, &seen);
-                classify_once_working(&axioms, c, &opts, dropped, &unmapped, &work)?
+                let answer = classify_once_working(&axioms, c, &opts, dropped, &unmapped, &work);
+                if let Some(error) = refused.borrow_mut().take() {
+                    return Err(error);
+                }
+                answer?
             };
             drop(axioms);
             drop(assertions);
             drop(unread);
             work.lock().shrink_to(
-                (out.stats.taxonomy_memory + sparkles_owl::classify::excluded_copy_bytes(&excluded))
-                    as u64,
+                (out.stats.taxonomy_memory
+                    + sparkles_owl::classify::excluded_copy_bytes(&excluded)
+                    + unmapped_bytes(&out.unmapped)) as u64,
             );
             (
-                Arc::new(KeptClassification::capture(
-                    self,
-                    req,
-                    c,
-                    &o,
-                    (out, excluded),
-                    &opts,
-                    &work,
-                )?),
+                KeptClassification::capture(self, req, c, &o, (out, excluded), &opts, &work)?
+                    .seal(),
                 false,
             )
         };
@@ -602,13 +710,18 @@ impl Ontologies {
             }
             // Admission precedes mutation, so a refused admission preserves a proven
             // old entry/publication. Later errors conservatively discard both.
+            let pool = state.pool.as_ref();
+            e.bind_work(pool, opts, &work);
+            let reused_credit = e.reused_credit();
             let par = admit(c.threads, opts)?;
             let seen = RefCell::new(None);
-            let mut dropped = dropped_assertions(o, opts, &seen);
+            let refused = RefCell::new(None);
             let none = Unmapped::default();
+            stage_unmapped(o, &none, &work)?;
+            let mut dropped = dropped_assertions(o, opts, &seen, &work, &refused);
             let unmapped = || unmapped_of(&o.ontology, &none, &seen);
             e.stage_input(o, 0, &work)?;
-            let (out, witness) = e.run_over(o, Vec::new(), |s, axioms, changes| {
+            let answer = e.run_over(o, Vec::new(), |s, axioms, changes| {
                 run(
                     s,
                     axioms,
@@ -619,8 +732,13 @@ impl Ontologies {
                     Some(&mut dropped),
                     &unmapped,
                     &work,
+                    reused_credit,
                 )
-            })?;
+            });
+            if let Some(error) = refused.borrow_mut().take() {
+                return Err(error);
+            }
+            let (out, witness) = answer?;
             #[cfg(test)]
             let out = if FORCE_PARTIAL.with(|f| f.replace(false)) {
                 let mut partial = out;
@@ -647,7 +765,16 @@ impl Ontologies {
             } else {
                 out
             };
-            work.lock().shrink_to(out.stats.memory as u64);
+            let saturation_bytes =
+                out.stats.memory.saturating_sub(out.stats.taxonomy_memory) as u64;
+            let used_reuse = saturation_bytes.min(reused_credit);
+            let witness_bytes = witness.as_ref().map_or(0, |w| {
+                sparkles_owl::classify::excluded_slice_copy_bytes(std::slice::from_ref(w))
+            });
+            work.lock().shrink_to(
+                (out.stats.memory + witness_bytes + unmapped_bytes(&out.unmapped)) as u64
+                    - used_reuse,
+            );
             let mut excluded = copy_excluded(&e.saturation, &work)?;
             excluded.extend(witness);
             let mut p = KeptClassification::capture(self, req, c, o, (out, excluded), opts, &work)?;
@@ -656,7 +783,6 @@ impl Ontologies {
             // A modules' pass that the deadline stopped answers by timing, so the next
             // request takes the pass again over the kept saturation.
             let publish = keep && !p.classification.stats.coverage_stopped;
-            let pool = state.pool.as_ref();
             // Mutable saturation and immutable taxonomy must both have cache credit.
             // A refusal leaves the answer under its request credit.
             let keep = if keep {
@@ -670,12 +796,16 @@ impl Ontologies {
                 } else {
                     0
                 };
-                e.admit_retention_bytes(pool, (e.retained_bytes - publication_bytes) as u64)
-                    && (!publish || p.admit_retention(opts, pool))
+                e.reconcile(
+                    pool,
+                    opts,
+                    &work,
+                    (e.retained_bytes - publication_bytes) as u64,
+                ) && (!publish || p.admit_retention(opts, pool))
             } else {
                 false
             };
-            let p = Arc::new(p);
+            let p = p.seal();
             e.result = (keep && publish).then(|| p.clone());
             Ok(((p, false), keep))
         })
@@ -693,38 +823,39 @@ impl Ontologies {
         kind: &'static str,
         f: impl FnOnce(&mut CacheEntry) -> Result<(T, bool)>,
     ) -> Result<T> {
-        check(opts)?;
-        let key = InputKey::of(self, req, &o.snapshot);
-        let state = self.ds.state();
-        let lock = loop {
-            if let Some(g) = state
-                .classify_flight
-                .try_lock_for(Duration::from_millis(50))
-            {
-                break g;
-            }
-            #[cfg(test)]
-            FLIGHT_WAIT_NOTIFY.with(|n| {
-                if let Some(tx) = n.borrow_mut().take() {
-                    let _ = tx.send(());
-                }
-            });
+        sparkles_core::sparql::pool::QueryPool::with_deferred_release_wakes(|| {
             check(opts)?;
-        };
-        check(opts)?;
-        let mut flight = KeptFlight::begin(state, lock, key, el_only, o.snapshot.commit, kind);
-        match f(flight.entry()) {
-            Ok((out, keep)) => {
-                let keep = keep && flight.entry().admit_retention(state.pool.as_ref());
-                flight.finish(keep);
-                Ok(out)
+            let key = InputKey::of(self, req, &o.snapshot);
+            let state = self.ds.state();
+            let lock = loop {
+                if let Some(g) = state
+                    .classify_flight
+                    .try_lock_for(Duration::from_millis(50))
+                {
+                    break g;
+                }
+                #[cfg(test)]
+                FLIGHT_WAIT_NOTIFY.with(|n| {
+                    if let Some(tx) = n.borrow_mut().take() {
+                        let _ = tx.send(());
+                    }
+                });
+                check(opts)?;
+            };
+            check(opts)?;
+            let mut flight = KeptFlight::begin(state, lock, key, el_only, o.snapshot.commit, kind);
+            match f(flight.entry()) {
+                Ok((out, keep)) => {
+                    flight.finish(keep);
+                    Ok(out)
+                }
+                Err(err) => {
+                    let preserve = !flight.entry().mutated;
+                    flight.finish(preserve);
+                    Err(err)
+                }
             }
-            Err(err) => {
-                let preserve = !flight.entry().mutated;
-                flight.finish(preserve);
-                Err(err)
-            }
-        }
+        })
     }
 
     /// Write the taxonomy to `target` in one commit: add its axioms, remove the taxonomy
@@ -969,7 +1100,9 @@ fn classify_once_working(
     let mut s = Saturation::new();
     let par = admit(c.threads, opts)?;
     let staged = work.lock().bytes();
-    let (out, witness) = run(&mut s, axioms, None, par, opts, c, dropped, unmapped, work)?;
+    let (out, witness) = run(
+        &mut s, axioms, None, par, opts, c, dropped, unmapped, work, 0,
+    )?;
     work.lock()
         .shrink_to(staged.saturating_add(out.stats.memory as u64));
     let mut excluded = copy_excluded(&s, work)?;
@@ -991,19 +1124,66 @@ pub(super) fn dropped_assertions<'o>(
     o: &'o Opened,
     opts: &'o QueryOptions,
     unmapped: &'o RefCell<Option<Triple>>,
+    work: &'o Working,
+    refused: &'o RefCell<Option<Error>>,
 ) -> impl FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + 'o {
     move |f| {
-        o.assertions(opts, |ax, t, _| {
+        let result = o.assertions_with_memory(opts, Some(work), |ax, t, _| {
             Ok(match ax {
-                Some(ax) => f(&ax.kind),
+                Some(ax) => {
+                    if logical(&ax.kind) && !matches!(&ax.kind, AxiomKind::Declaration(_)) {
+                        // Coverage may keep one cloned logical axiom as its witness.
+                        stage_assertion(work, &ax)?;
+                    }
+                    f(&ax.kind)
+                }
                 None => {
+                    work.lock().grow(triple_copy_bytes(t) * 3)?;
                     *unmapped.borrow_mut() = Some(t.clone());
                     false
                 }
             })
-        })
-        .is_ok()
+        });
+        match result {
+            Ok(()) => true,
+            Err(Error::Cancelled | Error::Timeout) => false,
+            Err(error) => {
+                *refused.borrow_mut() = Some(error);
+                false
+            }
+        }
     }
+}
+
+fn triple_copy_bytes(triple: &Triple) -> u64 {
+    256 + sparkles_owl::read::triple_payload(triple) as u64
+}
+
+pub(super) fn unmapped_bytes(unmapped: &Unmapped) -> usize {
+    unmapped
+        .triples
+        .iter()
+        .map(|triple| triple_copy_bytes(triple) as usize)
+        .sum()
+}
+
+fn stage_unmapped(o: &Opened, unread: &Unmapped, work: &Working) -> Result<()> {
+    let bytes = o
+        .ontology
+        .unmapped
+        .iter()
+        .map(|i| &o.ontology.triples[*i])
+        .filter(|t| !is_rdfs_property(t))
+        .chain(&unread.triples)
+        .take(sparkles_owl::classify::UNMAPPED_LISTED)
+        .map(triple_copy_bytes)
+        .sum::<u64>();
+    work.lock().grow(bytes * 2)
+}
+
+fn is_rdfs_property(t: &Triple) -> bool {
+    t.predicate.as_str() == vocab::RDF_TYPE
+        && matches!(&t.object, Term::NamedNode(n) if n.as_str() == vocab::RDF_PROPERTY)
 }
 
 /// The triples that map to no axiom of a classification of `o`: the terminology's, then
@@ -1017,16 +1197,12 @@ pub(super) fn unmapped_of(
     unread: &Unmapped,
     seen: &RefCell<Option<Triple>>,
 ) -> Unmapped {
-    let rdfs_property = |t: &&Triple| {
-        t.predicate.as_str() == vocab::RDF_TYPE
-            && matches!(&t.object, Term::NamedNode(n) if n.as_str() == vocab::RDF_PROPERTY)
-    };
     Unmapped::default()
         .extend(
             o.unmapped
                 .iter()
                 .map(|i| &o.triples[*i])
-                .filter(|t| !rdfs_property(t)),
+                .filter(|t| !is_rdfs_property(t)),
         )
         .merge(unread)
         .extend(seen.borrow().as_ref())
@@ -1050,8 +1226,9 @@ fn run(
     dropped: Option<&mut Dropped<'_>>,
     unmapped: &dyn Fn() -> Unmapped,
     work: &Working,
+    reused_credit: u64,
 ) -> Result<(Classification, Option<Excluded>)> {
-    bounded(par, opts, work, |limits| {
+    bounded(par, opts, work, reused_credit, |limits| {
         let limits = Limits {
             el_only: c.el_only,
             partial: c.partial,
@@ -1060,7 +1237,7 @@ fn run(
             cover_later: true,
             ..limits.clone()
         };
-        let mut out = k.classify_admitted(axioms, changes, &limits)?;
+        let mut out = k.classify_with_credit(axioms, changes, &limits, reused_credit as usize)?;
         let witness = out.cover(axioms, k.excluded(), dropped)?;
         out.leave_out_unmapped(unmapped())?;
         Ok((out.into_classification(), witness))
@@ -1068,6 +1245,7 @@ fn run(
 }
 
 /// Saturates without a taxonomy, under the bounds [`run`] sets.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn saturate(
     k: &mut Saturation,
     axioms: &[&AxiomKind],
@@ -1076,13 +1254,14 @@ pub(super) fn saturate(
     el_only: bool,
     opts: &QueryOptions,
     work: &Working,
+    reused_credit: u64,
 ) -> Result<sparkles_owl::classify::Saturated> {
-    bounded(par, opts, work, |limits| {
+    bounded(par, opts, work, reused_credit, |limits| {
         let limits = Limits {
             el_only,
             ..limits.clone()
         };
-        k.saturate(axioms, changes, &limits)
+        k.saturate_with_credit(axioms, changes, &limits, reused_credit as usize)
     })
 }
 
@@ -1092,6 +1271,7 @@ fn bounded<T>(
     par: Par,
     opts: &QueryOptions,
     memory: &Working,
+    reused_credit: u64,
     f: impl FnOnce(&Limits) -> std::result::Result<T, sparkles_owl::classify::Error>,
 ) -> Result<T> {
     let cancel = opts.cancel.clone();
@@ -1101,8 +1281,8 @@ fn bounded<T>(
     let max_memory = {
         let memory = memory.lock();
         memory
-            .limit()
-            .map(|limit| limit.saturating_sub(memory.bytes()) as usize)
+            .remaining()
+            .map(|remaining| remaining.saturating_add(reused_credit) as usize)
     };
     let memory = memory.clone();
     let pooled = opts.grant.is_some() || opts.pool.is_some();

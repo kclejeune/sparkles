@@ -243,6 +243,14 @@ state for the next run. Regression tests hold a live query result, a reasoning r
 and a view together under one pool ceiling and check exact credit return on completion,
 refusal, cancellation and unwind.
 
+Ontology reads admit parser expansion and streamed assertions. Kept classification
+uses credit already backing the previous saturation when it applies edits. Shared
+classification payloads and DL query answers retain their credit for their lifetimes.
+OWL 2 RL queries give nested SELECTs the remaining request allowance while the private
+store and any earlier answer data are live. Runtime checkpoints return scratch credit
+after their guards are released. WAL replay accounts for the overlap of growing tables
+and the conversion to materialization changes.
+
 Items 678 and 1069 have shipped. The string floors of `string_order_mask` read their keys
 and search for a string's first extension inside the decoding envelope, and a refused
 read fails the comparison with its refusal. The row-aligned pre-decode of `decode_for`

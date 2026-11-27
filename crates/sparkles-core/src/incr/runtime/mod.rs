@@ -97,6 +97,19 @@ pub(super) struct DeferredDrops {
     pub(super) retired: Vec<MemoryLease>,
 }
 
+/// Drain retired checkpoint credit on completion, refusal or unwind. The
+/// surrounding runtime operation releases it after the state and worker guards.
+struct CheckpointCredit<'a>(&'a Circuit);
+
+impl Drop for CheckpointCredit<'_> {
+    fn drop(&mut self) {
+        let retired = self.0.drain_retired();
+        if !retired.is_empty() {
+            Operation::after(move || drop(retired));
+        }
+    }
+}
+
 /// The branch whose state Phase 1 keeps.
 const BRANCH: &str = "main";
 /// The most rows a circuit's diff history keeps for resumed live queries.
