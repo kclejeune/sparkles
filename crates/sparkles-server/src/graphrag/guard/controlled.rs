@@ -133,7 +133,7 @@ pub(super) fn exempt(
             };
             let mut output = Exemptions::new(preparation)?;
             for (name, state) in &cached.value.graphs {
-                if proven(name, state, view, preparation)? {
+                if proven(snap, name, state, view, preparation)? {
                     output.push(name)?;
                 }
             }
@@ -147,7 +147,7 @@ pub(super) fn exempt(
     let mut output = Exemptions::new(preparation)?;
     for bucket in index.value.graphs.values() {
         for graph in bucket {
-            if proven(&graph.name, &graph.state, view, preparation)? {
+            if proven(snap, &graph.name, &graph.state, view, preparation)? {
                 output.push(&graph.name)?;
             }
         }
@@ -411,7 +411,10 @@ fn parse(name: &str, text: &str, workspace: &mut Workspace<'_>) -> Result<Option
         return Err(error);
     }
     workspace.preparation.check()?;
-    let Some(fp) = parsed.ok().filter(|fp| fp.version == FOOTPRINT_VERSION) else {
+    let Some(fp) = parsed
+        .ok()
+        .filter(|fp| (1..=FOOTPRINT_VERSION).contains(&fp.version))
+    else {
         return Ok(None);
     };
     // The parsing workspace ends here. Only the actual retained model remains
@@ -584,7 +587,12 @@ fn normalized(a: &[String], b: &[String], preparation: &Preparation) -> Result<b
     Ok(true)
 }
 
-fn coverage(view: &GraphAccess, fp: &Footprint, preparation: &Preparation) -> Result<Decision> {
+fn coverage(
+    snap: &GuardSnapshot<'_>,
+    view: &GraphAccess,
+    fp: &Footprint,
+    preparation: &Preparation,
+) -> Result<Decision> {
     preparation.check()?;
     if view.read.is_all() {
         let mut hides = false;
@@ -601,12 +609,19 @@ fn coverage(view: &GraphAccess, fp: &Footprint, preparation: &Preparation) -> Re
             return Ok(Decision::Proven);
         }
     }
-    if fp.version != FOOTPRINT_VERSION {
+    if fp.version != FOOTPRINT_VERSION || fp.evidence_gated {
         return Ok(Decision::Unproven);
     }
     for graph in &fp.graphs {
         if !preparation.allows_iri(&view.read, &graph.graph)? {
             return Ok(Decision::Denied);
+        }
+        // Footprints do not prove support-aware projection visibility dependencies;
+        // fail closed for restricted readers whenever an input graph was support-gated
+        // at capture time, is currently a review-policy output graph, or evidence
+        // configuration is unavailable.
+        if graph.support_gated || snap.is_evidence_output_or_unavailable(&graph.graph) {
+            return Ok(Decision::Unproven);
         }
         if let Some(rules) = &view.triples {
             for rule in &rules.rules {
@@ -657,6 +672,7 @@ fn coverage(view: &GraphAccess, fp: &Footprint, preparation: &Preparation) -> Re
 }
 
 fn proven(
+    snap: &GuardSnapshot<'_>,
     name: &str,
     state: &GraphFootprints,
     view: &GraphAccess,
@@ -670,7 +686,7 @@ fn proven(
         let Some(fp) = fp else {
             return Ok(false);
         };
-        if coverage(view, fp, preparation)? != Decision::Proven {
+        if coverage(snap, view, fp, preparation)? != Decision::Proven {
             return Ok(false);
         }
     }
@@ -788,6 +804,7 @@ mod tests {
             endpoint: "query".into(),
             graphs: Vec::new(),
             reports: (0..1000).map(|i| format!("urn:report:{i}")).collect(),
+            evidence_gated: false,
         };
         let text = fp.to_json();
         let name = fp.iri();

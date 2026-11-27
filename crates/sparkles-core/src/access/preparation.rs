@@ -390,6 +390,47 @@ impl Preparation {
         Ok(preparation)
     }
 
+    /// Prepare a child operation (such as incremental circuit masking) under `control`,
+    /// bounded by `memory_bytes` and charging its parent [`ParentHandle`] directly.
+    pub(crate) fn with_parent(
+        control: Control,
+        memory_bytes: u64,
+        parent: ParentHandle,
+        grant: Option<Arc<crate::sparql::pool::PoolGrant>>,
+    ) -> Result<Self> {
+        control.check()?;
+        let bytes =
+            (std::mem::size_of::<Inner>() + 16 + std::mem::size_of::<Upstream>() + 32) as u64;
+        if bytes > memory_bytes {
+            return Err(memory(memory_bytes));
+        }
+        let held = parent.reserve(bytes).map_err(parent_error)?;
+        let preparation = Self {
+            inner: Shared::new(Inner {
+                control,
+                limit: memory_bytes,
+                used: AtomicU64::new(bytes),
+                peak: AtomicU64::new(bytes),
+                selection: None,
+                grant,
+                context_bytes: bytes,
+                cancellation: None,
+                original_controls: None,
+                inherited_controls: None,
+                upstream: Some(Box::new(Upstream {
+                    parent,
+                    held: Mutex::new(held),
+                    pause: Arc::new(AtomicU64::new(0)),
+                })),
+            }),
+            no_wait: false,
+            query: None,
+            in_selection: false,
+        };
+        preparation.check()?;
+        Ok(preparation)
+    }
+
     /// Shared wait-credit counter for a view rebuild's own ordinary execution deadline.
     /// `None` for ordinary checked sources whose absolute deadlines never extend on pause.
     pub(crate) fn view_rebuild_pause(&self) -> Option<Arc<AtomicU64>> {
@@ -2364,6 +2405,11 @@ impl PreparedView {
     /// enforced by this raw snapshot alone.
     pub(crate) fn snapshot(&self) -> &Snapshot {
         &self.inner.snapshot
+    }
+
+    /// Cloned `Arc` handle to the physical masked snapshot.
+    pub(crate) fn snapshot_arc(&self) -> Arc<Snapshot> {
+        self.inner.snapshot.clone()
     }
 
     /// Whether the graph named by `term` (the default graph when `None`) is readable.

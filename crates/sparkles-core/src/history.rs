@@ -639,6 +639,22 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
     decode_file_with(&bytes, dataset_id, &mut crate::budgeted::Unlimited)
 }
 
+/// Read `history.json` under `budget` without opening the store.
+pub(crate) fn read_file_controlled(
+    root: &Path,
+    dataset_id: uuid::Uuid,
+    budget: &mut crate::store::cold::ColdBudget<'_>,
+) -> Result<HistoryConfig> {
+    let bytes = match budget.read_file(&root.join("history.json")) {
+        Ok(b) => b,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HistoryConfig::default());
+        }
+        Err(e) => return Err(e),
+    };
+    decode_file_controlled(&bytes, dataset_id, budget)
+}
+
 /// Validate current history metadata without startup writers or recovery cleanup.
 /// A legacy directory without history needs no recorded identity. A present
 /// identity-bearing history requires its own dataset.json, never a fabricated ID.

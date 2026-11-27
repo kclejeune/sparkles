@@ -159,18 +159,37 @@ impl Runtime {
     ) {
         let snap = store.snapshot();
         let before = st.circuit.applied;
+        let had_snap = st.circuit.snap.is_some();
+        let restricted = st
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything());
+        let prev_stamp = st.circuit.evidence_stamp();
+        let ev_mismatch = had_snap && st.evidence_mismatch(&snap);
         let t0 = Instant::now();
         // a rebuild's change reaches live queries
         match st.evaluate(snap, &self.control()) {
             Ok(change) => {
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(cell, st, t0.elapsed(), false);
-                self.live_budgets(st, deferred);
-                if let Some((c, c_lease)) = change {
-                    self.publish(st, before, c, c_lease, true, deferred);
-                }
-                if std::mem::take(&mut st.rebased) {
-                    st.clear_history();
+                let ev_boundary_crossed = restricted
+                    && had_snap
+                    && (ev_mismatch || st.circuit.evidence_stamp() != prev_stamp);
+                if ev_boundary_crossed {
+                    drop(change);
+                    st.rebased = false;
+                    self.live_budgets_inner(st, true, deferred);
+                    self.publish_evidence_reset(st, deferred);
+                } else {
+                    self.live_budgets(st, deferred);
+                    if let Some((c, c_lease)) = change {
+                        self.publish(st, before, c, c_lease, true, deferred);
+                    }
+                    let ev_restricted = restricted && st.circuit.evidence_key().is_some();
+                    if std::mem::take(&mut st.rebased) || ev_restricted {
+                        st.clear_history();
+                    }
                 }
             }
             Err(e) => self.fail(cell, st, &e, deferred),
@@ -189,8 +208,43 @@ impl Runtime {
             return false;
         }
         let from = st.circuit.applied;
-        if from >= store.snapshot().commit {
+        let head = store.snapshot();
+        let restricted = st
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything());
+        let prev_stamp = st.circuit.evidence_stamp();
+        let ev_changed = st.evidence_mismatch(&head);
+        if from >= head.commit && !ev_changed {
             return false;
+        }
+        if from >= head.commit && ev_changed {
+            // Managed settings, protection nonces, or availability changed without an RDF
+            // commit: rebuild at `head`, clear replay history, and replace subscriber queues
+            // with a fresh reset so no superseded events or same-commit replay diffs remain.
+            cell.info.lock().status = Status::Building;
+            let t0 = Instant::now();
+            match st
+                .circuit
+                .reset_charged(&DeltaSet::at(head), &self.control())
+            {
+                Ok((c, c_lease)) => {
+                    drop(c);
+                    drop(c_lease);
+                    self.counters.resets.fetch_add(1, Ordering::Relaxed);
+                    cell.info.lock().status = Status::Ready;
+                    self.note_pass(cell, st, t0.elapsed(), false);
+                    self.live_budgets_inner(st, true, deferred);
+                    self.publish_evidence_reset(st, deferred);
+                }
+                Err(e) => {
+                    st.clear_history();
+                    self.fail(cell, st, &e, deferred);
+                    return true;
+                }
+            }
+            return true;
         }
         let d = deltas
             .entry(from)
@@ -228,9 +282,24 @@ impl Runtime {
                 }
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(cell, st, took, false);
-                self.publish(st, from, c, c_lease, true, deferred);
+                let ev_now_changed =
+                    restricted && (ev_changed || st.circuit.evidence_stamp() != prev_stamp);
+                if ev_now_changed {
+                    drop(c);
+                    drop(c_lease);
+                    self.live_budgets_inner(st, true, deferred);
+                    self.publish_evidence_reset(st, deferred);
+                } else {
+                    self.publish(st, from, c, c_lease, true, deferred);
+                    if restricted && st.circuit.evidence_key().is_some() {
+                        st.clear_history();
+                    }
+                }
             }
             Err(e) => {
+                if restricted {
+                    st.clear_history();
+                }
                 self.fail(cell, st, &e, deferred);
                 return true;
             }
@@ -252,6 +321,15 @@ impl Runtime {
 
     /// End the live queries of the circuit whose budget its state passed.
     pub(super) fn live_budgets(&self, st: &mut Slot, deferred: &mut DeferredDrops) {
+        self.live_budgets_inner(st, false, deferred);
+    }
+
+    pub(super) fn live_budgets_inner(
+        &self,
+        st: &mut Slot,
+        replace: bool,
+        deferred: &mut DeferredDrops,
+    ) {
         let bytes = st.circuit.bytes();
         let before = st.subs.len();
         st.subs.retain(|s| {
@@ -259,16 +337,19 @@ impl Runtime {
                 return true;
             }
             if let Some(sh) = s.shared.upgrade() {
-                deferred.queued.extend(sh.push_leased(
-                    LiveEvent::Error {
-                        code: "over-budget".into(),
-                        message: format!(
-                            "the live query's state of {bytes} bytes passed its budget of {} bytes",
-                            s.budget
-                        ),
-                    },
-                    None,
-                ));
+                let err = LiveEvent::Error {
+                    code: "over-budget".into(),
+                    message: format!(
+                        "the live query's state of {bytes} bytes passed its budget of {} bytes",
+                        s.budget
+                    ),
+                };
+                let displaced = if replace {
+                    sh.replace_leased(err, None, None)
+                } else {
+                    sh.push_leased(err, None, None)
+                };
+                deferred.queued.extend(displaced);
             }
             false
         });
@@ -340,6 +421,54 @@ impl Runtime {
             crate::incr::circuit::into_arc_rows(decoded, &mut lease).ok()?,
             lease,
         ))
+    }
+
+    /// Clear commit-keyed replay history and replace every live subscriber's queued
+    /// events with a fresh `reset` reflecting the circuit's current evidence view.
+    fn publish_evidence_reset(&self, st: &mut Slot, deferred: &mut DeferredDrops) {
+        st.prune_dead_subs();
+        st.clear_history();
+        if st.subs.is_empty() {
+            return;
+        }
+        let to = st.circuit.applied;
+        let event_rows = st
+            .circuit
+            .ordered_row_count()
+            .unwrap_or_else(|| st.circuit.result.len());
+        if event_rows > crate::incr::live::QUEUE_ROWS {
+            for s in &mut st.subs {
+                if let Some(sh) = s.shared.upgrade() {
+                    deferred.queued.extend(sh.mark_overflow());
+                    s.last = to;
+                    self.counters.live_events.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        let (event, mut event_lease) = match st.event_budgeted(true) {
+            Ok(pair) => pair,
+            Err(e) => {
+                st.fail_live_subs(&e, deferred);
+                return;
+            }
+        };
+        let shared_lease = st.detach_event_lease(&mut event_lease);
+        let stamp = Some(st.circuit.evidence_stamp());
+        for s in &mut st.subs {
+            if let Some(sh) = s.shared.upgrade() {
+                s.last = to;
+                deferred.queued.extend(sh.replace_leased(
+                    event.clone(),
+                    shared_lease.clone(),
+                    stamp.clone(),
+                ));
+                self.counters.live_events.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        deferred
+            .queued
+            .push(crate::incr::live::QueuedEvent::new(event, shared_lease));
     }
 
     /// Send the change `c` from commit `from` to the circuit's commit to the
@@ -534,6 +663,7 @@ impl Runtime {
             }
         };
         let shared_lease = st.detach_event_lease(&mut event_lease);
+        let stamp = Some(st.circuit.evidence_stamp());
         for s in &mut st.subs {
             if let Some(sh) = s.shared.upgrade() {
                 // a diff starts from the subscriber's latest event, which commits that
@@ -546,7 +676,7 @@ impl Runtime {
                 s.last = to;
                 deferred
                     .queued
-                    .extend(sh.push_leased(e, shared_lease.clone()));
+                    .extend(sh.push_leased(e, shared_lease.clone(), stamp.clone()));
                 self.counters.live_events.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -648,14 +778,22 @@ impl Runtime {
         *self.last_checkpoint.lock() = Instant::now();
         let internal: Vec<Arc<InternalCell>> = self.reg.lock().internal.values().cloned().collect();
         self.checkpoint_internal(store, &internal);
-        let todo: Vec<(String, Arc<Cell>, u64)> = self
+        let todo: Vec<(String, Arc<Cell>, u64, Option<String>)> = self
             .reg
             .lock()
             .views
             .iter()
-            .filter_map(|(n, e)| Some((n.clone(), e.cell.clone()?, e.checkpointed)))
+            .filter_map(|(n, e)| {
+                Some((
+                    n.clone(),
+                    e.cell.clone()?,
+                    e.checkpointed,
+                    e.checkpointed_ev_key.clone(),
+                ))
+            })
             .collect();
-        for (name, cell, done) in todo {
+        let live_ev = store.snapshot().evidence_visibility_key();
+        for (name, cell, done, done_ev) in todo {
             // under the state lock, which a switch of the inference takes to replace the
             // circuit
             let st = cell.state.lock();
@@ -663,7 +801,17 @@ impl Runtime {
                 continue;
             }
             let applied = st.circuit.applied;
-            if applied <= done {
+            let restricted = st
+                .circuit
+                .access
+                .as_ref()
+                .is_some_and(|a| !a.reads_everything());
+            let circuit_ev = st.circuit.evidence_key().map(str::to_string);
+            if restricted && (circuit_ev.as_deref() == Some("unavailable") || circuit_ev != live_ev)
+            {
+                continue;
+            }
+            if applied <= done && (!restricted || circuit_ev == done_ev) {
                 continue;
             }
             let Some(snap) = st.circuit.snap.clone() else {
@@ -677,7 +825,7 @@ impl Runtime {
                     &persist::Header {
                         dataset: self.dataset,
                         commit: applied,
-                        fingerprint: st.fingerprint(cell.key),
+                        fingerprint: st.fingerprint(cell.key, circuit_ev.as_deref()),
                     },
                     &body,
                     || store.failpoint("view-checkpoint-written"),
@@ -689,6 +837,7 @@ impl Runtime {
                     self.counters.checkpoints.fetch_add(1, Ordering::Relaxed);
                     if let Some(e) = self.reg.lock().views.get_mut(&name) {
                         e.checkpointed = applied;
+                        e.checkpointed_ev_key = circuit_ev;
                     }
                 }
                 Err(e) => {

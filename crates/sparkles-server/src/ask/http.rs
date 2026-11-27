@@ -332,15 +332,17 @@ async fn ask_route(
         .filter(|b| *b != sparkles::branch::MAIN)
         .and_then(|b| st.branch_dataset(&ds, b).ok())
         .unwrap_or_else(|| ds.clone());
-    let start = target.store.snapshot();
+    let start = target.store.snapshot().pin_live_evidence();
+    // Explicit historical selectors (including `At::Commit(head)`) resolve against
+    // historical configuration bindings when configuration history is activated rather
+    // than live head, so only `None` and `At::Head` prove that every contributing read
+    // observed `start`'s live evidence binding.
     let pinned_to_head = match &o.at {
         None => true,
-        Some(Value::String(s)) => match s.parse::<sparkles::history::At>() {
-            Ok(sparkles::history::At::Head) => true,
-            Ok(sparkles::history::At::Commit(c)) => c == start.commit,
-            _ => false,
-        },
-        Some(Value::Number(n)) => n.as_u64() == Some(start.commit),
+        Some(Value::String(s)) => matches!(
+            s.parse::<sparkles::history::At>(),
+            Ok(sparkles::history::At::Head)
+        ),
         Some(_) => false,
     };
     let start = pinned_to_head.then_some(start);
@@ -353,22 +355,32 @@ async fn ask_route(
         let thread = thread.clone();
         let principal = principal.clone();
         let branch = o.branch.clone();
+        let review_policy = o.review_policy.is_some();
         move |out: &Value| {
             let tokens = crate::models::budget_of(&out["usage"]);
             st.asks.add_tokens(&ds.name, &me, tokens);
             st.asks
                 .record(&id, assistant::recent_of(&ds.name, &me, out), &out["usage"]);
-            // one state for every read: a head that did not move while the ask read it,
-            // and the result's commit, if any, is that state's; otherwise the record keeps
-            // no footprint
+            // one state for every read: a head whose RDF commit and managed evidence
+            // configuration did not change while the ask read it, and the result's
+            // commit, if any, is that state's; otherwise the record keeps no footprint
             let read = start.clone().filter(|s| {
-                target.store.snapshot().commit == s.commit
+                let now = target.store.snapshot().pin_live_evidence();
+                now.commit == s.commit
+                    && now.managed_generation() == s.managed_generation()
+                    && now.evidence_visibility_key() == s.evidence_visibility_key()
                     && out["result"]["commit"]
                         .as_u64()
                         .is_none_or(|c| c == s.commit)
             });
-            let access =
-                assistant::ask_access(read.as_ref(), &principal, &ds.name, branch.as_deref(), &me);
+            let access = assistant::ask_access(
+                read.as_ref(),
+                &principal,
+                &ds.name,
+                branch.as_deref(),
+                &me,
+                review_policy,
+            );
             let rec = assistant::record_of(&id, &me, out).with_answer(
                 &thread,
                 &written,

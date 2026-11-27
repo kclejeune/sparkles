@@ -231,8 +231,17 @@ impl Store {
         options: &HistoryOptions,
         max_memory_bytes: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
-        let (snapshot, resolved, origin, _) =
+        let (snapshot, resolved, origin, charge) =
             self.snapshot_at_with_branch_limited_charged(store, at, options, max_memory_bytes)?;
+        let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+            let remaining = max_memory_bytes.saturating_sub(charge.total());
+            let prep = options.temporary(remaining)?;
+            let (pinned, _held) =
+                self.pin_historical_evidence(store, at, resolved.commit.seq, snapshot, &prep)?;
+            pinned
+        } else {
+            snapshot
+        };
         Ok((snapshot, resolved, origin))
     }
 
@@ -330,20 +339,41 @@ impl Store {
                 "a branch is resolved through the dataset's main store",
             ));
         }
-        if branch == self.dataset_id {
-            return self.snapshot_from_limited(
+        let (snapshot, resolved, origin, mut charge) = if branch == self.dataset_id {
+            self.snapshot_from_limited(
                 PinnedSource::Resident(branching::BranchStore::Main(self)),
                 at,
                 options,
                 max_memory_bytes,
-            );
-        }
-        self.listed_with(branch, &limit)?;
-        let read =
-            self.snapshot_from_limited(PinnedSource::Cold(branch), at, options, max_memory_bytes)?;
-        // A branch deleted while it was read no longer names this state.
-        self.listed_with(branch, &limit)?;
-        Ok(read)
+            )?
+        } else {
+            self.listed_with(branch, &limit)?;
+            let read = self.snapshot_from_limited(
+                PinnedSource::Cold(branch),
+                at,
+                options,
+                max_memory_bytes,
+            )?;
+            // A branch deleted while it was read no longer names this state.
+            self.listed_with(branch, &limit)?;
+            read
+        };
+        let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+            let remaining = max_memory_bytes.saturating_sub(charge.total());
+            let prep = options.temporary(remaining)?;
+            let (pinned, held) = self.pin_historical_evidence_for_branch(
+                branch,
+                at,
+                resolved.commit.seq,
+                snapshot,
+                &prep,
+            )?;
+            charge.delta_bytes = charge.delta_bytes.saturating_add(held.bytes());
+            pinned
+        } else {
+            snapshot
+        };
+        Ok((snapshot, resolved, origin, charge))
     }
 
     /// Read a commit from a cold or retired ancestor branch already proven to lie in the
@@ -451,7 +481,9 @@ impl Store {
                 OriginRead::Resident(store) => {
                     selected = Source::Resident(branching::BranchStore::Other(store))
                 }
-                OriginRead::Clock(_) | OriginRead::Configuration { .. } => {
+                OriginRead::Clock(_)
+                | OriginRead::Configuration { .. }
+                | OriginRead::Pin { .. } => {
                     return Err(Error::Corrupt(
                         "snapshot lookup returned only a fork clock".into(),
                     ));

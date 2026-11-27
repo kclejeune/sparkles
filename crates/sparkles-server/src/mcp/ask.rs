@@ -656,7 +656,7 @@ impl Tools<'_> {
         };
         repairs.apply(&mut opts);
 
-        let start = target_ds.store.snapshot();
+        let start = target_ds.store.snapshot().pin_live_evidence();
         let pinned_to_head = match &opts.at {
             None => true,
             Some(Value::String(s)) => match s.parse::<sparkles::history::At>() {
@@ -687,7 +687,10 @@ impl Tools<'_> {
             &out["usage"],
         );
         let read = start.filter(|s| {
-            target_ds.store.snapshot().commit == s.commit
+            let now = target_ds.store.snapshot().pin_live_evidence();
+            now.commit == s.commit
+                && now.managed_generation() == s.managed_generation()
+                && now.evidence_visibility_key() == s.evidence_visibility_key()
                 && out["result"]["commit"]
                     .as_u64()
                     .is_none_or(|c| c == s.commit)
@@ -698,6 +701,7 @@ impl Tools<'_> {
             &main_ds.name,
             branch.as_deref(),
             &me,
+            opts.review_policy.is_some(),
         );
         let rec = assistant::record_of(&id, &me, &out).with_answer(
             &id,

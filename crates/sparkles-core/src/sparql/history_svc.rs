@@ -433,6 +433,7 @@ pub(super) fn run(
     input: Option<&Table>,
     vars: &[VarId],
 ) -> Result<Table> {
+    check_evidence_access(ctx, ctx.graphs.as_deref())?;
     let Some(input) = input else {
         range_vars_bound(ctx, spec)?;
         let t = lookup(ctx, spec, vars)?;
@@ -548,11 +549,28 @@ pub(super) fn bind<'a>(
     Ok(ok.then_some((s, decode)))
 }
 
+/// Refuse history execution for restricted callers when support-aware projection
+/// visibility may apply on the current snapshot or earlier commits of the change log.
+pub(super) fn check_evidence_access(
+    ctx: &Ctx,
+    access: Option<&crate::access::GraphAccess>,
+) -> Result<()> {
+    if access.is_some_and(|a| ctx.snap.has_evidence_visibility_for_access(a)) {
+        return Err(Error::NotPermitted(
+            "history queries are not available to a caller whose view is subject to \
+             support-aware projection visibility"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// One lookup in the change log: the changes that match the call's constants, as rows
 /// of `vars`.
 fn lookup(ctx: &Ctx, spec: &HistorySpec, vars: &[VarId]) -> Result<Table> {
     let log = change_log(ctx)?;
     let q = history_query(ctx, spec);
+    check_evidence_access(ctx, q.access.as_deref())?;
     if spec.limit == Some(0) {
         return Ok(Table::empty(vars.to_vec()));
     }

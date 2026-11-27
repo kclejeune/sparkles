@@ -981,12 +981,13 @@ pub fn ask_access(
     dataset: &str,
     branch: Option<&str>,
     me: &str,
+    review_policy: bool,
 ) -> AnswerAccess {
     let view_name = match branch.filter(|b| *b != sparkles::branch::MAIN) {
         Some(b) => format!("{dataset}@{b}"),
         None => dataset.to_string(),
     };
-    let mut access = answer_access(
+    let mut access = answer_access_for(
         snap,
         principal
             .view(&view_name, crate::auth::Endpoint::Query)
@@ -995,6 +996,8 @@ pub fn ask_access(
         dataset,
         branch,
         me,
+        "query",
+        review_policy,
     );
     access.info_access = if principal.can_at(
         &view_name,
@@ -1011,6 +1014,7 @@ pub fn ask_access(
             branch,
             me,
             "info",
+            review_policy,
         )))
     } else {
         InfoAccess::None
@@ -1021,6 +1025,7 @@ pub fn ask_access(
 /// The access record of an ask over `snap`, the state its answer read (`None` when
 /// that state cannot be opened, which keeps no footprint), read through `view`
 /// (`None`: unrestricted) by `principal` on the `query` endpoint.
+#[cfg(test)]
 pub fn answer_access(
     snap: Option<&Arc<sparkles::store::Snapshot>>,
     view: Option<&Arc<sparkles::access::GraphAccess>>,
@@ -1029,11 +1034,12 @@ pub fn answer_access(
     branch: Option<&str>,
     principal: &str,
 ) -> AnswerAccess {
-    answer_access_for(snap, view, caller, dataset, branch, principal, "query")
+    answer_access_for(snap, view, caller, dataset, branch, principal, "query", false)
 }
 
 /// [`answer_access`] for a named endpoint (`"query"` or `"info"`).
-pub fn answer_access_for(
+#[allow(clippy::too_many_arguments)]
+fn answer_access_for(
     snap: Option<&Arc<sparkles::store::Snapshot>>,
     view: Option<&Arc<sparkles::access::GraphAccess>>,
     caller: &sparkles::access::Caller,
@@ -1041,6 +1047,7 @@ pub fn answer_access_for(
     branch: Option<&str>,
     principal: &str,
     endpoint: &str,
+    review_policy: bool,
 ) -> AnswerAccess {
     use crate::graphrag::guard::{CaptureInput, capture, capture_guarded};
     use crate::graphrag::settings::is_guarded;
@@ -1090,6 +1097,8 @@ pub fn answer_access_for(
             caller,
             graphs,
             reports: &[],
+            snap: Some(snap.as_ref()),
+            review_policy,
         };
         if of_guarded {
             capture_guarded(&i).ok()
@@ -1123,7 +1132,7 @@ pub fn answer_visible(
     view: Option<&Arc<sparkles::access::GraphAccess>>,
     snap: &Arc<sparkles::store::Snapshot>,
 ) -> bool {
-    use crate::graphrag::guard::{Decision, covers, unrestricted};
+    use crate::graphrag::guard::{Decision, covers_with_evidence, unrestricted};
     let bound = view.map(|v| v.bound(snap));
     if unrestricted(bound.as_deref()) {
         return true;
@@ -1131,7 +1140,8 @@ pub fn answer_visible(
     // an answer stored without what it read is seen only by unrestricted readers
     let Some(a) = access else { return false };
     let Some(fp) = &a.footprint else { return false };
-    if covers(bound.as_deref(), fp) != Decision::Proven {
+    let is_support_gated = |g: &str| snap.is_evidence_output_or_unavailable(g);
+    if covers_with_evidence(bound.as_deref(), fp, is_support_gated) != Decision::Proven {
         return false;
     }
     // the guarded graphs it read: each readable, under the protections the asker had
@@ -1146,9 +1156,9 @@ pub fn answer_visible(
         })
     });
     readable
-        && a.guarded_footprint
-            .as_ref()
-            .is_some_and(|g| covers(bound.as_deref(), g) == Decision::Proven)
+        && a.guarded_footprint.as_ref().is_some_and(|g| {
+            covers_with_evidence(bound.as_deref(), g, is_support_gated) == Decision::Proven
+        })
 }
 
 /// The most characters of a stored text, and the most items of a stored list.

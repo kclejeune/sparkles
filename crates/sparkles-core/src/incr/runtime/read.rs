@@ -193,7 +193,7 @@ impl Runtime {
                 })
             }
             OpenedView::Rebuild(rebuild) => {
-                let whole = whole_reason(rebuild.access.as_ref())
+                let whole = key::whole_reason_on(rebuild.access.as_ref(), &rebuild.snap)
                     .map(str::to_string)
                     .or_else(|| rebuild.inference.as_ref().map(|i| i.reason().to_string()));
                 let mut c = Circuit::new(
@@ -338,7 +338,34 @@ impl Runtime {
                                 ));
                             }
                             Status::Ready => {
-                                if st.circuit.applied == r.at || r.allow_stale {
+                                let restricted = st
+                                    .circuit
+                                    .access
+                                    .as_ref()
+                                    .is_some_and(|a| !a.reads_everything());
+                                let ev_mismatch = if restricted {
+                                    r.snap.or(st.circuit.snap.as_ref()).is_some_and(|s| {
+                                        let (snap_gen, snap_ev) = s.evidence_visibility_stamp();
+                                        snap_ev.as_deref() != st.circuit.evidence_key()
+                                            || snap_ev.as_deref() == Some("unavailable")
+                                            || (s.pinned_evidence.is_none()
+                                                && snap_gen != st.circuit.managed_generation())
+                                    })
+                                } else {
+                                    false
+                                };
+                                if ev_mismatch {
+                                    // A pinned historical snapshot with a distinct evidence
+                                    // configuration evaluates directly rather than waiting
+                                    // for live head to change; otherwise let a runtime
+                                    // round refresh or fail closed on live head.
+                                    if let Some(snap) = r.snap
+                                        && snap.pinned_evidence.is_some()
+                                    {
+                                        return self
+                                            .prepare_rebuild(&st, open, snap, held, None, admit);
+                                    }
+                                } else if st.circuit.applied == r.at || r.allow_stale {
                                     let version = st.circuit.version.clone().ok_or_else(|| {
                                         crate::incr::error(
                                             "view-failed",
@@ -350,8 +377,7 @@ impl Runtime {
                                     })?;
                                     drop(st);
                                     return Ok(OpenedView::Shared(version));
-                                }
-                                if st.circuit.applied > r.at {
+                                } else if st.circuit.applied > r.at {
                                     return self.open_read_back(st, open, held, check, admit);
                                 }
                             }
@@ -402,7 +428,21 @@ impl Runtime {
         admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<OpenedView> {
         let r = &open.read;
-        let parts = st.history_rows_since(r.at, check, admit)?;
+        let restricted = st
+            .circuit
+            .access
+            .as_ref()
+            .is_some_and(|a| !a.reads_everything());
+        let ev_active = restricted
+            && (st.circuit.evidence_key().is_some()
+                || r.snap
+                    .or(st.circuit.snap.as_ref())
+                    .is_some_and(|s| s.has_evidence_projection_or_unavailable()));
+        let parts = if ev_active {
+            None
+        } else {
+            st.history_rows_since(r.at, check, admit)?
+        };
         if let Some(parts) = parts {
             let version = st.circuit.version.clone().ok_or_else(|| {
                 crate::incr::error(

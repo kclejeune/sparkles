@@ -1758,7 +1758,7 @@ fn caller_view(
     head: &Arc<crate::store::Snapshot>,
     preparation: &crate::access::Preparation,
 ) -> Result<Option<crate::access::PreparedView>> {
-    match access.filter(|a| a.hides_triples()) {
+    match access.filter(|a| !a.reads_everything()) {
         None => Ok(None),
         Some(a) => a
             .masked_controlled(head, preparation)
@@ -1770,13 +1770,13 @@ fn caller_view(
     }
 }
 
-/// The caller's controlled view over an evidence view when its access hides triples.
+/// The caller's controlled view over an evidence view when its access restricts reads.
 fn caller_view_evidence(
     access: Option<&Arc<GraphAccess>>,
     view: &sparkles_core::store::BoundEvidenceView,
     preparation: &crate::access::Preparation,
 ) -> Result<Option<crate::access::PreparedView>> {
-    match access.filter(|a| a.hides_triples()) {
+    match access.filter(|a| !a.reads_everything()) {
         None => Ok(None),
         Some(a) => view
             .prepare_view(a.clone(), preparation)

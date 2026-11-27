@@ -179,6 +179,8 @@ fn server_with(pattern: bool) -> AuthServer {
         caller: &p.caller(),
         graphs: &graphs,
         reports: &[REPORTS.to_string()],
+        snap: None,
+        review_policy: false,
     })
     .unwrap();
     let mut trig = format!(
@@ -1047,7 +1049,7 @@ async fn stored_answers_need_the_askers_view() {
     let at = chrono::Utc::now().to_rfc3339();
     let access = |asker: &str| {
         let p = guarded(&s, asker);
-        crate::assistant::ask_access(Some(&snap), &p, "rag", None, &p.id())
+        crate::assistant::ask_access(Some(&snap), &p, "rag", None, &p.id(), false)
     };
     // (reader, the view the answer was stored under, whether the reader sees it)
     let cases: &[(&str, Option<&str>, bool)] = &[

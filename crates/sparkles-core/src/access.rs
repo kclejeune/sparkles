@@ -219,6 +219,12 @@ impl<'a> GuardSnapshot<'a> {
     ) -> Result<R> {
         preparation.with_term(self.snap, id, f)
     }
+
+    /// Whether `graph_iri` is a review-policy projection output graph on this snapshot
+    /// or the snapshot's managed evidence configuration is unavailable (fail closed).
+    pub fn is_evidence_output_or_unavailable(&self, graph_iri: &str) -> bool {
+        self.snap.is_evidence_output_or_unavailable(graph_iri)
+    }
 }
 
 /// Graphs a guard keeps out of a set, except those it exempts by exact IRI.
@@ -838,9 +844,16 @@ impl GraphAccess {
     /// Prefer [`crate::store::Store::prepare_read`] or [`Self::masked_controlled`] for
     /// budgeted read paths so mask storage stays bound to a [`Preparation`].
     pub fn masked(&self, snap: &Arc<Snapshot>) -> Result<Arc<Snapshot>> {
-        match self.triples.as_ref().filter(|t| t.hides()) {
-            Some(t) if snap.mask.is_none() => triples::masked(self, t, snap),
-            _ => Ok(snap.clone()),
+        if snap.mask.is_some() {
+            return Ok(snap.clone());
+        }
+        let rules = self.triples.as_ref().filter(|t| t.hides());
+        if rules.is_some()
+            || (!self.reads_everything() && snap.has_evidence_projection_or_unavailable())
+        {
+            triples::masked(self, rules.map(Arc::as_ref), snap)
+        } else {
+            Ok(snap.clone())
         }
     }
 

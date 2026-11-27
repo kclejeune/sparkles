@@ -249,6 +249,12 @@ impl Store {
         self.enable_managed_checked(owner, entry, settings, Some(expected))
     }
 
+    /// Monotonic counter incremented on every managed-graph registry publication or
+    /// availability transition for this store's family, including same-commit changes.
+    pub fn managed_generation(&self) -> u64 {
+        self.family.managed_generation()
+    }
+
     /// The installed registry revision, or zero before its first publication.
     /// Reads one in-memory snapshot and never takes a dataset writer.
     pub fn managed_revision(&self) -> Result<u64> {
@@ -686,8 +692,7 @@ impl Store {
         let graphs = next.graphs.clone();
         // 4. main and every branch admit against the new registry from here on
         self.family
-            .managed
-            .store(Some(Arc::new(ManagedState::Installed(next))));
+            .store_managed(Some(Arc::new(ManagedState::Installed(next))));
         fence.armed = false;
         drop(w);
         self.managed_barrier()?;
@@ -815,7 +820,7 @@ impl Store {
         &self,
         graphs: impl Iterator<Item = &'k [u8]>,
     ) -> Result<()> {
-        let state = self.family.managed.load();
+        let state = self.family.managed.load_full();
         let Some(admission) = Admission::start(state.as_ref(), None)? else {
             return Ok(());
         };
@@ -918,7 +923,7 @@ impl Store {
                 .find(|(n, _)| *n == owner.settings_file())
                 .map(|(_, b)| b.clone()))
         });
-        self.family.managed.store(Some(Arc::new(state)));
+        self.family.store_managed(Some(Arc::new(state)));
     }
 }
 
@@ -943,8 +948,7 @@ impl Drop for UncertainRegistry<'_> {
         if self.armed {
             tracing::error!(target: "sparkles::store", "a managed-graph registry change did not complete; writes are refused until it is made again");
             self.family
-                .managed
-                .store(Some(Arc::new(ManagedState::Unavailable {
+                .store_managed(Some(Arc::new(ManagedState::Unavailable {
                     reason: "a change of the registry did not complete; enable the owner again"
                         .into(),
                     repairable: true,
