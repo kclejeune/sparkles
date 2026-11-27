@@ -1055,3 +1055,95 @@ fn controlled_diagnostic_row_memory_limit_is_incomplete_not_absent() {
     assert_eq!(report.checks[0].status, CheckStatus::Error);
     assert!(report.findings.is_empty());
 }
+
+/// A refused report charge leaves an incomplete report whose retained scope is
+/// admitted by the memory parent. A scope that cannot be admitted, and a refusal of
+/// the shared server memory, fail the report.
+#[test]
+fn controlled_diagnostic_scaffold_refusal_retains_only_an_admitted_scope() {
+    use sparkles_core::sparql::pool::QueryPool;
+    use sparkles_reasoner::MemoryLimitExceeded;
+    use sparkles_reasoner::diagnostics::{DiagnosticControls, diagnose_controlled_guarded};
+    let store = store("ex:tom a ex:Cat, ex:Dog . ex:Cat owl:disjointWith ex:Dog .");
+    let graphs: Vec<String> = (0..512)
+        .map(|i| format!("http://ex.org/graph/{i}/{}", "g".repeat(200)))
+        .collect();
+    let scope: usize = graphs.iter().map(|g| g.len() * 2 + 32).sum();
+    let options = DiagnoseOptions {
+        checks: vec!["disjoint-classes".into(), "same-different".into()],
+        graphs: graphs.clone(),
+        prefixes: (0..64)
+            .map(|i| {
+                (
+                    format!("p{i}"),
+                    format!("http://ex.org/{i}/{}/", "p".repeat(200)),
+                )
+            })
+            .collect(),
+        ..opts()
+    };
+    let pool = QueryPool::new(64 << 20);
+    let controls = |max_memory: Option<u64>| DiagnosticControls {
+        max_memory,
+        memory_parent: Some(pool.work_parent()),
+        ..Default::default()
+    };
+
+    // The local limit refuses the report's fixed part but admits its scope.
+    let (report, memory) = diagnose_controlled_guarded(
+        store.snapshot(),
+        &options,
+        None,
+        &controls(Some(scope as u64 + 1024)),
+    )
+    .unwrap();
+    assert_eq!(report.status, ReportStatus::Incomplete);
+    assert_eq!(report.checks.len(), 2);
+    assert!(
+        report
+            .checks
+            .iter()
+            .all(|c| c.status == CheckStatus::Error && c.error.is_some()),
+        "{:?}",
+        report.checks
+    );
+    assert!(report.findings.is_empty());
+    assert_eq!(report.graphs, graphs);
+    assert!(
+        pool.granted() >= scope as u64,
+        "the retained scope of {scope} bytes is not admitted: {} granted",
+        pool.granted()
+    );
+    drop(memory);
+    drop(report);
+    assert_eq!(pool.granted(), 0, "the report's credit was not returned");
+
+    // The local limit cannot admit the scope either, so the report fails.
+    let error =
+        diagnose_controlled_guarded(store.snapshot(), &options, None, &controls(Some(1024)))
+            .unwrap_err();
+    assert!(
+        error.downcast_ref::<MemoryLimitExceeded>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(pool.granted(), 0);
+
+    // A refusal of the shared server memory fails the report.
+    let blocker = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let error =
+        diagnose_controlled_guarded(store.snapshot(), &options, None, &controls(None)).unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<sparkles_core::Error>(),
+            Some(sparkles_core::Error::BudgetExceeded(
+                sparkles_core::Budget {
+                    kind: sparkles_core::BudgetKind::ServerMemory,
+                    ..
+                }
+            ))
+        ),
+        "{error:#}"
+    );
+    drop(blocker);
+    assert_eq!(pool.granted(), 0);
+}

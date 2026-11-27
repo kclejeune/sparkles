@@ -2367,8 +2367,10 @@ sticky failure. After such a refusal the row's expression gives up as it does af
 sticky failure, so it evaluates no arm that the ordinary evaluation skips and interns no
 discarded value. The map, its reservation and the batch's scratch are then released before
 any row is evaluated again. The misses that finished keep their values and are not
-evaluated again, so a large transient allocation of an early row, such as the decode of a
-long triple term, is not met a second time after later rows' results are retained. Each
+evaluated again, so a large transient allocation of a finished miss, such as the decode of
+a long triple term, is not met a second time after later rows' results are retained. A
+miss that had not finished is evaluated again, including an earlier row whose miss was
+refused while a later row's miss finished on another worker. Each
 remaining key is evaluated the ordinary way at its first row, in row order, where it meets
 the retained terms that the evaluation without the map has at that row, and a refusal
 there fails the query as it would without the map. On one worker a batch therefore fits

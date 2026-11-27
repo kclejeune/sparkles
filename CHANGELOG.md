@@ -1054,10 +1054,14 @@ evaluated every row. A map that stops paying is released, and the sketch and the
 charged to the query's memory budget, about 128 KiB and 6 MiB when full. A refused batch
 charge releases them and evaluates the batch the ordinary way. A refusal of memory that
 the evaluation of the map's misses meets beside the map, including the terms it interns on
-the way to its result, releases them too. The misses that finished keep their values, and
-the remaining keys are evaluated the ordinary way in row order, so the batch never repeats
-an earlier row's transient allocation, such as the decode of a long triple term, after
-later rows' results are retained. After such a refusal the miss gives up as it would after
+the way to its result, releases them too. The misses that finished keep their values and
+are not evaluated again, and the remaining keys are evaluated the ordinary way in row
+order. A finished miss's transient allocation, such as the decode of a long triple term,
+is therefore not met a second time after later rows' results are retained. A miss that had
+not finished is evaluated again, and on several workers a later miss can finish while an
+earlier one is refused, so the earlier row's work repeats beside the later result. Item
+1322 tracks the case where such a retried row repeats a large transient allocation beside
+an intermediate term that it had already interned. After such a refusal the miss gives up as it would after
 a query's memory failure, so it evaluates no `COALESCE`, `IF` or other arm that the
 ordinary evaluation skips. A BIND that ends its input releases
 them for the operators above it. Expressions that can construct a geometry never enter

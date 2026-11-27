@@ -863,30 +863,34 @@ fn diagnose_impl(
         .map_err(|bad| anyhow::anyhow!("unknown diagnostics check '{bad}'"))?;
     // The report's fixed part is charged like a finding. A refusal of the shared
     // server memory fails the report, and a refusal of its own limit leaves every
-    // check with an error, so the report is incomplete rather than absent.
+    // check with an error, so the report is incomplete rather than absent. The
+    // incomplete report builds no prefix map and keeps the caller's graph list only
+    // when a charge for that list alone is admitted, since the report's scope must
+    // name the checked graphs. A refused scope charge fails the report.
     let mut scaffold_error = None;
-    if let Some(held) = report_held
-        && let Err(e) = held.borrow_mut().try_grow(
-            4096 + opts.graphs.iter().map(|g| g.len() * 2 + 32).sum::<usize>()
-                + opts
-                    .prefixes
-                    .iter()
-                    .map(|(p, v)| p.len() + v.len() + 128)
-                    .sum::<usize>(),
-        )
-    {
-        match (&e, e.core_error()) {
-            (crate::budget::BudgetFailure::Local(_), _) => scaffold_error = Some(e.to_string()),
-            (
-                _,
-                Some(
-                    error @ Error::BudgetExceeded(sparkles_core::Budget {
-                        kind: sparkles_core::BudgetKind::Memory,
-                        ..
-                    }),
-                ),
-            ) => scaffold_error = Some(error.to_string()),
-            _ => return Err(e.into()),
+    if let Some(held) = report_held {
+        let scope = opts.graphs.iter().map(|g| g.len() * 2 + 32).sum::<usize>();
+        let names = opts
+            .prefixes
+            .iter()
+            .map(|(p, v)| p.len() + v.len() + 128)
+            .sum::<usize>();
+        let mut held = held.borrow_mut();
+        if let Err(e) = held.try_grow(4096 + scope + names) {
+            match (&e, e.core_error()) {
+                (crate::budget::BudgetFailure::Local(_), _) => scaffold_error = Some(e.to_string()),
+                (
+                    _,
+                    Some(
+                        error @ Error::BudgetExceeded(sparkles_core::Budget {
+                            kind: sparkles_core::BudgetKind::Memory,
+                            ..
+                        }),
+                    ),
+                ) => scaffold_error = Some(error.to_string()),
+                _ => return Err(e.into()),
+            }
+            held.try_grow(scope)?;
         }
     }
     let limit = opts.limit.clamp(1, MAX_LIMIT);
@@ -897,8 +901,14 @@ fn diagnose_impl(
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    let mut prefixes: BTreeMap<String, String> = sparkles_core::io::standard_prefixes();
-    prefixes.extend(opts.prefixes.iter().cloned());
+    // every check of an incomplete scaffold stops before it names a term
+    let prefixes: BTreeMap<String, String> = if scaffold_error.is_some() {
+        BTreeMap::new()
+    } else {
+        let mut prefixes = sparkles_core::io::standard_prefixes();
+        prefixes.extend(opts.prefixes.iter().cloned());
+        prefixes
+    };
     let names = Names::new(&prefixes);
     let mut outcomes = Vec::new();
     let mut findings = Vec::new();

@@ -199,7 +199,7 @@ ownership boundaries given below, and the rows are serial.
 | After 825 | Item 826 starts. Item 240 has shipped on item 534's measurement. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
 | After 827 and 825 | Item 829 starts. | Its leaf cursors land in the admission code that item 827 changes, and its operators that build over their input take item 825's hash kernel. |
 | After 240 | Item 828 can start, and item 534 opens the cursor in the producer's task. | The writers take the buffer that item 240 gave the cursor writers. |
-| After 293 | The expression memo phase is numbered and starts. | Its admission policy is item 293's open question. |
+| After 293 | The expression memo phase is numbered and starts. | Item 293 has settled the admission policy that the memo adopts, and the memo waits for the confirmation of the landed build against its base on forge that keeps item 293 open. |
 | After 825 to 829, 512, 243, 293, 534 and the remaining work of item 7 | The merge phase is numbered and starts. | The merge deletes the eager executor, so every kernel it keeps must already be one, and the reference evaluator must already be the oracle. |
 | After the merge | The frontier kernel and the demand seeding phases are numbered and start, and so does [X15](../X15-join-algorithms-and-estimation/README.md). | Neither blocks the merge, and new algorithms land in one executor. |
 
@@ -509,9 +509,13 @@ every copy once they are one.
 
 This phase replaces `exprcache`'s per-value reuse, the `Reuse` of `cursor/bind.rs` and the
 EXISTS memo of `expr.rs` with one charged memo keyed by expression and input value, with
-one admission policy fed by observed repetition. It waits for item 293, whose question is
-the admission policy for sparse reuse, and gets its number when item 293 settles it. The
-memo's charge is a retained charge of stage 4, its bound is the EXISTS memo's eighth of
+one admission policy fed by observed repetition. Item 293 has settled the admission policy
+for sparse reuse, as the [X14 Outcome](SPEC.md#cursor-bind-reuse-admission-item-293)
+records, and the memo adopts that policy. Item 293 stays open until forge confirms the
+landed build against its base, and that confirmation gates this phase, because a cost it
+finds could still change the policy that the memo adopts. The phase gets its number when
+item 293 closes, and the recoveries of item 1319 that the Outcome places before it land
+first. The memo's charge is a retained charge of stage 4, its bound is the EXISTS memo's eighth of
 the budget, and its oracle is the differential test of stage 4 that compares reuse with
 row-by-row evaluation on both sides of the 16,384-row threshold.
 
