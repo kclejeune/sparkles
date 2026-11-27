@@ -192,14 +192,23 @@ impl Host for OpenHost {
     }
 }
 
+#[derive(Default)]
+struct InstalledHost {
+    seq: u64,
+    host: Option<Arc<dyn Host>>,
+}
+
 /// The views and live queries of one dataset.
 pub struct Runtime {
     opts: RwLock<RuntimeOptions>,
     root: Option<PathBuf>,
     dataset: uuid::Uuid,
     pool: Option<Arc<QueryPool>>,
-    host: RwLock<Option<Arc<dyn Host>>>,
+    host: RwLock<InstalledHost>,
     reg: Mutex<Registry>,
+    /// Atomic mirror of `reg.mode_gen` updated under `reg` so readers and rounds can
+    /// detect a newer recorded mode generation without reacquiring `reg` under `cell.state`.
+    mode_gen: AtomicU64,
     /// The definitions as backups and clones capture them, replaced while `reg` is
     /// held after every change. A leaf lock: a capture reads it under the store's
     /// writer lock, and nothing that holds it waits for another lock.
@@ -230,6 +239,12 @@ pub struct Runtime {
     /// without a commit, so a live query resumed at or before it gets the whole result,
     /// even when its circuit was collected and created again since.
     switched: AtomicU64,
+    /// Test hook invoked in `open_view` between releasing `reg` and acquiring `cell.state`.
+    #[cfg(test)]
+    after_reg_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test counter incremented whenever `round` waits on a busy cell in Pass 2.
+    #[cfg(test)]
+    busy_waits: AtomicUsize,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -261,8 +276,9 @@ impl Runtime {
             root,
             dataset,
             pool,
-            host: RwLock::new(None),
+            host: RwLock::new(InstalledHost::default()),
             reg: Mutex::new(reg),
+            mode_gen: AtomicU64::new(0),
             defs,
             epoch: Mutex::new(0),
             cv: Condvar::new(),
@@ -280,6 +296,10 @@ impl Runtime {
             deferred_close: AtomicBool::new(false),
             seen: AtomicU64::new(0),
             switched: AtomicU64::new(0),
+            #[cfg(test)]
+            after_reg_hook: Mutex::new(None),
+            #[cfg(test)]
+            busy_waits: AtomicUsize::new(0),
         })
     }
 
@@ -300,24 +320,39 @@ impl Runtime {
     /// next round.
     pub fn set_host(&self, host: Arc<dyn Host>) {
         let _operation = Operation::enter();
-        *self.host.write() = Some(host);
+        let old = {
+            let mut slot = self.host.write();
+            slot.seq += 1;
+            slot.host.replace(host)
+        };
+        drop(old);
         self.kick();
+    }
+
+    pub(super) fn current_host(&self) -> (u64, Option<Arc<dyn Host>>) {
+        let slot = self.host.read();
+        (slot.seq, slot.host.clone())
+    }
+
+    pub(super) fn host_seq(&self) -> u64 {
+        self.host.read().seq
     }
 
     /// The host, or a host without access control before one is set.
     fn host_or_open(&self) -> Arc<dyn Host> {
         self.host
             .read()
+            .host
             .clone()
             .unwrap_or_else(|| Arc::new(OpenHost))
     }
 
     pub fn has_host(&self) -> bool {
-        self.host.read().is_some()
+        self.host.read().host.is_some()
     }
 
     fn host(&self) -> Result<Arc<dyn Host>> {
-        self.host.read().clone().ok_or_else(|| {
+        self.host.read().host.clone().ok_or_else(|| {
             super::error(
                 "views-unavailable",
                 "the views of this dataset have not started",

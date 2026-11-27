@@ -1737,28 +1737,37 @@ never holds the registry lock across another view's running pass or waits past i
 deadline or cancellation.
 
 The registry tracks a monotonically increasing mode generation alongside the dataset's
-inference and aggregate-error reading, and each circuit records the mode generation it
-was compiled for in both its slot and its leaf info block. Recording a host mode change
-updates the registry's target mode and generation without locking any circuit state.
-Idle circuits recompile outside the registry lock and drop their replaced operators and
-retired budget leases outside all locks. The worker's round processes idle circuits in
-a first pass before waiting on busy circuits, so a concurrent pass or live-query build
-on one view does not delay switching and rebuilding unrelated views. View reads check
-the registry's mode and the circuit's mode generation in bounded cooperative steps,
-honor deadlines with `Timeout` and cancellation with `Cancelled` even when `allowStale`
+inference, aggregate-error reading, and host installation sequence, mirroring the mode
+generation atomically on the runtime. Recording a host mode change samples the installed
+host under the registry lock without locking any circuit state and retries if a
+replacement host is installed concurrently so an older host cannot supersede a newer one.
+Idle circuits recompile outside the registry lock, and both worker rounds and live-query
+joins drop replaced operators and retired budget leases outside all locks before starting
+a replacement build. Worker rounds process idle circuits in a first pass before waiting
+on busy circuits in bounded steps that rotate out to a new round when the host mode
+changes, and drop their busy-cell references before garbage collection and checkpointing.
+View reads revalidate the runtime mode generation inside the circuit lock before accepting
+a version or preparing a fallback, bound wait loops independently of unrelated round
+completions, honor deadlines with `Timeout` and cancellation with `Cancelled` on both
+streaming (`open_view`) and eager (`read_view_with_check`) paths even when `allowStale`
 is set, refuse missing views immediately with `view-not-found`, and never return rows
 from an earlier mode. Metadata calls (`get`, `list`, and `wait_built`) report lagging
-busy circuits as `building` without blocking on their running passes, and garbage
-collection preserves the live-query switch boundary when dropping an unswitched dead
-circuit.
+busy circuits as `building` without exposing an obsolete plan or row count, bound
+`wait_built` registry access and waiting to its timeout without synchronous recompilation,
+and garbage collection preserves the live-query switch boundary when dropping an
+unswitched dead circuit.
 
-Deterministic tests pause the worker inside an unrelated view's pass through the
-`view-pass-applied` failpoint across both aggregate-error and RDFS-on-read mode changes
-and check that `read`, `open_view`, `get`, `list`, and `wait_built` respect deadlines
-and cancellation without returning old-mode rows, while reads succeed once the pass
-ends. Additional tests verify that holding one circuit's state lock outside the worker
-does not block switching and reading unrelated views and that streaming and eager
-`SERVICE view:read` queries honor timeouts and cancellation across mode changes.
+Deterministic tests cover each boundary: a failpoint test pauses the worker inside an
+unrelated view's changed pass (`view-pass-applied`) across aggregate-error and
+RDFS-on-read changes to verify `read`, `open_view`, `get`, `list`, and `wait_built`; a
+busy-cell rotation test starts a round under the old mode while an unrelated cell lock is
+held, confirms Pass 2 waits on that cell before toggling the mode, and checks that idle
+views still switch and rebuild; a worker-pause cursor test uses a hooked `ViewSource` to
+verify streaming and eager `SERVICE view:read` timeouts and mid-wait cancellation; and
+targeted runtime regressions cover tight-pool pre-rebuild credit release on worker and
+live paths, busy-cell release before GC and checkpointing, reader revalidation across a
+registry-to-state barrier, host replacement ordering, held-registry `wait_built` timeouts,
+and wait-loop expiration under continuous epoch advances.
 
 ### Scope changes
 

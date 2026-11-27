@@ -1784,12 +1784,87 @@ fn view_cursor_honors_deadline_and_cancel_across_mode_change() {
         assert!(t0.elapsed() < Duration::from_secs(2));
     }
 
+    // Helper wrapping `Runtime` so cancellation tests synchronize deterministically on
+    // entering the `open_view` / `read_view_with_check` wait loop rather than sleeping.
+    #[derive(Debug)]
+    struct HookedViewSource {
+        inner: Arc<Runtime>,
+        entered: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+    impl HookedViewSource {
+        fn new(inner: Arc<Runtime>) -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (
+                Arc::new(Self {
+                    inner,
+                    entered: parking_lot::Mutex::new(Some(tx)),
+                }),
+                rx,
+            )
+        }
+        fn signal(&self) {
+            if let Some(tx) = self.entered.lock().take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+    impl sparkles_core::sparql::viewsvc::ViewSource for HookedViewSource {
+        fn read_view(
+            &self,
+            r: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
+        ) -> Result<sparkles_core::sparql::viewsvc::ViewRows> {
+            self.inner.read(r)
+        }
+        fn read_view_with_check(
+            &self,
+            r: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<sparkles_core::sparql::viewsvc::ViewRows> {
+            let calls = std::cell::Cell::new(0usize);
+            self.inner.read_with_check(r, &|| {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n >= 2 {
+                    self.signal();
+                }
+                check()
+            })
+        }
+        fn streams_views(&self) -> bool {
+            true
+        }
+        fn open_view(
+            &self,
+            open: &sparkles_core::sparql::viewsvc::ViewOpen<'_>,
+            check: &dyn Fn() -> Result<()>,
+            admit: &mut dyn FnMut(u64) -> Result<()>,
+        ) -> Result<sparkles_core::sparql::viewsvc::OpenedView> {
+            let calls = std::cell::Cell::new(0usize);
+            self.inner.open_view(
+                open,
+                &|| {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    if n >= 2 {
+                        self.signal();
+                    }
+                    check()
+                },
+                admit,
+            )
+        }
+        fn view_reading(&self, name: &str, deadline: Option<Instant>) -> Option<AggregateErrors> {
+            self.inner.view_reading(name, deadline)
+        }
+    }
+
     // 2. Streaming cursor cancelled mid-wait fails promptly with Cancelled.
     {
+        let (hooked, entered_rx) = HookedViewSource::new(rt.clone());
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_bg = cancel.clone();
         let opts = QueryOptions {
-            views: Some(rt.clone()),
+            views: Some(hooked),
             aggregate_errors: Some(AggregateErrors::Sparkles),
             timeout: Some(Duration::from_secs(10)),
             cancel: Some(cancel),
@@ -1801,13 +1876,16 @@ fn view_cursor_honors_deadline_and_cancel_across_mode_change() {
             let mut cursor = select_cursor(snap, &q, &opts, &strict(8)).unwrap();
             cursor.next_batch().err()
         });
-        std::thread::sleep(Duration::from_millis(25));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("streaming cursor did not enter open_view wait");
         cancel_bg.store(true, Ordering::Relaxed);
         let err = handle.join().unwrap().expect("expected cancellation");
         assert!(matches!(err, Error::Cancelled), "got {err:?}");
     }
 
-    // 3. Eager query with a short timeout fails promptly with Timeout.
+    // 3. Eager query with a short timeout fails promptly with Timeout, and eager query
+    // cancelled mid-wait fails promptly with Cancelled.
     {
         let t0 = Instant::now();
         let opts = QueryOptions {
@@ -1821,6 +1899,27 @@ fn view_cursor_honors_deadline_and_cancel_across_mode_change() {
             .expect("expected eager timeout");
         assert!(matches!(err, Error::Timeout), "got {err:?}");
         assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+    {
+        let (hooked, entered_rx) = HookedViewSource::new(rt.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_bg = cancel.clone();
+        let opts = QueryOptions {
+            views: Some(hooked),
+            aggregate_errors: Some(AggregateErrors::Sparkles),
+            timeout: Some(Duration::from_secs(10)),
+            cancel: Some(cancel),
+            ..Default::default()
+        };
+        let snap = s.snapshot();
+        let q = q_people.clone();
+        let handle = std::thread::spawn(move || query(snap, &q, &opts).err());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("eager query did not enter view wait");
+        cancel_bg.store(true, Ordering::Relaxed);
+        let err = handle.join().unwrap().expect("expected eager cancellation");
+        assert!(matches!(err, Error::Cancelled), "got {err:?}");
     }
 
     // Release the worker and confirm subsequent streaming and eager reads return the

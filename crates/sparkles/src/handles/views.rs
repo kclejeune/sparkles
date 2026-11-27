@@ -108,6 +108,20 @@ impl ViewSource for Source {
         drop(state);
         rt.read(r)
     }
+    fn read_view_with_check(
+        &self,
+        r: &ViewRead<'_>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<ViewRows> {
+        let state = self
+            .state
+            .try_upgrade()?
+            .ok_or_else(|| Error::invalid("the dataset is closed"))?;
+        start(&state, None);
+        let rt = state.views.clone();
+        drop(state);
+        rt.read_with_check(r, check)
+    }
     fn streams_views(&self) -> bool {
         true
     }

@@ -28,6 +28,7 @@ pub(super) struct LiveRegistration {
 #[derive(Clone)]
 pub(super) struct TargetMode {
     pub(super) generation: u64,
+    pub(super) host_seq: u64,
     pub(super) inference: Option<Arc<Inference>>,
     pub(super) aggregate_errors: crate::sparql::AggregateErrors,
 }
@@ -39,6 +40,8 @@ pub(super) struct Registry {
     /// monotonically increasing generation bumped whenever `inference` or
     /// `aggregate_errors` changes
     pub(super) mode_gen: u64,
+    /// highest `InstalledHost::seq` whose mode has been recorded on `reg`
+    pub(super) host_seq: u64,
     /// highest `mode_gen` known to have been applied to every cell in `cells`
     pub(super) switched_gen: u64,
     /// the dataset's inference that every circuit is compiled for
@@ -133,6 +136,7 @@ impl Registry {
     pub(super) fn target_mode(&self) -> TargetMode {
         TargetMode {
             generation: self.mode_gen,
+            host_seq: self.host_seq,
             inference: self.inference.clone(),
             aggregate_errors: self.aggregate_errors,
         }

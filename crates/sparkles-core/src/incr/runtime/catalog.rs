@@ -39,7 +39,7 @@ impl Runtime {
         let (res, target, lagging) = {
             let mut reg = self.reg.lock();
             reg.writable()?;
-            let (target, lagging) = self.note_mode(&mut reg, host.as_ref());
+            let (target, lagging) = self.note_mode(&mut reg);
             // a new definition is the operator's: it runs, and no longer waits for a check
             if let Some(root) = &self.root {
                 views::write(root, name, &def)?;
@@ -170,8 +170,8 @@ impl Runtime {
             crate::incr::ops::Mode::Incremental
         });
         v.evaluation_reason = whole;
-        v.plan = Some(i.plan);
-        v.rows = i.rows;
+        v.plan = (!stale_mode).then_some(i.plan);
+        v.rows = if stale_mode { 0 } else { i.rows };
         v.state_bytes = i.bytes;
         v.passes = i.passes;
         v.skipped = i.skipped;
@@ -237,36 +237,50 @@ impl Runtime {
     pub fn wait_built(&self, name: &str, timeout: Duration) -> Result<ViewInfo> {
         let _operation = Operation::enter();
         let until = Instant::now() + timeout;
+        let mut last_info: Option<ViewInfo> = None;
+        let mut final_check = false;
         loop {
             let round_start = *self.epoch.lock();
-            self.sync_mode_nonblocking();
-            let (cell, err, mode_gen) = {
-                let reg = self.reg.lock();
-                let e = reg.view(name)?;
-                (
-                    e.cell.clone(),
-                    e.suspended.clone().or_else(|| e.error.clone()),
-                    reg.mode_gen,
-                )
+            let now = Instant::now();
+            let reg_guard = if final_check || now >= until {
+                self.reg.try_lock()
+            } else {
+                self.reg.try_lock_until((now + read::WAIT_STEP).min(until))
             };
-            if err.is_some() {
-                break;
+            let observed = if let Some(mut reg) = reg_guard {
+                self.record_mode(&mut reg);
+                let e = reg.view(name)?;
+                let mode_gen = reg.mode_gen;
+                let head = e.cell.as_ref().map_or(0, |c| c.info.lock().applied);
+                let info = self.info(name, e, head, &reg);
+                let done = e.suspended.is_some()
+                    || e.error.is_some()
+                    || e.cell.as_ref().is_some_and(|c| {
+                        let i = c.info.lock();
+                        i.mode_gen >= mode_gen && i.status != Status::Building
+                    });
+                Some((info, done))
+            } else {
+                None
+            };
+            if let Some((info, done)) = observed {
+                if done {
+                    return Ok(info);
+                }
+                last_info = Some(info);
             }
-            if cell.is_some_and(|c| {
-                let i = c.info.lock();
-                i.mode_gen >= mode_gen && i.status != Status::Building
-            }) {
-                break;
+            if final_check || Instant::now() >= until {
+                return last_info.ok_or(Error::Timeout);
             }
             self.kick();
             let step = (Instant::now() + read::WAIT_STEP).min(until);
-            if !self.wait_round_since(round_start, step) && Instant::now() >= until {
-                break;
+            let woke = self.wait_round_since(round_start, step);
+            if Instant::now() >= until {
+                if !woke {
+                    return last_info.ok_or(Error::Timeout);
+                }
+                final_check = true;
             }
         }
-        let reg = self.reg.lock();
-        let e = reg.view(name)?;
-        let head = e.cell.as_ref().map_or(0, |c| c.info.lock().applied);
-        Ok(self.info(name, e, head, &reg))
     }
 }

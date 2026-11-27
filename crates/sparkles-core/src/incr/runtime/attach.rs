@@ -260,13 +260,16 @@ impl Runtime {
     }
 
     pub(super) fn attach_pending(&self, store: &Store) {
-        let Some(host) = self.host.read().clone() else {
+        if !self.has_host() {
             return;
-        };
+        }
         let mut deferred = DeferredDrops::default();
         {
             let mut reg = self.reg.lock();
-            let _ = self.note_mode(&mut reg, host.as_ref());
+            let _ = self.note_mode(&mut reg);
+            let (_, Some(host)) = self.current_host() else {
+                return;
+            };
             let epoch = host.epoch();
             if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
                 // grants may have changed: resolve every view's principal again
@@ -296,32 +299,81 @@ impl Runtime {
         drop(deferred);
     }
 
-    /// Record any change of the host's inference or aggregate-error reading on `reg`
-    /// without acquiring any circuit state lock, returning the current target mode and
-    /// any circuits whose mode generation lags behind it.
-    pub(super) fn note_mode(
-        &self,
-        reg: &mut Registry,
-        host: &dyn Host,
-    ) -> (TargetMode, Vec<Arc<Cell>>) {
-        let now = host.inference();
-        let errors = host.aggregate_errors();
-        if !Inference::same(reg.inference.as_deref(), now.as_ref())
-            || errors != reg.aggregate_errors
-        {
-            let now = now.map(Arc::new);
-            tracing::info!(
-                target: "sparkles::incr::runtime",
-                "the dataset's inference ({}) or aggregate errors ({errors}) changed: {} circuits evaluate again",
-                now.as_ref().map_or("none", |i| i.reason()),
-                reg.cells.len()
-            );
-            reg.mode_gen += 1;
-            reg.inference = now;
-            reg.aggregate_errors = errors;
-            let boundary = self.seen.load(Ordering::Acquire);
-            self.switched.fetch_max(boundary, Ordering::AcqRel);
+    /// Record any change of the currently installed host's inference or aggregate-error
+    /// reading on `reg` without acquiring any circuit state lock.
+    pub(super) fn record_mode(&self, reg: &mut Registry) {
+        loop {
+            let (seq, Some(host)) = self.current_host() else {
+                return;
+            };
+            let now = host.inference();
+            let errors = host.aggregate_errors();
+            // Retry if a replacement host was installed while sampling.
+            if self.host_seq() != seq {
+                continue;
+            }
+            if seq < reg.host_seq {
+                return;
+            }
+            reg.host_seq = seq;
+            if !Inference::same(reg.inference.as_deref(), now.as_ref())
+                || errors != reg.aggregate_errors
+            {
+                let now = now.map(Arc::new);
+                tracing::info!(
+                    target: "sparkles::incr::runtime",
+                    "the dataset's inference ({}) or aggregate errors ({errors}) changed: {} circuits evaluate again",
+                    now.as_ref().map_or("none", |i| i.reason()),
+                    reg.cells.len()
+                );
+                reg.mode_gen += 1;
+                reg.inference = now;
+                reg.aggregate_errors = errors;
+                self.mode_gen.store(reg.mode_gen, Ordering::Release);
+                let boundary = self.seen.load(Ordering::Acquire);
+                self.switched.fetch_max(boundary, Ordering::AcqRel);
+            }
+            return;
         }
+    }
+
+    /// Whether a newer mode generation has been recorded, a replacement host was
+    /// installed, or the installed host reports a different inference or aggregate-error
+    /// setting than `target`.
+    pub(super) fn mode_changed_since(&self, target: &TargetMode) -> bool {
+        if self.mode_gen.load(Ordering::Acquire) != target.generation {
+            return true;
+        }
+        loop {
+            let (seq, Some(host)) = self.current_host() else {
+                return false;
+            };
+            if seq != target.host_seq {
+                return true;
+            }
+            let errors = host.aggregate_errors();
+            let inference = host.inference();
+            if self.host_seq() != seq {
+                continue;
+            }
+            if errors != target.aggregate_errors {
+                return true;
+            }
+            if Inference::same(target.inference.as_deref(), inference.as_ref()) {
+                return false;
+            }
+            return match (target.inference.as_deref(), inference.as_ref()) {
+                (Some(a), Some(b)) => a.key() != b.key(),
+                _ => true,
+            };
+        }
+    }
+
+    /// Record any change of the currently installed host's inference or aggregate-error
+    /// reading on `reg` without acquiring any circuit state lock, returning the current
+    /// target mode and any circuits whose mode generation lags behind it.
+    pub(super) fn note_mode(&self, reg: &mut Registry) -> (TargetMode, Vec<Arc<Cell>>) {
+        self.record_mode(reg);
         let target = reg.target_mode();
         if reg.switched_gen < reg.mode_gen {
             let lagging: Vec<Arc<Cell>> = reg
@@ -377,8 +429,7 @@ impl Runtime {
                 c
             }
             Err(e) => {
-                self.fail(cell, st, &e, deferred);
-                cell.info.lock().mode_gen = target.generation;
+                self.fail_at_mode_gen(cell, st, &e, Some(target.generation), deferred);
                 deferred.retired.extend(st.circuit.drain_retired());
                 return true;
             }
@@ -406,6 +457,7 @@ impl Runtime {
         info.whole = st.whole_reason(target.inference.as_deref());
         if info.status == Status::Ready {
             info.status = Status::Building;
+            info.rows = 0;
         }
         true
     }
@@ -433,13 +485,13 @@ impl Runtime {
     /// registry lock, leaving any busy circuit for the worker so callers never block on
     /// an unrelated running pass.
     pub(super) fn sync_mode_nonblocking(&self) {
-        let Some(host) = self.host.read().clone() else {
+        if !self.has_host() {
             return;
-        };
+        }
         let mut deferred = DeferredDrops::default();
         let (target, lagging) = {
             let mut reg = self.reg.lock();
-            self.note_mode(&mut reg, host.as_ref())
+            self.note_mode(&mut reg)
         };
         if !lagging.is_empty() {
             let any_busy = self.try_switch_cells(&lagging, &target, &mut deferred);
@@ -759,7 +811,18 @@ mod switch_tests {
             ),
         ] {
             // Deterministically pause the worker inside `slow`'s pass while it holds
-            // `slow`'s state lock (and does not hold the registry lock).
+            // `slow`'s state lock (and does not hold the registry lock). Checking
+            // `slow_cell.state.try_lock().is_none()` ensures the failpoint fires on
+            // `slow`'s changed pass rather than an earlier cell's skipped pass.
+            let slow_cell = rt
+                .reg
+                .lock()
+                .views
+                .get("slow")
+                .unwrap()
+                .cell
+                .clone()
+                .unwrap();
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let armed = Arc::new(AtomicBool::new(true));
@@ -767,7 +830,7 @@ mod switch_tests {
             s.set_failpoint(
                 "view-pass-applied",
                 Some(Arc::new(move |_| {
-                    if armed.swap(false, Ordering::AcqRel) {
+                    if slow_cell.state.try_lock().is_none() && armed.swap(false, Ordering::AcqRel) {
                         entered_tx.send(()).unwrap();
                         let _ = release_rx.lock().recv_timeout(Duration::from_secs(10));
                     }
@@ -788,10 +851,24 @@ mod switch_tests {
             let snap = s.snapshot();
 
             // Non-blocking metadata/planning operations return promptly and never report
-            // the old mode as current.
+            // the old mode as current. For the busy lagging `slow` view, metadata omits
+            // the obsolete plan and row count rather than mixing target mode with old plan.
             let info = rt.get(&s, target_view).unwrap();
             assert_eq!(info.state, ViewState::Building, "step {step}: {info:?}");
             assert_eq!(info.commit, None);
+            assert_eq!(info.rows, 0);
+            let slow_info = rt.get(&s, "slow").unwrap();
+            assert_eq!(slow_info.state, ViewState::Building);
+            assert_eq!(slow_info.commit, None);
+            assert!(slow_info.plan.is_none());
+            assert_eq!(slow_info.rows, 0);
+            if step == 2 {
+                assert_eq!(
+                    slow_info.evaluation,
+                    Some(crate::incr::ops::Mode::Recompute)
+                );
+                assert!(slow_info.evaluation_reason.is_some());
+            }
             assert!(!rt.list(&s).is_empty(), "list must not block on slow pass");
             let wait_t0 = Instant::now();
             let waited = rt
@@ -963,8 +1040,10 @@ mod switch_tests {
                 ViewState::Current
             );
         }
+        rt.settle(Duration::from_secs(5));
 
-        // Hold `busy`'s state lock across the mode change.
+        // Hold `busy`'s state lock, start a round that explicitly captures the old mode
+        // (`Jena`) and parks waiting on `busy` in Pass 2, then toggle to `Sparkles`.
         let busy_cell = rt
             .reg
             .lock()
@@ -975,15 +1054,33 @@ mod switch_tests {
             .clone()
             .unwrap();
         let busy_guard = busy_cell.state.lock();
+        let waits_before = rt.busy_waits.load(Ordering::Acquire);
+        rt.kick();
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while rt.busy_waits.load(Ordering::Acquire) == waits_before {
+            assert!(
+                Instant::now() < wait_deadline,
+                "worker did not enter Pass 2 waiting on busy under the old mode"
+            );
+            std::thread::yield_now();
+        }
         *host.errors.lock() = AggregateErrors::Sparkles;
         rt.kick();
 
         let snap = s.snapshot();
-        // `fast` switches and rebuilds in pass 1 without waiting for `busy`.
+        // The worker rotates out of the old-mode Pass-2 wait and switches/rebuilds
+        // `fast` in Pass 1 without waiting for `busy`.
         assert_eq!(
             read_cells(&rt, &snap, "fast"),
             vec!["\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_string()]
         );
+
+        // Lagging metadata for `busy` omits the stale plan and row count while building.
+        let busy_info = rt.get(&s, "busy").unwrap();
+        assert_eq!(busy_info.state, ViewState::Building);
+        assert_eq!(busy_info.commit, None);
+        assert!(busy_info.plan.is_none());
+        assert_eq!(busy_info.rows, 0);
 
         // `busy` itself honors deadline and cancellation promptly.
         let busy_err = rt.read(&ViewRead {
@@ -1037,5 +1134,488 @@ mod switch_tests {
 
         rt.close(&s);
         worker.join().unwrap();
+    }
+
+    /// Releasing replaced operators and detached budget leases before running the
+    /// replacement build lets both a worker round and a `live()` join succeed under a
+    /// tight shared `QueryPool` (Sol r1 P1).
+    #[test]
+    fn mode_switch_releases_old_circuit_and_retired_credit_before_rebuild_in_round_and_live() {
+        use crate::sparql::AggregateErrors;
+
+        let s = Store::in_memory(StoreOptions::default());
+        let mut init = String::from("INSERT DATA { ");
+        for i in 0..8000 {
+            init.push_str(&format!("<urn:s:{i}> <urn:g> \"g0\" ; <urn:v> {i} . "));
+        }
+        init.push('}');
+        crate::sparql::update::update(&s, &init, &crate::sparql::QueryOptions::default()).unwrap();
+
+        let q = "SELECT (MIN(?v) AS ?m) WHERE { ?s <urn:g> ?g ; <urn:v> ?v } GROUP BY ?g";
+
+        // 1. Worker round path under a tight pool.
+        {
+            let pool = QueryPool::new(16 << 20);
+            let rt = Runtime::open_with_pool(
+                None,
+                s.dataset_id(),
+                RuntimeOptions::default(),
+                Some(pool.clone()),
+            );
+            let host = Arc::new(ModeHost {
+                errors: Mutex::new(AggregateErrors::Jena),
+                inference: Mutex::new(None),
+            });
+            rt.set_host(host.clone());
+            rt.put(&s, "agg", ViewDef::table(q)).unwrap();
+            rt.round(&s);
+            let initial_granted = pool.granted();
+            assert!(
+                initial_granted >= (512 << 10),
+                "expected substantial operator credit, got {initial_granted}"
+            );
+
+            // Leave only 64 KiB free so the rebuild can fit only after the replaced
+            // circuit's detached lease is returned to the pool before `build` runs.
+            let filler = pool
+                .work_parent()
+                .reserve(pool.capacity() - initial_granted - (64 << 10))
+                .unwrap();
+            *host.errors.lock() = AggregateErrors::Sparkles;
+            rt.round(&s);
+
+            let info = rt.get(&s, "agg").unwrap();
+            assert_eq!(
+                info.state,
+                ViewState::Current,
+                "worker rebuild must not fail over-budget: {info:?}"
+            );
+            drop(filler);
+            rt.close(&s);
+            assert_eq!(pool.granted(), 0);
+        }
+
+        // 2. Live-query join path under a tight pool.
+        {
+            let pool = QueryPool::new(16 << 20);
+            let rt = Runtime::open_with_pool(
+                None,
+                s.dataset_id(),
+                RuntimeOptions::default(),
+                Some(pool.clone()),
+            );
+            let host = Arc::new(ModeHost {
+                errors: Mutex::new(AggregateErrors::Jena),
+                inference: Mutex::new(None),
+            });
+            rt.set_host(host.clone());
+            let live1 = rt.live(&s, q, None, &LiveOptions::default()).unwrap();
+            let initial_granted = pool.granted();
+            assert!(
+                initial_granted >= (512 << 10),
+                "expected substantial operator credit, got {initial_granted}"
+            );
+
+            let filler = pool
+                .work_parent()
+                .reserve(pool.capacity() - initial_granted - (64 << 10))
+                .unwrap();
+            *host.errors.lock() = AggregateErrors::Sparkles;
+            let live2 = rt
+                .live(&s, q, None, &LiveOptions::default())
+                .expect("live join rebuild must not fail over-budget");
+            assert!(matches!(live2.try_next(), Some(LiveEvent::Snapshot { .. })));
+
+            drop(live2);
+            drop(live1);
+            drop(filler);
+            rt.close(&s);
+            assert_eq!(pool.granted(), 0);
+        }
+    }
+
+    /// `round()` drops its `busy` cell list before `self.gc()` so a circuit that was
+    /// busy in Pass 1 and detached before GC releases its `QueryPool` credit before
+    /// checkpointing and round-completion notification (Neon r1 P2).
+    #[test]
+    fn round_drops_busy_cells_before_gc_and_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), StoreOptions::default()).unwrap());
+        let mut init = String::from("INSERT DATA { <urn:k0> <urn:keep> 1 . ");
+        for i in 0..256 {
+            init.push_str(&format!("<urn:b:{i}> <urn:busy> \"{}\". ", "x".repeat(64)));
+        }
+        init.push('}');
+        crate::sparql::update::update(&s, &init, &crate::sparql::QueryOptions::default()).unwrap();
+
+        let pool = QueryPool::new(16 << 20);
+        let rt = Runtime::open_with_pool(
+            Some(dir.path().to_path_buf()),
+            s.dataset_id(),
+            RuntimeOptions {
+                checkpoint_seconds: 0,
+                ..RuntimeOptions::default()
+            },
+            Some(pool.clone()),
+        );
+        rt.set_host(Arc::new(OpenHost));
+        rt.put(
+            &s,
+            "keeper",
+            ViewDef::table("SELECT ?s WHERE { ?s <urn:keep> ?o }"),
+        )
+        .unwrap();
+        rt.round(&s);
+        let keeper_only_granted = pool.granted();
+
+        let live_busy = rt
+            .live(
+                &s,
+                "SELECT ?s ?o WHERE { ?s <urn:busy> ?o }",
+                None,
+                &LiveOptions::default(),
+            )
+            .unwrap();
+        let busy_cell = {
+            let reg = rt.reg.lock();
+            let keeper_key = reg
+                .views
+                .get("keeper")
+                .and_then(|e| e.cell.as_ref())
+                .map(|k| k.key);
+            reg.cells
+                .values()
+                .find(|c| Some(c.key) != keeper_key)
+                .cloned()
+                .unwrap()
+        };
+        let weak_busy = Arc::downgrade(&busy_cell);
+        assert!(pool.granted() > keeper_only_granted);
+
+        // Advance keeper so checkpoint runs on the next round, and inspect `weak_busy`
+        // and `pool.granted()` from inside `view-checkpoint-written` (after `self.gc()`
+        // and before `round()` returns or notifies `epoch`).
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:k1> <urn:keep> 2 }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let observed_cb = observed.clone();
+        let weak_cb = weak_busy.clone();
+        let pool_cb = pool.clone();
+        s.set_failpoint(
+            "view-checkpoint-written",
+            Some(Arc::new(move |_| {
+                *observed_cb.lock() = Some((weak_cb.strong_count(), pool_cb.granted()));
+            })),
+        );
+
+        let busy_guard = busy_cell.state.lock();
+        let waits_before = rt.busy_waits.load(Ordering::Acquire);
+        let round_rt = rt.clone();
+        let round_store = s.clone();
+        let handle = std::thread::spawn(move || round_rt.round(&round_store));
+
+        // Wait until Pass 1 pushed `busy_cell` into `busy` and Pass 2 started waiting.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rt.busy_waits.load(Ordering::Acquire) == waits_before {
+            assert!(Instant::now() < deadline, "round did not enter Pass 2");
+            std::thread::yield_now();
+        }
+
+        // Detach `busy_cell` before releasing its state lock so `gc()` collects it.
+        drop(live_busy);
+        drop(busy_guard);
+        drop(busy_cell);
+        handle.join().unwrap();
+        s.set_failpoint("view-checkpoint-written", None);
+
+        let (strong_at_checkpoint, granted_at_checkpoint) =
+            observed.lock().expect("checkpoint failpoint did not fire");
+        assert_eq!(
+            strong_at_checkpoint, 0,
+            "busy Arc<Cell> must be dropped before gc() and checkpoint()"
+        );
+        assert!(
+            granted_at_checkpoint <= keeper_only_granted + (64 << 10),
+            "dead busy cell credit must be released before checkpoint(): got {granted_at_checkpoint}, baseline {keeper_only_granted}"
+        );
+
+        rt.close(&s);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    /// A reader paused between releasing the registry and locking `cell.state` must not
+    /// accept an old-generation version published after a newer mode was recorded, even
+    /// under `allow_stale: true` (Sol r1 P2 #1).
+    #[test]
+    fn reader_rejects_old_generation_published_after_mode_change() {
+        use crate::sparql::AggregateErrors;
+
+        let s = Arc::new(Store::in_memory(StoreOptions::default()));
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:a> <urn:g> \"x\" ; <urn:v> 1 . <urn:b> <urn:g> \"x\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+        let host = Arc::new(ModeHost {
+            errors: Mutex::new(AggregateErrors::Jena),
+            inference: Mutex::new(None),
+        });
+        rt.set_host(host.clone());
+        rt.put(
+            &s,
+            "agg",
+            ViewDef::table(
+                "SELECT (MIN(?v) AS ?m) WHERE { ?s <urn:g> ?g OPTIONAL { ?s <urn:v> ?v } }",
+            ),
+        )
+        .unwrap();
+        rt.round(&s);
+        let snap_n = s.snapshot();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let armed = Arc::new(AtomicBool::new(true));
+        let release_rx = Mutex::new(release_rx);
+        *rt.after_reg_hook.lock() = Some(Arc::new(move || {
+            if armed.swap(false, Ordering::AcqRel) {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.lock().recv_timeout(Duration::from_secs(10));
+            }
+        }));
+
+        let reader_rt = rt.clone();
+        let reader_snap = snap_n.clone();
+        let reader = std::thread::spawn(move || {
+            reader_rt.read(&ViewRead {
+                name: "agg",
+                at: reader_snap.commit,
+                snap: Some(&reader_snap),
+                allow_stale: true,
+                caller: None,
+                deadline: Some(Instant::now() + Duration::from_millis(120)),
+                aggregate_errors: None,
+                memory_parent: None,
+                memory_pool: None,
+                max_memory_bytes: None,
+            })
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader did not hit after_reg_hook");
+
+        // Record generation B via a live join on a different query, then land commit N+1
+        // and advance `agg` under generation A (simulating a stale round snapshot).
+        *host.errors.lock() = AggregateErrors::Sparkles;
+        let _other = rt
+            .live(
+                &s,
+                "SELECT ?s WHERE { ?s <urn:other> ?o }",
+                None,
+                &LiveOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(rt.mode_gen.load(Ordering::Acquire), 1);
+
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:c> <urn:g> \"x\" ; <urn:v> 0 }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        let agg_cell = rt
+            .reg
+            .lock()
+            .views
+            .get("agg")
+            .unwrap()
+            .cell
+            .clone()
+            .unwrap();
+        {
+            let mut st = agg_cell.state.lock();
+            assert_eq!(st.mode_gen, 0);
+            let mut deltas = FxHashMap::default();
+            let mut deferred = DeferredDrops::default();
+            assert!(rt.advance(&s, &agg_cell, &mut st, &mut deltas, &mut deferred));
+            assert_eq!(st.circuit.applied, snap_n.commit + 1);
+            drop(st);
+            drop(deferred);
+        }
+
+        // Release the paused reader: it must reject generation A at commit N+1 rather
+        // than returning old-mode rows published after B was recorded.
+        release_tx.send(()).unwrap();
+        let res = reader.join().unwrap();
+        *rt.after_reg_hook.lock() = None;
+        assert!(
+            matches!(res, Err(Error::Timeout)),
+            "reader accepted stale generation A after B was recorded: {:?}",
+            res.map(|r| (r.commit, r.rows))
+        );
+
+        // Once a round runs under B, the reader gets the Sparkles result cleanly.
+        rt.round(&s);
+        let snap_after = s.snapshot();
+        assert_eq!(
+            read_cells(&rt, &snap_after, "agg"),
+            vec!["\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_string()]
+        );
+    }
+
+    /// An older host paused while sampling must never supersede a replacement host
+    /// installed via `set_host` (Sol r1 P2 #3).
+    #[test]
+    fn older_host_cannot_supersede_replacement_host_mode() {
+        use crate::sparql::AggregateErrors;
+
+        struct PausingHost {
+            errors: AggregateErrors,
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            armed: AtomicBool,
+        }
+        impl Host for PausingHost {
+            fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+                Ok(None)
+            }
+            fn stored_query(&self, _: &str) -> Result<String> {
+                Err(Error::NotFound("none".into()))
+            }
+            fn inference(&self) -> Option<Inference> {
+                if self.armed.swap(false, Ordering::AcqRel) {
+                    self.entered.send(()).unwrap();
+                    let _ = self.release.lock().recv_timeout(Duration::from_secs(10));
+                }
+                None
+            }
+            fn aggregate_errors(&self) -> AggregateErrors {
+                self.errors
+            }
+        }
+
+        let s = Arc::new(Store::in_memory(StoreOptions::default()));
+        let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let h1 = Arc::new(PausingHost {
+            errors: AggregateErrors::Jena,
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            armed: AtomicBool::new(false),
+        });
+        rt.set_host(h1.clone());
+        rt.put(
+            &s,
+            "agg",
+            ViewDef::table("SELECT (MIN(?v) AS ?m) WHERE { ?s <urn:v> ?v }"),
+        )
+        .unwrap();
+        rt.round(&s);
+
+        // Arm H1 so `get` pauses while sampling H1, then install H2 (`Sparkles`).
+        h1.armed.store(true, Ordering::Release);
+        let rt_bg = rt.clone();
+        let s_bg = s.clone();
+        let t1 = std::thread::spawn(move || rt_bg.get(&s_bg, "agg").unwrap());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("get did not enter H1::inference");
+
+        let h2 = Arc::new(ModeHost {
+            errors: Mutex::new(AggregateErrors::Sparkles),
+            inference: Mutex::new(None),
+        });
+        rt.set_host(h2);
+        release_tx.send(()).unwrap();
+        let info = t1.join().unwrap();
+        assert_eq!(info.state, ViewState::Building);
+        assert_eq!(rt.reg.lock().aggregate_errors, AggregateErrors::Sparkles);
+
+        // Calling `get` again sees Sparkles and never reverts to Jena.
+        rt.round(&s);
+        assert_eq!(rt.reg.lock().aggregate_errors, AggregateErrors::Sparkles);
+        assert_eq!(rt.get(&s, "agg").unwrap().state, ViewState::Current);
+    }
+
+    /// `wait_built` enforces its timeout while the registry is held, and both `open_view`
+    /// and `wait_built` terminate at their wait bound even when unrelated rounds advance
+    /// the epoch counter continuously (Sol r1 P2 #4).
+    #[test]
+    fn wait_built_and_open_view_honor_bounds_under_held_registry_and_continuous_rounds() {
+        let s = Store::in_memory(StoreOptions::default());
+        let rt = Runtime::open(
+            None,
+            s.dataset_id(),
+            RuntimeOptions {
+                view_wait: Duration::from_millis(40),
+                ..RuntimeOptions::default()
+            },
+        );
+        rt.set_host(Arc::new(OpenHost));
+        rt.put(&s, "v", ViewDef::table("SELECT ?s WHERE { ?s <urn:p> ?o }"))
+            .unwrap();
+
+        // 1. Registry held past timeout: `wait_built` returns `Timeout` promptly.
+        {
+            let _reg = rt.reg.lock();
+            let t0 = Instant::now();
+            let res = rt.wait_built("v", Duration::from_millis(30));
+            assert!(
+                matches!(res, Err(Error::Timeout)),
+                "expected Timeout while registry held, got {res:?}"
+            );
+            assert!(t0.elapsed() < Duration::from_secs(2));
+        }
+
+        // 2. Continuous epoch bumps while `v` stays `Building`: neither `open_view`
+        // (with `deadline: None`) nor `wait_built` may loop past its bound.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let rt_bg = rt.clone();
+        let spinner = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Acquire) {
+                *rt_bg.epoch.lock() += 1;
+                rt_bg.cv.notify_all();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let snap = s.snapshot();
+        let t0 = Instant::now();
+        let open_res = rt.open_view(
+            &ViewOpen {
+                read: ViewRead {
+                    name: "v",
+                    at: snap.commit,
+                    snap: Some(&snap),
+                    allow_stale: false,
+                    caller: None,
+                    deadline: None,
+                    aggregate_errors: None,
+                    memory_parent: None,
+                    memory_pool: None,
+                    max_memory_bytes: None,
+                },
+            },
+            &|| Ok(()),
+            &mut |_| Ok(()),
+        );
+        assert_eq!(open_res.err().unwrap().code(), "view-behind");
+        assert!(t0.elapsed() < Duration::from_secs(2));
+
+        let t1 = Instant::now();
+        let waited = rt.wait_built("v", Duration::from_millis(40)).unwrap();
+        assert_eq!(waited.state, ViewState::Building);
+        assert!(t1.elapsed() < Duration::from_secs(2));
+
+        stop.store(true, Ordering::Release);
+        spinner.join().unwrap();
     }
 }

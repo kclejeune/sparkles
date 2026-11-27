@@ -23,7 +23,7 @@ impl Runtime {
             .max_memory_bytes
             .unwrap_or(self.opts.read().live_memory_bytes);
         let shared = Arc::new(Shared::new(budget));
-        let (cell, target, has_lagging) = {
+        let (cell, mut target, mut has_lagging) = {
             let mut reg = self.reg.lock();
             if self.is_closed() {
                 return Err(crate::incr::error(
@@ -31,7 +31,7 @@ impl Runtime {
                     "the dataset is closing",
                 ));
             }
-            let (target, lagging) = self.note_mode(&mut reg, host.as_ref());
+            let (target, lagging) = self.note_mode(&mut reg);
             let res = self.cell_for(&mut reg, q, query, access, Some(budget));
             if let Ok((cell, _)) = &res {
                 cell.pending.fetch_add(1, Ordering::AcqRel);
@@ -51,75 +51,100 @@ impl Runtime {
         let (cell, _) = cell?;
         let joining = Joining(&cell);
         self.ensure_subscription(store);
-        // Declared outside `cell.state.lock()` so any temporary circuit built by `resume`
-        // and any retired leases drop strictly after the state lock releases (even on
-        // panic unwind), with circuits freeing payloads strictly before retired leases.
-        let mut deferred_state = DeferredDrops::default();
-        let subscribe_res: Result<()> = {
-            struct LimitGuard<'a>(parking_lot::MutexGuard<'a, Slot>);
-            impl Drop for LimitGuard<'_> {
-                fn drop(&mut self) {
-                    self.0.recompute_local_limit();
+        // Switch any lagging cell and drop its replaced operators and retired budget
+        // leases outside `cell.state.lock()` before evaluating, so tight shared pools
+        // reclaim the old credit before the rebuild runs.
+        let subscribe_res: Result<()> = loop {
+            let mut deferred_state = DeferredDrops::default();
+            let mut retry_mode = false;
+            let step_res: Result<()> = {
+                struct LimitGuard<'a>(parking_lot::MutexGuard<'a, Slot>);
+                impl Drop for LimitGuard<'_> {
+                    fn drop(&mut self) {
+                        self.0.recompute_local_limit();
+                    }
                 }
+                let mut guard = LimitGuard(cell.state.lock());
+                let st = &mut *guard.0;
+                // Provisionally allow the joining subscriber's budget while building or
+                // constructing its initial event; `LimitGuard` restores the exact
+                // active-consumer ceiling on exit or unwind.
+                let result = (|| {
+                    if self.is_closed() {
+                        return Err(crate::incr::error(
+                            "views-unavailable",
+                            "the dataset is closing",
+                        ));
+                    }
+                    if st.mode_gen < target.generation {
+                        if self.switch_cell(&cell, st, &target, &mut deferred_state) {
+                            has_lagging = true;
+                        }
+                        retry_mode = true;
+                        return Ok(());
+                    }
+                    if self.mode_gen.load(Ordering::Acquire) > st.mode_gen {
+                        retry_mode = true;
+                        return Ok(());
+                    }
+                    let next_limit = st
+                        .circuit
+                        .local_limit()
+                        .map_or(budget, |cur| cur.max(budget));
+                    st.circuit.set_local_limit(Some(next_limit));
+                    let status = cell.info.lock().status.clone();
+                    if status != Status::Ready
+                        && let Err(e) =
+                            self.evaluate_for_live(store, &cell, st, &mut deferred_state)
+                    {
+                        return Err(e);
+                    }
+                    if st.circuit.bytes() > budget {
+                        let bytes = st.circuit.bytes();
+                        return Err(crate::incr::error(
+                            "over-budget",
+                            format!(
+                                "the live query's state of {bytes} bytes passes its budget of {budget} bytes"
+                            ),
+                        ));
+                    }
+                    let first = match o.after {
+                        None => Some(st.event_budgeted(false)?),
+                        Some(after) => {
+                            self.resume(store, st, after, &mut deferred_state.circuits)?
+                        }
+                    };
+                    // queued before a pass can see the subscriber, so that no later diff
+                    // overtakes it
+                    if let Some((e, mut lease)) = first {
+                        let shared_lease = st.detach_event_lease(&mut lease);
+                        deferred_state
+                            .queued
+                            .extend(shared.push_leased(e, shared_lease));
+                    }
+                    let last = st.circuit.applied;
+                    st.subs.push(Sub {
+                        shared: Arc::downgrade(&shared),
+                        budget,
+                        last,
+                    });
+                    st.recompute_local_limit();
+                    Ok(())
+                })();
+                deferred_state.retired.extend(st.circuit.drain_retired());
+                result
+            };
+            drop(deferred_state);
+            if retry_mode {
+                let cur_gen = self.mode_gen.load(Ordering::Acquire);
+                if cur_gen > target.generation {
+                    target = self.reg.lock().target_mode();
+                    has_lagging = true;
+                }
+                continue;
             }
-            let mut guard = LimitGuard(cell.state.lock());
-            let st = &mut *guard.0;
-            // Provisionally allow the joining subscriber's budget while building or
-            // constructing its initial event; `LimitGuard` restores the exact
-            // active-consumer ceiling on exit or unwind.
-            let result = (|| {
-                if self.is_closed() {
-                    return Err(crate::incr::error(
-                        "views-unavailable",
-                        "the dataset is closing",
-                    ));
-                }
-                self.switch_cell(&cell, st, &target, &mut deferred_state);
-                let next_limit = st
-                    .circuit
-                    .local_limit()
-                    .map_or(budget, |cur| cur.max(budget));
-                st.circuit.set_local_limit(Some(next_limit));
-                let status = cell.info.lock().status.clone();
-                if status != Status::Ready
-                    && let Err(e) = self.evaluate_for_live(store, &cell, st, &mut deferred_state)
-                {
-                    return Err(e);
-                }
-                if st.circuit.bytes() > budget {
-                    let bytes = st.circuit.bytes();
-                    return Err(crate::incr::error(
-                        "over-budget",
-                        format!(
-                            "the live query's state of {bytes} bytes passes its budget of {budget} bytes"
-                        ),
-                    ));
-                }
-                let first = match o.after {
-                    None => Some(st.event_budgeted(false)?),
-                    Some(after) => self.resume(store, st, after, &mut deferred_state.circuits)?,
-                };
-                // queued before a pass can see the subscriber, so that no later diff
-                // overtakes it
-                if let Some((e, mut lease)) = first {
-                    let shared_lease = st.detach_event_lease(&mut lease);
-                    deferred_state
-                        .queued
-                        .extend(shared.push_leased(e, shared_lease));
-                }
-                let last = st.circuit.applied;
-                st.subs.push(Sub {
-                    shared: Arc::downgrade(&shared),
-                    budget,
-                    last,
-                });
-                st.recompute_local_limit();
-                Ok(())
-            })();
-            deferred_state.retired.extend(st.circuit.drain_retired());
-            result
+            break step_res;
         };
-        drop(deferred_state);
         if has_lagging {
             self.mark_mode_switched(target.generation);
         }
