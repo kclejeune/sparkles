@@ -281,8 +281,12 @@ weights or overflow, it retains minimum backward edge distances and the outgoing
 each branch. As each source is requested, the search checks the branches on its parent
 chain. For each branch it caches the shortest budget admitting two simple suffixes with
 distinct first edges. A hop to a node at the same or a smaller minimum edge distance can
-follow that node's shortest suffix directly. For deeper hops, one breadth-first walk over
-the recorded topology excludes the branch itself and uses minimum edge distances to prune
+follow that node's shortest suffix directly. For a hop one level deeper, the shortest
+suffix also avoids the branch if its first step reaches a different node at the branch's
+depth. The two shortest routes certified by these checks settle the threshold because
+every unresolved hop costs at least two edges more than the branch's minimum distance.
+When a deeper hop still needs checking, one breadth-first walk over the recorded
+topology excludes the branch itself and uses minimum edge distances to prune
 over-budget prefixes. The walk enqueues each node at most once for that branch. The
 virtual endpoint represents a completed cycle and can only appear as a source of recorded
 hops. The query memory budget covers retained hops and the temporary queue and visited

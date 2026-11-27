@@ -1497,8 +1497,12 @@ impl ReverseAlternatives {
             let suffix = tree.dist[&u];
             let len = suffix + 1;
             // A shortest-hop suffix strictly descends in depth. At or below the
-            // source depth it cannot revisit the source. VIRT is only a start node.
-            if source == VIRT || suffix <= depth {
+            // source depth it cannot revisit the source. From one level deeper,
+            // only its first step can reach the source. VIRT is only a start node.
+            if source == VIRT
+                || suffix <= depth
+                || (suffix - 1 == depth && tree.parent[&(u, suffix)].node != source)
+            {
                 if shortest.is_none_or(|best| len < best) {
                     second = shortest;
                     shortest = Some(len);
@@ -1509,13 +1513,13 @@ impl ReverseAlternatives {
                 needs_walk = true;
             }
         }
-        // Every deeper first hop costs at least depth + 2 edges. Two shallow
-        // first hops therefore settle the threshold without allocating a frontier.
+        // Each certified route costs at most depth + 2 for a real source.
+        // An unresolved deeper hop cannot beat two such routes.
         if second.is_some() || !needs_walk {
             return Ok(second);
         }
 
-        // The sole shallow edge supplies the shortest route. Search from every
+        // The sole certified edge supplies the shortest route. Search from every
         // other first edge in one FIFO, forbidding the source throughout. At a
         // shallow destination append its shortest suffix. Cutting any loops
         // preserves the distinct first edge because the source cannot recur.
@@ -14278,6 +14282,16 @@ mod tree_tests {
         properties: &str,
         memory: Option<u64>,
     ) -> [(Term, usize); 2] {
+        reverse_first_batches(ttl, properties, memory, 1)
+            .map(|(rows, steps)| (rows.unwrap().pop().unwrap(), steps))
+    }
+
+    fn reverse_first_batches(
+        ttl: String,
+        properties: &str,
+        memory: Option<u64>,
+        batch_rows: usize,
+    ) -> [(Result<Vec<Term>>, usize); 2] {
         use crate::io::Source;
         use crate::sparql::{CursorOptions, FallbackPolicy, QueryOptions, query, select_cursor};
         use crate::store::{Store, StoreOptions};
@@ -14305,15 +14319,19 @@ mod tree_tests {
         };
         let take_steps = || test_hooks::REVERSE_SUFFIX_STEPS.with(|count| count.replace(0));
         take_steps();
-        let result =
-            query(snap.clone(), &query_text(" ; path:limit 1"), &opts).expect("eager first row");
+        let limit = format!(" ; path:limit {batch_rows}");
+        let eager = query(snap.clone(), &query_text(&limit), &opts).and_then(|result| {
+            let rows = result.rows()?;
+            assert_eq!(rows.len(), batch_rows);
+            Ok(rows
+                .iter()
+                .map(|row| row.values()[0].clone().unwrap())
+                .collect())
+        });
         let eager_steps = take_steps();
-        let rows = result.rows().unwrap();
-        assert_eq!(rows.len(), 1);
-        let eager = rows.iter().next().unwrap().values()[0].clone().unwrap();
 
         let cursor_opts = CursorOptions {
-            batch_rows: 1,
+            batch_rows,
             fallback: FallbackPolicy::RejectMaterialization,
             ..Default::default()
         };
@@ -14335,12 +14353,14 @@ mod tree_tests {
                     .is_some_and(|reason| reason.contains("streams matching paths")),
             "{path_plan:?}"
         );
-        take_steps();
-        let batch = cursor.next_batch().expect("cursor first pull").unwrap();
-        let cursor_steps = take_steps();
-        assert_eq!(batch.len(), 1);
-        let streamed = batch.row(0).unwrap().values()[0].clone().unwrap();
-        [(eager, eager_steps), (streamed, cursor_steps)]
+        let streamed = cursor.next_batch().map(|batch| {
+            let batch = batch.expect("cursor first batch");
+            assert_eq!(batch.len(), batch_rows);
+            (0..batch.len())
+                .map(|i| batch.row(i).unwrap().values()[0].clone().unwrap())
+                .collect()
+        });
+        [(eager, eager_steps), (streamed, take_steps())]
     }
 
     #[test]
@@ -14428,6 +14448,66 @@ mod tree_tests {
                 "branch took {steps} suffix steps"
             );
         }
+    }
+
+    #[test]
+    fn reverse_batch_shared_deeper_neighbor_has_linear_suffix_work() {
+        use std::fmt::Write as _;
+
+        let n = 1024;
+        let mut ttl =
+            String::from("@prefix ex: <http://example.org/> . ex:b ex:p ex:t {| ex:w 1e12 |} . ");
+        let mut expected = Vec::new();
+        for i in 0..n {
+            write!(
+                ttl,
+                "ex:a{i} ex:p ex:t {{| ex:w 0.5e0 |}} . ex:a{i} ex:p ex:h {{| ex:w 2e0 |}} . \
+                 ex:h ex:p ex:z{i} . ex:z{i} ex:p ex:t . "
+            )
+            .unwrap();
+            expected.push(format!("http://example.org/a{i}"));
+        }
+        expected.sort_unstable();
+
+        // The reverse search settles 2N + 3 labels. Forward ranking settles
+        // only a_i and t for each of the N requested one-edge paths.
+        let cap = 4 * n + 3;
+        let batch = |visits| {
+            let properties = format!(
+                "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+                 path:weight ex:w ; path:maxLength 3 ; path:maxVisited {visits}"
+            );
+            reverse_first_batches(ttl.clone(), &properties, None, n)
+        };
+        for (result, _) in batch(cap - 1) {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("visited more than {} nodes", cap - 1)),
+                "{err}"
+            );
+        }
+
+        let batches = batch(cap);
+        for (result, _) in &batches {
+            let mut sources: Vec<_> = result
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|term| {
+                    let Term::NamedNode(source) = term else {
+                        panic!("expected a source IRI: {term}")
+                    };
+                    source.as_str()
+                })
+                .collect();
+            sources.sort_unstable();
+            assert_eq!(sources, expected);
+        }
+        let steps = batches.map(|(_, steps)| steps);
+        assert!(
+            steps.iter().all(|&count| (n..=8 * n).contains(&count)),
+            "eager and cursor suffix steps for {n} branches: {steps:?}"
+        );
     }
 
     #[test]
