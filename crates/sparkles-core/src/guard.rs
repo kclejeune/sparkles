@@ -163,6 +163,21 @@ pub struct WriteOptions {
     pub before_publish: Option<PublishHook>,
 }
 
+/// Metadata tied to the reserved sequence of a data commit.
+#[doc(hidden)]
+pub trait CommitIntent: Sync {
+    /// Persist the metadata for `seq`. Once called, failure or unwind leaves the
+    /// sequence unavailable until reopen.
+    fn persist(&self, seq: u64) -> Result<()>;
+    /// Durably withdraw what [`persist`](Self::persist) wrote, after the write was
+    /// refused before anything of it was published. Success makes `seq` available
+    /// again, and failure leaves it unavailable until reopen.
+    fn retire(&self, seq: u64) -> Result<()>;
+}
+
+#[doc(hidden)]
+pub type CommitHook<'a> = &'a dyn CommitIntent;
+
 /// The check of [`WriteOptions::before_publish`].
 #[derive(Clone)]
 pub struct PublishHook(pub Arc<dyn Fn() -> Result<()> + Send + Sync>);
@@ -229,7 +244,8 @@ impl WriteOptions {
 
     /// [`check`](Self::check), then the [`before_publish`](Self::before_publish) hook,
     /// then `check` again, since the hook may wait past the deadline or a cancellation:
-    /// the last check of a write before it is published.
+    /// the last check of a write before it is published. A write with a
+    /// [`CommitIntent`] runs `check` once more after persisting it.
     pub fn check_publish(&self) -> Result<()> {
         self.check()?;
         if let Some(hook) = &self.before_publish {

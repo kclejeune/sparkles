@@ -333,7 +333,16 @@ fn mutation_errors_and_unwinds_discard_both_owners_but_not_a_read_arc() {
             h.with_kept(&o, &req(), false, &opts(), "dlQuery", |e| {
                 e.run_over(&o, vec![], |s, axioms, changes| {
                     let par = super::super::classify::admit(1, &opts())?;
-                    super::super::classify::saturate(s, axioms, changes, par, false, &opts())?;
+                    super::super::classify::saturate(
+                        s,
+                        axioms,
+                        changes,
+                        par,
+                        false,
+                        &opts(),
+                        &super::super::classify::working(&opts(), &o),
+                        0,
+                    )?;
                     if panic {
                         panic!("controlled mutation unwind");
                     }
@@ -375,6 +384,8 @@ fn retention_counts_auxiliary_bytes_once_and_taxonomy_eviction_releases_owners()
             excluded: p.excluded.clone(),
             content_fingerprint: p.content_fingerprint.clone(),
             auxiliary_bytes: CACHE_MAX_BYTES - base,
+            memory: None,
+            _lease: None,
         };
         assert_eq!(classification_retained_bytes(e, &fake), CACHE_MAX_BYTES);
         fake.auxiliary_bytes += 1;
@@ -1330,19 +1341,21 @@ fn isolated_names_never_redecide_graph_guards_after_triple_masking() {
     partial.complete_for_taken = false;
     partial.consistency = sparkles_owl::classify::Consistency::Unknown;
     c.classification = Arc::new(partial);
-    c.publication = KeptClassification::capture(
-        &ds.ontology(),
-        &request,
-        &ClassifyRequest {
-            partial: true,
-            ..Default::default()
-        },
-        &c.opened,
-        c.classification.clone(),
-        c.excluded.clone(),
-        &c.read_options,
-    )
-    .unwrap();
+    c.publication = Arc::new(
+        KeptClassification::capture(
+            &ds.ontology(),
+            &request,
+            &ClassifyRequest {
+                partial: true,
+                ..Default::default()
+            },
+            &c.opened,
+            ((*c.classification).clone(), (*c.excluded).clone()),
+            &c.read_options,
+            &super::super::classify::working(&c.read_options, &c.opened),
+        )
+        .unwrap(),
+    );
     let partial_frame = super::super::wire::classify_body(
         "fixture",
         &c,
@@ -1922,5 +1935,216 @@ fn el_only_and_full_classifications_are_keyed_separately_and_never_clobber() {
             "surviving EL-only slot must stay within cap after retain_dl: {} <= {dl_cap}",
             surviving.retained_bytes
         );
+    }
+}
+
+#[test]
+fn a_waiter_reenters_only_after_classifier_flight_and_work_unlock() {
+    use sparkles_core::sparql::pool::QueryPool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let ds = ds(":A a owl:Class .");
+    let handle = ds.ontology();
+    let request = req();
+    let opened = handle.open(&request, &opts()).unwrap();
+    for unwind in [false, true] {
+        let pool = QueryPool::new(4 << 20);
+        let work = super::super::classify::working(
+            &QueryOptions {
+                pool: Some(pool.clone()),
+                ..opts()
+            },
+            &opened,
+        );
+        work.lock().grow(2 << 20).unwrap();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let ticket = pool.enter(
+            pool.capacity(),
+            Some(Arc::new({
+                let (ds, work, observed) = (ds.clone(), work.clone(), observed.clone());
+                move || {
+                    let unlocked = ds.state().classify_flight.try_lock().is_some()
+                        && work.try_lock().is_some();
+                    if observed
+                        .compare_exchange(
+                            0,
+                            if unlocked { 1 } else { 2 },
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                        && unlocked
+                        && ds
+                            .ontology()
+                            .classify(&req(), &ClassifyRequest::default(), &opts())
+                            .is_ok()
+                    {
+                        observed.store(3, Ordering::SeqCst);
+                    }
+                }
+            })),
+        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle
+                .with_kept(&opened, &request, false, &opts(), "classify", |_| {
+                    work.lock().shrink_to(0);
+                    assert!(!unwind, "injected flight unwind");
+                    Ok(((), false))
+                })
+                .unwrap();
+        }));
+        assert_eq!(outcome.is_err(), unwind);
+        assert_eq!(observed.load(Ordering::SeqCst), 3);
+        drop(ticket);
+    }
+}
+
+#[test]
+fn edited_kept_ontology_charges_only_incremental_saturation_growth() {
+    use crate::DatasetOptions;
+    use crate::store::Store;
+    use sparkles_core::sparql::pool::QueryPool;
+
+    let mut data = String::new();
+    for i in 0..1800 {
+        data.push_str(&format!(":C{i} rdfs:subClassOf :Top . "));
+    }
+    let prepare = || {
+        let pool = QueryPool::with_retained_capacity(64 << 20, 64 << 20).unwrap();
+        let ds = Dataset::from_store_with(
+            Store::in_memory(Default::default()),
+            DatasetOptions {
+                pool: Some(pool.clone()),
+                ..Default::default()
+            },
+        );
+        ds.update(&format!("{BASE} INSERT DATA {{ {data} }}"))
+            .unwrap();
+        let classifier = ClassifyRequest {
+            threads: 1,
+            el_only: true,
+            ..Default::default()
+        };
+        let initial = ds
+            .ontology()
+            .classify(&req(), &classifier, &opts())
+            .unwrap();
+        assert!(initial.retained);
+        let old_bytes = ds
+            .state()
+            .classify_cache
+            .lock()
+            .slot(true)
+            .entry
+            .as_ref()
+            .unwrap()
+            .reused_credit();
+        ds.update(&format!(
+            "{BASE} INSERT DATA {{ :New rdfs:subClassOf :Top . }}"
+        ))
+        .unwrap();
+        ds.ontology().open(&req(), &opts()).unwrap();
+        (ds, classifier, old_bytes)
+    };
+    let (measure, classifier, old_bytes) = prepare();
+    let measured = measure
+        .ontology()
+        .classify(&req(), &classifier, &opts())
+        .unwrap();
+    let actual_peak = measured.classification.stats.peak_memory as u64;
+    // Allow the façade's old/new axiom pointers and delta staging alongside
+    // the classifier's incremental portion of that peak.
+    let cap = actual_peak.saturating_sub(old_bytes) + 400_000;
+    assert!(
+        cap < actual_peak,
+        "fixture must leave less than an extra saturation's worth of work ({cap} / {actual_peak})"
+    );
+    drop((measured, measure));
+
+    let (ds, classifier, _) = prepare();
+    let edited = ds
+        .ontology()
+        .classify(
+            &req(),
+            &classifier,
+            &QueryOptions {
+                max_memory_bytes: Some(cap),
+                ..opts()
+            },
+        )
+        .unwrap();
+    assert!(edited.retained);
+    assert!(
+        edited
+            .classification
+            .taxonomy
+            .node_of(&sparkles_owl::Class::new("http://ex.org/New"))
+            .is_some()
+    );
+}
+
+#[test]
+fn signature_wide_incomplete_list_is_owned_by_oneshot_and_evicted_publications() {
+    use sparkles_core::sparql::pool::QueryPool;
+    let pool = QueryPool::with_retained_capacity(128 << 20, 128 << 20).unwrap();
+    let ds = Dataset::from_store_with(
+        crate::store::Store::in_memory(Default::default()),
+        crate::DatasetOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        },
+    );
+    let mut data = String::from(":a a :C0 .");
+    for i in 0..96 {
+        data.push_str(&format!(" :C{i} a owl:Class ."));
+    }
+    ds.update(&format!("{BASE} INSERT DATA {{ {data} }}"))
+        .unwrap();
+    let handle = ds.ontology();
+
+    for keep in [false, true] {
+        let grant = Arc::new(pool.empty_grant());
+        let query = QueryOptions {
+            no_cache: !keep,
+            grant: (!keep).then(|| grant.clone()),
+            ..Default::default()
+        };
+        let answer = handle
+            .classify(&req(), &ClassifyRequest::default(), &query)
+            .unwrap();
+        let p = &answer.publication;
+        let classification = answer.classification.clone();
+        assert!(classification.incomplete.len() >= 96);
+        let noncoverage = size_of::<KeptClassification>()
+            + p.source.owned_bytes()
+            + sparkles_owl::classify::excluded_slice_copy_bytes(&p.excluded)
+            + super::super::classify::unmapped_bytes(&classification.unmapped)
+            + p.content_fingerprint.capacity()
+            + classification.stats.taxonomy_memory;
+        let minimum = (noncoverage + classification.incomplete_bytes()) as u64;
+        assert!(p._lease.as_ref().unwrap().bytes() >= minimum);
+        drop(answer);
+        if keep {
+            let retired = {
+                let mut cache = ds.state().classify_cache.lock();
+                let slot = cache.slot_mut(false);
+                assert_eq!(
+                    slot.entry.as_ref().unwrap().reused_credit() as usize,
+                    classification.stats.memory
+                        - classification.stats.taxonomy_memory
+                        - classification.incomplete_bytes(),
+                );
+                std::mem::take(slot)
+            };
+            drop(retired);
+            let ontologies = std::mem::take(&mut *ds.state().ontology_cache.lock());
+            drop(ontologies);
+            assert!(pool.domain_stats().retained_reserved >= minimum);
+        } else {
+            assert!(grant.used() >= minimum);
+        }
+        drop(classification);
+        assert_eq!(grant.used(), 0);
+        assert_eq!(pool.domain_stats().retained_reserved, 0);
     }
 }

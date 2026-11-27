@@ -269,3 +269,70 @@ fn a_terminology_read_reads_a_repeated_statement_once() {
     assert_eq!(o.error_count, 0, "{:?}", o.diagnostics);
     assert_eq!(tbox(&o), tbox(&terminology(TERMINOLOGY)));
 }
+
+#[test]
+fn admitted_parse_charges_each_reuse_of_a_blank_inverse_property() {
+    let iri = format!("urn:{}", "p".repeat(32 << 10));
+    let mut body = format!("<{iri}> a owl:ObjectProperty . _:inverse owl:inverseOf <{iri}> .");
+    for i in 0..32 {
+        body.push_str(&format!(
+            " _:inverse rdfs:domain :C{i} . :C{i} a owl:Class ."
+        ));
+    }
+    let triples = ttl(&body);
+    let flat: usize = triples
+        .iter()
+        .map(|triple| 1024 + 8 * read::triple_payload(triple))
+        .sum();
+    let count_domains = |o: &read::Ontology| {
+        o.axiom_set()
+            .filter(|a| {
+                matches!(
+                    a.kind,
+                    AxiomKind::ObjectPropertyDomain(ObjectPropertyExpression::InverseOf(_), _)
+                )
+            })
+            .count()
+    };
+    assert_eq!(count_domains(&lenient(&body)), 32);
+    let graph_of = vec![0; triples.len()];
+    let used = std::cell::Cell::new(0);
+    let answer = read::read_admitted(triples, graph_of, &[0], ReadOptions::default(), &|bytes| {
+        let next = used.get() + bytes;
+        used.set(next);
+        next <= flat + 3 * iri.len()
+    });
+    assert!(answer.is_none());
+    assert!(used.get() > flat);
+}
+
+#[test]
+fn admitted_parse_can_refuse_the_first_facet_copy_before_memoization() {
+    let body = format!(
+        ":p a owl:DatatypeProperty ; rdfs:range _:range .
+        _:range a rdfs:Datatype ; owl:onDatatype xsd:string ; owl:withRestrictions (_:facet) .
+        _:facet xsd:minInclusive \"{}\" .",
+        "x".repeat(32 << 10),
+    );
+    let triples = ttl(&body);
+    assert!(lenient(&body).axiom_set().any(|ax| matches!(
+        ax.kind,
+        AxiomKind::DataPropertyRange(_, DataRange::DatatypeRestriction(..))
+    )));
+    let facet = triples
+        .iter()
+        .find(|t| t.predicate.as_str().ends_with("#minInclusive"))
+        .unwrap();
+    let bytes = facet.predicate.as_str().len() + super::term_payload(&facet.object);
+    let graph_of = vec![0; triples.len()];
+    let refused = std::cell::Cell::new(false);
+    let result = read::read_admitted(triples, graph_of, &[0], ReadOptions::default(), &|n| {
+        if n == bytes {
+            refused.set(true);
+            return false;
+        }
+        true
+    });
+    assert!(refused.get());
+    assert!(result.is_none());
+}

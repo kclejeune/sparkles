@@ -6464,7 +6464,7 @@ fn entailment_diff_cli(
     if request.all_changes {
         request.sample_limit = 100_000;
     }
-    let result = dataset.reasoning().diff(&request)?;
+    let result = dataset.reasoning().diff_admitted(&request)?;
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&result.to_json())?),
         "turtle" | "trig" => print!("{}", result.to_trig()?),

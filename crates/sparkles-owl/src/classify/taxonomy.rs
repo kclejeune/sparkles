@@ -24,13 +24,22 @@ pub struct Node {
 /// sorted by their first class. The bottom node has no parents or children: every
 /// class is its superclass. In an inconsistent ontology every class, `owl:Thing`
 /// included, is in the bottom node and node 0 is empty.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Taxonomy {
     nodes: Vec<Node>,
     /// the node and the place in it of each class of the signature, in the order of
     /// their IRIs, which [`Taxonomy::node_of`] searches by the names the nodes hold
     at: Vec<(u32, u32)>,
+    memory: Option<std::sync::Arc<sparkles_budget::MemoryLease>>,
 }
+
+impl PartialEq for Taxonomy {
+    fn eq(&self, other: &Self) -> bool {
+        self.nodes == other.nodes && self.at == other.at
+    }
+}
+
+impl Eq for Taxonomy {}
 
 pub const TOP_NODE: usize = 0;
 /// The direct parents the greedy reduction finds before it marks instead.
@@ -40,6 +49,11 @@ const POLL_EVERY: usize = 4096;
 pub const BOTTOM_NODE: usize = 1;
 
 impl Taxonomy {
+    #[doc(hidden)]
+    pub fn keep_memory(&mut self, memory: Option<std::sync::Arc<sparkles_budget::MemoryLease>>) {
+        self.memory = memory;
+    }
+
     pub fn nodes(&self) -> &[Node] {
         &self.nodes
     }
@@ -242,6 +256,7 @@ pub(super) fn build(
                     },
                 ],
                 at,
+                memory: None,
             },
             bytes,
         ));
@@ -502,7 +517,14 @@ pub(super) fn build(
         }
         nodes[j + 2].parents = ps;
     }
-    Ok((Taxonomy { nodes, at }, bytes))
+    Ok((
+        Taxonomy {
+            nodes,
+            at,
+            memory: None,
+        },
+        bytes,
+    ))
 }
 
 /// Pushes `item` onto `v`, admitting any capacity growth against `budget` before
@@ -1495,7 +1517,14 @@ pub(super) fn build_inconsistent(
         },
     ];
     debit.transfer(bytes);
-    Ok((Taxonomy { nodes, at }, bytes))
+    Ok((
+        Taxonomy {
+            nodes,
+            at,
+            memory: None,
+        },
+        bytes,
+    ))
 }
 
 /// Exact retained heap bytes of a built [`Taxonomy`].
@@ -1944,7 +1973,11 @@ pub(super) fn build_from_rows(
     }
     drop(parents_hdr_debit);
 
-    let tax = Taxonomy { nodes, at };
+    let tax = Taxonomy {
+        nodes,
+        at,
+        memory: None,
+    };
     let owned = taxonomy_owned_bytes(&tax);
     // Settle any minor capacity discrepancy between exact `owned` and `tax_debit.bytes`.
     if owned > tax_debit.bytes {

@@ -437,7 +437,7 @@ fn query_with(
     reasoning: DlReasoning,
     answers: &[&str],
     opts: &QueryOptions,
-) -> Result<DlQueryAnswer> {
+) -> Result<AdmittedDlQueryAnswer> {
     let h = ds.ontology();
     let req = OntologyRequest::default();
     let opts = h.anchored(opts)?;
@@ -452,7 +452,7 @@ fn query_with(
     for a in answers {
         q.answers.set(a)?;
     }
-    h.dl_query_opened(o, &req, &q, &opts)
+    h.dl_query_opened_admitted(o, &req, &q, &opts)
 }
 
 #[test]
@@ -532,7 +532,7 @@ fn rl_superclasses_alone_leave_out_the_class_itself() {
     )
     .unwrap();
     assert_eq!(a.direct_superclasses, Some(vec![c("B")]));
-    assert!(!a.superclasses.unwrap().contains(&c("A")));
+    assert!(!a.superclasses.as_ref().unwrap().contains(&c("A")));
     assert_eq!(a.equivalents, None);
 }
 
@@ -835,4 +835,148 @@ fn el_only_dl_query_reproduces_elk_and_keeps_full_cache_intact() {
         err.to_string().contains("ask for reasoning=rl or auto"),
         "{err}"
     );
+}
+
+#[test]
+fn rl_direct_refuses_pair_storage_after_select_and_releases_it() {
+    use crate::reasoning::memory::Memory;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let ds = Dataset::memory();
+    let iris: Vec<_> = (0..12).map(|i| format!("urn:class:{i:02}")).collect();
+    let classes: Vec<_> = iris.iter().map(String::as_str).collect();
+    let mut insert = String::from("INSERT DATA {");
+    for (i, a) in classes.iter().enumerate() {
+        for b in &classes[i + 1..] {
+            write!(
+                insert,
+                "<{a}> <{}> <{b}> .",
+                sparkles_owl::vocab::RDFS_SUB_CLASS_OF
+            )
+            .unwrap();
+        }
+    }
+    insert.push('}');
+    ds.update(&insert).unwrap();
+    let opts = QueryOptions::default();
+    let unrestricted = Arc::new(parking_lot::Mutex::new(Memory::new(None, None)));
+    assert_eq!(
+        rl_direct(
+            &private_rl_snapshot(&ds),
+            &opts,
+            &unrestricted,
+            &classes,
+            true
+        )
+        .unwrap(),
+        [classes[0]]
+    );
+
+    let live = Arc::new(AtomicU64::new(0));
+    let parent = sparkles_budget::MemoryDomain::new().parent(
+        {
+            let live = live.clone();
+            move |bytes| {
+                live.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    used.checked_add(bytes).filter(|&used| used <= 2048)
+                })
+                .map(|_| ())
+                .map_err(|used| sparkles_budget::ParentRefused::Limit {
+                    limit: 2048,
+                    requested: used.saturating_add(bytes),
+                    scope: sparkles_budget::Scope::Work,
+                })
+            }
+        },
+        {
+            let live = live.clone();
+            move |bytes| {
+                live.fetch_sub(bytes, Ordering::Relaxed);
+            }
+        },
+    );
+    // The nested SELECT is unrestricted here, so only the receiving pair set can
+    // hit the 2 KiB cap after the VALUES string has been prepared.
+    let work = Arc::new(parking_lot::Mutex::new(Memory::new(None, Some(parent))));
+    assert!(
+        matches!(rl_direct(&private_rl_snapshot(&ds), &opts, &work, &classes, true), Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::ServerMemory)
+    );
+    assert!(work.lock().bytes() > 1024);
+    drop(work);
+    assert_eq!(live.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn bounded_private_rl_select_uses_a_noncacheable_snapshot() {
+    let ds = dataset(
+        "Declaration(Class(:A)) Declaration(Class(:C))
+         SubClassOf(:A :C) EquivalentClasses(:X ObjectIntersectionOf(:A :C))
+         ClassAssertion(:A :a)",
+    );
+    let view = ds
+        .inference_view(ReasoningMode::Demand(Demand {
+            profile: Some(sparkles_reasoner::Profile::OwlRl),
+            max_derived: None,
+        }))
+        .unwrap();
+    let snapshot = private_rl_snapshot(&ds);
+    assert!(!snapshot.cacheable);
+    let opts = QueryOptions {
+        no_cache: true,
+        ..view.query_options()
+    };
+    let select = format!("SELECT ?x WHERE {{ ?x a <{}> }}", ex("C"));
+    let probe = crate::sparql::query(snapshot.clone(), &select, &opts).unwrap();
+    let limit = probe.mem_peak_bytes + (1 << 20);
+    drop(probe);
+    let work = Arc::new(parking_lot::Mutex::new(Memory::new(Some(limit), None)));
+    let mut rows = 0;
+    rl_select(&snapshot, &opts, &work, &select, |_, _| {
+        rows += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn rl_query_owns_class_lists_and_gaps_until_the_answer_drops() {
+    let ds = dataset("Declaration(Class(:A)) SubClassOf(:A ObjectUnionOf(:B :C))");
+    let pool = sparkles_core::sparql::pool::QueryPool::new(128 << 20);
+    let grant = Arc::new(pool.empty_grant());
+    let opts = QueryOptions {
+        grant: Some(grant.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let handle = ds.ontology();
+    let opened = handle.open(&OntologyRequest::default(), &opts).unwrap();
+    let input_bytes = grant.used();
+    let answer = query_with(
+        &ds,
+        "A",
+        DlReasoning::Rl,
+        &["equivalents", "directSuperclasses"],
+        &opts,
+    )
+    .unwrap();
+    assert!(!answer.reasoning.gaps.is_empty());
+    assert!(
+        grant.used() > input_bytes * 2,
+        "the two cold inputs and answer all have credit"
+    );
+    let held = grant.used();
+    let detached = answer.clone();
+    assert!(std::ptr::eq::<DlQueryAnswer>(&*answer, &*detached));
+    assert!(std::ptr::eq(
+        answer.reasoning.gaps.as_ptr(),
+        detached.reasoning.gaps.as_ptr(),
+    ));
+    drop(answer);
+    assert_eq!(grant.used(), held);
+    assert!(!detached.reasoning.gaps.is_empty());
+    drop(detached);
+    assert_eq!(grant.used(), input_bytes);
+    drop(opened);
+    assert_eq!(grant.used(), 0);
 }

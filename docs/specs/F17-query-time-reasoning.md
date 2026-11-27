@@ -714,7 +714,7 @@ capabilities and remaining work are described by the spec status and Outcome.
    counted shared chunks per retaining table; item 757 subsequently measured and
    calibrated the estimator and eviction allowances (see
    [Derived-table retained-estimate calibration](#derived-table-retained-estimate-calibration-item-757)),
-   while hierarchical live charging remains item 675.
+   and active demand sessions charge live memory to the query pool under item 675.
 8. Lists that rules derive are complete in a lower stage, which derives every list the
    rules give rather than the lists a query reaches. This costs a derivation of all such
    lists for each query that reads one and keeps the answers equal to a fixpoint. Lists

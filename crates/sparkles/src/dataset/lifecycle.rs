@@ -234,7 +234,6 @@ impl Closing {
         }
         let root = self.root.as_mut().expect("root stays present");
         let state = Arc::get_mut(&mut root.state).expect("exclusive root state");
-        let reasoning = state.reasoning.get_mut().clone();
         let StoreHandle::Own(main) = &mut state.store else {
             unreachable!("main owns its Store")
         };
@@ -250,6 +249,7 @@ impl Closing {
             return Err(self.refused(reserved.err()));
         }
         core.commit();
+        let reasoning = state.reasoning.get_mut().value.clone();
         self.finished = true;
         root.frozen.take().expect("frozen root").close();
         for node in self.nodes.values_mut() {

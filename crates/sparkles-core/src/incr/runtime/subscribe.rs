@@ -350,7 +350,7 @@ impl Runtime {
             }
             let old = d.old().ok()?;
             let mut c = st.fresh(st.circuit.inference.clone()).ok()?;
-            c.set_pool(self.pool.clone(), self.circuit_parent());
+            c.set_runtime_pool(self.pool.clone(), self.circuit_parent());
             // Keep the temporary circuit outside the cell lock's drop scope.
             temp_circuits.push(c);
             let c = temp_circuits.last_mut().expect("pushed above");
@@ -478,7 +478,7 @@ mod resume_unwind_tests {
             let mut deferred_state = DeferredDrops::default();
             let st = cell.state.lock();
             let mut c = st.fresh(st.circuit.inference.clone()).unwrap();
-            c.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+            c.set_runtime_pool(Some(pool.clone()), Some(pool.work_parent()));
             // Same ordering as `Runtime::resume`: push into `deferred_state` BEFORE build.
             deferred_state.circuits.push(c);
             let c = deferred_state.circuits.last_mut().unwrap();

@@ -438,7 +438,7 @@ pub fn start(
                 .with_context(|| format!("--fuseki-config: the query-time reasoning of /{name}"))?;
             tracing::info!("fuseki-config: /{name} answers queries with reasoning={mode}");
         }
-        if r.demand_only || ds.reasoning.read().is_some() {
+        if r.demand_only || ds.read_reasoning().is_some() {
             continue;
         }
         let profile = match rules {

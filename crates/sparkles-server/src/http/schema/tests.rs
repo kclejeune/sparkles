@@ -337,12 +337,16 @@ async fn inferences_follow_the_reasoning_parameter() {
         find(&j["classes"], "http://ex.org/B")["observed"]["instances"],
         0
     );
-    *s.state.get("t").unwrap().reasoning.write() = Some(ReasoningInfo {
-        profile: "rdfs".into(),
-        inferred: 2,
-        at: crate::state::now(),
-        ..Default::default()
-    });
+    s.state
+        .get("t")
+        .unwrap()
+        .set_reasoning(Some(ReasoningInfo {
+            profile: "rdfs".into(),
+            inferred: 2,
+            at: crate::state::now(),
+            ..Default::default()
+        }))
+        .unwrap();
     let j = ok(&s.app, "/$/schema/t").await;
     assert_eq!(j["selection"]["reasoning"], true);
     assert_eq!(

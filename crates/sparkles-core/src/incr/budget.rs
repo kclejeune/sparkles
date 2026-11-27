@@ -59,6 +59,8 @@ pub(crate) fn budget_error(err: ParentRefused) -> Error {
 struct BudgetState {
     local_limit: u64,
     state_bytes: u64,
+    /// The current immutable publication has detached parent credit.
+    published_local: u64,
     external_bytes: u64,
     pass_bytes: u64,
     scratch_bytes: u64,
@@ -84,6 +86,7 @@ impl BudgetState {
         Self {
             local_limit: local_limit.unwrap_or(u64::MAX),
             state_bytes: 0,
+            published_local: 0,
             external_bytes: 0,
             pass_bytes: 0,
             scratch_bytes: 0,
@@ -100,6 +103,7 @@ impl BudgetState {
     #[inline]
     fn local_live(&self) -> u64 {
         self.state_bytes
+            .saturating_add(self.published_local)
             .saturating_add(self.external_bytes)
             .saturating_add(self.pass_bytes)
             .saturating_add(self.scratch_bytes)
@@ -108,7 +112,9 @@ impl BudgetState {
 
     #[inline]
     fn total_live(&self) -> u64 {
-        self.local_live().saturating_add(self.pool_scratch_bytes)
+        self.local_live()
+            .saturating_sub(self.published_local)
+            .saturating_add(self.pool_scratch_bytes)
     }
 
     fn reclaim(&mut self, needed: u64) -> u64 {
@@ -290,8 +296,7 @@ impl BudgetState {
         }
     }
 
-    fn check_local_limit_after_reclaim(&mut self) -> Result<()> {
-        let cur = self.local_live();
+    fn check_local_limit_after_reclaim(&mut self, cur: u64) -> Result<()> {
         if cur > self.local_limit {
             let freed = self.reclaim(cur - self.local_limit);
             if freed > 0 {
@@ -300,7 +305,7 @@ impl BudgetState {
                     self.trim_raw();
                 }
             }
-            let after = self.local_live();
+            let after = cur.saturating_sub(freed);
             if after > self.local_limit {
                 return Err(Error::BudgetExceeded(Budget {
                     kind: BudgetKind::Memory,
@@ -683,6 +688,37 @@ impl ViewBudget {
         s.parent = parent;
     }
 
+    #[cfg(test)]
+    pub(super) fn live_credit(&self) -> u64 {
+        self.inner
+            .lock()
+            .credit
+            .as_ref()
+            .map_or(0, LiveCredit::live)
+    }
+
+    pub(crate) fn backs_publication(&self) -> bool {
+        self.inner.lock().credit.is_some()
+    }
+
+    /// Move bytes from an already admitted publication peak to its independent owner.
+    pub(crate) fn detach_publication(&self, bytes: u64) -> Option<MemoryLease> {
+        let mut s = self.inner.lock();
+        let lease = s
+            .credit
+            .as_mut()?
+            .split_live(bytes)
+            .expect("publication bytes were admitted before allocation");
+        let from_pass = bytes.min(s.pass_bytes);
+        s.pass_bytes -= from_pass;
+        s.state_bytes -= bytes - from_pass;
+        Some(lease.into_lease())
+    }
+
+    pub(crate) fn set_publication_local(&self, bytes: u64) {
+        self.inner.lock().published_local = bytes;
+    }
+
     pub(crate) fn set_local_limit(&self, limit: Option<u64>) {
         self.inner.lock().local_limit = limit.unwrap_or(u64::MAX);
     }
@@ -756,7 +792,8 @@ impl ViewBudget {
             s.release_raw(delta);
         }
         s.state_bytes = next_state_bytes;
-        s.check_local_limit_after_reclaim()?;
+        let local = s.local_live();
+        s.check_local_limit_after_reclaim(local)?;
         if s.total_live() == 0 {
             s.trim_raw();
         }
@@ -808,6 +845,11 @@ impl ViewBudget {
             .state_bytes
             .saturating_add(s.pass_bytes)
             .saturating_add(release_scratch);
+        let next_local = s
+            .local_live()
+            .saturating_sub(prev_combined)
+            .saturating_add(next_state_bytes);
+        s.check_local_limit_after_reclaim(next_local)?;
         if next_state_bytes > prev_combined {
             let delta = next_state_bytes - prev_combined;
             s.reserve_raw(delta).map_err(budget_error)?;
@@ -819,7 +861,6 @@ impl ViewBudget {
         s.pass_bytes = 0;
         s.scratch_bytes -= release_scratch;
         let _ = out_lease.take_bytes();
-        s.check_local_limit_after_reclaim()?;
         if s.total_live() == 0 {
             s.trim_raw();
         }
@@ -854,6 +895,7 @@ impl ViewBudget {
         let mut s = self.inner.lock();
         let drop_bytes = s.state_bytes.saturating_add(s.pass_bytes);
         s.state_bytes = 0;
+        s.published_local = 0;
         s.pass_bytes = 0;
         s.release_raw(drop_bytes);
         if s.total_live() == 0 {
@@ -1067,6 +1109,45 @@ mod tests {
         assert!(err_flag.load(Ordering::SeqCst));
         assert!(err_count.load(Ordering::SeqCst) >= 1);
         drop(taken_budget);
+    }
+
+    #[test]
+    fn operator_state_returns_active_and_retired_chunks_on_unwind() {
+        use sparkles_budget::{LIVE_SLACK, LIVE_STEP};
+
+        struct Interrupted;
+
+        let pool = QueryPool::new(4 * LIVE_SLACK);
+        let parent = pool.work_parent();
+        let sibling = parent.reserve(17).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let budget = ViewBudget::new(None, Some(parent));
+            budget.try_set_state(LIVE_STEP - 1).unwrap();
+            assert_eq!(pool.granted(), sibling.bytes() + LIVE_STEP);
+            budget.try_set_state(LIVE_STEP).unwrap();
+            assert_eq!(pool.granted(), sibling.bytes() + LIVE_STEP);
+            budget.try_set_state(LIVE_STEP + 1).unwrap();
+            assert_eq!(pool.granted(), sibling.bytes() + 2 * LIVE_STEP);
+
+            budget.try_set_state(2 * LIVE_SLACK + 1).unwrap();
+            let peak = sibling.bytes() + 2 * LIVE_SLACK + LIVE_STEP;
+            assert_eq!(pool.granted(), peak);
+            budget.try_set_state(1).unwrap();
+            assert_eq!(pool.granted(), peak);
+            drop(budget.drain_retired());
+            assert!(pool.granted() < peak);
+            assert!(pool.granted() > sibling.bytes());
+            // The next reduction leaves both active and retired credit to unwind.
+            budget.try_set_state(2 * LIVE_SLACK + 1).unwrap();
+            budget.try_set_state(LIVE_STEP + 1).unwrap();
+            assert_eq!(pool.granted(), peak);
+            std::panic::panic_any(Interrupted);
+        }))
+        .unwrap_err();
+        assert!(panic.is::<Interrupted>());
+        assert_eq!(pool.granted(), sibling.bytes());
+        drop(sibling);
+        assert_eq!(pool.granted(), 0);
     }
 
     /// Proves that `local_limit` is enforced without a 64 KiB `LIVE_STEP` slack overshoot

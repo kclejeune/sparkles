@@ -217,7 +217,7 @@ impl PyReasoning {
                     (asked, limit) => asked.or(limit),
                 };
                 request.analysis.cancel = Some(control.cancel.flag());
-                let result = ds.reasoning().diff(&request)?;
+                let result = ds.reasoning().diff_admitted(&request)?;
                 control.check()?;
                 Ok(result.to_json())
             })?;

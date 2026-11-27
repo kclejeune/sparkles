@@ -307,6 +307,11 @@ impl Views {
         })
     }
 
+    /// Run a worker round and report whether it completed before the timeout.
+    pub fn settle_checked(&self, timeout: Duration) -> bool {
+        self.rt().settle_checked(timeout)
+    }
+
     /// Wait for one round of the views' thread, at most `timeout`: the views defined
     /// in the dataset are then attached and recovered.
     pub fn settle(&self, timeout: Duration) {

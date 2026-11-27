@@ -4,12 +4,11 @@
 
 This spec covers one morsel-driven pull executor in which eager execution is a consumption policy, with one memory-accounting model, one kernel per join and grouping algorithm, and one execution-policy function for every entry point. Its
 first stage of deletions, the policy items 480 to 483 of its third stage and the
-accounting model, mode-neutral kernels and decoding twins of its fourth stage have
-shipped, as its [Outcome](SPEC.md#outcome) records. The format cutoff of item 479 and the
-commit publish tail of item 484 remain with
-[X16](../X16-storage-consolidation/README.md), the hierarchical budget of item 675 closes
-stage 4, and
-[roadmap item 453](../../ROADMAP.md) holds the rest of the work. The [plan](PLAN.md)
+accounting model, mode-neutral kernels, decoding twins and hierarchical budget of its
+fourth stage have shipped, as its [Outcome](SPEC.md#outcome) records. The format cutoff
+of item 479 and the commit publish tail of item 484 remain with
+[X16](../X16-storage-consolidation/README.md). [Roadmap item 453](../../ROADMAP.md)
+holds the rest of the work. The [plan](PLAN.md)
 orders the remaining stages into phases, items 825 to 829 first, with their files, gates,
 measurements and the decisions that are open.
 

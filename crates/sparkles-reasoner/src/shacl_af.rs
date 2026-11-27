@@ -251,6 +251,8 @@ pub(crate) fn derive(
     let rules = shapes.rules().context("reading the SHACL rules")?;
     let vopts = ValidateOptions {
         cancel: opts.cancel.clone(),
+        query_memory_parent: (opts.max_memory.is_some() || opts.memory_parent.is_some())
+            .then(|| budget.query_parent()),
         ..Default::default()
     };
     let mut interner = Interner {
@@ -302,25 +304,7 @@ pub(crate) fn derive(
                     g.derived_len()
                 ),
             );
-            // the queries of the round may use a quarter of what the run has left,
-            // reserved from its budget while they run, so that the run stays within it
-            let query_held = match opts.max_memory {
-                Some(_) => {
-                    let share = (budget.available() / 4).max(1 << 20);
-                    Some(Held::try_new(&budget, share)?)
-                }
-                None => None,
-            };
-            let data = RuleData::new(
-                overlay.clone(),
-                &shapes,
-                Some(&iris[0]),
-                &iris[1..],
-                &ValidateOptions {
-                    query_memory: query_held.as_ref().map(|h| h.bytes() as u64),
-                    ..vopts.clone()
-                },
-            )?;
+            let data = RuleData::new(overlay.clone(), &shapes, Some(&iris[0]), &iris[1..], &vopts)?;
             let mut found: rustc_hash::FxHashSet<[u64; 3]> = Default::default();
             let mut found_held = Held::new(&budget);
             let derived = g.derived_len();
@@ -349,7 +333,6 @@ pub(crate) fn derive(
                 .with_context(|| format!("the SHACL rule {}", rule.node))?;
             }
             drop(data);
-            drop(query_held);
             let mut found: Vec<[u64; 3]> = found.into_iter().collect();
             found.sort_unstable();
             round += 1;

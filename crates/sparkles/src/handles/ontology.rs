@@ -154,20 +154,49 @@ impl OntologyRequest {
         view: &Snapshot,
         readable: &dyn Fn(Id) -> bool,
     ) -> (sparkles_reasoner::inputs::Resolved, Vec<ImportEdge>) {
-        let inputs = Inputs {
+        sparkles_reasoner::inputs::resolve_closure(
+            view,
+            &self.inputs(),
+            readable,
+            &self.import_targets,
+        )
+    }
+
+    fn inputs(&self) -> Inputs {
+        Inputs {
             data_graphs: self.graphs(),
             ontology_graphs: Vec::new(),
             imports: self.imports,
             location_mapping: Default::default(),
-        };
-        sparkles_reasoner::inputs::resolve_closure(view, &inputs, readable, &self.import_targets)
+        }
+    }
+}
+
+/// Read-only ontology data that keeps its admission while the reader shares it.
+#[derive(Debug)]
+pub struct SharedOntology {
+    value: read::Ontology,
+    _memory: Option<Arc<sparkles_budget::MemoryLease>>,
+}
+
+impl std::ops::Deref for SharedOntology {
+    type Target = read::Ontology;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl AsRef<read::Ontology> for SharedOntology {
+    fn as_ref(&self) -> &read::Ontology {
+        &self.value
     }
 }
 
 /// An open ontology: its terminology read from one state, through the caller's view.
 #[derive(Clone)]
 pub struct Opened {
-    pub ontology: Arc<read::Ontology>,
+    pub ontology: Arc<SharedOntology>,
     /// the state read, as the caller's view sees it
     pub snapshot: Arc<Snapshot>,
     /// the graphs read: index `n` is graph `n` of [`read::Ontology::graph_of`]. The
@@ -185,6 +214,7 @@ pub struct Opened {
     /// them and the dataset has them; `None` reads the asserted axioms only
     pub inferences: Option<Inferences>,
     inner: Arc<Inner>,
+    request_bytes: u64,
 }
 
 /// The materialized inferences an open ontology read (spec F21 §7): the profile of the
@@ -220,12 +250,13 @@ struct Inner {
     /// the blank nodes whose class assertions `x rdf:type _:c` were read eagerly, as
     /// the class expressions of the terminology
     class_nodes: FxHashSet<Id>,
+    _memory: Option<Arc<sparkles_budget::MemoryLease>>,
 }
 
 /// One kept ontology.
 pub struct CacheEntry {
     key: String,
-    ontology: Arc<read::Ontology>,
+    ontology: Arc<SharedOntology>,
     graphs: Vec<GraphRef>,
     requested: usize,
     imports: Vec<Import>,
@@ -271,6 +302,23 @@ impl ReadView<'_> {
 }
 
 impl Opened {
+    fn source_bytes(&self) -> usize {
+        self.graphs
+            .iter()
+            .map(|g| 64 + g.as_str().len())
+            .sum::<usize>()
+            + self
+                .imports
+                .iter()
+                .map(|i| {
+                    128 + i.iri.len()
+                        + i.location.as_ref().map_or(0, String::len)
+                        + i.graph.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>()
+            + self.warnings.iter().map(|w| 64 + w.len()).sum::<usize>()
+    }
+
     /// The name of graph `n` of the ontology.
     pub fn graph_name(&self, n: u32) -> &str {
         self.graphs.get(n as usize).map_or("", |g| g.as_str())
@@ -322,21 +370,57 @@ impl Opened {
     pub fn assertions(
         &self,
         opts: &QueryOptions,
+        f: impl FnMut(Option<Axiom>, &Triple, u32) -> Result<bool>,
+    ) -> Result<()> {
+        self.assertions_with_memory(opts, None, f)
+    }
+
+    fn assertions_with_memory(
+        &self,
+        opts: &QueryOptions,
+        memory: Option<&classify::Working>,
         mut f: impl FnMut(Option<Axiom>, &Triple, u32) -> Result<bool>,
     ) -> Result<()> {
-        let opts = &*crate::overview::one_deadline(opts)?;
-        let mut stream = self.stream(opts);
-        for (g, id) in self.inner.graph_ids.iter().enumerate() {
-            let Some(id) = id else { continue };
-            let more = stream.scan(Perm::Gspo, &[id.0], |t, _| {
-                let ax = self.ontology.map_assertion(&t);
-                f(ax, &t, g as u32)
-            })?;
-            if !more {
-                break;
+        self.assertion_triples_with_memory(opts, memory, |t, graph| {
+            let scratch = 512 + read::triple_payload(t) as u64 * 2;
+            if let Some(memory) = memory {
+                memory.lock().grow(scratch)?;
             }
+            let ax = self.ontology.map_assertion(t);
+            let result = f(ax, t, graph);
+            if let Some(memory) = memory {
+                let mut held = memory.lock();
+                let bytes = held.bytes() - scratch;
+                held.shrink_to(bytes);
+            }
+            result
+        })
+    }
+
+    fn assertion_triples_with_memory(
+        &self,
+        opts: &QueryOptions,
+        memory: Option<&classify::Working>,
+        mut f: impl FnMut(&Triple, u32) -> Result<bool>,
+    ) -> Result<()> {
+        let mut scan = || {
+            let opts = &*crate::overview::one_deadline(opts)?;
+            let mut stream = self.stream(opts);
+            stream.memory = memory;
+            for (g, id) in self.inner.graph_ids.iter().enumerate() {
+                let Some(id) = id else { continue };
+                let more = stream.scan(Perm::Gspo, &[id.0], |t, _| f(&t, g as u32))?;
+                if !more {
+                    break;
+                }
+            }
+            Ok(())
+        };
+        if memory.is_some() {
+            sparkles_core::sparql::pool::QueryPool::with_deferred_release_wakes(scan)
+        } else {
+            scan()
         }
-        Ok(())
     }
 
     fn stream<'a>(&'a self, opts: &'a QueryOptions) -> Stream<'a> {
@@ -345,6 +429,7 @@ impl Opened {
             opts,
             rdf_type: self.snapshot.lookup_iri(vocab::RDF_TYPE),
             n: 0,
+            memory: None,
         }
     }
 
@@ -803,6 +888,7 @@ struct Stream<'a> {
     opts: &'a QueryOptions,
     rdf_type: Option<Id>,
     n: usize,
+    memory: Option<&'a classify::Working>,
 }
 
 impl Stream<'_> {
@@ -811,12 +897,26 @@ impl Stream<'_> {
     /// not a class assertion of a structural type or of a class expression the read
     /// collected. A class assertion whose blank-node class the read did not collect
     /// stays in the stream, where it maps to no axiom.
-    fn assertion(o: &Opened, rdf_type: Option<Id>, q: &[Id; 4]) -> Option<Triple> {
+    fn assertion(
+        o: &Opened,
+        rdf_type: Option<Id>,
+        q: &[Id; 4],
+        opts: &QueryOptions,
+        memory: Option<&classify::Working>,
+    ) -> Result<Option<Triple>> {
         let inner = &o.inner;
         if inner.terminological.contains(&q[1]) || inner.mains.contains(q) {
-            return None;
+            return Ok(None);
         }
-        let t = triple_of(&o.snapshot, q)?;
+        let triple = if let Some(memory) = memory {
+            let mut held = memory.lock();
+            triple_of_admitted(&o.snapshot, q, opts, &mut held)?
+        } else {
+            triple_of(&o.snapshot, q)
+        };
+        let Some(t) = triple else {
+            return Ok(None);
+        };
         // class assertions with a structural type or a collected class expression were
         // read
         if Some(q[1]) == rdf_type
@@ -825,9 +925,9 @@ impl Stream<'_> {
                 _ => read::is_terminological(&t, &|_| false),
             }
         {
-            return None;
+            return Ok(None);
         }
-        Some(t)
+        Ok(Some(t))
     }
 
     /// Scan `perm` under `prefix`, calling `f` with each assertion and its quad until it
@@ -839,17 +939,23 @@ impl Stream<'_> {
         mut f: impl FnMut(Triple, &[Id; 4]) -> Result<bool>,
     ) -> Result<bool> {
         let stopped = std::cell::Cell::new(false);
-        let (o, opts, rdf_type) = (self.o, self.opts, self.rdf_type);
+        let (o, opts, rdf_type, memory) = (self.o, self.opts, self.rdf_type, self.memory);
         let n = &mut self.n;
         let mut each = |q: &[Id; 4]| -> Result<bool> {
             *n += 1;
             if n.is_multiple_of(4096) {
                 check(opts)?;
             }
-            let Some(t) = Self::assertion(o, rdf_type, q) else {
-                return Ok(true);
-            };
-            let more = f(t, q)?;
+            let before = memory.map_or(0, |work| work.lock().bytes());
+            let assertion = Self::assertion(o, rdf_type, q, opts, memory)?;
+            let scratch = memory.map_or(0, |work| work.lock().bytes() - before);
+            let more = assertion.map_or(Ok(true), |term| f(term, q));
+            if let Some(memory) = memory {
+                let mut held = memory.lock();
+                let retained = held.bytes() - scratch;
+                held.shrink_to(retained);
+            }
+            let more = more?;
             stopped.set(!more);
             Ok(more)
         };
@@ -1202,6 +1308,24 @@ fn triple_of(snap: &Snapshot, q: &[Id; 4]) -> Option<Triple> {
     Some(Triple::new(s, p, snap.term(q[2])?))
 }
 
+fn triple_of_admitted(
+    snap: &Snapshot,
+    q: &[Id; 4],
+    opts: &QueryOptions,
+    memory: &mut crate::reasoning::memory::Memory,
+) -> Result<Option<Triple>> {
+    let mut decode =
+        |i: usize| crate::reasoning::memory::term(snap, q[i], memory, &mut || check(opts));
+    let (Some(subject), Some(Term::NamedNode(predicate)), Some(object)) =
+        (decode(0)?, decode(1)?, decode(2)?)
+    else {
+        return Ok(None);
+    };
+    Ok(NamedOrBlankNode::try_from(subject)
+        .ok()
+        .map(|s| Triple::new(s, predicate, object)))
+}
+
 impl Ontologies {
     /// The state `req.at` names through the caller's view, with the options anchored to
     /// one deadline.
@@ -1248,12 +1372,18 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<Opened> {
         req.validate()?;
+        let defaults = self.ds.with_query_defaults(opts);
+        let opts = &defaults;
+        let request_parent = opts.grant.is_some() || opts.pool.is_some();
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let view = match &access {
             Some(a) => a.masked(snap)?,
             None => snap.clone(),
         };
-        let keep = access.is_none() && snap.cacheable;
+        let keep = !opts.no_cache
+            && access.is_none()
+            && snap.cacheable
+            && (self.ds.pool().is_some() || !request_parent);
         // an inferred view reads the inferred graph while the dataset records a
         // materialization; without one it reads the asserted axioms only (§7)
         let record = if req.inferences {
@@ -1277,6 +1407,7 @@ impl Ontologies {
                     cached: true,
                     inferences: None,
                     inner: e.inner.clone(),
+                    request_bytes: 0,
                 };
                 cache.push(e);
                 drop(cache);
@@ -1284,8 +1415,29 @@ impl Ontologies {
                 return Ok(opened);
             }
         }
+        check(opts)?;
+        let mut memory = crate::reasoning::memory::Memory::query(opts);
+        let opening_bytes = 1024
+            + req
+                .graphs
+                .iter()
+                .map(|graph| 128 + graph.as_str().len())
+                .sum::<usize>();
+        memory.grow(opening_bytes as u64)?;
         let readable = |g: Id| access.as_ref().is_none_or(|a| a.readable_id(snap, g));
-        let (resolved, closure) = req.resolve(&view, &readable);
+        let resolved = {
+            let memory = std::cell::RefCell::new(&mut memory);
+            sparkles_reasoner::inputs::resolve_closure_admitted(
+                &view,
+                &req.inputs(),
+                &readable,
+                &req.import_targets,
+                &|| check(opts),
+                &|bytes| memory.borrow_mut().grow(bytes as u64),
+            )
+            .map_err(crate::handles::from_anyhow)?
+        };
+        let (resolved, closure) = resolved;
         let mut graphs = resolved.graphs.clone();
         let inferred = GraphRef::Named(INFERRED_GRAPH.to_string());
         if record.is_some() && !graphs.contains(&inferred) {
@@ -1296,16 +1448,34 @@ impl Ontologies {
             .iter()
             .map(|g| g.id(&view).filter(|id| readable(*id)))
             .collect();
-        let (ontology, inner) = read_store(&view, &graph_ids, requested, req.mode, opts)?;
+        let (ontology, mut inner) = read_store(
+            &view,
+            &graph_ids,
+            requested,
+            req.mode,
+            opts,
+            Some(&mut memory),
+        )?;
         check(opts)?;
-        let ontology = Arc::new(ontology);
+        let mut keep = keep && ontology.triples.len() <= CACHE_MAX_TRIPLES;
+        if keep && let Some(pool) = self.ds.pool() {
+            keep = kept::admit_cached_memory(opts, pool, &mut memory);
+        }
+        let request_bytes = if keep { 0 } else { memory.bytes() };
+        let lease = memory.into_lease().map(Arc::new);
+        inner._memory = lease.clone();
+        let ontology = Arc::new(SharedOntology {
+            value: ontology,
+            _memory: lease,
+        });
         let inner = Arc::new(inner);
-        if keep && ontology.triples.len() <= CACHE_MAX_TRIPLES {
+        if keep {
             let mut cache = self.ds.state().ontology_cache.lock();
-            cache.retain(|e| e.key != key);
-            if cache.len() >= CACHE_ENTRIES {
-                cache.remove(0);
-            }
+            let retired = cache
+                .iter()
+                .position(|entry| entry.key == key)
+                .map(|index| cache.remove(index))
+                .or_else(|| (cache.len() >= CACHE_ENTRIES).then(|| cache.remove(0)));
             cache.push(CacheEntry {
                 key,
                 ontology: ontology.clone(),
@@ -1316,6 +1486,8 @@ impl Ontologies {
                 warnings: resolved.warnings.clone(),
                 inner: inner.clone(),
             });
+            drop(cache);
+            drop(retired);
         }
         let mut opened = Opened {
             ontology,
@@ -1328,9 +1500,16 @@ impl Ontologies {
             cached: false,
             inferences: None,
             inner,
+            request_bytes,
         };
         opened.inferences = self.inferences(&opened, record.as_ref());
         Ok(opened)
+    }
+
+    fn can_keep(&self, o: &Opened, opts: &QueryOptions) -> bool {
+        !opts.no_cache
+            && o.request_bytes == 0
+            && (self.ds.pool().is_some() || (opts.pool.is_none() && opts.grant.is_none()))
     }
 
     /// The inferences `o` read, when `record` made it read the inferred graph and the
@@ -2073,7 +2252,13 @@ fn read_store(
     requested: usize,
     mode: Mode,
     opts: &QueryOptions,
+    memory: Option<&mut crate::reasoning::memory::Memory>,
 ) -> Result<(read::Ontology, Inner)> {
+    let mut memory = memory;
+    let base = memory.as_ref().map_or(0, |memory| memory.bytes());
+    if let Some(memory) = &mut memory {
+        memory.grow((graph_ids.len() * 128 + 8192) as u64)?;
+    }
     let graph_of_id: FxHashMap<Id, u32> = graph_ids
         .iter()
         .enumerate()
@@ -2085,6 +2270,7 @@ fn read_store(
         quads: Vec::new(),
         seen: FxHashSet::default(),
         opts,
+        memory: memory.as_deref_mut(),
     };
     let mut terminological: FxHashSet<Id> = FxHashSet::default();
     let mut class_nodes: FxHashSet<Id> = FxHashSet::default();
@@ -2165,23 +2351,33 @@ fn read_store(
             check(opts)?;
             for g in &graphs {
                 let q = [s, p, o, *g];
-                if !terminological.contains(&p) && snap.contains(&q)? && c.seen.insert(q) {
-                    c.quads.push(q);
+                if !terminological.contains(&p) && snap.contains(&q)? && c.push(q)? {
                     mains.insert(q);
                 }
             }
         }
     }
-    let quads = c.quads;
-    finish(
-        snap,
-        quads,
-        &graph_of_id,
+    let (ontology, inner) = c.finish(
         graph_ids.len(),
         requested,
         mode,
         (terminological, mains, class_nodes),
-    )
+    )?;
+    drop(graph_of_id);
+    if let Some(memory) = memory {
+        use sparkles_budget::sizes::table_bytes_for;
+        let retained = ontology.retained_bytes()
+            + size_of::<Inner>()
+            + inner.quads.capacity() * size_of::<[Id; 4]>()
+            + inner.graph_ids.capacity() * size_of::<Option<Id>>()
+            + table_bytes_for::<Id>(inner.terminological.capacity())
+            + table_bytes_for::<[Id; 4]>(inner.mains.capacity())
+            + table_bytes_for::<Id>(inner.class_nodes.capacity());
+        let target = base.saturating_add(retained as u64);
+        memory.cover(target)?;
+        memory.shrink_to(target);
+    }
+    Ok((ontology, inner))
 }
 
 /// The quads of the graphs read that POS prefixes select, each once.
@@ -2191,23 +2387,36 @@ struct Collect<'a> {
     quads: Vec<[Id; 4]>,
     seen: FxHashSet<[Id; 4]>,
     opts: &'a QueryOptions,
+    memory: Option<&'a mut crate::reasoning::memory::Memory>,
 }
 
 impl Collect<'_> {
+    fn push(&mut self, quad: [Id; 4]) -> Result<bool> {
+        if self.seen.contains(&quad) {
+            return Ok(false);
+        }
+        if let Some(memory) = &mut self.memory {
+            memory.grow(512)?;
+        }
+        self.seen.insert(quad);
+        self.quads.push(quad);
+        Ok(true)
+    }
+
     fn prefix(&mut self, prefix: &[u64]) -> Result<()> {
         let mut n = 0usize;
-        let (graphs, seen, quads, opts) = (self.graphs, &mut self.seen, &mut self.quads, self.opts);
+        let (snap, graphs, opts) = (self.snap, self.graphs, self.opts);
         let mut each = |q: [Id; 4]| -> Result<()> {
             n += 1;
             if n.is_multiple_of(4096) {
                 check(opts)?;
             }
-            if graphs.contains_key(&q[3]) && seen.insert(q) {
-                quads.push(q);
+            if graphs.contains_key(&q[3]) {
+                self.push(q)?;
             }
             Ok(())
         };
-        self.snap.scan(Perm::Pos, prefix, |c| {
+        snap.scan(Perm::Pos, prefix, |c| {
             match c {
                 Chunk::Block(b, s, e) => {
                     for i in s..e {
@@ -2219,55 +2428,81 @@ impl Collect<'_> {
             Ok(true)
         })
     }
-}
-
-fn finish(
-    snap: &Snapshot,
-    quads: Vec<[Id; 4]>,
-    graph_of_id: &FxHashMap<Id, u32>,
-    graphs: usize,
-    requested: usize,
-    mode: Mode,
-    (terminological, mains, class_nodes): (FxHashSet<Id>, FxHashSet<[Id; 4]>, FxHashSet<Id>),
-) -> Result<(read::Ontology, Inner)> {
-    let mut triples = Vec::with_capacity(quads.len());
-    let mut graph_of = Vec::with_capacity(quads.len());
-    let mut kept = Vec::with_capacity(quads.len());
-    for q in quads {
-        if let Some(t) = triple_of(snap, &q) {
-            triples.push(t);
-            graph_of.push(graph_of_id[&q[3]]);
-            kept.push(q);
+    fn finish(
+        self,
+        graph_count: usize,
+        requested: usize,
+        mode: Mode,
+        (terminological, mains, class_nodes): (FxHashSet<Id>, FxHashSet<[Id; 4]>, FxHashSet<Id>),
+    ) -> Result<(read::Ontology, Inner)> {
+        let Self {
+            snap,
+            quads,
+            graphs: graph_of_id,
+            opts,
+            mut memory,
+            ..
+        } = self;
+        let mut triples = Vec::with_capacity(quads.len());
+        let mut graph_of = Vec::with_capacity(quads.len());
+        let mut kept = Vec::with_capacity(quads.len());
+        for q in quads {
+            let triple = match &mut memory {
+                None => triple_of(snap, &q),
+                Some(memory) => triple_of_admitted(snap, &q, opts, memory)?,
+            };
+            if let Some(t) = triple {
+                triples.push(t);
+                graph_of.push(graph_of_id[&q[3]]);
+                kept.push(q);
+            }
         }
-    }
-    let primary: Vec<u32> = (0..requested.min(graphs) as u32).collect();
-    let o = read::read(
-        triples,
-        graph_of,
-        &primary,
-        ReadOptions {
+        let primary: Vec<u32> = (0..requested.min(graph_count) as u32).collect();
+        let read_opts = ReadOptions {
             mode,
             terminology_only: true,
             max_diagnostics: 0,
-        },
-    );
-    let graph_ids = {
-        let mut ids = vec![None; graphs];
-        for (id, n) in graph_of_id {
-            ids[*n as usize] = Some(*id);
-        }
-        ids
-    };
-    Ok((
-        o,
-        Inner {
-            quads: kept,
-            graph_ids,
-            terminological,
-            mains,
-            class_nodes,
-        },
-    ))
+        };
+        let o =
+            if let Some(memory) = memory {
+                let memory = std::cell::RefCell::new(memory);
+                let refused = std::cell::RefCell::new(None);
+                let admitted =
+                    read::read_admitted(triples, graph_of, &primary, read_opts, &|bytes| {
+                        match check(opts).and_then(|()| memory.borrow_mut().grow(bytes as u64)) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                *refused.borrow_mut() = Some(error);
+                                false
+                            }
+                        }
+                    });
+                match admitted {
+                    Some(ontology) => ontology,
+                    None => return Err(refused.into_inner().expect("reader refused by admission")),
+                }
+            } else {
+                read::read(triples, graph_of, &primary, read_opts)
+            };
+        let graph_ids = {
+            let mut ids = vec![None; graph_count];
+            for (id, n) in graph_of_id {
+                ids[*n as usize] = Some(*id);
+            }
+            ids
+        };
+        Ok((
+            o,
+            Inner {
+                quads: kept,
+                graph_ids,
+                terminological,
+                mains,
+                class_nodes,
+                _memory: None,
+            },
+        ))
+    }
 }
 
 /// The most changed quads an ontology diff reads from the store's diff.
@@ -2665,7 +2900,17 @@ pub fn rl_warnings(
     let resolved = sparkles_reasoner::inputs::resolve_readable(snap, &inputs, &|_| true);
     let graph_ids: Vec<Option<Id>> = resolved.graphs.iter().map(|g| g.id(snap)).collect();
     let requested = inputs.data_graphs.len();
-    let (ontology, _) = read_store(snap, &graph_ids, requested, Mode::Lenient, opts)?;
+    check(opts)?;
+    let mut memory = crate::reasoning::memory::Memory::query(opts);
+    let (ontology, _) = read_store(
+        snap,
+        &graph_ids,
+        requested,
+        Mode::Lenient,
+        opts,
+        Some(&mut memory),
+    )?;
+    check(opts)?;
     let part = sparkles_owl::profiles::partition(&ontology, Profile::Rl);
     let render = sparkles_owl::ofn::Renderer::new(prefixes.clone());
     let mut out = Vec::new();

@@ -54,6 +54,8 @@ mod group_index_tests;
 mod group_model;
 mod history_limited;
 mod history_probe;
+#[doc(hidden)]
+pub mod import_journal;
 pub(crate) use history_limited::SnapshotCharge;
 mod history_query;
 mod holds;
@@ -1414,7 +1416,7 @@ impl Snapshot {
     /// scratch growth (`old_cap`, `new_cap`), settled scratch capacity (`cap`),
     /// coexisting scratch and decoded-output bytes (`scratch_cap`, `key_len`), and
     /// live request-control checkpoints.
-    pub(crate) fn term_controlled_owned(
+    pub fn term_controlled_owned(
         &self,
         id: Id,
         grow: &mut dyn FnMut(usize, usize) -> Result<()>,
@@ -2459,6 +2461,36 @@ struct WriterState {
     control_log: Option<control_store::ControlLog>,
 }
 
+impl Store {
+    /// Persist a tracked write's intent for `seq`. The sidecar may name `seq` even if
+    /// its sync reports an error, so subsequent writes are refused until recovery
+    /// can resolve that ambiguity. The intent's sync can outlast a cancellation or
+    /// the deadline, so the controls are checked once more after it. A refusal there
+    /// retires the intent, and only a confirmed retirement makes `seq` available again.
+    fn arm_commit_hook(
+        &self,
+        w: &mut WriterState,
+        hook: Option<crate::guard::CommitHook<'_>>,
+        seq: u64,
+        opts: &crate::guard::WriteOptions,
+    ) -> Result<bool> {
+        let Some(hook) = hook else {
+            return Ok(false);
+        };
+        let poisoned = w.poisoned;
+        w.poisoned = true;
+        hook.persist(seq)?;
+        self.failpoint("commit-intent-persisted");
+        if let Err(refusal) = opts.check() {
+            if hook.retire(seq).is_ok() {
+                w.poisoned = poisoned;
+            }
+            return Err(refusal);
+        }
+        Ok(true)
+    }
+}
+
 impl WriterState {
     /// Cut the space preallocated after the last commit off the WAL, before the store
     /// closes or moves on to another generation's log: a log that is no longer
@@ -2481,7 +2513,8 @@ impl WriterState {
 }
 
 /// Commit metadata for a transaction that is committed by rebuilding the generation.
-struct BulkCommit {
+struct BulkCommit<'a> {
+    hook: Option<crate::guard::CommitHook<'a>>,
     kind: CommitKind,
     /// quads the transaction deleted (net) before its bulk batch
     net_del: u64,
@@ -2691,6 +2724,8 @@ pub struct Store {
     /// Verified imported-origin closure and proven WAL intervals retained from the
     /// opening proof of an imported destination (drops before `_lock` and `family`).
     imported_opening: Option<Arc<configuration_history::ImportedRetained>>,
+    /// Private stores used for reasoning keep their storage credit through teardown.
+    private_memory: Option<Mutex<sparkles_budget::LiveCredit>>,
     /// Keep exclusion through Drop and every other owned field's destructor.
     /// Fields drop in declaration order. Only the family root lease follows this.
     _lock: Option<Arc<ProcessLock>>,
@@ -2924,6 +2959,38 @@ impl Store {
         )
     }
 
+    /// An isolated, request-owned store whose snapshots must stay inside the request.
+    pub fn private_memory(
+        mut opts: StoreOptions,
+        parent: Option<sparkles_budget::ParentHandle>,
+    ) -> Result<Store> {
+        if let Some(parent) = parent {
+            let mut memory = sparkles_budget::LiveCredit::new(parent);
+            memory
+                .try_add(16 << 10)
+                .map_err(crate::access::preparation::parent_error)?;
+            // The private copy needs neither a larger rebuilt generation nor a change log.
+            opts.bulk_threshold = u64::MAX;
+            opts.change_log = false;
+            let mut store = Self::in_memory(opts);
+            store.private_memory = Some(Mutex::new(memory));
+            return Ok(store);
+        }
+        Ok(Self::in_memory(opts))
+    }
+
+    fn admit_private_storage(&self, bytes: u64) -> Result<()> {
+        if let Some(memory) = &self.private_memory {
+            let mut memory = memory.lock();
+            let target = bytes.saturating_add(16 << 10);
+            let growth = target.saturating_sub(memory.live());
+            memory
+                .try_add(growth)
+                .map_err(crate::access::preparation::parent_error)?;
+        }
+        Ok(())
+    }
+
     /// An in-memory store whose base is the generation `gen_` (built in a temporary
     /// directory it owns), with root commit `root`: a new store, or an in-memory clone.
     pub(crate) fn in_memory_from(
@@ -3032,6 +3099,7 @@ impl Store {
             _lock: None,
             family: family.clone(),
             _close_complete: Arc::new(()),
+            private_memory: None,
             dataset_id,
             forked_mem: forked_from,
             catalog: Arc::new(Mutex::new(Catalog::memory(root, opts.memory_commit_ring))),
@@ -3522,6 +3590,7 @@ impl Store {
         gen_.dvocab.settle()?;
         #[cfg(test)]
         open_step("vocab-settled");
+        import_journal::discard_uncommitted(root, head.seq)?;
         // the control log's accepted prefix is durable after the log it follows
         let control_log = match &control_opened {
             Some(o) => Some(control_store::settle_at_open(root, o)?),
@@ -3672,6 +3741,7 @@ impl Store {
             _lock: Some(lock.clone()),
             family: family.clone(),
             _close_complete: Arc::new(()),
+            private_memory: None,
             dataset_id,
             forked_mem: None,
             catalog: Arc::new(Mutex::new(catalog)),
@@ -6583,6 +6653,7 @@ impl Store {
     /// `StorageFull` when an in-memory store's data with its configuration's history,
     /// `size` bytes, would pass its limit.
     fn check_memory_total(&self, size: u64) -> Result<()> {
+        self.admit_private_storage(size)?;
         match self.opts.max_memory_bytes {
             Some(max) if self.root.is_none() && size > max => {
                 let h = crate::error::human_bytes;
@@ -6788,7 +6859,7 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
     ) -> Result<Receipt> {
-        self.load_with_entry_classified(load_plan::Entry::Load, sources, kind, o)
+        self.load_with_entry_classified(load_plan::Entry::Load, sources, kind, o, None)
             .map_err(SparqlLoadError::into_inner)
     }
 
@@ -6801,12 +6872,14 @@ impl Store {
         source: &Source,
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
+        hook: Option<crate::guard::CommitHook<'_>>,
     ) -> std::result::Result<Receipt, SparqlLoadError> {
         self.load_with_entry_classified(
             load_plan::Entry::SparqlLoad,
             std::slice::from_ref(source),
             kind,
             o,
+            hook,
         )
     }
 
@@ -6816,6 +6889,7 @@ impl Store {
         sources: &[Source],
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
+        hook: Option<crate::guard::CommitHook<'_>>,
     ) -> std::result::Result<Receipt, SparqlLoadError> {
         let allow_source_io = sources
             .iter()
@@ -6830,6 +6904,7 @@ impl Store {
             }
             let snap = self.snapshot();
             let bulk = BulkCommit {
+                hook,
                 kind,
                 net_del: 0,
                 start_len: snap.len(),
@@ -6904,7 +6979,8 @@ impl Store {
                 txn.guard.next_bnode = txn.start_bnode;
                 return Err(self.classify_refusal_after_drain(is_source, error, o));
             }
-            let r = with_early_refusal(txn.commit(), early).map_err(SparqlLoadError::Store)?;
+            let r = with_early_refusal(txn.commit_with_hook(hook), early)
+                .map_err(SparqlLoadError::Store)?;
             self.add_prefixes(prefixes)
                 .map_err(SparqlLoadError::Store)?;
             Ok(r)
@@ -7142,6 +7218,7 @@ impl Store {
         }
         let start_len = snap.len();
         let bulk = BulkCommit {
+            hook: None,
             kind,
             net_del: dropped,
             start_len,
@@ -7178,7 +7255,7 @@ impl Store {
         extra: &[Source],
         extra_quads: &[[Id; 4]],
         drop_graphs: &[Id],
-        bulk: BulkCommit,
+        bulk: BulkCommit<'_>,
         check: (crate::guard::Changes<'_>, &crate::guard::WriteOptions),
     ) -> Result<(u64, Receipt)> {
         self.rebuild_locked_classified(w, snap, extra, extra_quads, drop_graphs, bulk, check)
@@ -7193,7 +7270,7 @@ impl Store {
         extra: &[Source],
         extra_quads: &[[Id; 4]],
         drop_graphs: &[Id],
-        bulk: BulkCommit,
+        bulk: BulkCommit<'_>,
         check: (crate::guard::Changes<'_>, &crate::guard::WriteOptions),
     ) -> std::result::Result<(u64, Receipt), SparqlLoadError> {
         let (changes, o) = check;
@@ -7503,12 +7580,18 @@ impl Store {
         if bulk.skip_if_unchanged {
             w.tap = None;
         }
+        let tracked;
         let annotation;
         if let Some(root) = &self.root {
             // Publication order: the new generation's files (with the commit its base
             // holds) and directory entries are durable, its WAL file exists durably, then
             // CURRENT switches durably, and only after that is the old generation removed.
-            let pre_switch = (|| -> std::result::Result<(File, u64, crate::annotations::Annotation), SparqlLoadError> {
+            // The second flag says whether the candidate directory must go too.
+            type PreSwitch = std::result::Result<
+                (File, u64, bool, crate::annotations::Annotation),
+                (SparqlLoadError, bool),
+            >;
+            let pre_switch = (|| -> PreSwitch {
                 write_synced(
                     &dir.join("commit.json"),
                     &commit::gen_commit_bytes_for(
@@ -7519,28 +7602,34 @@ impl Store {
                         configuration,
                     ),
                 )
-                .map_err(SparqlLoadError::Store)?;
+                .map_err(|e| (SparqlLoadError::Store(e), false))?;
                 let wal = wal::open_for_append(
                     &dir.join("wal.log"),
                     wal::version_with(self.configuration_activated(), self.control_enabled()),
                 )
-                .map_err(|e| SparqlLoadError::Store(e.into()))?;
+                .map_err(|e| (SparqlLoadError::Store(e.into()), false))?;
                 let wal_size = wal
                     .metadata()
-                    .map_err(|e| SparqlLoadError::Store(e.into()))?
+                    .map_err(|e| (SparqlLoadError::Store(e.into()), false))?
                     .len();
-                sync_dir(&dir).map_err(SparqlLoadError::Store)?;
-                sync_dir(root).map_err(SparqlLoadError::Store)?;
+                sync_dir(&dir).map_err(|e| (SparqlLoadError::Store(e), false))?;
+                sync_dir(root).map_err(|e| (SparqlLoadError::Store(e), false))?;
+                // CURRENT still names the old generation. A walk during the intent's
+                // sync may have counted the candidate, so a refused hook removes it after
+                // the log closes.
+                let armed = self
+                    .arm_commit_hook(w, bulk.hook, head.seq, o)
+                    .map_err(|e| (SparqlLoadError::Store(e), true))?;
                 // the commit's message is durable before the switch (no digest: its change
                 // set is not at hand)
                 let ann = self
                     .annotate(&head, message.clone(), || None)
-                    .map_err(SparqlLoadError::Store)?;
-                Ok((wal, wal_size, ann))
+                    .map_err(|e| (SparqlLoadError::Store(e), false))?;
+                Ok((wal, wal_size, armed, ann))
             })();
-            let (wal, wal_size, ann) = match pre_switch {
+            let (wal, wal_size, armed, ann) = match pre_switch {
                 Ok(v) => v,
-                Err(e) => {
+                Err((e, remove_candidate)) => {
                     if self.clear_staged_prefixes().is_ok() {
                         if let Some(prep) = prepared_prefixes.as_mut() {
                             prep.disarm_staged_fence();
@@ -7548,11 +7637,18 @@ impl Store {
                     } else {
                         w.poisoned = true;
                     }
+                    if remove_candidate {
+                        drop(prepared_prefixes);
+                        drop(gen_);
+                        cleanup_dir(&dir);
+                    }
                     return Err(e);
                 }
             };
+            tracked = armed;
             annotation = ann;
             if let Err(f) = self.switch_generation(w, root, &name) {
+                w.poisoned |= tracked;
                 // Unless CURRENT may name the new generation, in which case the next open
                 // may bring the bulk commit back with its annotation and staged prefixes,
                 // both go.
@@ -7583,8 +7679,14 @@ impl Store {
                 },
             );
         } else {
-            annotation = match self.annotate(&head, message.clone(), || None) {
-                Ok(a) => a,
+            let published = self
+                .arm_commit_hook(w, bulk.hook, head.seq, o)
+                .and_then(|armed| {
+                    self.annotate(&head, message.clone(), || None)
+                        .map(|ann| (armed, ann))
+                });
+            let (armed, ann) = match published {
+                Ok(v) => v,
                 Err(e) => {
                     if self.clear_staged_prefixes().is_ok() {
                         if let Some(prep) = prepared_prefixes.as_mut() {
@@ -7596,6 +7698,8 @@ impl Store {
                     return Err(SparqlLoadError::Store(e));
                 }
             };
+            tracked = armed;
+            annotation = ann;
         }
         // the switch is the commit point: a failure after it leaves the published state
         // behind the durable one, so later writes are refused
@@ -7656,6 +7760,9 @@ impl Store {
             validated: validation.is_some(),
         }));
         self.disarm_switch(w);
+        if tracked {
+            w.poisoned = false;
+        }
         // and its own vector indexes, built in the background
         self.vectors_switched(snap);
         // a bulk commit has no log to schedule embeddings from
@@ -8791,6 +8898,13 @@ impl WriteTxn<'_> {
         if let Ok(i) = self.base.generation.vocab.find(key) {
             return Ok(Id::vocab(i));
         }
+        if self.store.private_memory.is_some() && self.lookup_key(key).is_none() {
+            self.store.admit_private_storage(
+                self.memory_size()
+                    .saturating_add(key.len() as u64 * 2)
+                    .saturating_add(simulation::APPEND_VOCAB_ENTRY_BYTES),
+            )?;
+        }
         self.base.generation.intern_delta_key(key)
     }
 
@@ -8929,7 +9043,16 @@ impl WriteTxn<'_> {
         let Some(ib) = self.change_base(&q, true)? else {
             return Ok(false);
         };
-        // re-adding a quad this transaction deleted cancels that deletion
+        if self.store.private_memory.is_some() {
+            self.store.admit_private_storage(
+                self.memory_size()
+                    .saturating_add(DELTA_QUAD_BYTES)
+                    .saturating_add(
+                        ((self.log.len() + 1) * (2 * std::mem::size_of::<(u8, [Id; 4])>())) as u64,
+                    ),
+            )?;
+        }
+        // Re-adding a quad this transaction deleted cancels that deletion.
         if self.present_at_start(&q, ib) {
             self.net_del -= 1;
         } else {
@@ -9013,6 +9136,13 @@ impl WriteTxn<'_> {
     /// Durably commit and publish a new snapshot. A transaction without net effect (and
     /// without a bulk batch) creates no commit: its receipt carries the unchanged head.
     pub fn commit(self) -> Result<Receipt> {
+        self.commit_with_hook(None)
+    }
+
+    pub(crate) fn commit_with_hook(
+        self,
+        hook: Option<crate::guard::CommitHook<'_>>,
+    ) -> Result<Receipt> {
         let span = tracing::info_span!(
             target: "sparkles::commit",
             "commit",
@@ -9026,7 +9156,7 @@ impl WriteTxn<'_> {
             store: self.store,
             sample: None,
         };
-        let r = self.commit_inner(&mut observation.sample);
+        let r = self.commit_inner(&mut observation.sample, hook);
         drop(observation);
         if let Ok(r) = &r
             && r.committed
@@ -9042,6 +9172,7 @@ impl WriteTxn<'_> {
     fn commit_inner(
         mut self,
         sync: &mut Option<(SyncPath, std::time::Duration)>,
+        hook: Option<crate::guard::CommitHook<'_>>,
     ) -> Result<Receipt> {
         self._callback_owner.check()?;
         if self.guard.poisoned
@@ -9049,7 +9180,7 @@ impl WriteTxn<'_> {
         {
             return Err(Error::Poisoned);
         }
-        let grouped = self.group_admitted();
+        let grouped = self.group_admitted(hook.is_some());
         // A dependent no-op, preview, validation, bulk rebuild or other fallback
         // cannot acknowledge or capture a speculative predecessor.
         if !grouped || (self.net_ins == 0 && self.net_del == 0) {
@@ -9151,9 +9282,9 @@ impl WriteTxn<'_> {
             let staged_prefixes = std::mem::take(&mut self.staged_prefixes);
             if staged_prefixes.is_empty() {
                 if self.guard.wal.is_none() {
-                    return self.publish_memory(validation);
+                    return self.publish_memory(validation, hook);
                 }
-                return self.publish_grouped(validation, grouped, sync);
+                return self.publish_grouped(validation, grouped, sync, hook);
             }
             let store = self.store;
             let target_seq = self.guard.head.seq + 1;
@@ -9169,9 +9300,9 @@ impl WriteTxn<'_> {
                     return Err(e);
                 }
                 let res = if self.guard.wal.is_none() {
-                    self.publish_memory(validation)
+                    self.publish_memory(validation, hook)
                 } else {
-                    self.publish_grouped(validation, grouped, sync)
+                    self.publish_grouped(validation, grouped, sync, hook)
                 };
                 match res {
                     Ok(receipt) => {
@@ -9202,9 +9333,9 @@ impl WriteTxn<'_> {
             drop(prep);
             store.warn_skipped_prefixes(skipped);
             if self.guard.wal.is_none() {
-                return self.publish_memory(validation);
+                return self.publish_memory(validation, hook);
             }
-            return self.publish_grouped(validation, grouped, sync);
+            return self.publish_grouped(validation, grouped, sync, hook);
         }
         // Build the new generation from this transaction's view (base + uncommitted delta)
         // plus the bulk quads; switching CURRENT is the atomic commit point, so the
@@ -9218,6 +9349,7 @@ impl WriteTxn<'_> {
             self.base.generation.dvocab.sync()?;
         }
         let commit = BulkCommit {
+            hook,
             kind: self.kind,
             net_del: self.net_del,
             start_len: self.base.len(),
@@ -9243,7 +9375,7 @@ impl WriteTxn<'_> {
 
     /// Whether this commit joins a group. A commit of a store with group commit on that
     /// does not is counted under the first reason it fell back for.
-    fn group_admitted(&self) -> bool {
+    fn group_admitted(&self, tracked: bool) -> bool {
         let why = match self
             .store
             .group_check(self.kind, &self.opts, &self.guard, self.idle_group)
@@ -9251,6 +9383,8 @@ impl WriteTxn<'_> {
             Err(None) => return false,
             Err(Some(why)) => Some(why),
             Ok(()) if !self.bulk.is_empty() => Some(Fallback::Bulk),
+            // A tracked write must reserve its sequence through a solo commit.
+            Ok(()) if tracked => Some(Fallback::Kind),
             // a managed commit is stamped with the sequence number after the head
             Ok(())
                 if self.force
@@ -9289,6 +9423,7 @@ impl WriteTxn<'_> {
     fn publish_memory(
         &mut self,
         validation: Option<Arc<crate::guard::ValidationSummary>>,
+        hook: Option<crate::guard::CommitHook<'_>>,
     ) -> Result<Receipt> {
         let gen_ = &self.base.generation;
         let message = match &self.opts.message {
@@ -9299,6 +9434,9 @@ impl WriteTxn<'_> {
         gen_.dvocab.sync()?;
         let c = self.next_commit(validation.as_deref());
         let control = self.control_frame(c.seq, c.timestamp_ms)?;
+        let tracked = self
+            .store
+            .arm_commit_hook(&mut self.guard, hook, c.seq, &self.opts)?;
         let annotation = self
             .store
             .annotate(&c, message, || Some(self.change_lines()))?;
@@ -9355,6 +9493,9 @@ impl WriteTxn<'_> {
         }));
         if let Some((_, state)) = control {
             self.store.control.store(Some(Arc::new(state)));
+        }
+        if tracked {
+            self.guard.poisoned = false;
         }
         Ok(Receipt {
             dataset_id: self.store.owner_dataset_id(),

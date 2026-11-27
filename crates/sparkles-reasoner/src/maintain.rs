@@ -130,8 +130,24 @@ impl Cache {
 
     /// Drop the kept closure.
     pub fn clear(&self) {
+        self.clear_at_generation(None);
+    }
+
+    /// Identify the cache state observed while ordering a facade clear under the writer.
+    #[doc(hidden)]
+    pub fn generation(&self) -> u64 {
+        self.kept.lock().generation
+    }
+
+    /// A delayed clear may discard the entry it observed, keeping a replacement
+    /// installed by a newer run. Compare and detach under the same cache lock.
+    #[doc(hidden)]
+    pub fn clear_at_generation(&self, observed: Option<u64>) {
         let old = {
             let mut slot = self.kept.lock();
+            if observed.is_some_and(|generation| generation != slot.generation) {
+                return;
+            }
             slot.generation = slot.generation.wrapping_add(1);
             slot.kept.take()
         };
@@ -426,22 +442,93 @@ pub(crate) fn changes(
     snap: &Arc<Snapshot>,
     cache: Option<&Cache>,
     inputs: &[GraphRef],
-) -> Result<RawChanges, String> {
+    budget: &Arc<Budget>,
+    cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<Result<RawChanges, String>> {
+    let admission = Staging::new(budget, cancel);
     // the log of the snapshot's generation gives the changes as its ids, without their
     // terms; other histories give them as terms
-    if let Ok(Some(r)) = logged_ids(store, since, snap, inputs) {
-        return Ok(r);
+    match logged_ids(store, since, snap, inputs, &admission) {
+        Ok(Some(raw)) => return Ok(Ok(admission.finish(raw))),
+        Ok(None) => {}
+        Err(e) => refuse_staging_error(&e)?,
     }
-    let e = match logged_changes(store, since, snap.commit, inputs) {
-        Ok(r) => return Ok(r),
-        Err(e) => e,
+    drop(admission);
+    let admission = Staging::new(budget, cancel);
+    let e = match logged_changes(store, since, snap.commit, inputs, &admission) {
+        Ok(raw) => return Ok(Ok(admission.finish(raw))),
+        Err(e) => {
+            refuse_staging_error(&e)?;
+            e
+        }
     };
-    match kept_changes(store, since, snap, cache, inputs) {
-        Some(r) => r,
-        None => Err(format!(
+    drop(admission);
+    match kept_changes(store, since, snap, cache, inputs, budget, cancel)? {
+        Some(raw) => Ok(raw),
+        None => Ok(Err(format!(
             "commit {since} cannot be compared with the head: {e:#}"
-        )),
+        ))),
     }
+}
+
+fn refuse_staging_error(error: &anyhow::Error) -> anyhow::Result<()> {
+    if let Some(error) = BudgetFailure::from_anyhow(error) {
+        return Err(error.into());
+    }
+    match error.downcast_ref::<sparkles_core::Error>() {
+        Some(sparkles_core::Error::BudgetExceeded(b)) => {
+            Err(sparkles_core::Error::BudgetExceeded(*b).into())
+        }
+        Some(sparkles_core::Error::Cancelled) => Err(sparkles_core::Error::Cancelled.into()),
+        _ => Ok(()),
+    }
+}
+
+struct Staging {
+    held: std::cell::RefCell<Held>,
+    opts: DiffOptions,
+}
+
+impl Staging {
+    fn new(budget: &Arc<Budget>, cancel: Option<&Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        Self {
+            held: std::cell::RefCell::new(Held::new(budget)),
+            opts: DiffOptions {
+                cancel: cancel.cloned(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn admit(&self, bytes: u64) -> sparkles_core::Result<()> {
+        let mut held = self.held.borrow_mut();
+        held.try_grow(bytes as usize).map_err(|error| match error {
+            BudgetFailure::Local(local) => {
+                sparkles_core::Error::BudgetExceeded(sparkles_core::error::Budget {
+                    kind: sparkles_core::error::BudgetKind::Memory,
+                    limit: local.limit as u64,
+                    requested: (held.budget().used() as u64).saturating_add(bytes),
+                })
+            }
+            error => crate::query::memory_error(error, "staging materialization changes"),
+        })
+    }
+
+    fn release(&self, bytes: u64) {
+        self.held.borrow_mut().shrink(bytes as usize);
+    }
+
+    fn finish(self, data: RawChangeData) -> RawChanges {
+        RawChanges {
+            data,
+            held: self.held.into_inner(),
+        }
+    }
+}
+
+pub(crate) struct RawChanges {
+    data: RawChangeData,
+    held: Held,
 }
 
 /// The changes from `since` to `snap` from the deltas of the closure kept for `since`,
@@ -452,7 +539,9 @@ pub(crate) fn kept_changes(
     snap: &Arc<Snapshot>,
     cache: Option<&Cache>,
     inputs: &[GraphRef],
-) -> Option<Result<RawChanges, String>> {
+    budget: &Arc<Budget>,
+    cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<Option<Result<RawChanges, String>>> {
     let old = cache.and_then(|c| {
         let slot = c.kept.lock();
         slot.kept
@@ -463,8 +552,18 @@ pub(crate) fn kept_changes(
                     && Arc::ptr_eq(&k.snap.generation, &snap.generation)
             })
             .map(|k| k.snap.clone())
-    })?;
-    Some(delta_changes(&old, snap, inputs).map_err(|e| e.to_string()))
+    });
+    let Some(old) = old else {
+        return Ok(None);
+    };
+    let admission = Staging::new(budget, cancel);
+    match delta_changes(&old, snap, inputs, &admission) {
+        Ok(raw) => Ok(Some(Ok(admission.finish(raw)))),
+        Err(e) => {
+            refuse_staging_error(&e)?;
+            Ok(Some(Err(e.to_string())))
+        }
+    }
 }
 
 /// The heap of a set of facts.
@@ -543,7 +642,7 @@ pub(crate) fn previous(
         let old_lookups = closure.set_inputs(snap.clone(), run_ids)?;
         remap_set(&mut generalized, &moved, None)?;
         held.set(set_bytes(&generalized))?;
-        let changes = raw.resolve(&closure.terms, snap, &ids)?;
+        let changes = raw.resolve(&closure.terms, snap, &ids, &mut held)?;
         // the remembered lookups follow the changes: with one input graph they take them
         // in, and with several the answers they touch are dropped
         if let Some(mut l) = old_lookups {
@@ -565,7 +664,6 @@ pub(crate) fn previous(
             }
             closure.put_lookups(l);
         }
-        held.grow(changes.heap_bytes())?;
         closure.settle()?;
         budget.check()?;
         return Ok(Previous {
@@ -593,9 +691,8 @@ pub(crate) fn previous(
     };
     let raw = raw.map_err(Fallback)?;
     let terms = Terms::new_in(snap.clone(), budget)?;
-    let changes = raw.resolve(&terms, snap, &ids)?;
     let mut held = Held::new(budget);
-    held.grow(changes.heap_bytes())?;
+    let changes = raw.resolve(&terms, snap, &ids, &mut held)?;
     held.try_grow(table_bytes(table_capacity(keys.len()), size_of::<Triple>()))?;
     let generalized: FxHashSet<Triple> = keys
         .iter()
@@ -715,7 +812,7 @@ fn reconstruct(
 }
 
 /// Changes as the commit diff reports them, or as ids of one generation.
-pub(crate) enum RawChanges {
+enum RawChangeData {
     Quads {
         /// the changes of each input graph
         base: Vec<(DiffOp, oxrdf::Quad)>,
@@ -728,12 +825,26 @@ pub(crate) enum RawChanges {
 }
 
 impl RawChanges {
+    pub(crate) fn budget(&self) -> Arc<Budget> {
+        self.held.budget().clone()
+    }
+
     /// The changes as ids of `terms`, whose snapshot is `snap`; `inputs` are the ids of
     /// the input graphs in it.
-    fn resolve(self, terms: &Terms, snap: &Snapshot, inputs: &[Id]) -> anyhow::Result<Changes> {
-        Ok(match self {
-            RawChanges::Ids(c) => c,
-            RawChanges::Quads {
+    fn resolve(
+        self,
+        terms: &Terms,
+        snap: &Snapshot,
+        inputs: &[Id],
+        held: &mut Held,
+    ) -> anyhow::Result<Changes> {
+        let RawChanges {
+            data,
+            held: mut staged,
+        } = self;
+        let changes = match data {
+            RawChangeData::Ids(c) => c,
+            RawChangeData::Quads {
                 base,
                 inferred,
                 union,
@@ -779,7 +890,10 @@ impl RawChanges {
                 }
                 c
             }
-        })
+        };
+        staged.try_set(changes.heap_bytes())?;
+        held.try_merge(&mut staged)?;
+        Ok(changes)
     }
 }
 
@@ -794,28 +908,38 @@ fn union_changes(
     c: &mut Changes,
 ) -> anyhow::Result<()> {
     for (t, changed) in by_triple {
-        let stored = t
-            .iter()
-            .all(|&x| Id(x).tag() != sparkles_core::id::Tag::Local);
-        let (mut before, mut after) = (false, false);
-        for &g in inputs {
-            let now = stored && snap.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])?;
-            after |= now;
-            before |= match changed.iter().find(|(cg, _)| *cg == Some(g)) {
-                Some((_, added)) => !added,
-                None => now,
-            };
-        }
-        // a graph the snapshot no longer names held the triple before when the diff
-        // removed it there
-        before |= changed.iter().any(|(cg, added)| cg.is_none() && !added);
-        match (before, after) {
-            (false, true) => c.base_added.push(t),
-            (true, false) => c.base_removed.push(t),
-            _ => c.base_moved.push(t),
-        }
+        union_change(t, changed.iter().copied(), snap, inputs, c)?.push(t);
     }
     Ok(())
+}
+
+fn union_change<'a>(
+    t: Triple,
+    changed: impl Iterator<Item = (Option<Id>, bool)> + Clone,
+    snap: &Snapshot,
+    inputs: &[Id],
+    c: &'a mut Changes,
+) -> anyhow::Result<&'a mut Vec<Triple>> {
+    let stored = t
+        .iter()
+        .all(|&x| Id(x).tag() != sparkles_core::id::Tag::Local);
+    let (mut before, mut after) = (false, false);
+    for &g in inputs {
+        let now = stored && snap.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])?;
+        after |= now;
+        before |= match changed.clone().find(|(cg, _)| *cg == Some(g)) {
+            Some((_, added)) => !added,
+            None => now,
+        };
+    }
+    // a graph the snapshot no longer names held the triple before when the diff
+    // removed it there
+    before |= changed.clone().any(|(cg, added)| cg.is_none() && !added);
+    Ok(match (before, after) {
+        (false, true) => &mut c.base_added,
+        (true, false) => &mut c.base_removed,
+        _ => &mut c.base_moved,
+    })
 }
 
 /// The ids of the input graphs in `snap` (or in `other`, for a graph only it names).
@@ -834,17 +958,35 @@ pub(crate) fn input_ids(snap: &Snapshot, other: Option<&Snapshot>, inputs: &[Gra
     ids
 }
 
+fn push_logged_change(
+    out: &mut Vec<Triple>,
+    triple: Triple,
+    stage: &Staging,
+) -> Result<(), sparkles_core::Error> {
+    if out.len() == out.capacity() {
+        let slot = size_of::<Triple>();
+        let old = out.capacity();
+        let capacity = sparkles_budget::sizes::vec_grown(old, out.len(), 1, slot);
+        stage.admit((capacity * slot) as u64)?;
+        out.reserve_exact(capacity - out.len());
+        stage.release((old * slot) as u64);
+    }
+    out.push(triple);
+    Ok(())
+}
+
 /// The changes from commit `since` to `snap` as ids of `snap`, from the log of its
 /// generation, when that log holds every commit between them (see
 /// [`Store::changed_ids`]). The log holds ids, so this reads no term, where the commit
 /// diff of [`logged_changes`] turns every changed quad into terms that
-/// [`RawChanges::resolve`] then looks up again.
+/// [`RawChangeData::resolve`] then looks up again.
 fn logged_ids(
     store: &Store,
     since: u64,
     snap: &Snapshot,
     inputs: &[GraphRef],
-) -> anyhow::Result<Option<RawChanges>> {
+    stage: &Staging,
+) -> anyhow::Result<Option<RawChangeData>> {
     let ids = input_ids(snap, None, inputs);
     let inferred = snap.lookup_iri(INFERRED_GRAPH);
     if inferred.is_some_and(|g| ids.contains(&g)) {
@@ -852,29 +994,54 @@ fn logged_ids(
     }
     let mut graphs = ids.clone();
     graphs.extend(inferred);
-    let Some(found) = store.changed_ids(since, snap, &graphs, &DiffOptions::default())? else {
+    let Some(mut found) = store.changed_ids_metered(
+        since,
+        snap,
+        &graphs,
+        &stage.opts,
+        Some(&|bytes| stage.admit(bytes)),
+        &|bytes| stage.release(bytes),
+    )?
+    else {
         return Ok(None);
     };
     let mut c = Changes::default();
-    let mut by_triple: FxHashMap<Triple, Vec<(Option<Id>, bool)>> = FxHashMap::default();
-    for (q, added) in found {
-        let t = [q[0].0, q[1].0, q[2].0];
-        if Some(q[3]) == inferred {
-            if added {
-                c.inferred_added.push(t);
-            } else {
-                c.inferred_removed.push(t);
+    let found_bytes = (found.capacity() * size_of::<([Id; 4], bool)>()) as u64;
+    if ids.len() <= 1 {
+        for &(q, added) in &found {
+            let out = match (Some(q[3]) == inferred, added) {
+                (true, true) => &mut c.inferred_added,
+                (true, false) => &mut c.inferred_removed,
+                (false, true) => &mut c.base_added,
+                (false, false) => &mut c.base_removed,
+            };
+            push_logged_change(out, [q[0].0, q[1].0, q[2].0], stage)?;
+        }
+    } else {
+        found.sort_unstable_by_key(|(q, _)| [q[0], q[1], q[2], q[3]]);
+        for group in found.chunk_by(|(a, _), (b, _)| a[..3] == b[..3]) {
+            let q = group[0].0;
+            let t = [q[0].0, q[1].0, q[2].0];
+            if let Some((_, added)) = group.iter().find(|(q, _)| Some(q[3]) == inferred) {
+                let out = if *added {
+                    &mut c.inferred_added
+                } else {
+                    &mut c.inferred_removed
+                };
+                push_logged_change(out, t, stage)?;
             }
-        } else if ids.len() > 1 {
-            by_triple.entry(t).or_default().push((Some(q[3]), added));
-        } else if added {
-            c.base_added.push(t);
-        } else {
-            c.base_removed.push(t);
+            let changed = group
+                .iter()
+                .filter_map(|(q, added)| (Some(q[3]) != inferred).then_some((Some(q[3]), *added)));
+            if changed.clone().next().is_some() {
+                let out = union_change(t, changed, snap, &ids, &mut c)?;
+                push_logged_change(out, t, stage)?;
+            }
         }
     }
-    union_changes(by_triple, snap, &ids, &mut c)?;
-    Ok(Some(RawChanges::Ids(c)))
+    drop(found);
+    stage.release(found_bytes);
+    Ok(Some(RawChangeData::Ids(c)))
 }
 
 /// The changes between two commits from the store's commit diff.
@@ -883,16 +1050,25 @@ fn logged_changes(
     since: u64,
     head: u64,
     inputs: &[GraphRef],
-) -> anyhow::Result<RawChanges> {
+    stage: &Staging,
+) -> anyhow::Result<RawChangeData> {
     if since == head {
-        return Ok(RawChanges::Ids(Changes::default()));
+        return Ok(RawChangeData::Ids(Changes::default()));
     }
     let diff = |g: GraphName| -> anyhow::Result<Vec<(DiffOp, oxrdf::Quad)>> {
         let o = DiffOptions {
             graph: Some(g),
-            ..Default::default()
+            ..stage.opts.clone()
         };
-        let d = store.diff(&At::Commit(since), &At::Commit(head), &o)?;
+        let d = store.diff_with_admission(
+            &At::Commit(since),
+            &At::Commit(head),
+            &o,
+            Some(&|bytes| stage.admit(bytes)),
+        )?;
+        for (_, keys) in d.keys() {
+            stage.admit(512 + keys.iter().map(|key| key.len() as u64 * 8).sum::<u64>())?;
+        }
         Ok(d.iter().collect())
     };
     let mut base = Vec::new();
@@ -902,7 +1078,7 @@ fn logged_changes(
             GraphRef::Named(n) => GraphName::NamedNode(NamedNode::new_unchecked(n.as_str())),
         })?);
     }
-    Ok(RawChanges::Quads {
+    Ok(RawChangeData::Quads {
         base,
         inferred: diff(GraphName::NamedNode(NamedNode::new_unchecked(
             INFERRED_GRAPH,
@@ -916,7 +1092,8 @@ fn delta_changes(
     old: &Snapshot,
     new: &Snapshot,
     inputs: &[GraphRef],
-) -> anyhow::Result<RawChanges> {
+    stage: &Staging,
+) -> anyhow::Result<RawChangeData> {
     let i = Perm::Gspo.index();
     let inferred = new
         .lookup_iri(INFERRED_GRAPH)
@@ -942,8 +1119,19 @@ fn delta_changes(
     ] {
         for k in set.iter() {
             let base = ids.binary_search(&Id(k[0])).is_ok();
-            if !(base || inferred.is_some_and(|g| g.0 == k[0])) || !seen.insert(*k) {
+            if !(base || inferred.is_some_and(|g| g.0 == k[0])) || seen.contains(k) {
                 continue;
+            }
+            stage.admit(256)?;
+            seen.insert(*k);
+            if seen.len().is_multiple_of(1024)
+                && stage
+                    .opts
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Err(sparkles_core::Error::Cancelled.into());
             }
             let q = Perm::Gspo.to_quad(k);
             let t = [q[0].0, q[1].0, q[2].0];
@@ -975,7 +1163,7 @@ fn delta_changes(
             }
         }
     }
-    Ok(RawChanges::Ids(c))
+    Ok(RawChangeData::Ids(c))
 }
 
 /// Keep the closure after the run's commit: in the cache, while the commit kept the
@@ -1057,7 +1245,8 @@ pub(crate) fn keep(
     // Migrate off the run's transient work budget onto the cache's retained budget so
     // finishing a materialization returns work-pool credit to exact 0 and the next
     // incremental run does not double-charge the closure across two work budgets.
-    let kept_budget = Budget::with_parent(None, cache.retained_parent());
+    // The run that evicts or takes the closure releases it under its own deferral.
+    let kept_budget = Budget::retained(None, cache.retained_parent());
     let closure_plan = match closure.plan_budget_transfer(&kept_budget) {
         Ok(plan) => plan,
         Err(e) => {
@@ -1503,6 +1692,91 @@ pub(crate) fn remove_saved(store: &Store) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logged_ids_admits_multigraph_conversion_after_the_wal_rows_fit() {
+        use sparkles_core::sparql::update::update;
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            &dir.path().join("db"),
+            sparkles_core::store::StoreOptions {
+                bulk_threshold: 10_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let since = store.snapshot().commit;
+        let mut text = String::from("INSERT DATA {");
+        for (graph, nodes) in [("urn:g1", 0..1300), ("urn:g2", 1100..1500)] {
+            text.push_str(&format!("GRAPH <{graph}> {{ "));
+            for i in nodes {
+                text.push_str(&format!("<urn:s{i}> <urn:p> 1 ."));
+            }
+            text.push_str(" }");
+        }
+        text.push('}');
+        update(&store, &text, &Default::default()).unwrap();
+        let snapshot = store.snapshot();
+        let inputs = [
+            GraphRef::Named("urn:g1".into()),
+            GraphRef::Named("urn:g2".into()),
+        ];
+        let live = Cell::new(0);
+        let peak = Cell::new(0);
+        let found = store
+            .changed_ids_metered(
+                since,
+                &snapshot,
+                &input_ids(&snapshot, None, &inputs),
+                &Default::default(),
+                Some(&|bytes| {
+                    live.set(live.get() + bytes);
+                    peak.set(peak.get().max(live.get()));
+                    Ok(())
+                }),
+                &|bytes| live.set(live.get() - bytes),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.len(), 1700);
+        let limited = Budget::new(Some(peak.get() as usize + 4096));
+        let stage = Staging::new(&limited, None);
+        let found = store
+            .changed_ids_metered(
+                since,
+                &snapshot,
+                &input_ids(&snapshot, None, &inputs),
+                &Default::default(),
+                Some(&|bytes| stage.admit(bytes)),
+                &|bytes| stage.release(bytes),
+            )
+            .unwrap()
+            .unwrap();
+        // A sibling can take shared budget after the WAL table is freed but
+        // while the returned ID vector still overlaps the conversion.
+        let sibling = Held::try_new_exact(&limited, limited.available() - 64).unwrap();
+        let mut converted = Vec::new();
+        let q = found[0].0;
+        let error =
+            push_logged_change(&mut converted, [q[0].0, q[1].0, q[2].0], &stage).unwrap_err();
+        assert!(matches!(error, sparkles_core::Error::BudgetExceeded(b)
+            if b.kind == sparkles_core::error::BudgetKind::Memory));
+        assert_eq!(converted.capacity(), 0);
+        drop((found, sibling, stage));
+
+        let wide = Budget::new(None);
+        let stage = Staging::new(&wide, None);
+        let RawChangeData::Ids(changes) = logged_ids(&store, since, &snapshot, &inputs, &stage)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected ID changes");
+        };
+        assert_eq!(changes.base_added.len(), 1500);
+        assert_eq!(stage.held.borrow().bytes(), changes.heap_bytes());
+    }
 
     fn key(s: &str) -> Keys {
         [s.as_bytes().to_vec(), b"p".to_vec(), b"o".to_vec()]

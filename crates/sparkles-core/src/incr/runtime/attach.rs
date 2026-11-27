@@ -57,7 +57,7 @@ impl Runtime {
         let compiled = compile(&q, mode.as_deref())?;
         let history = Arc::new(Mutex::new(HistoryBuf::default()));
         let mut circuit = Circuit::new(compiled, access);
-        circuit.set_pool(self.pool.clone(), self.circuit_parent());
+        circuit.set_runtime_pool(self.pool.clone(), self.circuit_parent());
         circuit.set_local_limit(max_memory_bytes);
         circuit.set_reclaim_external(Some(Slot::history_reclaim_hook(&history)));
         circuit.inference = inference;
@@ -108,6 +108,17 @@ impl Runtime {
         name: &str,
         retired: &mut Vec<MemoryLease>,
     ) -> Result<()> {
+        self.attach_persisting(store, reg, name, retired, |_| Ok(()))
+    }
+
+    pub(super) fn attach_persisting(
+        &self,
+        store: &Store,
+        reg: &mut Registry,
+        name: &str,
+        retired: &mut Vec<MemoryLease>,
+        persist: impl FnOnce(&ViewDef) -> Result<()>,
+    ) -> Result<()> {
         let host = self.host()?;
         let Some(entry) = reg.views.get(name) else {
             return Ok(());
@@ -118,6 +129,7 @@ impl Runtime {
         // checked again on every attach, since a change of the host's epoch or a
         // rebuild clears the error
         if let Some(e) = unsupported(&entry.def) {
+            persist(&entry.def)?;
             let entry = reg.views.get_mut(name).expect("checked above");
             entry.error = Some(e);
             return Ok(());
@@ -127,22 +139,37 @@ impl Runtime {
         let q = self.parse(host.as_ref(), &text)?;
         let access = host.access(def.principal.as_deref())?;
         let (cell, new) = self.cell_for(reg, q, &text, access.clone(), Some(def.memory_bytes))?;
-        {
+        let attached = {
             let mut st = cell.state.lock();
             let was_empty = st.view_limits.is_empty();
-            st.view_limits.insert(name.to_string(), def.memory_bytes);
+            let previous = st.view_limits.insert(name.to_string(), def.memory_bytes);
             st.recompute_local_limit();
-            if was_empty {
+            let result = if was_empty {
                 st.circuit
-                    .set_version_pool(Some(self.published_views.clone()));
+                    .attach_version_pool(self.published_views.clone(), || persist(&def))
+            } else {
+                persist(&def)
+            };
+            if result.is_err() {
+                if let Some(previous) = previous {
+                    st.view_limits.insert(name.to_string(), previous);
+                } else {
+                    st.view_limits.remove(name);
+                }
+                st.recompute_local_limit();
+            } else if was_empty {
                 let mut info = cell.info.lock();
                 info.bytes = st.circuit.bytes();
-                info.published_bytes = st
-                    .circuit
-                    .version
-                    .as_ref()
-                    .map_or(0, |v| v.published_bytes());
+                info.published_bytes = st.circuit.published_bytes();
             }
+            retired.extend(st.circuit.drain_retired());
+            result
+        };
+        if let Err(error) = attached {
+            if new {
+                reg.cells.remove(&cell.key);
+            }
+            return Err(error);
         }
         if new {
             self.ensure_subscription(store);
@@ -230,9 +257,12 @@ impl Runtime {
                     && h.fingerprint == st.fingerprint(cell.key, snap_ev.as_deref())
                     && commit_ok
                 {
-                    match st.circuit.decode_with_input_charged(body, &snap) {
+                    match st
+                        .circuit
+                        .decode_with_input_charged(body, &snap)
+                        .and_then(|()| st.circuit.set_applied(h.commit))
+                    {
                         Ok(()) => {
-                            st.circuit.set_applied(h.commit);
                             st.circuit
                                 .set_evidence_stamp(crate::incr::live::EvidenceStamp {
                                     managed_gen: snap_gen,
@@ -245,11 +275,7 @@ impl Runtime {
                             info.applied = h.commit;
                             info.rows = st.circuit.result.total().max(0) as u64;
                             info.bytes = st.circuit.bytes();
-                            info.published_bytes = st
-                                .circuit
-                                .version
-                                .as_ref()
-                                .map_or(0, |v| v.published_bytes());
+                            info.published_bytes = st.circuit.published_bytes();
                             tracing::info!(
                                 target: "sparkles::incr::runtime",
                                 "view {name}: loaded its state at commit {}; {} commits to apply",
@@ -298,7 +324,7 @@ impl Runtime {
                 for (name, e) in reg.views.iter_mut() {
                     e.error = None;
                     if let Some(c) = e.cell.take() {
-                        c.release_view(name);
+                        c.release_view(name, &mut deferred.retired);
                         deferred.cells.push(c);
                     }
                 }
@@ -2208,11 +2234,20 @@ mod switch_tests {
         let installed = Arc::new(AtomicU64::new(0));
         let admitted = installed.clone();
         let row_bytes = crate::incr::zset::row_bytes(1);
-        // Inline integer VALUES needs no budget reservation before result installation.
-        // Refuse rounded credit so each installed row reaches the parent separately.
+        // Inline integer VALUES needs no budget reservation before result installation
+        // beyond the read's exact admission of the fallback's staging, which follows the
+        // refusal of its rounded chunk. Refuse rounded credit so each installed row
+        // reaches the parent separately.
+        let staged = AtomicBool::new(false);
         let parent = sparkles_budget::MemoryDomain::unpooled().parent(
             move |bytes| {
                 if bytes > row_bytes {
+                    if !bytes.is_multiple_of(sparkles_budget::LIVE_STEP)
+                        && admitted.load(Ordering::Relaxed) == 0
+                        && !staged.swap(true, Ordering::Relaxed)
+                    {
+                        return Ok(());
+                    }
                     return Err(sparkles_budget::ParentRefused::Overflow);
                 }
                 assert_eq!(bytes, row_bytes);

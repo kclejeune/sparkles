@@ -820,6 +820,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("validation.json", 3),
     ds("validation-status.json", 1),
     ds("text.json", 1),
+    ds("reasoning-imports.json", 2),
     named(ds("reasoning.json", 2), "reasoningFormat"),
     named(ds("query-reasoning.json", 1), "queryReasoningFormat"),
     named(ds("rdfs.json", 1), "rdfsFormat"),

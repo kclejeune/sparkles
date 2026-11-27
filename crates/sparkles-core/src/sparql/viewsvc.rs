@@ -90,14 +90,20 @@ pub struct ViewRows {
 pub(crate) struct PublishedBytes {
     total: Arc<AtomicU64>,
     bytes: u64,
+    memory: Option<sparkles_budget::MemoryLease>,
 }
 
 impl PublishedBytes {
-    pub(crate) fn new(total: &Arc<AtomicU64>, bytes: u64) -> Self {
+    pub(crate) fn new(
+        total: &Arc<AtomicU64>,
+        bytes: u64,
+        memory: Option<sparkles_budget::MemoryLease>,
+    ) -> Self {
         total.fetch_add(bytes, Ordering::Relaxed);
         Self {
             total: total.clone(),
             bytes,
+            memory,
         }
     }
 
@@ -109,6 +115,9 @@ impl PublishedBytes {
 impl Drop for PublishedBytes {
     fn drop(&mut self) {
         self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+        if let Some(memory) = self.memory.take() {
+            crate::incr::runtime::RuntimeOperation::release_publication(memory);
+        }
     }
 }
 
@@ -185,7 +194,8 @@ impl ViewVersion {
             + self.terms.published_bytes()
     }
 
-    /// Decode all rows into owned RDF terms for callers of [`ViewSource::read_view`].
+    /// Decode a caller-owned copy of all rows. The runtime's checked read
+    /// path admits its own decoded copy separately from this shared version.
     pub fn to_view_rows(&self) -> ViewRows {
         let mut rows = Vec::with_capacity(self.table.len());
         for i in 0..self.table.len() {

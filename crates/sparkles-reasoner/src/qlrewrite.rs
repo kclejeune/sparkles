@@ -558,9 +558,17 @@ pub fn clear() {
 
 /// An active OWL 2 QL TBox whose estimated memory stays charged to the calling budget
 /// until this guard drops. Declared with `tbox` before `_held` so payload drops first.
-pub(crate) struct ChargedTbox {
+pub struct ChargedTbox {
     pub(crate) tbox: Arc<Tbox>,
     _held: crate::budget::Held,
+}
+
+impl std::ops::Deref for ChargedTbox {
+    type Target = Tbox;
+
+    fn deref(&self) -> &Tbox {
+        &self.tbox
+    }
 }
 
 /// The TBox of the input graphs of `inputs` that the caller of `req` reads, from the
@@ -1008,7 +1016,11 @@ fn cq_bytes(q: &Cq) -> usize {
 
 /// The count of each variable and blank node in the SSE form of `text`, by name with its
 /// sigil. A name inside a string literal counts too, which errs towards distinguished.
-fn count_names(text: &str, out: &mut FxHashMap<String, i64>, by: i64) {
+fn count_names(
+    text: &str,
+    out: &mut FxHashMap<String, i64>,
+    held: &mut crate::budget::Held,
+) -> Result<()> {
     let b = text.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -1026,9 +1038,25 @@ fn count_names(text: &str, out: &mut FxHashMap<String, i64>, by: i64) {
             i += 1;
         }
         if i > start + sigil {
-            *out.entry(text[start..i].to_string()).or_default() += by;
+            count_name(&text[start..i], out, held)?;
         }
     }
+    Ok(())
+}
+
+fn count_name(
+    name: &str,
+    out: &mut FxHashMap<String, i64>,
+    held: &mut crate::budget::Held,
+) -> Result<()> {
+    if let Some(n) = out.get_mut(name) {
+        *n += 1;
+    } else {
+        held.try_grow(name.len() + 96)
+            .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+        out.insert(name.to_owned(), 1);
+    }
+    Ok(())
 }
 
 fn name_of(t: &TermPattern) -> Option<String> {
@@ -1874,7 +1902,8 @@ pub fn rewrite_query(
     rewrite_query_with_parent(query, bound, tbox, max_union, max_memory, None, stop)
 }
 
-/// [`rewrite_query`], reserving from `memory_parent` when present.
+/// [`rewrite_query`], reserving from `memory_parent` during construction. The returned
+/// algebra is caller-owned. Use [`rewrite_query_guarded_with_parent`] to keep its credit.
 pub fn rewrite_query_with_parent(
     query: &Query,
     bound: &[(String, Term)],
@@ -1924,35 +1953,77 @@ pub(crate) fn rewrite_query_in_budget(
     budget: &Arc<crate::budget::Budget>,
     stop: &dyn Fn() -> Result<()>,
 ) -> Result<Option<GuardedRewritten>> {
-    // the projection that ASK wraps its pattern in names every variable, and none of them
-    // is an answer, so it does not count
-    let sse = match query {
-        Query::Ask {
-            pattern: GraphPattern::Project { inner, .. },
-            dataset,
-            base_iri,
-        } => Query::Ask {
-            pattern: (**inner).clone(),
-            dataset: dataset.clone(),
-            base_iri: base_iri.clone(),
-        }
-        .to_sse(),
-        q => q.to_sse(),
-    };
-    let mut counts = FxHashMap::default();
-    count_names(&sse, &mut counts, 1);
-    // a variable that an initial binding gives a value is used outside its pattern
-    for (name, _) in bound {
-        *counts.entry(format!("?{name}")).or_default() += 1;
+    use std::fmt;
+    use std::mem::size_of;
+
+    #[derive(Default)]
+    struct SyntaxSize {
+        text: usize,
+        lists: usize,
+        unbound: usize,
     }
-    let emitted_held = crate::budget::Held::new(budget);
+    impl fmt::Write for SyntaxSize {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.text = self.text.checked_add(text.len()).ok_or(fmt::Error)?;
+            self.lists += text.bytes().filter(|&b| b == b'(').count();
+            self.unbound += usize::from(text == "UNDEF ");
+            Ok(())
+        }
+    }
+
+    if matches!(query, Query::Describe { .. }) {
+        return Ok(None);
+    }
+    stop()?;
+    let overflow = |_| sparkles_core::Error::invalid("OWL 2 QL algebra size overflow");
+    let memory_error = |e| crate::query::memory_error(e, "the OWL 2 QL rewriting");
+    let mut syntax = SyntaxSize::default();
+    query.fmt_sse(&mut syntax).map_err(overflow)?;
+    let mut sparql = SyntaxSize::default();
+    fmt::write(&mut sparql, format_args!("{query}")).map_err(overflow)?;
+    // Each SSE list accounts for the algebra node or container it describes. SPARQL
+    // also prints VALUES cells whose unbound slots are absent from SSE.
+    let algebra_bytes = syntax
+        .text
+        .saturating_add(syntax.lists.saturating_mul(2 * size_of::<GraphPattern>()))
+        .saturating_add(
+            sparql
+                .unbound
+                .saturating_mul(size_of::<Option<spargebra::term::GroundTerm>>()),
+        )
+        .saturating_add(512);
+    let emitted_held = crate::budget::Held::try_new(budget, algebra_bytes).map_err(memory_error)?;
+    let binding_bytes = bound.iter().fold(0usize, |bytes, (name, term)| {
+        bytes
+            .saturating_add(96 + name.len() * 2)
+            .saturating_add(sparkles_core::explain::term_bytes(term))
+    });
+    let mut names_held =
+        crate::budget::Held::try_new(budget, binding_bytes).map_err(memory_error)?;
+    let (mut counts, all_distinguished) = {
+        let _text_held = crate::budget::Held::try_new(budget, syntax.text).map_err(memory_error)?;
+        let mut sse = String::with_capacity(syntax.text);
+        query
+            .fmt_sse_without_ask_projection(&mut sse)
+            .map_err(overflow)?;
+        let mut counts = FxHashMap::default();
+        count_names(&sse, &mut counts, &mut names_held)?;
+        (
+            counts,
+            sse.contains("(count)") || sse.contains("(count distinct)"),
+        )
+    };
+    // Initial bindings make their variables visible outside their patterns.
+    for (name, _) in bound {
+        count_name(&format!("?{name}"), &mut counts, &mut names_held)?;
+    }
     let mut rw = Rewriter {
         tbox,
         max_union,
         stop,
         bound: bound.iter().cloned().collect(),
         counts,
-        all_distinguished: sse.contains("(count)") || sse.contains("(count distinct)"),
+        all_distinguished,
         fresh: 0,
         path_warned: false,
         derive: Vec::new(),

@@ -386,7 +386,7 @@ mod enabled {
         // when the map is parsed, and the caller's permissions apply all the same)
         let selector_query = crate::http::CallerContext::for_caller(&st, &ds, &principal)
             .options(&query, crate::auth::Endpoint::Shex);
-        let has_inferred = ds.reasoning.read().is_some();
+        let has_inferred = ds.read_reasoning().is_some();
         // a client that disconnects stops the validation at its next check
         let (cancel, _cancel_on_drop) = cancel_on_drop();
         let max_bytes = st.limits.max_result_bytes;

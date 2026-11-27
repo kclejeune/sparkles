@@ -303,7 +303,7 @@ impl Request {
             request.analysis.timeout = self
                 .analysis_deadline
                 .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
-            let document = ds.dataset.reasoning().diff(&request)?.to_json();
+            let document = ds.dataset.reasoning().diff_admitted(&request)?.to_json();
             if let Some(limit) = self.max_result_bytes {
                 let size = serde_json::to_vec(&document).unwrap().len() as u64;
                 if size > limit {
@@ -338,7 +338,7 @@ impl Request {
                     doc["entailments"] = ds
                         .dataset
                         .reasoning()
-                        .diff_preview(preview, &request)?
+                        .diff_preview_admitted(preview, &request)?
                         .to_json();
                 } else {
                     doc["entailments"] = J::Null;

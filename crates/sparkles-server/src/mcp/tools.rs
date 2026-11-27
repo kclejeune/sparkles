@@ -688,7 +688,7 @@ impl Tools<'_> {
     /// Whether a call reads the materialized inferences (as the HTTP `reasoning`
     /// parameter: when the dataset has them and the argument is not false).
     pub(super) fn reasoning(ds: &Dataset, arg: Option<bool>) -> bool {
-        arg != Some(false) && ds.reasoning.read().is_some()
+        arg != Some(false) && ds.read_reasoning().is_some()
     }
 
     /// The reasoning mode of a query tool's `reasoning` argument. An absent argument is
@@ -836,7 +836,7 @@ impl Tools<'_> {
                 let snap = ds.store.snapshot();
                 let head = ds.store.head_commit();
                 let modified = ds.store.commit(snap.commit).unwrap_or(head).timestamp();
-                let reasoning = ds.reasoning.read().as_ref().map_or(Value::Null, |info| {
+                let reasoning = ds.read_reasoning().as_ref().map_or(Value::Null, |info| {
                     let f = crate::reasoning::freshness(info, &ds.store, snap.commit);
                     json!({ "profile": info.profile, "stale": f.stale })
                 });
@@ -1339,7 +1339,7 @@ impl Tools<'_> {
         let deadline = self.deadline(timeout);
         let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), deadline)?;
         let mode = Self::reasoning_mode(&ds, a.reasoning.as_ref())?;
-        let reasoning = mode.reads_inferences() && ds.reasoning.read().is_some();
+        let reasoning = mode.reads_inferences() && ds.read_reasoning().is_some();
         let t0 = Instant::now();
         let mut parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
         let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1493,7 +1493,7 @@ impl Tools<'_> {
         };
         let ctx = self.ctx(&names, timeout.as_secs_f64());
         let mode = Self::reasoning_mode(&ds, a.reasoning.as_ref())?;
-        let reasoning = mode.reads_inferences() && ds.reasoning.read().is_some();
+        let reasoning = mode.reads_inferences() && ds.read_reasoning().is_some();
         let parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
         let deadline = self.deadline(timeout);
         let mut opts = self

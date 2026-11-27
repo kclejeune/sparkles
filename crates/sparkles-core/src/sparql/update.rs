@@ -54,9 +54,36 @@ pub fn update_as(
     opts: &QueryOptions,
     kind: crate::commit::CommitKind,
 ) -> Result<UpdateStats> {
+    update_as_with_hook(store, u, opts, kind, None)
+}
+
+/// Execute an update with a commit hook for a recoverable sidecar.
+#[doc(hidden)]
+pub fn update_with_commit_hook(
+    store: &Store,
+    u: &str,
+    opts: &QueryOptions,
+    hook: crate::guard::CommitHook<'_>,
+) -> Result<UpdateStats> {
+    update_as_with_hook(
+        store,
+        u,
+        opts,
+        crate::commit::CommitKind::Update,
+        Some(hook),
+    )
+}
+
+fn update_as_with_hook(
+    store: &Store,
+    u: &str,
+    opts: &QueryOptions,
+    kind: crate::commit::CommitKind,
+    hook: Option<crate::guard::CommitHook<'_>>,
+) -> Result<UpdateStats> {
     let t0 = Instant::now();
     let (parsed, depth) = super::depth::checked_update(parse_update(u, opts)?)?;
-    super::depth::with_stack(depth, || run_update(store, &parsed, opts, kind, t0))
+    super::depth::with_stack(depth, || run_update(store, &parsed, opts, kind, t0, hook))
 }
 
 /// Run a SPARQL Update request inside an open write transaction without committing it.
@@ -210,6 +237,7 @@ fn run_update(
     opts: &QueryOptions,
     kind: crate::commit::CommitKind,
     t0: Instant,
+    hook: Option<crate::guard::CommitHook<'_>>,
 ) -> Result<UpdateStats> {
     // malformed geometry constants fail before the writer lock is taken
     validate_geometry(parsed)?;
@@ -288,6 +316,7 @@ fn run_update(
             kind,
             parse_ms,
             t1,
+            hook,
         );
     }
     // only a store that groups commits drains on a refusal, so only it needs a copy
@@ -303,7 +332,7 @@ fn run_update(
     // a request cancelled or timed out before this point publishes nothing
     req.check()?;
     stats.rows_produced = req.produced.load(std::sync::atomic::Ordering::Relaxed);
-    stats.commit = Some(txn.commit()?);
+    stats.commit = Some(txn.commit_with_hook(hook)?);
     let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
     stats.timing = Timing {
         parse_ms,
@@ -1238,6 +1267,7 @@ fn run_single_load(
     kind: crate::commit::CommitKind,
     parse_ms: f64,
     t1: Instant,
+    hook: Option<crate::guard::CommitHook<'_>>,
 ) -> Result<UpdateStats> {
     use crate::store::SparqlLoadError;
 
@@ -1250,7 +1280,7 @@ fn run_single_load(
         store.try_write_with(kind, wopts)?.commit()
     };
     let receipt = match prepare_load_source(source, destination, req, &wopts) {
-        Ok((src, fatal)) => match store.load_sparql(&src, kind, &wopts) {
+        Ok((src, fatal)) => match store.load_sparql(&src, kind, &wopts, hook) {
             Ok(r) => r,
             Err(SparqlLoadError::Store(e)) => return Err(e),
             Err(SparqlLoadError::Source(e)) => {

@@ -649,7 +649,7 @@ pub(super) async fn dl_query(
         let q = onto::wire::dl_expression(&handle, &opened, &o, q, &prefixes, &opts)
             .map_err(ontology_error)?;
         let out = handle
-            .dl_query_opened(opened, &req, &q, &opts)
+            .dl_query_opened_admitted(opened, &req, &q, &opts)
             .map_err(ontology_error)?;
         let seq = out.opened.snapshot.commit;
         let body = onto::wire::dl_query_body(

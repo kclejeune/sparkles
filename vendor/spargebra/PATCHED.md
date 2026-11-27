@@ -222,3 +222,6 @@ validation:
 
 Drop this copy once a spargebra release supplies the remaining fixes and extensions,
 with the nesting check retained in Sparkles callers if upstream does not provide it.
+
+The query SSE formatter accepts a caller-supplied formatter in `src/query.rs`. The QL
+rewriter uses it to size and admit its working copy before allocating it.

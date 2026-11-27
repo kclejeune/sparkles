@@ -194,6 +194,49 @@ impl PoolGrant {
         &self.pool.domain
     }
 
+    /// Charge a report to the active request. When the request ends, its surviving
+    /// leases own just their bytes in the work pool. No further growth is admitted.
+    pub fn report_memory_parent(self: &Arc<Self>) -> ParentHandle {
+        let take = Arc::downgrade(self);
+        let give = take.clone();
+        let pool = self.pool.clone();
+        self.pool.domain.parent(
+            move |bytes| {
+                let grant = take.upgrade().ok_or(ParentRefused::Limit {
+                    limit: 0,
+                    requested: bytes,
+                    scope: Scope::Work,
+                })?;
+                grant.charge_parent(bytes)?;
+                grant.surviving.fetch_add(bytes, Ordering::Relaxed);
+                Ok(())
+            },
+            move |bytes| {
+                if let Some(grant) = give.upgrade() {
+                    grant.surviving.fetch_sub(bytes, Ordering::Relaxed);
+                    grant.release(bytes);
+                } else {
+                    // The final strong owner releases granted minus surviving.
+                    // This repayment can race that drop; their sum is unchanged.
+                    pool.release(bytes);
+                }
+            },
+        )
+    }
+
+    fn charge_parent(&self, bytes: u64) -> Result<(), ParentRefused> {
+        self.charge(bytes).map_err(|error| {
+            let Error::BudgetExceeded(budget) = error else {
+                unreachable!("grant charge only returns memory refusals")
+            };
+            ParentRefused::Limit {
+                limit: budget.limit,
+                requested: budget.requested,
+                scope: Scope::Work,
+            }
+        })
+    }
+
     /// Adapt existing direct grant ownership. The later query-ledger child must
     /// additionally enforce its shared local query limit; this adapter alone is
     /// only pool backing. An owner retaining this parent also retains the grant.
@@ -203,18 +246,7 @@ impl PoolGrant {
         let take = self.clone();
         let give = self.clone();
         self.pool.domain.parent(
-            move |bytes| {
-                take.charge(bytes).map_err(|error| {
-                    let Error::BudgetExceeded(budget) = error else {
-                        unreachable!("grant charge only returns memory refusals")
-                    };
-                    ParentRefused::Limit {
-                        limit: budget.limit,
-                        requested: budget.requested,
-                        scope: Scope::Work,
-                    }
-                })
-            },
+            move |bytes| take.charge_parent(bytes),
             move |bytes| give.release(bytes),
         )
     }

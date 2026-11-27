@@ -16,7 +16,7 @@ Stages 1 and 3 have shipped, apart from the storage items 479 and 484 that
 [X16](../X16-storage-consolidation/README.md) holds. Stage 4's accounting model and
 mode-neutral kernels have shipped as items 671 to 674, and its decoding twins as items
 678 and 1069, whose per-query floor cache lets cursor batches compare strings through
-the floors. Item 675's hierarchical budget is landing. The rest of the design is
+the floors. Item 675's hierarchical budget has shipped. The rest of the design is
 stages 5 and 6, together with the phases that are scheduled with their area and the
 execution additions, which this plan does not schedule.
 
@@ -194,7 +194,7 @@ ownership boundaries given below, and the rows are serial.
 
 | Step | Phases | Why they wait |
 |---|---|---|
-| Now | Item 675 lands. Items 678, 512 and 534 start. Item 825 starts. Item 827 starts. | Each owns its own functions, as the boundaries below say. Item 534 is measurement work that items 240 and 828 build on. |
+| Now | Items 678, 512 and 534 start. Item 825 starts. Item 827 starts. | Each owns its own functions, as the boundaries below say. Item 534 is measurement work that items 240 and 828 build on. |
 | After 825 | Item 826 starts. Item 240 has shipped on item 534's measurement. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
 | After 827 and 825 | Item 829 starts. | Its leaf cursors land in the admission code that item 827 changes, and its operators that build over their input take item 825's hash kernel. |
 | After 240 | Item 828 can start, and item 534 opens the cursor in the producer's task. | The writers take the buffer that item 240 gave the cursor writers. |
@@ -224,15 +224,13 @@ Each phase keeps the stage 4 rules that the maintainer settled, which the
 path meets the [acceptance gates](SPEC.md#acceptance-gates), measured as the
 [measurement section](#how-the-gates-are-measured) describes.
 
-## Stage 4 remainder
+## Stage 4 accounting and decoding
 
 ### Hierarchical budget, item 675
 
-The foundation has landed, and item 675 is narrowed to giving the reasoner's budgets and
-incremental views parents in the query pool without blocking the merge. The maintainer
-decided that a graph result keeps the query's admitted high point charged to the pool
-until the result is dropped, as the design says for eager contexts until the merge leases
-every table. The remaining seams are tracked separately and do not block stage 5 or the
+The reasoner's budgets and incremental views have parents in the query pool. A graph
+result keeps the query's admitted high point charged to the pool until the result drops,
+as the design says for eager contexts until the merge leases every table. The remaining seams are tracked separately and do not block stage 5 or the
 merge: MCP native frames in item 1305, binding result buffers in item 1306, snapshot and
 access escapes in item 1307 and strict decoding across all callers in item 1308.
 

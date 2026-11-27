@@ -83,7 +83,7 @@ impl ReasoningMode {
 pub(crate) fn materialized(state: &DatasetState) -> (Option<Arc<RdfsOnRead>>, Vec<String>) {
     (
         state.rdfs.read().clone(),
-        if state.reasoning.read().is_some() {
+        if state.read_reasoning().is_some() {
             vec![super::INFERRED_GRAPH.to_string()]
         } else {
             Vec::new()

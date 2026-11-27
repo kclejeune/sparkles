@@ -226,10 +226,53 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's query-memory accounting, mode-neutral kernels and decoding twins
-have shipped. Item 675 remains open for reasoning and incremental-view budgets. Stage 5's
-join-kernel library has shipped, and its other phases follow the
-[plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
+479 of stage 2. Stage 4's query-memory accounting, mode-neutral kernels, decoding twins
+and hierarchical budget have shipped. Stage 5's join-kernel library has shipped, and its
+other phases follow the [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks
+the rest of the work.
+
+Item 675 links materialization, demand reasoning, OWL 2 QL rewriting, bounded ontology
+analysis and incremental view circuits to the query pool. A nested reasoner uses the
+query's parent handle, so its reservations also count against the query's local limit.
+Standalone runs and maintained circuits use the pool's work parent. Children grow their
+reservations in 64 KiB chunks and can request the exact shortfall when a rounded
+reservation fails. Dropping a child returns its full reservation after releasing its
+payloads. Retained view versions can outlive the circuit and hold their own credit until
+their last reader drops them. A kept materialization closure uses the configured pool's
+retained branch. A pool with no retained allowance may reuse saved persistent closure
+state for the next run. Regression tests hold a live query result, a reasoning run
+and a view together under one pool ceiling and check exact credit return on completion,
+refusal, cancellation and unwind.
+
+Ontology reads admit parser expansion and streamed assertions, and release parser
+scratch before handing off the finished ontology. Kept classification uses credit
+already backing the previous saturation when it applies edits. Shared classification
+payloads retain their credit, including the incomplete-class list. OWL 2 RL queries
+give nested SELECTs the remaining request allowance while the private store and any
+earlier answer data are live. The private snapshot skips demand cache publication.
+An import fetch reserves its report entry before a LOAD can commit and returns its
+scratch reservation when the report is ready. A dataset's reasoning record admits
+its warnings and fetched import names before the inference commit. It uses the
+retained pool when configured and otherwise draws exact credit from the dataset's
+work pool, if any. When a pending import and its final record would exceed the
+retained limit together, the active materialization budget admits the transfer
+bookkeeping and the overlapping IRI copy before the inference commit. Each
+in-memory branch admits its journal links before publication and shares the
+pending names. One retained reservation backs each shared name. Each additional
+live copy has its own work credit, including copies in other branches' records.
+Releasing a copy returns its overlap credit. The last owner releases the
+retained reservation. A catalog save
+streams the existing registry bytes for records that the pool refused.
+In-memory branches share the record and its reservation, and
+reopened datasets admit the saved record before publishing it. Runtime checkpoints
+return scratch credit after their guards are released. WAL replay accounts for the
+overlap of growing tables and the conversion to materialization changes.
+
+In Rust, `Opened::ontology` uses `Arc<SharedOntology>` and `Classified::excluded` uses
+`Arc<ClassifiedExclusions>`. These handles preserve credit through detached clones and
+borrow the original ontology and exclusion vector through `AsRef`. The admitted diff
+and DL query methods return `AdmittedEntailmentDiff` and `AdmittedDlQueryAnswer`.
+Their plain value APIs transfer ownership to the application, as does `fetch_imports`.
 
 Item 513 removed the sparse vocabulary and read-window environment switches and moved
 the query prefetch and decoding switches to test controls. The read-ahead target is
@@ -636,10 +679,9 @@ rather than one cell at a time, and its additional live storage counts against t
 budget. These remain estimated heap charges rather than process RSS limits.
 
 The remaining stage 4 ownership seams are tracked by their own items. Retaining every
-result table under its own lease belongs to the merge phase of item 453, linking the
-reasoner's budgets and incremental views into the query pool belongs to item 675, binding
-result buffers belong to item 1306, strict decoding across all callers belongs to item
-1308 and the post-merge retained-source flip for MCP rendering belongs to item 1305.
+result table under its own lease belongs to the merge phase of item 453. Binding result
+buffers belong to item 1306, strict decoding across all callers belongs to item 1308
+and the post-merge retained-source flip for MCP rendering belongs to item 1305.
 
 MCP tool results, resource reads and completed task results keep their rendered payloads
 and encoded wire frames under query memory credit until the transport writes or drops
