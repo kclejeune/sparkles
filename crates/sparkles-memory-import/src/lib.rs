@@ -23,7 +23,8 @@ pub mod vocab;
 mod adapters;
 
 pub use adapters::{
-    Request, Roots, Scan, Skipped, norm_name, scan, scan_with_policy, scan_with_project_key,
+    Request, Roots, Scan, Skipped, norm_name, scan, scan_for_status, scan_with_policy,
+    scan_with_project_key,
 };
 pub use ids::Ctx;
 pub use project::Project;

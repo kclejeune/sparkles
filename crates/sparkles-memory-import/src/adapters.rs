@@ -8,7 +8,7 @@ use crate::redact::{self, Pattern};
 use crate::vocab::*;
 use crate::{Adapter, Fact, FileImport, FileKind, Harness, MAX_FILE_BYTES, Obj, Scope};
 use regex::Regex;
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -164,6 +164,17 @@ pub struct Scan {
     pub areas: Vec<String>,
     /// Prefixes where a redaction refusal prevented the scan from establishing absence.
     pub incomplete_areas: HashSet<String>,
+    /// Refused files, keyed by graph area using the same relative paths as readable files.
+    pub refused_paths: HashMap<String, HashSet<String>>,
+}
+
+impl Scan {
+    /// Whether a refusal could have hidden the owner of this graph at this path.
+    pub fn has_refused_path(&self, graph: &str, rel_path: &str) -> bool {
+        self.refused_paths
+            .iter()
+            .any(|(area, paths)| graph.starts_with(area) && paths.contains(rel_path))
+    }
 }
 
 /// Run the adapters of `req`.
@@ -183,7 +194,22 @@ pub fn scan_with_project_key(
     policy: &redact::Policy,
     project_key: Option<String>,
 ) -> Scan {
+    collect_files(req, policy, project_key, false)
+}
+
+/// Keep every distinct file that could own a source when comparing disk with the server.
+pub fn scan_for_status(req: &Request, policy: &redact::Policy, project_key: String) -> Scan {
+    collect_files(req, policy, Some(project_key), true)
+}
+
+fn collect_files(
+    req: &Request,
+    policy: &redact::Policy,
+    project_key: Option<String>,
+    keep_collisions: bool,
+) -> Scan {
     let mut s = Scanner {
+        keep_collisions,
         req,
         policy,
         project_key: req
@@ -191,7 +217,7 @@ pub fn scan_with_project_key(
             .as_ref()
             .map(|p| project_key.unwrap_or_else(|| p.redacted_key(policy).into_owned())),
         out: Scan::default(),
-        seen: HashSet::new(),
+        seen: HashMap::new(),
     };
     for a in &req.adapters {
         match a {
@@ -223,8 +249,9 @@ struct Scanner<'a> {
     policy: &'a redact::Policy,
     project_key: Option<String>,
     out: Scan,
-    /// graphs already produced
-    seen: HashSet<String>,
+    /// Files already produced for each graph. Imports retain only the first owner.
+    seen: HashMap<String, HashSet<PathBuf>>,
+    keep_collisions: bool,
 }
 
 fn rel(path: &Path, root: &Path) -> String {
@@ -386,7 +413,7 @@ impl Scanner<'_> {
     }
 
     /// Read a file: the size limit, UTF-8, the generated marker, then redaction.
-    fn read(&mut self, path: &Path, graph_prefix: &str) -> Option<Read> {
+    fn read(&mut self, path: &Path, rel_path: &str, graph_prefix: &str) -> Option<Read> {
         let skip = |me: &mut Self, reason: &str| {
             me.out.skipped.push(Skipped {
                 path: path.to_path_buf(),
@@ -416,6 +443,11 @@ impl Scanner<'_> {
             || "redaction-too-large",
         ) else {
             self.out.incomplete_areas.insert(graph_prefix.to_owned());
+            self.out
+                .refused_paths
+                .entry(graph_prefix.to_owned())
+                .or_default()
+                .insert(rel_path.to_owned());
             return skip(self, "redaction-too-large");
         };
         Some(Read {
@@ -514,7 +546,8 @@ impl Scanner<'_> {
         body_offset: usize,
         facts: Vec<Fact>,
     ) {
-        if !self.seen.insert(graph.clone()) {
+        let paths = self.seen.entry(graph.clone()).or_default();
+        if (!self.keep_collisions && !paths.is_empty()) || !paths.insert(path.to_owned()) {
             return;
         }
         let title = path
@@ -573,7 +606,7 @@ impl Scanner<'_> {
         let area = self
             .ctx()
             .graph(harness.segment(), project_segment, "memory/");
-        let Some(read) = self.read(path, &area) else {
+        let Some(read) = self.read(path, &rel_path, &area) else {
             return;
         };
         let doc = frontmatter::parse(&read.text);
@@ -703,7 +736,7 @@ impl Scanner<'_> {
             .ctx()
             .graph(harness.segment(), project_segment, "index");
         let rel_path = rel(path, memdir);
-        let Some(read) = self.read(path, &graph) else {
+        let Some(read) = self.read(path, &rel_path, &graph) else {
             return;
         };
         let mut facts = Vec::new();
@@ -842,10 +875,14 @@ impl Scanner<'_> {
                 .ctx()
                 .graph(harness.segment(), &project_segment, "instructions/");
             let graph = format!("{area}{}", ids::segment(&key));
-            if self.seen.contains(&graph) {
+            if self
+                .seen
+                .get(&graph)
+                .is_some_and(|paths| paths.contains(&path))
+            {
                 continue;
             }
-            let Some(read) = self.read(&path, &area) else {
+            let Some(read) = self.read(&path, &rel_path, &area) else {
                 // A refused file can hide imports in either instruction scope.
                 if follow_imports
                     && self
@@ -864,6 +901,11 @@ impl Scanner<'_> {
                 }
                 continue;
             };
+            // Read distinct paths even when sync will keep only the first graph.
+            // A refusal on a colliding path affects whether the first can be synced.
+            if !self.keep_collisions && self.seen.contains_key(&graph) {
+                continue;
+            }
             let doc = frontmatter::parse(&read.text);
             let i = self
                 .ctx()

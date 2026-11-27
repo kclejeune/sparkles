@@ -1747,6 +1747,76 @@ fn sources(
     Ok(0)
 }
 
+/// Match each server source to files in its graph by the path recorded at import.
+fn status_files(
+    scan: &sparkles_memory_import::Scan,
+    harness: Option<Harness>,
+    listed: &std::collections::BTreeMap<String, sync::Listed>,
+    project_graphs: impl Fn(&str) -> Vec<String>,
+) -> (Vec<Value>, std::collections::HashSet<String>) {
+    let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for file in &scan.files {
+        if harness.is_none_or(|h| h == file.harness) {
+            groups.entry(&file.graph).or_default().push(file);
+        }
+    }
+    let mut on_disk = Vec::new();
+    let mut present = std::collections::HashSet::new();
+    for (graph, files) in groups {
+        let mut graphs = project_graphs(graph);
+        if graphs.is_empty() {
+            // An instruction imported from a user directory has no project segment.
+            graphs.push(graph.clone());
+        }
+        let mut reported = vec![false; files.len()];
+        for source in graphs {
+            let Some(stored) = listed.get(&source) else {
+                continue;
+            };
+            // Missing or masked paths cannot disambiguate two files with the same key.
+            let stored_path = stored
+                .file_path
+                .as_deref()
+                .filter(|p| !p.contains("[redacted:"));
+            let candidates: Vec<_> = files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| {
+                    stored_path.is_none_or(|p| p == f.rel_path || f.rel_path.contains("[redacted:"))
+                })
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            present.insert(source.clone());
+            if stored.deleted {
+                continue;
+            }
+            let multiple = candidates.len() > 1;
+            for (index, file) in candidates {
+                let status = if multiple
+                    || stored_path != Some(file.rel_path.as_str())
+                    || scan.has_refused_path(graph, &file.rel_path)
+                {
+                    "ambiguous"
+                } else if stored.digest == sync::source_digest(file) {
+                    "imported"
+                } else {
+                    "changed"
+                };
+                on_disk.push(json!({"path": file.path.display().to_string(), "source": source, "status": status}));
+                reported[index] = true;
+            }
+        }
+        for (file, reported) in files.into_iter().zip(reported) {
+            if !reported {
+                on_disk.push(json!({"path": file.path.display().to_string(), "source": graph, "status": "not-imported"}));
+            }
+        }
+    }
+    (on_disk, present)
+}
+
 fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Result<i32, CmdError> {
     let h = harness_filter(harness.as_deref())?;
     let project = project_of(project.as_deref())?;
@@ -1771,8 +1841,7 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
         patterns: &policy.patterns,
     };
     let (listed, _) = sync::list_sources(&conn, &prefix)?;
-    let scan =
-        sparkles_memory_import::scan_with_project_key(&req, &policy, Some(keys.primary.clone()));
+    let scan = sparkles_memory_import::scan_for_status(&req, &policy, keys.primary.clone());
     let segments = keys.segments();
     // Only the project segment of a source graph changes between the two identities.
     let project_graphs = |graph: &str| -> Vec<String> {
@@ -1792,37 +1861,7 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
             .collect()
     };
     let areas: Vec<_> = scan.areas.iter().flat_map(|a| project_graphs(a)).collect();
-    let mut on_disk = Vec::new();
-    let mut present = std::collections::HashSet::new();
-    for f in scan
-        .files
-        .iter()
-        .filter(|f| h.is_none_or(|h| f.harness == h))
-    {
-        let mut graphs = project_graphs(&f.graph);
-        if graphs.is_empty() {
-            // An instruction imported from a user directory has no project segment.
-            graphs.push(f.graph.clone());
-        }
-        let start = on_disk.len();
-        let digest = sync::source_digest(f);
-        for graph in graphs {
-            present.insert(graph.clone());
-            if let Some(l) = listed.get(&graph).filter(|l| !l.deleted) {
-                let st = if l.digest == digest {
-                    "imported"
-                } else {
-                    "changed"
-                };
-                on_disk.push(
-                    json!({ "path": f.path.display().to_string(), "source": graph, "status": st }),
-                );
-            }
-        }
-        if on_disk.len() == start {
-            on_disk.push(json!({ "path": f.path.display().to_string(), "source": f.graph, "status": "not-imported" }));
-        }
-    }
+    let (on_disk, present) = status_files(&scan, h, &listed, project_graphs);
     let mut missing = Vec::new();
     for (g, l) in &listed {
         if areas.iter().any(|a| g.starts_with(a.as_str())) && !present.contains(g) {

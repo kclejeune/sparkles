@@ -718,10 +718,7 @@ pub fn sync(
             && scan.incomplete_areas.iter().any(|a| f.graph.starts_with(a))
             && (l.file_path.as_deref() != Some(f.rel_path.as_str())
                 || f.rel_path.contains("[redacted:")
-                || scan
-                    .skipped
-                    .iter()
-                    .any(|s| s.reason == "redaction-too-large" && s.path.ends_with(&f.rel_path)))
+                || scan.has_refused_path(&f.graph, &f.rel_path))
         {
             rep.status = "skipped".into();
             rep.reason = Some("uncertain-source-owner".into());

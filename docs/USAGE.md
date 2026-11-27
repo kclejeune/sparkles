@@ -4307,7 +4307,9 @@ explicitly, pass `--redact-known-values FILE` or set
 line. Blank lines, comments beginning with `#` and values shorter than eight characters
 are skipped. Directory selectors include sources published under either the original or the
 redacted project key, including imports that used a per-run flag. Status and export
-use the caller's own imports. If two sources export to the same path, select one
+use the caller's own imports. Status matches each source to its stored file path. It
+reports `ambiguous` when several files could own the source or the path cannot establish
+ownership. If two sources export to the same path, select one
 with its explicit project key. When a file exceeds the redaction budget, sync keeps
 existing sources whose ownership or absence it cannot establish. The next complete
 sync checks the server again before recording deletions.

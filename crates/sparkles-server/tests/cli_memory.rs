@@ -372,6 +372,49 @@ fn memory_redaction_refusal_keeps_an_existing_source_without_a_cache() {
     assert_eq!(s.head(), before);
 }
 
+#[cfg(unix)]
+#[test]
+fn refused_file_keeps_its_source_across_a_normalized_path_collision() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let args = ["sync", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(status, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "budget", "regex": "budget-marker"}]});
+    let (status, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(status, 200, "{output:#}");
+
+    let original = r"nested\note.md";
+    f.write_mem(
+        original,
+        "---\nname: shared\ndescription: Original fact\n---\nOriginal body.\n",
+    );
+    let first = mem_json(&f, &s, "ana", &args);
+    let graph = report(&first, original)["graph"].as_str().unwrap();
+    let query = format!(
+        "SELECT ?r WHERE {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . ?m <http://schema.org/description> \"Original fact\" }} }}"
+    );
+    let rendition = s.select(&query);
+    assert_eq!(rendition.len(), 1);
+    let head = s.head();
+    std::fs::remove_dir_all(f.state()).unwrap();
+    f.write_mem(original, &"budget-marker ".repeat(32_769));
+    f.write_mem(
+        "nested/note.md",
+        "---\nname: shared\ndescription: Replacement fact\n---\nDifferent body.\n",
+    );
+    let second = mem_json(&f, &s, "ana", &args);
+    assert_eq!(report(&second, original)["reason"], "redaction-too-large");
+    assert_eq!(s.select(&query), rendition, "{second:#}");
+    assert_eq!(
+        report(&second, "nested/note.md")["reason"],
+        "uncertain-source-owner"
+    );
+    assert_eq!(s.head(), head);
+}
+
 #[test]
 fn memory_redaction_refusal_keeps_an_existing_source_after_path_policy_changes() {
     let s = start_server(&["--mem", DS]);
@@ -705,6 +748,123 @@ fn directory_selectors_include_both_imported_project_keys() {
     assert!(
         out.join("staging-db.md").is_file() && out.join("local.md").is_file(),
         "{export:#}"
+    );
+}
+
+#[test]
+fn status_matches_shared_graph_names_to_each_project_keys_stored_path() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let p = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let policy = f.dir.path().join("values");
+    std::fs::write(&policy, "github.com/acme/shop\n").unwrap();
+    let a = f.memdir().join("a.md");
+    let b = f.memdir().join("nested/b.md");
+    let parked = f.dir.path().join("parked");
+    f.write_mem("a.md", "---\nname: shared\n---\nFirst memory.\n");
+    let alias = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "import",
+            "claude-code",
+            "--project",
+            p,
+            "--only",
+            a.to_str().unwrap(),
+            "--redact-known-values",
+            policy.to_str().unwrap(),
+        ],
+    );
+    let alias = &report(&alias, "a.md")["graph"];
+    std::fs::rename(&a, &parked).unwrap();
+    f.write_mem("nested/b.md", "---\nname: shared\n---\nSecond memory.\n");
+    let raw = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "import",
+            "claude-code",
+            "--project",
+            p,
+            "--only",
+            b.to_str().unwrap(),
+        ],
+    );
+    let raw = &report(&raw, b.to_str().unwrap())["graph"];
+    assert_ne!(raw, alias);
+    std::fs::rename(&parked, &a).unwrap();
+    std::fs::remove_dir_all(f.state()).unwrap();
+
+    let status = || mem_json(&f, &s, "ana", &["status", "--project", p]);
+    let rows = |out: &Value, graph: &Value| -> Vec<(String, String)> {
+        out["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| &r["source"] == graph && r["status"] != "not-imported")
+            .map(|r| {
+                (
+                    r["path"].as_str().unwrap().to_owned(),
+                    r["status"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let both = status();
+    assert_eq!(
+        rows(&both, raw),
+        [(b.display().to_string(), "imported".into())],
+        "{both:#}"
+    );
+    assert_eq!(
+        rows(&both, alias),
+        [(a.display().to_string(), "imported".into())],
+        "{both:#}"
+    );
+    #[cfg(unix)]
+    {
+        f.write_mem(r"nested\b.md", "---\nname: shared\n---\nThird memory.\n");
+        let ambiguous = status();
+        let matches = rows(&ambiguous, raw);
+        assert_eq!(matches.len(), 2, "{ambiguous:#}");
+        assert!(
+            matches.iter().all(|(_, state)| state == "ambiguous"),
+            "{ambiguous:#}"
+        );
+        assert_eq!(
+            rows(&ambiguous, alias),
+            [(a.display().to_string(), "imported".into())]
+        );
+        std::fs::remove_file(f.memdir().join(r"nested\b.md")).unwrap();
+    }
+    f.write_mem(
+        "nested/b.md",
+        "---\nname: shared\n---\nEdited second memory.\n",
+    );
+    let edited = status();
+    assert_eq!(
+        rows(&edited, raw),
+        [(b.display().to_string(), "changed".into())]
+    );
+    assert_eq!(
+        rows(&edited, alias),
+        [(a.display().to_string(), "imported".into())]
+    );
+    std::fs::remove_file(&b).unwrap();
+    let missing = status();
+    assert!(rows(&missing, raw).is_empty(), "{missing:#}");
+    assert!(
+        missing["sourcesWithoutFile"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| &r["source"] == raw),
+        "{missing:#}"
     );
 }
 
