@@ -101,7 +101,7 @@ fn executors() -> [Option<Optimizations>; 3] {
     [None, Some(rows), Some(Optimizations::NONE)]
 }
 
-/// Allow rounding differences in statistics computed with floating-point arithmetic.
+/// Allow small numeric differences when the actual value has a decimal point.
 fn same(got: &str, want: &str) -> bool {
     got == want
         || matches!((got.parse::<f64>(), want.parse::<f64>()),

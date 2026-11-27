@@ -23,7 +23,7 @@ use crate::sparql::expr::Expr;
 use crate::sparql::plan::Agg;
 use crate::sparql::table::Table;
 use crate::sparql::value::{
-    DECIMAL_SCALE, NumOp, Value, arith, avg_big_decimal, avg_fixed_raw, decimal_from_raw,
+    NumOp, Value, arith, avg_big_decimal, avg_fixed_integer, avg_fixed_raw, decimal_from_raw,
     decimal_raw, exact_sum, order_cmp,
 };
 use oxsdatatypes::{Decimal, Double, Float};
@@ -331,32 +331,36 @@ pub(crate) fn vec_insert_growth<T>(v: &Vec<T>) -> u64 {
 
 /// Shared finalization for `SUM` and `AVG` over a pre-evaluated result value, keeping
 /// `AggregateErrors` readings and big-number interning scratch admission consistent.
-pub(crate) fn finish_sum_avg(
-    ctx: &Ctx,
+/// A division scratch charge also covers interning the quotient.
+fn finish_sum_avg<'a>(
+    ctx: &'a Ctx,
     is_avg: bool,
     rows: u64,
     undef: u64,
     value: Option<Value>,
+    mut scratch: Option<Charge<'a>>,
 ) -> Result<Id> {
     // AVG is Sum over Count, and Count leaves the errors out
     if rows > 0 && undef == rows && is_avg && ctx.aggregate_errors.avg_of_errors_zero() {
         return ctx.try_intern_value(&Value::Integer(0.into()));
     }
-    let _scratch = match value.as_ref() {
-        Some(Value::BigInteger(i)) => {
-            Some(ctx.charge(crate::sparql::bignum::intern_scratch_bytes(i.lexical_len()))?)
-        }
-        Some(Value::BigDecimal(d)) => {
-            Some(ctx.charge(crate::sparql::bignum::intern_scratch_bytes(d.lexical_len()))?)
-        }
-        _ => None,
-    };
+    if scratch.is_none() {
+        scratch = match value.as_ref() {
+            Some(Value::BigInteger(i)) => {
+                Some(ctx.charge(crate::sparql::bignum::intern_scratch_bytes(i.lexical_len()))?)
+            }
+            Some(Value::BigDecimal(d)) => {
+                Some(ctx.charge(crate::sparql::bignum::intern_scratch_bytes(d.lexical_len()))?)
+            }
+            _ => None,
+        };
+    }
     let id = match value.as_ref() {
         Some(v) => ctx.try_intern_value(v)?,
         None => Id::UNDEF,
     };
     drop(value);
-    drop(_scratch);
+    drop(scratch);
     ctx.check()?;
     Ok(id)
 }
@@ -424,6 +428,20 @@ pub(crate) fn finish_concat(
     drop(_scratch);
     ctx.check()?;
     Ok(id)
+}
+
+#[derive(Default)]
+pub(crate) struct FinishMemory {
+    pub retained: u64,
+    pub scratch: u64,
+}
+
+impl FinishMemory {
+    /// Serial finalization keeps each interned result and reuses the scratch.
+    pub(crate) fn add_serial(&mut self, next: Self) {
+        self.retained = self.retained.saturating_add(next.retained);
+        self.scratch = self.scratch.max(next.scratch);
+    }
 }
 
 /// How one aggregate folds the rows of its groups. `merge` serves item 1066's parallel
@@ -499,11 +517,11 @@ pub(crate) trait Accumulator: Send {
         ))
     }
 
-    /// Upper bound on bytes that calling [`Accumulator::finish`] for every group can
-    /// charge to `ctx.retain_bytes()` when interning results. Polls `ctx.check()` in
+    /// Upper bounds on retained result terms and peak scratch when calling
+    /// [`Accumulator::finish`] serially for every group. Polls `ctx.check()` in
     /// bounded chunks so cancellation and deadlines remain responsive.
-    fn finish_intern_bytes(&self, _ctx: &Ctx) -> Result<u64> {
-        Ok(0)
+    fn finish_memory(&self, _ctx: &Ctx) -> Result<FinishMemory> {
+        Ok(FinishMemory::default())
     }
 
     /// Whether [`Accumulator::retract`] can take back every row.
@@ -978,7 +996,7 @@ impl Accumulator for Running {
         self.states[group].read(ctx, &self.agg)
     }
 
-    fn finish_intern_bytes(&self, ctx: &Ctx) -> Result<u64> {
+    fn finish_memory(&self, ctx: &Ctx) -> Result<FinishMemory> {
         if matches!(
             self.agg.func,
             AggregateFunction::Count
@@ -986,14 +1004,14 @@ impl Accumulator for Running {
                 | AggregateFunction::Max
                 | AggregateFunction::Sample
         ) {
-            return Ok(0);
+            return Ok(FinishMemory::default());
         }
-        let mut total = 0u64;
+        let mut total = FinishMemory::default();
         for (i, state) in self.states.iter().enumerate() {
             if i.is_multiple_of(1024) {
                 ctx.check()?;
             }
-            total = total.saturating_add(state.finish_intern_bytes(&self.agg));
+            total.add_serial(state.finish_memory(&self.agg));
         }
         Ok(total)
     }
@@ -1142,9 +1160,11 @@ impl Wide {
 }
 
 enum NumericSubtotal {
+    FixedInt(i128),
+    FixedDecimal(Decimal),
     Int(BigInt),
     Dec(BigDec),
-    Fixed(Value),
+    Approximate(Value),
 }
 
 #[derive(Debug, Default)]
@@ -1390,7 +1410,7 @@ impl SumState {
             }
             acc.add_product(self.int, 1_000_000_000_000_000_000);
             if let Some(raw) = acc.to_i128() {
-                NumericSubtotal::Fixed(Value::Decimal(Decimal::from_be_bytes(raw.to_be_bytes())))
+                NumericSubtotal::FixedDecimal(decimal_from_raw(raw))
             } else {
                 use crate::sparql::bignum::AGG_MAX_DEC_DIGITS;
                 let mut total = BigDec::from_bigint(BigInt::from_i128(self.int));
@@ -1412,7 +1432,7 @@ impl SumState {
             }
             NumericSubtotal::Int(total)
         } else {
-            NumericSubtotal::Fixed(exact_sum(self.int))
+            NumericSubtotal::FixedInt(self.int)
         };
 
         if !has_approx {
@@ -1421,7 +1441,8 @@ impl SumState {
 
         // Fold floats at float precision before the first double promotes the subtotal.
         let mut acc = match exact {
-            NumericSubtotal::Fixed(v) => v,
+            NumericSubtotal::FixedInt(i) => exact_sum(i),
+            NumericSubtotal::FixedDecimal(d) => Value::Decimal(d),
             NumericSubtotal::Dec(bd) => match bd.to_oxs_decimal() {
                 Some(decimal) => Value::Decimal(decimal),
                 None if self.floats.is_empty() => Value::Double(Double::from(bd.to_f64())),
@@ -1431,6 +1452,7 @@ impl SumState {
                 Value::Double(Double::from(bi.to_f64()))
             }
             NumericSubtotal::Int(bi) => Value::Float(Float::from(bi.to_f32())),
+            NumericSubtotal::Approximate(_) => unreachable!("exact subtotal"),
         };
         let mut floats: Vec<(f32, i64)> = self
             .floats
@@ -1450,7 +1472,7 @@ impl SumState {
         for (d, n) in doubles {
             acc = arith(NumOp::Add, &acc, &Value::Double(Double::from(d * n as f64))).ok()?;
         }
-        Some(NumericSubtotal::Fixed(acc))
+        Some(NumericSubtotal::Approximate(acc))
     }
 
     fn map_bytes(&self) -> u64 {
@@ -1713,55 +1735,51 @@ impl Accumulator for RetractableSum {
         } else {
             let subtotal = match s.subtotal() {
                 Some(subtotal) => subtotal,
-                None => return finish_sum_avg(ctx, self.is_avg, rows, undef, None),
+                None => return finish_sum_avg(ctx, self.is_avg, rows, undef, None, None),
             };
             if self.is_avg {
-                let fixed_raw = match &subtotal {
-                    NumericSubtotal::Fixed(Value::Integer(i)) => {
-                        Some(i128::from(i64::from(*i)) * DECIMAL_SCALE)
-                    }
-                    NumericSubtotal::Fixed(Value::Decimal(d)) => Some(decimal_raw(*d)),
+                let fixed_avg = match &subtotal {
+                    NumericSubtotal::FixedInt(i) => avg_fixed_integer(*i, rows),
+                    NumericSubtotal::FixedDecimal(d) => avg_fixed_raw(decimal_raw(*d), rows),
                     _ => None,
                 };
-                if let Some(avg) = fixed_raw.and_then(|raw| avg_fixed_raw(raw, rows)) {
+                if let Some(avg) = fixed_avg {
                     Some(Value::Decimal(avg))
-                } else if let NumericSubtotal::Fixed(v @ (Value::Float(_) | Value::Double(_))) =
-                    subtotal
-                {
+                } else if let NumericSubtotal::Approximate(v) = subtotal {
                     arith(NumOp::Div, &v, &Value::Integer(s.rows.into())).ok()
                 } else {
-                    let scratch = ctx.charge(if fixed_raw.is_some() {
-                        FIXED_AVG_SCRATCH_BYTES
-                    } else {
-                        AGG_SUM_SCRATCH_BYTES
-                    })?;
+                    let scratch = ctx.charge(
+                        if matches!(
+                            subtotal,
+                            NumericSubtotal::FixedInt(_) | NumericSubtotal::FixedDecimal(_)
+                        ) {
+                            FIXED_AVG_SCRATCH_BYTES
+                        } else {
+                            AGG_SUM_SCRATCH_BYTES
+                        },
+                    )?;
                     let sum = match subtotal {
+                        NumericSubtotal::FixedInt(i) => BigDec::from_bigint(BigInt::from_i128(i)),
+                        NumericSubtotal::FixedDecimal(d) => BigDec::from_oxs_decimal(d),
                         NumericSubtotal::Int(i) => BigDec::from_bigint(i),
                         NumericSubtotal::Dec(d) => d,
-                        NumericSubtotal::Fixed(Value::BigInteger(i)) => {
-                            BigDec::from_bigint(i.as_ref().clone())
-                        }
-                        NumericSubtotal::Fixed(Value::Integer(_) | Value::Decimal(_)) => {
-                            BigDec::from_oxs_decimal(decimal_from_raw(
-                                fixed_raw.expect("fixed subtotal"),
-                            ))
-                        }
-                        NumericSubtotal::Fixed(_) => unreachable!("numeric subtotal"),
+                        NumericSubtotal::Approximate(_) => unreachable!("exact subtotal"),
                     };
-                    let id = finish_sum_avg(ctx, true, rows, undef, avg_big_decimal(&sum, rows))?;
+                    let avg = avg_big_decimal(&sum, rows);
                     drop(sum);
-                    drop(scratch);
-                    return Ok(id);
+                    return finish_sum_avg(ctx, true, rows, undef, avg, Some(scratch));
                 }
             } else {
                 match subtotal {
-                    NumericSubtotal::Fixed(v) => Some(v),
+                    NumericSubtotal::FixedInt(i) => Some(exact_sum(i)),
+                    NumericSubtotal::FixedDecimal(d) => Some(Value::Decimal(d)),
                     NumericSubtotal::Int(i) => i.fits_limits().then(|| Value::from_bigint(i)),
                     NumericSubtotal::Dec(d) => d.fits_limits().then(|| Value::from_bigdec(d)),
+                    NumericSubtotal::Approximate(v) => Some(v),
                 }
             }
         };
-        finish_sum_avg(ctx, self.is_avg, rows, undef, value)
+        finish_sum_avg(ctx, self.is_avg, rows, undef, value, None)
     }
 
     fn retractable(&self) -> bool {
@@ -2884,7 +2902,7 @@ impl Accumulator for Concat {
         finish_concat(ctx, self.distinct, state.empty, state.ok, state.text)
     }
 
-    fn finish_intern_bytes(&self, ctx: &Ctx) -> Result<u64> {
+    fn finish_memory(&self, ctx: &Ctx) -> Result<FinishMemory> {
         let mut total = 0u64;
         for (i, state) in self.groups.iter().enumerate() {
             if i.is_multiple_of(1024) {
@@ -2894,7 +2912,10 @@ impl Accumulator for Concat {
                 total = total.saturating_add((state.text.len() as u64).saturating_add(128));
             }
         }
-        Ok(total)
+        Ok(FinishMemory {
+            retained: total,
+            scratch: 0,
+        })
     }
 
     fn group_bytes(&self) -> u64 {
@@ -3037,8 +3058,8 @@ impl Accumulator for Distinct {
             .finish_replay(ctx, group, aggregate, deferred, scratch)
     }
 
-    fn finish_intern_bytes(&self, ctx: &Ctx) -> Result<u64> {
-        self.inner.finish_intern_bytes(ctx)
+    fn finish_memory(&self, ctx: &Ctx) -> Result<FinishMemory> {
+        self.inner.finish_memory(ctx)
     }
 
     fn take_growth(&mut self) -> u64 {

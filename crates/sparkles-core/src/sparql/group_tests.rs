@@ -99,6 +99,38 @@ fn decimal_avg_rounds_after_merging_partial_sums() {
 }
 
 #[test]
+fn maintained_integer_avg_with_wide_subtotal_respects_scratch_budget() {
+    use super::bignum::FIXED_AVG_SCRATCH_BYTES;
+
+    let mut ctx = ctx();
+    let mut acc = retractable(&agg(AggregateFunction::Avg, true, false), 1).unwrap();
+    acc.init(1);
+    let value = int(&ctx, 1 << 62);
+    fold(&ctx, acc.as_mut(), &[value, value], &[0, 0]);
+
+    // The subtotal exceeds i64::MAX. Only the exact result term needs admission.
+    ctx.mem_limit = ctx.live_bytes() + 512;
+    let exact = acc.read(&ctx, 0).unwrap();
+
+    let zero = int(&ctx, 0);
+    fold(&ctx, acc.as_mut(), &[zero], &[0]);
+    // A repeating quotient needs division scratch for the same i128 subtotal.
+    ctx.mem_limit = ctx.live_bytes() + FIXED_AVG_SCRATCH_BYTES + 256;
+    let repeating = acc.read(&ctx, 0).unwrap();
+
+    // Inspect the result ids outside the budget under test.
+    ctx.mem_limit = u64::MAX;
+    let Some(Value::Decimal(avg)) = ctx.value(exact) else {
+        panic!("expected an exact decimal average");
+    };
+    assert_eq!(avg, oxsdatatypes::Decimal::from(1_i64 << 62));
+    assert_eq!(
+        ctx.value(repeating).unwrap().lexical().unwrap().as_ref(),
+        "3074457345618258602.666666666666666666666667"
+    );
+}
+
+#[test]
 fn merging_two_passes_gives_one_pass() {
     let ctx = ctx();
     let values: Vec<Id> = [5, 3, 9, 3, 7, 1, 8, 2, 6, 4]
@@ -3784,20 +3816,20 @@ fn hash_assembly_sort_and_key_only_group_poll_cancellation_and_timeout() {
     let err = super::group::par::sort_order_map(&cancel_ctx, &mut map, max_row).unwrap_err();
     assert!(matches!(err, crate::error::Error::Cancelled));
 
-    // 2. `finish_intern_bytes` scans poll in bounded chunks and abort on cancellation.
+    // 2. `finish_memory` scans poll in bounded chunks and abort on cancellation.
     let groups = 20_000usize;
     let avg_agg = agg(AggregateFunction::Avg, true, false);
     let mut run_acc = Running::new(&avg_agg, false);
     run_acc.init(groups);
     let before = super::ctx::CHECKS.with(std::cell::Cell::get);
-    let _ = run_acc.finish_intern_bytes(&ctx_ok).unwrap();
+    let _ = run_acc.finish_memory(&ctx_ok).unwrap();
     let run_checks = super::ctx::CHECKS.with(std::cell::Cell::get) - before;
     assert!(
         run_checks >= groups / 1024,
-        "expected Running::finish_intern_bytes to poll in chunks, got {run_checks}"
+        "expected Running::finish_memory to poll in chunks, got {run_checks}"
     );
     assert!(matches!(
-        run_acc.finish_intern_bytes(&cancel_ctx),
+        run_acc.finish_memory(&cancel_ctx),
         Err(crate::error::Error::Cancelled)
     ));
 
@@ -3811,14 +3843,14 @@ fn hash_assembly_sort_and_key_only_group_poll_cancellation_and_timeout() {
     let mut concat_acc = Concat::new(&concat_agg);
     concat_acc.init(groups);
     let before = super::ctx::CHECKS.with(std::cell::Cell::get);
-    let _ = concat_acc.finish_intern_bytes(&ctx_ok).unwrap();
+    let _ = concat_acc.finish_memory(&ctx_ok).unwrap();
     let concat_checks = super::ctx::CHECKS.with(std::cell::Cell::get) - before;
     assert!(
         concat_checks >= groups / 1024,
-        "expected Concat::finish_intern_bytes to poll in chunks, got {concat_checks}"
+        "expected Concat::finish_memory to poll in chunks, got {concat_checks}"
     );
     assert!(matches!(
-        concat_acc.finish_intern_bytes(&cancel_ctx),
+        concat_acc.finish_memory(&cancel_ctx),
         Err(crate::error::Error::Cancelled)
     ));
 
@@ -3845,7 +3877,7 @@ fn hash_assembly_sort_and_key_only_group_poll_cancellation_and_timeout() {
             super::group::whole(&ctx_ok, &table, &[0], &avg_aggs, false, true, &mut rep).unwrap();
         super::ctx::CHECKS.with(std::cell::Cell::get) - before
     });
-    // Coordinator thread runs Pass 3 (finish_intern_bytes + order_map build + gather + finish).
+    // Coordinator thread runs Pass 3 (finish_memory + order_map build + gather + finish).
     assert!(
         asm_checks >= (n / 1024) * 3,
         "expected Pass 3 coordinator polling across estimate, build, gather, and finish, got {asm_checks}"

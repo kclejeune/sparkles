@@ -844,6 +844,11 @@ pub(crate) fn avg_fixed_raw(raw: i128, rows: u64) -> Option<Decimal> {
     (raw.checked_rem(rows)? == 0).then(|| decimal_from_raw(raw / rows))
 }
 
+/// Try fixed-point division of an integer subtotal, including the scaling step.
+pub(crate) fn avg_fixed_integer(sum: i128, rows: u64) -> Option<Decimal> {
+    avg_fixed_raw(sum.checked_mul(DECIMAL_SCALE)?, rows)
+}
+
 /// Use the same division for every exact subtotal, even one which grew past the
 /// digit cap before division but whose final quotient fits.
 pub(crate) fn avg_big_decimal(sum: &BigDec, rows: u64) -> Option<Value> {

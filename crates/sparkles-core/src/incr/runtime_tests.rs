@@ -2711,6 +2711,31 @@ fn maintained_numeric_aggregates_use_arq_avg_and_staged_float_promotion() {
 }
 
 #[test]
+fn maintained_integer_avg_fits_tight_view_budget() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { :a :v 4611686018427387904 . :b :v 4611686018427387904 }",
+    );
+    let rt = runtime(&s, None);
+    let mut def = ViewDef::table(q("SELECT (AVG(?v) AS ?a) WHERE { ?x :v ?v }"));
+    def.memory_bytes = 16 * 1024;
+    rt.put(&s, "integer-avg", def).unwrap();
+    rt.round(&s);
+    assert_eq!(
+        read(&rt, &s, "integer-avg", None).unwrap(),
+        ["4611686018427387904"]
+    );
+
+    upd(&s, "INSERT DATA { :c :v 0 }");
+    rt.round(&s);
+    assert_eq!(
+        read(&rt, &s, "integer-avg", None).unwrap(),
+        ["3074457345618258602.666666666666666666666667"]
+    );
+}
+
+#[test]
 fn maintained_decimal_avg_updates_retracts_and_rebuilds_old_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let query = q("SELECT (AVG(?v) AS ?a) WHERE { ?x :v ?v }");

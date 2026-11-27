@@ -8731,36 +8731,31 @@ impl AggState {
         }
     }
 
-    /// Upper bound on bytes [`AggState::finish_with`] can charge to `ctx.retain_bytes()`
-    /// when interning the finalized result value.
-    pub(super) fn finish_intern_bytes(&self, agg: &Agg) -> u64 {
-        match self {
+    /// Upper bounds on result term retention and transient finalization scratch.
+    pub(super) fn finish_memory(&self, agg: &Agg) -> super::group::acc::FinishMemory {
+        use super::bignum::{AGG_SUM_SCRATCH_BYTES, FIXED_AVG_SCRATCH_BYTES, intern_scratch_bytes};
+        use super::group::acc::FinishMemory;
+        use super::value::{avg_fixed_integer, avg_fixed_raw};
+
+        let mut scratch = 0;
+        let retained = match self {
             AggState::Count(_) | AggState::Best(..) | AggState::Sample(_) => 0,
             AggState::Sum {
                 acc, rows, errs, ..
             } => {
                 let is_avg = matches!(agg.func, AggregateFunction::Avg);
-                if *rows > 0 && *errs == *rows && is_avg {
-                    return 0;
+                if is_avg && *errs == *rows {
+                    return FinishMemory::default();
                 }
                 match acc {
                     SumAcc::HardError | SumAcc::Overflow => 0,
                     SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_) => {
                         let sum = acc.int_sum().expect("int variant");
                         if is_avg {
-                            if *rows == 0 {
-                                0
-                            } else {
-                                let needs_big = sum
-                                    .checked_mul(super::value::DECIMAL_SCALE)
-                                    .and_then(|raw| super::value::avg_fixed_raw(raw, *rows))
-                                    .is_none();
-                                if needs_big {
-                                    super::bignum::FIXED_AVG_SCRATCH_BYTES + 256
-                                } else {
-                                    256
-                                }
+                            if avg_fixed_integer(sum, *rows).is_none() {
+                                scratch = FIXED_AVG_SCRATCH_BYTES;
                             }
+                            256
                         } else if i64::try_from(sum)
                             .ok()
                             .is_some_and(|i| Id::from_i64(i).is_some())
@@ -8771,42 +8766,34 @@ impl AggState {
                         }
                     }
                     SumAcc::Decimal(ds) => {
-                        if is_avg {
-                            if *rows == 0 {
-                                0
-                            } else {
-                                if super::value::avg_fixed_raw(ds.val, *rows).is_none() {
-                                    super::bignum::FIXED_AVG_SCRATCH_BYTES + 256
-                                } else {
-                                    256
-                                }
-                            }
-                        } else {
-                            256
+                        if is_avg && avg_fixed_raw(ds.val, *rows).is_none() {
+                            scratch = FIXED_AVG_SCRATCH_BYTES;
                         }
+                        256
                     }
                     SumAcc::BigInt(bi) => {
                         if is_avg {
-                            super::bignum::AGG_SUM_SCRATCH_BYTES + 4500
+                            scratch = AGG_SUM_SCRATCH_BYTES;
+                            4500
                         } else {
-                            super::bignum::intern_scratch_bytes(bi.lexical_len())
-                                .saturating_add(bi.lexical_len() as u64 + 144)
+                            let len = bi.lexical_len();
+                            scratch = intern_scratch_bytes(len);
+                            len as u64 + 144
                         }
                     }
                     SumAcc::BigDec(bd) => {
                         if is_avg {
-                            super::bignum::AGG_SUM_SCRATCH_BYTES + 4500
+                            scratch = AGG_SUM_SCRATCH_BYTES;
+                            4500
                         } else {
-                            super::bignum::intern_scratch_bytes(bd.lexical_len())
-                                .saturating_add(bd.lexical_len() as u64 + 144)
+                            let len = bd.lexical_len();
+                            scratch = intern_scratch_bytes(len);
+                            len as u64 + 144
                         }
                     }
                     SumAcc::Float(_) => 256,
                     SumAcc::Double(d) => {
                         let x = if is_avg {
-                            if *rows == 0 {
-                                return 0;
-                            }
                             f64::from(*d) / (*rows as f64)
                         } else {
                             f64::from(*d)
@@ -8816,7 +8803,8 @@ impl AggState {
                 }
             }
             AggState::Stat(arq, acc) => acc.finish_value(*arq).map_or(0, double_intern_bytes),
-        }
+        };
+        FinishMemory { retained, scratch }
     }
 
     /// Add one row; `id` is the aggregated column's value (`None` for COUNT(*)).
@@ -9824,17 +9812,14 @@ impl AggState {
                 }
                 use super::bignum::{BigDec, BigInt, FIXED_AVG_SCRATCH_BYTES};
                 use super::value::{
-                    DECIMAL_SCALE, avg_big_decimal, avg_fixed_raw, decimal_from_raw,
+                    avg_big_decimal, avg_fixed_integer, avg_fixed_raw, decimal_from_raw,
                 };
                 let (v, scratch) = match acc {
                     SumAcc::Int { .. } | SumAcc::Int128(_) | SumAcc::IntRetracted(_) => {
                         let int = acc.int_sum().expect("int variant");
                         if !is_avg {
                             (Some(super::value::exact_sum(int)), None)
-                        } else if let Some(avg) = int
-                            .checked_mul(DECIMAL_SCALE)
-                            .and_then(|raw| avg_fixed_raw(raw, rows))
-                        {
+                        } else if let Some(avg) = avg_fixed_integer(int, rows) {
                             (Some(Value::Decimal(avg)), None)
                         } else {
                             let scratch =
