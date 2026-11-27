@@ -43,9 +43,10 @@ pub fn replace_in_place(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    st.forget_routing(name);
-    // the catalog lists the dataset again only once the swap or its rollback is done
-    let swapping = st.swapping();
+    // Detach routing and hold the predecessor store's `$other` counters as pending
+    // until the swap or its rollback finishes (the catalog lists the dataset again
+    // only once the swap or its rollback is done).
+    let swapping = st.begin_swap(name);
     let result = st
         .catalog
         .replace_restored_reserved(r, restored, task, keep);

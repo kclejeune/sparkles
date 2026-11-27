@@ -346,37 +346,54 @@ fn rooted_in_cancel(e: &anyhow::Error) -> bool {
 struct Leaving<'a> {
     st: &'a AppState,
     name: String,
-    pending_open_id: Option<u64>,
+    pending: Option<(u64, u64)>,
 }
 
 impl Leaving<'_> {
     /// Disarm automatic pending-metrics cancellation once the caller has committed or
     /// retired the leaving store's `$other` accounting.
     fn disarm_metrics(&mut self) {
-        self.pending_open_id = None;
+        self.pending = None;
     }
 }
 
 impl Drop for Leaving<'_> {
     fn drop(&mut self) {
-        {
-            let mut l = self.st.leaving.lock();
-            l.remove(&self.name);
-            self.st.lifecycle.fetch_add(1, Ordering::SeqCst);
+        let mut l = self.st.leaving.lock();
+        if let Some((id, token)) = self.pending.take() {
+            self.st.metrics.cancel_leaving(id, token);
         }
-        if let Some(id) = self.pending_open_id.take() {
-            self.st.metrics.cancel_leaving(id);
-        }
+        l.remove(&self.name);
+        self.st.lifecycle.fetch_add(1, Ordering::SeqCst);
     }
 }
 
-/// Counts a store swap in progress on [`AppState`] until dropped.
-pub(crate) struct Swapping<'a>(&'a AppState);
+/// Counts a store swap in progress on [`AppState`] until dropped, and reconciles
+/// the replaced store's `$other` metrics ledger when used by an in-place restore.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub(crate) struct Swapping<'a> {
+    st: &'a AppState,
+    #[cfg(feature = "backup")]
+    metrics_target: Option<(String, u64, u64)>,
+}
 
 impl Drop for Swapping<'_> {
     fn drop(&mut self) {
-        self.0.swapping.fetch_sub(1, Ordering::SeqCst);
-        self.0.lifecycle.fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "backup")]
+        if let Some((name, old_id, token)) = self.metrics_target.take() {
+            let same_store = self
+                .st
+                .catalog
+                .get(&name)
+                .is_some_and(|cur| cur.state().open_id == old_id);
+            if same_store {
+                self.st.metrics.cancel_leaving(old_id, token);
+            } else {
+                self.st.metrics.retire_reopened(old_id);
+            }
+        }
+        self.st.swapping.fetch_sub(1, Ordering::SeqCst);
+        self.st.lifecycle.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -1190,7 +1207,7 @@ impl AppState {
         Some(ds)
     }
 
-    #[cfg(feature = "backup")]
+    #[cfg(all(test, feature = "backup"))]
     pub fn forget_routing(&self, name: &str) {
         self.routing.lock().remove(name);
     }
@@ -1294,11 +1311,50 @@ impl AppState {
 
     /// Count a swap of a dataset's store, such as an in-place restore, until the guard
     /// drops, so that [`Self::any_leaving`] and [`Self::lifecycle`] tell of it.
-    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    #[cfg_attr(not(all(test, feature = "backup")), allow(dead_code))]
     pub(crate) fn swapping(&self) -> Swapping<'_> {
         self.swapping.fetch_add(1, Ordering::SeqCst);
         self.lifecycle.fetch_add(1, Ordering::SeqCst);
-        Swapping(self)
+        Swapping {
+            st: self,
+            #[cfg(feature = "backup")]
+            metrics_target: None,
+        }
+    }
+
+    /// Detach routing for an in-place store swap and hold the predecessor store's `$other`
+    /// counters as pending until the returned [`Swapping`] guard drops and reconciles the
+    /// post-swap or post-rollback store identity.
+    #[cfg(feature = "backup")]
+    pub(crate) fn begin_swap(&self, name: &str) -> Swapping<'_> {
+        self.swapping.fetch_add(1, Ordering::SeqCst);
+        self.lifecycle.fetch_add(1, Ordering::SeqCst);
+        let metrics_target = {
+            let mut routing = self.routing.lock();
+            if let Some(ds) = routing.remove(name) {
+                let id = ds.open_id;
+                let counters = crate::obs::StoreCounters::read(&ds.store);
+                let token = self.metrics.begin_leaving(name, id, counters);
+                drop(routing);
+                drop(ds);
+                token.map(|t| (name.to_string(), id, t))
+            } else {
+                drop(routing);
+                if let Some(ds) = self.catalog.get(name) {
+                    let id = ds.state().open_id;
+                    let counters = crate::obs::StoreCounters::read(ds.store());
+                    let token = self.metrics.begin_leaving(name, id, counters);
+                    drop(ds);
+                    token.map(|t| (name.to_string(), id, t))
+                } else {
+                    None
+                }
+            }
+        };
+        Swapping {
+            st: self,
+            metrics_target,
+        }
     }
 
     /// Hold `name` as leaving, as a deletion that is draining does (tests).
@@ -1323,7 +1379,7 @@ impl AppState {
         Ok(Leaving {
             st: self,
             name: name.to_string(),
-            pending_open_id: None,
+            pending: None,
         })
     }
 
@@ -1341,10 +1397,11 @@ impl AppState {
         }
         self.lifecycle.fetch_add(1, Ordering::SeqCst);
         let cached = routing.remove(name);
-        let pending_open_id = cached.as_ref().map(|ds| {
+        let pending = cached.as_ref().and_then(|ds| {
             let counters = crate::obs::StoreCounters::read(&ds.store);
-            self.metrics.begin_leaving(name, ds.open_id, counters);
-            ds.open_id
+            self.metrics
+                .begin_leaving(name, ds.open_id, counters)
+                .map(|token| (ds.open_id, token))
         });
         drop(leaving);
         drop(routing);
@@ -1352,7 +1409,7 @@ impl AppState {
             Leaving {
                 st: self,
                 name: name.to_string(),
-                pending_open_id,
+                pending,
             },
             cached,
         ))
@@ -1397,12 +1454,29 @@ impl AppState {
             .map(|ds| ds.store.dataset_id())
             .or_else(|| self.catalog.info(name).map(|info| info.id));
         let old_open_id = cached.as_ref().map(|ds| ds.open_id);
+        if let Some(ds) = cached.as_ref() {
+            self.metrics.refresh_leaving(
+                name,
+                ds.open_id,
+                crate::obs::StoreCounters::read(&ds.store),
+            );
+        }
         drop(cached);
         if managed {
             // Other holders of the dataset itself, not this server's wrapper, get the
             // same window. The catalog then refuses if one still does, except the
             // dataset's own views worker, which it pauses instead.
             wait_until(end, || !self.catalog.in_use(name));
+            if let Some(old_id) = old_open_id
+                && let Some(ds) = self.catalog.get(name)
+                && ds.state().open_id == old_id
+            {
+                self.metrics.refresh_leaving(
+                    name,
+                    old_id,
+                    crate::obs::StoreCounters::read(ds.store()),
+                );
+            }
         }
         #[cfg(test)]
         tests::delete_hook(name);
@@ -1494,11 +1568,28 @@ impl AppState {
             .as_ref()
             .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
         let old_open_id = cached.as_ref().map(|ds| ds.open_id);
+        if let Some(ds) = cached.as_ref() {
+            self.metrics.refresh_leaving(
+                from,
+                ds.open_id,
+                crate::obs::StoreCounters::read(&ds.store),
+            );
+        }
         drop(cached);
         // As in delete, wait for the workers that hold the dataset itself. The catalog
         // refuses a rename for those handles only on a persistent dataset.
         if self.catalog_persistent(from) {
             wait_until(end, || !self.catalog.in_use(from));
+            if let Some(old_id) = old_open_id
+                && let Some(ds) = self.catalog.get(from)
+                && ds.state().open_id == old_id
+            {
+                self.metrics.refresh_leaving(
+                    from,
+                    old_id,
+                    crate::obs::StoreCounters::read(ds.store()),
+                );
+            }
         }
         let result = self.catalog.rename(from, to);
         match result {

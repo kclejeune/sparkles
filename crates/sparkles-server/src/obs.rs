@@ -190,14 +190,25 @@ struct StoreOtherState {
     promoted_offset: StoreCounters,
 }
 
+struct PendingStore {
+    /// Active leaving/swapping tokens for this `open_id`. Normally 1; can briefly be 2
+    /// when a doomed delete or rename overlaps an in-place restore swap on the same store.
+    tokens: BTreeSet<u64>,
+    contrib: Option<StoreCounters>,
+    in_overflow: bool,
+}
+
 #[derive(Default)]
 struct OtherStoreLedger {
     /// Permanently retired live-store counters from deleted, promoted, or reopened overflow stores.
     retired: StoreCounters,
-    /// Counters temporarily held for stores currently in `AppState::leaving` (delete/rename),
+    /// Counters temporarily held for stores currently leaving or swapping (delete/rename/restore),
     /// keyed by `DatasetState::open_id`.
-    pending: BTreeMap<u64, Option<StoreCounters>>,
-    /// Counters of stores whose `leaving` ended without retiring (failed delete/rename or
+    pending: BTreeMap<u64, PendingStore>,
+    /// Monotonic token generator for `pending` entries so an older cancellation cannot clear
+    /// a newer or overlapping pending owner for the same `open_id`.
+    next_pending_token: u64,
+    /// Counters of stores whose `leaving` ended without retiring (failed delete/rename/swap or
     /// memory rename) while a scrape was in flight (`active_scrapes > 0`). Added to `$other`
     /// only for scrapes whose live sample set missed the store. Cleared when `active_scrapes == 0`.
     restored_during_scrape: BTreeMap<u64, StoreCounters>,
@@ -205,27 +216,35 @@ struct OtherStoreLedger {
     /// stale `Arc<Dataset>` held by a concurrent scrape is skipped rather than doubled or
     /// resurrecting a deleted named slot. Cleared when `active_scrapes == 0`.
     retired_ids: BTreeSet<u64>,
+    /// `(from_name, open_id)` aliases vacated by an in-memory rename while `active_scrapes > 0`,
+    /// so a stale `LiveSample` holding the dead alias is skipped instead of allocating a ghost
+    /// named slot or misattributing named counters to `$other`. Cleared when `active_scrapes == 0`.
+    renamed_from: BTreeSet<(String, u64)>,
     /// Number of `gauges()` scrapes currently in flight.
     active_scrapes: usize,
     /// Per-open-store `$other` tracking, keyed by `DatasetState::open_id`.
     stores: BTreeMap<u64, StoreOtherState>,
 }
 
-fn other_contribution(
+fn is_in_overflow(
     max_datasets: usize,
     name: &str,
+    datasets: &BTreeMap<String, Arc<DsMetrics>>,
+) -> bool {
+    let named = datasets.keys().filter(|k| !k.starts_with('$')).count();
+    !datasets.contains_key(name) && named >= max_datasets && datasets.contains_key(OTHER)
+}
+
+fn other_contribution_for(
+    in_overflow: bool,
     open_id: u64,
     raw: &StoreCounters,
-    datasets: &BTreeMap<String, Arc<DsMetrics>>,
-    ledger: &OtherStoreLedger,
+    stores: &BTreeMap<u64, StoreOtherState>,
 ) -> Option<StoreCounters> {
-    let st_entry = ledger.stores.get(&open_id);
+    let st_entry = stores.get(&open_id);
     let seen = st_entry
         .map(|s| s.seen_under_other.clone_counters())
         .unwrap_or_default();
-    let named = datasets.keys().filter(|k| !k.starts_with('$')).count();
-    let in_overflow =
-        !datasets.contains_key(name) && named >= max_datasets && datasets.contains_key(OTHER);
     let contrib = if in_overflow {
         let eff = match st_entry {
             Some(s) => raw.sub(&s.promoted_offset),
@@ -238,18 +257,29 @@ fn other_contribution(
     contrib.any().then_some(contrib)
 }
 
+fn max_opt_counters(
+    prev: Option<StoreCounters>,
+    next: Option<StoreCounters>,
+) -> Option<StoreCounters> {
+    match (prev, next) {
+        (Some(a), Some(b)) => Some(a.max_with(&b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 #[cfg(all(test, feature = "otel"))]
 type GaugesHook = Box<dyn FnOnce() + Send>;
 
 #[cfg(all(test, feature = "otel"))]
-thread_local! {
-    static GAUGES_AFTER_DATASETS_HOOK: std::cell::RefCell<Option<GaugesHook>> =
-        const { std::cell::RefCell::new(None) };
-}
+static GAUGES_AFTER_DATASETS_HOOKS: std::sync::LazyLock<Mutex<BTreeMap<usize, GaugesHook>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 #[cfg(all(test, feature = "otel"))]
-pub(crate) fn set_gauges_after_datasets_hook(f: impl FnOnce() + Send + 'static) {
-    GAUGES_AFTER_DATASETS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
+pub(crate) fn set_gauges_after_datasets_hook(st: &AppState, f: impl FnOnce() + Send + 'static) {
+    let key = std::ptr::from_ref(st) as usize;
+    GAUGES_AFTER_DATASETS_HOOKS.lock().insert(key, Box::new(f));
 }
 
 // ---------------------------------------------------------------- request ids ------
@@ -1078,25 +1108,83 @@ impl Metrics {
         self.commit_delete(dataset, None);
     }
 
-    /// Record a leaving store's pending `$other` counters so concurrent scrapes during
-    /// delete or rename never observe a transient drop.
-    pub(crate) fn begin_leaving(&self, name: &str, open_id: u64, raw: StoreCounters) {
+    /// Record a leaving or swapping store's pending `$other` counters so concurrent scrapes
+    /// during delete, rename, or in-place restore never observe a transient drop. Returns a
+    /// token for [`Self::cancel_leaving`] when metrics are enabled.
+    pub(crate) fn begin_leaving(
+        &self,
+        name: &str,
+        open_id: u64,
+        raw: StoreCounters,
+    ) -> Option<u64> {
         if !self.enabled {
-            return;
+            return None;
         }
-        let mut ledger = self.other_store.lock();
+        let mut ledger_guard = self.other_store.lock();
+        let ledger = &mut *ledger_guard;
+        ledger.restored_during_scrape.remove(&open_id);
         let r = self.datasets.read();
-        let contrib = other_contribution(self.max_datasets, name, open_id, &raw, &r, &ledger);
-        ledger.pending.insert(open_id, contrib);
+        let in_overflow = is_in_overflow(self.max_datasets, name, &r);
+        let contrib = other_contribution_for(in_overflow, open_id, &raw, &ledger.stores);
+        let token = ledger.next_pending_token;
+        ledger.next_pending_token = ledger.next_pending_token.wrapping_add(1);
+        match ledger.pending.get_mut(&open_id) {
+            Some(existing) => {
+                existing.tokens.insert(token);
+                existing.in_overflow |= in_overflow;
+                existing.contrib = max_opt_counters(existing.contrib.take(), contrib);
+            }
+            None => {
+                let mut tokens = BTreeSet::new();
+                tokens.insert(token);
+                ledger.pending.insert(
+                    open_id,
+                    PendingStore {
+                        tokens,
+                        contrib,
+                        in_overflow,
+                    },
+                );
+            }
+        }
+        Some(token)
     }
 
-    /// Clear a leaving store's pending entry when delete or rename did not close the store.
-    pub(crate) fn cancel_leaving(&self, open_id: u64) {
+    /// Refresh a leaving store's pending `$other` counters after draining in-flight
+    /// handles, preserving the monotonic maximum against the initial pending snapshot.
+    pub(crate) fn refresh_leaving(&self, name: &str, open_id: u64, raw: StoreCounters) {
+        if !self.enabled {
+            return;
+        }
+        let mut ledger_guard = self.other_store.lock();
+        let ledger = &mut *ledger_guard;
+        let Some(existing) = ledger.pending.get_mut(&open_id) else {
+            return;
+        };
+        let r = self.datasets.read();
+        let in_overflow = existing.in_overflow || is_in_overflow(self.max_datasets, name, &r);
+        let contrib = other_contribution_for(in_overflow, open_id, &raw, &ledger.stores);
+        existing.in_overflow = in_overflow;
+        existing.contrib = max_opt_counters(existing.contrib.take(), contrib);
+    }
+
+    /// Clear a leaving or swapping store's pending token when delete, rename, or restore
+    /// did not close the store.
+    pub(crate) fn cancel_leaving(&self, open_id: u64, token: u64) {
         if !self.enabled {
             return;
         }
         let mut ledger = self.other_store.lock();
-        if let Some(Some(contrib)) = ledger.pending.remove(&open_id)
+        let remove = match ledger.pending.get_mut(&open_id) {
+            Some(existing) => {
+                existing.tokens.remove(&token);
+                existing.tokens.is_empty()
+            }
+            None => return,
+        };
+        if remove
+            && let Some(entry) = ledger.pending.remove(&open_id)
+            && let Some(contrib) = entry.contrib
             && ledger.active_scrapes > 0
         {
             ledger.restored_during_scrape.insert(open_id, contrib);
@@ -1110,7 +1198,8 @@ impl Metrics {
         let mut w = self.datasets.write();
         w.remove(dataset);
         if let Some(id) = open_id {
-            if let Some(Some(contrib)) = ledger.pending.remove(&id) {
+            ledger.restored_during_scrape.remove(&id);
+            if let Some(contrib) = ledger.pending.remove(&id).and_then(|e| e.contrib) {
                 ledger.retired.add_assign(&contrib);
                 w.entry(OTHER.to_string()).or_default();
             }
@@ -1121,15 +1210,16 @@ impl Metrics {
         }
     }
 
-    /// Retire a leaving store whose underlying store was closed and either reopened at zero
-    /// or left closed after a failed delete or rename.
+    /// Retire a leaving or swapping store whose underlying store was closed and either
+    /// reopened at zero or left closed after a failed delete, rename, or restore swap.
     pub(crate) fn retire_reopened(&self, open_id: u64) {
         if !self.enabled {
             return;
         }
         let mut ledger = self.other_store.lock();
         let mut w = self.datasets.write();
-        if let Some(Some(contrib)) = ledger.pending.remove(&open_id) {
+        ledger.restored_during_scrape.remove(&open_id);
+        if let Some(contrib) = ledger.pending.remove(&open_id).and_then(|e| e.contrib) {
             ledger.retired.add_assign(&contrib);
             w.entry(OTHER.to_string()).or_default();
         }
@@ -1156,12 +1246,15 @@ impl Metrics {
             w.insert(to.to_string(), series);
         }
         if let Some(old_id) = old_open_id {
-            let contrib = ledger.pending.remove(&old_id).flatten();
+            ledger.restored_during_scrape.remove(&old_id);
+            let contrib = ledger.pending.remove(&old_id).and_then(|e| e.contrib);
             if old_id == new_open_id {
-                if let Some(c) = contrib
-                    && ledger.active_scrapes > 0
-                {
-                    ledger.restored_during_scrape.insert(old_id, c);
+                if ledger.active_scrapes > 0 {
+                    ledger.renamed_from.insert((from.to_string(), old_id));
+                    ledger.renamed_from.remove(&(to.to_string(), old_id));
+                    if let Some(c) = contrib {
+                        ledger.restored_during_scrape.insert(old_id, c);
+                    }
                 }
             } else {
                 if let Some(c) = contrib {
@@ -1174,6 +1267,11 @@ impl Metrics {
                 }
             }
         }
+    }
+
+    #[cfg(all(test, feature = "otel", feature = "backup"))]
+    pub(crate) fn other_ledger_store_ids(&self) -> Vec<u64> {
+        self.other_store.lock().stores.keys().copied().collect()
     }
 
     fn ensure_other_slot(&self) {
@@ -1486,6 +1584,7 @@ impl Drop for ActiveScrapeGuard<'_> {
         if ledger.active_scrapes == 0 {
             ledger.retired_ids.clear();
             ledger.restored_during_scrape.clear();
+            ledger.renamed_from.clear();
         }
     }
 }
@@ -1575,8 +1674,12 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         })
         .collect();
     #[cfg(all(test, feature = "otel"))]
-    if let Some(hook) = GAUGES_AFTER_DATASETS_HOOK.with(|slot| slot.borrow_mut().take()) {
-        hook();
+    {
+        let key = std::ptr::from_ref(st) as usize;
+        let hook = GAUGES_AFTER_DATASETS_HOOKS.lock().remove(&key);
+        if let Some(hook) = hook {
+            hook();
+        }
     }
     let mut out: BTreeMap<String, DsGauges> = BTreeMap::new();
     if !st.metrics.enabled {
@@ -1608,7 +1711,11 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         let ledger = &mut *ledger_guard;
         let mut live_ids = BTreeSet::new();
         for s in samples {
-            if ledger.retired_ids.contains(&s.open_id) || ledger.pending.contains_key(&s.open_id) {
+            if ledger.retired_ids.contains(&s.open_id)
+                || ledger.pending.contains_key(&s.open_id)
+                || (!ledger.renamed_from.is_empty()
+                    && ledger.renamed_from.contains(&(s.name.clone(), s.open_id)))
+            {
                 continue;
             }
             live_ids.insert(s.open_id);
@@ -1619,17 +1726,20 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
                 let eff = s.counters.sub(&entry.promoted_offset);
                 entry.seen_under_other = entry.seen_under_other.max_with(&eff);
                 eff
-            } else if let Some(entry) = ledger.stores.get_mut(&s.open_id) {
-                if entry.seen_under_other.any() {
-                    let retired = entry.seen_under_other.clone_counters();
-                    ledger.retired.add_assign(&retired);
-                    st.metrics.ensure_other_slot();
-                    entry.promoted_offset.add_assign(&retired);
-                    entry.seen_under_other = StoreCounters::default();
-                }
-                s.counters.sub(&entry.promoted_offset)
             } else {
-                s.counters
+                ledger.restored_during_scrape.remove(&s.open_id);
+                if let Some(entry) = ledger.stores.get_mut(&s.open_id) {
+                    if entry.seen_under_other.any() {
+                        let retired = entry.seen_under_other.clone_counters();
+                        ledger.retired.add_assign(&retired);
+                        st.metrics.ensure_other_slot();
+                        entry.promoted_offset.add_assign(&retired);
+                        entry.seen_under_other = StoreCounters::default();
+                    }
+                    s.counters.sub(&entry.promoted_offset)
+                } else {
+                    s.counters
+                }
             };
             let g = out.entry(label).or_default();
             if !is_other {
@@ -1652,12 +1762,21 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
             add_store_counters(g, &effective);
         }
         let mut carried = ledger.retired.clone_counters();
-        for c in ledger.pending.values().flatten() {
-            carried.add_assign(c);
-        }
-        for (id, c) in &ledger.restored_during_scrape {
-            if !live_ids.contains(id) {
+        for (&id, entry) in &ledger.pending {
+            if let Some(c) = &entry.contrib {
                 carried.add_assign(c);
+                let st_entry = ledger.stores.entry(id).or_default();
+                st_entry.seen_under_other = st_entry.seen_under_other.max_with(c);
+            }
+        }
+        for (&id, c) in &ledger.restored_during_scrape {
+            if !live_ids.contains(&id)
+                && !ledger.pending.contains_key(&id)
+                && !ledger.retired_ids.contains(&id)
+            {
+                carried.add_assign(c);
+                let st_entry = ledger.stores.entry(id).or_default();
+                st_entry.seen_under_other = st_entry.seen_under_other.max_with(c);
             }
         }
         if carried.any() || st.metrics.has_other_slot() {
