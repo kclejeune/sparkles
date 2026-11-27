@@ -859,18 +859,36 @@ fn diagnose_impl(
     } else {
         opts
     };
-    if let Some(held) = report_held {
-        held.borrow_mut().try_grow(
+    let checks = select_checks(&opts.checks)
+        .map_err(|bad| anyhow::anyhow!("unknown diagnostics check '{bad}'"))?;
+    // The report's fixed part is charged like a finding. A refusal of the shared
+    // server memory fails the report, and a refusal of its own limit leaves every
+    // check with an error, so the report is incomplete rather than absent.
+    let mut scaffold_error = None;
+    if let Some(held) = report_held
+        && let Err(e) = held.borrow_mut().try_grow(
             4096 + opts.graphs.iter().map(|g| g.len() * 2 + 32).sum::<usize>()
                 + opts
                     .prefixes
                     .iter()
                     .map(|(p, v)| p.len() + v.len() + 128)
                     .sum::<usize>(),
-        )?;
+        )
+    {
+        match (&e, e.core_error()) {
+            (crate::budget::BudgetFailure::Local(_), _) => scaffold_error = Some(e.to_string()),
+            (
+                _,
+                Some(
+                    error @ Error::BudgetExceeded(sparkles_core::Budget {
+                        kind: sparkles_core::BudgetKind::Memory,
+                        ..
+                    }),
+                ),
+            ) => scaffold_error = Some(error.to_string()),
+            _ => return Err(e.into()),
+        }
     }
-    let checks = select_checks(&opts.checks)
-        .map_err(|bad| anyhow::anyhow!("unknown diagnostics check '{bad}'"))?;
     let limit = opts.limit.clamp(1, MAX_LIMIT);
     let relative = opts
         .timeout
@@ -905,6 +923,12 @@ fn diagnose_impl(
             millis: 0,
             error: None,
         };
+        if let Some(error) = &scaffold_error {
+            out.status = CheckStatus::Error;
+            out.error = Some(error.clone());
+            outcomes.push(out);
+            continue;
+        }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             out.status = CheckStatus::Timeout;
             outcomes.push(out);
