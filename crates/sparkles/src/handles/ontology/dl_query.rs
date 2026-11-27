@@ -45,8 +45,9 @@ use super::classify::{Working, admit, logical_axioms, saturate, working};
 use super::{Ontologies, OntologyRequest, Opened, check};
 use crate::Dataset;
 use crate::error::{Error, Result};
-use crate::reasoning::{Demand, ReasoningMode};
+use crate::reasoning::{Demand, ReasoningMode, memory::Memory};
 use crate::sparql::QueryOptions;
+use crate::store::Snapshot;
 use oxrdf::{GraphName, Term};
 use sparkles_core::algo::pool::Par;
 use sparkles_owl::classify::{Changes, Description, Excluded, Gap, Saturation};
@@ -278,6 +279,30 @@ pub struct DlQueryAnswer {
     pub opened: Opened,
 }
 
+/// A DL answer that holds its request memory credit. Clones share the answer's
+/// backing and credit. Its fields can be borrowed through this handle.
+#[derive(Clone)]
+pub struct AdmittedDlQueryAnswer(Arc<DlQueryBacking>);
+
+struct DlQueryBacking {
+    value: DlQueryAnswer,
+    _memory: [Option<Memory>; 2],
+}
+
+impl AdmittedDlQueryAnswer {
+    fn into_value(self) -> DlQueryAnswer {
+        Arc::into_inner(self.0).expect("unshared DL answer").value
+    }
+}
+
+impl std::ops::Deref for AdmittedDlQueryAnswer {
+    type Target = DlQueryAnswer;
+
+    fn deref(&self) -> &DlQueryAnswer {
+        &self.0.value
+    }
+}
+
 /// The query's defining axiom.
 fn defining(e: &ClassExpression) -> Axiom {
     Axiom::equivalent_classes([Class::new(QUERY_CLASS).into(), e.clone()])
@@ -408,13 +433,25 @@ impl Ontologies {
 
     /// Answer a DL query over the ontology `req` names (spec U12): the equivalent
     /// classes, the superclasses and subclasses and the instances of `q.expression`, as
-    /// the [module documentation](self) describes.
+    /// the [module documentation](self) describes. The returned value is owned by
+    /// the application. Use [Self::dl_query_admitted] to retain the answer credit.
     pub fn dl_query(
         &self,
         req: &OntologyRequest,
         q: &DlQueryRequest,
         opts: &QueryOptions,
     ) -> Result<DlQueryAnswer> {
+        self.dl_query_admitted(req, q, opts)
+            .map(AdmittedDlQueryAnswer::into_value)
+    }
+
+    /// Answer a DL query while retaining credit for the answer's owned data.
+    pub fn dl_query_admitted(
+        &self,
+        req: &OntologyRequest,
+        q: &DlQueryRequest,
+        opts: &QueryOptions,
+    ) -> Result<AdmittedDlQueryAnswer> {
         req.validate()?;
         if req.inferences {
             return Err(Error::invalid(
@@ -423,11 +460,12 @@ impl Ontologies {
         }
         let opts = self.anchored(opts)?;
         let o = self.open(req, &opts)?;
-        self.dl_query_opened(o, req, q, &opts)
+        self.dl_query_opened_admitted(o, req, q, &opts)
     }
 
     /// [`dl_query`](Self::dl_query) over an ontology the caller opened with `req` and
-    /// `opts`, such as one it read the expression against.
+    /// `opts`, such as one it read the expression against. The returned value
+    /// is owned by the application.
     pub fn dl_query_opened(
         &self,
         o: Opened,
@@ -435,6 +473,18 @@ impl Ontologies {
         q: &DlQueryRequest,
         opts: &QueryOptions,
     ) -> Result<DlQueryAnswer> {
+        self.dl_query_opened_admitted(o, req, q, opts)
+            .map(AdmittedDlQueryAnswer::into_value)
+    }
+
+    /// Answer over a previously opened ontology while retaining the answer credit.
+    pub fn dl_query_opened_admitted(
+        &self,
+        o: Opened,
+        req: &OntologyRequest,
+        q: &DlQueryRequest,
+        opts: &QueryOptions,
+    ) -> Result<AdmittedDlQueryAnswer> {
         let start = Instant::now();
         let defaults = self.ds.with_query_defaults(opts);
         let opts = defaults.as_ref();
@@ -545,8 +595,8 @@ impl Ontologies {
             DlEngine::El => self.el(&o, req, q, &ax, why, &opts)?,
             DlEngine::Rl => rl(o, q, &ax, why, &opts)?,
         };
-        a.elapsed = start.elapsed();
-        Ok(a)
+        a.value.elapsed = start.elapsed();
+        Ok(AdmittedDlQueryAnswer(Arc::new(a)))
     }
 
     fn el(
@@ -557,7 +607,7 @@ impl Ontologies {
         ax: &Axiom,
         why: String,
         opts: &QueryOptions,
-    ) -> Result<DlQueryAnswer> {
+    ) -> Result<DlQueryBacking> {
         use super::classify::{copy_excluded, stage_assertion, stage_axioms};
         let expression_bytes = 1024
             + why.len()
@@ -768,11 +818,13 @@ impl Ontologies {
                 answer.reasoning.complete = excluded.is_empty();
             }
         }
-        answer.opened.answer_memory = Some(Arc::new([
-            work.lock().split(retained as u64)?,
-            expression_memory,
-        ]));
-        Ok(answer)
+        Ok(DlQueryBacking {
+            value: answer,
+            _memory: [
+                Some(work.lock().split(retained as u64)?),
+                Some(expression_memory),
+            ],
+        })
     }
 }
 
@@ -831,7 +883,7 @@ fn rl(
     ax: &Axiom,
     why: String,
     opts: &QueryOptions,
-) -> Result<DlQueryAnswer> {
+) -> Result<DlQueryBacking> {
     let work = working(opts, &o);
     let (count, bytes) = write::axiom_projection_cost(ax);
     work.lock().grow((2048 + count * 256 + bytes * 4) as u64)?;
@@ -870,6 +922,8 @@ fn rl(
     qo.cancellation = opts.cancellation.clone();
     qo.grant = opts.grant.clone();
     qo.pool = opts.pool.clone();
+    qo.no_cache = true;
+    let snapshot = private_rl_snapshot(&mem);
 
     let rdfs = sparkles_owl::vocab::RDFS_SUB_CLASS_OF;
     let nothing = sparkles_owl::vocab::OWL_NOTHING;
@@ -888,7 +942,7 @@ fn rl(
             (format!("?c <{rdfs}> <{QUERY_CLASS}>"), &mut subs),
         ] {
             rl_select(
-                &mem,
+                &snapshot,
                 &qo,
                 &work,
                 &format!("SELECT DISTINCT ?c WHERE {{ {pattern} }}"),
@@ -935,7 +989,7 @@ fn rl(
     if a.instances {
         let mut values = Vec::new();
         rl_select(
-            &mem,
+            &snapshot,
             &qo,
             &work,
             &format!("SELECT DISTINCT ?x WHERE {{ ?x a <{QUERY_CLASS}> }}"),
@@ -955,12 +1009,12 @@ fn rl(
     let (gaps, instances_complete, gap_bytes) = rl_gaps(&o, q, &work, opts)?;
     retained += gap_bytes;
     let direct_supers = if a.direct_superclasses {
-        Some(rl_direct(&mem, &qo, &work, &strict_supers, true)?)
+        Some(rl_direct(&snapshot, &qo, &work, &strict_supers, true)?)
     } else {
         None
     };
     let direct_subs = if a.direct_subclasses {
-        Some(rl_direct(&mem, &qo, &work, &strict_subs, false)?)
+        Some(rl_direct(&snapshot, &qo, &work, &strict_subs, false)?)
     } else {
         None
     };
@@ -985,10 +1039,8 @@ fn rl(
         "the OWL 2 RL rules derive subsumptions between classes only in part, so the class answers can miss entailed ones".to_string(),
         "OWL 2 RL cannot tell whether the expression is satisfiable or the ontology consistent".to_string(),
     ];
-    let mut opened = o;
-    opened.answer_memory = Some(Arc::new([work.lock().split(retained)?]));
-    Ok(DlQueryAnswer {
-        opened,
+    let value = DlQueryAnswer {
+        opened: o,
         expression: q.expression.clone(),
         reasoning: DlReasoningUsed {
             engine: DlEngine::Rl,
@@ -1009,11 +1061,23 @@ fn rl(
         instances,
         incremental: false,
         elapsed: Duration::ZERO,
+    };
+    Ok(DlQueryBacking {
+        value,
+        _memory: [Some(work.lock().split(retained)?), None],
     })
 }
 
+fn private_rl_snapshot(dataset: &Dataset) -> Arc<Snapshot> {
+    // The private generation dies with the DL query, so no schema publication
+    // can be reused. Exclude it from demand caches before session construction.
+    let mut snapshot = dataset.store().snapshot();
+    Arc::make_mut(&mut snapshot).cacheable = false;
+    snapshot
+}
+
 fn rl_select(
-    dataset: &Dataset,
+    snapshot: &Arc<Snapshot>,
     opts: &QueryOptions,
     work: &Working,
     sparql: &str,
@@ -1023,7 +1087,7 @@ fn rl_select(
         max_memory_bytes: work.lock().remaining(),
         ..opts.clone()
     };
-    let result = dataset.query_with(sparql, &opts)?;
+    let result = crate::sparql::query(snapshot.clone(), sparql, &opts)?;
     let rows = result.rows()?;
     let overlap = result.live_memory_bytes();
     for i in 0..rows.len() {
@@ -1041,7 +1105,7 @@ fn named_iri(term: Option<&Term>) -> Option<&str> {
 }
 
 fn rl_direct<'a>(
-    dataset: &Dataset,
+    snapshot: &Arc<Snapshot>,
     opts: &QueryOptions,
     work: &Working,
     classes: &[&'a str],
@@ -1061,7 +1125,7 @@ fn rl_direct<'a>(
     let rdfs = sparkles_owl::vocab::RDFS_SUB_CLASS_OF;
     let mut pairs = BTreeSet::new();
     rl_select(
-        dataset,
+        snapshot,
         opts,
         work,
         &format!(

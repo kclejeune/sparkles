@@ -243,13 +243,22 @@ state for the next run. Regression tests hold a live query result, a reasoning r
 and a view together under one pool ceiling and check exact credit return on completion,
 refusal, cancellation and unwind.
 
-Ontology reads admit parser expansion and streamed assertions. Kept classification
-uses credit already backing the previous saturation when it applies edits. Shared
-classification payloads and DL query answers retain their credit for their lifetimes.
-OWL 2 RL queries give nested SELECTs the remaining request allowance while the private
-store and any earlier answer data are live. Runtime checkpoints return scratch credit
-after their guards are released. WAL replay accounts for the overlap of growing tables
-and the conversion to materialization changes.
+Ontology reads admit parser expansion and streamed assertions, and release parser
+scratch before handing off the finished ontology. Kept classification uses credit
+already backing the previous saturation when it applies edits. Shared classification
+payloads retain their credit, including the incomplete-class list. OWL 2 RL queries
+give nested SELECTs the remaining request allowance while the private store and any
+earlier answer data are live. The private snapshot skips demand cache publication.
+An import fetch reserves its report entry before a LOAD can commit, and the dataset's
+reasoning record keeps the credit for its fetch warnings. Runtime
+checkpoints return scratch credit after their guards are released. WAL replay accounts
+for the overlap of growing tables and the conversion to materialization changes.
+
+In Rust, `Opened::ontology` uses `Arc<SharedOntology>` and `Classified::excluded` uses
+`Arc<ClassifiedExclusions>`. These handles preserve credit through detached clones and
+borrow the original ontology and exclusion vector through `AsRef`. The admitted diff
+and DL query methods return `AdmittedEntailmentDiff` and `AdmittedDlQueryAnswer`.
+Their plain value APIs transfer ownership to the application, as does `fetch_imports`.
 
 Items 678 and 1069 have shipped. The string floors of `string_order_mask` read their keys
 and search for a string's first extension inside the decoding envelope, and a refused

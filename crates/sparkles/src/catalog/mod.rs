@@ -437,7 +437,7 @@ impl Catalog {
             }
             let ds = catalog.open_dataset(&e.name, e.kind, None)?;
             if ds.reasoning_record().is_none() {
-                *ds.state().reasoning.write() = e.reasoning;
+                ds.state().restore_reasoning(e.reasoning);
             }
             catalog.inner.entries.write().insert(
                 e.name,
@@ -513,7 +513,7 @@ impl Catalog {
                     .get(name)
                     .and_then(|d| d.reasoning.clone());
                 if ds.reasoning_record().is_none() {
-                    *ds.state().reasoning.write() = reasoning;
+                    ds.state().restore_reasoning(reasoning);
                 }
                 self.publish_reattached(name, ds);
                 Ok(())
@@ -1628,7 +1628,7 @@ impl Catalog {
             ..self.dataset_options(name)
         };
         let ds = Dataset::from_store_with(store, opts);
-        *ds.state().reasoning.write() = reasoning;
+        ds.state().restore_reasoning(reasoning);
         self.inner.entries.write().insert(
             name.into(),
             Entry {

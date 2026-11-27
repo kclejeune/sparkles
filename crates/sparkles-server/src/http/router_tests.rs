@@ -465,12 +465,13 @@ async fn shacl_with_inferences() {
     )
     .unwrap();
     assert!(rep.inferred > 0);
-    *ds.reasoning.write() = Some(crate::reasoning::recorded(
+    ds.set_reasoning(Some(crate::reasoning::recorded(
         &sparkles_reasoner::Profile::Rdfs,
         &Default::default(),
         &rep,
         &ds.store,
-    ));
+    )))
+    .unwrap();
 
     // data ∪ inferred by default
     for q in ["", "?graph=default", "?reasoning=true", "?graph=union"] {

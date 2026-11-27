@@ -2082,3 +2082,69 @@ fn edited_kept_ontology_charges_only_incremental_saturation_growth() {
             .is_some()
     );
 }
+
+#[test]
+fn signature_wide_incomplete_list_is_owned_by_oneshot_and_evicted_publications() {
+    use sparkles_core::sparql::pool::QueryPool;
+    let pool = QueryPool::with_retained_capacity(128 << 20, 128 << 20).unwrap();
+    let ds = Dataset::from_store_with(
+        crate::store::Store::in_memory(Default::default()),
+        crate::DatasetOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        },
+    );
+    let mut data = String::from(":a a :C0 .");
+    for i in 0..96 {
+        data.push_str(&format!(" :C{i} a owl:Class ."));
+    }
+    ds.update(&format!("{BASE} INSERT DATA {{ {data} }}"))
+        .unwrap();
+    let handle = ds.ontology();
+
+    for keep in [false, true] {
+        let grant = Arc::new(pool.empty_grant());
+        let query = QueryOptions {
+            no_cache: !keep,
+            grant: (!keep).then(|| grant.clone()),
+            ..Default::default()
+        };
+        let answer = handle
+            .classify(&req(), &ClassifyRequest::default(), &query)
+            .unwrap();
+        let p = &answer.publication;
+        let classification = answer.classification.clone();
+        assert!(classification.incomplete.len() >= 96);
+        let noncoverage = size_of::<KeptClassification>()
+            + p.source.owned_bytes()
+            + sparkles_owl::classify::excluded_slice_copy_bytes(&p.excluded)
+            + super::super::classify::unmapped_bytes(&classification.unmapped)
+            + p.content_fingerprint.capacity()
+            + classification.stats.taxonomy_memory;
+        let minimum = (noncoverage + classification.incomplete_bytes()) as u64;
+        assert!(p._lease.as_ref().unwrap().bytes() >= minimum);
+        drop(answer);
+        if keep {
+            let retired = {
+                let mut cache = ds.state().classify_cache.lock();
+                let slot = cache.slot_mut(false);
+                assert_eq!(
+                    slot.entry.as_ref().unwrap().reused_credit() as usize,
+                    classification.stats.memory
+                        - classification.stats.taxonomy_memory
+                        - classification.incomplete_bytes(),
+                );
+                std::mem::take(slot)
+            };
+            drop(retired);
+            let ontologies = std::mem::take(&mut *ds.state().ontology_cache.lock());
+            drop(ontologies);
+            assert!(pool.domain_stats().retained_reserved >= minimum);
+        } else {
+            assert!(grant.used() >= minimum);
+        }
+        drop(classification);
+        assert_eq!(grant.used(), 0);
+        assert_eq!(pool.domain_stats().retained_reserved, 0);
+    }
+}

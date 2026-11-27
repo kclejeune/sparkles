@@ -47,7 +47,7 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri, p: &Principal) -> ApiResult<Req
     let graph = graph_param("graph")?.unwrap_or(GraphSelection::Default);
     let declared_graph = graph_param("declaredGraph")?;
     let reasoning = match params.get("reasoning") {
-        None => ds.reasoning.read().is_some(),
+        None => ds.read_reasoning().is_some(),
         Some("true") => true,
         Some("false") => false,
         Some(v) => return Err(bad(format!("reasoning must be true or false, not '{v}'"))),

@@ -62,7 +62,7 @@ impl Dataset {
         );
         if ds.store().root().is_none() {
             let source = upstream.as_ref().unwrap_or(self);
-            *ds.state().reasoning.write() = source.reasoning_record();
+            ds.state().restore_reasoning(source.reasoning_record());
             *ds.state().rdfs.write() = source.state().rdfs.read().as_ref().map(|r| {
                 std::sync::Arc::new(crate::sparql::rdfs::RdfsOnRead::new(r.source.clone()))
             });

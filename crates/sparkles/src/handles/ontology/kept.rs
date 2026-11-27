@@ -335,6 +335,7 @@ impl KeptClassification {
         let auxiliary_bytes = size_of::<Self>()
             .saturating_add(source.owned_bytes())
             .saturating_add(excluded_bytes)
+            .saturating_add(classification.incomplete_bytes())
             .saturating_add(super::classify::unmapped_bytes(&classification.unmapped))
             .saturating_add(content_fingerprint.capacity());
         let memory = working
@@ -532,6 +533,7 @@ pub(super) fn classification_retained_bytes(e: &CacheEntry, p: &KeptClassificati
     p.classification
         .stats
         .memory
+        .saturating_sub(p.classification.incomplete_bytes())
         .saturating_add(entry_aux_bytes(e))
         .saturating_add(p.auxiliary_bytes)
 }

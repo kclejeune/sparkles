@@ -788,7 +788,7 @@ fn btree_set_2<T: Ord>(a: T, b: T) -> BTreeSet<T> {
 /// removing one leaves 5 + 1 + 5 keys across 2 leaves and 1 internal root, a 3-node shape
 /// preserved by `clone()`. Only `len <= 10` is guaranteed to fit in a single leaf.
 #[inline]
-pub(super) fn btree_set_bytes<T>(len: usize) -> usize {
+pub(crate) fn btree_set_bytes<T>(len: usize) -> usize {
     if len == 0 {
         return 0;
     }
@@ -809,7 +809,7 @@ pub(super) fn btree_set_bytes<T>(len: usize) -> usize {
 /// Only `len <= 10` is guaranteed to occupy a single leaf; `len == 11` can retain a 3-node
 /// shape (5 + 1 + 5) after removal and across `clone()`.
 #[inline]
-fn btree_map_bytes<K, V>(len: usize) -> usize {
+pub(crate) fn btree_map_bytes<K, V>(len: usize) -> usize {
     if len == 0 {
         return 0;
     }

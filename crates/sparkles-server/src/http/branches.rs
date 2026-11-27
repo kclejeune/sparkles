@@ -1770,7 +1770,7 @@ async fn execute(
             dry_run::Request::for_write(st, headers, &params, dry, false, Some(p), &tds, &o.write)
         })
         .transpose()?;
-    let reasoned = tds.reasoning.read().is_some();
+    let reasoned = tds.read_reasoning().is_some();
     let d = ds.clone();
     let (op2, o2) = (op.clone(), o.clone());
     let t0 = std::time::Instant::now();

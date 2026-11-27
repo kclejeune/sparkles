@@ -3131,6 +3131,55 @@ mod equality_cache_tests {
         assert!(!explaining.cached_equality);
     }
 
+    #[test]
+    fn synthetic_rl_snapshot_derives_noncompact_schema_at_its_budget_without_publishing() {
+        let store = store(
+            "ex:A <http://www.w3.org/2000/01/rdf-schema#subClassOf> ex:C .
+             ex:a a ex:A . ex:intersection owl:intersectionOf (ex:A ex:C) .",
+        );
+        let reasoner =
+            QueryReasoner::new(Profile::OwlRl, &Extras::default(), Inputs::default()).unwrap();
+        let mut private = store.snapshot();
+        Arc::make_mut(&mut private).cacheable = false;
+        let open = |max_memory| {
+            Session::new(
+                reasoner.shared.clone(),
+                SessionRequest {
+                    snap: private.clone(),
+                    readable: None,
+                    stop: Arc::new(|| Ok(())),
+                    max_memory,
+                    memory_parent: None,
+                    no_cache: true,
+                },
+            )
+            .unwrap()
+        };
+        let mut baseline = open(None);
+        baseline.derive_all(&[types_of_c()]).unwrap();
+        assert!(baseline.pre.is_some());
+        assert!(holds(&baseline, "http://ex.org/a"));
+        let limit = baseline.budget.peak();
+        let mut bounded = open(Some(limit as u64));
+        bounded.derive_all(&[types_of_c()]).unwrap();
+        assert!(bounded.pre.is_some());
+        assert!(holds(&bounded, "http://ex.org/a"));
+        assert!(bounded.schema_view.is_none());
+        // The identical committed view would publish a schema table despite no_cache.
+        let cached = session(&reasoner, &store);
+        let key = tables::Key {
+            view: cached.schema_view.clone().unwrap(),
+            digest: reasoner.shared.digest,
+            demand: "schema".into(),
+            seeds: (0, 0),
+        };
+        assert!(!tables::peek(&key));
+        let mut cached = cached;
+        cached.derive_all(&[types_of_c()]).unwrap();
+        assert!(cached.pre.is_some());
+        assert!(tables::peek(&key));
+    }
+
     /// A session whose graph holds facts from outside the view, as a why-not hypothesis
     /// adds them, neither reads nor fills the equality table.
     #[test]

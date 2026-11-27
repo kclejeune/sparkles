@@ -65,7 +65,8 @@ impl Default for ReasonRequest {
     }
 }
 
-/// What a materialization did, and the record it left.
+/// What a materialization did, and the record it left. The application owns these
+/// values. The dataset keeps its own record and the credit for its import warnings.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ReasonOutcome {
@@ -88,9 +89,10 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     let state = ds.state();
     let store: &Store = &state.store;
     let cancel = ctl.cancel.flag();
-    let fetched_before: Vec<String> = ds
-        .reasoning_record()
-        .map(|r| r.fetched_imports)
+    let fetched_before: Vec<String> = state
+        .read_reasoning()
+        .as_ref()
+        .map(|r| r.fetched_imports.clone())
         .unwrap_or_default();
     let mut fetched = fetched_before.clone();
     let mut fetch_warnings = Vec::new();
@@ -132,21 +134,22 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             p.report(f, msg);
         })
     };
+    let max_memory = req.max_memory.map(|limit| {
+        limit.saturating_sub(fetch_memory.as_ref().map_or(0, |memory| memory.bytes()))
+    });
     let opts = sparkles_reasoner::ReasonOptions {
         progress: Some(progress),
         cancel: Some(cancel),
         inputs: req.inputs.clone(),
         threads: req.threads,
-        max_memory: req.max_memory.map(|limit| {
-            limit.saturating_sub(fetch_memory.as_ref().map_or(0, |memory| memory.bytes()))
-        }),
+        max_memory,
         memory_parent: state.pool.as_ref().map(|p| p.work_parent()),
         max_inferred: req
             .max_inferred
             .unwrap_or(sparkles_reasoner::DEFAULT_MAX_INFERRED),
         pool: super::reason_pool(),
         // the input graphs' axioms outside OWL 2 RL, in the state the run reads
-        inspect: rl_inspector(ds, req, ctl),
+        inspect: rl_inspector(ds, req, ctl, max_memory),
         ..Default::default()
     };
     let superseded = AtomicBool::new(false);
@@ -174,7 +177,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             });
         }
         let since = if req.incremental {
-            incremental_since(ds.reasoning_record().as_ref(), store)
+            incremental_since(state.read_reasoning().as_ref(), store)
         } else {
             None
         };
@@ -208,8 +211,13 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     record_inputs(&mut record, &req.inputs, &report, fetched);
     record.warnings.splice(0..0, fetch_warnings);
     // a run keeps the dataset's automatic re-run setting
-    record.auto = ds.reasoning_record().and_then(|r| r.auto);
-    state.set_reasoning(Some(record.clone()))?;
+    record.auto = state.read_reasoning().as_ref().and_then(|r| r.auto.clone());
+    let retained_record = record.clone();
+    let retained_memory = fetch_memory
+        .as_mut()
+        .filter(|memory| memory.bytes() != 0)
+        .map(|memory| memory.split_copy());
+    state.set_reasoning_admitted(retained_record, retained_memory)?;
     ctl.progress.report(1.0, "materialized");
     Ok(ReasonOutcome { report, record })
 }
@@ -221,13 +229,14 @@ fn rl_inspector(
     ds: &Dataset,
     req: &ReasonRequest,
     ctl: &Control,
+    max_memory: Option<usize>,
 ) -> Option<sparkles_reasoner::InspectFn> {
     #[cfg(feature = "ontology")]
     if req.profile == Profile::OwlRl {
         let opts = QueryOptions {
             cancel: Some(ctl.cancel.flag()),
             deadline: ctl.deadline,
-            max_memory_bytes: req.max_memory.map(|bytes| bytes as u64),
+            max_memory_bytes: max_memory.map(|bytes| bytes as u64),
             pool: ds.pool().cloned(),
             ..Default::default()
         };
@@ -237,7 +246,7 @@ fn rl_inspector(
             opts,
         ));
     }
-    let _ = (ds, req, ctl);
+    let _ = (ds, req, ctl, max_memory);
     None
 }
 

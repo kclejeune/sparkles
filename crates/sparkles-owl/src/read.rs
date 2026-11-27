@@ -444,6 +444,89 @@ pub struct Ontology {
 }
 
 impl Ontology {
+    /// Estimate the backing that survives parsing, without visiting parser indexes
+    /// and memo copies. This is used when handing off the admission for a read.
+    #[doc(hidden)]
+    pub fn retained_bytes(&self) -> usize {
+        use crate::classify::{axiom_copy_bytes, btree_map_bytes};
+        use sparkles_budget::sizes::table_bytes_for;
+
+        fn annotation_bytes(set: &BTreeSet<Annotation>) -> usize {
+            crate::classify::btree_set_bytes::<Annotation>(set.len())
+                + set
+                    .iter()
+                    .map(|a| {
+                        let value = match &a.value {
+                            AnnotationValue::Iri(i) => i.as_str().len(),
+                            AnnotationValue::Literal(l) => literal_payload(&l.0),
+                            AnnotationValue::Anonymous(b) => b.0.capacity(),
+                        };
+                        a.property.as_str().len() + value + annotation_bytes(&a.annotations)
+                    })
+                    .sum::<usize>()
+        }
+
+        fn header_bytes(header: &Header) -> usize {
+            header
+                .iri
+                .iter()
+                .chain(&header.version_iri)
+                .chain(&header.imports)
+                .map(|iri| iri.as_str().len())
+                .sum::<usize>()
+                + crate::classify::btree_set_bytes::<Iri>(header.imports.len())
+                + annotation_bytes(&header.annotations)
+        }
+
+        fn typing_bytes(typing: &FxHashMap<String, Kinds>) -> usize {
+            table_bytes_for::<(String, Kinds)>(typing.capacity())
+                + typing.keys().map(String::capacity).sum::<usize>()
+        }
+
+        size_of::<Self>()
+            + header_bytes(&self.header)
+            + self.other_headers.capacity() * size_of::<(u32, Header)>()
+            + self
+                .other_headers
+                .iter()
+                .map(|(_, h)| header_bytes(h))
+                .sum::<usize>()
+            + btree_map_bytes::<Axiom, Vec<Origin>>(self.axioms.len())
+            + self
+                .axioms
+                .iter()
+                .map(|(axiom, origins)| {
+                    axiom_copy_bytes(&axiom.kind) - size_of::<Axiom>()
+                        + annotation_bytes(&axiom.annotations)
+                        + origins.capacity() * size_of::<Origin>()
+                        + origins
+                            .iter()
+                            .map(|o| o.triples.capacity() * size_of::<usize>())
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+            + self.triples.capacity() * size_of::<Triple>()
+            + self.triples.iter().map(triple_payload).sum::<usize>()
+            + self.graph_of.capacity() * size_of::<u32>()
+            + self.unmapped.capacity() * size_of::<usize>()
+            + self.diagnostics.capacity() * size_of::<Diagnostic>()
+            + self
+                .diagnostics
+                .iter()
+                .map(|d| d.message.capacity() + d.triples.capacity() * size_of::<usize>())
+                .sum::<usize>()
+            + typing_bytes(&self.typing.declared)
+            + typing_bytes(&self.typing.inferred)
+            + table_bytes_for::<BlankNode>(self.reification_nodes.capacity())
+            + self
+                .reification_nodes
+                .iter()
+                .map(|b| b.as_str().len())
+                .sum::<usize>()
+            + table_bytes_for::<Key>(self.ontology_nodes.capacity())
+            + self.ontology_nodes.iter().map(key_payload).sum::<usize>()
+    }
+
     /// The ontology of axioms that a structural syntax gives, as the functional-style
     /// syntax does, read as one graph: the header in graph 0, each axiom once with an
     /// origin that names no triple, and the declared typing. A read of the same axioms
@@ -825,11 +908,7 @@ fn term_payload(mut term: &Term) -> usize {
         let bytes = match term {
             Term::NamedNode(iri) => iri.as_str().len(),
             Term::BlankNode(node) => node.as_str().len(),
-            Term::Literal(lit) => {
-                lit.value().len()
-                    + lit.datatype().as_str().len()
-                    + lit.language().map_or(0, str::len)
-            }
+            Term::Literal(lit) => literal_payload(lit),
             Term::Triple(triple) => {
                 nested = nested.saturating_add(size_of::<Triple>() + triple_head_payload(triple));
                 term = &triple.object;
@@ -840,12 +919,19 @@ fn term_payload(mut term: &Term) -> usize {
     }
 }
 
+fn literal_payload(lit: &oxrdf::Literal) -> usize {
+    lit.value().len() + lit.datatype().as_str().len() + lit.language().map_or(0, str::len)
+}
+
+fn key_payload(key: &Key) -> usize {
+    match key {
+        NamedOrBlankNode::NamedNode(iri) => iri.as_str().len(),
+        NamedOrBlankNode::BlankNode(node) => node.as_str().len(),
+    }
+}
+
 fn triple_head_payload(triple: &Triple) -> usize {
-    let subject = match &triple.subject {
-        NamedOrBlankNode::NamedNode(iri) => iri.as_str(),
-        NamedOrBlankNode::BlankNode(node) => node.as_str(),
-    };
-    subject.len() + triple.predicate.as_str().len()
+    key_payload(&triple.subject) + triple.predicate.as_str().len()
 }
 
 #[doc(hidden)]
@@ -2015,7 +2101,9 @@ impl<'a> Parser<'a> {
                 let Term::NamedNode(y) = y else {
                     return None;
                 };
-                if !self.typing.is(y.as_str(), EntityKind::ObjectProperty) || !self.check_shared(b)
+                if !self.typing.is(y.as_str(), EntityKind::ObjectProperty)
+                    || !self.admit(y.as_str().len() + size_of::<usize>())
+                    || !self.check_shared(b)
                 {
                     return None;
                 }
@@ -2191,7 +2279,9 @@ impl<'a> Parser<'a> {
             [v::OWL_ON_DATATYPE] => {
                 let (i, d) = self.one(&k, v::OWL_ON_DATATYPE)?;
                 let Term::NamedNode(d) = d else { return None };
-                if !self.typing.is(d.as_str(), EntityKind::Datatype) {
+                if !self.typing.is(d.as_str(), EntityKind::Datatype)
+                    || !self.admit(d.as_str().len())
+                {
                     return None;
                 }
                 let d = d.clone();
@@ -2206,12 +2296,14 @@ impl<'a> Parser<'a> {
                         return None;
                     };
                     let zk: Key = z.clone().into();
-                    let zs = self.about(&zk).to_vec();
-                    let [zi] = zs.as_slice() else { return None };
+                    let [zi] = self.about(&zk) else { return None };
                     let zt = &self.t[*zi];
                     let Term::Literal(lit) = &zt.object else {
                         return None;
                     };
+                    if !self.admit(zt.predicate.as_str().len() + term_payload(&zt.object)) {
+                        return None;
+                    }
                     triples.push(*zi);
                     facets.insert(FacetRestriction {
                         facet: zt.predicate.clone(),
@@ -3021,6 +3113,9 @@ impl<'a> Parser<'a> {
             }
         }
         for (ti, x) in nodes {
+            if self.refused.get() {
+                return;
+            }
             let xk: Key = x.clone().into();
             let (Some((si, s)), Some((pi, Term::NamedNode(p))), Some((oi, o))) = (
                 self.one(&xk, v::OWL_ANNOTATED_SOURCE),
@@ -3081,6 +3176,9 @@ impl<'a> Parser<'a> {
             }
         }
         for (ti, x, ty) in nodes {
+            if self.refused.get() {
+                return;
+            }
             if self.used[ti] {
                 continue;
             }
@@ -3227,6 +3325,9 @@ impl<'a> Parser<'a> {
         let mut subjects: Vec<Key> = self.ann_triples.keys().cloned().collect();
         subjects.sort_by_cached_key(|k| k.to_string());
         for x in subjects {
+            if self.refused.get() {
+                return;
+            }
             if self.onodes.contains(&x) {
                 continue;
             }

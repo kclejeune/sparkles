@@ -215,7 +215,6 @@ pub struct Opened {
     pub inferences: Option<Inferences>,
     inner: Arc<Inner>,
     request_bytes: u64,
-    answer_memory: Option<Arc<[crate::reasoning::memory::Memory]>>,
 }
 
 /// The materialized inferences an open ontology read (spec F21 §7): the profile of the
@@ -1409,7 +1408,6 @@ impl Ontologies {
                     inferences: None,
                     inner: e.inner.clone(),
                     request_bytes: 0,
-                    answer_memory: None,
                 };
                 cache.push(e);
                 drop(cache);
@@ -1503,7 +1501,6 @@ impl Ontologies {
             inferences: None,
             inner,
             request_bytes,
-            answer_memory: None,
         };
         opened.inferences = self.inferences(&opened, record.as_ref());
         Ok(opened)
@@ -2258,6 +2255,7 @@ fn read_store(
     memory: Option<&mut crate::reasoning::memory::Memory>,
 ) -> Result<(read::Ontology, Inner)> {
     let mut memory = memory;
+    let base = memory.as_ref().map_or(0, |memory| memory.bytes());
     if let Some(memory) = &mut memory {
         memory.grow((graph_ids.len() * 128 + 8192) as u64)?;
     }
@@ -2272,7 +2270,7 @@ fn read_store(
         quads: Vec::new(),
         seen: FxHashSet::default(),
         opts,
-        memory,
+        memory: memory.as_deref_mut(),
     };
     let mut terminological: FxHashSet<Id> = FxHashSet::default();
     let mut class_nodes: FxHashSet<Id> = FxHashSet::default();
@@ -2359,12 +2357,27 @@ fn read_store(
             }
         }
     }
-    c.finish(
+    let (ontology, inner) = c.finish(
         graph_ids.len(),
         requested,
         mode,
         (terminological, mains, class_nodes),
-    )
+    )?;
+    drop(graph_of_id);
+    if let Some(memory) = memory {
+        use sparkles_budget::sizes::table_bytes_for;
+        let retained = ontology.retained_bytes()
+            + size_of::<Inner>()
+            + inner.quads.capacity() * size_of::<[Id; 4]>()
+            + inner.graph_ids.capacity() * size_of::<Option<Id>>()
+            + table_bytes_for::<Id>(inner.terminological.capacity())
+            + table_bytes_for::<[Id; 4]>(inner.mains.capacity())
+            + table_bytes_for::<Id>(inner.class_nodes.capacity());
+        let target = base.saturating_add(retained as u64);
+        memory.cover(target)?;
+        memory.shrink_to(target);
+    }
+    Ok((ontology, inner))
 }
 
 /// The quads of the graphs read that POS prefixes select, each once.

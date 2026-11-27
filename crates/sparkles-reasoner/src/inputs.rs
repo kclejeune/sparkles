@@ -1690,6 +1690,8 @@ fn fetchable(location: &str) -> bool {
 /// outbound policy, the file-load rules, the timeouts and the response ceiling of `opts`
 /// apply, and all the fetches share one request budget. A refused destination, a spent
 /// budget, a timeout or a cancellation fails the call; another failure is a warning.
+/// The returned report is owned by the application. Use [`fetch_imports_admitted`]
+/// when an engine operation holds the report while doing additional budgeted work.
 pub fn fetch_imports(
     store: &Store,
     inputs: &Inputs,
@@ -1699,25 +1701,51 @@ pub fn fetch_imports(
     fetch_imports_admitted(store, inputs, refresh, opts).map(|(fetched, _)| fetched)
 }
 
-/// Live credit for the strings in a fetch report.
-#[doc(hidden)]
+/// Live credit for the strings in a fetch report and one copy for a reasoning record.
 #[derive(Debug)]
 pub struct FetchMemory(Held);
 
 impl FetchMemory {
+    fn new(mut held: Held) -> Self {
+        // Keep only the live report credit and return the holder's unused step.
+        let bytes = held.bytes();
+        Self(held.split(bytes))
+    }
+
     pub fn bytes(&self) -> usize {
         self.0.bytes()
     }
+
+    /// Move one copy of the report credit to the dataset record.
+    #[doc(hidden)]
+    pub fn split_copy(&mut self) -> Self {
+        Self(self.0.split(self.0.bytes() / 2))
+    }
 }
 
-/// Fetch imports and return the report's credit separately so a caller can
-/// transfer the strings into a larger report while preserving their credit.
-#[doc(hidden)]
+/// Fetch imports and return their report with the credit for its backing.
+/// Hold the credit while using the report or moving its strings into an engine-owned record.
 pub fn fetch_imports_admitted(
     store: &Store,
     inputs: &Inputs,
     refresh: &[String],
     opts: &sparkles_core::sparql::QueryOptions,
+) -> anyhow::Result<(Fetched, FetchMemory)> {
+    fetch_imports_with_load(store, inputs, refresh, opts, |store, update, opts| {
+        sparkles_core::sparql::update::update(store, update, opts).map(|_| ())
+    })
+}
+
+fn fetch_imports_with_load(
+    store: &Store,
+    inputs: &Inputs,
+    refresh: &[String],
+    opts: &sparkles_core::sparql::QueryOptions,
+    mut execute: impl FnMut(
+        &Store,
+        &str,
+        &sparkles_core::sparql::QueryOptions,
+    ) -> sparkles_core::Result<()>,
 ) -> anyhow::Result<(Fetched, FetchMemory)> {
     let parent = opts
         .grant
@@ -1735,7 +1763,7 @@ pub fn fetch_imports_admitted(
                 format_args!("imports are fetched only with imports: fetch; nothing was refreshed"),
             )?;
         }
-        return Ok((out, FetchMemory(report)));
+        return Ok((out, FetchMemory::new(report)));
     }
     let mut opts = opts.clone();
     opts.outbound_budget = Some(sparkles_core::outbound::RequestBudget::new(&opts.outbound));
@@ -1785,6 +1813,10 @@ pub fn fetch_imports_admitted(
             )?;
             return Ok(true);
         }
+        // LOAD commits independently. Reserve the successful report entry and
+        // its record copy while failure can still leave the graph untouched.
+        let success = Held::try_new_exact(&budget, iri.len().saturating_mul(2) + 128)
+            .map_err(|e| crate::query::memory_error(e, "keeping fetched imports"))?;
         let u = if replace {
             format!("DROP SILENT GRAPH <{iri}> ; LOAD <{location}> INTO GRAPH <{iri}>")
         } else {
@@ -1794,22 +1826,24 @@ pub fn fetch_imports_admitted(
             max_memory_bytes: opts.max_memory_bytes.map(|_| budget.available() as u64),
             ..opts.clone()
         };
-        match sparkles_core::sparql::update::update(store, &u, &load_opts) {
-            Ok(_) => {
+        let error = match execute(store, &u, &load_opts) {
+            Ok(()) => {
                 tracing::info!(import = iri, location, "fetched an import");
-                report
-                    .try_grow(iri.len() + 128)
-                    .map_err(|e| crate::query::memory_error(e, "keeping fetched imports"))?;
+                report.absorb(success);
                 out.fetched.push(iri.to_string());
-                Ok(true)
+                return Ok(true);
             }
-            Err(
-                e @ (sparkles_core::Error::NotPermitted(_)
-                | sparkles_core::Error::BudgetExceeded(_)
-                | sparkles_core::Error::Timeout
-                | sparkles_core::Error::Cancelled),
-            ) => Err(anyhow::Error::new(e).context(format!("fetching owl:imports <{iri}>"))),
-            Err(e) => {
+            Err(error) => error,
+        };
+        drop(success);
+        match error {
+            e @ (sparkles_core::Error::NotPermitted(_)
+            | sparkles_core::Error::BudgetExceeded(_)
+            | sparkles_core::Error::Timeout
+            | sparkles_core::Error::Cancelled) => {
+                Err(anyhow::Error::new(e).context(format!("fetching owl:imports <{iri}>")))
+            }
+            e => {
                 push_fetch_warning(
                     out,
                     &mut report,
@@ -1868,7 +1902,7 @@ pub fn fetch_imports_admitted(
             )?;
         }
         if !tried {
-            return Ok((out, FetchMemory(report)));
+            return Ok((out, FetchMemory::new(report)));
         }
     }
 }
@@ -1884,6 +1918,90 @@ fn import_discovery_error(error: anyhow::Error) -> anyhow::Error {
 mod controlled_budget_tests {
     use super::*;
     use crate::budget::{Budget, BudgetFailure, Held, WorkingWarnings, table_bytes};
+
+    #[test]
+    fn fetched_name_can_refuse_before_load_and_is_available_to_refresh_after_success() {
+        use sparkles_core::{sparql::QueryOptions, store::StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let iri = format!("urn:import:{}", "x".repeat(8192));
+        let seed = format!(
+            "INSERT DATA {{ <urn:source> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+        );
+        sparkles_core::sparql::update::update(&store, &seed, &QueryOptions::default()).unwrap();
+        let start = store.snapshot().commit;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("import.ttl");
+        std::fs::write(&path, "<urn:s> <urn:p> <urn:first> .").unwrap();
+        let mut inputs = Inputs {
+            imports: ImportMode::Fetch,
+            ..Default::default()
+        };
+        inputs
+            .location_mapping
+            .names
+            .insert(iri.clone(), format!("file://{}", path.display()));
+
+        // Find the first allowance reaching the commit-capable call. The callback
+        // has no side effects, so all probes operate on exactly the same state.
+        let probe = |limit| {
+            let mut called = false;
+            let error = fetch_imports_with_load(
+                &store,
+                &inputs,
+                &[],
+                &QueryOptions {
+                    max_memory_bytes: Some(limit),
+                    ..Default::default()
+                },
+                |_, _, _| {
+                    called = true;
+                    Err(sparkles_core::Error::Cancelled)
+                },
+            )
+            .unwrap_err();
+            (called, error)
+        };
+        let (mut low, mut high) = (0, 1 << 20);
+        assert!(probe(high).0);
+        while high - low > 1 {
+            let mid = (low + high) / 2;
+            if probe(mid).0 {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        let (called, error) = probe(low);
+        assert!(!called);
+        assert!(
+            format!("{error:#}").contains("keeping fetched imports"),
+            "{error:#}"
+        );
+        assert_eq!(store.snapshot().commit, start);
+        let (report, _) =
+            fetch_imports_admitted(&store, &inputs, &[], &QueryOptions::default()).unwrap();
+        assert_eq!(report.fetched, [iri.as_str()]);
+        assert!(store.snapshot().commit > start);
+
+        std::fs::write(path, "<urn:s> <urn:p> <urn:refreshed> .").unwrap();
+        let (refreshed, _) =
+            fetch_imports_admitted(&store, &inputs, &report.fetched, &QueryOptions::default())
+                .unwrap();
+        assert_eq!(refreshed.fetched, report.fetched);
+        let query = format!("SELECT ?o WHERE {{ GRAPH <{iri}> {{ <urn:s> <urn:p> ?o }} }}");
+        let result =
+            sparkles_core::sparql::query(store.snapshot(), &query, &QueryOptions::default())
+                .unwrap();
+        let rows = result.rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.row(0).unwrap().values()[0]
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            "<urn:refreshed>"
+        );
+    }
 
     #[test]
     fn insert_id_set_controlled_uses_hash_table_allocation_sizes() {

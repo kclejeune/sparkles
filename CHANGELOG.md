@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Hierarchical memory budgets for reasoning and views
+
+Reasoning, ontology reads and maintained views share the dataset's query memory pool.
+Retained ontology, classification and DL query results carry credit for as long as
+their admitted handles live.
+
+- **Rust compatibility.** `Opened::ontology` now uses `Arc<SharedOntology>`.
+  Borrow the original `read::Ontology` with `AsRef`. `Classified::excluded` now
+  uses `Arc<ClassifiedExclusions>`. Borrow the exclusions with `AsRef`.
+  The new types keep the credit through Arc clones. `AdmittedEntailmentDiff` and
+  `AdmittedDlQueryAnswer` provide shared ownership of admitted output. The existing
+  diff and DL query methods still return application-owned values.
+
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 
 Term and value decoding in SPARQL UPDATE, ARQ property functions, registered property and aggregate extensions, custom aggregates, hybrid search, history service, path search, vector top-k, remote SERVICE and LATERAL enhancers, GeoSPARQL planner rewrites and aggregates, planner range and lexical probes and RDFS schema and explanation decoding now uses checked decode helpers that enforce live cancellation, deadline and memory controls while keeping decoded-output credit alive across multi-term operations. Plan and error diagnostic rendering decodes terms through `plan_term` so describing a plan never latches a decode refusal, and RDFS explanation keeps its answer memory limit separate from its decode workspace accounting. This lands the first wave of roadmap item 1308.

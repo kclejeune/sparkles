@@ -77,9 +77,15 @@ impl std::fmt::Debug for QueryPool {
     }
 }
 
+type DeferredWakes = std::mem::ManuallyDrop<std::cell::RefCell<Option<Vec<Arc<QueryPool>>>>>;
+
+// The outer drain owns the pending pools. Keep the empty slot accessible during
+// thread teardown, when other TLS destructors can still run a classification.
+const _: () = assert!(!std::mem::needs_drop::<DeferredWakes>());
+
 thread_local! {
-    static DEFERRED_RELEASE_WAKES: std::cell::RefCell<Option<Vec<Arc<QueryPool>>>> =
-        const { std::cell::RefCell::new(None) };
+    static DEFERRED_RELEASE_WAKES: DeferredWakes =
+        const { std::mem::ManuallyDrop::new(std::cell::RefCell::new(None)) };
 }
 
 /// A snapshot of the pool for `/$/server/memory` and the metrics.
@@ -606,6 +612,51 @@ mod tests {
     use super::*;
 
     const MB: u64 = 1 << 20;
+
+    #[test]
+    fn nested_release_deferral_remains_available_during_tls_teardown() {
+        struct ReleaseOnExit {
+            grant: Option<PoolGrant>,
+            wakes: Arc<AtomicUsize>,
+        }
+        impl Drop for ReleaseOnExit {
+            fn drop(&mut self) {
+                QueryPool::with_deferred_release_wakes(|| {
+                    QueryPool::with_deferred_release_wakes(|| drop(self.grant.take()));
+                    assert_eq!(self.wakes.load(Ordering::Relaxed), 0);
+                });
+                assert_eq!(self.wakes.load(Ordering::Relaxed), 1);
+            }
+        }
+        thread_local! {
+            static ON_EXIT: std::cell::RefCell<Option<ReleaseOnExit>> = const {
+                std::cell::RefCell::new(None)
+            };
+        }
+        let pool = QueryPool::new(GRANULE);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let grant = pool.try_grant(GRANULE).unwrap();
+        let _ticket = pool.enter(
+            GRANULE,
+            Some({
+                let wakes = wakes.clone();
+                Arc::new(move || {
+                    wakes.fetch_add(1, Ordering::Relaxed);
+                })
+            }),
+        );
+        std::thread::spawn(move || {
+            ON_EXIT.with(|slot| {
+                *slot.borrow_mut() = Some(ReleaseOnExit {
+                    grant: Some(grant),
+                    wakes,
+                })
+            });
+            QueryPool::with_deferred_release_wakes(|| {});
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn grants_round_to_granules_and_return_on_drop() {

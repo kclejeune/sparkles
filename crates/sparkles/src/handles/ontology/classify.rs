@@ -611,6 +611,7 @@ impl Ontologies {
             drop(unread);
             work.lock().shrink_to(
                 (out.stats.taxonomy_memory
+                    + out.incomplete_bytes()
                     + sparkles_owl::classify::excluded_copy_bytes(&excluded)
                     + unmapped_bytes(&out.unmapped)) as u64,
             );
@@ -765,8 +766,11 @@ impl Ontologies {
             } else {
                 out
             };
-            let saturation_bytes =
-                out.stats.memory.saturating_sub(out.stats.taxonomy_memory) as u64;
+            let saturation_bytes = out
+                .stats
+                .memory
+                .saturating_sub(out.stats.taxonomy_memory)
+                .saturating_sub(out.incomplete_bytes()) as u64;
             let used_reuse = saturation_bytes.min(reused_credit);
             let witness_bytes = witness.as_ref().map_or(0, |w| {
                 sparkles_owl::classify::excluded_slice_copy_bytes(std::slice::from_ref(w))

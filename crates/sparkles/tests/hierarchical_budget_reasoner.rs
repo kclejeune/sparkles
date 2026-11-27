@@ -819,7 +819,8 @@ fn classification_retention_refusal_leaves_a_request_owned_answer() {
             },
         )
         .unwrap();
-    let ontology = opened.ontology.clone();
+    let ontology: Arc<sparkles::handles::ontology::SharedOntology> = opened.ontology.clone();
+    let _: &sparkles::owl::read::Ontology = ontology.as_ref().as_ref();
     drop(opened);
     assert!(
         grant.used() > 0,
@@ -938,6 +939,79 @@ fn shared_expression_growth_refuses_after_the_cold_ontology_fits() {
 
 #[cfg(feature = "ontology")]
 #[test]
+fn shared_expression_parser_scratch_returns_before_classification_and_cache_admission() {
+    use sparkles::handles::ontology::OntologyRequest;
+
+    let mut ttl = String::from(
+        "@prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         _:shared owl:intersectionOf (",
+    );
+    for i in 0..8 {
+        ttl.push_str(&format!("<urn:{}:{i}> ", "x".repeat(4096)));
+    }
+    ttl.push_str(") .");
+    for i in 0..12 {
+        ttl.push_str(&format!("<urn:C{i}> rdfs:subClassOf _:shared ."));
+    }
+
+    let pool = QueryPool::with_retained_capacity(128 * MIB, MIB).unwrap();
+    let ds = Dataset::from_store_with(
+        sparkles::store::Store::in_memory(Default::default()),
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        },
+    );
+    ds.load_str(&ttl, RdfFormat::Turtle).unwrap();
+    let request = OntologyRequest::default();
+    let handle = ds.ontology();
+    let grant = Arc::new(pool.empty_grant());
+    let opts = QueryOptions {
+        grant: Some(grant.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let opened = handle.open(&request, &opts).unwrap();
+    let opening_peak = grant.peak();
+    assert!(opening_peak > 2 * grant.used());
+    assert!(grant.used() >= opened.ontology.retained_bytes() as u64);
+    drop(opened);
+    assert_eq!(grant.used(), 0);
+
+    let opened = handle.open(&request, &Default::default()).unwrap();
+    assert!(handle.open(&request, &Default::default()).unwrap().cached);
+    assert!(pool.domain_stats().retained_reserved < opening_peak);
+    drop(opened);
+
+    let probe = Arc::new(pool.empty_grant());
+    let answer = handle
+        .classify(
+            &request,
+            &Default::default(),
+            &QueryOptions {
+                grant: Some(probe.clone()),
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+    let cap = opening_peak.max(probe.peak());
+    drop(answer);
+    let answer = handle
+        .classify(
+            &request,
+            &Default::default(),
+            &QueryOptions {
+                max_memory_bytes: Some(cap + 8 * 1024),
+                ..opts
+            },
+        )
+        .unwrap();
+    assert!(answer.classification.complete_for_taken);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
 fn terminology_only_coverage_refuses_an_assertion_after_opening_fits() {
     use sparkles::handles::ontology::OntologyRequest;
     let ds = Dataset::memory();
@@ -1008,7 +1082,9 @@ fn detached_classification_and_exclusions_keep_their_caller_grant() {
             .unwrap();
         let classification: Arc<sparkles::owl::classify::Classification> =
             answer.classification.clone();
-        let excluded = answer.excluded.clone();
+        let excluded: Arc<sparkles::handles::ontology::classify::ClassifiedExclusions> =
+            answer.excluded.clone();
+        let _: &Vec<sparkles::owl::classify::Excluded> = excluded.as_ref().as_ref();
         assert!(!excluded.is_empty());
         drop(answer);
         assert!(grant.used() > 0);
@@ -1068,6 +1144,93 @@ fn invalid_import_warning_text_is_admitted_and_owned_after_fetch() {
     drop(report);
     drop(credit);
     assert_eq!(grant.used(), 0);
+}
+
+#[test]
+fn fetch_warnings_remain_charged_in_the_dataset_reasoning_record() {
+    use sparkles::reasoning::reasoner::{ImportMode, Inputs, fetch_imports};
+    let ds = Dataset::memory();
+    let pool = QueryPool::new(16 * MIB);
+    let grant = Arc::new(pool.empty_grant());
+    ds.update("INSERT DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }")
+        .unwrap();
+    let mut inputs = Inputs {
+        imports: ImportMode::Fetch,
+        ..Default::default()
+    };
+    inputs
+        .location_mapping
+        .names
+        .insert("urn:missing".into(), "x".repeat(32 << 10));
+    let load = QueryOptions {
+        grant: Some(grant.clone()),
+        ..Default::default()
+    };
+    let owned = fetch_imports(ds.store(), &inputs, &[], &load).unwrap();
+    assert_eq!(owned.warnings.len(), 1);
+    assert_eq!(
+        grant.used(),
+        0,
+        "the plain fetch result belongs to the application"
+    );
+    let result = ds
+        .reasoning()
+        .run(&ReasonRequest {
+            inputs,
+            load,
+            ..Default::default()
+        })
+        .unwrap();
+    let warning = &result.record.warnings[0];
+    assert_eq!(warning, &owned.warnings[0]);
+    assert!(grant.used() >= warning.len() as u64);
+    drop(result);
+    assert!(grant.used() > 0);
+    assert_eq!(
+        ds.reasoning_record().unwrap().warnings[0],
+        owned.warnings[0]
+    );
+    ds.reasoning().clear().unwrap();
+    assert_eq!(grant.used(), 0);
+}
+
+#[test]
+fn materialization_refreshes_the_import_named_in_its_record() {
+    use sparkles::reasoning::reasoner::{ImportMode, Inputs};
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:import> }")
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("import.ttl");
+    std::fs::write(&source, "<urn:s> <urn:p> <urn:original> .").unwrap();
+    let mut inputs = Inputs {
+        imports: ImportMode::Fetch,
+        ..Default::default()
+    };
+    inputs
+        .location_mapping
+        .names
+        .insert("urn:import".into(), format!("file://{}", source.display()));
+    let mut request = ReasonRequest {
+        inputs,
+        ..Default::default()
+    };
+    let first = ds.reasoning().run(&request).unwrap();
+    assert_eq!(first.record.fetched_imports, ["urn:import"]);
+
+    std::fs::write(&source, "<urn:s> <urn:p> <urn:updated> .").unwrap();
+    request.refresh_imports = true;
+    let next = ds.reasoning().run(&request).unwrap();
+    assert_eq!(next.record.fetched_imports, first.record.fetched_imports);
+    let ask = |object| {
+        ds.query(&format!(
+            "ASK {{ GRAPH <urn:import> {{ <urn:s> <urn:p> <{object}> }} }}"
+        ))
+        .unwrap()
+        .boolean
+    };
+    assert!(ask("urn:updated"));
+    assert!(!ask("urn:original"));
 }
 
 #[cfg(feature = "ontology")]

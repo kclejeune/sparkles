@@ -80,6 +80,7 @@ mod dl_clause;
 mod dl_eq;
 mod dl_norm;
 mod dl_reduce;
+pub(crate) use dl_reduce::{btree_map_bytes, btree_set_bytes};
 mod dl_root;
 mod dl_rules;
 mod dt_sat;
@@ -1565,6 +1566,12 @@ impl Classification {
             .and_then(|n| n.checked_add(str_bytes))
             .unwrap_or(usize::MAX);
         (count, bytes)
+    }
+
+    /// The memory owned by the published incomplete-class list.
+    #[doc(hidden)]
+    pub fn incomplete_bytes(&self) -> usize {
+        Self::incomplete_vec_bytes(&self.incomplete)
     }
 
     fn incomplete_vec_bytes(xs: &[Class]) -> usize {

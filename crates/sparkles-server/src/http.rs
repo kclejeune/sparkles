@@ -5437,10 +5437,9 @@ async fn reason(
     let full = full || query.get("full").is_some_and(truthy);
     let recorded = if rerun {
         // the recorded profile, including its custom rules, extras and input graphs
-        let info = ds
-            .reasoning
-            .read()
-            .clone()
+        let record = ds.read_reasoning();
+        let info = record
+            .as_ref()
             .ok_or_else(|| err(StatusCode::CONFLICT, "no recorded reasoning to re-run"))?;
         let conflict = |e: sparkles::Error| err(StatusCode::CONFLICT, e.to_string());
         Some((
@@ -5583,7 +5582,7 @@ async fn set_auto(
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = dataset(st, name)?;
-    let Some(mut info) = ds.reasoning.read().clone() else {
+    let Some(mut info) = ds.read_reasoning().clone() else {
         return Err(err(
             StatusCode::CONFLICT,
             "no recorded reasoning: materialize inferences first",
@@ -6201,7 +6200,7 @@ async fn shacl(
         }
     };
     let use_inferred = reasoning_mode(&ds, &params).reads_inferences();
-    let has_inferred = ds.reasoning.read().is_some();
+    let has_inferred = ds.read_reasoning().is_some();
     let timeout = timeout_param(&st, &params);
     let at = history::at_param(&params)?;
     // a client that disconnects stops the validation at its next check

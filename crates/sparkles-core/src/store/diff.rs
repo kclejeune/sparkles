@@ -1017,7 +1017,8 @@ impl Store {
         if !Arc::ptr_eq(&generation, &to.generation) {
             return Ok(None);
         }
-        let mut net: FxHashMap<[Id; 4], bool> = FxHashMap::default();
+        let mut net: hashbrown::HashMap<[Id; 4], bool, rustc_hash::FxBuildHasher> =
+            hashbrown::HashMap::default();
         let mut table_bytes = 0;
         let mut table_capacity = 0;
         walk_wal(&mut cursor, after, to.commit, o, &mut |op, q| {
@@ -1028,13 +1029,16 @@ impl Store {
                 && net.len() == net.capacity()
             {
                 use sparkles_budget::sizes::{table_bytes_for, table_grown};
+                // Hashbrown reports live entries plus remaining insertion growth.
+                // Keep the full backing capacity separately because deletes can
+                // leave tombstones and reduce the reported capacity.
                 let wanted = net.len() + 1;
                 // Hashbrown clears tombstones in place when the live entries plus
                 // this insert fit in half the allocated table.
                 if wanted <= table_capacity / 2 {
                     net.reserve(1);
                 } else {
-                    let capacity = table_grown(table_capacity, net.len(), 1);
+                    let capacity = table_grown(table_capacity, table_capacity, 1);
                     let needed = table_bytes_for::<IdChange>(capacity);
                     admit(needed as u64)?;
                     net.reserve(1);

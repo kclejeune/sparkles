@@ -507,7 +507,7 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
     let mut pending = auto.pending.lock();
     pending.retain(|n, _| datasets.iter().any(|d| &d.name == n));
     for ds in datasets {
-        let info = ds.reasoning.read().clone();
+        let info = ds.read_reasoning().clone();
         let Some(timing) = info.as_ref().and_then(|i| auto_timing(st, i)) else {
             pending.remove(&ds.name);
             continue;

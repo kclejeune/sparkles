@@ -189,7 +189,7 @@ pub struct DatasetState {
     #[cfg(feature = "graphql")]
     pub graphql: sparkles_graphql::Catalog,
     /// the record of the last materialization (`reasoning.json`)
-    pub reasoning: RwLock<Option<ReasoningRecord>>,
+    reasoning: RwLock<RecordedReasoning>,
     /// the closure of the last materialization, for the next incremental run
     #[cfg(feature = "reasoning")]
     pub closure: sparkles_reasoner::Cache,
@@ -238,14 +238,81 @@ impl Drop for DatasetState {
     }
 }
 
+struct RecordedReasoning {
+    value: Option<ReasoningRecord>,
+    #[cfg(feature = "reasoning")]
+    fetch_memory: Option<sparkles_reasoner::inputs::FetchMemory>,
+}
+
+impl RecordedReasoning {
+    fn new(value: Option<ReasoningRecord>) -> Self {
+        Self {
+            value,
+            #[cfg(feature = "reasoning")]
+            fetch_memory: None,
+        }
+    }
+}
+
 impl DatasetState {
+    /// Borrow the reasoning record kept with the dataset.
+    pub fn read_reasoning(
+        &self,
+    ) -> parking_lot::MappedRwLockReadGuard<'_, Option<ReasoningRecord>> {
+        parking_lot::RwLockReadGuard::map(self.reasoning.read(), |record| &record.value)
+    }
+
+    /// Install a record restored or inherited by a newly opened dataset.
+    pub(crate) fn restore_reasoning(&self, record: Option<ReasoningRecord>) {
+        self.replace_reasoning(RecordedReasoning::new(record));
+    }
+
+    fn replace_reasoning(&self, record: RecordedReasoning) {
+        let mut current = self.reasoning.write();
+        #[cfg(feature = "reasoning")]
+        let record = {
+            let mut record = record;
+            if record.fetch_memory.is_none()
+                && current
+                    .value
+                    .as_ref()
+                    .zip(record.value.as_ref())
+                    .is_some_and(|(old, new)| {
+                        old.warnings == new.warnings && old.fetched_imports == new.fetched_imports
+                    })
+            {
+                record.fetch_memory = current.fetch_memory.take();
+            }
+            record
+        };
+        let retired = std::mem::replace(&mut *current, record);
+        drop(current);
+        drop(retired);
+    }
+
     /// Update the reasoning record in memory and, for a persistent dataset, in its
     /// directory.
     pub fn set_reasoning(&self, record: Option<ReasoningRecord>) -> Result<()> {
+        self.write_reasoning(RecordedReasoning::new(record))
+    }
+
+    #[cfg(feature = "reasoning")]
+    pub(crate) fn set_reasoning_admitted(
+        &self,
+        record: ReasoningRecord,
+        fetch_memory: Option<sparkles_reasoner::inputs::FetchMemory>,
+    ) -> Result<()> {
+        self.write_reasoning(RecordedReasoning {
+            value: Some(record),
+            fetch_memory,
+        })
+    }
+
+    fn write_reasoning(&self, record: RecordedReasoning) -> Result<()> {
         if let Some(root) = self.store.root() {
-            crate::reasoning::write_record(root, record.as_ref())?;
+            crate::reasoning::write_record(root, record.value.as_ref())?;
         }
-        *self.reasoning.write() = record;
+        self.replace_reasoning(record);
         // views and live queries switch to the new default graph
         self.views.kick();
         Ok(())
@@ -430,7 +497,7 @@ impl Dataset {
             algo,
             #[cfg(feature = "graphql")]
             graphql,
-            reasoning: RwLock::new(reasoning),
+            reasoning: RwLock::new(RecordedReasoning::new(reasoning)),
             #[cfg(feature = "reasoning")]
             closure: sparkles_reasoner::Cache::new(opts.closure_cache_triples)
                 .with_retained_parent(retained_parent),
@@ -574,7 +641,7 @@ impl Dataset {
 
     /// The reasoning record of the last materialization, if any.
     pub fn reasoning_record(&self) -> Option<ReasoningRecord> {
-        self.inner.reasoning.read().clone()
+        self.inner.read_reasoning().clone()
     }
 
     /// The query-time reasoning setting (spec F17 §2.2), if any.
