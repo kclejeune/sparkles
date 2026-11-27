@@ -503,3 +503,45 @@ fn index_links_use_published_memory_keys_and_redacted_quotes() {
             .is_some_and(|q| q.contains("[redacted:metadata].md"))
     }));
 }
+
+#[test]
+fn repeated_instruction_imports_record_one_refusal_at_the_published_path() {
+    let f = fixture();
+    let c = ctx();
+    let path = f.repo.join("private-note.md");
+    write(
+        &f.repo.join("CLAUDE.md"),
+        "@private-note.md\n@private-note.md\n",
+    );
+    write(&path, "Original text.");
+    let patterns = [
+        redact::Pattern::new("filename", "^private-note").unwrap(),
+        redact::Pattern::new("budget", "budget-marker").unwrap(),
+    ];
+    let request = Request {
+        ctx: &c,
+        roots: &f.roots,
+        adapters: vec![Adapter::ClaudeCode],
+        project: Some(Project::of(&f.repo)),
+        user_scope: false,
+        paths: Vec::new(),
+        instructions_only: true,
+        patterns: &patterns,
+    };
+    let first = scan(&request);
+    let original = first.files.iter().find(|file| file.path == path).unwrap();
+    assert_eq!(original.rel_path, "[redacted:filename].md");
+
+    write(&path, &"budget-marker ".repeat(32_769));
+    let second = scan(&request);
+    assert_eq!(
+        second
+            .skipped
+            .iter()
+            .filter(|s| s.path == path && s.reason == "redaction-too-large")
+            .count(),
+        1
+    );
+    assert!(second.has_refused_path(&original.graph, &original.rel_path));
+    assert!(!second.has_refused_path(&original.graph, "private-note.md"));
+}

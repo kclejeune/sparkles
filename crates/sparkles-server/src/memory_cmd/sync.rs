@@ -712,13 +712,14 @@ pub fn sync(
         let stamp = stamp(&f.path);
         let server = listed.get(&f.graph);
         // Frontmatter names can collide. In an incomplete area, a stored path
-        // identifies this file only if it is unmasked and no refused file shares it.
+        // identifies this file only if neither a refusal nor an unvisited import can share it.
         if let Some(l) = server
             && !l.deleted
             && scan.incomplete_areas.iter().any(|a| f.graph.starts_with(a))
             && (l.file_path.as_deref() != Some(f.rel_path.as_str())
                 || f.rel_path.contains("[redacted:")
-                || scan.has_refused_path(&f.graph, &f.rel_path))
+                || scan.has_refused_path(&f.graph, &f.rel_path)
+                || scan.hidden_path_collision(&f.graph, &f.rel_path))
         {
             rep.status = "skipped".into();
             rep.reason = Some("uncertain-source-owner".into());
@@ -1064,6 +1065,7 @@ mod tests {
             scope: None,
             path: "/x/a.md".into(),
             rel_path: "a.md".into(),
+            local_path_digest: None,
             key: "a".into(),
             graph: "urn:g".into(),
             entity: None,

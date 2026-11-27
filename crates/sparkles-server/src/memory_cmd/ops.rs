@@ -1747,74 +1747,98 @@ fn sources(
     Ok(0)
 }
 
-/// Match each server source to files in its graph by the path recorded at import.
+/// Split a source or area under the selected principal and harness.
+fn status_graph_parts<'a>(
+    graph: &'a str,
+    prefix: &str,
+    h: Option<Harness>,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    let (harness, rest) = graph.strip_prefix(prefix)?.split_once('/')?;
+    let (project, tail) = rest.split_once('/')?;
+    h.is_none_or(|h| h.segment() == harness)
+        .then_some((harness, project, tail))
+}
+
+/// Match each stored source against the local scan of its project identity.
 fn status_files(
     scan: &sparkles_memory_import::Scan,
     harness: Option<Harness>,
     listed: &std::collections::BTreeMap<String, sync::Listed>,
-    project_graphs: impl Fn(&str) -> Vec<String>,
-) -> (Vec<Value>, std::collections::HashSet<String>) {
+    local_graph: impl Fn(&str) -> Option<String>,
+) -> (Vec<Value>, Vec<Value>) {
     let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
-    for file in &scan.files {
+    for (index, file) in scan.files.iter().enumerate() {
         if harness.is_none_or(|h| h == file.harness) {
-            groups.entry(&file.graph).or_default().push(file);
+            groups
+                .entry(file.graph.as_str())
+                .or_default()
+                .push((index, file));
         }
     }
-    let mut on_disk = Vec::new();
-    let mut present = std::collections::HashSet::new();
-    for (graph, files) in groups {
-        let mut graphs = project_graphs(graph);
-        if graphs.is_empty() {
-            // An instruction imported from a user directory has no project segment.
-            graphs.push(graph.clone());
-        }
-        let mut reported = vec![false; files.len()];
-        for source in graphs {
-            let Some(stored) = listed.get(&source) else {
-                continue;
-            };
-            // Missing or masked paths cannot disambiguate two files with the same key.
-            let stored_path = stored
-                .file_path
-                .as_deref()
-                .filter(|p| !p.contains("[redacted:"));
-            let candidates: Vec<_> = files
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| {
-                    stored_path.is_none_or(|p| p == f.rel_path || f.rel_path.contains("[redacted:"))
+    let mut files = Vec::new();
+    let mut missing = Vec::new();
+    let mut reported = vec![false; scan.files.len()];
+    for (source, stored) in listed {
+        let Some(graph) = local_graph(source) else {
+            continue;
+        };
+        let group = groups
+            .get(graph.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let stored_path = stored
+            .file_path
+            .as_deref()
+            .filter(|p| !p.contains("[redacted:"));
+        let candidates: Vec<_> = group
+            .iter()
+            .filter(|(_, f)| {
+                stored_path.is_none_or(|p| match &f.local_path_digest {
+                    Some(digest) => *digest == sparkles_memory_import::ids::digest(p.as_bytes()),
+                    None => p == f.rel_path,
                 })
-                .collect();
-            if candidates.is_empty() {
+            })
+            .collect();
+        if candidates.is_empty() {
+            // A project scan follows individual user imports, but never lists the whole user area.
+            let in_area = scan.areas.iter().any(|area| graph.starts_with(area));
+            if !in_area && group.is_empty() && !scan.incomplete_areas.contains(&graph) {
                 continue;
             }
-            present.insert(source.clone());
-            if stored.deleted {
-                continue;
+            if scan.absence_uncertain(&graph, stored_path) {
+                files.push(json!({"path": stored.file_path.as_deref().unwrap_or(source), "source": source, "status": "ambiguous"}));
+            } else if in_area {
+                missing.push(
+                    json!({"source": source, "path": stored.file_path, "deleted": stored.deleted}),
+                );
             }
-            let multiple = candidates.len() > 1;
-            for (index, file) in candidates {
-                let status = if multiple
-                    || stored_path != Some(file.rel_path.as_str())
-                    || scan.has_refused_path(graph, &file.rel_path)
-                {
-                    "ambiguous"
-                } else if stored.digest == sync::source_digest(file) {
-                    "imported"
-                } else {
-                    "changed"
-                };
-                on_disk.push(json!({"path": file.path.display().to_string(), "source": source, "status": status}));
-                reported[index] = true;
-            }
+            continue;
         }
-        for (file, reported) in files.into_iter().zip(reported) {
-            if !reported {
-                on_disk.push(json!({"path": file.path.display().to_string(), "source": graph, "status": "not-imported"}));
-            }
+        if stored.deleted {
+            continue;
+        }
+        let ambiguous = candidates.len() > 1
+            || stored_path.is_none_or(|p| {
+                scan.refused_local_path(&graph, p) || scan.hidden_path_collision(&graph, p)
+            });
+        for (index, file) in candidates {
+            let status = if ambiguous {
+                "ambiguous"
+            } else if stored.digest == sync::source_digest(file) {
+                "imported"
+            } else {
+                "changed"
+            };
+            files.push(json!({"path": file.path.display().to_string(), "source": source, "status": status}));
+            reported[*index] = true;
         }
     }
-    (on_disk, present)
+    for (index, file) in groups.into_values().flatten() {
+        if !reported[index] {
+            files.push(json!({"path": file.path.display().to_string(), "source": file.graph, "status": "not-imported"}));
+        }
+    }
+    (files, missing)
 }
 
 fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Result<i32, CmdError> {
@@ -1844,30 +1868,28 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
     let scan = sparkles_memory_import::scan_for_status(&req, &policy, keys.primary.clone());
     let segments = keys.segments();
     // Only the project segment of a source graph changes between the two identities.
-    let project_graphs = |graph: &str| -> Vec<String> {
-        let Some((harness, rest)) = graph.strip_prefix(&prefix).and_then(|s| s.split_once('/'))
-        else {
-            return Vec::new();
-        };
-        let Some((project, tail)) = rest.split_once('/') else {
-            return Vec::new();
-        };
-        if project != segments[0] || h.is_some_and(|h| h.segment() != harness) {
-            return Vec::new();
+    let mut areas = Vec::new();
+    for area in &scan.areas {
+        if let Some((harness, project, tail)) = status_graph_parts(area, &prefix, h)
+            && project == segments[0]
+        {
+            areas.extend(
+                segments
+                    .iter()
+                    .map(|s| format!("{prefix}{harness}/{s}/{tail}")),
+            );
+        }
+    }
+    let (on_disk, missing) = status_files(&scan, h, &listed, |graph| {
+        let (harness, project, tail) = status_graph_parts(graph, &prefix, h)?;
+        if project == "user" {
+            return Some(graph.to_owned());
         }
         segments
             .iter()
-            .map(|s| format!("{prefix}{harness}/{s}/{tail}"))
-            .collect()
-    };
-    let areas: Vec<_> = scan.areas.iter().flat_map(|a| project_graphs(a)).collect();
-    let (on_disk, present) = status_files(&scan, h, &listed, project_graphs);
-    let mut missing = Vec::new();
-    for (g, l) in &listed {
-        if areas.iter().any(|a| g.starts_with(a.as_str())) && !present.contains(g) {
-            missing.push(json!({ "source": g, "path": l.file_path, "deleted": l.deleted }));
-        }
-    }
+            .any(|s| s == project)
+            .then(|| format!("{prefix}{harness}/{}/{tail}", segments[0]))
+    });
     // links to IRIs that no triple describes
     let lit = sparkles_memory_import::quoted;
     let mut unresolved = Vec::new();

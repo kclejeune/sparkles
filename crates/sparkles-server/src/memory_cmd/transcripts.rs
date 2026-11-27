@@ -491,6 +491,7 @@ pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default(),
+                local_path_digest: None,
                 key: id.clone(),
                 graph: graph.clone(),
                 entity: Some(run.ctx.session_iri(f.harness.segment(), &id)),

@@ -280,6 +280,8 @@ pub struct FileImport {
     pub path: std::path::PathBuf,
     /// `mem:filePath`: relative to the harness's root for its scope
     pub rel_path: String,
+    /// Local status scans retain the digest of a normalized path when redaction masks it.
+    pub local_path_digest: Option<String>,
     /// the file's key in its graph's IRI
     pub key: String,
     /// the file's graph, which is also its source's IRI

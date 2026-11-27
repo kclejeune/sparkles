@@ -370,6 +370,34 @@ fn memory_redaction_refusal_keeps_an_existing_source_without_a_cache() {
     assert_eq!(report(&again, "other.md")["status"], "skipped", "{again:#}");
     assert!(s.ask(&retained));
     assert_eq!(s.head(), before);
+    let status = || mem_json(&f, &s, "ana", &["status", "--project", p.to_str().unwrap()]);
+    let missing = |out: &Value| {
+        out["sourcesWithoutFile"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["source"] == graph)
+    };
+    for with_collision in [true, false] {
+        if !with_collision {
+            std::fs::remove_file(f.memdir().join("other.md")).unwrap();
+        }
+        let out = status();
+        assert!(!missing(&out), "{out:#}");
+        let row = report(&out, "staging-db.md");
+        assert_eq!(row["source"], graph);
+        assert_eq!(row["status"], "ambiguous");
+    }
+    std::fs::remove_file(f.memdir().join("staging-db.md")).unwrap();
+    assert!(missing(&status()));
+
+    // A returned file is on disk even when its previous source was marked deleted.
+    let deleted = mem_json(&f, &s, "ana", &args);
+    assert_eq!(report(&deleted, "staging-db.md")["status"], "deleted");
+    f.write_mem("staging-db.md", &"budget-marker ".repeat(32_769));
+    let returned = status();
+    assert!(!missing(&returned), "{returned:#}");
+    assert_eq!(report(&returned, "staging-db.md")["status"], "ambiguous");
 }
 
 #[cfg(unix)]
@@ -457,6 +485,10 @@ fn memory_redaction_refusal_keeps_an_existing_source_after_path_policy_changes()
     );
     assert!(s.ask(&retained));
     assert_eq!(s.head(), before);
+    let status = mem_json(&f, &s, "ana", &["status", "--project", p.to_str().unwrap()]);
+    let refused = report(&status, "staging-db.md");
+    assert_eq!(refused["source"], graph);
+    assert_eq!(refused["status"], "ambiguous", "{status:#}");
 }
 
 #[test]
@@ -500,6 +532,128 @@ fn memory_redaction_refusal_keeps_imports_hidden_by_a_refused_instruction_file()
     let complete = mem_json(&f, &s, "ana", &args);
     assert_eq!(report(&complete, "CLAUDE.md")["status"], "deleted");
     assert!(!s.ask(&live), "{complete:#}");
+}
+
+#[cfg(unix)]
+fn check_hidden_instruction_owner(user: bool) {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let root = if user {
+        f.home().join(".claude")
+    } else {
+        p.clone()
+    };
+    let link_prefix = if user { "~/.claude/" } else { "" };
+    let original = r"sub\note.md";
+    let replacement = "sub/note.md";
+    let args = ["sync", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (code, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(code, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "budget", "regex": "budget-marker"}]});
+    let (code, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(code, 200, "{output:#}");
+
+    std::fs::write(p.join("CLAUDE.md"), format!("@{link_prefix}{original}\n")).unwrap();
+    std::fs::write(
+        root.join(original),
+        "---\ndescription: Original rule\n---\nOld body.\n",
+    )
+    .unwrap();
+    let first = mem_json(&f, &s, "ana", &args);
+    let graph = report(&first, original)["graph"].as_str().unwrap();
+    assert_eq!(graph.contains("/user/instructions/"), user);
+    let query = format!(
+        "SELECT ?r WHERE {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . ?i <http://schema.org/description> \"Original rule\" }} }}"
+    );
+    let original_rendition = s.select(&query);
+    assert_eq!(original_rendition.len(), 1);
+    std::fs::remove_dir_all(f.state()).unwrap();
+    std::fs::write(p.join("CLAUDE.md"), "budget-marker ".repeat(32_769)).unwrap();
+    std::fs::write(
+        p.join("CLAUDE.local.md"),
+        format!("@{link_prefix}{replacement}\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(
+        root.join(replacement),
+        "---\ndescription: Replacement rule\n---\nNew body.\n",
+    )
+    .unwrap();
+    let status = mem_json(&f, &s, "ana", &["status", "--project", p.to_str().unwrap()]);
+    let sync = mem_json(&f, &s, "ana", &args);
+    assert_eq!(s.select(&query), original_rendition, "{sync:#}");
+    assert_eq!(
+        report(&sync, replacement)["reason"],
+        "uncertain-source-owner"
+    );
+    let row = report(&status, replacement);
+    assert_eq!(row["source"], graph);
+    assert_eq!(row["status"], "ambiguous", "{status:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_parent_preserves_hidden_project_instruction_owner() {
+    check_hidden_instruction_owner(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_parent_preserves_hidden_user_instruction_owner() {
+    check_hidden_instruction_owner(true);
+}
+
+#[test]
+fn status_matches_public_source_with_an_unrelated_masked_candidate() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    f.write_mem("public.md", "---\nname: shared\n---\nPublic body.\n");
+    let first = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["sync", "claude-code", "--project", p.to_str().unwrap()],
+    );
+    let graph = &report(&first, "public.md")["graph"];
+    let (code, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(code, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "filename", "regex": "private-note"}]});
+    let (code, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(code, 200, "{output:#}");
+    f.write_mem(
+        "subdir/private-note.md",
+        "---\nname: shared\n---\nOther body.\n",
+    );
+    let status = || mem_json(&f, &s, "ana", &["status", "--project", p.to_str().unwrap()]);
+    let out = status();
+    assert_eq!(report(&out, "public.md")["status"], "imported", "{out:#}");
+    assert_eq!(report(&out, "private-note.md")["status"], "not-imported");
+    // The stored path can still identify its owner when today's policy masks both filenames alike.
+    settings["redaction"]["patterns"][0]["regex"] = "public|private-note".into();
+    let (code, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(code, 200, "{output:#}");
+    f.write_mem("private-note.md", "---\nname: shared\n---\nAnother body.\n");
+    let masked = status();
+    assert_eq!(
+        report(&masked, "public.md")["status"],
+        "imported",
+        "{masked:#}"
+    );
+    std::fs::remove_file(f.memdir().join("public.md")).unwrap();
+    let out = status();
+    assert!(
+        out["sourcesWithoutFile"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| &r["source"] == graph),
+        "{out:#}"
+    );
 }
 
 #[test]

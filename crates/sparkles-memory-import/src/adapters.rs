@@ -166,6 +166,10 @@ pub struct Scan {
     pub incomplete_areas: HashSet<String>,
     /// Refused files, keyed by graph area using the same relative paths as readable files.
     pub refused_paths: HashMap<String, HashSet<String>>,
+    /// Local lookup for formerly unmasked stored paths under the current redaction policy.
+    masked_refusal_digests: HashMap<String, HashSet<String>>,
+    /// Instruction areas reachable from a parent whose imports could not be read.
+    hidden_import_areas: HashSet<String>,
 }
 
 impl Scan {
@@ -174,6 +178,40 @@ impl Scan {
         self.refused_paths
             .iter()
             .any(|(area, paths)| graph.starts_with(area) && paths.contains(rel_path))
+    }
+
+    fn may_hide_imports(&self, graph: &str) -> bool {
+        self.hidden_import_areas
+            .iter()
+            .any(|area| graph.starts_with(area))
+    }
+
+    /// Whether an unmasked stored path matches a file refused by this status scan.
+    pub fn refused_local_path(&self, graph: &str, path: &str) -> bool {
+        self.has_refused_path(graph, path)
+            || self.masked_refusal_digests.iter().any(|(area, digests)| {
+                graph.starts_with(area) && digests.contains(&ids::digest(path.as_bytes()))
+            })
+    }
+
+    /// Without a readable candidate, a refused parent may have hidden even a unique path.
+    pub fn absence_uncertain(&self, graph: &str, stored_path: Option<&str>) -> bool {
+        self.may_hide_imports(graph)
+            || self.incomplete_areas.contains(graph)
+            || match stored_path.filter(|p| !p.contains("[redacted:")) {
+                Some(path) => self.refused_local_path(graph, path),
+                None => self
+                    .incomplete_areas
+                    .iter()
+                    .any(|area| graph.starts_with(area)),
+            }
+    }
+
+    /// A hidden import may have a distinct OS path with the same normalized spelling.
+    pub fn hidden_path_collision(&self, graph: &str, path: &str) -> bool {
+        (path.contains(char::REPLACEMENT_CHARACTER)
+            || (!std::path::is_separator('\\') && path.contains('/')))
+            && self.may_hide_imports(graph)
     }
 }
 
@@ -218,6 +256,7 @@ fn collect_files(
             .map(|p| project_key.unwrap_or_else(|| p.redacted_key(policy).into_owned())),
         out: Scan::default(),
         seen: HashMap::new(),
+        attempted_instructions: HashMap::new(),
     };
     for a in &req.adapters {
         match a {
@@ -251,6 +290,8 @@ struct Scanner<'a> {
     out: Scan,
     /// Files already produced for each graph. Imports retain only the first owner.
     seen: HashMap<String, HashSet<PathBuf>>,
+    /// Includes refused and discarded paths, which never enter `seen`.
+    attempted_instructions: HashMap<String, HashSet<PathBuf>>,
     keep_collisions: bool,
 }
 
@@ -442,12 +483,20 @@ impl Scanner<'_> {
             || Ok(()),
             || "redaction-too-large",
         ) else {
+            let published = self.redact(rel_path).text;
+            if self.keep_collisions && published != rel_path {
+                self.out
+                    .masked_refusal_digests
+                    .entry(graph_prefix.to_owned())
+                    .or_default()
+                    .insert(ids::digest(rel_path.as_bytes()));
+            }
             self.out.incomplete_areas.insert(graph_prefix.to_owned());
             self.out
                 .refused_paths
                 .entry(graph_prefix.to_owned())
                 .or_default()
-                .insert(rel_path.to_owned());
+                .insert(published);
             return skip(self, "redaction-too-large");
         };
         Some(Read {
@@ -559,14 +608,17 @@ impl Scanner<'_> {
             facts.push(fact(&graph, &mem("copyOf"), Obj::Iri(iri), Some(&line)));
         }
         let title = self.redact(&title).text;
-        let rel_path = self.redact(&rel_path).text;
+        let published_path = self.redact(&rel_path).text;
+        let local_path_digest = (self.keep_collisions && published_path != rel_path)
+            .then(|| ids::digest(rel_path.as_bytes()));
         self.out.files.push(FileImport {
             adapter,
             harness,
             kind,
             scope,
             path: path.to_path_buf(),
-            rel_path,
+            rel_path: published_path,
+            local_path_digest,
             key,
             digest: ids::digest(&read.bytes),
             body_digest: ids::digest(body),
@@ -875,29 +927,35 @@ impl Scanner<'_> {
                 .ctx()
                 .graph(harness.segment(), &project_segment, "instructions/");
             let graph = format!("{area}{}", ids::segment(&key));
-            if self
-                .seen
-                .get(&graph)
-                .is_some_and(|paths| paths.contains(&path))
+            if !self
+                .attempted_instructions
+                .entry(graph.clone())
+                .or_default()
+                .insert(path.clone())
             {
                 continue;
             }
             let Some(read) = self.read(&path, &rel_path, &area) else {
                 // A refused file can hide imports in either instruction scope.
-                if follow_imports
-                    && self
-                        .out
-                        .skipped
-                        .last()
-                        .is_some_and(|s| s.reason == "redaction-too-large")
+                if self
+                    .out
+                    .skipped
+                    .last()
+                    .is_some_and(|s| s.reason == "redaction-too-large")
                 {
-                    let other = if user {
-                        self.project_segment()
-                    } else {
-                        "user".to_string()
-                    };
-                    let area = self.ctx().graph(harness.segment(), &other, "instructions/");
-                    self.out.incomplete_areas.insert(area);
+                    // The instruction key is known even when its content is unavailable.
+                    self.out.incomplete_areas.insert(graph);
+                    if follow_imports {
+                        let other = if user {
+                            self.project_segment()
+                        } else {
+                            "user".to_string()
+                        };
+                        let other_area =
+                            self.ctx().graph(harness.segment(), &other, "instructions/");
+                        self.out.incomplete_areas.insert(other_area.clone());
+                        self.out.hidden_import_areas.extend([area, other_area]);
+                    }
                 }
                 continue;
             };
