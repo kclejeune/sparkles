@@ -1936,6 +1936,33 @@ more wall time than an eager one on those queries, against 0.23 to 0.31 ms in th
 because the hand-off between threads that the phase trace measured lies outside the
 writer.
 
+Both thread-handoff changes of item 534 have now landed on top of item 828's batch-source
+writers. Pool-routed cursors, both explicit `execution=streaming` and pool-routed
+`execution=auto` or eager-trial requests, open and serialize in one blocking-pool task
+through `stream::open_and_serialize_controlled`, removing the return wake to the handler
+and the second pool wake while keeping open-phase error responses, concurrency permit
+lifetimes, `StreamControl`, and the execution-to-serialization timing split unchanged.
+When a request targets the current snapshot and an in-place runtime is available, eligible
+`execution=auto` requests open and drain cursors in place through resumable `Send`
+`CursorWriter` sessions in `sparkles-core`. Eligibility covers texts whose quick history
+retains automatic execution and unseen first runs that carry a timeout, arrive after a
+server-idle interval (`FIRST_RUN_QUIET`) and pass a conservative text scan rejecting any
+case-insensitive `service` substring or `\u` or `\U` Unicode escape prefix.
+A cursor whose encoded output finishes within `STREAM_AFTER` returns a whole response with
+`Content-Length` and zero thread hops, and a cursor that would cross `STREAM_AFTER` pauses
+before buffering an oversized row, quad or footer and hands off the cursor, encoder state
+and buffered `SwitchWriter` prefix to a blocking streaming task whose initial chunk stays
+within `STREAM_AFTER + 1` bytes and whose subsequent chunks drain in `CHUNK`-sized
+backpressured frames. Explicit `execution=streaming` keeps the blocking-pool route with
+early first-batch or 64 KiB commit and immediate cancellation on client disconnect, and
+queries that call graph algorithms are never recorded as quick on either route. Core
+session parity tests and HTTP router integration tests cover route selection, format parity
+across all SELECT, ASK and graph formats (including JSON-LD, with decoded statement
+equality for Jena binary formats and native JSON), open errors, memory, result-byte and
+row budgets on both sides of commit, mid-stream timeouts, and client-disconnect
+cancellation. The quiet `atlas` timing comparison against pre-handoff `5369883f` is
+pending.
+
 ### One writer per format and exact row accounting (items 828 and 243)
 
 Roadmap items 828 and 243 shipped one columnar writer per format over a shared `Source`

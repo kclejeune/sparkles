@@ -1,7 +1,7 @@
 //! Per-request test observers. No hook or threshold override exists in ordinary builds.
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Default)]
@@ -17,6 +17,8 @@ pub(crate) struct Probe {
     /// Pause after a branch handler returns, before selector response decoration.
     pub branch_response: Option<Arc<Gate>>,
     pub cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// Nanoseconds added to `StreamControl::check`'s clock for deterministic timeout tests.
+    pub clock_advance_ns: Option<Arc<AtomicU64>>,
 }
 
 tokio::task_local! {

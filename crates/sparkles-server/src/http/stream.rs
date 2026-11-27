@@ -171,6 +171,8 @@ pub(super) struct StreamControl {
     wait_ns: Arc<AtomicU64>,
     /// The longest the producer may wait for room in one stretch.
     stall: Option<Duration>,
+    #[cfg(test)]
+    clock_advance_ns: Option<Arc<AtomicU64>>,
 }
 
 impl StreamControl {
@@ -185,6 +187,8 @@ impl StreamControl {
             deadline,
             wait_ns: pause,
             stall,
+            #[cfg(test)]
+            clock_advance_ns: None,
         }
     }
     fn check_cancel(&self) -> io::Result<()> {
@@ -202,6 +206,14 @@ impl StreamControl {
             // the deadline counts the query's own time, not the time it waited for the
             // reader, and a deadline too far out to represent never passes
             let paused = Duration::from_nanos(self.wait_ns.load(Ordering::Relaxed));
+            #[cfg(test)]
+            let now = self
+                .clock_advance_ns
+                .as_ref()
+                .map(|ns| Duration::from_nanos(ns.load(Ordering::Relaxed)))
+                .and_then(|offset| Instant::now().checked_add(offset))
+                .unwrap_or_else(Instant::now);
+            #[cfg(not(test))]
             let now = Instant::now();
             if now >= d && d.checked_add(paused).is_some_and(|end| now >= end) {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "query timed out"));
@@ -367,6 +379,9 @@ impl SwitchWriter {
             }
             self.producer_gate = probe.producer.clone();
             self.queued_producer_gate = probe.queued_producer.clone();
+            if let Some(control) = &mut self.control {
+                control.clock_advance_ns = probe.clock_advance_ns.clone();
+            }
         }
     }
 
