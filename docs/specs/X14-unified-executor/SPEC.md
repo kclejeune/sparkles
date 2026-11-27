@@ -2372,8 +2372,8 @@ a long triple term, is not met a second time after later rows' results are retai
 miss that had not finished is evaluated again, including an earlier row whose miss was
 refused while a later row's miss finished on another worker. Each
 remaining key is evaluated the ordinary way at its first row, in row order, beside the
-values of the finished misses and any intermediate term that its own refused attempt
-interned, and a refusal there fails the query. On one worker the finished misses are the
+values of the finished misses and any intermediate term already interned by a refused
+miss, and a refusal there fails the query. On one worker the finished misses are the
 keys whose first rows come before the refused one, which the evaluation without the map
 has also retained at that row. A batch therefore fits the budget whenever its evaluation
 without the map fits, except in the intra-row case where an unfinished miss takes a large
