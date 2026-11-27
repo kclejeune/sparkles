@@ -136,11 +136,11 @@ fn columns_bytes(columns: &[String]) -> u64 {
 
 type WeightedRow = (Vec<Option<Term>>, i64);
 
-/// Decoded fallback rows with the scratch credit that covers them. The rows are
-/// declared first so that they are freed before the credit returns.
-struct ChargedRows {
-    rows: Vec<WeightedRow>,
-    lease: crate::incr::budget::ScratchLease,
+/// Decoded rows with the scratch credit that covers them. The rows are declared
+/// first so that they are freed before the credit returns.
+pub(super) struct ChargedRows {
+    pub(super) rows: Vec<WeightedRow>,
+    pub(super) lease: crate::incr::budget::ScratchLease,
 }
 type HistoryOverlay<'a> = (&'a mut FxHashMap<Vec<Option<Term>>, i64>, &'a [WeightedRow]);
 

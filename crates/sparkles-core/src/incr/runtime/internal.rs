@@ -261,10 +261,18 @@ impl InternalCircuit {
         if let Some(e) = status_error(&st.status) {
             return Err(e);
         }
-        let (rows, mut lease) = st.circuit.rows_charged()?;
-        let columns = st.circuit.columns_charged(&mut lease)?;
-        lease.try_reserve(std::mem::size_of_val(rows.as_slice()) as u64)?;
-        let rows = rows
+        // The decoded rows stay with the scratch credit that covers them in an owner
+        // that frees the rows first, so no error return below releases the credit
+        // while the rows are still allocated.
+        let mut charged = st
+            .circuit
+            .rows_charged()
+            .map(|(rows, lease)| super::read::ChargedRows { rows, lease })?;
+        let columns = st.circuit.columns_charged(&mut charged.lease)?;
+        charged
+            .lease
+            .try_reserve(std::mem::size_of_val(charged.rows.as_slice()) as u64)?;
+        let rows = std::mem::take(&mut charged.rows)
             .into_iter()
             .map(|(r, w)| (r, w.unsigned_abs()))
             .collect();
@@ -273,7 +281,7 @@ impl InternalCircuit {
             columns,
             rows,
             _memory: internal::RowsMemory {
-                _lease: st.circuit.detach_scratch_lease(&mut lease),
+                _lease: st.circuit.detach_scratch_lease(&mut charged.lease),
             },
         })
     }
