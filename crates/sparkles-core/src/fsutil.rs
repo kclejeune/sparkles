@@ -78,7 +78,30 @@ pub(crate) fn write_atomic_via_then(
 /// directory. Callers must sync the parent to make the replacement durable.
 /// Returning an error means the replacement was not published.
 pub fn replace_via(path: &Path, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
-    let written = write_synced(tmp, bytes).and_then(|()| std::fs::rename(tmp, path));
+    replace_with(path, tmp, |file| file.write_all(bytes))
+}
+
+/// Stream a durable replacement without first collecting its contents in memory.
+pub fn write_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    replace_with(path, &path.with_extension("tmp"), write)?;
+    sync_dir(path.parent().unwrap_or(Path::new(".")))
+}
+
+fn replace_with(
+    path: &Path,
+    tmp: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let written = (|| {
+        let mut file = File::create(tmp)?;
+        write(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(tmp, path)
+    })();
     if written.is_err() {
         let _ = std::fs::remove_file(tmp);
     }

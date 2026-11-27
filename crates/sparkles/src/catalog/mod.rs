@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -191,7 +191,44 @@ struct RegistryEntry {
 struct Detached {
     id: Option<Uuid>,
     revision: Option<Uuid>,
-    reasoning: Option<crate::reasoning::ReasoningRecord>,
+    reasoning: DetachedReasoning,
+}
+
+/// A row left closed by deferred startup already has a durable record in the
+/// registry. Keep only its location until a legacy root needs that fallback.
+enum DetachedReasoning {
+    Registry(RegistryRecord),
+    Current(Option<Box<crate::reasoning::ReasoningRecord>>),
+}
+
+/// A slice of the registry file opened at startup. Atomic saves can replace
+/// its directory entry while a deferred dataset still needs the original bytes.
+struct RegistryRecord {
+    file: Arc<Mutex<File>>,
+    offset: u64,
+    len: u64,
+}
+
+impl DetachedReasoning {
+    fn read(&self) -> Result<Option<crate::reasoning::ReasoningRecord>> {
+        match self {
+            Self::Current(record) => Ok(record.as_deref().cloned()),
+            Self::Registry(record) => {
+                let mut file = record.file.lock();
+                file.seek(SeekFrom::Start(record.offset))?;
+                let reader = BufReader::new((&mut *file).take(record.len));
+                serde_json::from_reader(reader)
+                    .map(Some)
+                    .map_err(|e| Error::Corrupt(format!("{CONFIG_FILE}: {e}")))
+            }
+        }
+    }
+}
+
+impl From<Option<crate::reasoning::ReasoningRecord>> for DetachedReasoning {
+    fn from(record: Option<crate::reasoning::ReasoningRecord>) -> Self {
+        Self::Current(record.map(Box::new))
+    }
 }
 
 /// Why a registered dataset is closed: the message, which names paths, and a stable
@@ -354,7 +391,8 @@ impl Catalog {
         let lock = lock_dir(&dir)?;
         let catalog_dir = RecoveryDir::open(&dir)?;
         let intents = delete::read_intents_at(&catalog_dir)?;
-        let registry = match read_registry_at(&catalog_dir)? {
+        let mut records = BTreeMap::new();
+        let registry = match read_registry_with_locations(&catalog_dir, Some(&mut records))? {
             Some(registry) => registry,
             None => {
                 let staged_swaps =
@@ -428,7 +466,9 @@ impl Catalog {
                     Detached {
                         id: e.id,
                         revision: e.revision,
-                        reasoning: e.reasoning,
+                        reasoning: records
+                            .remove(&e.name)
+                            .map_or_else(|| None.into(), DetachedReasoning::Registry),
                     },
                 );
                 catalog.inner.opening.lock().insert(e.name.clone());
@@ -506,13 +546,15 @@ impl Catalog {
         let _g = self.manage_internal();
         let opened = opened.and_then(|ds| {
             if ds.state().read_reasoning().is_none() {
-                let reasoning = self
+                let fallback = self
                     .inner
                     .detached
                     .lock()
                     .get(name)
-                    .and_then(|d| d.reasoning.clone());
-                ds.state().restore_reasoning(reasoning)?;
+                    .map(|entry| entry.reasoning.read())
+                    .transpose()?
+                    .flatten();
+                ds.state().restore_reasoning(fallback)?;
             }
             Ok(ds)
         });
@@ -1273,7 +1315,7 @@ impl Catalog {
             Detached {
                 id: Some(dataset.dataset_id()),
                 revision,
-                reasoning: dataset.reasoning_record(),
+                reasoning: dataset.reasoning_record().into(),
             },
         );
     }
@@ -1350,7 +1392,7 @@ impl Catalog {
             Detached {
                 id: Some(id),
                 revision,
-                reasoning,
+                reasoning: reasoning.into(),
             },
         );
         self.inner.refused.lock().insert(
@@ -1470,7 +1512,7 @@ impl Catalog {
                     Detached {
                         id: Some(id),
                         revision,
-                        reasoning: ds.reasoning_record(),
+                        reasoning: ds.reasoning_record().into(),
                     },
                 );
             }
@@ -1537,7 +1579,7 @@ impl Catalog {
                     Detached {
                         id: Some(id),
                         revision: rev,
-                        reasoning,
+                        reasoning: reasoning.into(),
                     },
                 );
                 Error::Corrupt(format!(
@@ -1780,7 +1822,7 @@ impl Catalog {
         let _g = self.manage()?;
         self.save_locked()
     }
-    fn registry_locked(&self) -> Registry {
+    fn registry_locked(&self) -> Result<Registry> {
         let mut datasets: Vec<RegistryEntry> = self
             .inner
             .entries
@@ -1805,12 +1847,12 @@ impl Catalog {
                     kind: DatasetKind::Persistent,
                     id: d.id,
                     revision: d.revision,
-                    reasoning: d.reasoning.clone(),
+                    reasoning: d.reasoning.read()?,
                 });
             }
         }
         datasets.sort_by(|a, b| a.name.cmp(&b.name));
-        Registry { datasets }
+        Ok(Registry { datasets })
     }
     fn replace_registry_locked(&self, dir: &Path, registry: &Registry) -> Result<()> {
         #[cfg(test)]
@@ -1828,13 +1870,13 @@ impl Catalog {
 
     fn save_locked(&self) -> Result<()> {
         let Some(dir) = self.dir() else { return Ok(()) };
-        self.replace_registry_locked(dir, &self.registry_locked())?;
+        self.replace_registry_locked(dir, &self.registry_locked()?)?;
         sync_dir(dir)
     }
 
     fn commit_delete_registry(&self, dir: &Path) -> std::result::Result<(), RegistryCommitError> {
         delete_fail_point(DELETE_SAVE_BEFORE_REPLACE)
-            .and_then(|()| self.replace_registry_locked(dir, &self.registry_locked()))
+            .and_then(|()| self.replace_registry_locked(dir, &self.registry_locked()?))
             .map_err(RegistryCommitError::BeforeReplace)?;
         delete_fail_point(DELETE_SAVE_SYNC)
             .and_then(|()| sync_dir(dir))
@@ -1850,7 +1892,9 @@ impl Catalog {
         revision: Option<Uuid>,
     ) -> std::result::Result<Dataset, RegistryCommitError> {
         let dir = self.dir().expect("persistent catalog");
-        let mut registry = self.registry_locked();
+        let mut registry = self
+            .registry_locked()
+            .map_err(RegistryCommitError::BeforeReplace)?;
         let entry = RegistryEntry {
             name: name.into(),
             kind: DatasetKind::Persistent,
@@ -1909,7 +1953,7 @@ impl Catalog {
             Detached {
                 id: Some(ds.dataset_id()),
                 revision: entry.revision,
-                reasoning: ds.reasoning_record(),
+                reasoning: ds.reasoning_record().into(),
             },
         );
         Ok(Some(ds))
@@ -1931,7 +1975,7 @@ impl Catalog {
         };
         if let Some(dir) = self.dir() {
             if needs_save {
-                let mut registry = self.registry_locked();
+                let mut registry = self.registry_locked()?;
                 let row = registry
                     .datasets
                     .iter_mut()
@@ -2104,6 +2148,13 @@ fn read_registry(dir: &Path) -> Result<Registry> {
 }
 
 fn read_registry_at(dir: &RecoveryDir) -> Result<Option<Registry>> {
+    read_registry_with_locations(dir, None)
+}
+
+fn read_registry_with_locations(
+    dir: &RecoveryDir,
+    locations: Option<&mut BTreeMap<String, RegistryRecord>>,
+) -> Result<Option<Registry>> {
     #[derive(Deserialize)]
     struct Header {
         format: Option<serde_json::Value>,
@@ -2143,6 +2194,42 @@ fn read_registry_at(dir: &RecoveryDir) -> Result<Option<Registry>> {
                 "duplicate dataset '{}' in {CONFIG_FILE}",
                 entry.name,
             )));
+        }
+    }
+    if let Some(locations) = locations
+        && registry
+            .datasets
+            .iter()
+            .any(|e| e.kind == DatasetKind::Persistent && e.reasoning.is_some())
+    {
+        // Borrow the raw JSON values to locate the validated records in the
+        // same immutable file. Nothing from the input buffer escapes this call.
+        #[derive(Deserialize)]
+        struct Spans<'a> {
+            #[serde(borrow)]
+            datasets: Vec<Row<'a>>,
+        }
+        #[derive(Deserialize)]
+        struct Row<'a> {
+            #[serde(borrow)]
+            reasoning: Option<&'a serde_json::value::RawValue>,
+        }
+        let spans: Spans<'_> = serde_json::from_slice(&bytes).map_err(corrupt)?;
+        let file = Arc::new(Mutex::new(file));
+        for (row, span) in registry.datasets.iter().zip(spans.datasets) {
+            if row.kind == DatasetKind::Persistent
+                && let Some(raw) = span.reasoning
+            {
+                let value = raw.get();
+                locations.insert(
+                    row.name.clone(),
+                    RegistryRecord {
+                        file: file.clone(),
+                        offset: (value.as_ptr().addr() - bytes.as_ptr().addr()) as u64,
+                        len: value.len() as u64,
+                    },
+                );
+            }
         }
     }
     Ok(Some(registry))
@@ -2453,6 +2540,59 @@ mod tests {
         BETWEEN_STATES.set(None);
         assert_eq!(seen.get(), 2);
         assert!(cat.get("a").is_some() && cat.refusal("bad").is_some());
+    }
+
+    #[test]
+    fn refused_deferred_record_stays_on_disk_and_survives_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let warning = "x".repeat(64 << 10);
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        for name in ["modern", "legacy"] {
+            let ds = cat.create(name, &Default::default()).unwrap();
+            ds.state()
+                .set_reasoning(Some(crate::reasoning::ReasoningRecord {
+                    warnings: vec![warning.clone()],
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+        cat.save().unwrap();
+        drop(cat);
+        std::fs::remove_file(dir.path().join("databases/legacy/reasoning.json")).unwrap();
+        let (cat, pending) = Catalog::open_deferred(
+            dir.path(),
+            CatalogOptions {
+                memory: MemoryOptions {
+                    pool_bytes: Some(1024),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for name in &pending {
+            assert!(matches!(
+                cat.open_registered(name),
+                Err(Error::BudgetExceeded(_))
+            ));
+        }
+        assert_eq!(cat.closed(), ["legacy", "modern"]);
+        assert_eq!(cat.pool().unwrap().domain_stats().work_reserved, 0);
+        assert!(
+            cat.inner
+                .detached
+                .lock()
+                .values()
+                .all(|entry| matches!(entry.reasoning, DetachedReasoning::Registry(_))),
+            "a refused record is still resident in the detached catalog"
+        );
+        cat.save().unwrap();
+        drop(cat);
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        for name in pending {
+            let ds = cat.get(&name).unwrap();
+            assert_eq!(ds.reasoning_record().unwrap().warnings, [warning.as_str()]);
+        }
     }
 
     #[test]

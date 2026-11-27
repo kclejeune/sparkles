@@ -1736,32 +1736,35 @@ pub fn fetch_imports_admitted(
     refresh: &[String],
     opts: &sparkles_core::sparql::QueryOptions,
 ) -> anyhow::Result<(Fetched, FetchMemory)> {
-    fetch_imports_with_load(store, inputs, refresh, opts, |store, update, opts| {
+    fetch_imports_with_load(store, inputs, refresh.iter(), opts, |_, update, opts| {
         sparkles_core::sparql::update::update(store, update, opts).map(|_| ())
     })
 }
 
-fn fetch_imports_with_load(
+/// Fetch with a caller that tracks the identity of each independent LOAD.
+#[doc(hidden)]
+pub fn fetch_imports_with_load<'a>(
     store: &Store,
     inputs: &Inputs,
-    refresh: &[String],
+    refresh: impl Iterator<Item = &'a String>,
     opts: &sparkles_core::sparql::QueryOptions,
     mut execute: impl FnMut(
-        &Store,
+        &str,
         &str,
         &sparkles_core::sparql::QueryOptions,
     ) -> sparkles_core::Result<()>,
 ) -> anyhow::Result<(Fetched, FetchMemory)> {
+    let mut refresh = refresh.peekable();
     let parent = opts
         .grant
         .as_ref()
-        .map(|grant| grant.memory_parent())
+        .map(|grant| grant.report_memory_parent())
         .or_else(|| opts.pool.as_ref().map(|pool| pool.work_parent()));
     let budget = Budget::with_parent(opts.max_memory_bytes.map(|bytes| bytes as usize), parent);
     let mut report = Held::new(&budget);
     let mut out = Fetched::default();
     if inputs.imports != ImportMode::Fetch {
-        if !refresh.is_empty() {
+        if refresh.peek().is_some() {
             push_fetch_warning(
                 &mut out,
                 &mut report,
@@ -1833,7 +1836,7 @@ fn fetch_imports_with_load(
             max_memory_bytes: opts.max_memory_bytes.map(|_| budget.available() as u64),
             ..opts.clone()
         };
-        let error = match execute(store, &u, &load_opts) {
+        let error = match execute(iri, &u, &load_opts) {
             Ok(()) => {
                 tracing::info!(import = iri, location, "fetched an import");
                 report.absorb(success);
@@ -1995,7 +1998,7 @@ mod controlled_budget_tests {
             let error = fetch_imports_with_load(
                 &store,
                 &inputs,
-                &[],
+                [].iter(),
                 &QueryOptions {
                     max_memory_bytes: Some(limit),
                     ..Default::default()

@@ -111,14 +111,19 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         if qopts.pool.is_none() && qopts.grant.is_none() {
             qopts.pool = state.pool.clone();
         }
-        let refresh = if req.refresh_imports {
-            fetched_before
-        } else {
-            &[]
-        };
-        let (fetched, memory) =
-            sparkles_reasoner::inputs::fetch_imports_admitted(store, &req.inputs, refresh, &qopts)
-                .map_err(|e| from_anyhow(e.context("fetching imports")))?;
+        let pending = state.pending_imports.lock().loaded.clone();
+        let refresh = fetched_before
+            .iter()
+            .chain(pending.names().filter(|iri| !fetched_before.contains(iri)))
+            .filter(|_| req.refresh_imports);
+        let (fetched, memory) = sparkles_reasoner::inputs::fetch_imports_with_load(
+            store,
+            &req.inputs,
+            refresh,
+            &qopts,
+            |iri, update, opts| ds.load_reasoning_import(iri, update, opts),
+        )
+        .map_err(|e| from_anyhow(e.context("fetching imports")))?;
         (fetched, Some(memory))
     } else {
         (Fetched::default(), None)
@@ -154,6 +159,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     };
     let superseded = AtomicBool::new(false);
     let done = AtomicBool::new(false);
+    let pending = state.pending_imports.lock().loaded.clone();
     let mut prepared = None;
     let result = std::thread::scope(|s| {
         struct SignalDone<'a>(&'a AtomicBool);
@@ -197,6 +203,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
                     state.pool.as_ref(),
                     resolved,
                     fetched_before,
+                    &pending,
                     &fetched,
                     warnings,
                 )?);
@@ -250,6 +257,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     record.auto = state.read_reasoning().as_ref().and_then(|r| r.auto.clone());
     let outcome = record.clone();
     state.set_reasoning_admitted(record, memory)?;
+    state.forget_recorded_imports(&pending)?;
     ctl.progress.report(1.0, "materialized");
     Ok(ReasonOutcome {
         report,
@@ -267,6 +275,7 @@ fn prepare_record_strings(
     pool: Option<&Arc<crate::sparql::pool::QueryPool>>,
     resolved: &sparkles_reasoner::inputs::Resolved,
     previous: &[String],
+    pending: &super::imports::PendingImports,
     fetched: &Fetched,
     warnings: &[String],
 ) -> Result<PreparedRecordStrings> {
@@ -278,7 +287,13 @@ fn prepare_record_strings(
     };
     let names = previous
         .iter()
-        .chain(fetched.fetched.iter().filter(|iri| !previous.contains(iri)))
+        .chain(pending.names().filter(|iri| !previous.contains(iri)))
+        .chain(
+            fetched
+                .fetched
+                .iter()
+                .filter(|iri| !previous.contains(iri) && !pending.names().any(|p| p == *iri)),
+        )
         .filter(imported);
     let warning_count = fetched.warnings.len() + warnings.len();
     let warnings = fetched.warnings.iter().chain(warnings);

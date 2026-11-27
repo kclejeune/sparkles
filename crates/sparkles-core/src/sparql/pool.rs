@@ -393,6 +393,8 @@ pub struct PoolGrant {
     granted: AtomicU64,
     /// Sum of eager context contributions, live cursor charges and direct charges.
     used: AtomicU64,
+    /// Part of `used` whose leases can outlive the request and repay the pool directly.
+    surviving: AtomicU64,
     /// the most the grant has held
     peak: AtomicU64,
     /// serializes growth and trimming of this grant
@@ -414,6 +416,7 @@ impl PoolGrant {
             pool,
             granted: AtomicU64::new(bytes),
             used: AtomicU64::new(0),
+            surviving: AtomicU64::new(0),
             peak: AtomicU64::new(bytes),
             resize: Mutex::new(()),
         }
@@ -603,7 +606,8 @@ impl PoolGrant {
 
 impl Drop for PoolGrant {
     fn drop(&mut self) {
-        self.pool.release(*self.granted.get_mut());
+        self.pool
+            .release(*self.granted.get_mut() - *self.surviving.get_mut());
     }
 }
 

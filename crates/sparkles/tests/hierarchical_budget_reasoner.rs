@@ -1189,6 +1189,136 @@ fn memory_with_reasoning_pool(pool: Arc<QueryPool>) -> Dataset {
 }
 
 #[test]
+fn admitted_fetch_report_outlives_its_request_grant() {
+    use sparkles::reasoning::reasoner::inputs::fetch_imports_admitted;
+    use sparkles::sparql::pool::{GRANULE, INITIAL_GRANT};
+
+    let pool = QueryPool::new(INITIAL_GRANT);
+    let grant = Arc::new(pool.try_grant(INITIAL_GRANT).unwrap());
+    let ds = Dataset::memory();
+    let mut request = import_warning_request(&ds);
+    request.load.grant = Some(grant.clone());
+    let other = grant.memory_parent().reserve(4096).unwrap();
+    let (report, credit) =
+        fetch_imports_admitted(ds.store(), &request.inputs, &[], &request.load).unwrap();
+    assert_eq!(report.warnings.len(), 1);
+    drop(request);
+    drop(grant);
+    assert!(pool.domain_stats().work_reserved >= credit.bytes() as u64 + other.bytes());
+    drop(other);
+    assert_eq!(pool.domain_stats().work_reserved, credit.bytes() as u64);
+    assert!(pool.try_grant(GRANULE).is_some());
+    drop(report);
+    drop(credit);
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+}
+
+#[test]
+fn refused_import_record_can_refresh_the_document_on_retry() {
+    use sparkles::reasoning::reasoner::ImportMode;
+
+    // Refuse the name before LOAD, then allow LOAD and refuse the complete
+    // record (including a long warning) before the inference commit.
+    for (free, committed) in [(100, false), (24 << 10, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+        let options = DatasetOptions {
+            pool: Some(pool.clone()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        };
+        let ds = Dataset::open_with(&root, options.clone()).unwrap();
+        let previous = ds.reasoning().run(&ReasonRequest::default()).unwrap();
+        let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+        ds.update(&format!(
+            "INSERT DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+        ))
+        .unwrap();
+        let source = dir.path().join("import.ttl");
+        std::fs::write(&source, "<urn:s> <urn:p> <urn:first> .").unwrap();
+        let mut request = ReasonRequest::default();
+        request.inputs.imports = ImportMode::Fetch;
+        ds.update("INSERT DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }")
+            .unwrap();
+        request
+            .inputs
+            .location_mapping
+            .names
+            .insert("urn:missing".into(), "x".repeat(32 << 10));
+        request
+            .inputs
+            .location_mapping
+            .names
+            .insert(iri.clone(), format!("file://{}", source.display()));
+        let blocker = pool.retained_parent().reserve(MIB - free).unwrap();
+        let error = ds.reasoning().run(&request).unwrap_err();
+        assert!(is_server_memory(&error), "{error}");
+        assert_eq!(
+            ds.reasoning_record().unwrap().commit,
+            previous.record.commit
+        );
+        assert_eq!(
+            ds.query(&format!(
+                "ASK {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:first> }} }}"
+            ))
+            .unwrap()
+            .boolean,
+            committed
+        );
+        drop(ds);
+        drop(blocker);
+        std::fs::write(source, "<urn:s> <urn:p> <urn:updated> .").unwrap();
+        let ds = Dataset::open_with(&root, options).unwrap();
+        request.refresh_imports = true;
+        let outcome = ds.reasoning().run(&request).unwrap();
+        assert!(!root.join("reasoning-imports.json").exists());
+        assert_eq!(outcome.record.fetched_imports.len(), 1);
+        assert_eq!(outcome.record.fetched_imports[0], iri);
+        assert!(
+            ds.query(&format!(
+                "ASK {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:updated> }} }}"
+            ))
+            .unwrap()
+            .boolean
+        );
+        assert!(
+            !ds.query(&format!(
+                "ASK {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:first> }} }}"
+            ))
+            .unwrap()
+            .boolean
+        );
+    }
+}
+
+#[test]
+fn reopen_reconciles_an_interrupted_import_with_the_recovered_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    ds.update("INSERT DATA { GRAPH <urn:committed> { <urn:s> <urn:p> <urn:o> } }")
+        .unwrap();
+    drop(ds);
+    let path = dir.path().join("reasoning-imports.json");
+    let mut journal = serde_json::json!({
+        "format": 2,
+        "imports": [],
+        "publishing": ["urn:committed", "urn:aborted"]
+    });
+    std::fs::write(&path, journal.to_string()).unwrap();
+    assert!(Dataset::open(dir.path()).is_err());
+    journal["format"] = 1.into();
+    std::fs::write(&path, journal.to_string()).unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(recovered["imports"], serde_json::json!(["urn:committed"]));
+    assert_eq!(recovered["publishing"], serde_json::json!([]));
+    ds.reasoning().clear().unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
 fn fetch_record_uses_retained_credit_and_releases_the_request_grant() {
     use sparkles::reasoning::reasoner::fetch_imports;
     use sparkles::sparql::pool::{GRANULE, INITIAL_GRANT};

@@ -16,6 +16,7 @@ pub mod explain;
 pub mod freshness;
 #[cfg(feature = "reasoning")]
 pub mod hypotheses;
+pub(crate) mod imports;
 #[cfg(feature = "reasoning")]
 pub mod justify;
 #[cfg(feature = "reasoning")]

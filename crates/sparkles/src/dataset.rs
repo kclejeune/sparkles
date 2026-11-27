@@ -190,6 +190,7 @@ pub struct DatasetState {
     pub graphql: sparkles_graphql::Catalog,
     /// the record of the last materialization (`reasoning.json`)
     reasoning: RwLock<Arc<RecordedReasoning>>,
+    pub(crate) pending_imports: Mutex<crate::reasoning::imports::ImportJournal>,
     /// the closure of the last materialization, for the next incremental run
     #[cfg(feature = "reasoning")]
     pub closure: sparkles_reasoner::Cache,
@@ -317,6 +318,8 @@ impl DatasetState {
     /// Branches share both the immutable record and the pool that backs it.
     pub(crate) fn inherit_reasoning(&self, source: &Self) {
         self.replace_reasoning(source.recorded_reasoning());
+        let pending = source.pending_imports.lock().loaded.clone();
+        self.pending_imports.lock().loaded = pending;
     }
 
     fn replace_reasoning(&self, record: Arc<RecordedReasoning>) {
@@ -327,7 +330,14 @@ impl DatasetState {
     /// Update the reasoning record in memory and, for a persistent dataset, in its
     /// directory.
     pub fn set_reasoning(&self, record: Option<ReasoningRecord>) -> Result<()> {
-        self.write_reasoning(RecordedReasoning::admit(record, self.pool.as_ref())?)
+        let clear = record
+            .is_none()
+            .then(|| self.pending_imports.lock().loaded.clone());
+        self.write_reasoning(RecordedReasoning::admit(record, self.pool.as_ref())?)?;
+        if let Some(pending) = clear {
+            self.forget_recorded_imports(&pending)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "reasoning")]
@@ -448,7 +458,7 @@ impl Dataset {
         let store = store.into();
         let reasoning = Self::admit_saved_reasoning(&store, &opts).unwrap_or_else(|error| {
             tracing::warn!(%error, "could not admit the dataset's saved reasoning record");
-            RecordedReasoning::default()
+            Default::default()
         });
         Self::from_store_and_record(store, opts, reasoning)
     }
@@ -462,15 +472,28 @@ impl Dataset {
         Ok(Self::from_store_and_record(store, opts, reasoning))
     }
 
-    fn admit_saved_reasoning(store: &Store, opts: &DatasetOptions) -> Result<RecordedReasoning> {
+    fn admit_saved_reasoning(
+        store: &Store,
+        opts: &DatasetOptions,
+    ) -> Result<(RecordedReasoning, crate::reasoning::imports::PendingImports)> {
         let record = store.root().and_then(crate::reasoning::read_record);
-        RecordedReasoning::admit(record, opts.pool.as_ref())
+        let pending = store
+            .root()
+            .map(|root| {
+                crate::reasoning::imports::PendingImports::read(root, store, opts.pool.as_ref())
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok((
+            RecordedReasoning::admit(record, opts.pool.as_ref())?,
+            pending,
+        ))
     }
 
     fn from_store_and_record(
         store: StoreHandle,
         opts: DatasetOptions,
-        reasoning: RecordedReasoning,
+        (reasoning, pending): (RecordedReasoning, crate::reasoning::imports::PendingImports),
     ) -> Dataset {
         let shown = || {
             opts.name
@@ -563,6 +586,7 @@ impl Dataset {
             #[cfg(feature = "graphql")]
             graphql,
             reasoning: RwLock::new(Arc::new(reasoning)),
+            pending_imports: Mutex::new(pending.into()),
             #[cfg(feature = "reasoning")]
             closure: sparkles_reasoner::Cache::new(opts.closure_cache_triples)
                 .with_retained_parent(retained_parent),

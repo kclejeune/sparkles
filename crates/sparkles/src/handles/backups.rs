@@ -36,6 +36,12 @@ impl Backups<'_> {
         captured: impl FnOnce(&crate::store::BackupCapture),
     ) -> Result<BackupSummary> {
         ctl.check()?;
+        let pending = self
+            .ds
+            .store()
+            .root()
+            .is_none()
+            .then(|| self.ds.state().pending_imports.lock().loaded.clone());
         let cap = if self.ds.store().root().is_some()
             && self.ds.store().snapshot().generation.linked().is_none()
         {
@@ -62,6 +68,14 @@ impl Backups<'_> {
         };
         captured(&cap);
         let mut extra = opts.extra.clone();
+        if let Some(pending) = pending
+            && pending.names().next().is_some()
+        {
+            extra.push((
+                crate::reasoning::imports::FILE.into(),
+                pending.backup_bytes()?,
+            ));
+        }
         if let Some(mut record) = self.ds.reasoning_record()
             && record.commit.is_none_or(|c| c <= cap.commit.seq)
         {
