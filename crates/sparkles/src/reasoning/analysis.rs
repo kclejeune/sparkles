@@ -325,7 +325,7 @@ fn decode_fact(
 
 /// A decoding scratch that passes the limit of its analysis share has passed the
 /// analysis's memory limit. A refusal of the shared server memory stays as it is.
-fn share_error(error: Error) -> Error {
+pub(crate) fn share_error(error: Error) -> Error {
     match error {
         Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory => budget(format!(
             "the entailment analysis passed its memory limit: {b}"
@@ -470,7 +470,7 @@ pub(crate) fn stored(
                 memory_parent: pool.as_ref().map(|p| p.work_parent()),
             },
         )
-        .map_err(|error| control.error(crate::handles::from_anyhow(error)))?;
+        .map_err(|error| diagnostic_error(control, error))?;
     if !summary_complete
         && let Some(check) = diagnostics
             .checks
@@ -511,6 +511,20 @@ fn materialization_error(control: &AnalysisControl, error: anyhow::Error) -> Err
     } else {
         control.error(crate::handles::from_anyhow(error))
     }
+}
+
+/// A diagnostic report that passes the limit of its analysis share, either its own
+/// local limit or an enclosing memory share, has passed the analysis's memory limit.
+/// Cancellation, the deadline and a refusal of the shared server memory or of graph
+/// ownership keep their own errors.
+pub(crate) fn diagnostic_error(control: &AnalysisControl, error: anyhow::Error) -> Error {
+    if let Err(stopped) = control.check() {
+        return stopped;
+    }
+    if let Some(error) = error.downcast_ref::<sparkles_reasoner::MemoryLimitExceeded>() {
+        return budget(error.to_string());
+    }
+    control.error(share_error(crate::handles::from_anyhow(error)))
 }
 
 /// Full-closure fallback on a private writable copy. Data and blank identities come
@@ -744,7 +758,7 @@ fn analyze_with_cache_limit(
                 memory_parent: pool.as_ref().map(|p| p.work_parent()),
             },
         )
-        .map_err(|error| control.error(crate::handles::from_anyhow(error)))?;
+        .map_err(|error| diagnostic_error(control, error))?;
     control.check()?;
     for finding in &diagnostics.findings {
         hold(share, &mut bytes, diagnostic_bytes(finding))?;
@@ -975,5 +989,40 @@ mod review_regressions {
         };
         let error = materialization_error(&control, anyhow::Error::new(capture));
         assert!(matches!(error, Error::Cancelled), "{error}");
+    }
+
+    #[test]
+    fn diagnostic_refusals_keep_cancellation_and_shared_memory_and_map_local_memory() {
+        let refusal = |kind| {
+            anyhow::Error::new(Error::BudgetExceeded(crate::Budget {
+                kind,
+                limit: 1024,
+                requested: 2048,
+            }))
+        };
+        let is_budget = |error: &Error| matches!(error, Error::Component(c) if c.code == super::super::explain::REASONING_BUDGET);
+        let control = AnalysisControl::new(&AnalysisOptions::default()).unwrap();
+        let local = sparkles_reasoner::MemoryLimitExceeded {
+            limit: 1024,
+            context: " while retaining the report scope".into(),
+        };
+        let error = diagnostic_error(&control, anyhow::Error::new(local.clone()));
+        assert!(is_budget(&error), "{error:?}");
+        let error = diagnostic_error(&control, refusal(crate::BudgetKind::Memory));
+        assert!(is_budget(&error), "{error:?}");
+        let error = diagnostic_error(&control, refusal(crate::BudgetKind::ServerMemory));
+        assert!(
+            matches!(&error, Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::ServerMemory),
+            "{error:?}"
+        );
+        let caller = Arc::new(AtomicBool::new(false));
+        let control = AnalysisControl::new(&AnalysisOptions {
+            cancel: Some(caller.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        caller.store(true, Ordering::Relaxed);
+        let error = diagnostic_error(&control, anyhow::Error::new(local));
+        assert!(matches!(error, Error::Cancelled), "{error:?}");
     }
 }

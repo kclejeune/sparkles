@@ -1258,10 +1258,12 @@ impl Reuse {
     /// value of each slot whose miss finished or [`UNEVALUATED`]. A finished miss is not
     /// evaluated again, so the transient memory of its evaluation, such as a large decode,
     /// is not met a second time once later rows' results are retained. Each other slot is
-    /// evaluated the ordinary way at its first row, in row order, so its evaluation meets
-    /// the retained terms that the evaluation without the map has at that row, and a
-    /// refusal now fails the query as it would without the map. The two vectors stay
-    /// within the cursor's scratch and output charges of the batch.
+    /// evaluated the ordinary way at its first row, in row order, beside the finished
+    /// values and any intermediate term its refused attempt interned (roadmap item 1322),
+    /// and a refusal now fails the query. On one worker the finished values are those of
+    /// the earlier rows, which the evaluation without the map also retains there. On
+    /// several they can include later rows. The two vectors stay within the cursor's
+    /// scratch and output charges of the batch.
     fn finish_refused(
         &mut self,
         ctx: &Ctx,

@@ -1099,7 +1099,7 @@ pub fn diagnose(
                 .or_else(|| state.pool.as_ref().map(|p| p.work_parent())),
         },
     )
-    .map_err(|error| control.error(error))?;
+    .map_err(|error| control.error(analysis::share_error(error)))?;
     let program = if options.inferences && (analysis.program.is_some() || record.is_some()) {
         analysis::program(dataset, &analysis)?
     } else {

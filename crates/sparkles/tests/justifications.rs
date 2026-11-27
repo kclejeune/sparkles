@@ -458,3 +458,43 @@ fn justified_diagnostics_cannot_disclose_a_denied_inferred_graph() {
         "a denied inferred graph disclosed a finding"
     );
 }
+
+/// A named scope whose name passes the justified diagnostics' report share is a
+/// refusal of the analysis's memory bounds, not a malformed request.
+#[test]
+fn justified_diagnostic_scope_beyond_its_share_is_a_reasoning_budget_refusal() {
+    use sparkles::reasoning::analysis::AnalysisOptions;
+    let graph = format!("http://ex.org/graph/{}", "g".repeat(600_000));
+    let (_dir, dataset) = open(&format!(
+        "<{graph}> {{ ex:Cat owl:disjointWith ex:Dog . ex:tom a ex:Cat, ex:Dog . }}"
+    ));
+    let options = DiagnoseOptions {
+        checks: vec!["disjoint-classes".into()],
+        graphs: vec![graph.clone()],
+        ..Default::default()
+    };
+    // The scope is valid: with room for the report its finding is justified.
+    let report = dataset
+        .reasoning()
+        .diagnostics_justified(&options, &AnalysisOptions::default(), 500)
+        .unwrap();
+    assert_eq!(report.diagnostics.report.findings.len(), 1);
+    assert_eq!(report.diagnostics.report.graphs, vec![graph.clone()]);
+    // The report has a sixteenth of the analysis limit, which the scope alone passes.
+    let max_memory = 16 * 1024 * 1024;
+    let report_limit = max_memory / 16;
+    assert!(graph.len() * 2 + 32 > report_limit);
+    let analysis = AnalysisOptions {
+        max_memory: Some(max_memory),
+        ..Default::default()
+    };
+    let error = dataset
+        .reasoning()
+        .diagnostics_justified(&options, &analysis, 500)
+        .unwrap_err();
+    assert!(
+        matches!(&error, sparkles::Error::Component(c) if c.code == "reasoning-budget"
+            && c.message.contains(&format!("memory limit of {report_limit} bytes"))),
+        "{error:?}"
+    );
+}

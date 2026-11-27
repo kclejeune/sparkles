@@ -2371,16 +2371,19 @@ evaluated again, so a large transient allocation of a finished miss, such as the
 a long triple term, is not met a second time after later rows' results are retained. A
 miss that had not finished is evaluated again, including an earlier row whose miss was
 refused while a later row's miss finished on another worker. Each
-remaining key is evaluated the ordinary way at its first row, in row order, where it meets
-the retained terms that the evaluation without the map has at that row, and a refusal
-there fails the query as it would without the map. On one worker a batch therefore fits
-the budget whenever its evaluation without the map fits, except in the intra-row case
-where an unfinished miss takes a large transient allocation, interns an intermediate
-query-local term, and then meets a memory refusal later in the same expression so that
-retrying that row repeats the transient allocation beside the retained intermediate term
-(tracked in item 1322). On several workers the finished
-misses are those that completed while the refusal stopped the others, an order that the
-parallel evaluation without the map can also take. A geometry constructor keeps the charge of each
+remaining key is evaluated the ordinary way at its first row, in row order, beside the
+values of the finished misses and any intermediate term that its own refused attempt
+interned, and a refusal there fails the query. On one worker the finished misses are the
+keys whose first rows come before the refused one, which the evaluation without the map
+has also retained at that row. A batch therefore fits the budget whenever its evaluation
+without the map fits, except in the intra-row case where an unfinished miss takes a large
+transient allocation, interns an intermediate query-local term, and then meets a memory
+refusal later in the same expression so that retrying that row repeats the transient
+allocation beside the retained intermediate term (tracked in item 1322). On several
+workers the finished misses are those that completed while the refusal stopped the
+others, an order that the parallel evaluation without the map can also take. They can
+include later rows, so the retry of an earlier row also meets a later row's retained
+result. A geometry constructor keeps the charge of each
 geometry it builds until the query ends, so an expression that can call one, directly or
 through `fn:apply` or `afn:eval`, never enters the map, and item 1321 tracks a releasable
 charge that would admit it. A CRS warning that the budget

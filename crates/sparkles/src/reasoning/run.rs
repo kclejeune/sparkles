@@ -710,7 +710,14 @@ pub(crate) fn diagnose_snapshot_with(
         typings.as_deref(),
         controls,
     )
-    .map_err(from_anyhow)?;
+    .map_err(|error| {
+        // a report that passes its own memory limit is a reasoning budget refusal,
+        // not a malformed request
+        match error.downcast_ref::<sparkles_reasoner::MemoryLimitExceeded>() {
+            Some(limit) => super::analysis::budget(limit.to_string()),
+            None => from_anyhow(error),
+        }
+    })?;
     let inferences = record
         .filter(|_| opts.inferences)
         .map(|r| (r.profile.clone(), freshness(r, store, commit)));
