@@ -249,8 +249,8 @@ completion.
   and cache accounting in items 88 and 210, idle server RSS, Python process RSS and
   full-text index footprint in item 40, parallel checkpoint reader tail and indexed
   group-commit overhead in items 170 and 448, FSST and front-coding lookup costs in
-  items 160 and 241, and dataset-local codec settings in item 343. Item 448 may run ahead
-  of Wave E whenever Wave A needs it as a prerequisite for item 833.
+  items 160 and 241, and dataset-local codec settings in item 343. Item 448 tracks the
+  remaining Intel verification for serial spatial writes and spatial reads under mixed load.
 
 ### Wave F: bindings parity, web UI and operational completion
 
@@ -277,11 +277,10 @@ post-release as [Release](#release) specifies.
 
 The waves run in parallel, and each has its own capacity. Waves A and C take capacity
 first, Wave B runs alongside them when a stream is free, and Waves D, E and F take
-ready items as earlier streams open. A prerequisite in a later wave, such as item 448
-for item 833, runs ahead of the work that depends on it. When work competes for gate,
-review or benchmark time, dependency order and readiness decide which goes first, not
-the wave it belongs to. The goal at the start of this section states what Sparkles
-optimizes for, and it does not order the waves.
+ready items as earlier streams open. A prerequisite in a later wave runs ahead of the
+work that depends on it. When work competes for gate, review or benchmark time,
+dependency order and readiness decide which goes first, regardless of wave. The goal
+at the start of this section states what Sparkles optimizes for.
 
 The waves group the work by delivery, and the tiers below rate its value. A wave can
 therefore hold items from several tiers. Within a wave, the order its section gives

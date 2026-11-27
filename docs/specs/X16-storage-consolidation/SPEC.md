@@ -1,8 +1,11 @@
 # X16: Storage consolidation
 
-> **Status:** implemented in part (Phases 1, 2, 3, 4, 5 apart from `imbl`, and items 846 and 1062). The plan below is ordered and audited against the code.
+> Phases 1 through 4, most of Phase 5, the unified WAL commit path of Phase 6, and
+> items 846 and 1062 have shipped.
 >
-> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Item 833 holds the remaining ready phase, item 1152 takes the last `imbl` maps of Phase 5, and items 479, 484, 830, 831, 832, 846 and 1062 are complete. The later candidate phases get their numbers when their prerequisites land.
+> [Roadmap item 455](../../ROADMAP.md) tracks the remaining work. Item 833 tracks Phase 6's
+> Intel writes benchmark, and item 1152 tracks the remaining `imbl` maps from Phase 5.
+> The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -360,11 +363,10 @@ item 448 measured at about 1,000 user instructions goes and the leader keeps
 `commit_direct`. It is a hypothesis until the writes benchmark measures it, and a
 measured slowdown that the screen accepts gets a follow-up item in the same change.
 
-The gates are those of Phase 2 with the writes benchmark of
-[docs/benchmarks/writes](../../benchmarks/writes/README.md) on a benchmark worker before
-the phase reports, since its goal is a single path at no cost in serial latency. Items
-446, 447, 448 and Phase 2 land first. This is concurrency and WAL-ordering work, and its
-planner implements it.
+The gates are those of Phase 2 plus the
+[writes benchmark](../../benchmarks/writes/README.md) on an Intel benchmark worker to
+verify serial latency. The implementation builds on items 446 and 447, the idle-writer
+optimization from item 448 and the shared publish tail from Phase 2.
 
 ### Phase 7. Partitioned vocabulary and per-range generations
 
@@ -418,8 +420,8 @@ the loader entry points of `store.rs`, and Phase 5 touches `index.rs`, `builder/
 and `io.rs`. Phases 1 and 2 both edit `store.rs` and `compaction.rs`, so the first to
 land merges forward and the second rebases its tests. Phase 3 follows Phase 1, since the
 cutoff removes the legacy branches that its readers would otherwise carry. Phase 6
-follows Phase 2 and item 448. Phase 7 follows item 14 and Phase 1. Phase 8 follows item
-40 and nothing in this spec.
+builds on Phase 2 and the idle-writer optimization from item 448. Phase 7 follows item
+14 and Phase 1. Phase 8 follows item 40 and nothing in this spec.
 
 ### Routine and judgment
 
@@ -502,9 +504,10 @@ written under the writer before a compaction or a bulk commit switches `CURRENT`
 generation switch never discards a control frame that no other file holds, and a switch
 installs a new log only at the version the store writes at that moment.
 
-A transaction that carries a control record drains the group and commits through the
-serial path. The group-of-one commit of item 833 must keep that rule, or carry control
-frames through the group's fence with the same durability order, which C26 §7.1 states.
+The writer drains earlier commits and encodes the control frame in the same WAL
+transaction as the quads. It seals and leads a fence for that commit alone while
+holding the writer lock. The fence makes the commit durable, then publishes the snapshot
+and then the control state. This order follows [C26 §7.1](../C26-durable-jobs-and-delivery.md#71-ordering-against-the-write-ahead-log-and-the-commit-tail).
 
 ## Decisions
 
@@ -546,8 +549,8 @@ follows them.
 
 ## Dependencies
 
-* Items 446 and 447 have landed. Item 448 and Phase 2 land before the group-of-one
-  commit of item 833.
+* The unified WAL commit path built on items 446 and 447, the idle-writer optimization
+  from item 448 and the shared publish tail from Phase 2.
 * Items 4 and 14 settle cold reads and per-block deltas before the layout changes of
   Phase 7.
 * Item 409 settles the cost of controlled preparation before the vocabulary scanners move
