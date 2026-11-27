@@ -156,7 +156,7 @@ impl Store {
             if seq == live.commit {
                 Ok(Some(live.clone()))
             } else {
-                limit.lock(history)?.get_with(seq, &limit)
+                limit.lock(history)?.get_checked(seq, step)
             }
         };
         let Some(mut prev) = read(*range.start())? else {
@@ -231,6 +231,78 @@ fn changed_in_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::{At, Retention};
+
+    fn insert_unrelated(store: &Store, value: u64) {
+        crate::sparql::update::update(
+            store,
+            &format!("INSERT DATA {{ <urn:s> <urn:p> {value} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+    }
+
+    fn probe_memory(store: &Store, after: u64, work: u64) -> Result<Option<bool>> {
+        store.probe_raw_history(
+            after,
+            store.head_commit().seq,
+            [HistoryPattern {
+                graph: "urn:watched",
+                predicate_object: None,
+            }],
+            work,
+            Instant::now() + std::time::Duration::from_secs(10),
+        )
+    }
+
+    #[test]
+    fn memory_probe_budgets_the_retention_window_baseline_lookup() {
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .set_retention(Retention {
+                keep_commits: Some(65),
+                ..Default::default()
+            })
+            .unwrap();
+        for value in 0..64 {
+            insert_unrelated(&store, value);
+        }
+        let after = store.head_commit().seq;
+        insert_unrelated(&store, 64);
+
+        assert!(matches!(
+            probe_memory(&store, after, 3),
+            Err(Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::Rows,
+                ..
+            }))
+        ));
+        assert_eq!(probe_memory(&store, after, 16).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn memory_probe_budgets_the_pin_scan_before_the_ring_fallback() {
+        let store = Store::in_memory(StoreOptions::default());
+        insert_unrelated(&store, 0);
+        for pin in 0..32 {
+            store
+                .create_snapshot(&format!("pin-{pin}"), &At::Head, None)
+                .unwrap();
+        }
+        insert_unrelated(&store, 1);
+        let after = store.head_commit().seq;
+        let _subscription = store.subscribe_deltas();
+        insert_unrelated(&store, 2);
+
+        assert!(matches!(
+            probe_memory(&store, after, 8),
+            Err(Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::Rows,
+                ..
+            }))
+        ));
+        assert_eq!(probe_memory(&store, after, 64).unwrap(), Some(false));
+    }
 
     #[test]
     fn wal_probe_bounds_a_large_unrelated_transaction_before_its_commit_marker() {
