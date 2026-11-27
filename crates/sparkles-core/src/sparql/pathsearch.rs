@@ -1579,7 +1579,7 @@ impl ReverseAlternatives {
         // Visits run first. Groups at the same bound take turns dispatching them.
         // Different suffix depths need separate return groups even at one node.
         let mut return_runs = Vec::new();
-        let mut runs_by_bound = HbMap::default();
+        let mut dispatched_visit = None;
         let mut next_runs = HbMap::default();
         let mut turn = 0u64;
         let mut tie_budget = tree.dist.len();
@@ -1592,7 +1592,8 @@ impl ReverseAlternatives {
         )?;
         loop {
             let mut charged_scan = false;
-            let next = match (queue.peek(), intervals.peek()) {
+            let ready = dispatched_visit.as_ref().or_else(|| queue.peek());
+            let take_ready = match (ready, intervals.peek()) {
                 (
                     Some(Reverse((bound, _, work, u, _, (start, end)))),
                     Some(Reverse((check, _, _, _, _, _))),
@@ -1603,22 +1604,31 @@ impl ReverseAlternatives {
                     let can_exit =
                         *work != Work::TreeChildren || tree.dist[u].saturating_sub(depth) < 2;
                     let hops = self.branches.get(u).map_or(1, |b| b.hops.len());
+                    let pop_cost = usize::from(dispatched_visit.is_none());
                     if tree.ancestry.is_none()
                         && can_exit
-                        && let Some(left) = tie_budget.checked_sub(1 + (hops.min(*end) - start))
+                        && let Some(left) =
+                            tie_budget.checked_sub(pop_cost + (hops.min(*end) - start))
                     {
                         tie_budget = left;
                         charged_scan = true;
-                        queue.pop()
+                        true
                     } else {
-                        intervals.pop()
+                        false
                     }
                 }
-                (Some(Reverse((bound, ..))), Some(Reverse((check, ..)))) if check < bound => {
-                    intervals.pop()
+                (Some(Reverse((bound, ..))), Some(Reverse((check, ..)))) => bound < check,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            let next = if take_ready {
+                dispatched_visit.take().or_else(|| queue.pop())
+            } else {
+                if let Some(visit) = dispatched_visit.take() {
+                    // The interval can schedule other work before this visit.
+                    base = push_heap(&mut queue, visit, &mut scratch, base)?;
                 }
-                (Some(_), _) => queue.pop(),
-                (None, _) => intervals.pop(),
+                intervals.pop()
             };
             let Some(Reverse((bound, _, work, u, prefix, (start, end)))) = next else {
                 break;
@@ -1706,12 +1716,16 @@ impl ReverseAlternatives {
                     #[cfg(test)]
                     test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.set(count.get() + 1));
                     (_, base) = insert_hb_map(&mut prefixes, v, next_prefix, &mut scratch, base)?;
-                    base = push_heap(
-                        &mut queue,
-                        Reverse((lower, (0, 0), Work::Visit, v, next_prefix, (0, usize::MAX))),
-                        &mut scratch,
-                        base,
-                    )?;
+                    let visit =
+                        Reverse((lower, (0, 0), Work::Visit, v, next_prefix, (0, usize::MAX)));
+                    if charged_scan && work == Work::TreeChildren && offset + 1 < end {
+                        // All tree children have the group's bound. Its visit
+                        // precedes every ready group, including the continuation.
+                        // Hand it directly to the next turn to save a heap pop.
+                        dispatched_visit = Some(visit);
+                    } else {
+                        base = push_heap(&mut queue, visit, &mut scratch, base)?;
+                    }
                     let remainder = match work {
                         Work::TreeChildren => &mut children,
                         Work::IndexedReturns => &mut indexed_returns,
@@ -1738,6 +1752,9 @@ impl ReverseAlternatives {
             // Reverse settlement order can interleave suffix depths. Link
             // disjoint runs of the same bound so only one is ready at a time
             // and resuming it never rescans runs belonging to other depths.
+            // Size the table for this scan. Enumerating later groups must not
+            // traverse the spare capacity left by an earlier high-degree node.
+            let mut runs_by_bound = HbMap::default();
             if !return_runs.is_empty() {
                 for (lower, start, end) in return_runs.drain(..).chain(indexed_returns.take()) {
                     poll()?;
@@ -1773,8 +1790,12 @@ impl ReverseAlternatives {
                 (Work::CheckIntervals, deferred),
             ];
             let mixed_bounds = !runs_by_bound.is_empty();
+            #[cfg(test)]
+            test_hooks::REVERSE_BOUND_SLOTS
+                .with(|count| count.set(count.get() + runs_by_bound.capacity()));
+            let bound_bytes = map_bytes(&runs_by_bound);
             let other_groups = runs_by_bound
-                .drain()
+                .into_iter()
                 .map(|(lower, (run, _))| (Work::IndexedReturns, Some((lower, run.start, run.end))));
             for (kind, group) in groups.into_iter().chain(other_groups) {
                 if let Some((lower, start, end)) = group
@@ -1794,6 +1815,10 @@ impl ReverseAlternatives {
                         base,
                     )?;
                 }
+            }
+            if mixed_bounds {
+                base -= bound_bytes;
+                scratch.resize(base)?;
             }
         }
         Ok(second)
@@ -12854,6 +12879,8 @@ pub mod test_hooks {
         #[cfg(test)]
         pub(super) static REVERSE_ANCESTRY_BUILDS: Cell<usize> = const { Cell::new(0) };
         #[cfg(test)]
+        pub(super) static REVERSE_BOUND_SLOTS: Cell<usize> = const { Cell::new(0) };
+        #[cfg(test)]
         pub(super) static REVERSE_SUFFIX_STEPS: Cell<usize> = const { Cell::new(0) };
     }
 
@@ -14609,6 +14636,8 @@ mod tree_tests {
     }
 
     struct FirstBatchWork {
+        bound_slots: usize,
+        ancestry_builds: usize,
         steps: usize,
         enqueues: usize,
     }
@@ -14654,12 +14683,17 @@ mod tree_tests {
             ..Default::default()
         };
         let mut last_enqueues = 0;
+        let mut last_builds = 0;
         let mut take_work = || {
             let total = test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.get());
+            let builds = test_hooks::REVERSE_ANCESTRY_BUILDS.with(|count| count.get());
             let work = FirstBatchWork {
+                bound_slots: test_hooks::REVERSE_BOUND_SLOTS.with(|count| count.replace(0)),
+                ancestry_builds: builds - last_builds,
                 steps: test_hooks::REVERSE_SUFFIX_STEPS.with(|count| count.replace(0)),
                 enqueues: total - last_enqueues,
             };
+            last_builds = builds;
             last_enqueues = total;
             work
         };
@@ -14981,6 +15015,75 @@ mod tree_tests {
             11,
             24,
         );
+    }
+
+    #[test]
+    fn reverse_walk_sparse_distinct_bounds_scan_only_current_groups() {
+        use std::fmt::Write as _;
+
+        let n = 128;
+        let mut ttl = String::from(
+            "@prefix ex: <http://example.org/> . ex:a ex:p ex:t {| ex:w 0.5e0 |} . \
+             ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:b2 . ex:b2 ex:p ex:b1 . \
+             ex:b1 ex:p ex:a . ex:r1 ex:p ex:a . ex:w ex:p ex:t {| ex:w 1e12 |} . ",
+        );
+        let mut detours = String::new();
+        for i in 2..=n + 2 {
+            write!(ttl, "ex:r{i} ex:p ex:r{} . ", i - 1).unwrap();
+            if i >= 3 {
+                write!(ttl, "ex:u ex:p ex:v{i} . ex:v{i} ex:p ex:r{i} . ").unwrap();
+                if i <= n {
+                    write!(detours, "ex:v{i} ex:p ex:r{}, ex:r{} . ", i + 1, i + 2).unwrap();
+                }
+            }
+        }
+        let properties = format!(
+            "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+             path:weight ex:w ; path:maxLength {} ; path:maxVisited {}",
+            n + 6,
+            2 * n + 8
+        );
+        let expected = Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap());
+        // After u's N bounds, visits either have no mixed bounds or just two.
+        for (extra, max_slots) in [("", 2 * n), (detours.as_str(), 6 * n)] {
+            let rows = reverse_first_batches(format!("{ttl}{extra}"), &properties, None, 1);
+            for (batch, _) in &rows {
+                assert_eq!(batch.as_ref().unwrap(), std::slice::from_ref(&expected));
+            }
+            let slots = rows.each_ref().map(|(_, work)| work.bound_slots);
+            let steps = rows.map(|(_, work)| work.steps);
+            assert!(
+                slots.iter().all(|&count| (n..=max_slots).contains(&count)),
+                "eager and cursor bound-table slots {slots:?} for {n} distinct bounds"
+            );
+            assert!(
+                steps.iter().all(|&count| count <= 64 * n),
+                "eager and cursor suffix steps {steps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_walk_sparse_two_child_tie_settles_without_intervals() {
+        let ttl = "@prefix ex: <http://example.org/> . ex:a ex:p ex:t {| ex:w 0.5e0 |} . \
+                   ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:a, ex:w1, ex:w2, ex:h . \
+                   ex:w1 ex:p ex:u, ex:w2, ex:h . ex:w2 ex:p ex:u {| ex:w 1.1e0 |}, ex:z . \
+                   ex:h ex:p ex:c . ex:c ex:p ex:d . ex:d ex:p ex:t . \
+                   ex:z ex:p ex:y . ex:y ex:p ex:t {| ex:w 1e12 |} . ";
+        let properties = "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+                          path:weight ex:w ; path:maxLength 5";
+        let expected = Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap());
+        // A third child needs one hop and a two-unit visit. The two unrelated
+        // leaves keep the larger tree's tie allowance exactly sufficient.
+        let third = "ex:u ex:p ex:w0 . ex:w0 ex:p ex:u {| ex:w 0.9e0 |} . \
+                     ex:s1 ex:p ex:t {| ex:w 1e12 |} . ex:s2 ex:p ex:t {| ex:w 1e12 |} . ";
+        for extra in ["", third] {
+            let rows = reverse_first_batches(format!("{ttl}{extra}"), properties, None, 1);
+            for (batch, _) in &rows {
+                assert_eq!(batch.as_ref().unwrap(), std::slice::from_ref(&expected));
+            }
+            assert_eq!(rows.map(|(_, work)| work.ancestry_builds), [0, 0]);
+        }
     }
 
     #[test]

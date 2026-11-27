@@ -294,14 +294,17 @@ minimum remaining distance. At equal bounds the walk uses an existing ancestry i
 Before building one, it allows visits and child scans that could reach a shallow exit
 to examine up to one hop or queue entry per node in the tree in total. It checks
 intervals first if the next scan would exceed that allowance or the children are
-too deep to reach a shallow exit. The walk keeps offsets into a node's hop list for
-its deeper tree children, pending interval checks and hops whose indexed suffix
-returns to the branch. It settles exits before enqueuing those returning hops, so
-a shorter exit can discard the whole group. It groups indexed returns by their exact
-lower bound and links offset ranges when other depths fall between them. When new
-tree children and indexed returns tie, the shorter slice starts first. Each group
-schedules one visit per turn, including tree children that run before the ancestry
-index exists.
+too deep to reach a shallow exit. A child scan that yields partway through its slice
+can pass its visit directly to the next turn. The visit then costs only the hops
+it examines. If an interval takes that turn, the visit goes back on the heap.
+The walk keeps offsets into a node's hop list for its deeper tree children, pending
+interval checks and hops whose indexed suffix returns to the branch. It settles exits
+before enqueuing those returning hops, so a shorter exit can discard the whole group.
+It groups indexed returns by their exact lower bound and links offset ranges when
+other depths fall between them. The temporary table for grouping these ranges lasts
+for one scan of a node. When new tree children and indexed returns tie, the shorter
+slice starts first. Each group schedules one visit per turn, including tree children
+that run before the ancestry index exists.
 Each node expands at its shortest prefix. The walk stops when the remaining bounds cannot improve the threshold.
 The virtual endpoint represents a completed cycle and can only appear as a source of
 recorded hops. The query memory budget covers retained hops and intervals, the
