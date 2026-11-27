@@ -818,6 +818,20 @@ impl super::Catalog {
         task: &str,
         keep: bool,
     ) -> crate::Result<crate::Dataset> {
+        self.replace_restored_reserved_observed(reservation, restored, task, keep, |_, _| {})
+    }
+
+    /// Notify the server after the predecessor's final drain and committed close,
+    /// while its counters are still readable and before publishing a successor.
+    #[doc(hidden)]
+    pub fn replace_restored_reserved_observed(
+        &self,
+        reservation: super::Reservation,
+        restored: &Path,
+        task: &str,
+        keep: bool,
+        on_closed: impl FnMut(u64, &crate::store::Store),
+    ) -> crate::Result<crate::Dataset> {
         // A close callback's refusal comes before any drain or error translation.
         self.check_manageable()?;
         if !std::sync::Arc::ptr_eq(&self.inner, &reservation.catalog.inner)
@@ -825,7 +839,7 @@ impl super::Catalog {
         {
             return Err(crate::Error::invalid("invalid restore reservation"));
         }
-        super::swap::replace_reserved(self, reservation, restored, task, keep)
+        super::swap::replace_reserved(self, reservation, restored, task, keep, on_closed)
             .map_err(crate::backup::error)
     }
     #[doc(hidden)]

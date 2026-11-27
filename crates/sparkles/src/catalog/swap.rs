@@ -158,6 +158,7 @@ pub(crate) fn replace_reserved(
     restored: &Path,
     task: &str,
     keep_replaced: bool,
+    on_closed: impl FnMut(u64, &crate::store::Store),
 ) -> Result<Dataset, BackupError> {
     let name = reservation.name().to_string();
     swap(
@@ -167,7 +168,7 @@ pub(crate) fn replace_reserved(
         task,
         keep_replaced,
         DRAIN,
-        Some(reservation),
+        (Some(reservation), on_closed),
     )
 }
 
@@ -181,7 +182,15 @@ pub(crate) fn replace_with(
     keep_replaced: bool,
     drain: Duration,
 ) -> Result<Dataset, BackupError> {
-    swap(st, name, restored, task, keep_replaced, drain, None)
+    swap(
+        st,
+        name,
+        restored,
+        task,
+        keep_replaced,
+        drain,
+        (None, |_, _| {}),
+    )
 }
 
 fn swap(
@@ -191,7 +200,7 @@ fn swap(
     task: &str,
     keep_replaced: bool,
     drain: Duration,
-    reservation: Option<Reservation>,
+    (reservation, mut on_closed): (Option<Reservation>, impl FnMut(u64, &crate::store::Store)),
 ) -> Result<Dataset, BackupError> {
     let _span = tracing::info_span!(
         "restore.swap",
@@ -299,7 +308,7 @@ fn swap(
         close_hook(CloseStage::Proof, attempt);
         let closed = {
             let _disposing = st.disposal_scope();
-            old.close_for_disposal(|| {})
+            old.close_for_disposal(|| {}, &mut on_closed)
         };
         match closed {
             Ok(reasoning) => break reasoning,

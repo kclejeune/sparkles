@@ -1007,11 +1007,59 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
   shares the rebuild histogram with bulk commits.
 - `obs_tests::metrics_count_work_memory_peaks_and_rebuilds` and
   `compaction_tests::rebuilds_are_counted_by_reason` cover them, and the access log test
-  checks the new field. The JSON snapshot of `/$/metrics?format=json` does not have the
-  new series, and neither do the OTLP metrics, which are read from that snapshot.
+  checks the new field. Initially the JSON snapshot of `/$/metrics?format=json` and the
+  OTLP metrics read from it did not carry the new series. Item 342 added both.
 
-**Not built.** The new Phase 2 metrics are not in the JSON snapshot or the OTLP
-metrics. Item 342 tracks them.
+**Metrics parity** (item 342). The Phase 2 produced-row, query-memory-peak and rebuild
+series now appear in `/$/metrics?format=json` and in OTLP metric export alongside
+Prometheus.
+- `MetricsSnapshot` keeps `"formatVersion": 1` because all added fields are purely additive
+  and every existing member keeps its name and type. Top-level fields
+  `queryMemoryPeakBucketBounds` and `rebuildDurationBucketBounds` expose the byte and
+  second bucket bounds without `+Inf`. Each dataset entry gains `rowsProduced`,
+  `queryMemoryPeak` (`null` until a query is observed, or `{count, sumBytes, buckets}`
+  with cumulative counts matching `MEMORY_BUCKETS` plus `+Inf`), and `rebuilds` keyed by
+  `compact` and `bulk`. Each rebuild entry holds `{count, duration}`, where `duration` is
+  `null` while `count` is zero and `{count, sumSeconds, buckets}` matching
+  `REBUILD_BUCKETS` plus `+Inf` otherwise. `DsMetrics::mem_peak_snapshot` and
+  `rebuild_cumulative` share the cumulative snapshot computation between Prometheus and
+  JSON so `+Inf` always equals `_count` under concurrency. `metrics_json` computes gauges
+  before taking the counter snapshot, matching `render_prometheus`.
+- Label lifetime matches across all three formats. Requests that name no existing dataset
+  record `$none` only on request series, while dataset work, peak memory, and rebuild
+  series cover existing datasets and `$other`. Deleting an overflow dataset, reopening a
+  persistent overflow dataset on rename, or promoting an overflow dataset to a freed named
+  slot retires its rebuild counts and live-store cache hit and miss counters into `$other`.
+  Pending leaving entries keep `$other` monotonic during concurrent deletion or rename,
+  and `$other` stays present across all three formats once used so shared counters never
+  drop or disappear when the last overflow dataset leaves. Deleting a named dataset
+  removes its series completely.
+- The OTLP observer in `otel/sdk.rs` exports `sparkles.rows.produced` (`{row}`),
+  `sparkles.query.memory.peak.{bucket,sum,count}` (`{query}` and `By`, with `le` on
+  `.bucket`), `sparkles.rebuilds` (`{rebuild}`, labelled by `dataset` and `reason`), and
+  `sparkles.rebuild.duration.{bucket,count}` (`{rebuild}`, labelled by `dataset`, `reason`,
+  and `le` on `.bucket`) as monotonic 64-bit integer observable counters, and
+  `sparkles.rebuild.duration.sum` (`s`) as a monotonic floating-point observable counter.
+  `SdkMeterProvider` installs cardinality views sized from `--metrics-max-datasets` up to
+  a 250,000 attribute-set per-stream ceiling, keeping multi-label bucket streams below the
+  SDK overflow threshold at default and moderate caps while noting that a sufficiently
+  large configured cap can still overflow individual streams. A per-cycle seen bitmask
+  refreshes the shared snapshot once per collection regardless of callback order or
+  dropped views, and per-dataset generation tracking keyed by each store's monotonic
+  `open_id` preserves monotonic continuation if a dataset name is deleted and recreated
+  between two consecutive OTLP collections under either cumulative or delta temporality.
+  When an intervening collection observes a deleted dataset absent, a later recreation
+  restarts at zero to match Prometheus and JSON, starting a fresh accumulation interval
+  under delta temporality and retaining the SDK's instrument-level start timestamp without
+  an explicit gap marker under cumulative temporality.
+- `obs_tests::metrics_count_work_memory_peaks_and_rebuilds`,
+  `obs_tests::metrics_parity_dataset_cap_reset_reopen_and_auth`, and the tests in
+  `otel::tests` verify cross-format parity across unseen datasets, queries, updates, failed
+  or abandoned builds, compactions, bulk commits, `$other` aggregation and deletion,
+  named-slot promotion, `$none` filtering, dataset renames, deletes and recreations under
+  both cumulative and delta temporality, default-cap OTLP cardinality budgets, dropped
+  callback views, 64-bit integer precision above 2^53, persistent reopens, and `metrics`
+  access control. The `--no-default-features` build verifies the exporter-disabled path.
 
 **Bind-before-open startup** (item 64). `serve` binds its listeners, then opens the
 registered datasets as §4.1 Phase 2 describes. The [startup section of
@@ -1117,27 +1165,31 @@ measurement on a quiet Intel host and removes the cost if it holds.
 
   *Shipped (2026-10-30), except the derived-index state and replay progress.* The
   Outcome's bind-before-open entry records the delivery, and item 402 tracks the rest.
-* The Phase 2 JSON and OTLP metrics are tracked by item 342 below.
+* **Phase 2 JSON and OTLP metrics parity** (item 342). *Shipped.* The
+  [Outcome](#outcome) entry for item 342 records the delivery against the
+  [Metrics parity](#metrics-parity) acceptance contract below.
 
 ### Metrics parity
 
-Roadmap item 342 completes the Phase 2 series in the JSON snapshot and OTLP export.
-Prometheus already emits produced rows, query memory peaks and rebuild counts and
-durations. `obs::metrics_json` does not include those fields, and the OTLP observer in
-`otel/sdk.rs` consumes that snapshot. An enabled exporter therefore does not imply
-that every Prometheus series is exported.
+*Shipped.* The [Outcome](#outcome) entry for item 342 records the implementation of this
+contract.
 
-Add cumulative produced-row counts, query-memory-peak histograms and rebuild counters
-and duration histograms by reason. The three representations must agree on units,
-bucket boundaries, labels, dataset aggregation and each series' reset semantics,
-including rebuild counts resetting when a dataset opens. Preserve
-the existing metrics endpoint's access policy and dataset-label bounds. Any changed
-JSON snapshot contract needs an explicit compatibility/version decision.
+Roadmap item 342 specified parity for the Phase 2 produced-row, query-memory-peak, and
+rebuild series across Prometheus, `/$/metrics?format=json`, and OTLP metric export.
 
-Acceptance extends the existing work, memory and rebuild test to compare all three
-representations after queries, updates, successful compact/bulk publications and
-failed or abandoned builds. Test histogram sums/counts, unseen datasets, reopen/reset
-behavior and the exporter-disabled build. No new counters belong on inner executor loops.
+The acceptance contract requires cumulative produced-row counts, query-memory-peak
+histograms, and rebuild counters and duration histograms by reason across all three
+representations. The three representations must agree on units, bucket boundaries, labels,
+dataset aggregation, and each series' reset semantics, including rebuild counts resetting
+when a dataset opens. The metrics endpoint's access policy and dataset-label bounds remain
+unchanged, and any JSON snapshot change carries an explicit compatibility and version
+decision.
+
+Acceptance extends the work, memory, and rebuild tests to compare all three
+representations after queries, updates, successful compact and bulk publications, and
+failed or abandoned builds. Coverage includes histogram sums and counts, unseen datasets,
+reopen and reset behavior, and the exporter-disabled build. No new counters belong on
+inner executor loops.
 
 ### Roadmap follow-ups
 

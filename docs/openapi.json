@@ -17693,6 +17693,36 @@
                 "quads": {
                   "type": "integer"
                 },
+                "queryMemoryPeak": {
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "buckets": {
+                          "description": "Cumulative counts for `queryMemoryPeakBucketBounds` plus +Inf. The last one equals `count`.",
+                          "items": {
+                            "type": "integer"
+                          },
+                          "type": "array"
+                        },
+                        "count": {
+                          "type": "integer"
+                        },
+                        "sumBytes": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "count",
+                        "sumBytes",
+                        "buckets"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "quotaBytes": {
                   "description": "0 means unlimited.",
                   "type": "integer"
@@ -17710,6 +17740,99 @@
                       "type": "null"
                     }
                   ]
+                },
+                "rebuilds": {
+                  "properties": {
+                    "bulk": {
+                      "properties": {
+                        "count": {
+                          "type": "integer"
+                        },
+                        "duration": {
+                          "oneOf": [
+                            {
+                              "properties": {
+                                "buckets": {
+                                  "description": "Cumulative counts for `rebuildDurationBucketBounds` plus +Inf. The last one equals `count`.",
+                                  "items": {
+                                    "type": "integer"
+                                  },
+                                  "type": "array"
+                                },
+                                "count": {
+                                  "type": "integer"
+                                },
+                                "sumSeconds": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "count",
+                                "sumSeconds",
+                                "buckets"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "count",
+                        "duration"
+                      ],
+                      "type": "object"
+                    },
+                    "compact": {
+                      "properties": {
+                        "count": {
+                          "type": "integer"
+                        },
+                        "duration": {
+                          "oneOf": [
+                            {
+                              "properties": {
+                                "buckets": {
+                                  "description": "Cumulative counts for `rebuildDurationBucketBounds` plus +Inf. The last one equals `count`.",
+                                  "items": {
+                                    "type": "integer"
+                                  },
+                                  "type": "array"
+                                },
+                                "count": {
+                                  "type": "integer"
+                                },
+                                "sumSeconds": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "count",
+                                "sumSeconds",
+                                "buckets"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "count",
+                        "duration"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "compact",
+                    "bulk"
+                  ],
+                  "type": "object"
                 },
                 "resultCache": {
                   "properties": {
@@ -17745,6 +17868,10 @@
                 "resultRows": {
                   "type": "integer"
                 },
+                "rowsProduced": {
+                  "description": "Rows produced by all operators of queries and updates.",
+                  "type": "integer"
+                },
                 "walBytes": {
                   "type": "integer"
                 }
@@ -17758,6 +17885,9 @@
                 "diskBytes",
                 "quotaBytes",
                 "resultRows",
+                "rowsProduced",
+                "queryMemoryPeak",
+                "rebuilds",
                 "budgetExceeded",
                 "rateLimited",
                 "blockCache",
@@ -17782,8 +17912,22 @@
               "null"
             ]
           },
+          "queryMemoryPeakBucketBounds": {
+            "description": "Upper bounds in bytes of `datasets[*].queryMemoryPeak.buckets`, without +Inf.",
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
           "ready": {
             "type": "boolean"
+          },
+          "rebuildDurationBucketBounds": {
+            "description": "Upper bounds in seconds of `datasets[*].rebuilds.*.duration.buckets`, without +Inf.",
+            "items": {
+              "type": "number"
+            },
+            "type": "array"
           },
           "requests": {
             "items": {
@@ -17846,6 +17990,8 @@
           "processResidentBytes",
           "limits",
           "bucketBounds",
+          "queryMemoryPeakBucketBounds",
+          "rebuildDurationBucketBounds",
           "active",
           "requests",
           "datasets"

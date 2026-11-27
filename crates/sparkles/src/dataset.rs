@@ -55,6 +55,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_OPEN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The name of the file in which a persistent clone records where it came from.
 pub const ORIGIN_FILE: &str = "origin.json";
@@ -169,6 +172,8 @@ impl From<StoreOptions> for DatasetOptions {
 /// may change between releases; programs use the methods of [`Dataset`].
 #[doc(hidden)]
 pub struct DatasetState {
+    /// Process-local monotonic identifier assigned once per opened store instance.
+    pub open_id: u64,
     pub(crate) branches: Mutex<BTreeMap<String, Dataset>>,
     pub(crate) branch_handles: Mutex<Vec<StateReference>>,
     pub(crate) owner: Option<StateReference>,
@@ -420,7 +425,9 @@ impl Dataset {
             let source: Arc<dyn crate::store::DefinitionSource> = views.clone();
             s.register_definitions(Arc::downgrade(&source));
         }
+        let open_id = NEXT_OPEN_ID.fetch_add(1, Ordering::Relaxed);
         let inner = Arc::new_cyclic(|weak| DatasetState {
+            open_id,
             reference: StateReference {
                 link: crate::store::lifecycle::WeakLink::new(weak.clone()),
             },
@@ -566,8 +573,9 @@ impl Dataset {
     pub(crate) fn close_for_disposal(
         self,
         release_entries: impl FnOnce(),
+        on_closed: impl FnOnce(u64, &Store),
     ) -> std::result::Result<Option<ReasoningRecord>, RefusedClose> {
-        lifecycle::close(self, release_entries)
+        lifecycle::close(self, release_entries, on_closed)
     }
 
     /// The name a catalog or a server gave the dataset, if any.

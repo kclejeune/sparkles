@@ -1189,7 +1189,7 @@ enum Cmd {
         #[arg(long)]
         no_metrics: bool,
         /// Datasets with their own metric labels; the others share `$other`
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = obs::DEFAULT_METRICS_MAX_DATASETS)]
         metrics_max_datasets: usize,
         /// Also expose Fuseki's metric names (fuseki_requests, fuseki_requests_good,
         /// fuseki_requests_bad, ...) on /$/metrics, for dashboards built for Fuseki
@@ -2782,12 +2782,14 @@ fn run() -> Result<()> {
             otel_query_text,
             otel_plan_spans,
             otel_logs,
+            metrics_max_datasets,
             ..
         } => otel::Settings {
             enabled: *otel,
             query_text: *otel_query_text,
             plan_spans: *otel_plan_spans,
             logs: *otel_logs,
+            metrics_max_datasets: *metrics_max_datasets,
         },
         _ => otel::Settings::default(),
     };

@@ -44,7 +44,7 @@ pub fn enabled() -> bool {
 }
 
 /// What `serve` asked for on its command line (the environment adds to it).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Settings {
     /// `--otel`: export even when no `OTEL_*` variable asks for it
     pub enabled: bool,
@@ -55,6 +55,20 @@ pub struct Settings {
     pub plan_spans: bool,
     /// `--otel-logs`: export `tracing` events as OTLP logs (also `OTEL_LOGS_EXPORTER=otlp`)
     pub logs: bool,
+    /// `--metrics-max-datasets`: bounds OTLP per-dataset stream cardinality limits
+    pub metrics_max_datasets: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            query_text: false,
+            plan_spans: false,
+            logs: false,
+            metrics_max_datasets: crate::obs::DEFAULT_METRICS_MAX_DATASETS,
+        }
+    }
 }
 
 /// The exporters of a running process; [`Guard::shutdown`] flushes them.

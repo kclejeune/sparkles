@@ -327,7 +327,12 @@ its first request, and from then on with all nine outcomes. The `denied` outcome
 refusal by the auth layer. Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI
 assets are not counted. The validation series cover every validated write to a dataset
 with write-time validation, whether it comes over HTTP, over MCP or from a reasoning task.
-Deleting a dataset removes its series. The block, result, SERVICE and history caches are
+Deleting a dataset removes its named series. Once datasets past
+`--metrics-max-datasets` have recorded activity under `$other`, the `$other` series keeps
+its accumulated counters and retired rebuild counts across Prometheus, JSON, and OTLP even
+when no overflow dataset remains open. Request series use `$none` for requests that name
+no existing dataset, while dataset work, peak memory, and rebuild series apply only to
+existing datasets and `$other`. The block, result, SERVICE and history caches are
 shared by all datasets and sized once by `--cache-mb`, `--result-cache-mb`,
 `--service-cache-mb` and `--history-cache-mb`. The per-dataset cache series count the
 bytes, entries, hits and misses that the dataset caused. Before this sharing, the capacity
@@ -405,6 +410,8 @@ type MetricsSnapshot = {
   processResidentBytes: number | null;
   limits: Limits;
   bucketBounds: number[];                  // histogram upper bounds in seconds, without +Inf
+  queryMemoryPeakBucketBounds: number[];   // query memory peak upper bounds in bytes, without +Inf
+  rebuildDurationBucketBounds: number[];   // rebuild duration upper bounds in seconds, without +Inf
   active: Record<Operation, number>;       // requests in progress
   requests: {
     dataset: string; operation: Operation;
@@ -416,6 +423,18 @@ type MetricsSnapshot = {
   datasets: {
     name: string; quads: number; deltaInserts: number; deltaDeletes: number;
     walBytes: number; diskBytes: number; quotaBytes: number /* 0: unlimited */; resultRows: number;
+    rowsProduced: number;                  // rows produced by all operators of queries and updates
+    queryMemoryPeak: null | {              // null before the first query on the dataset
+      count: number; sumBytes: number;
+      buckets: number[];                   // cumulative counts for queryMemoryPeakBucketBounds plus +Inf
+    };
+    rebuilds: Record<"compact" | "bulk", {
+      count: number;                       // resets to 0 when the dataset opens
+      duration: null | {                   // null while count is 0
+        count: number; sumSeconds: number;
+        buckets: number[];                 // cumulative counts for rebuildDurationBucketBounds plus +Inf
+      };
+    }>;
     groupCommit: boolean;                  // concurrent commits share one synchronization
     commits: { fences: number; failures: number; fallbacks: Record<string, number> }; // group commit counters, fences counts successful fences
     budgetExceeded: Record<BudgetKind, number> | null;
@@ -512,14 +531,28 @@ is exported as observable instruments read at collection time, so nothing is cou
 twice and `/$/metrics` does not change. These instruments are
 `sparkles.requests` (`dataset`, `operation`, `outcome`),
 `sparkles.response.size`, `sparkles.requests.active`, `sparkles.result.rows`,
-`sparkles.budget.exceeded`, `sparkles.rate_limited`, `sparkles.dataset.quads`,
+`sparkles.rows.produced`, `sparkles.query.memory.peak.{bucket,sum,count}` (`dataset`, with
+`le` on `.bucket`), `sparkles.rebuilds` (`dataset`, `reason`),
+`sparkles.rebuild.duration.{bucket,sum,count}` (`dataset`, `reason`, with `le` on
+`.bucket`), `sparkles.budget.exceeded`, `sparkles.rate_limited`, `sparkles.dataset.quads`,
 `sparkles.delta.quads`, `sparkles.wal.size`, `sparkles.disk.size`,
 `sparkles.block_cache.{size,capacity,hits,misses}`,
 `sparkles.result_cache.{size,capacity,entries,hits,misses}`, `sparkles.geo.rows`
 (`dataset`, `part`), `sparkles.geo.build.duration`,
 `sparkles.geo.{candidates,refined,matches,rechecked}`,
 `sparkles.memory.review.pending` and `sparkles.memory.review.oldest` (`dataset`, `kind`),
-`sparkles.ready`, `process.uptime` and `process.memory.usage`.
+`sparkles.ready`, `process.uptime` and `process.memory.usage`. Integer counters for
+produced rows, query memory peaks, and rebuild counts export as exact 64-bit integers up
+to the signed 64-bit OTLP wire limit. Per-stream cardinality limits scale with
+`--metrics-max-datasets` up to a ceiling of 250,000 attribute sets per stream, so a
+sufficiently large `--metrics-max-datasets` can still overflow individual multi-label
+streams such as `sparkles.rebuild.duration.bucket`. Deleting and recreating a named
+dataset between two consecutive OTLP collections carries prior emitted Phase 2 totals
+forward so neither cumulative nor delta counters decrease. When an intervening collection
+observes the dataset absent, a later recreation restarts at zero to match Prometheus and
+JSON. Under delta temporality the recreated series begins a fresh accumulation interval,
+while under cumulative temporality the OpenTelemetry Rust SDK retains the instrument
+start timestamp without emitting an explicit gap marker.
 
 **Logs.** With `--otel-logs` or `OTEL_LOGS_EXPORTER=otlp`, every log event that passes
 `RUST_LOG` is also exported as an OTLP log record, with the trace and span id of its

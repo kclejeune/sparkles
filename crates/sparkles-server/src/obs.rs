@@ -17,12 +17,12 @@ use axum::extract::{MatchedPath, Path, Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde_json::{Value as J, json};
 use sparkles::BudgetKind;
 use sparkles::sparql::Timing;
 use sparkles::store::{REBUILD_BUCKETS, RebuildHistogram, RebuildReason};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -38,10 +38,251 @@ mod completion_dispatch_tests;
 
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
+/// Default value of `--metrics-max-datasets`.
+pub const DEFAULT_METRICS_MAX_DATASETS: usize = 100;
+
 /// Dataset label of requests that name no existing dataset.
 const NONE: &str = "$none";
 /// Dataset label shared by the datasets beyond the label cap.
 const OTHER: &str = "$other";
+
+static NEXT_METRICS_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_metrics_id() -> u64 {
+    NEXT_METRICS_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+struct MetricsId(u64);
+
+impl Default for MetricsId {
+    fn default() -> Self {
+        Self(next_metrics_id())
+    }
+}
+
+fn clone_rebuild(h: &RebuildHistogram) -> RebuildHistogram {
+    RebuildHistogram {
+        buckets: h.buckets,
+        sum_seconds: h.sum_seconds,
+    }
+}
+
+fn add_rebuild(dst: &mut RebuildHistogram, src: &RebuildHistogram) {
+    for (a, b) in dst.buckets.iter_mut().zip(src.buckets) {
+        *a = a.saturating_add(b);
+    }
+    dst.sum_seconds += src.sum_seconds;
+}
+
+fn sub_rebuild(a: &RebuildHistogram, b: &RebuildHistogram) -> RebuildHistogram {
+    let mut buckets = [0u64; REBUILD_BUCKETS.len() + 1];
+    for ((out, x), y) in buckets.iter_mut().zip(a.buckets).zip(b.buckets) {
+        *out = x.saturating_sub(y);
+    }
+    RebuildHistogram {
+        buckets,
+        sum_seconds: (a.sum_seconds - b.sum_seconds).max(0.0),
+    }
+}
+
+fn max_rebuild(a: &RebuildHistogram, b: &RebuildHistogram) -> RebuildHistogram {
+    let mut buckets = [0u64; REBUILD_BUCKETS.len() + 1];
+    for ((out, x), y) in buckets.iter_mut().zip(a.buckets).zip(b.buckets) {
+        *out = x.max(y);
+    }
+    RebuildHistogram {
+        buckets,
+        sum_seconds: a.sum_seconds.max(b.sum_seconds),
+    }
+}
+
+fn any_rebuild(hs: &[RebuildHistogram; 2]) -> bool {
+    hs.iter()
+        .any(|h| h.buckets.iter().any(|&c| c > 0) || h.sum_seconds > 0.0)
+}
+
+/// Per-store monotonic counters carried in `$other` across deletion, promotion, and
+/// persistent store reopen so shared overflow series never drop or emit negative deltas.
+#[derive(Default)]
+pub(crate) struct StoreCounters {
+    rebuilds: [RebuildHistogram; 2],
+    cache_hits: u64,
+    cache_misses: u64,
+    rcache_hits: u64,
+    rcache_misses: u64,
+}
+
+impl StoreCounters {
+    pub(crate) fn read(store: &sparkles::store::Store) -> Self {
+        let (c, r) = (store.cache(), store.result_cache());
+        Self {
+            rebuilds: RebuildReason::ALL.map(|reason| store.rebuilds(reason)),
+            cache_hits: c.hits(),
+            cache_misses: c.misses(),
+            rcache_hits: r.hits(),
+            rcache_misses: r.misses(),
+        }
+    }
+
+    fn clone_counters(&self) -> Self {
+        Self {
+            rebuilds: [
+                clone_rebuild(&self.rebuilds[0]),
+                clone_rebuild(&self.rebuilds[1]),
+            ],
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
+            rcache_hits: self.rcache_hits,
+            rcache_misses: self.rcache_misses,
+        }
+    }
+
+    fn add_assign(&mut self, src: &Self) {
+        add_rebuild(&mut self.rebuilds[0], &src.rebuilds[0]);
+        add_rebuild(&mut self.rebuilds[1], &src.rebuilds[1]);
+        self.cache_hits = self.cache_hits.saturating_add(src.cache_hits);
+        self.cache_misses = self.cache_misses.saturating_add(src.cache_misses);
+        self.rcache_hits = self.rcache_hits.saturating_add(src.rcache_hits);
+        self.rcache_misses = self.rcache_misses.saturating_add(src.rcache_misses);
+    }
+
+    fn sub(&self, b: &Self) -> Self {
+        Self {
+            rebuilds: [
+                sub_rebuild(&self.rebuilds[0], &b.rebuilds[0]),
+                sub_rebuild(&self.rebuilds[1], &b.rebuilds[1]),
+            ],
+            cache_hits: self.cache_hits.saturating_sub(b.cache_hits),
+            cache_misses: self.cache_misses.saturating_sub(b.cache_misses),
+            rcache_hits: self.rcache_hits.saturating_sub(b.rcache_hits),
+            rcache_misses: self.rcache_misses.saturating_sub(b.rcache_misses),
+        }
+    }
+
+    fn max_with(&self, b: &Self) -> Self {
+        Self {
+            rebuilds: [
+                max_rebuild(&self.rebuilds[0], &b.rebuilds[0]),
+                max_rebuild(&self.rebuilds[1], &b.rebuilds[1]),
+            ],
+            cache_hits: self.cache_hits.max(b.cache_hits),
+            cache_misses: self.cache_misses.max(b.cache_misses),
+            rcache_hits: self.rcache_hits.max(b.rcache_hits),
+            rcache_misses: self.rcache_misses.max(b.rcache_misses),
+        }
+    }
+
+    fn any(&self) -> bool {
+        any_rebuild(&self.rebuilds)
+            || self.cache_hits > 0
+            || self.cache_misses > 0
+            || self.rcache_hits > 0
+            || self.rcache_misses > 0
+    }
+}
+
+#[derive(Default)]
+struct StoreOtherState {
+    /// Highest live-store counters observed while this open store was aggregated under `$other`.
+    seen_under_other: StoreCounters,
+    /// Counters retired to `$other` when this open store was promoted to a named slot,
+    /// subtracted from its named slot to prevent both `$other` shrinkage and double counting.
+    promoted_offset: StoreCounters,
+}
+
+struct PendingStore {
+    /// Active leaving/swapping tokens for this `open_id`. Normally 1; can briefly be 2
+    /// when a doomed delete or rename overlaps an in-place restore swap on the same store.
+    tokens: BTreeSet<u64>,
+    contrib: Option<StoreCounters>,
+    in_overflow: bool,
+    /// The alias that can be sampled while a memory rename finishes server cleanup.
+    published_alias: Option<String>,
+}
+
+#[derive(Default)]
+struct OtherStoreLedger {
+    /// Permanently retired live-store counters from deleted, promoted, or reopened overflow stores.
+    retired: StoreCounters,
+    /// Counters temporarily held for stores currently leaving or swapping (delete/rename/restore),
+    /// keyed by `DatasetState::open_id`.
+    pending: BTreeMap<u64, PendingStore>,
+    /// Monotonic token generator for `pending` entries so an older cancellation cannot clear
+    /// a newer or overlapping pending owner for the same `open_id`.
+    next_pending_token: u64,
+    /// Counters of stores whose `leaving` ended without retiring (failed delete/rename/swap or
+    /// memory rename) while a scrape was in flight (`active_scrapes > 0`). Added to `$other`
+    /// only for scrapes whose live sample set missed the store. Cleared when `active_scrapes == 0`.
+    restored_during_scrape: BTreeMap<u64, StoreCounters>,
+    /// `open_id`s finalized (deleted or closed/reopened) while `active_scrapes > 0`, so a
+    /// stale `Arc<Dataset>` held by a concurrent scrape is skipped rather than doubled or
+    /// resurrecting a deleted named slot. Cleared when `active_scrapes == 0`.
+    retired_ids: BTreeSet<u64>,
+    /// `(from_name, open_id)` aliases vacated by an in-memory rename while `active_scrapes > 0`,
+    /// so a stale `LiveSample` holding the dead alias is skipped instead of allocating a ghost
+    /// named slot or misattributing named counters to `$other`. Cleared when `active_scrapes == 0`.
+    renamed_from: BTreeSet<(String, u64)>,
+    /// Number of `gauges()` scrapes currently in flight.
+    active_scrapes: usize,
+    /// Per-open-store `$other` tracking, keyed by `DatasetState::open_id`.
+    stores: BTreeMap<u64, StoreOtherState>,
+}
+
+fn is_in_overflow(
+    max_datasets: usize,
+    name: &str,
+    datasets: &BTreeMap<String, Arc<DsMetrics>>,
+) -> bool {
+    let named = datasets.keys().filter(|k| !k.starts_with('$')).count();
+    !datasets.contains_key(name) && named >= max_datasets && datasets.contains_key(OTHER)
+}
+
+fn other_contribution_for(
+    in_overflow: bool,
+    open_id: u64,
+    raw: &StoreCounters,
+    stores: &BTreeMap<u64, StoreOtherState>,
+) -> Option<StoreCounters> {
+    let st_entry = stores.get(&open_id);
+    let seen = st_entry
+        .map(|s| s.seen_under_other.clone_counters())
+        .unwrap_or_default();
+    let contrib = if in_overflow {
+        let eff = match st_entry {
+            Some(s) => raw.sub(&s.promoted_offset),
+            None => raw.clone_counters(),
+        };
+        eff.max_with(&seen)
+    } else {
+        seen
+    };
+    contrib.any().then_some(contrib)
+}
+
+fn max_opt_counters(
+    prev: Option<StoreCounters>,
+    next: Option<StoreCounters>,
+) -> Option<StoreCounters> {
+    match (prev, next) {
+        (Some(a), Some(b)) => Some(a.max_with(&b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+#[cfg(all(test, feature = "otel"))]
+type GaugesHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(all(test, feature = "otel"))]
+static GAUGES_AFTER_DATASETS_HOOKS: std::sync::LazyLock<Mutex<BTreeMap<usize, GaugesHook>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[cfg(all(test, feature = "otel"))]
+pub(crate) fn set_gauges_after_datasets_hook(st: &AppState, f: impl FnOnce() + Send + 'static) {
+    let key = std::ptr::from_ref(st) as usize;
+    GAUGES_AFTER_DATASETS_HOOKS.lock().insert(key, Box::new(f));
+}
 
 // ---------------------------------------------------------------- request ids ------
 
@@ -652,6 +893,7 @@ struct OpMetrics {
 /// Counters of one dataset label.
 #[derive(Default)]
 pub struct DsMetrics {
+    series_id: MetricsId,
     ops: [OpMetrics; Op::ALL.len()],
     result_rows: AtomicU64,
     budget: [AtomicU64; BudgetKind::ALL.len()],
@@ -672,7 +914,7 @@ pub struct DsMetrics {
 
 /// Upper bounds in bytes of the `sparkles_query_memory_peak_bytes` histogram, without
 /// `+Inf`: 1 MiB to 16 GiB in steps of ×4.
-const MEMORY_BUCKETS: [u64; 8] = [
+pub(crate) const MEMORY_BUCKETS: [u64; 8] = [
     1 << 20,
     1 << 22,
     1 << 24,
@@ -682,6 +924,38 @@ const MEMORY_BUCKETS: [u64; 8] = [
     1 << 32,
     1 << 34,
 ];
+
+impl DsMetrics {
+    /// Cumulative bucket counts (the last is `+Inf`, the total count) and byte sum of
+    /// `sparkles_query_memory_peak_bytes`, or `None` when no query has been observed.
+    fn mem_peak_snapshot(&self) -> Option<([u64; MEMORY_BUCKETS.len() + 1], u64)> {
+        let mut cum = [0u64; MEMORY_BUCKETS.len() + 1];
+        let mut acc = 0u64;
+        for (i, c) in self.mem_peak.iter().enumerate() {
+            acc += c.load(Ordering::Relaxed);
+            cum[i] = acc;
+        }
+        if acc == 0 {
+            return None;
+        }
+        Some((cum, self.mem_peak_sum.load(Ordering::Relaxed)))
+    }
+}
+
+/// Cumulative bucket counts (the last is `+Inf`, the total count) and second sum of a
+/// rebuild histogram, or `None` when no rebuild has been recorded.
+fn rebuild_cumulative(h: &RebuildHistogram) -> Option<([u64; REBUILD_BUCKETS.len() + 1], f64)> {
+    let mut cum = [0u64; REBUILD_BUCKETS.len() + 1];
+    let mut acc = 0u64;
+    for (i, &n) in h.buckets.iter().enumerate() {
+        acc += n;
+        cum[i] = acc;
+    }
+    if acc == 0 {
+        return None;
+    }
+    Some((cum, h.sum_seconds))
+}
 
 /// Upper bounds of the `sparkles_graphql_groups` histogram, without `+Inf`.
 const GROUP_BUCKETS: [u64; 7] = [1, 2, 4, 8, 16, 32, 64];
@@ -708,6 +982,8 @@ pub struct Metrics {
     pub fuseki_names: bool,
     max_datasets: usize,
     datasets: RwLock<BTreeMap<String, Arc<DsMetrics>>>,
+    /// Coordinated `$other` live-store counter ledger (always locked before `datasets`).
+    other_store: Mutex<OtherStoreLedger>,
     /// in-flight requests per operation of the matched route (kept even when metrics
     /// are off)
     active: [AtomicI64; Op::ALL.len()],
@@ -720,6 +996,7 @@ impl Metrics {
             fuseki_names: false,
             max_datasets,
             datasets: RwLock::new(BTreeMap::new()),
+            other_store: Mutex::new(OtherStoreLedger::default()),
             active: Default::default(),
         }
     }
@@ -766,10 +1043,13 @@ impl Metrics {
         {
             ds.result_rows.fetch_add(n, Ordering::Relaxed);
         }
-        if let Some(n) = r.rows_produced {
+        if dataset.is_some()
+            && let Some(n) = r.rows_produced
+        {
             ds.rows_produced.fetch_add(n, Ordering::Relaxed);
         }
-        if op == Op::Query
+        if dataset.is_some()
+            && op == Op::Query
             && let Some(b) = r.mem_peak_bytes
         {
             let i = MEMORY_BUCKETS
@@ -819,22 +1099,219 @@ impl Metrics {
     }
 
     /// `--metrics-max-datasets` (other capped labels, like backup repositories, share it).
-    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "backup", feature = "otel")), allow(dead_code))]
     pub fn max_datasets(&self) -> usize {
         self.max_datasets
     }
 
     /// Drop a deleted dataset's series (a recreated name starts again at zero).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn forget(&self, dataset: &str) {
-        self.datasets.write().remove(dataset);
+        self.commit_delete(dataset, None);
+    }
+
+    /// Record a leaving or swapping store's pending `$other` counters so concurrent scrapes
+    /// during delete, rename, or in-place restore never observe a transient drop. Returns a
+    /// token for [`Self::cancel_leaving`] when metrics are enabled.
+    pub(crate) fn begin_leaving(
+        &self,
+        name: &str,
+        open_id: u64,
+        raw: StoreCounters,
+    ) -> Option<u64> {
+        if !self.enabled {
+            return None;
+        }
+        let mut ledger_guard = self.other_store.lock();
+        let ledger = &mut *ledger_guard;
+        ledger.restored_during_scrape.remove(&open_id);
+        let r = self.datasets.read();
+        let in_overflow = is_in_overflow(self.max_datasets, name, &r);
+        let contrib = other_contribution_for(in_overflow, open_id, &raw, &ledger.stores);
+        let token = ledger.next_pending_token;
+        ledger.next_pending_token = ledger.next_pending_token.wrapping_add(1);
+        match ledger.pending.get_mut(&open_id) {
+            Some(existing) => {
+                existing.tokens.insert(token);
+                existing.in_overflow |= in_overflow;
+                existing.contrib = max_opt_counters(existing.contrib.take(), contrib);
+            }
+            None => {
+                let mut tokens = BTreeSet::new();
+                tokens.insert(token);
+                ledger.pending.insert(
+                    open_id,
+                    PendingStore {
+                        tokens,
+                        contrib,
+                        in_overflow,
+                        published_alias: None,
+                    },
+                );
+            }
+        }
+        Some(token)
+    }
+
+    /// Refresh a leaving store's pending `$other` counters after draining in-flight
+    /// handles, preserving the monotonic maximum against the initial pending snapshot.
+    pub(crate) fn refresh_leaving(&self, name: &str, open_id: u64, raw: StoreCounters) {
+        if !self.enabled {
+            return;
+        }
+        let mut ledger_guard = self.other_store.lock();
+        let ledger = &mut *ledger_guard;
+        let Some(existing) = ledger.pending.get_mut(&open_id) else {
+            return;
+        };
+        let r = self.datasets.read();
+        let in_overflow = existing.in_overflow || is_in_overflow(self.max_datasets, name, &r);
+        let contrib = other_contribution_for(in_overflow, open_id, &raw, &ledger.stores);
+        existing.in_overflow = in_overflow;
+        existing.contrib = max_opt_counters(existing.contrib.take(), contrib);
+    }
+
+    /// Clear a leaving or swapping store's pending token when delete, rename, or restore
+    /// did not close the store.
+    pub(crate) fn cancel_leaving(&self, open_id: u64, token: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut ledger = self.other_store.lock();
+        let remove = match ledger.pending.get_mut(&open_id) {
+            Some(existing) => {
+                existing.tokens.remove(&token);
+                existing.tokens.is_empty()
+            }
+            None => return,
+        };
+        if remove
+            && let Some(entry) = ledger.pending.remove(&open_id)
+            && let Some(contrib) = entry.contrib
+            && ledger.active_scrapes > 0
+        {
+            ledger.restored_during_scrape.insert(open_id, contrib);
+        }
+    }
+
+    /// Commit a completed dataset deletion: drop any named series and retire any pending
+    /// `$other` counters atomically under `other_store -> datasets`.
+    pub(crate) fn commit_delete(&self, dataset: &str, open_id: Option<u64>) {
+        let mut ledger = self.other_store.lock();
+        let mut w = self.datasets.write();
+        w.remove(dataset);
+        if let Some(id) = open_id {
+            ledger.restored_during_scrape.remove(&id);
+            if let Some(contrib) = ledger.pending.remove(&id).and_then(|e| e.contrib) {
+                ledger.retired.add_assign(&contrib);
+                w.entry(OTHER.to_string()).or_default();
+            }
+            ledger.stores.remove(&id);
+            if ledger.active_scrapes > 0 {
+                ledger.retired_ids.insert(id);
+            }
+        }
+    }
+
+    /// Retire a leaving or swapping store whose underlying store was closed and either
+    /// reopened at zero or left closed after a failed delete, rename, or restore swap.
+    pub(crate) fn retire_reopened(&self, open_id: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut ledger = self.other_store.lock();
+        let mut w = self.datasets.write();
+        ledger.restored_during_scrape.remove(&open_id);
+        if let Some(contrib) = ledger.pending.remove(&open_id).and_then(|e| e.contrib) {
+            ledger.retired.add_assign(&contrib);
+            w.entry(OTHER.to_string()).or_default();
+        }
+        ledger.stores.remove(&open_id);
+        if ledger.active_scrapes > 0 {
+            ledger.retired_ids.insert(open_id);
+        }
+    }
+
+    /// Move the named series before the catalog exposes the destination to requests.
+    /// An in-flight scrape of the same opening must skip the vacated alias.
+    pub(crate) fn move_rename_series(
+        &self,
+        from: &str,
+        to: &str,
+        old_open_id: Option<u64>,
+        new_open_id: u64,
+    ) {
+        let mut ledger = self.other_store.lock();
+        let mut w = self.datasets.write();
+        if let Some(series) = w.remove(from) {
+            w.insert(to.to_string(), series);
+        }
+        if old_open_id == Some(new_open_id) {
+            if let Some(pending) = ledger.pending.get_mut(&new_open_id) {
+                pending.published_alias = Some(to.to_string());
+            }
+            if ledger.active_scrapes > 0 {
+                ledger.renamed_from.insert((from.to_string(), new_open_id));
+                ledger.renamed_from.remove(&(to.to_string(), new_open_id));
+            }
+        }
+    }
+
+    /// Keep the predecessor's pending `$other` contribution until the catalog has
+    /// published the destination. Retire it if the store reopened at zero.
+    pub(crate) fn finish_rename(&self, old_open_id: Option<u64>, new_open_id: u64) {
+        let mut ledger = self.other_store.lock();
+        if let Some(old_id) = old_open_id {
+            ledger.restored_during_scrape.remove(&old_id);
+            let contrib = ledger.pending.remove(&old_id).and_then(|e| e.contrib);
+            if old_id == new_open_id {
+                if ledger.active_scrapes > 0
+                    && let Some(c) = contrib
+                {
+                    ledger.restored_during_scrape.insert(old_id, c);
+                }
+            } else {
+                if let Some(c) = contrib {
+                    ledger.retired.add_assign(&c);
+                    self.ensure_other_slot();
+                }
+                ledger.stores.remove(&old_id);
+                if ledger.active_scrapes > 0 {
+                    ledger.retired_ids.insert(old_id);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(test, feature = "otel", feature = "backup"))]
+    pub(crate) fn other_ledger_store_ids(&self) -> Vec<u64> {
+        self.other_store.lock().stores.keys().copied().collect()
+    }
+
+    fn ensure_other_slot(&self) {
+        self.datasets.write().entry(OTHER.to_string()).or_default();
+    }
+
+    fn has_other_slot(&self) -> bool {
+        self.datasets.read().contains_key(OTHER)
+    }
+
+    #[cfg(all(test, feature = "otel"))]
+    pub(crate) fn record_test_work(&self, dataset: &str, rows_produced: u64, mem_peak_bytes: u64) {
+        let (_, ds) = self.series(Some(dataset));
+        ds.rows_produced.fetch_add(rows_produced, Ordering::Relaxed);
+        let i = MEMORY_BUCKETS
+            .iter()
+            .position(|m| mem_peak_bytes <= *m)
+            .unwrap_or(MEMORY_BUCKETS.len());
+        ds.mem_peak[i].fetch_add(1, Ordering::Relaxed);
+        ds.mem_peak_sum.fetch_add(mem_peak_bytes, Ordering::Relaxed);
     }
 
     /// Carry a renamed dataset's series over to its new name.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn rename(&self, from: &str, to: &str) {
-        let mut m = self.datasets.write();
-        if let Some(series) = m.remove(from) {
-            m.insert(to.to_string(), series);
-        }
+        self.move_rename_series(from, to, None, 0);
     }
 
     pub fn active(&self, op: Op) -> i64 {
@@ -1086,6 +1563,8 @@ fn add_totals(t: &mut ValidationTotals, m: &LanguageCounters) {
 /// Scrape-time state of one dataset label (summed over datasets sharing `$other`).
 #[derive(Default)]
 struct DsGauges {
+    /// server-local store instance id for a named dataset (0 for `$other`)
+    instance_id: u64,
     quads: u64,
     delta_inserts: u64,
     delta_deletes: u64,
@@ -1110,63 +1589,235 @@ struct DsGauges {
     commit: sparkles::store::CommitMetrics,
 }
 
+struct ActiveScrapeGuard<'a>(&'a Metrics);
+
+impl Drop for ActiveScrapeGuard<'_> {
+    fn drop(&mut self) {
+        let mut ledger = self.0.other_store.lock();
+        ledger.active_scrapes = ledger.active_scrapes.saturating_sub(1);
+        if ledger.active_scrapes == 0 {
+            ledger.retired_ids.clear();
+            ledger.restored_during_scrape.clear();
+            ledger.renamed_from.clear();
+        }
+    }
+}
+
+fn add_store_counters(g: &mut DsGauges, c: &StoreCounters) {
+    g.cache_hits = g.cache_hits.saturating_add(c.cache_hits);
+    g.cache_misses = g.cache_misses.saturating_add(c.cache_misses);
+    g.rcache_hits = g.rcache_hits.saturating_add(c.rcache_hits);
+    g.rcache_misses = g.rcache_misses.saturating_add(c.rcache_misses);
+    for (h, eff) in g.rebuilds.iter_mut().zip(&c.rebuilds) {
+        add_rebuild(h, eff);
+    }
+}
+
 fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
+    let _scrape_guard = if st.metrics.enabled {
+        st.metrics.other_store.lock().active_scrapes += 1;
+        Some(ActiveScrapeGuard(&st.metrics))
+    } else {
+        None
+    };
     let datasets: Vec<_> = st.datasets().values().cloned().collect();
-    let mut out: BTreeMap<String, DsGauges> = BTreeMap::new();
     // the caches are shared, so one pass over each gives every dataset's bytes
     let (block_usage, result_usage) = match st.catalog.caches() {
         Some(c) => (Some(c.blocks().usage()), Some(c.results().usage())),
         None => (None, None),
     };
-    for d in datasets {
-        let label = if st.metrics.enabled {
-            st.metrics.series(Some(&d.name)).0
-        } else {
-            d.name.clone()
-        };
-        let g = out.entry(label).or_default();
-        let snap = d.store.snapshot();
-        let (c, r) = (d.store.cache(), d.store.result_cache());
-        g.quads += snap.len();
-        g.delta_inserts += snap.delta.inserts() as u64;
-        g.delta_deletes += snap.delta.deletes() as u64;
-        g.wal_bytes += d.store.wal_bytes();
-        // measured at most once a second, like the quota checks of commits
-        let quota = d.dataset.settings().quota().get();
-        g.disk_bytes += quota.used_bytes;
-        g.quota_bytes += quota.max_bytes.unwrap_or(0);
-        let cu = match &block_usage {
-            Some(u) => u.get(&c.namespace()).copied().unwrap_or_default(),
-            None => sparkles::index::NamespaceUsage {
-                bytes: c.bytes(),
-                entries: c.entries() as u64,
-            },
-        };
-        g.cache_bytes += cu.bytes;
-        g.cache_capacity = c.capacity();
-        g.cache_entries += cu.entries;
-        g.cache_hits += c.hits();
-        g.cache_misses += c.misses();
-        g.rcache_enabled |= r.enabled();
-        let ru = match &result_usage {
-            Some(u) => u.get(&r.namespace()).copied().unwrap_or_default(),
-            None => sparkles::index::NamespaceUsage {
-                bytes: r.bytes(),
-                entries: r.entries() as u64,
-            },
-        };
-        g.rcache_bytes += ru.bytes;
-        g.rcache_capacity = r.capacity();
-        g.rcache_entries += ru.entries;
-        g.rcache_hits += r.hits();
-        g.rcache_misses += r.misses();
-        g.commit.merge(&d.store.commit_metrics());
-        for (h, reason) in g.rebuilds.iter_mut().zip(RebuildReason::ALL) {
-            let d = d.store.rebuilds(reason);
-            for (a, b) in h.buckets.iter_mut().zip(d.buckets) {
-                *a += b;
+    struct LiveSample {
+        name: String,
+        open_id: u64,
+        quads: u64,
+        delta_inserts: u64,
+        delta_deletes: u64,
+        wal_bytes: u64,
+        disk_bytes: u64,
+        quota_bytes: u64,
+        cache_bytes: u64,
+        cache_capacity: u64,
+        cache_entries: u64,
+        rcache_enabled: bool,
+        rcache_bytes: u64,
+        rcache_capacity: u64,
+        rcache_entries: u64,
+        commit: sparkles::store::CommitMetrics,
+        counters: StoreCounters,
+    }
+    let samples: Vec<LiveSample> = datasets
+        .into_iter()
+        .map(|d| {
+            let snap = d.store.snapshot();
+            let (c, r) = (d.store.cache(), d.store.result_cache());
+            // measured at most once a second, like the quota checks of commits
+            let quota = d.dataset.settings().quota().get();
+            let cu = match &block_usage {
+                Some(u) => u.get(&c.namespace()).copied().unwrap_or_default(),
+                None => sparkles::index::NamespaceUsage {
+                    bytes: c.bytes(),
+                    entries: c.entries() as u64,
+                },
+            };
+            let ru = match &result_usage {
+                Some(u) => u.get(&r.namespace()).copied().unwrap_or_default(),
+                None => sparkles::index::NamespaceUsage {
+                    bytes: r.bytes(),
+                    entries: r.entries() as u64,
+                },
+            };
+            LiveSample {
+                name: d.name.clone(),
+                open_id: d.open_id,
+                quads: snap.len(),
+                delta_inserts: snap.delta.inserts() as u64,
+                delta_deletes: snap.delta.deletes() as u64,
+                wal_bytes: d.store.wal_bytes(),
+                disk_bytes: quota.used_bytes,
+                quota_bytes: quota.max_bytes.unwrap_or(0),
+                cache_bytes: cu.bytes,
+                cache_capacity: c.capacity(),
+                cache_entries: cu.entries,
+                rcache_enabled: r.enabled(),
+                rcache_bytes: ru.bytes,
+                rcache_capacity: r.capacity(),
+                rcache_entries: ru.entries,
+                commit: d.store.commit_metrics(),
+                counters: StoreCounters::read(&d.store),
             }
-            h.sum_seconds += d.sum_seconds;
+        })
+        .collect();
+    #[cfg(all(test, feature = "otel"))]
+    {
+        let key = std::ptr::from_ref(st) as usize;
+        let hook = GAUGES_AFTER_DATASETS_HOOKS.lock().remove(&key);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    let mut out: BTreeMap<String, DsGauges> = BTreeMap::new();
+    if !st.metrics.enabled {
+        for s in samples {
+            let g = out.entry(s.name).or_default();
+            g.instance_id = s.open_id;
+            g.quads += s.quads;
+            g.delta_inserts += s.delta_inserts;
+            g.delta_deletes += s.delta_deletes;
+            g.wal_bytes += s.wal_bytes;
+            g.disk_bytes += s.disk_bytes;
+            g.quota_bytes += s.quota_bytes;
+            g.cache_bytes += s.cache_bytes;
+            g.cache_capacity = s.cache_capacity;
+            g.cache_entries += s.cache_entries;
+            g.rcache_enabled |= s.rcache_enabled;
+            g.rcache_bytes += s.rcache_bytes;
+            g.rcache_capacity = s.rcache_capacity;
+            g.rcache_entries += s.rcache_entries;
+            g.commit.merge(&s.commit);
+            add_store_counters(g, &s.counters);
+        }
+        return out;
+    }
+    // Hold `other_store` across slot resolution, promotion retirement, and pending/retired
+    // `$other` aggregation so concurrent scrapes never double-count or drop an overflow store.
+    {
+        let mut ledger_guard = st.metrics.other_store.lock();
+        let ledger = &mut *ledger_guard;
+        let mut live_ids = BTreeSet::new();
+        for s in samples {
+            if ledger.retired_ids.contains(&s.open_id)
+                || (!ledger.renamed_from.is_empty()
+                    && ledger.renamed_from.contains(&(s.name.clone(), s.open_id)))
+            {
+                continue;
+            }
+            let pending = ledger.pending.get_mut(&s.open_id);
+            if pending
+                .as_ref()
+                .is_some_and(|p| p.published_alias.as_deref() != Some(s.name.as_str()))
+                || !live_ids.insert(s.open_id)
+            {
+                continue;
+            }
+            // Merge the predecessor's overflow counters before resolving the new
+            // alias, which may have a named slot now.
+            if let Some(c) = pending.as_ref().and_then(|p| p.contrib.as_ref()) {
+                let entry = ledger.stores.entry(s.open_id).or_default();
+                entry.seen_under_other = entry.seen_under_other.max_with(c);
+            }
+            let label = st.metrics.series(Some(&s.name)).0;
+            let is_other = label == OTHER;
+            let effective = if is_other {
+                let entry = ledger.stores.entry(s.open_id).or_default();
+                let eff = s.counters.sub(&entry.promoted_offset);
+                entry.seen_under_other = entry.seen_under_other.max_with(&eff);
+                if let Some(restored) = ledger.restored_during_scrape.get(&s.open_id) {
+                    entry.seen_under_other = entry.seen_under_other.max_with(restored);
+                }
+                entry.seen_under_other.clone_counters()
+            } else {
+                ledger.restored_during_scrape.remove(&s.open_id);
+                if let Some(entry) = ledger.stores.get_mut(&s.open_id) {
+                    if entry.seen_under_other.any() {
+                        let retired = entry.seen_under_other.clone_counters();
+                        ledger.retired.add_assign(&retired);
+                        st.metrics.ensure_other_slot();
+                        entry.promoted_offset.add_assign(&retired);
+                        entry.seen_under_other = StoreCounters::default();
+                    }
+                    s.counters.sub(&entry.promoted_offset)
+                } else {
+                    s.counters
+                }
+            };
+            if let Some(pending) = pending {
+                // Scrapes that miss the destination still need the overflow total.
+                // Promotion to a named slot already moved it to retired counters.
+                pending.contrib = (is_other && effective.any()).then(|| effective.clone_counters());
+            }
+            let g = out.entry(label).or_default();
+            if !is_other {
+                g.instance_id = s.open_id;
+            }
+            g.quads += s.quads;
+            g.delta_inserts += s.delta_inserts;
+            g.delta_deletes += s.delta_deletes;
+            g.wal_bytes += s.wal_bytes;
+            g.disk_bytes += s.disk_bytes;
+            g.quota_bytes += s.quota_bytes;
+            g.cache_bytes += s.cache_bytes;
+            g.cache_capacity = s.cache_capacity;
+            g.cache_entries += s.cache_entries;
+            g.rcache_enabled |= s.rcache_enabled;
+            g.rcache_bytes += s.rcache_bytes;
+            g.rcache_capacity = s.rcache_capacity;
+            g.rcache_entries += s.rcache_entries;
+            g.commit.merge(&s.commit);
+            add_store_counters(g, &effective);
+        }
+        let mut carried = ledger.retired.clone_counters();
+        for (&id, entry) in &ledger.pending {
+            if !live_ids.contains(&id)
+                && let Some(c) = &entry.contrib
+            {
+                let st_entry = ledger.stores.entry(id).or_default();
+                st_entry.seen_under_other = st_entry.seen_under_other.max_with(c);
+                carried.add_assign(&st_entry.seen_under_other);
+            }
+        }
+        for (&id, c) in &ledger.restored_during_scrape {
+            if !live_ids.contains(&id)
+                && !ledger.pending.contains_key(&id)
+                && !ledger.retired_ids.contains(&id)
+            {
+                let st_entry = ledger.stores.entry(id).or_default();
+                st_entry.seen_under_other = st_entry.seen_under_other.max_with(c);
+                carried.add_assign(&st_entry.seen_under_other);
+            }
+        }
+        if carried.any() || st.metrics.has_other_slot() {
+            let g = out.entry(OTHER.to_string()).or_default();
+            add_store_counters(g, &carried);
         }
     }
     out
@@ -1627,6 +2278,9 @@ pub fn render_prometheus(st: &AppState) -> String {
         "Rows produced by all operators of queries and updates (the rows-produced work).",
     );
     for (ds, m) in &series {
+        if ds == NONE {
+            continue;
+        }
         let _ = writeln!(
             o,
             "sparkles_rows_produced_total{{dataset=\"{}\"}} {}",
@@ -1641,14 +2295,14 @@ pub fn render_prometheus(st: &AppState) -> String {
         "Estimated peak memory of queries in bytes.",
     );
     for (ds, m) in &series {
-        let total: u64 = m.mem_peak.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-        if total == 0 {
+        if ds == NONE {
             continue;
         }
+        let Some((cum, sum)) = m.mem_peak_snapshot() else {
+            continue;
+        };
         let ds = escape_label(ds);
-        let mut acc = 0;
-        for (i, c) in m.mem_peak.iter().enumerate() {
-            acc += c.load(Ordering::Relaxed);
+        for (i, acc) in cum.iter().enumerate() {
             let le = MEMORY_BUCKETS
                 .get(i)
                 .map_or("+Inf".to_string(), |b| b.to_string());
@@ -1659,12 +2313,12 @@ pub fn render_prometheus(st: &AppState) -> String {
         }
         let _ = writeln!(
             o,
-            "sparkles_query_memory_peak_bytes_sum{{dataset=\"{ds}\"}} {}",
-            m.mem_peak_sum.load(Ordering::Relaxed)
+            "sparkles_query_memory_peak_bytes_sum{{dataset=\"{ds}\"}} {sum}"
         );
         let _ = writeln!(
             o,
-            "sparkles_query_memory_peak_bytes_count{{dataset=\"{ds}\"}} {total}"
+            "sparkles_query_memory_peak_bytes_count{{dataset=\"{ds}\"}} {}",
+            cum[MEMORY_BUCKETS.len()]
         );
     }
     family(
@@ -1966,13 +2620,11 @@ pub fn render_prometheus(st: &AppState) -> String {
     for (ds, g) in &gauges {
         let ds = escape_label(ds);
         for (h, reason) in g.rebuilds.iter().zip(RebuildReason::ALL) {
-            if h.count() == 0 {
+            let Some((cum, sum)) = rebuild_cumulative(h) else {
                 continue;
-            }
+            };
             let labels = format!("dataset=\"{ds}\",reason=\"{}\"", reason.as_str());
-            let mut acc = 0;
-            for (i, n) in h.buckets.iter().enumerate() {
-                acc += n;
+            for (i, acc) in cum.iter().enumerate() {
                 let le = REBUILD_BUCKETS
                     .get(i)
                     .map_or("+Inf".to_string(), |b| b.to_string());
@@ -1981,14 +2633,11 @@ pub fn render_prometheus(st: &AppState) -> String {
                     "sparkles_rebuild_duration_seconds_bucket{{{labels},le=\"{le}\"}} {acc}"
                 );
             }
+            let _ = writeln!(o, "sparkles_rebuild_duration_seconds_sum{{{labels}}} {sum}");
             let _ = writeln!(
                 o,
-                "sparkles_rebuild_duration_seconds_sum{{{labels}}} {}",
-                h.sum_seconds
-            );
-            let _ = writeln!(
-                o,
-                "sparkles_rebuild_duration_seconds_count{{{labels}}} {acc}"
+                "sparkles_rebuild_duration_seconds_count{{{labels}}} {}",
+                cum[REBUILD_BUCKETS.len()]
             );
         }
     }
@@ -2090,11 +2739,29 @@ fn io_metrics(o: &mut String) {
     );
 }
 
+/// Internal snapshot shared by `/$/metrics?format=json` and the OTLP observer.
+/// `dataset_gens` carries `(series_id, instance_id)` per dataset label so OTLP can
+/// detect same-cycle delete/recreate resets without changing the public JSON schema.
+pub(crate) struct OtelMetricsSnapshot {
+    pub(crate) json: J,
+    #[cfg_attr(not(feature = "otel"), allow(dead_code))]
+    pub(crate) dataset_gens: BTreeMap<String, (u64, u64)>,
+}
+
 /// The JSON snapshot of the registry (`/$/metrics?format=json`) for the UI.
 pub fn metrics_json(st: &AppState) -> J {
+    metrics_otel_snapshot(st).json
+}
+
+pub(crate) fn metrics_otel_snapshot(st: &AppState) -> OtelMetricsSnapshot {
+    // Match `render_prometheus`: compute gauges first so live datasets register their
+    // metric slots before `st.metrics.snapshot()` runs.
+    let gauges = gauges(st);
     let mut requests = Vec::new();
     let mut counters = serde_json::Map::new();
+    let mut series_ids: BTreeMap<String, u64> = BTreeMap::new();
     for (ds, m) in st.metrics.snapshot() {
+        series_ids.insert(ds.clone(), m.series_id.0);
         for op in Op::ALL {
             let om = &m.ops[op.index()];
             if !om.seen.load(Ordering::Relaxed) {
@@ -2129,10 +2796,19 @@ pub fn metrics_json(st: &AppState) -> J {
                 )
             })
             .collect();
+        let query_memory_peak = m.mem_peak_snapshot().map_or(J::Null, |(cum, sum)| {
+            json!({
+                "count": cum[MEMORY_BUCKETS.len()],
+                "sumBytes": sum,
+                "buckets": cum.to_vec(),
+            })
+        });
         counters.insert(
             ds,
             json!({
                 "resultRows": m.result_rows.load(Ordering::Relaxed),
+                "rowsProduced": m.rows_produced.load(Ordering::Relaxed),
+                "queryMemoryPeak": query_memory_peak,
                 "budgetExceeded": budget,
                 "rateLimited": crate::ratelimit::Class::ALL
                     .iter()
@@ -2145,9 +2821,34 @@ pub fn metrics_json(st: &AppState) -> J {
         );
     }
     let geo = crate::geo::series(st);
-    let datasets: Vec<J> = gauges(st)
+    let mut dataset_gens = BTreeMap::new();
+    let datasets: Vec<J> = gauges
         .into_iter()
         .map(|(ds, g)| {
+            dataset_gens.insert(
+                ds.clone(),
+                (series_ids.get(&ds).copied().unwrap_or(0), g.instance_id),
+            );
+            let rebuilds: serde_json::Map<String, J> = RebuildReason::ALL
+                .iter()
+                .zip(&g.rebuilds)
+                .map(|(reason, h)| {
+                    let duration = rebuild_cumulative(h).map_or(J::Null, |(cum, sum)| {
+                        json!({
+                            "count": cum[REBUILD_BUCKETS.len()],
+                            "sumSeconds": sum,
+                            "buckets": cum.to_vec(),
+                        })
+                    });
+                    (
+                        reason.as_str().to_string(),
+                        json!({
+                            "count": h.count(),
+                            "duration": duration,
+                        }),
+                    )
+                })
+                .collect();
             json!({
                 "geo": crate::geo::series_json(geo.get(&ds)),
                 "name": ds,
@@ -2169,6 +2870,9 @@ pub fn metrics_json(st: &AppState) -> J {
                 "diskBytes": g.disk_bytes,
                 "quotaBytes": g.quota_bytes,
                 "resultRows": counters.get(&ds).map_or(J::from(0), |c| c["resultRows"].clone()),
+                "rowsProduced": counters.get(&ds).map_or(J::from(0), |c| c["rowsProduced"].clone()),
+                "queryMemoryPeak": counters.get(&ds).map_or(J::Null, |c| c["queryMemoryPeak"].clone()),
+                "rebuilds": rebuilds,
                 "budgetExceeded": counters.get(&ds).map_or(J::Null, |c| c["budgetExceeded"].clone()),
                 "rateLimited": counters.get(&ds).map_or(J::Null, |c| c["rateLimited"].clone()),
                 "blockCache": {
@@ -2194,7 +2898,7 @@ pub fn metrics_json(st: &AppState) -> J {
         .map(|op| (op.as_str().to_string(), st.metrics.active(*op).into()))
         .collect();
     let (status, states) = (server_status(st), dataset_states(st));
-    json!({
+    let json = json!({
         "formatVersion": 1,
         "version": env!("CARGO_PKG_VERSION"),
         "uptimeSeconds": st.started.elapsed().as_secs_f64(),
@@ -2209,11 +2913,14 @@ pub fn metrics_json(st: &AppState) -> J {
         "io": sparkles::ioacct::IoSnapshot::now().report(),
         "limits": st.limits.json(st.default_timeout),
         "bucketBounds": BUCKETS.to_vec(),
+        "queryMemoryPeakBucketBounds": MEMORY_BUCKETS.to_vec(),
+        "rebuildDurationBucketBounds": REBUILD_BUCKETS.to_vec(),
         "active": active,
         "requests": requests,
         "datasets": datasets,
         "memoryReview": memory_review(st),
-    })
+    });
+    OtelMetricsSnapshot { json, dataset_gens }
 }
 
 /// The open items of the agent memory review inboxes (`memoryReview`).

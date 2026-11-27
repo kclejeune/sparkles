@@ -1,7 +1,7 @@
 //! Server state: dataset registry (persisted like Fuseki's `configuration/`), async tasks.
 
 use anyhow::Result;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use serde::Serialize;
 use sparkles::store::StoreOptions;
 use std::collections::{BTreeMap, BTreeSet};
@@ -346,23 +346,105 @@ fn rooted_in_cancel(e: &anyhow::Error) -> bool {
 struct Leaving<'a> {
     st: &'a AppState,
     name: String,
+    target: Option<String>,
+    open_id: Option<u64>,
+    pending: Option<(u64, u64)>,
+    closed: bool,
+}
+
+impl Leaving<'_> {
+    fn observe_close(&mut self, id: u64, store: &sparkles::store::Store) {
+        if self.open_id == Some(id) {
+            self.st
+                .metrics
+                .refresh_leaving(&self.name, id, crate::obs::StoreCounters::read(store));
+        } else {
+            // A restore may have published a successor before the catalog granted
+            // this mutation. Only the opening we actually closed belongs to us.
+            if let Some((old_id, token)) = self.pending.take() {
+                self.st.metrics.cancel_leaving(old_id, token);
+            }
+            self.open_id = Some(id);
+            self.pending = self.st.record_leaving(&self.name, id, store);
+        }
+        self.closed = true;
+    }
+
+    /// Disarm automatic pending-metrics cancellation once the caller has committed or
+    /// retired the leaving store's `$other` accounting.
+    fn disarm_metrics(&mut self) {
+        self.pending = None;
+    }
 }
 
 impl Drop for Leaving<'_> {
     fn drop(&mut self) {
         let mut l = self.st.leaving.lock();
-        l.remove(&self.name);
+        if let Some((id, token)) = self.pending.take() {
+            if self.closed {
+                self.st.metrics.retire_reopened(id);
+            } else {
+                self.st.metrics.cancel_leaving(id, token);
+            }
+        }
+        l.sources.remove(&self.name);
+        if let Some(target) = &self.target {
+            l.rename_targets.remove(target);
+        }
         self.st.lifecycle.fetch_add(1, Ordering::SeqCst);
+        self.st.leaving_changed.notify_all();
     }
 }
 
-/// Counts a store swap in progress on [`AppState`] until dropped.
-pub(crate) struct Swapping<'a>(&'a AppState);
+#[derive(Default)]
+struct LeavingNames {
+    sources: BTreeSet<String>,
+    rename_targets: BTreeSet<String>,
+    creating: BTreeSet<String>,
+}
+
+/// Excludes server mutations while creating or reserving an alias.
+struct Creating<'a> {
+    st: &'a AppState,
+    name: &'a str,
+}
+
+impl Drop for Creating<'_> {
+    fn drop(&mut self) {
+        self.st.leaving.lock().creating.remove(self.name);
+    }
+}
+
+/// Counts a store swap in progress on [`AppState`] until dropped, and reconciles
+/// the replaced store's `$other` metrics ledger when used by an in-place restore.
+#[cfg_attr(not(feature = "backup"), allow(dead_code))]
+pub(crate) struct Swapping<'a> {
+    st: &'a AppState,
+    #[cfg(feature = "backup")]
+    pending: Option<(u64, u64)>,
+}
+
+#[cfg(feature = "backup")]
+impl Swapping<'_> {
+    pub(crate) fn observe_close(&mut self, name: &str, id: u64, store: &sparkles::store::Store) {
+        if self.pending.is_some_and(|(old, _)| old == id) {
+            self.st
+                .metrics
+                .refresh_leaving(name, id, crate::obs::StoreCounters::read(store));
+            self.st.metrics.retire_reopened(id);
+            self.pending = None;
+        }
+    }
+}
 
 impl Drop for Swapping<'_> {
     fn drop(&mut self) {
-        self.0.swapping.fetch_sub(1, Ordering::SeqCst);
-        self.0.lifecycle.fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "backup")]
+        if let Some((old_id, token)) = self.pending.take() {
+            self.st.metrics.cancel_leaving(old_id, token);
+        }
+        self.st.swapping.fetch_sub(1, Ordering::SeqCst);
+        self.st.lifecycle.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -383,7 +465,10 @@ pub struct AppState {
     routing: Mutex<BTreeMap<String, Arc<Dataset>>>,
     /// Datasets being deleted or renamed. Lookups do not find them, so no request can
     /// take a handle that would make the delete or rename fail.
-    leaving: Mutex<BTreeSet<String>>,
+    leaving: Mutex<LeavingNames>,
+    leaving_changed: Condvar,
+    #[cfg(test)]
+    pub(crate) lifecycle_hooks: tests::LifecycleHooks,
     /// Counts the starts and ends of deletions, renames and store swaps, so a reader of
     /// the catalog can tell that one came while it read.
     lifecycle: AtomicU64,
@@ -781,7 +866,10 @@ impl AppState {
             catalog,
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
-            leaving: Mutex::new(BTreeSet::new()),
+            leaving: Mutex::default(),
+            leaving_changed: Condvar::new(),
+            #[cfg(test)]
+            lifecycle_hooks: Default::default(),
             lifecycle: AtomicU64::new(0),
             swapping: Default::default(),
             tasks: Arc::new(Mutex::new(Vec::new())),
@@ -866,7 +954,10 @@ impl AppState {
             catalog,
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
-            leaving: Mutex::new(BTreeSet::new()),
+            leaving: Mutex::default(),
+            leaving_changed: Condvar::new(),
+            #[cfg(test)]
+            lifecycle_hooks: Default::default(),
             lifecycle: AtomicU64::new(0),
             swapping: Default::default(),
             tasks: Arc::new(Mutex::new(Vec::new())),
@@ -1154,7 +1245,7 @@ impl AppState {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Dataset>> {
-        if self.leaving.lock().contains(name) {
+        if self.leaving.lock().sources.contains(name) {
             return None;
         }
         // startup's own steps see the datasets it holds back from requests
@@ -1171,20 +1262,31 @@ impl AppState {
         }
         // A delete or rename may have started since the check above. Its wrapper is
         // not cached, and the catalog refuses the delete or rename while it lives.
-        if self.leaving.lock().contains(name) {
+        if self.leaving.lock().sources.contains(name) {
             return None;
         }
-        let ds = self.wrap_dataset(name, info.kind, dataset, info.attached);
+        Some(self.wrap_and_cache(&mut routing, name, info.kind, dataset, info.attached))
+    }
+
+    fn wrap_and_cache(
+        &self,
+        routing: &mut BTreeMap<String, Arc<Dataset>>,
+        name: &str,
+        kind: DbType,
+        dataset: sparkles::Dataset,
+        ephemeral: bool,
+    ) -> Arc<Dataset> {
+        let ds = self.wrap_dataset(name, kind, dataset, ephemeral);
         // A request that passed the restore guard can reach this lookup after the
         // routing cache was drained. Its temporary wrapper must not keep the old
         // library dataset alive after that request finishes.
         if self.catalog.restoring_by(name).is_none() {
             routing.insert(name.to_string(), ds.clone());
         }
-        Some(ds)
+        ds
     }
 
-    #[cfg(feature = "backup")]
+    #[cfg(all(test, feature = "backup"))]
     pub fn forget_routing(&self, name: &str) {
         self.routing.lock().remove(name);
     }
@@ -1215,21 +1317,54 @@ impl AppState {
         out
     }
 
+    fn begin_create<'a>(&'a self, name: &'a str) -> sparkles::Result<Creating<'a>> {
+        let mut names = self.leaving.lock();
+        if names.sources.contains(name)
+            || names.rename_targets.contains(name)
+            || !names.creating.insert(name.to_string())
+        {
+            return Err(sparkles::Error::Conflict(format!(
+                "dataset /{name} is being created, reserved, deleted or renamed"
+            )));
+        }
+        Ok(Creating { st: self, name })
+    }
+
     pub fn create(&self, name: &str, kind: DbType) -> Result<Arc<Dataset>> {
+        let _creating = self.begin_create(name)?;
         self.catalog.set_defaults(sparkles::DatasetOptions {
             store: self.store_opts.clone(),
             closure_cache_triples: self.reason_cache_triples,
             ..Default::default()
         });
-        self.catalog.create(
+        let dataset = self.catalog.create(
             name,
             &sparkles::catalog::CreateDataset {
                 kind,
                 ..Default::default()
             },
         )?;
-        Ok(self.get(name).expect("created"))
+        Ok(self.cache_published(name, kind, dataset))
     }
+
+    pub(crate) fn cache_published(
+        &self,
+        name: &str,
+        kind: DbType,
+        dataset: sparkles::Dataset,
+    ) -> Arc<Dataset> {
+        let mut routing = self.routing.lock();
+        if let Some(ds) = routing.get(name)
+            && ds.open_id == dataset.state().open_id
+        {
+            return ds.clone();
+        }
+        if self.leaving.lock().sources.contains(name) {
+            return self.wrap_dataset(name, kind, dataset, false);
+        }
+        self.wrap_and_cache(&mut routing, name, kind, dataset, false)
+    }
+
     /// Startup attaches its datasets with [`attach_expected`](Self::attach_expected),
     /// so outside the tests only `sparkles ingest` (with `mcp`) attaches this way.
     #[cfg(any(test, feature = "mcp"))]
@@ -1276,7 +1411,7 @@ impl AppState {
     /// Whether any dataset is being deleted or renamed now, or has its store swapped
     /// by an in-place restore, any of which can take it out of the catalog for a while.
     pub fn any_leaving(&self) -> bool {
-        self.swapping.load(Ordering::SeqCst) > 0 || !self.leaving.lock().is_empty()
+        self.swapping.load(Ordering::SeqCst) > 0 || !self.leaving.lock().sources.is_empty()
     }
 
     /// How many deletions, renames and store swaps started or ended since the server
@@ -1288,11 +1423,25 @@ impl AppState {
 
     /// Count a swap of a dataset's store, such as an in-place restore, until the guard
     /// drops, so that [`Self::any_leaving`] and [`Self::lifecycle`] tell of it.
-    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    #[cfg_attr(not(all(test, feature = "backup")), allow(dead_code))]
     pub(crate) fn swapping(&self) -> Swapping<'_> {
         self.swapping.fetch_add(1, Ordering::SeqCst);
         self.lifecycle.fetch_add(1, Ordering::SeqCst);
-        Swapping(self)
+        Swapping {
+            st: self,
+            #[cfg(feature = "backup")]
+            pending: None,
+        }
+    }
+
+    /// Detach routing for an in-place store swap and hold the predecessor store's `$other`
+    /// counters as pending until the catalog closes the opening or the swap refuses it.
+    #[cfg(feature = "backup")]
+    pub(crate) fn begin_swap(&self, name: &str) -> Swapping<'_> {
+        let mut swapping = self.swapping();
+        let cached = self.routing.lock().remove(name);
+        swapping.pending = self.leaving_opening(name, cached.as_deref()).1;
+        swapping
     }
 
     /// Hold `name` as leaving, as a deletion that is draining does (tests).
@@ -1303,9 +1452,10 @@ impl AppState {
 
     /// Mark `name` as leaving until the guard drops. A second delete or rename of the
     /// same dataset is refused meanwhile.
+    #[cfg(all(test, feature = "auth"))]
     fn leave(&self, name: &str) -> Result<Leaving<'_>> {
         let mut l = self.leaving.lock();
-        if !l.insert(name.to_string()) {
+        if !l.sources.insert(name.to_string()) {
             return Err(sparkles::Error::Conflict(format!(
                 "dataset /{name} is already being deleted or renamed"
             ))
@@ -1316,7 +1466,104 @@ impl AppState {
         Ok(Leaving {
             st: self,
             name: name.to_string(),
+            target: None,
+            open_id: None,
+            pending: None,
+            closed: false,
         })
+    }
+
+    fn record_leaving(
+        &self,
+        name: &str,
+        id: u64,
+        store: &sparkles::store::Store,
+    ) -> Option<(u64, u64)> {
+        self.metrics
+            .begin_leaving(name, id, crate::obs::StoreCounters::read(store))
+            .map(|token| (id, token))
+    }
+
+    fn leaving_opening(
+        &self,
+        name: &str,
+        cached: Option<&Dataset>,
+    ) -> (Option<u64>, Option<(u64, u64)>) {
+        if let Some(ds) = cached {
+            (
+                Some(ds.open_id),
+                self.record_leaving(name, ds.open_id, &ds.store),
+            )
+        } else if let Some(ds) = self.catalog.get(name) {
+            let id = ds.state().open_id;
+            (Some(id), self.record_leaving(name, id, ds.store()))
+        } else {
+            (None, None)
+        }
+    }
+
+    /// Atomically mark `name` as leaving, detach its cached routing object, and register
+    /// any `$other` live-store counters as pending under `routing -> leaving -> other_store`
+    /// lock order so concurrent scrapes never observe a gap during deletion or rename.
+    fn leave_and_take_cached(
+        &self,
+        name: &str,
+        target: Option<&str>,
+    ) -> Result<(Leaving<'_>, Option<Arc<Dataset>>)> {
+        let (mut routing, mut leaving) = loop {
+            let routing = self.routing.lock();
+            let mut leaving = self.leaving.lock();
+            if leaving.sources.contains(name) {
+                return Err(sparkles::Error::Conflict(format!(
+                    "dataset /{name} is already being deleted or renamed"
+                ))
+                .into());
+            }
+            if let Some(creating) = [Some(name), target]
+                .into_iter()
+                .flatten()
+                .find(|n| leaving.creating.contains(*n))
+            {
+                return Err(sparkles::Error::Conflict(format!(
+                    "dataset /{creating} is being created"
+                ))
+                .into());
+            }
+            if !leaving.rename_targets.contains(name)
+                && !target.is_some_and(|to| {
+                    leaving.sources.contains(to) || leaving.rename_targets.contains(to)
+                })
+            {
+                break (routing, leaving);
+            }
+            // A rename can already expose its destination while server state is still
+            // being moved. Wait before sampling or mutating that alias.
+            drop(routing);
+            #[cfg(all(test, feature = "otel"))]
+            self.lifecycle_hooks
+                .run(tests::HookPoint::WaitingForRename, name);
+            self.leaving_changed.wait(&mut leaving);
+        };
+        leaving.sources.insert(name.to_string());
+        if let Some(to) = target {
+            leaving.rename_targets.insert(to.to_string());
+        }
+        self.lifecycle.fetch_add(1, Ordering::SeqCst);
+        let cached = routing.remove(name);
+        drop(routing);
+        let (open_id, pending) = self.leaving_opening(name, cached.as_deref());
+        drop(leaving);
+        Ok((
+            Leaving {
+                st: self,
+                name: name.to_string(),
+                target: target.map(str::to_string),
+                open_id,
+                pending,
+                closed: false,
+            },
+            cached,
+        ))
     }
 
     /// Delete a dataset. Lookups stop finding it first, then its cached routing object
@@ -1334,9 +1581,8 @@ impl AppState {
         &self,
         name: &str,
     ) -> Result<(bool, Option<uuid::Uuid>)> {
-        let leaving = self.leave(name)?;
+        let (mut leaving, cached) = self.leave_and_take_cached(name, None)?;
         let end = Instant::now() + LEAVE_DRAIN;
-        let cached = self.routing.lock().remove(name);
         // Only a managed persistent dataset has files that an old handle could write.
         let managed = match cached.as_ref() {
             Some(ds) => ds.kind == DbType::Persistent && !ds.ephemeral,
@@ -1354,27 +1600,49 @@ impl AppState {
         let offline = cached
             .as_ref()
             .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
-        let identity = cached
+        let mut identity = cached
             .as_ref()
             .map(|ds| ds.store.dataset_id())
             .or_else(|| self.catalog.info(name).map(|info| info.id));
+        if let Some(ds) = cached.as_ref() {
+            self.metrics.refresh_leaving(
+                name,
+                ds.open_id,
+                crate::obs::StoreCounters::read(&ds.store),
+            );
+        }
         drop(cached);
         if managed {
             // Other holders of the dataset itself, not this server's wrapper, get the
             // same window. The catalog then refuses if one still does, except the
             // dataset's own views worker, which it pauses instead.
             wait_until(end, || !self.catalog.in_use(name));
+            if let Some(old_id) = leaving.open_id
+                && let Some(ds) = self.catalog.get(name)
+                && ds.state().open_id == old_id
+            {
+                self.metrics.refresh_leaving(
+                    name,
+                    old_id,
+                    crate::obs::StoreCounters::read(ds.store()),
+                );
+            }
         }
         #[cfg(test)]
-        tests::delete_hook(name);
-        let deleted = self.catalog.delete(name);
-        drop(leaving);
+        self.lifecycle_hooks
+            .run(tests::HookPoint::BeforeMutation, name);
+        let deleted = self.catalog.delete_observed(name, |id, store| {
+            identity = Some(store.dataset_id());
+            leaving.observe_close(id, store);
+        });
         match deleted {
             Ok(deleted) => {
                 if deleted {
+                    self.metrics.commit_delete(name, leaving.open_id);
+                    leaving.disarm_metrics();
+                    drop(leaving);
                     #[cfg(all(test, feature = "mcp"))]
                     tests::fire_delete_after_leave_hook(name);
-                    self.metrics.forget(name);
                     self.volatile.forget(identity);
                     #[cfg(feature = "mcp")]
                     self.graphrag.forget(name, identity);
@@ -1382,6 +1650,7 @@ impl AppState {
                 Ok((deleted, deleted.then_some(identity).flatten()))
             }
             Err(e) => {
+                drop(leaving);
                 if let Some(ds) = self.get(name) {
                     ds.offline.store(offline, Ordering::Relaxed);
                 }
@@ -1425,9 +1694,8 @@ impl AppState {
             ))
             .into());
         }
-        let leaving = self.leave(from)?;
+        let (mut leaving, cached) = self.leave_and_take_cached(from, Some(to))?;
         let end = Instant::now() + LEAVE_DRAIN;
-        let cached = self.routing.lock().remove(from);
         if cached.as_ref().is_some_and(|ds| !drained(ds, end)) {
             self.routing
                 .lock()
@@ -1440,57 +1708,93 @@ impl AppState {
         let offline = cached
             .as_ref()
             .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
+        if let Some(ds) = cached.as_ref() {
+            self.metrics.refresh_leaving(
+                from,
+                ds.open_id,
+                crate::obs::StoreCounters::read(&ds.store),
+            );
+        }
         drop(cached);
         // As in delete, wait for the workers that hold the dataset itself. The catalog
         // refuses a rename for those handles only on a persistent dataset.
         if self.catalog_persistent(from) {
             wait_until(end, || !self.catalog.in_use(from));
+            if let Some(old_id) = leaving.open_id
+                && let Some(ds) = self.catalog.get(from)
+                && ds.state().open_id == old_id
+            {
+                self.metrics.refresh_leaving(
+                    from,
+                    old_id,
+                    crate::obs::StoreCounters::read(ds.store()),
+                );
+            }
         }
-        let result = self.catalog.rename(from, to);
+        #[cfg(test)]
+        self.lifecycle_hooks
+            .run(tests::HookPoint::BeforeMutation, from);
+        use sparkles::catalog::RenameEvent;
+        let mut published = None;
+        let result = self.catalog.rename_observed(from, to, |event| match event {
+            RenameEvent::Closed(id, store) => leaving.observe_close(id, store),
+            RenameEvent::Publishing(id) => {
+                self.metrics
+                    .move_rename_series(from, to, leaving.open_id, id);
+                published = Some(id);
+            }
+            RenameEvent::DestinationDetached => {
+                // The source alias is reusable and the destination has no live opening.
+                self.metrics.commit_delete(from, leaving.open_id);
+                leaving.disarm_metrics();
+            }
+        });
+        let Some(open_id) = published else {
+            drop(leaving);
+            if let Some(ds) = self.get(from) {
+                ds.offline.store(offline, Ordering::Relaxed);
+            }
+            return result.map(drop).map_err(Into::into);
+        };
+        #[cfg(all(test, feature = "otel"))]
+        self.lifecycle_hooks
+            .run(tests::HookPoint::RenamePublished, from);
+        self.metrics.finish_rename(leaving.open_id, open_id);
+        leaving.disarm_metrics();
+        #[cfg(test)]
+        self.lifecycle_hooks
+            .run(tests::HookPoint::RenameCleanup, from);
+        #[cfg(feature = "mcp")]
+        let dataset_id = result.as_ref().ok().map(sparkles::Dataset::dataset_id);
+        let result = result.map(drop);
+        // Volatile files are keyed by dataset UUID, which the catalog preserves.
+        self.compaction.rename(from, to);
+        if let Some(auto) = &self.auto_reason {
+            auto.rename(from, to);
+        }
+        #[cfg(feature = "backup")]
+        if let Some(b) = &self.backup
+            && let Err(e) = crate::backup::policies::rename_dataset(b, from, to)
+        {
+            tracing::warn!("backup policies still name /{from}: {e:#}");
+        }
+        if let Some(ds) = self.get(to) {
+            ds.offline.store(offline, Ordering::Relaxed);
+        }
         drop(leaving);
-        match result {
-            Ok(ds) => {
-                #[cfg(feature = "mcp")]
-                let dataset_id = ds.dataset_id();
-                drop(ds);
-                #[cfg(all(test, feature = "mcp"))]
-                tests::fire_rename_after_catalog_hook(from, to);
-                self.metrics.rename(from, to);
-                #[cfg(feature = "mcp")]
-                self.graphrag.rename(from, dataset_id);
-                // Volatile in-memory files are keyed by dataset UUID, which
-                // `catalog.rename` preserves atomically.
-                self.compaction.rename(from, to);
-                if let Some(auto) = &self.auto_reason {
-                    auto.rename(from, to);
-                }
-                #[cfg(feature = "backup")]
-                if let Some(b) = &self.backup
-                    && let Err(e) = crate::backup::policies::rename_dataset(b, from, to)
-                {
-                    tracing::warn!("backup policies still name /{from}: {e:#}");
-                }
-                if let Some(ds) = self.get(to) {
-                    ds.offline.store(offline, Ordering::Relaxed);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                if let Some(ds) = self.get(from) {
-                    ds.offline.store(offline, Ordering::Relaxed);
-                }
-                Err(e.into())
-            }
+        #[cfg(feature = "mcp")]
+        if let Some(dataset_id) = dataset_id {
+            #[cfg(test)]
+            tests::fire_rename_after_catalog_hook(from, to);
+            self.graphrag.rename(from, dataset_id);
         }
+        result.map_err(Into::into)
     }
     pub fn reserved_by(&self, name: &str) -> Option<String> {
         self.catalog.reserved_by(name)
     }
-    pub fn reserve(
-        self: &Arc<Self>,
-        name: &str,
-        task: &str,
-    ) -> std::result::Result<Reservation, String> {
+    pub fn reserve(&self, name: &str, task: &str) -> std::result::Result<Reservation, String> {
+        let _creating = self.begin_create(name).map_err(|e| e.to_string())?;
         self.catalog
             .reserve(name, sparkles::catalog::ReservationKind::Clone, task)
             .map_err(|e| e.to_string())
@@ -1978,11 +2282,40 @@ pub(crate) mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    type Hook = (String, Box<dyn FnOnce() + Send>);
-    static DELETE_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
-    type TaskHooks = Mutex<BTreeMap<String, Box<dyn FnOnce() + Send>>>;
+    type Hook = Box<dyn FnOnce() + Send>;
+    type TaskHooks = Mutex<BTreeMap<String, Hook>>;
     static TASK_RETIREMENT_HOOK: TaskHooks = Mutex::new(BTreeMap::new());
     static TASK_START_HOOK: TaskHooks = Mutex::new(BTreeMap::new());
+
+    #[derive(Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
+    pub(crate) enum HookPoint {
+        BeforeMutation,
+        #[cfg(feature = "otel")]
+        RenamePublished,
+        RenameCleanup,
+        #[cfg(feature = "otel")]
+        WaitingForRename,
+        #[cfg(all(feature = "backup", feature = "otel"))]
+        SwapReserved,
+        #[cfg(all(feature = "backup", feature = "otel"))]
+        SwapPending,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct LifecycleHooks(Mutex<BTreeMap<(HookPoint, String), Hook>>);
+
+    impl LifecycleHooks {
+        pub(crate) fn set(&self, point: HookPoint, name: &str, f: impl FnOnce() + Send + 'static) {
+            self.0.lock().insert((point, name.into()), Box::new(f));
+        }
+
+        pub(crate) fn run(&self, point: HookPoint, name: &str) {
+            let hook = self.0.lock().remove(&(point, name.into()));
+            if let Some(f) = hook {
+                f();
+            }
+        }
+    }
 
     pub(crate) fn task_retirement_hook(kind: &str) {
         run_task_hook(&TASK_RETIREMENT_HOOK, kind);
@@ -2054,22 +2387,6 @@ pub(crate) mod tests {
             );
             release.send(()).unwrap();
             drop(reopened);
-        }
-    }
-
-    /// Runs the hook installed for dataset `name`, where a delete starts its catalog
-    /// work.
-    pub(crate) fn delete_hook(name: &str) {
-        let hook = {
-            let mut h = DELETE_HOOK.lock();
-            if h.as_ref().is_some_and(|(n, _)| n == name) {
-                h.take()
-            } else {
-                None
-            }
-        };
-        if let Some((_, f)) = hook {
-            f();
         }
     }
 
@@ -2333,13 +2650,11 @@ pub(crate) mod tests {
         drop(st.create("bystander", DbType::Persistent).unwrap());
         let (entered, entered_rx) = mpsc::channel();
         let (release, release_rx) = mpsc::channel::<()>();
-        *DELETE_HOOK.lock() = Some((
-            target.to_string(),
-            Box::new(move || {
+        st.lifecycle_hooks
+            .set(HookPoint::BeforeMutation, target, move || {
                 entered.send(()).unwrap();
                 release_rx.recv().unwrap();
-            }),
-        ));
+            });
         let deleter = {
             let st = st.clone();
             std::thread::spawn(move || st.delete(target).unwrap())

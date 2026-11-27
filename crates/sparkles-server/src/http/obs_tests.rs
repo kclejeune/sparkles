@@ -2,6 +2,7 @@
 
 use super::router;
 use crate::obs::Phase;
+use crate::state::tests::HookPoint;
 use crate::state::{AppState, DbType};
 use axum::Router;
 use axum::body::Body;
@@ -101,6 +102,151 @@ async fn send(app: &Router, req: Request<Body>) -> Resp {
         headers,
         body,
     }
+}
+
+#[tokio::test]
+async fn recreate_source_during_rename_cleanup_conflicts_before_publication() {
+    let s = server();
+    let original = s.state.create("a", DbType::Mem).unwrap().store.dataset_id();
+    let (paused, at_cleanup) = std::sync::mpsc::channel();
+    let (resume, release) = std::sync::mpsc::channel();
+    s.state
+        .lifecycle_hooks
+        .set(HookPoint::RenameCleanup, "a", move || {
+            paused.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(15)).unwrap();
+        });
+    let renaming = {
+        let st = s.state.clone();
+        std::thread::spawn(move || st.rename("a", "b").unwrap())
+    };
+    at_cleanup.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    assert_eq!(s.state.catalog.get("b").unwrap().dataset_id(), original);
+    let create = || {
+        Request::post("/$/datasets")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"dbName":"a","dbType":"persistent"}"#))
+            .unwrap()
+    };
+    let conflict = send(&s.app, create()).await;
+    let reservation_conflict = s.state.reserve("a", "reserve-test").is_err();
+    let published = s.state.catalog.get("a").is_some();
+    let directory_created = s.state.data_dir.join("databases/a").exists();
+    resume.send(()).unwrap();
+    renaming.join().unwrap();
+
+    assert_eq!(conflict.status, StatusCode::CONFLICT, "{}", conflict.text());
+    assert!(reservation_conflict);
+    assert!(!published);
+    assert!(!directory_created);
+    drop(s.state.reserve("a", "reserve-test").unwrap());
+    let recreated = send(&s.app, create()).await;
+    assert_eq!(
+        recreated.status,
+        StatusCode::CREATED,
+        "{}",
+        recreated.text()
+    );
+    let id = s.state.get("a").unwrap().store.dataset_id();
+    assert_ne!(id, original);
+    assert_eq!(recreated.json()["id"], id.to_string());
+}
+
+#[tokio::test]
+async fn persistent_rename_recovery_moves_request_metrics_before_source_reuse() {
+    let s = server_with(|st| st.metrics = crate::obs::Metrics::new(true, 3));
+    let original = {
+        let a = s.state.create("a", DbType::Persistent).unwrap();
+        a.dataset
+            .update("INSERT DATA { <urn:original> <urn:p> 1 }")
+            .unwrap();
+        a.store.dataset_id()
+    };
+    let query =
+        |name| format!("/{name}/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D");
+    let series = |name| format!(r#"sparkles_rows_produced_total{{dataset="{name}"}}"#);
+    let peaks = |name| format!(r#"sparkles_query_memory_peak_bytes_count{{dataset="{name}"}}"#);
+    assert_eq!(get(&s.app, &query("a")).await.status, StatusCode::OK);
+    let before = metrics_once(&s.app, &peaks("a"), 1.0).await;
+    let original_rows = sample(&before, &series("a")).unwrap();
+    assert!(original_rows > 0.0);
+
+    sparkles::Catalog::fail_next_rename_registry_sync();
+    let error = s.state.rename("a", "b").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected rename registry sync failure")
+    );
+    assert!(s.state.get("a").is_none());
+    assert_eq!(s.state.get("b").unwrap().store.dataset_id(), original);
+
+    let recovered = metrics(&s.app).await;
+    assert_eq!(sample(&recovered, &series("b")), Some(original_rows));
+    assert_eq!(sample(&recovered, &peaks("b")), Some(1.0));
+    assert_eq!(sample(&recovered, &series("a")), None);
+    assert_eq!(get(&s.app, &query("b")).await.status, StatusCode::OK);
+    let queried = metrics_once(&s.app, &peaks("b"), 2.0).await;
+    let destination_rows = sample(&queried, &series("b")).unwrap();
+    assert!(destination_rows > original_rows);
+
+    {
+        let recreated = s.state.create("a", DbType::Persistent).unwrap();
+        assert_ne!(recreated.store.dataset_id(), original);
+        recreated
+            .dataset
+            .update("INSERT DATA { <urn:fresh> <urn:p> 2 }")
+            .unwrap();
+    }
+    let fresh = metrics(&s.app).await;
+    assert_eq!(sample(&fresh, &series("a")), Some(0.0));
+    assert_eq!(sample(&fresh, &peaks("a")), None);
+    assert_eq!(get(&s.app, &query("a")).await.status, StatusCode::OK);
+    let after = metrics_once(&s.app, &peaks("a"), 1.0).await;
+    assert!(sample(&after, &series("a")).unwrap() > 0.0);
+    assert_eq!(sample(&after, &series("b")), Some(destination_rows));
+    assert_eq!(sample(&after, &peaks("b")), Some(2.0));
+}
+
+#[tokio::test]
+async fn persistent_rename_with_detached_destination_clears_source_request_metrics() {
+    let s = server_with(|st| st.metrics = crate::obs::Metrics::new(true, 3));
+    let original = {
+        let a = s.state.create("a", DbType::Persistent).unwrap();
+        a.dataset
+            .update("INSERT DATA { <urn:original> <urn:p> 1 }")
+            .unwrap();
+        a.store.dataset_id()
+    };
+    let query = "/a/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D";
+    let rows = r#"sparkles_rows_produced_total{dataset="a"}"#;
+    let peaks = r#"sparkles_query_memory_peak_bytes_count{dataset="a"}"#;
+    assert_eq!(get(&s.app, query).await.status, StatusCode::OK);
+    let before = metrics_once(&s.app, peaks, 1.0).await;
+    assert!(sample(&before, rows).unwrap() > 0.0);
+
+    sparkles::Catalog::fail_next_rename_registry_sync();
+    sparkles::Catalog::fail_next_rename_recovery_reopen();
+    let error = s.state.rename("a", "b").unwrap_err().to_string();
+    assert!(
+        error.contains("injected rename registry sync failure"),
+        "{error}"
+    );
+    assert!(
+        error.contains("reopening the dataset failed too"),
+        "{error}"
+    );
+    assert_eq!(s.state.catalog.closed(), ["b"]);
+    assert!(s.state.get("b").is_none());
+
+    let recreated = s.state.create("a", DbType::Persistent).unwrap();
+    assert_ne!(recreated.store.dataset_id(), original);
+    let fresh = metrics(&s.app).await;
+    assert_eq!(
+        (sample(&fresh, rows), sample(&fresh, peaks)),
+        (Some(0.0), None)
+    );
 }
 
 async fn get(app: &Router, uri: &str) -> Resp {
@@ -282,11 +428,215 @@ async fn metrics_count_requests_by_dataset_operation_and_outcome() {
     }
 }
 
+async fn metrics_json_resp(app: &Router) -> J {
+    let r = get(app, "/$/metrics?format=json").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+/// Assert that the JSON snapshot agrees with Prometheus text on every Phase 2 series
+/// (`rows_produced`, `query_memory_peak`, `rebuilds`, `rebuild_duration`) for `label`.
+fn assert_prom_json_phase2_parity(prom: &str, json: &J, label: &str) {
+    let mem_bounds: Vec<u64> = json["queryMemoryPeakBucketBounds"]
+        .as_array()
+        .expect("queryMemoryPeakBucketBounds")
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    assert_eq!(mem_bounds, crate::obs::MEMORY_BUCKETS);
+
+    let rebuild_bounds: Vec<f64> = json["rebuildDurationBucketBounds"]
+        .as_array()
+        .expect("rebuildDurationBucketBounds")
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    assert_eq!(rebuild_bounds, sparkles::store::REBUILD_BUCKETS);
+
+    let ds = json["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == label)
+        .unwrap_or_else(|| panic!("dataset {label} missing from JSON snapshot: {json}"));
+
+    // rows_produced
+    let rows_produced = ds["rowsProduced"].as_u64().expect("rowsProduced");
+    assert_eq!(
+        sample(
+            prom,
+            &format!(r#"sparkles_rows_produced_total{{dataset="{label}"}}"#)
+        ),
+        Some(rows_produced as f64),
+        "rows_produced mismatch for {label}\n{prom}\n{ds}"
+    );
+
+    // query_memory_peak
+    if ds["queryMemoryPeak"].is_null() {
+        assert!(
+            !prom.contains(&format!(
+                r#"sparkles_query_memory_peak_bytes_count{{dataset="{label}"}}"#
+            )),
+            "unexpected query_memory_peak series in Prometheus for {label}\n{prom}"
+        );
+    } else {
+        let peak = &ds["queryMemoryPeak"];
+        let count = peak["count"].as_u64().unwrap();
+        let sum = peak["sumBytes"].as_u64().unwrap();
+        let buckets: Vec<u64> = peak["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert_eq!(buckets.len(), mem_bounds.len() + 1);
+        assert_eq!(*buckets.last().unwrap(), count);
+        assert_eq!(
+            sample(
+                prom,
+                &format!(r#"sparkles_query_memory_peak_bytes_count{{dataset="{label}"}}"#)
+            ),
+            Some(count as f64),
+            "query_memory_peak count mismatch for {label}"
+        );
+        assert_eq!(
+            sample(
+                prom,
+                &format!(r#"sparkles_query_memory_peak_bytes_sum{{dataset="{label}"}}"#)
+            ),
+            Some(sum as f64),
+            "query_memory_peak sum mismatch for {label}"
+        );
+        for (i, b) in buckets.iter().enumerate() {
+            let le = mem_bounds
+                .get(i)
+                .map_or("+Inf".to_string(), |v| v.to_string());
+            assert_eq!(
+                sample(
+                    prom,
+                    &format!(
+                        r#"sparkles_query_memory_peak_bytes_bucket{{dataset="{label}",le="{le}"}}"#
+                    )
+                ),
+                Some(*b as f64),
+                "query_memory_peak bucket le={le} mismatch for {label}"
+            );
+        }
+    }
+
+    // rebuilds + rebuild_duration by reason
+    let rebuilds = ds["rebuilds"].as_object().expect("rebuilds object");
+    assert_eq!(rebuilds.len(), 2);
+    for reason in sparkles::store::RebuildReason::ALL {
+        let r = reason.as_str();
+        let entry = &rebuilds[r];
+        let count = entry["count"].as_u64().unwrap();
+        assert_eq!(
+            sample(
+                prom,
+                &format!(r#"sparkles_rebuilds_total{{dataset="{label}",reason="{r}"}}"#)
+            ),
+            Some(count as f64),
+            "rebuilds_total mismatch for {label}/{r}"
+        );
+        if count == 0 {
+            assert!(
+                entry["duration"].is_null(),
+                "zero rebuilds must have null duration for {label}/{r}: {entry}"
+            );
+            assert!(
+                !prom.contains(&format!(
+                    r#"sparkles_rebuild_duration_seconds_count{{dataset="{label}",reason="{r}"}}"#
+                )),
+                "unexpected rebuild_duration in Prometheus for {label}/{r}\n{prom}"
+            );
+        } else {
+            let dur = &entry["duration"];
+            let dcount = dur["count"].as_u64().unwrap();
+            let dsum = dur["sumSeconds"].as_f64().unwrap();
+            let buckets: Vec<u64> = dur["buckets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect();
+            assert_eq!(dcount, count);
+            assert_eq!(buckets.len(), rebuild_bounds.len() + 1);
+            assert_eq!(*buckets.last().unwrap(), dcount);
+            assert_eq!(
+                sample(
+                    prom,
+                    &format!(
+                        r#"sparkles_rebuild_duration_seconds_count{{dataset="{label}",reason="{r}"}}"#
+                    )
+                ),
+                Some(dcount as f64),
+                "rebuild_duration count mismatch for {label}/{r}"
+            );
+            let psum = sample(
+                prom,
+                &format!(
+                    r#"sparkles_rebuild_duration_seconds_sum{{dataset="{label}",reason="{r}"}}"#
+                ),
+            )
+            .unwrap();
+            assert!(
+                (psum - dsum).abs() <= 1e-9,
+                "rebuild_duration sum mismatch for {label}/{r}: prom={psum} json={dsum}"
+            );
+            for (i, b) in buckets.iter().enumerate() {
+                let le = rebuild_bounds
+                    .get(i)
+                    .map_or("+Inf".to_string(), |v| v.to_string());
+                assert_eq!(
+                    sample(
+                        prom,
+                        &format!(
+                            r#"sparkles_rebuild_duration_seconds_bucket{{dataset="{label}",reason="{r}",le="{le}"}}"#
+                        )
+                    ),
+                    Some(*b as f64),
+                    "rebuild_duration bucket le={le} mismatch for {label}/{r}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn metrics_count_work_memory_peaks_and_rebuilds() {
-    let s = server();
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(
+            dir.path(),
+            StoreOptions {
+                bulk_threshold: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    let ds = state.attach("ds", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    // Also attach an untouched empty dataset with zero rebuilds and zero queries.
+    state.attach("empty", DbType::Mem, None).unwrap();
+    state.set_phase(Phase::Ready);
+    let s = Server {
+        _dir: dir,
+        app: router(state.clone()),
+        state,
+    };
+
     // the fixture's load into an empty dataset was a bulk commit
     let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
     for (series, v) in [
         (
             r#"sparkles_rebuilds_total{dataset="ds",reason="bulk"}"#,
@@ -309,6 +659,21 @@ async fn metrics_count_work_memory_peaks_and_rebuilds() {
         !m.contains(r#"sparkles_rebuild_duration_seconds_count{dataset="ds",reason="compact"}"#)
     );
     assert!(!m.contains("sparkles_query_memory_peak_bytes_count"), "{m}");
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "empty");
+
+    let empty_ds = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "empty")
+        .unwrap();
+    assert_eq!(empty_ds["rowsProduced"], 0);
+    assert!(empty_ds["queryMemoryPeak"].is_null());
+    assert_eq!(empty_ds["rebuilds"]["compact"]["count"], 0);
+    assert!(empty_ds["rebuilds"]["compact"]["duration"].is_null());
+    assert_eq!(empty_ds["rebuilds"]["bulk"]["count"], 0);
+    assert!(empty_ds["rebuilds"]["bulk"]["duration"].is_null());
 
     assert_eq!(get(&s.app, ALL).await.status, StatusCode::OK);
     let rq = Request::post("/ds/update")
@@ -319,9 +684,75 @@ async fn metrics_count_work_memory_peaks_and_rebuilds() {
         ))
         .unwrap();
     assert_eq!(send(&s.app, rq).await.status, StatusCode::OK);
+
+    // Failed bulk load, dry-run bulk load, and cancelled compaction publish nothing and
+    // must not increment rebuild counters or histograms in either format.
     let ds = s.state.datasets()["ds"].clone();
+    assert!(
+        ds.store
+            .load(&[Source::from_bytes(
+                b"not valid ntriples".to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .is_err()
+    );
+    let bulk_nt: String = (0..30)
+        .map(|i| format!("<http://example.org/b{i}> <http://example.org/p> \"{i}\" .\n"))
+        .collect();
+    let dry = sparkles::guard::WriteOptions {
+        dry_run: Some(sparkles::preview::DryRun::default()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        ds.store.load_with(
+            &[Source::from_bytes(
+                bulk_nt.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )],
+            sparkles::commit::CommitKind::Load,
+            &dry,
+        ),
+        Err(sparkles::Error::DryRun(_))
+    ));
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    assert!(matches!(
+        ds.store.compact_with(&sparkles::store::CompactOptions {
+            cancel: Some(cancel),
+            ..Default::default()
+        }),
+        Err(sparkles::Error::Cancelled)
+    ));
+    let m_after_failed = metrics(&s.app).await;
+    let j_after_failed = metrics_json_resp(&s.app).await;
+    assert_eq!(
+        sample(
+            &m_after_failed,
+            r#"sparkles_rebuilds_total{dataset="ds",reason="bulk"}"#
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        sample(
+            &m_after_failed,
+            r#"sparkles_rebuilds_total{dataset="ds",reason="compact"}"#
+        ),
+        Some(0.0)
+    );
+    assert_prom_json_phase2_parity(&m_after_failed, &j_after_failed, "ds");
+
+    // Successful compaction and a second bulk publication.
     ds.store.compact().unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            bulk_nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
     let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
     // the query's 9 rows at least, and the rows of the update's WHERE
     let produced = sample(&m, r#"sparkles_rows_produced_total{dataset="ds"}"#).unwrap();
     assert!(produced >= 11.0, "{m}");
@@ -343,6 +774,14 @@ async fn metrics_count_work_memory_peaks_and_rebuilds() {
             r#"sparkles_rebuild_duration_seconds_bucket{dataset="ds",reason="compact",le="+Inf"}"#,
             1.0,
         ),
+        (
+            r#"sparkles_rebuilds_total{dataset="ds",reason="bulk"}"#,
+            2.0,
+        ),
+        (
+            r#"sparkles_rebuild_duration_seconds_bucket{dataset="ds",reason="bulk",le="+Inf"}"#,
+            2.0,
+        ),
     ] {
         assert_eq!(sample(&m, series), Some(v), "{series}\n{m}");
     }
@@ -351,6 +790,536 @@ async fn metrics_count_work_memory_peaks_and_rebuilds() {
         r#"sparkles_rebuild_duration_seconds_sum{dataset="ds",reason="compact"}"#,
     );
     assert!(sum.unwrap() > 0.0, "{m}");
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "empty");
+}
+
+#[tokio::test]
+async fn metrics_parity_dataset_cap_reset_reopen_and_auth() {
+    // 1. Dataset-label cap (`--metrics-max-datasets=1`): overflow datasets aggregate into `$other`.
+    let s = server_with(|st| st.metrics = crate::obs::Metrics::new(true, 1));
+    // Trigger `ds` first so it claims the 1 named slot.
+    assert_eq!(get(&s.app, ALL).await.status, StatusCode::OK);
+    for extra in ["extra1", "extra2"] {
+        let d = s.state.attach(extra, DbType::Mem, None).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        d.store.compact().unwrap();
+        assert_eq!(
+            get(
+                &s.app,
+                &format!("/{extra}/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D")
+            )
+            .await
+            .status,
+            StatusCode::OK
+        );
+    }
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert!(!m.contains("extra1") && !m.contains("extra2"), "{m}");
+    assert!(
+        !j["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "extra1" || d["name"] == "extra2"),
+        "{j}"
+    );
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["queryMemoryPeak"]["count"], 2);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 2);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 2);
+
+    // Deleting one overflow dataset must keep `$other` counters and rebuilds monotonic.
+    assert!(s.state.delete("extra1").unwrap());
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["queryMemoryPeak"]["count"], 2);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 2);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 2);
+
+    // Deleting the final overflow dataset keeps `$other` in both Prometheus and JSON
+    // with zero live quads and preserved monotonic counters/rebuilds.
+    assert!(s.state.delete("extra2").unwrap());
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["quads"], 0);
+    assert_eq!(other["queryMemoryPeak"]["count"], 2);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 2);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 2);
+
+    // Adding a new overflow dataset continues `$other` monotonically.
+    {
+        let d = s.state.attach("extra3", DbType::Mem, None).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        d.store.compact().unwrap();
+    }
+    assert_eq!(
+        get(
+            &s.app,
+            "/extra3/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D"
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m, &j, "ds");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["queryMemoryPeak"]["count"], 3);
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 3);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 3);
+
+    // Deleting the named slot (`ds`) promotes `extra3` cleanly to its own named slot
+    // while retiring `extra3`'s earlier rebuilds into `$other` without double counting.
+    assert!(s.state.delete("ds").unwrap());
+    let m = metrics(&s.app).await;
+    let j = metrics_json_resp(&s.app).await;
+    assert!(!m.contains(r#"dataset="ds""#), "{m}");
+    assert_prom_json_phase2_parity(&m, &j, "extra3");
+    assert_prom_json_phase2_parity(&m, &j, "$other");
+    let promoted = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "extra3")
+        .unwrap();
+    assert_eq!(promoted["rowsProduced"], 0);
+    assert_eq!(promoted["rebuilds"]["bulk"]["count"], 0);
+    assert_eq!(promoted["rebuilds"]["compact"]["count"], 0);
+    let other = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "$other")
+        .unwrap();
+    assert_eq!(other["rebuilds"]["bulk"]["count"], 3);
+    assert_eq!(other["rebuilds"]["compact"]["count"], 3);
+
+    // 2. Rename preserves Phase 2 counters and histograms, then delete/recreate resets them.
+    let s = server();
+    let create = Request::post("/$/datasets")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"dbName":"tmp","dbType":"mem"}"#))
+        .unwrap();
+    assert_eq!(send(&s.app, create).await.status, StatusCode::CREATED);
+    {
+        let tmp = s.state.get("tmp").unwrap();
+        tmp.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        tmp.store.compact().unwrap();
+    }
+    assert_eq!(
+        get(
+            &s.app,
+            "/tmp/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D"
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let m_before = metrics(&s.app).await;
+    let j_before = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m_before, &j_before, "tmp");
+    let tmp_before = j_before["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "tmp")
+        .unwrap()
+        .clone();
+    s.state.rename("tmp", "tmp_renamed").unwrap();
+    let m_renamed = metrics(&s.app).await;
+    let j_renamed = metrics_json_resp(&s.app).await;
+    assert!(!m_renamed.contains(r#"dataset="tmp""#), "{m_renamed}");
+    assert!(
+        !j_renamed["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "tmp"),
+        "{j_renamed}"
+    );
+    assert_prom_json_phase2_parity(&m_renamed, &j_renamed, "tmp_renamed");
+    let renamed_ds = j_renamed["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "tmp_renamed")
+        .unwrap();
+    assert_eq!(renamed_ds["rowsProduced"], tmp_before["rowsProduced"]);
+    assert_eq!(renamed_ds["queryMemoryPeak"], tmp_before["queryMemoryPeak"]);
+    assert_eq!(renamed_ds["rebuilds"], tmp_before["rebuilds"]);
+
+    let del = Request::delete("/$/datasets/tmp_renamed")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&s.app, del).await.status, StatusCode::OK);
+    let m_del = metrics(&s.app).await;
+    let j_del = metrics_json_resp(&s.app).await;
+    assert!(!m_del.contains(r#"dataset="tmp_renamed""#), "{m_del}");
+    assert!(
+        !j_del["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "tmp_renamed"),
+        "{j_del}"
+    );
+    let create = Request::post("/$/datasets")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"dbName":"tmp_renamed","dbType":"mem"}"#))
+        .unwrap();
+    assert_eq!(send(&s.app, create).await.status, StatusCode::CREATED);
+    let m_new = metrics(&s.app).await;
+    let j_new = metrics_json_resp(&s.app).await;
+    assert_prom_json_phase2_parity(&m_new, &j_new, "tmp_renamed");
+    let new_ds = j_new["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "tmp_renamed")
+        .unwrap();
+    assert_eq!(new_ds["rowsProduced"], 0);
+    assert!(new_ds["queryMemoryPeak"].is_null());
+    assert_eq!(new_ds["rebuilds"]["compact"]["count"], 0);
+    assert!(new_ds["rebuilds"]["compact"]["duration"].is_null());
+    assert_eq!(new_ds["rebuilds"]["bulk"]["count"], 0);
+    assert!(new_ds["rebuilds"]["bulk"]["duration"].is_null());
+
+    // 3. Reopening a persistent dataset resets rebuild counts and durations to zero.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let st = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        let d = st.create("disk", DbType::Persistent).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        d.store.compact().unwrap();
+        st.set_phase(Phase::Ready);
+        let app = router(st);
+        let m = metrics(&app).await;
+        let j = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m, &j, "disk");
+        let disk = j["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "disk")
+            .unwrap();
+        assert_eq!(disk["rebuilds"]["bulk"]["count"], 1);
+        assert_eq!(disk["rebuilds"]["compact"]["count"], 1);
+    }
+    {
+        let st = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        st.set_phase(Phase::Ready);
+        let app = router(st);
+        let m = metrics(&app).await;
+        let j = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m, &j, "disk");
+        let disk = j["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "disk")
+            .unwrap();
+        assert_eq!(disk["quads"], 11);
+        assert_eq!(disk["rowsProduced"], 0);
+        assert!(disk["queryMemoryPeak"].is_null());
+        assert_eq!(disk["rebuilds"]["bulk"]["count"], 0);
+        assert!(disk["rebuilds"]["bulk"]["duration"].is_null());
+        assert_eq!(disk["rebuilds"]["compact"]["count"], 0);
+        assert!(disk["rebuilds"]["compact"]["duration"].is_null());
+    }
+
+    // 3b. Persistent overflow rename conserves `$other` rebuilds, promoted persistent
+    //     rename drops stale `promoted_offset`, and unscraped named-eligible delete does
+    //     not leak into `$other`.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = AppState::new(
+            dir.path(),
+            StoreOptions {
+                bulk_threshold: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        st.metrics = crate::obs::Metrics::new(true, 1);
+        let st = Arc::new(st);
+        st.create("a", DbType::Mem).unwrap();
+        {
+            let b = st.create("b", DbType::Persistent).unwrap();
+            b.store
+                .load(&[Source::from_bytes(
+                    DATA.as_bytes().to_vec(),
+                    oxrdfio::RdfFormat::TriG,
+                    None,
+                )])
+                .unwrap();
+        }
+        st.set_phase(Phase::Ready);
+        let app = router(st.clone());
+        assert_eq!(
+            get(&app, "/a/sparql?query=ASK%7B%7D").await.status,
+            StatusCode::OK
+        );
+        let m1 = metrics(&app).await;
+        let j1 = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m1, &j1, "$other");
+        // Persistent overflow rename `b -> c` keeps `$other` at 1.
+        st.rename("b", "c").unwrap();
+        let m2 = metrics(&app).await;
+        let j2 = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m2, &j2, "$other");
+        let other2 = j2["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "$other")
+            .unwrap();
+        assert_eq!(other2["rebuilds"]["bulk"]["count"], 1);
+        // Promote `c` after deleting `a`, then persistent rename `c -> d`: fresh `d`
+        // reports its first post-rename rebuild as 1 without stale `promoted_offset`.
+        {
+            let c = st.get("c").unwrap();
+            let nt: String = (0..5)
+                .map(|i| format!("<http://example.org/n1_{i}> <http://example.org/p> \"{i}\" .\n"))
+                .collect();
+            c.store
+                .load(&[Source::from_bytes(
+                    nt.into_bytes(),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+        }
+        let _ = metrics_json_resp(&app).await;
+        assert!(st.delete("a").unwrap());
+        let _ = metrics_json_resp(&app).await;
+        st.rename("c", "d").unwrap();
+        {
+            let d = st.get("d").unwrap();
+            let nt: String = (0..5)
+                .map(|i| format!("<http://example.org/n2_{i}> <http://example.org/p> \"{i}\" .\n"))
+                .collect();
+            d.store
+                .load(&[Source::from_bytes(
+                    nt.into_bytes(),
+                    oxrdfio::RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+        }
+        let m3 = metrics(&app).await;
+        let j3 = metrics_json_resp(&app).await;
+        assert_prom_json_phase2_parity(&m3, &j3, "d");
+        let d3 = j3["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "d")
+            .unwrap();
+        assert_eq!(d3["rebuilds"]["bulk"]["count"], 1);
+        // Delete `d` so `named = 0 < 1` while `$other` exists; unscraped `x` must not leak.
+        assert!(st.delete("d").unwrap());
+        let j4 = metrics_json_resp(&app).await;
+        let before = j4["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "$other")
+            .unwrap()["rebuilds"]["bulk"]["count"]
+            .as_u64()
+            .unwrap();
+        {
+            let x = st.create("x", DbType::Mem).unwrap();
+            x.store
+                .load(&[Source::from_bytes(
+                    DATA.as_bytes().to_vec(),
+                    oxrdfio::RdfFormat::TriG,
+                    None,
+                )])
+                .unwrap();
+        }
+        assert!(st.delete("x").unwrap());
+        let j5 = metrics_json_resp(&app).await;
+        let after = j5["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "$other")
+            .unwrap()["rebuilds"]["bulk"]["count"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    // 4. Access policy: both Prometheus and JSON require `metrics` permission and never
+    //    leak unauthorized or nonexistent dataset names.
+    #[cfg(feature = "auth")]
+    {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let reader_pw = crate::auth::hash_password_with("reader-pw", 8, 1, 1).unwrap();
+        let obs_pw = crate::auth::hash_password_with("obs-pw", 8, 1, 1).unwrap();
+        let cfg_path = dir.path().join("auth.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+version = 1
+
+[[users]]
+name = "reader"
+password = "{reader_pw}"
+datasets = {{ ds = "read" }}
+
+[[users]]
+name = "observer"
+password = "{obs_pw}"
+server = ["metrics"]
+"#
+            ),
+        )
+        .unwrap();
+        let mut st =
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        st.auth = Some(Arc::new(
+            crate::auth::Auth::open(&cfg_path, dir.path()).unwrap().0,
+        ));
+        let st = Arc::new(st);
+        let d = st.attach("ds", DbType::Mem, None).unwrap();
+        d.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        st.set_phase(Phase::Ready);
+        let app = router(st);
+        let basic = |u: &str, p: &str| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"))
+            )
+        };
+        for path in ["/$/metrics", "/$/metrics?format=json"] {
+            assert_eq!(get(&app, path).await.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                get_with(&app, path, "authorization", &basic("reader", "reader-pw"))
+                    .await
+                    .status,
+                StatusCode::FORBIDDEN
+            );
+        }
+        // Reader probes a nonexistent dataset and runs a query on `ds`.
+        assert_eq!(
+            get_with(
+                &app,
+                "/secret/sparql?query=ASK%7B%7D",
+                "authorization",
+                &basic("reader", "reader-pw"),
+            )
+            .await
+            .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_with(&app, ALL, "authorization", &basic("reader", "reader-pw"))
+                .await
+                .status,
+            StatusCode::OK
+        );
+        let auth_hdr = basic("observer", "obs-pw");
+        let prom = get_with(&app, "/$/metrics", "authorization", &auth_hdr).await;
+        let json_r = get_with(&app, "/$/metrics?format=json", "authorization", &auth_hdr).await;
+        assert_eq!(prom.status, StatusCode::OK);
+        assert_eq!(json_r.status, StatusCode::OK);
+        let m = prom.text();
+        let j = json_r.json();
+        assert!(!m.contains("secret"), "{m}");
+        assert!(!j.to_string().contains("secret"), "{j}");
+        // `$none` belongs to request series only, never dataset work/memory series.
+        assert!(
+            m.contains(r#"sparkles_requests_total{dataset="$none""#),
+            "{m}"
+        );
+        assert!(
+            !m.contains(r#"sparkles_rows_produced_total{dataset="$none"}"#),
+            "{m}"
+        );
+        assert!(
+            !m.contains(r#"sparkles_query_memory_peak_bytes_count{dataset="$none"}"#),
+            "{m}"
+        );
+        assert!(
+            !j["datasets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["name"] == "$none"),
+            "{j}"
+        );
+        assert_prom_json_phase2_parity(&m, &j, "ds");
+    }
 }
 
 #[tokio::test]

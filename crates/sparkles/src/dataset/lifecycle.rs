@@ -225,6 +225,7 @@ impl Closing {
     fn close(
         mut self,
         release_entries: impl FnOnce(),
+        on_closed: impl FnOnce(u64, &Store),
     ) -> std::result::Result<Option<crate::reasoning::ReasoningRecord>, RefusedClose> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.prepare())) {
             Ok(true) => {}
@@ -257,6 +258,12 @@ impl Closing {
         Self::restore_slots(&mut self.nodes, &self.stores, Some(&core));
         release_entries();
         let (_lease, mut panic) = core.finish_commit();
+        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            on_closed(state.open_id, &state.store);
+        }));
+        if panic.is_none() {
+            panic = observed.err();
+        }
         drop(self.edges.drain(..));
         drop(self.shell.take());
         for (_, node) in std::mem::take(&mut self.nodes) {
@@ -287,6 +294,7 @@ impl Drop for Closing {
 pub(super) fn close(
     dataset: Dataset,
     release_entries: impl FnOnce(),
+    on_closed: impl FnOnce(u64, &Store),
 ) -> std::result::Result<Option<crate::reasoning::ReasoningRecord>, RefusedClose> {
-    Closing::new(dataset).close(release_entries)
+    Closing::new(dataset).close(release_entries, on_closed)
 }
