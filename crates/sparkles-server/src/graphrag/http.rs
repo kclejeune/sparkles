@@ -74,8 +74,8 @@ fn ledger_of(
             Err(_) => (Default::default(), Vec::new()),
         },
         None => (
-            *st.graphrag.day(&owner.name).lock(),
-            st.graphrag.anomalies(&owner.name),
+            st.graphrag.day_snapshot(owner.store.dataset_id()),
+            st.graphrag.anomalies(owner.store.dataset_id()),
         ),
     }
 }
@@ -290,7 +290,7 @@ async fn get_status(
         out["levels"] = levels.into();
         let state = match ds.store.root() {
             Some(db) => super::state::BuildState::load(db).ok(),
-            None => Some(st2.graphrag.state(&ds.name)),
+            None => Some(st2.graphrag.state(super::runtime::owner_id(&ds))),
         };
         // the record of the last run says what that run read: it shows only for the
         // configured graph, and to a restricted caller only while the run's footprint is
@@ -795,12 +795,13 @@ async fn post_review(
             sparkles::sparql::update::update_as(&ds.store, &text, &o, sparkles::commit::CommitKind::Graphrag)
                 .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let counts = statuses(&ds, &QueryOptions::default(), &graph)?;
-        st2.graphrag.update(&ds.name, |f| {
-            f.reports = Status::ALL
-                .iter()
-                .map(|s| (s.as_str(), counts.get(s.as_str()).copied().unwrap_or(0)))
-                .collect();
-        });
+        st2.graphrag
+            .update_if_live(&st2, &ds.name, super::runtime::owner_id(&ds), |f| {
+                f.reports = Status::ALL
+                    .iter()
+                    .map(|s| (s.as_str(), counts.get(s.as_str()).copied().unwrap_or(0)))
+                    .collect();
+            });
         Ok(json!({
             "report": b.report,
             "status": status.as_str(),
@@ -999,7 +1000,7 @@ pub(crate) fn inbox_member(st: &AppState, ds: &Dataset, p: &Principal) -> Option
 /// accounting anomalies, as of the last build or review since the server started.
 pub fn metrics(st: &AppState, out: &mut String) {
     use std::fmt::Write;
-    let figures = st.graphrag.figures();
+    let figures = st.graphrag.figures(st);
     if figures.is_empty() {
         return;
     }

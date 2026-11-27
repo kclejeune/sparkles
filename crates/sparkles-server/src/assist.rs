@@ -30,9 +30,11 @@ const MAX_AGENT_GRAPHS: usize = 50;
 
 type St = State<Arc<AppState>>;
 
-/// The files of in-memory datasets, by dataset name and file name.
+/// The files of in-memory datasets, by canonical dataset UUID and file name so
+/// in-memory renames carry files atomically and delayed delete cleanup never touches a
+/// replacement dataset created under the same name.
 #[derive(Default)]
-pub struct Volatile(Mutex<HashMap<(String, &'static str), Value>>);
+pub struct Volatile(Mutex<HashMap<(uuid::Uuid, &'static str), Value>>);
 
 /// How an agent's conversation facts are written (§8.8).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -448,6 +450,11 @@ impl Imports {
     }
 }
 
+fn volatile_id(ds: &Dataset) -> uuid::Uuid {
+    ds.main()
+        .map_or_else(|| ds.store.dataset_id(), |m| m.store.dataset_id())
+}
+
 pub(crate) fn read_file(st: &AppState, ds: &Dataset, file: &'static str) -> Result<Option<Value>> {
     match ds.store.root() {
         Some(root) => match std::fs::read(root.join(file)) {
@@ -464,7 +471,7 @@ pub(crate) fn read_file(st: &AppState, ds: &Dataset, file: &'static str) -> Resu
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {file} of {}", ds.name)),
         },
-        None => Ok(st.volatile.0.lock().get(&(ds.name.clone(), file)).cloned()),
+        None => Ok(st.volatile.0.lock().get(&(volatile_id(ds), file)).cloned()),
     }
 }
 
@@ -483,7 +490,7 @@ pub(crate) fn write_file(st: &AppState, ds: &Dataset, file: &'static str, v: &Va
             st.volatile
                 .0
                 .lock()
-                .insert((ds.name.clone(), file), v.clone());
+                .insert((volatile_id(ds), file), v.clone());
             Ok(())
         }
     }
@@ -499,27 +506,19 @@ pub(crate) fn remove_file(st: &AppState, ds: &Dataset, file: &'static str) -> Re
             _ => Ok(()),
         },
         None => {
-            st.volatile.0.lock().remove(&(ds.name.clone(), file));
+            st.volatile.0.lock().remove(&(volatile_id(ds), file));
             Ok(())
         }
     }
 }
 
 impl Volatile {
-    /// Carry the files of an in-memory dataset over to its new name.
-    pub fn rename(&self, from: &str, to: &str) {
-        let mut m = self.0.lock();
-        let keys: Vec<_> = m.keys().filter(|k| k.0 == from).cloned().collect();
-        for k in keys {
-            if let Some(v) = m.remove(&k) {
-                m.insert((to.to_string(), k.1), v);
-            }
-        }
-    }
-
-    /// Forget the files of a deleted in-memory dataset.
-    pub fn forget(&self, name: &str) {
-        self.0.lock().retain(|k, _| k.0 != name);
+    /// Forget the files of a deleted in-memory dataset instance.
+    pub fn forget(&self, dataset_id: Option<uuid::Uuid>) {
+        let Some(id) = dataset_id else {
+            return;
+        };
+        self.0.lock().retain(|k, _| k.0 != id);
     }
 }
 

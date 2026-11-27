@@ -1339,6 +1339,19 @@ impl Circuit {
         self.resolved = None;
         self.schema_resolved = None;
         self.budget.shrink_state_to(0);
+        // An accumulator over stateless operators keeps neither result rows nor
+        // operator state, so building it needs no full scan of the store.
+        if !self.keep_result && self.prov.is_none() && self.root.is_stateless() {
+            if let Err(e) = control.check() {
+                self.clear_state();
+                return Err(e);
+            }
+            self.resolved = None;
+            self.applied = snap.commit;
+            self.snap = Some(snap);
+            self.last = PassStats::default();
+            return Ok(());
+        }
         let vis = Vis::new(self.access.as_ref(), &snap);
         let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
         let width = root.schema.len();

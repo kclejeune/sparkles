@@ -14702,21 +14702,24 @@ request and before each commit, and it fails without sending or committing when 
 them changed. It also fails when a review changed a report link while it ran. All
 branches of a dataset share its daily token ledger.
 
-With `refresh.mode` set to `auto`, the server starts a refresh itself. It looks at the
-dataset once a second, and a dataset is due after `refresh.debounceSeconds` without a
-new commit, or after ten debounce periods while commits continue. A due dataset reads
-the change feed from the commit of its last build or refresh, through the view of the
-settings' `principal`, and counts the changed facts of each community. A refresh starts
-when the changed facts of a community reach `refresh.minChangedFraction` of the facts
-its report was written from, when a link joins an entity outside every community to a
-member, or when the feed cannot list the changes. The task needs no confirmation, its
-message starts with `automatic refresh` and the reason, and its `detail` holds the
-reason as `trigger`. The daily token budget bounds it as it bounds any run. The server
-never starts a first build, follows main only, waits while another GraphRAG task of the
-dataset is queued or running, and retries a run that left pending communities once a
-day without waiting for a commit. Commits that GraphRAG made itself start nothing. A
-check or a refresh that fails is tried again after a backoff that starts at two
-debounce periods and doubles up to 64.
+With `refresh.mode` set to `auto`, the server starts a refresh itself. For each enabled
+dataset with a build on `main`, the server attaches an internal F13 accumulator circuit
+over the projection's graphs and predicates, read through the view of the settings'
+`principal`, and maintains per-community change counts incrementally on commits with
+checkpoints across restarts. It looks at the dataset once a second, and a dataset is due
+after `refresh.debounceSeconds` without a new commit, or after ten debounce periods while
+commits continue. A due dataset totals the accumulator's counts since the commit of its
+last build or refresh. A refresh starts when the changed facts of a community reach
+`refresh.minChangedFraction` of the facts its report was written from, when a link joins
+an entity outside every community to a member, or when the accumulator cannot cover every
+commit, such as after a bulk commit, a change-log gap, memory eviction or data-dependent
+protections on the principal's view. The task needs no confirmation, its message starts
+with `automatic refresh` and the reason, and its `detail` holds the reason as `trigger`.
+The daily token budget bounds it as it bounds any run. The server never starts a first
+build, follows main only, waits while another GraphRAG task of the dataset is queued or
+running, and retries a run that left pending communities once a day without waiting for a
+commit. Commits that GraphRAG made itself start nothing. A check or a refresh that fails
+is tried again after a backoff that starts at two debounce periods and doubles up to 64.
 
 ```json
 { "mode": "build", "sourceCommit": 41, "communities": 12, "written": 12, "kept": 0,
