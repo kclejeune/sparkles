@@ -2318,14 +2318,21 @@ its rows. An admitted map evaluates its misses once per distinct key, holds a pe
 entry for a missed key until then, and is released when it answers fewer than one row in
 sixteen. The sketch, the map and each batch's scratch are charged to the query's memory
 budget. A sketch or a map whose growth the budget refuses keeps what it holds. A refused
-pilot or batch charge, or any refusal of memory that the evaluation of the misses meets
-while the map and the batch's scratch hold their charges, releases the sketch and the map
-and evaluates the batch the ordinary way. The misses run as optional evaluation, which
-keeps a memory refusal of the result or of a term, decode envelope or regular expression
-on the way to it out of the query's sticky failure. After such a refusal the row's
-expression gives up as it does after a sticky failure, so it evaluates no arm that the
-ordinary evaluation skips and interns no discarded value, and the ordinary evaluation meets
-the budget it would have without the map. A geometry constructor keeps the charge of each
+pilot or batch charge releases the sketch and the map and evaluates the batch the ordinary
+way. The misses run as optional evaluation, which keeps a memory refusal of the result or
+of a term, decode envelope or regular expression on the way to it out of the query's
+sticky failure. After such a refusal the row's expression gives up as it does after a
+sticky failure, so it evaluates no arm that the ordinary evaluation skips and interns no
+discarded value. The map, its reservation and the batch's scratch are then released before
+any row is evaluated again. The misses that finished keep their values and are not
+evaluated again, so a large transient allocation of an early row, such as the decode of a
+long triple term, is not met a second time after later rows' results are retained. Each
+remaining key is evaluated the ordinary way at its first row, in row order, where it meets
+the retained terms that the evaluation without the map has at that row, and a refusal
+there fails the query as it would without the map. On one worker a batch therefore fits
+the budget whenever its evaluation without the map fits. On several workers the finished
+misses are those that completed while the refusal stopped the others, an order that the
+parallel evaluation without the map can also take. A geometry constructor keeps the charge of each
 geometry it builds until the query ends, so an expression that can call one, directly or
 through `fn:apply` or `afn:eval`, never enters the map, and item 1321 tracks a releasable
 charge that would admit it. A CRS warning that the budget

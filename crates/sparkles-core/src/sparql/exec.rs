@@ -7311,23 +7311,41 @@ pub(super) fn column_rows_split(
     Ok((map_rows(ctx, t.len(), par, f)?, None))
 }
 
+/// The result of [`column_rows_split_optional`].
+pub(super) enum OptionalColumn {
+    /// Every row was evaluated without a refusal of memory.
+    Complete(Vec<Id>, Option<Split>),
+    /// A refusal of memory met at least one row. Each row that finished without a
+    /// refusal holds its value, which is final and whose terms are interned. Each refused
+    /// row, and each row that a refusal on another row skipped, holds the caller's
+    /// `unevaluated` marker.
+    Refused(Vec<Id>),
+}
+
 /// [`column_rows_split`] for the misses of an optional cache, such as cursor BIND reuse.
 /// Each row runs as [`Ctx::optional_eval`], so a refusal of memory that the evaluation
 /// meets, whether it interns the result or a term on the way to it, grows a decode
-/// envelope or a regular expression cache, is returned as `Ok(None)` instead of being
-/// recorded as the query's memory failure. After the refusal the row's expression takes
-/// no arm that the ordinary evaluation would skip, and its value is not interned. The
-/// caller then releases its optional state and evaluates the rows the ordinary way,
-/// which meets the same budget as it would without the cache. The rows after a refusal
-/// are not evaluated. Expressions that an
-/// optional cache admits are pure, so none has an EXISTS that hands work to the pool,
-/// and they construct no geometry, whose charge would outlast a discarded row.
+/// envelope or a regular expression cache, is not recorded as the query's memory
+/// failure. After the refusal the row's expression takes no arm that the ordinary
+/// evaluation would skip, and its value is not interned. The rows that start after a
+/// refusal are not evaluated, and [`OptionalColumn::Refused`] marks them and the refused
+/// rows with `unevaluated`, which must be an id that no term carries. The rows that
+/// finished keep their values, so the caller releases its optional state and evaluates
+/// only the marked rows the ordinary way (see [`with_row_eval`]), without repeating the
+/// work of the finished rows. On one worker the finished rows are the rows before the
+/// refused one. On several, they are the rows that finished while the refusal stopped
+/// the others. The caller checks the context before it uses the values, since a
+/// cancellation or a latched failure leaves `UNDEF` in rows that look finished.
+/// Expressions that an optional cache admits are pure, so none has an EXISTS that hands
+/// work to the pool, and they construct no geometry, whose charge would outlast a
+/// refused row.
 pub(super) fn column_rows_split_optional(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
     par: bool,
-) -> Result<Option<(Vec<Id>, Option<Split>)>> {
+    unevaluated: Id,
+) -> Result<OptionalColumn> {
     let nested = super::exists::nested(ctx, t, &[e])?;
     debug_assert!(nested.is_none(), "an optional cache admits no EXISTS");
     let exists = nested.as_ref().map(|n| &n.answers);
@@ -7336,7 +7354,7 @@ pub(super) fn column_rows_split_optional(
     let refused = std::sync::atomic::AtomicBool::new(false);
     let f = |i: usize| {
         if refused.load(AtomicOrdering::Relaxed) {
-            return Id::UNDEF;
+            return unevaluated;
         }
         let (id, refusal) = ctx.optional_eval(|| {
             match eval(
@@ -7358,17 +7376,55 @@ pub(super) fn column_rows_split_optional(
         });
         if refusal {
             refused.store(true, AtomicOrdering::Relaxed);
-            return Id::UNDEF;
+            return unevaluated;
         }
         id
     };
     let par = par && e.parallel();
-    let values = if t.len() <= PAR_THRESHOLD {
+    let (values, split) = if t.len() <= PAR_THRESHOLD {
         map_batch_split(ctx, t.len(), batch_may_split(t.len()) && par, f)?
     } else {
         (map_rows(ctx, t.len(), par, f)?, None)
     };
-    Ok((!refused.into_inner()).then_some(values))
+    Ok(if refused.into_inner() {
+        OptionalColumn::Refused(values)
+    } else {
+        OptionalColumn::Complete(values, split)
+    })
+}
+
+/// Call `body` with the ordinary evaluation of one row of `t` at a time, on this
+/// thread, for the rows of an optional cache that a refusal left unevaluated (see
+/// [`column_rows_split_optional`]). Each row is evaluated and interned as
+/// [`column_rows_split`] evaluates it, so a refusal of memory fails the query as it
+/// would without the cache. The rows read their terms as they need them, with no
+/// decoded columns of the whole table, whose charge would stand beside the evaluation
+/// of a few remaining keys where the evaluation without the cache decodes only the
+/// distinct ones. `body` polls cancellation and the deadline itself.
+pub(super) fn with_row_eval<R>(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    body: impl FnOnce(&dyn Fn(usize) -> Id) -> Result<R>,
+) -> Result<R> {
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
+    let map = t.var_map(ctx.nvars());
+    let f = |i: usize| match eval(
+        e,
+        &Row {
+            table: t,
+            i,
+            map: &map,
+            dec: None,
+            exists,
+        },
+        ctx,
+    ) {
+        Ok(v) => v.into_id(ctx),
+        Err(_) => Id::UNDEF,
+    };
+    body(&f)
 }
 
 #[cfg(test)]

@@ -4,15 +4,16 @@
 //! distinct count, and weak repetition of a parallel-capable expression must also pass
 //! a cost guard. Map misses and the ordinary evaluation share one split controller that
 //! retries the pool after a cooldown. Optional cache entries never weaken query budgets,
-//! and a refusal of memory that the map's state causes yields the batch to ordinary
-//! evaluation instead of failing the query. Expressions that can construct a geometry
+//! and a refusal of memory that the map's state causes yields the batch's unevaluated
+//! keys to ordinary evaluation instead of failing the query, while the keys whose
+//! misses finished keep their values. Expressions that can construct a geometry
 //! are not admitted, because each constructed geometry stays charged to the query even
 //! when a yielded batch discards it.
 use crate::error::Result;
 use crate::id::{Id, PAYLOAD_MASK, Tag};
 use crate::index::{O, P, Perm, S};
 use crate::sparql::ctx::RetainedCharge;
-use crate::sparql::exec::{self, ColumnEval, Split, SplitOutcome};
+use crate::sparql::exec::{self, ColumnEval, OptionalColumn, Split, SplitOutcome};
 use crate::sparql::expr::{Expr, Func};
 use crate::sparql::plan::{Kind, Node};
 use crate::sparql::table::VarId;
@@ -82,6 +83,9 @@ const ADMIT: u32 = 8;
 /// The tag bits of a map entry whose value the current batch has not yet evaluated.
 /// No term carries this tag, so a pending entry cannot be mistaken for a value.
 const PENDING: u64 = !PAYLOAD_MASK;
+/// The value of a miss that a refusal of memory left unevaluated. It carries the
+/// pending tag, which no term carries, with a payload that no slot of a batch reaches.
+const UNEVALUATED: Id = Id(PENDING | PAYLOAD_MASK);
 
 /// Two evaluated-row buckets for sampled batch splits (`768..=2047` and `2048..=16384`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -507,6 +511,10 @@ pub(super) struct Reuse {
     last_miss_dispatch: Option<(bool, Option<Split>)>,
     #[cfg(test)]
     last_fallback_dispatch: Option<(usize, bool, Option<Split>)>,
+    /// For each batch whose misses met a refusal of memory, the misses that finished
+    /// and the slots evaluated after the map was released, for tests.
+    #[cfg(test)]
+    refusals: Vec<(usize, usize)>,
 }
 
 impl Reuse {
@@ -567,6 +575,8 @@ impl Reuse {
             last_miss_dispatch: None,
             #[cfg(test)]
             last_fallback_dispatch: None,
+            #[cfg(test)]
+            refusals: Vec::new(),
         })
     }
 
@@ -872,10 +882,9 @@ impl Reuse {
         self.counted_confirmations = 0;
         self.batch_probe_window = None;
         self.cost = CostHistory::default();
-        if let Some(charge) = &mut self.charge {
-            // A shrink only releases.
-            let _ = charge.resize(512);
-        }
+        // `Mode::Off` is final and holds nothing, so the ordinary evaluation of the rest
+        // of the query has the whole retained charge.
+        self.charge = None;
     }
 
     /// Release the map, the sketch and their retained charge once the operator produces
@@ -883,7 +892,6 @@ impl Reuse {
     /// work. The counters stay for EXPLAIN, and a later batch evaluates the ordinary way.
     pub(super) fn release(&mut self) {
         self.decline();
-        self.charge = None;
     }
 
     /// The first batch: substantial exact repetition, or a repeated key with the
@@ -1121,7 +1129,7 @@ impl Reuse {
         // they grow the map or fill the side map. The map's retained charge of
         // `ENTRY_BYTES` an entry covers its existing entries in both the old and the new
         // table while the table grows or shrinks.
-        let Ok(_scratch) = ctx.charge(n as u64 * SCRATCH_BYTES + 256) else {
+        let Ok(scratch) = ctx.charge(n as u64 * SCRATCH_BYTES + 256) else {
             // Optional state yields its memory to the ordinary evaluation of the batch.
             self.decline();
             return Ok(false);
@@ -1160,48 +1168,59 @@ impl Reuse {
                 MapSplitPolicy::Default => self.allow_map_split(misses.len(), expr),
             };
             // A refusal of memory that the evaluation of the misses meets while the map
-            // and the batch's scratch hold their charges releases both, and the ordinary
-            // evaluation of the batch runs under the budget it would have without the
-            // map. This covers the result and the terms, decode envelopes and regular
-            // expressions that the evaluation interns or grows on its way to it, none of
-            // which records a refusal for the query. After the refusal the expression
-            // gives up as it would after a latched one, so it takes no arm that the
-            // ordinary evaluation skips and interns no discarded value. Geometry
-            // constructors, whose charge lasts until the query ends, never reach this
-            // pass (see `prepare`).
-            let values = match exec::column_rows_split_optional(ctx, &misses, expr, par)
-                .and_then(|values| ctx.check().map(|()| values))
-            {
-                Ok(None) => {
-                    self.decline();
-                    return Ok(false);
-                }
-                Ok(Some((values, split))) => {
-                    #[cfg(test)]
-                    {
-                        self.last_miss_dispatch = Some((par, split));
+            // and the batch's scratch hold their charges does not fail the query. This
+            // covers the result and the terms, decode envelopes and regular expressions
+            // that the evaluation interns or grows on its way to it, none of which
+            // records a refusal for the query. After the refusal the expression gives up
+            // as it would after a latched one, so it takes no arm that the ordinary
+            // evaluation skips and interns no discarded value. The misses that finished
+            // keep their values, and the rest of the batch is answered by
+            // `finish_refused`. Geometry constructors, whose charge lasts until the
+            // query ends, never reach this pass (see `prepare`).
+            let values =
+                match exec::column_rows_split_optional(ctx, &misses, expr, par, UNEVALUATED)
+                    .and_then(|values| ctx.check().map(|()| values))
+                {
+                    Ok(OptionalColumn::Refused(values)) => {
+                        // The map, its pending entries and the batch's scratch go before any
+                        // row is evaluated again, so that evaluation has the memory it would
+                        // have without the map.
+                        drop(misses);
+                        drop(missed);
+                        self.decline();
+                        drop(scratch);
+                        return self.finish_refused(ctx, table, target, expr, output, values);
                     }
-                    match split_policy {
-                        MapSplitPolicy::Iri(bucket) => {
-                            self.iri_split.observe(bucket, par, split);
+                    Ok(OptionalColumn::Complete(values, split)) => {
+                        #[cfg(test)]
+                        {
+                            self.last_miss_dispatch = Some((par, split));
                         }
-                        MapSplitPolicy::Default => {
-                            self.observe_map_split(misses.len(), expr, par, split)
+                        match split_policy {
+                            MapSplitPolicy::Iri(bucket) => {
+                                self.iri_split.observe(bucket, par, split);
+                            }
+                            MapSplitPolicy::Default => {
+                                self.observe_map_split(misses.len(), expr, par, split)
+                            }
                         }
+                        values
                     }
-                    values
-                }
-                Err(error) => {
-                    self.decline();
-                    // Another refusal of memory that nothing latched, such as a charge of
-                    // the evaluation beside the map, yields to ordinary evaluation too.
-                    ctx.check()?;
-                    if crate::sparql::ctx::is_memory_refusal(&error) {
-                        return Ok(false);
+                    Err(error) => {
+                        self.decline();
+                        // Another refusal of memory that nothing latched, such as a charge of
+                        // the evaluation beside the map, yields to ordinary evaluation too.
+                        // Such a charge is taken before any miss is evaluated, so the
+                        // ordinary evaluation of the whole batch repeats no work. After
+                        // that, the evaluation fails only through the checks, which this
+                        // returns.
+                        ctx.check()?;
+                        if crate::sparql::ctx::is_memory_refusal(&error) {
+                            return Ok(false);
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
-            };
+                };
             for row in &missed {
                 let at = &mut output[*row as usize];
                 *at = values[(at.0 & PAYLOAD_MASK) as usize];
@@ -1228,6 +1247,64 @@ impl Reuse {
                 self.decline();
             }
         }
+        Ok(true)
+    }
+
+    /// Answer a batch whose misses met a refusal of memory, once the map and the batch's
+    /// scratch are released. `output` holds the answers of the rows that the map held
+    /// before the batch and the pending slot of every other row, and `values` holds the
+    /// value of each slot whose miss finished or [`UNEVALUATED`]. A finished miss is not
+    /// evaluated again, so the transient memory of its evaluation, such as a large decode,
+    /// is not met a second time once later rows' results are retained. Each other slot is
+    /// evaluated the ordinary way at its first row, in row order, so its evaluation meets
+    /// the retained terms that the evaluation without the map has at that row, and a
+    /// refusal now fails the query as it would without the map. The two vectors stay
+    /// within the cursor's scratch and output charges of the batch.
+    fn finish_refused(
+        &mut self,
+        ctx: &Ctx,
+        table: &mut Table,
+        target: VarId,
+        expr: &Expr,
+        mut output: Vec<Id>,
+        mut values: Vec<Id>,
+    ) -> Result<bool> {
+        let n = table.len;
+        #[cfg(test)]
+        let finished = values.iter().filter(|v| **v != UNEVALUATED).count();
+        #[cfg(test)]
+        let mut evaluated = 0;
+        exec::with_row_eval(ctx, table, expr, |eval_row| {
+            for (row, at) in output.iter_mut().enumerate() {
+                if row.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                if at.0 & !PAYLOAD_MASK != PENDING {
+                    continue;
+                }
+                let value = &mut values[(at.0 & PAYLOAD_MASK) as usize];
+                if *value == UNEVALUATED {
+                    *value = eval_row(row);
+                    #[cfg(test)]
+                    {
+                        evaluated += 1;
+                    }
+                }
+                *at = *value;
+            }
+            Ok(())
+        })?;
+        ctx.check()?;
+        #[cfg(test)]
+        {
+            self.refusals.push((finished, evaluated));
+        }
+        // Each distinct miss was evaluated once, by the map or after it.
+        self.misses += values.len() as u64;
+        self.hits += (n - values.len()) as u64;
+        drop(values);
+        table.vars.push(target);
+        table.cols.push(output);
         Ok(true)
     }
 }
@@ -2376,7 +2453,7 @@ mod tests {
         assert_eq!(reuse.mode, Mode::Off);
         assert_eq!(reuse.evaluations, 0);
         assert!(reuse.sketch.is_empty() && reuse.values.is_empty());
-        assert_eq!(reuse.charge.as_ref().unwrap().bytes(), 512);
+        assert!(reuse.charge.is_none());
     }
 
     #[test]
@@ -2455,7 +2532,7 @@ mod tests {
         run(&ctx, &mut reuse, input, target, &expr, &keys[4096..]);
         assert_eq!(reuse.mode, Mode::Off);
         assert!(reuse.values.is_empty());
-        assert_eq!(reuse.charge.as_ref().unwrap().bytes(), 512);
+        assert!(reuse.charge.is_none());
         assert!(
             reuse.evaluations <= 64 + MAP_ENTRIES + MAP_WINDOW as usize,
             "the map is judged once it has seen as many rows as it holds"
@@ -3677,7 +3754,8 @@ mod tests {
 
     /// Item 293 round 1: a result that the budget cannot intern while the map and its
     /// batch scratch hold their charges releases the optional state, and the ordinary
-    /// evaluation of the batch, which fits the same budget, answers it.
+    /// evaluation of the keys left unevaluated, which fits the same budget, answers the
+    /// batch.
     #[test]
     fn optional_map_yields_to_ordinary_evaluation_that_fits_the_budget() {
         let single = rayon::ThreadPoolBuilder::new()
@@ -3800,27 +3878,19 @@ mod tests {
                 ctx.check().unwrap_or_else(|error| {
                     panic!("{name}: the optional map latched a refusal: {error}")
                 });
-                assert!(!reused, "{name}: the map cannot hold this batch's intermediates");
-                assert!(
-                    reuse.evaluations > 0,
-                    "{name}: the map declined only after evaluating its misses"
+                assert!(reused, "{name}: the batch is answered after the refusal");
+                assert_eq!(
+                    reuse.refusals.len(),
+                    1,
+                    "{name}: the map cannot hold this batch's intermediates"
                 );
+                let (finished, evaluated) = reuse.refusals[0];
+                assert_eq!(finished + evaluated, 512, "{name}: each key is evaluated once");
+                assert!(evaluated > 0, "{name}");
                 assert_eq!(reuse.mode, Mode::Off, "{name}");
                 assert!(reuse.values.is_empty(), "{name}");
-                assert!(reuse.charge.as_ref().unwrap().bytes() <= 512, "{name}");
-                let mut report = crate::sparql::exprcache::Report::default();
-                let values = exec::compute_column_controlled(
-                    &ctx,
-                    &table,
-                    &expr,
-                    &mut report,
-                    |n| reuse.allow_fallback_split(n, &expr),
-                    |n| reuse.want_cost_timing(n, &expr),
-                )
-                .unwrap()
-                .0;
-                ctx.check().unwrap();
-                assert_eq!(terms(&ctx, &values), expected, "{name}");
+                assert!(reuse.charge.is_none(), "{name}");
+                assert_eq!(terms(&ctx, &table.cols[1]), expected, "{name}");
             }
         });
     }
@@ -3961,9 +4031,9 @@ mod tests {
     /// run against the cursor's evaluation of the batch without the map. A run that
     /// succeeds must match its answers, query-local terms and plan warnings, so a
     /// refusal that the misses meet leaves nothing behind that the evaluation without
-    /// the map would not. A run that fails must fail without the map at a budget 4 KiB
-    /// smaller, which covers the charge that a declined map keeps. Returns how many
-    /// successful runs declined the map after evaluating its misses.
+    /// the map would not. A run that fails must fail without the map at the same budget,
+    /// since a declined map keeps no charge and does not evaluate a finished miss again.
+    /// Returns how many successful runs declined the map after evaluating its misses.
     fn refused_misses_with_no_skipped_arm(
         name: &str,
         build: impl Fn(&Ctx) -> (VarId, Expr, Vec<Id>) + Sync,
@@ -4052,14 +4122,26 @@ mod tests {
                     Ok(run) => run,
                     Err(error) => {
                         assert!(
-                            ordinary(budget - (4 << 10), false).is_none(),
+                            ordinary(budget, false).is_none(),
                             "{name} at {budget}: the map fails a batch that the evaluation without it fits: {error}"
                         );
                         continue;
                     }
                 };
-                if !reused && reuse.evaluations > 0 {
+                if reuse.mode == Mode::Off && reuse.evaluations > 0 {
                     declined += 1;
+                    assert!(reuse.charge.is_none(), "{name} at {budget}");
+                }
+                // A batch whose misses met a refusal evaluates each distinct key once,
+                // by the map or after it.
+                let distinct = keys.iter().collect::<FxHashSet<_>>().len();
+                for (finished, evaluated) in &reuse.refusals {
+                    assert!(reused, "{name} at {budget}");
+                    assert_eq!(
+                        finished + evaluated,
+                        distinct,
+                        "{name} at {budget}: a finished miss was evaluated again"
+                    );
                 }
                 let found = (terms(&ctx, &values), ctx.local_len(), codes(&ctx));
                 assert_eq!(found.0, expected.0, "{name} at {budget}");
@@ -4167,6 +4249,101 @@ mod tests {
             declined > 0,
             "some budget declines the map after its misses"
         );
+    }
+
+    /// Item 293 round 5: a refusal late in the misses does not make the batch repeat an
+    /// early transient allocation after the later rows' results are retained. The first
+    /// row is a query-local triple with a 16 KiB subject, whose `OBJECT` charges about
+    /// 128 KiB to a decode that it drops at once. The other rows are 799 distinct
+    /// integers and 224 repeats of them, each building a new string of about 1 KiB. The
+    /// evaluation without the map meets the decode first and then retains the strings.
+    /// A map that refused the intern of a late string and then evaluated the whole batch
+    /// again would meet the decode with most of the strings retained.
+    #[test]
+    fn a_refused_miss_does_not_repeat_an_earlier_transient_allocation() {
+        let declined = refused_misses_with_no_skipped_arm("IF(isTRIPLE, OBJECT, CONCAT)", |ctx| {
+            let input = ctx.var("input");
+            let triple = ctx.intern_term(&Term::Triple(Box::new(oxrdf::Triple::new(
+                oxrdf::NamedNode::new_unchecked(format!(
+                    "http://example.org/{}",
+                    "s".repeat(16 << 10)
+                )),
+                oxrdf::NamedNode::new_unchecked("http://example.org/p"),
+                Literal::from(7i64),
+            ))));
+            assert_eq!(triple.tag(), Tag::Local);
+            let integers: Vec<Id> = (0..799).map(|n| Id::from_i64(1000 + n).unwrap()).collect();
+            let mut keys = vec![triple];
+            keys.extend(&integers);
+            keys.extend(&integers[..224]);
+            let builtin = |f: Function, args: Vec<Expr>| Expr::Call(Func::Builtin(f), args);
+            let expr = Expr::If(
+                Box::new(builtin(Function::IsTriple, vec![Expr::Var(input)])),
+                Box::new(builtin(Function::Object, vec![Expr::Var(input)])),
+                Box::new(builtin(
+                    Function::Concat,
+                    vec![
+                        builtin(Function::Str, vec![Expr::Var(input)]),
+                        simple(ctx, &"p".repeat(1024)),
+                    ],
+                )),
+            );
+            (input, expr, keys)
+        });
+        assert!(
+            declined > 0,
+            "some budget declines the map after its misses"
+        );
+    }
+
+    /// Item 293 round 5: when the misses run on several workers and a refusal stops them,
+    /// each miss that finished holds its ordinary value, and every other miss is marked
+    /// unevaluated rather than holding a refused or skipped `UNDEF`.
+    #[test]
+    fn parallel_misses_that_meet_a_refusal_keep_only_finished_values() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let store = Store::in_memory(StoreOptions::default());
+            let rows = exec::PAR_THRESHOLD + 4096;
+            let build = |ctx: &Ctx| {
+                let input = ctx.var("input");
+                let expr = Expr::Call(
+                    Func::Builtin(Function::Concat),
+                    vec![
+                        Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]),
+                        simple(ctx, &"p".repeat(256)),
+                    ],
+                );
+                let keys: Vec<Id> = (0..rows).map(|n| Id::from_i64(n as i64).unwrap()).collect();
+                (batch(input, &keys), expr)
+            };
+            let plain = cursor_context(&store, 64 << 20);
+            let (table, expr) = build(&plain);
+            let expected = exec::column_rows(&plain, &table, &expr).unwrap();
+            plain.check().unwrap();
+
+            let ctx = cursor_context(&store, 2 << 20);
+            let (table, expr) = build(&ctx);
+            assert!(expr.parallel() && table.len() > exec::PAR_THRESHOLD);
+            let column =
+                exec::column_rows_split_optional(&ctx, &table, &expr, true, UNEVALUATED).unwrap();
+            ctx.check()
+                .expect("a refusal of the misses is not the query's failure");
+            let OptionalColumn::Refused(values) = column else {
+                panic!("the budget refuses some of the misses");
+            };
+            let finished = values.iter().filter(|v| **v != UNEVALUATED).count();
+            assert!(finished > 0 && finished < rows, "{finished} of {rows}");
+            for (row, value) in values.iter().enumerate() {
+                if *value != UNEVALUATED {
+                    assert_ne!(*value, Id::UNDEF, "row {row}");
+                    assert_eq!(ctx.term(*value), plain.term(expected[row]), "row {row}");
+                }
+            }
+        });
     }
 
     /// Item 293 round 4: the geometry arm of `COALESCE` after a refusal in its first arm
@@ -4282,7 +4459,7 @@ mod tests {
         );
         assert_eq!(reuse.mode, Mode::Off);
         assert!(reuse.values.is_empty());
-        assert!(reuse.charge.as_ref().unwrap().bytes() <= 512);
+        assert!(reuse.charge.is_none());
         drop(_other);
         assert!(ctx.live_bytes() < before, "the map's entries are released");
         ctx.check().unwrap();

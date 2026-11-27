@@ -2635,8 +2635,11 @@ impl Ctx {
     /// set and evaluate the same input the ordinary way. From the refusal on,
     /// [`Ctx::has_memory_failure`] is true inside `f` as it is after a latched refusal,
     /// so expressions that catch errors give up instead of evaluating arms that the
-    /// ordinary evaluation skips. The ordinary evaluation then meets the query's budget
-    /// as it would without the cache. That holds only for evaluations that keep no
+    /// ordinary evaluation skips. The ordinary evaluation of that input then meets the
+    /// query's budget as it would without the cache, provided the caller has released
+    /// its optional state and does not evaluate again an input whose earlier evaluation
+    /// finished, which would meet that evaluation's transient memory beside the terms
+    /// that later inputs retained. That holds only for evaluations that keep no
     /// charge past their value, so callers keep out geometry constructors, whose charge
     /// lasts until the query ends. Every other refusal, and refusals met on other
     /// contexts or other threads, still fail the next check. A scope opened inside a
