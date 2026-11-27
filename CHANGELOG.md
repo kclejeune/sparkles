@@ -1042,7 +1042,8 @@ charged to the query's memory budget, about 128 KiB and 6 MiB when full. A refus
 charge, or any refusal of memory that the evaluation of the map's misses meets beside the
 map, including the terms it interns on the way to its result, releases them and evaluates
 the batch the ordinary way, and a BIND that ends its input releases
-them for the operators above it. On more than one
+them for the operators above it. Expressions that can construct a geometry never enter
+the map, because each geometry they build stays charged until the query ends. On more than one
 worker, weak repetition of a parallel-capable expression admits the map only when the
 measured evaluation rate says it pays. The map's misses and the ordinary evaluation share
 one split controller, which keeps a contended expression serial for a cooldown and then

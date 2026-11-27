@@ -5,7 +5,9 @@
 //! a cost guard. Map misses and the ordinary evaluation share one split controller that
 //! retries the pool after a cooldown. Optional cache entries never weaken query budgets,
 //! and a refusal of memory that the map's state causes yields the batch to ordinary
-//! evaluation instead of failing the query.
+//! evaluation instead of failing the query. Expressions that can construct a geometry
+//! are not admitted, because each constructed geometry stays charged to the query even
+//! when a yielded batch discards it.
 use crate::error::Result;
 use crate::id::{Id, PAYLOAD_MASK, Tag};
 use crate::index::{O, P, Perm, S};
@@ -513,6 +515,12 @@ impl Reuse {
             return None;
         }
         let input = crate::sparql::exprcache::eligible(&[expr]).ok().flatten()?;
+        // A geometry constructor keeps its result's charge until the query ends, so
+        // misses that a refusal later discards would leave that charge behind for the
+        // ordinary evaluation of the batch.
+        if expr.charges_geometry() {
+            return None;
+        }
         Some(Admission {
             input,
             direct_str_input: is_direct_str_input(expr, input),
@@ -1156,7 +1164,8 @@ impl Reuse {
             // evaluation of the batch runs under the budget it would have without the
             // map. This covers the result and the terms, decode envelopes and regular
             // expressions that the evaluation interns or grows on its way to it, none of
-            // which records a refusal for the query.
+            // which records a refusal for the query. Geometry constructors, whose charge
+            // lasts until the query ends, never reach this pass (see `prepare`).
             let values = match exec::column_rows_split_optional(ctx, &misses, expr, par)
                 .and_then(|values| ctx.check().map(|()| values))
             {
@@ -3789,6 +3798,10 @@ mod tests {
                     panic!("{name}: the optional map latched a refusal: {error}")
                 });
                 assert!(!reused, "{name}: the map cannot hold this batch's intermediates");
+                assert!(
+                    reuse.evaluations > 0,
+                    "{name}: the map declined only after evaluating its misses"
+                );
                 assert_eq!(reuse.mode, Mode::Off, "{name}");
                 assert!(reuse.values.is_empty(), "{name}");
                 assert!(reuse.charge.as_ref().unwrap().bytes() <= 512, "{name}");
@@ -3806,6 +3819,137 @@ mod tests {
                 ctx.check().unwrap();
                 assert_eq!(terms(&ctx, &values), expected, "{name}");
             }
+        });
+    }
+
+    /// Item 293 round 3: a geometry constructor keeps its result's charge until the
+    /// query ends, so misses that a refusal discards would leave their charges behind
+    /// for the ordinary evaluation of the batch. The map does not admit such
+    /// expressions, and a batch whose ordinary evaluation fits the budget with a few
+    /// KiB to spare is answered the same way with reuse enabled.
+    #[cfg(feature = "geo")]
+    #[test]
+    fn geometry_constructors_stay_out_of_the_optional_map() {
+        use crate::geo::vocab::{GEOF, SPATIALF};
+        use crate::sparql::expr::ArithOp;
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        single.install(|| {
+            let store = Store::in_memory(StoreOptions::default());
+            let keys: Vec<Id> = (0..4096)
+                .map(|row| Id::from_i64((row % 2048) as i64).unwrap())
+                .collect();
+            let int = |n: i64| Expr::Const(Id::from_i64(n).unwrap());
+            let call = |iri: String, args: Vec<Expr>| Expr::Call(Func::Ext(iri), args);
+            let builtin = |f: Function, args: Vec<Expr>| Expr::Call(Func::Builtin(f), args);
+            // STRLEN(STR(spatialF:convertLatLon(?input / 40, 0))) is an inline integer, so
+            // the result interns nothing and only the constructed point is charged.
+            let point = |input: VarId| {
+                call(
+                    format!("{SPATIALF}convertLatLon"),
+                    vec![
+                        Expr::Arith(Box::new(Expr::Var(input)), Box::new(int(40)), ArithOp::Div),
+                        int(0),
+                    ],
+                )
+            };
+            let build = |input: VarId| {
+                builtin(
+                    Function::StrLen,
+                    vec![builtin(Function::Str, vec![point(input)])],
+                )
+            };
+            let ordinary = |memory: u64| {
+                let ctx = cursor_context(&store, memory);
+                let input = ctx.var("input");
+                let values = exec::column_rows(&ctx, &batch(input, &keys), &build(input));
+                values.ok().filter(|_| ctx.check().is_ok())
+            };
+            // The smallest budget that the ordinary evaluation fits, to 256 bytes.
+            let (mut refused, mut fits) = (0u64, 4u64 << 20);
+            assert!(ordinary(fits).is_some());
+            while fits - refused > 256 {
+                let mid = refused + (fits - refused) / 2;
+                if ordinary(mid).is_some() {
+                    fits = mid;
+                } else {
+                    refused = mid;
+                }
+            }
+            // Each row constructs a point of about 120 charged bytes.
+            assert!(fits >= 256 << 10, "the batch constructs its points: {fits}");
+            let budget = fits + (4 << 10);
+            let expected = ordinary(budget).unwrap();
+            assert!(expected.iter().all(|id| *id != Id::UNDEF));
+
+            let ctx = cursor_context(&store, budget);
+            let input = ctx.var("input");
+            let target = ctx.var("bound");
+            let expr = build(input);
+            let mut reuse = new_reuse(&ctx, &expr, None);
+            let mut table = batch(input, &keys);
+            let reused = match reuse.as_mut() {
+                Some(reuse) => reuse.apply(&ctx, &mut table, target, &expr).expect(
+                    "the optional map must not refuse a batch that ordinary evaluation fits",
+                ),
+                None => false,
+            };
+            ctx.check()
+                .expect("the optional map must not latch a refusal");
+            let values = if reused {
+                table.cols[1].clone()
+            } else {
+                let mut report = crate::sparql::exprcache::Report::default();
+                let reuse = reuse.as_ref();
+                exec::compute_column_controlled(
+                    &ctx,
+                    &table,
+                    &expr,
+                    &mut report,
+                    |n| reuse.is_some_and(|reuse| reuse.allow_fallback_split(n, &expr)),
+                    |n| reuse.is_some_and(|reuse| reuse.want_cost_timing(n, &expr)),
+                )
+                .expect("ordinary evaluation fits the budget")
+                .0
+            };
+            ctx.check()
+                .expect("the ordinary evaluation after the map fits the budget");
+            assert_eq!(values, expected);
+
+            // Every geometry constructor stays out, however deep, and so do the calls
+            // that can select one at runtime. A geometry function that constructs
+            // nothing is still admitted.
+            let ctx = cursor_context(&store, 4 << 20);
+            let input = ctx.var("input");
+            let wkt = || call(format!("{GEOF}asWKT"), vec![point(input)]);
+            for (name, expr) in [
+                ("convertLatLon", point(input)),
+                ("STRLEN(STR(convertLatLon))", build(input)),
+                (
+                    "envelope",
+                    call(format!("{GEOF}envelope"), vec![Expr::Var(input)]),
+                ),
+                ("asWKT", wkt()),
+                (
+                    "IF(BOUND, transform, 0)",
+                    Expr::If(
+                        Box::new(Expr::Bound(input)),
+                        Box::new(call(
+                            format!("{GEOF}transform"),
+                            vec![Expr::Var(input), int(0)],
+                        )),
+                        Box::new(int(0)),
+                    ),
+                ),
+            ] {
+                let eligible = crate::sparql::exprcache::eligible(&[&expr]);
+                assert_eq!(eligible.ok().flatten(), Some(input), "{name}");
+                assert!(Reuse::prepare(&ctx, &expr, None).is_none(), "{name}");
+            }
+            let dimension = call(format!("{GEOF}dimension"), vec![Expr::Var(input)]);
+            assert!(Reuse::prepare(&ctx, &dimension, None).is_some());
         });
     }
 

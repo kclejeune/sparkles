@@ -2323,7 +2323,10 @@ while the map and the batch's scratch hold their charges, releases the sketch an
 and evaluates the batch the ordinary way. The misses run as optional evaluation, which
 keeps a memory refusal of the result or of a term, decode envelope or regular expression
 on the way to it out of the query's sticky failure, so the ordinary evaluation meets the
-budget it would have without the map. A BIND that ends its input releases them for the operators
+budget it would have without the map. A geometry constructor keeps the charge of each
+geometry it builds until the query ends, so an expression that can call one, directly or
+through `fn:apply` or `afn:eval`, never enters the map. A CRS warning that the budget
+refuses during the misses is raised again by the ordinary evaluation. A BIND that ends its input releases them for the operators
 above it, and every loop checks cancellation. The batch charge is a bound sized by the batch, so the memory audit's
 `bind` fixture allows its ledger to stand above its heap until item 1320 tightens it.
 

@@ -7318,7 +7318,8 @@ pub(super) fn column_rows_split(
 /// recorded as the query's memory failure. The caller then releases its optional state
 /// and evaluates the rows the ordinary way, which meets the same budget as it would
 /// without the cache. The rows after a refusal are not evaluated. Expressions that an
-/// optional cache admits are pure, so none has an EXISTS that hands work to the pool.
+/// optional cache admits are pure, so none has an EXISTS that hands work to the pool,
+/// and they construct no geometry, whose charge would outlast a discarded row.
 pub(super) fn column_rows_split_optional(
     ctx: &Ctx,
     t: &Table,

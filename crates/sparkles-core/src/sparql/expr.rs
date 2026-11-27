@@ -611,6 +611,21 @@ pub(super) const EXISTS_MEMO_ENTRIES: usize = 100_000;
 /// takes up to 30 KiB a level.
 const PARALLEL_DEPTH: usize = 32;
 
+/// Whether a call of `f` can construct a geometry through `Call::geometry`, whose
+/// charge lasts until the query ends. `fn:apply` and `afn:eval` can select a
+/// constructor at runtime.
+#[cfg(feature = "geo")]
+fn may_charge_geometry(f: &Func) -> bool {
+    let iri = match f {
+        Func::Ext(iri) => iri.as_str(),
+        Func::Builtin(Function::Custom(iri)) => iri.as_str(),
+        _ => return false,
+    };
+    iri.strip_prefix(FN) == Some("apply")
+        || iri.strip_prefix(AFN) == Some("eval")
+        || crate::geo::functions::charges_geometry_result(iri)
+}
+
 #[derive(Clone)]
 pub enum Expr {
     Const(Id),
@@ -820,20 +835,45 @@ impl Expr {
     pub(super) fn parallel_order_key(&self) -> bool {
         #[cfg(feature = "geo")]
         {
-            self.within(PARALLEL_DEPTH, &|f| {
-                let iri = match f {
-                    Func::Ext(iri) => iri.as_str(),
-                    Func::Builtin(Function::Custom(iri)) => iri.as_str(),
-                    _ => return true,
-                };
-                // These calls can select a geometry constructor at runtime.
-                iri.strip_prefix(FN) != Some("apply")
-                    && iri.strip_prefix(AFN) != Some("eval")
-                    && !crate::geo::functions::charges_geometry_result(iri)
-            })
+            self.within(PARALLEL_DEPTH, &|f| !may_charge_geometry(f))
         }
         #[cfg(not(feature = "geo"))]
         self.parallel()
+    }
+
+    /// Whether this expression can call a geometry constructor, which keeps its
+    /// serialized result charged for the rest of the query even when the caller
+    /// discards the value. EXISTS patterns are not searched. Always false without the
+    /// `geo` feature.
+    pub(super) fn charges_geometry(&self) -> bool {
+        #[cfg(feature = "geo")]
+        {
+            self.any_call(&may_charge_geometry)
+        }
+        #[cfg(not(feature = "geo"))]
+        false
+    }
+
+    /// Whether `f` holds for a function that this expression calls outside EXISTS.
+    #[cfg(feature = "geo")]
+    fn any_call(&self, f: &impl Fn(&Func) -> bool) -> bool {
+        let any = |e: &Expr| e.any_call(f);
+        match self {
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) | Expr::Exists(_) => {
+                false
+            }
+            Expr::Or(a, b)
+            | Expr::And(a, b)
+            | Expr::Eq(a, b)
+            | Expr::SameTerm(a, b)
+            | Expr::Cmp(a, b, _)
+            | Expr::Arith(a, b, _) => any(a) || any(b),
+            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => any(a),
+            Expr::In(a, l) => any(a) || l.iter().any(any),
+            Expr::If(a, b, c) => any(a) || any(b) || any(c),
+            Expr::Coalesce(l) => l.iter().any(any),
+            Expr::Call(g, args) => f(g) || args.iter().any(any),
+        }
     }
 
     /// Whether this expression fits within the stack depth and call restrictions
