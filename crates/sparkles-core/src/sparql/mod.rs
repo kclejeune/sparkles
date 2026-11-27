@@ -3135,15 +3135,18 @@ mod result_backing_tests {
         let store = crate::store::Store::in_memory(Default::default());
         for unwind in [false, true] {
             let pool = pool::QueryPool::new(64 << 10);
+            let grant = Arc::new(pool.empty_grant());
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let opts = QueryOptions {
-                pool: Some(pool.clone()),
+                grant: Some(grant.clone()),
                 cancel: Some(cancel.clone()),
                 ..Default::default()
             };
+            let observed_grant = grant.clone();
             let hook = probe::install(
                 move |point| {
                     if let probe::Point::Allocation("query-result-backing", 1) = point {
+                        assert!(observed_grant.used() > 0);
                         if unwind {
                             std::panic::panic_any(InjectedPanic);
                         }
@@ -3161,6 +3164,8 @@ mod result_backing_tests {
             } else {
                 assert!(matches!(outcome.unwrap(), Err(Error::Cancelled)));
             }
+            assert_eq!(grant.used(), 0);
+            drop((opts, grant));
             assert_eq!(pool.granted(), 0);
         }
     }

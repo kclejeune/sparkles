@@ -1703,7 +1703,9 @@ impl Ctx {
     /// Preserve the old fast account in the ledger before testing a change of grant.
     #[cfg(test)]
     pub(crate) fn reconfigure_grant(&mut self, grant: Option<Arc<PoolGrant>>) {
-        if self.fast.peak.load(Ordering::Relaxed) != 0
+        if (self.fast.live.load(Ordering::Relaxed) != 0
+            || self.fast.eager.load(Ordering::Relaxed) != 0
+            || self.fast.peak.load(Ordering::Relaxed) != 0)
             && !super::query_memory::same(self.grant(), grant.as_ref())
         {
             self.memory();

@@ -226,8 +226,8 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's accounting model, mode-neutral kernels and decoding twins have
-shipped, including the hierarchical budget of item 675. Stage 5's
+479 of stage 2. Stage 4's query-memory accounting, mode-neutral kernels and decoding twins
+have shipped. Item 675 remains open for reasoning and incremental-view budgets. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
 
@@ -1814,21 +1814,91 @@ it held none. Admission and pool granules are unchanged.
 
 Item 884 remains open pending a valid wall-time comparison on `atlas`. Set
 `BASE_BIN` and `TIP_BIN` to the server binaries built on the same Boat worker with
-the same compiler and release settings from `0c425e86` and the item 884 commit.
-Set `PEOPLE_100K_ZST` to the 1.05M-triple synthetic dataset. Run the staged A/B
-under the timing kit's atlas locks and compare the HTTP wall and execution results
-for the four small queries, with matching answers and a valid same-binary control.
+matched `nix develop` compilers, identical release settings and
+`MBX_LEARNED_INCREMENTAL=false` from `0c425e86` and the item 884 tip. Set
+`PEOPLE_100K_ZST` to the 1.05M-triple synthetic dataset. Run the comparison under the
+timing kit's atlas locks. Arm C runs the base binary again as a same-binary control
+for all four small queries. Use syscall spinners in every arm so that a wake-up can
+run before the next scheduler tick.
 
 ```sh
 python3 scripts/timing-kit.py stage --out .artifacts/884-atlas \
-  --base "A=$BASE_BIN" --tip "B=$TIP_BIN" --data "$PEOPLE_100K_ZST" \
+  --base "A=$BASE_BIN" --tip "B=$TIP_BIN" --tip "C=$BASE_BIN" --data "$PEOPLE_100K_ZST" \
   --only count-all,distinct-obj,predicate-counts,employee-docs,class-predicates,contains,two-hop-count \
-  --controls class-predicates,contains,two-hop-count --execution auto \
-  --serve-args="--total-query-memory-mb 256" --rounds 16 --reps 200 --rotate \
-  --rerun-rounds 24 --rerun-reps 300 --early-stop-rules bound,every-round
+  --controls class-predicates,contains,two-hop-count --execution auto --spin-loop syscall \
+  --serve-args="--total-query-memory-mb 256" --rounds 18 --reps 200 --rotate \
+  --rerun-rounds 24 --rerun-reps 300
 python3 scripts/timing-kit.py preflight .artifacts/884-atlas
 python3 scripts/timing-kit.py launch --host atlas --unit item-884-atlas .artifacts/884-atlas
 ```
+
+After `DONE` reports exit 0, copy back `pass1` and retain its summaries and raw samples.
+Check the `wall_ms` distributions in `pass1/results/samples.tsv` for all three arms on
+the four small queries and reject a run with clusters at scheduler tick boundaries.
+The kit's execution verdict can leave a wall-only cost unflagged. Check wall and
+execution separately with the paired per-round medians in the summaries. Bootstrap
+whole three-round rotations to preserve the order balance. The wall control's 95%
+interval must fit inside ±2 µs for every query. The tip must meet the
+[Intel rule](PLAN.md#the-intel-rule) for both metrics, and the wall interval's upper
+bound must also be below 2 µs added.
+
+```sh
+python3 - .artifacts/884-atlas/pass1 <<'PY'
+import json
+import random
+import statistics as stats
+import subprocess
+import sys
+from itertools import chain
+from pathlib import Path
+
+run = Path(sys.argv[1])
+rounds = int(next(line.split("=", 1)[1] for line in (run / "run.env").read_text().splitlines()
+                  if line.startswith("ROUNDS=")))
+if rounds < 18 or rounds % 3:
+    sys.exit("Use at least 18 rounds in complete three-round rotations")
+rng = random.Random(884)
+queries = ("count-all", "distinct-obj", "predicate-counts", "employee-docs")
+accepted = True
+for pair, metrics in (("A-C", ("wall_ms",)), ("A-B", ("wall_ms", "exec_ms"))):
+    summary = run / f"summary-{pair}.json"
+    subprocess.run([sys.executable, "scripts/nsc-bench-summary.py", "--check",
+                    str(summary), "first"], check=True)
+    data = json.loads(summary.read_text())
+    if data["errors"]:
+        sys.exit(f"Failed timed requests in {pair}")
+    for query in queries:
+        for metric in metrics:
+            cell = data["queries"][query][metric]
+            ratios = cell["rounds"]
+            if len(ratios) != rounds or min(cell["epochs_a"], cell["epochs_b"]) != 2 * rounds:
+                sys.exit(f"Incomplete rotations for {pair} {query} {metric}")
+            rotations = [ratios[i:i+3] for i in range(0, len(ratios), 3)]
+            boot = [stats.median(chain.from_iterable(rng.choices(rotations, k=len(rotations))))
+                    for _ in range(10_000)]
+            low, *_, high = stats.quantiles(boot, n=40, method="inclusive")
+            estimate = stats.median(ratios)
+            base_us = 1000 * cell["a"]
+            low_us, added_us, high_us = ((r - 1) * base_us for r in (low, estimate, high))
+            ok = (high <= 1.02 or added_us <= 0.5) if pair == "A-B" else low_us > -2
+            if metric == "wall_ms":
+                ok = ok and high_us < 2
+            accepted &= ok
+            print(f"{pair} {query} {metric}: medians {cell['a']:.6f}, {cell['b']:.6f} ms, "
+                  f"ratio {estimate:.4f} [{low:.4f}, {high:.4f}], "
+                  f"added {added_us:+.2f} µs [{low_us:+.2f}, {high_us:+.2f}], "
+                  f"{'pass' if ok else 'check with a repeat'}")
+sys.exit(0 if accepted else 1)
+PY
+```
+
+If the controls fail or the wall intervals leave a 2 µs effect unresolved, stage a
+fresh run of all arms with 36 rounds and 300 requests per round, even when the kit
+selects no rerun. Report a wall improvement only if its interval lies below zero.
+The adjacent comparison measures the effect of the item 884 change. To estimate the
+remaining cost against the earlier query path, repeat the same procedure using
+`001f2328`, the first parent of the query hierarchy merge `65686274`, for both A and C.
+Report that comparison separately because it includes changes between the two bases.
 
 ### Checked result output
 
