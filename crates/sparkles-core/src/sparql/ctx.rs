@@ -862,6 +862,7 @@ pub struct Optimizations {
     pub fused_star_costs: bool,
     /// an index join with few keys asks the kernel to read every block it will visit
     /// before it decodes the first, so a cold server reads them in parallel
+    #[cfg(test)]
     pub prefetch_blocks: bool,
     /// a hash join whose right side is a `text:query` call without a limit searches only
     /// the subjects of a small left side
@@ -877,17 +878,24 @@ pub struct Optimizations {
     pub bound_order_keys: bool,
     /// the vocabulary groups that hold a query's constants are requested together before
     /// the planner looks the constants up one after the other
+    #[cfg(test)]
     pub prefetch_constants: bool,
     /// a FILTER, BIND or ORDER BY over a table of fewer than 4,096 rows asks for the
     /// vocabulary pages of the terms it evaluates before the first row
+    #[cfg(test)]
     pub prefetch_terms: bool,
     /// the blocks of a plan's scans with few blocks are requested before any operator runs
+    #[cfg(test)]
     pub prefetch_first_scan: bool,
     /// the columns of the blocks that an index join has asked the kernel for are decoded
-    /// in parallel on a pool of the cache's own, before the reader gets to them
+    /// in parallel on a pool of the cache's own, before the reader gets to them.
+    /// Integration tests can disable this to check foreground decoding.
+    #[doc(hidden)]
     pub parallel_decode: bool,
     /// a streamed result writer decodes the terms of the next batch on the Rayon pool
-    /// while it writes the current one
+    /// while it writes the current one. Integration tests can disable this to check
+    /// sequential output.
+    #[doc(hidden)]
     pub decode_ahead: bool,
     /// cursor operators that read their whole input before output, and filters without
     /// effects whose rows do not pass, read larger inputs as a long input goes on
@@ -898,7 +906,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 45] = [
+    pub const NAMES: [&str; 39] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -932,16 +940,10 @@ impl Optimizations {
         "key_backoff",
         "domain_estimates",
         "fused_star_costs",
-        "prefetch_blocks",
         "text_subject_pushdown",
         "vector_topk",
         "topk_heap",
         "bound_order_keys",
-        "prefetch_constants",
-        "prefetch_terms",
-        "prefetch_first_scan",
-        "parallel_decode",
-        "decode_ahead",
         "grow_input",
         "predicate_patterns",
     ];
@@ -981,13 +983,17 @@ impl Optimizations {
         key_backoff: true,
         domain_estimates: true,
         fused_star_costs: true,
+        #[cfg(test)]
         prefetch_blocks: true,
         text_subject_pushdown: true,
         vector_topk: true,
         topk_heap: true,
         bound_order_keys: true,
+        #[cfg(test)]
         prefetch_constants: true,
+        #[cfg(test)]
         prefetch_terms: true,
+        #[cfg(test)]
         prefetch_first_scan: true,
         parallel_decode: true,
         decode_ahead: true,
@@ -995,7 +1001,7 @@ impl Optimizations {
         predicate_patterns: true,
     };
 
-    /// Everything off: the generic operators only.
+    /// All named optimizations off, using the generic operators.
     pub const NONE: Optimizations = Optimizations {
         range_pushdown: false,
         incremental_group: false,
@@ -1030,16 +1036,20 @@ impl Optimizations {
         key_backoff: false,
         domain_estimates: false,
         fused_star_costs: false,
-        prefetch_blocks: false,
+        #[cfg(test)]
+        prefetch_blocks: true,
         text_subject_pushdown: false,
         vector_topk: false,
         topk_heap: false,
         bound_order_keys: false,
-        prefetch_constants: false,
-        prefetch_terms: false,
-        prefetch_first_scan: false,
-        parallel_decode: false,
-        decode_ahead: false,
+        #[cfg(test)]
+        prefetch_constants: true,
+        #[cfg(test)]
+        prefetch_terms: true,
+        #[cfg(test)]
+        prefetch_first_scan: true,
+        parallel_decode: true,
+        decode_ahead: true,
         grow_input: false,
         predicate_patterns: false,
     };
@@ -1079,51 +1089,69 @@ impl Optimizations {
             "key_backoff" => &mut self.key_backoff,
             "domain_estimates" => &mut self.domain_estimates,
             "fused_star_costs" => &mut self.fused_star_costs,
-            "prefetch_blocks" => &mut self.prefetch_blocks,
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
             "vector_topk" => &mut self.vector_topk,
             "topk_heap" => &mut self.topk_heap,
             "bound_order_keys" => &mut self.bound_order_keys,
-            "prefetch_constants" => &mut self.prefetch_constants,
-            "prefetch_terms" => &mut self.prefetch_terms,
-            "prefetch_first_scan" => &mut self.prefetch_first_scan,
-            "parallel_decode" => &mut self.parallel_decode,
-            "decode_ahead" => &mut self.decode_ahead,
             "grow_input" => &mut self.grow_input,
             "predicate_patterns" => &mut self.predicate_patterns,
             _ => return None,
         })
     }
 
-    /// Switch off the named optimizations (`all` switches off every one). Unknown names
+    /// Switch off optimizations by name (`all` selects [`Self::NONE`]). Unknown names
     /// are returned as an error.
     pub fn disable(mut self, names: &str) -> std::result::Result<Optimizations, String> {
-        for n in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-            if n == "all" {
-                self = Optimizations::NONE;
-                continue;
-            }
-            *self.flag(n).ok_or_else(|| {
+        for name in Self::split_names(names) {
+            self.disable_name(name)?;
+        }
+        Ok(self)
+    }
+
+    fn split_names(names: &str) -> impl Iterator<Item = &str> {
+        names
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    fn disable_name(&mut self, name: &str) -> std::result::Result<(), String> {
+        if name == "all" {
+            *self = Self::NONE;
+        } else {
+            *self.flag(name).ok_or_else(|| {
                 format!(
-                    "unknown optimization {n:?} (known: {})",
+                    "unknown optimization {name:?} (known: {})",
                     Self::NAMES.join(", ")
                 )
             })? = false;
         }
-        Ok(self)
+        Ok(())
     }
 }
 
 impl Default for Optimizations {
     /// Everything on, except what `SPARKLES_DISABLE_OPTIMIZATIONS` lists.
+    /// Retired names are ignored and unknown names are logged.
     fn default() -> Optimizations {
         static DEFAULT: std::sync::OnceLock<Optimizations> = std::sync::OnceLock::new();
-        *DEFAULT.get_or_init(|| match std::env::var("SPARKLES_DISABLE_OPTIMIZATIONS") {
-            Ok(v) => Optimizations::ALL.disable(&v).unwrap_or_else(|e| {
-                tracing::warn!(target: "sparkles::sparql::ctx", "SPARKLES_DISABLE_OPTIMIZATIONS: {e}");
-                Optimizations::ALL
-            }),
-            Err(_) => Optimizations::ALL,
+        *DEFAULT.get_or_init(|| {
+            let mut optimizations = Self::ALL;
+            if let Ok(names) = std::env::var("SPARKLES_DISABLE_OPTIMIZATIONS") {
+                for name in Self::split_names(&names) {
+                    if matches!(
+                        name,
+                        "prefetch_blocks" | "prefetch_constants" | "prefetch_terms"
+                            | "prefetch_first_scan" | "parallel_decode" | "decode_ahead"
+                    ) {
+                        continue;
+                    }
+                    if let Err(error) = optimizations.disable_name(name) {
+                        tracing::warn!(target: "sparkles::sparql::ctx", "SPARKLES_DISABLE_OPTIMIZATIONS: {error}");
+                    }
+                }
+            }
+            optimizations
         })
     }
 }

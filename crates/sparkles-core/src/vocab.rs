@@ -381,10 +381,7 @@ impl Ahead {
             self.offsets_until = to;
         }
         let pos = v.block_offset(block);
-        let window = match crate::index::read_window() {
-            0 => 1 << 20,
-            w => w,
-        };
+        let window = crate::index::read_window();
         if self.until < self.end && pos + window / 2 >= self.until {
             let from = pos.max(self.until);
             let to = (pos + window).min(self.end);
@@ -803,46 +800,36 @@ impl Vocab {
                     "vocabulary offsets disagree with its term count".into(),
                 ));
             }
-            let sparse = if crate::index::sparse_vocab() {
-                let before = control.used();
-                match Sparse::read_with(
-                    &dir.join("vocab.idx"),
-                    blocks,
-                    data.as_slice().len() as u64,
-                    control,
-                ) {
-                    Ok(loaded) => Some(loaded.value),
-                    Err(crate::Error::BudgetExceeded(_)) => {
-                        // The index is required on disk but not in memory: a budgeted
-                        // reader that cannot hold it looks terms up through the offsets,
-                        // which remains exact. Its failed decoder owns no surviving storage.
-                        control.release(control.used() - before);
-                        None
-                    }
-                    Err(error) => return Err(error),
+            let before = control.used();
+            let sparse = match Sparse::read_with(
+                &dir.join("vocab.idx"),
+                blocks,
+                data.as_slice().len() as u64,
+                control,
+            ) {
+                Ok(loaded) => Some(loaded.value),
+                Err(Error::BudgetExceeded(_)) => {
+                    // The index is required on disk but not in memory: a budgeted
+                    // reader that cannot hold it looks terms up through the offsets,
+                    // which remains exact. Its failed decoder owns no surviving storage.
+                    control.release(control.used() - before);
+                    None
                 }
-            } else {
-                require_index_file(dir)?;
-                None
+                Err(error) => return Err(error),
             };
             (offsets, blocks, len, sparse)
         } else {
             let blocks = (std::fs::metadata(&off_path)?.len() as usize / 8).saturating_sub(1);
-            let sparse = if crate::index::sparse_vocab() {
-                Some(
-                    Sparse::read_with(
-                        &dir.join("vocab.idx"),
-                        blocks,
-                        data.as_slice().len() as u64,
-                        control,
-                    )?
-                    .value,
-                )
-            } else {
-                require_index_file(dir)?;
-                None
-            };
-            let offsets = Bytes::open(&off_path, sparse.is_some())?;
+            let sparse = Some(
+                Sparse::read_with(
+                    &dir.join("vocab.idx"),
+                    blocks,
+                    data.as_slice().len() as u64,
+                    control,
+                )?
+                .value,
+            );
+            let offsets = Bytes::open(&off_path, true)?;
             let off = offsets.as_slice();
             let len = if off.len() >= 8 {
                 u64::from_le_bytes(off[off.len() - 8..].try_into().unwrap())
@@ -3026,16 +3013,6 @@ pub(crate) fn verify_sparse_index(
         }
     }
     Ok(s.len())
-}
-
-/// Require `vocab.idx` of the vocabulary in `dir` to exist when a process opens the
-/// vocabulary without using it: the switch leaves the index out of memory, not off the
-/// disk.
-fn require_index_file(dir: &Path) -> crate::error::Result<()> {
-    let path = dir.join("vocab.idx");
-    std::fs::metadata(&path)
-        .map(|_| ())
-        .map_err(|e| missing_index(&path, &e))
 }
 
 /// The refusal of a generation whose `vocab.idx` cannot be read: index format 5
@@ -6197,10 +6174,18 @@ mod tests {
                 .to_string()
                 .contains("requires the sparse vocabulary index")
         );
-        // a process that does not use the index still needs the file on disk
-        crate::index::set_sparse_vocab(false);
-        let opened = Vocab::open(dir.path());
-        crate::index::set_sparse_vocab(true);
+        use crate::{
+            history::{HistoryOptions, ReadLimit},
+            store::cold::ColdBudget,
+        };
+        let options = HistoryOptions::default();
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(64 << 10),
+            held: 0,
+        })
+        .unwrap();
+        let opened = Vocab::open_controlled(dir.path(), false, &mut budget);
         assert!(matches!(opened, Err(crate::Error::Corrupt(_))));
     }
 

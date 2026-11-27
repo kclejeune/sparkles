@@ -2026,7 +2026,11 @@ fn merge_counters(
 pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
     /// scans of more blocks than this are left to their own read-ahead
     const FEW_BLOCKS: usize = 64;
-    if !ctx.opt.prefetch_first_scan || !crate::index::io_hints() {
+    #[cfg(test)]
+    if !ctx.opt.prefetch_first_scan {
+        return;
+    }
+    if !crate::index::io_hints() {
         return;
     }
     /// The columns the reader decodes of block `b` of the range `[lo, hi]`: the scan's own
@@ -5993,7 +5997,11 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> 
         // The rows are evaluated one at a time, each reading the terms it needs. On a
         // cold vocabulary every term is a page fault that waits for the one before it.
         // Ask for all their blocks first, so that the reads overlap.
-        if ctx.opt.prefetch_terms && crate::index::io_hints() {
+        #[cfg(not(test))]
+        let prefetch_terms = true;
+        #[cfg(test)]
+        let prefetch_terms = ctx.opt.prefetch_terms;
+        if prefetch_terms && crate::index::io_hints() {
             prefetch_column_terms(ctx, t, &vars);
         }
         return Ok(None);

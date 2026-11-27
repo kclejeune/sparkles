@@ -1879,9 +1879,11 @@ fn prepare_query_input_policy(
     }
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     // the keys are visited only when asking for their groups can do something
-    if ctx.opt.prefetch_constants
-        && let Some(mut prefetch) = ctx.snap.generation.vocab.key_prefetch()
-    {
+    #[cfg(not(test))]
+    let prefetch_constants = true;
+    #[cfg(test)]
+    let prefetch_constants = ctx.opt.prefetch_constants;
+    if prefetch_constants && let Some(mut prefetch) = ctx.snap.generation.vocab.key_prefetch() {
         constkeys::for_each_key(pattern, &mut |key| prefetch.add(key));
         prefetch.finish();
     }

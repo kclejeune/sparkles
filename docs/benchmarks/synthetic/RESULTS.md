@@ -372,7 +372,8 @@ these features limit what a cold lookup reads:
   a query reads. `SPARKLES_IO_HINTS=off` disables them.
 * A sparse vocabulary index, `vocab.idx`, holds the first key of every 128th front-coded
   block. It narrows a lookup to one range of offsets and data, and costs 66 KB at 10.5M and
-  8.4 MB of memory at 1.01B quads. `SPARKLES_SPARSE_VOCAB=off` disables its use.
+  8.4 MB of memory at 1.01B quads. The historical ablation disabled it with
+  `SPARKLES_SPARSE_VOCAB=off` on the measured revision.
 * An index join with up to 16,384 keys requests its blocks before it decodes the first, so
   their reads overlap.
 * A filter, sort or aggregate over non-canonical numeric literals reads 8-byte values from
