@@ -522,9 +522,7 @@ test('evidence transaction-owner, in-txn holds, branch errors, integer precision
     InvalidInputError,
   );
   await assert.rejects(
-    ds.evidence.findDependents(
-      Array.from({ length: 1_001 }, () => 'https://example.org/c/1'),
-    ),
+    ds.evidence.findDependents(Array.from({ length: 1_001 }, () => 'https://example.org/c/1')),
     InvalidInputError,
   );
 
