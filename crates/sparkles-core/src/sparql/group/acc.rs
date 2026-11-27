@@ -2903,19 +2903,26 @@ impl Accumulator for Concat {
     }
 
     fn finish_memory(&self, ctx: &Ctx) -> Result<FinishMemory> {
-        let mut total = 0u64;
+        let mut total = FinishMemory::default();
         for (i, state) in self.groups.iter().enumerate() {
             if i.is_multiple_of(1024) {
                 ctx.check()?;
             }
-            if state.ok {
-                total = total.saturating_add((state.text.len() as u64).saturating_add(128));
+            if concat_is_undef(ctx, self.distinct, state.empty, state.ok) {
+                continue;
+            }
+            let len = state.text.len();
+            total.retained = total
+                .retained
+                .saturating_add((len as u64).saturating_add(128));
+            // Empty strings use a stack key. Other strings grow only if the two
+            // framing bytes do not fit, and that buffer stays live through interning.
+            let key_len = len.saturating_add(2);
+            if len != 0 && state.text.capacity() < key_len {
+                total.scratch = total.scratch.max(key_len as u64);
             }
         }
-        Ok(FinishMemory {
-            retained: total,
-            scratch: 0,
-        })
+        Ok(total)
     }
 
     fn group_bytes(&self) -> u64 {

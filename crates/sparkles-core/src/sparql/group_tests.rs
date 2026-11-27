@@ -131,6 +131,35 @@ fn maintained_integer_avg_with_wide_subtotal_respects_scratch_budget() {
 }
 
 #[test]
+fn wide_integer_sum_finish_memory_covers_interning_scratch() {
+    use super::bignum::intern_scratch_bytes;
+    use super::exec::{AggState, SumAcc};
+
+    let ctx = ctx();
+    let agg = agg(AggregateFunction::Sum, true, false);
+    let zero = Id::from_i64(0).unwrap();
+    for (base, delta, lexical_len) in [(i64::MAX, 1, 19), (i64::MIN, -1, 20)] {
+        let mut state = AggState::new(&agg);
+        for n in [base, delta, 0] {
+            state
+                .add(&ctx, &agg, Some(int(&ctx, n)), &mut |_| Ok(()))
+                .unwrap();
+        }
+        assert!(matches!(
+            state,
+            AggState::Sum {
+                acc: SumAcc::Int128(_),
+                ..
+            }
+        ));
+        let scratch = intern_scratch_bytes(lexical_len);
+        assert_eq!(state.finish_memory(&agg).scratch, scratch);
+        assert!(state.retract(Some(zero), 1));
+        assert_eq!(state.finish_memory(&agg).scratch, scratch);
+    }
+}
+
+#[test]
 fn merging_two_passes_gives_one_pass() {
     let ctx = ctx();
     let values: Vec<Id> = [5, 3, 9, 3, 7, 1, 8, 2, 6, 4]

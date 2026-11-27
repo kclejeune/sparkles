@@ -1617,4 +1617,95 @@ mod tests {
             assert_eq!(out.cols[1][g], avg);
         }
     }
+
+    #[test]
+    fn hash_average_and_concat_probe_preserves_computed_arguments() {
+        const GROUPS: usize = 128;
+        const CHUNK_BYTES: usize = 128 * 1024;
+        const REPEATS: usize = 16;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+
+        // The 2 MiB concat fills its buffer exactly. 7 MiB covers folding and the
+        // retained terms but cannot cover the additional key buffer during interning.
+        for (limit, fits) in [(7 * 1024 * 1024, false), (10 * 1024 * 1024, true)] {
+            let mut ctx = Ctx::new(Store::in_memory(StoreOptions::default()).snapshot());
+            ctx.mem_limit = limit;
+            let ctx = std::sync::Arc::new(ctx);
+            ctx.attach_owner();
+            let text = ctx.intern_value(&Value::Str("x".repeat(CHUNK_BYTES).into()));
+            let empty = ctx.intern_value(&Value::Str("".into()));
+            let one = Id::from_i64(1).unwrap();
+            let zero = Id::from_i64(0).unwrap();
+            let mut table = Table::new(vec![0, 1, 2]);
+            for g in 0..GROUPS {
+                let key = Id::from_i64(g as i64).unwrap();
+                for value in [one, zero, zero] {
+                    table.push_row(&[key, value, empty]);
+                }
+                if g == 0 {
+                    for _ in 0..REPEATS {
+                        table.push_row(&[key, zero, text]);
+                    }
+                }
+            }
+            let aggs = [
+                Agg {
+                    func: AggregateFunction::Avg,
+                    expr: Some(Expr::Var(1)),
+                    distinct: false,
+                    fold: None,
+                    registered: None,
+                },
+                Agg {
+                    func: AggregateFunction::GroupConcat {
+                        separator: Some(String::new()),
+                    },
+                    expr: Some(Expr::Coalesce(vec![Expr::Var(2), Expr::Const(empty)])),
+                    distinct: false,
+                    fold: None,
+                    registered: None,
+                },
+            ];
+            let sources = sources_of(&aggs, &table.vars);
+            let accs = accumulators(&ctx, &aggs, true, false);
+            let per_group = group_bytes_per_entry(1, &accs);
+            let acc_group_bytes = accs.iter().map(|acc| acc.group_bytes()).sum();
+            drop(accs);
+            let args_charge = ctx.charge(table_bytes(table.len, 1)).unwrap();
+            let mut expr_buf = Some((vec![None, Some(table.cols[2].clone())], Some(args_charge)));
+
+            let out = pool
+                .install(|| {
+                    run_hash_partitioned(
+                        &ctx,
+                        &table,
+                        &[Some(0)],
+                        &aggs,
+                        &sources,
+                        &mut expr_buf,
+                        &[0, 3, 4],
+                        true,
+                        true,
+                        per_group,
+                        acc_group_bytes,
+                        4,
+                    )
+                })
+                .expect("the memory probe should decline assembly before finalization fails");
+            assert_eq!(out.is_some(), fits);
+            assert_eq!(expr_buf.is_none(), fits);
+            if let Some(out) = out {
+                assert_eq!(out.len, GROUPS);
+                let concat = out.cols[2][0];
+                assert_eq!(concat.tag(), crate::id::Tag::Local);
+                assert_eq!(
+                    ctx.with_local_key(concat.payload(), |key| key.len()),
+                    Some(CHUNK_BYTES * REPEATS + 2)
+                );
+            }
+        }
+    }
 }

@@ -8756,13 +8756,18 @@ impl AggState {
                                 scratch = FIXED_AVG_SCRATCH_BYTES;
                             }
                             256
-                        } else if i64::try_from(sum)
-                            .ok()
-                            .is_some_and(|i| Id::from_i64(i).is_some())
-                        {
-                            0
                         } else {
-                            256
+                            match i64::try_from(sum) {
+                                Ok(sum) if Id::from_i64(sum).is_some() => 0,
+                                Ok(_) => 256,
+                                Err(_) => {
+                                    // `exact_sum` produces a BigInteger, whose decimal
+                                    // lexical form includes the sign for negative sums.
+                                    let digits = sum.unsigned_abs().ilog10() as usize + 1;
+                                    scratch = intern_scratch_bytes(digits + usize::from(sum < 0));
+                                    256
+                                }
+                            }
                         }
                     }
                     SumAcc::Decimal(ds) => {
