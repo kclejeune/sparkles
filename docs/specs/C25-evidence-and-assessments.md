@@ -1761,19 +1761,19 @@ the view selects.
 
 #### Ask
 
-`POST /{ds}/ask` accepts the same two arguments and passes them to a new grounding
-stage, which calls `recall` with the policies for the linked entities at hop 0.
-`sparkles ask` accepts `--review-policy` and `--matching-policy` with the same
-preflight checks, summary grounding, JSON output and event stream, and prints recall's
-`# claims` and `# resolution` sections in its human output. Passing `matchingPolicy`
-without `reviewPolicy` reports `resolution` and keeps the pre-publication recheck
-without emitting `claims` or `claimCitations`. MCP has
-no Ask tool, and an MCP client reads claims through `recall` itself. An ask that names
-a policy answers from the data, so `mode` `global` is refused with `400` and `auto`
-answers locally. Its policies and the store's configuration history are checked before
-any model call, with the refusals and HTTP statuses of `recall`. That check reads no
-entity and no claim. An ask with no linked entity, such as one that supplies its own
-query, carries an empty claims section.
+`POST /{ds}/ask` accepts the same two arguments. MCP exposes `ask`, `recall` for standalone claims, and `community_reports` for standalone reports.
+`sparkles ask` accepts `--review-policy` and `--matching-policy` with the same preflight
+checks, summary grounding, JSON output and event stream. Human output includes
+`# claims` and `# resolution` when present. Matching policy alone omits `claims`
+and `claimCitations`. In local
+mode, or when `auto` routes a question to the data, a grounding stage calls `recall` with
+the policies for the linked entities at hop 0, and community grounding filters any
+attached community summaries by `reviewPolicy`. In `global` mode, or when `auto` routes a
+question to community reports, Ask selects policy-filtered reports and resolves report
+identities as described in [Reading reports](#reading-reports) below. Its policies and
+the store's configuration history are checked before any model call, with the refusals
+and HTTP statuses of `recall`. That check reads no entity and no claim. An ask with no
+linked entity, such as one that supplies its own query, carries an empty claims section.
 
 The claims section enters only the summary step's context, under the same structural
 label, and the summary may cite occurrences as `[c1]`. That step's system prompt lets
@@ -2335,10 +2335,33 @@ them, so existing responses are unchanged. Every path reads the report through t
 guard of C22 §6, so the lists reach only readers for whom the reports graph is proven.
 `sparkles graphrag reports` lists titles and statuses and does not change.
 
-A global answer still refuses `reviewPolicy`, because recall's argument names the policy
-whose claims an answer reads, not the policy its reports were built under. Roadmap item
-811 lets a global answer name a policy and use only reports read under it, and adds
-identity resolution through a matching policy to reports. `POST /{ds}/claims/dependents`,
+Roadmap item 811 extends `community_reports` and global answers in `POST /{ds}/ask` with
+`reviewPolicy` and `matchingPolicy`. Both arguments require activated configuration
+history and read on the Head `BoundEvidenceView`, refusing inactive configuration history
+with `409 configuration-history-inactive`, unavailable projections or maps with `503
+projection-unavailable`, and unknown, wrong-kind or unauthorized policies with `400
+bad-argument` before reading reports or calling a model. With `reviewPolicy`, report counting, level selection, search ranking and retrieval admit
+only reports whose `gr:reviewPolicy` matches the requested policy's IRI, excluding
+reports built under other policies or no policy before search limits and rank fusion,
+while the C22 disclosure guard continues to enforce the reports graph's build footprint.
+With `matchingPolicy`, `community_reports` resolves the distinct entity IRIs referenced by
+the returned findings' `gr:about` and `gr:cites` triple terms through
+`sparkles::evidence::resolve_entities_at` in bounded chunks under the caller's access
+view, refusing selections that reference more than 10,000 distinct entities or exceed the
+identity response budget as `422 incomplete-evidence` and shortening cluster member lists
+with `membersComplete: false` when needed to stay within the aggregate member budget.
+Each finding keeps its source IRIs in `about`, each report records mapped `identities`,
+and the response carries `resolution` with the policy name, version, map revision IRI,
+map revision number and mapped `entities`. Global Ask passes both arguments to
+`community_reports`, pairs bounded identity links with their supporting findings inside
+the map prompt's data block without rewriting source IRIs, fences map and reduce calls
+with `AuthorityFence`, and re-verifies the caller's authority and report selection before
+publishing the answer, withholding it as `403 forbidden` if either changed in flight. In
+`auto` mode, policy preflight runs before any model call while full report loading and
+entity resolution wait until the draft routes globally, so exact-linked local questions
+are not aborted by report-only limits.
+
+`POST /{ds}/claims/dependents`,
 `find_evidence_dependents`, `sparkles::evidence::find_dependents` and
 `sparkles::evidence::find_dependents_at` also search guarded reports graphs through the
 C22 §6 disclosure guard for the reports whose activity used a changed record, as recorded

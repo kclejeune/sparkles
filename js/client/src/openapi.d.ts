@@ -5635,7 +5635,7 @@ export interface components {
             drafts?: number;
             /** @description Explore the data once after a draft without a query or with an empty result. Over the dataset's `repairs.explore`. */
             explore?: boolean;
-            /** @description A matching policy of the dataset's evidence settings, which resolves the linked entities for the claims the summary reads. Not with `mode` `global`. */
+            /** @description A matching policy of the dataset's evidence settings. In local answers, it resolves the linked entities for the claims the summary reads. In global answers, it resolves the entity identities referenced by the selected community reports. */
             matchingPolicy?: string;
             /** @description The rows returned in `result`, 1000 by default. */
             maxRows?: number;
@@ -5649,7 +5649,7 @@ export interface components {
             /** @description At most 2000 characters. */
             question: string;
             reasoning?: boolean;
-            /** @description A review policy of the dataset's evidence settings. The summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. Not with `mode` `global`. */
+            /** @description A review policy of the dataset's evidence settings. In local answers, the summary reads the claim occurrences about the linked entities with their state under the policy and may cite them in `claimCitations`. In global answers, only community reports built under that policy are selected. */
             reviewPolicy?: string;
             /** @description Hide the agent memory graphs of the dataset from the query, and use only reviewed community reports. */
             reviewedOnly?: boolean;
@@ -5671,7 +5671,7 @@ export interface components {
             attempts?: {
                 [key: string]: unknown;
             }[];
-            /** @description With `reviewPolicy`, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`. */
+            /** @description With `reviewPolicy` in a local answer, the claim occurrences the summary read, in the `claims` form of `recall`: `version` 1, `policy`, `occurrences` and `truncated`. */
             claims?: {
                 [key: string]: unknown;
             };
@@ -5684,7 +5684,7 @@ export interface components {
                 code: string;
                 message: string;
             };
-            /** @description In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports and the map `batches`. */
+            /** @description In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports, the map `batches` and, with `reviewPolicy`, the requested `reviewPolicy`. */
             global?: {
                 [key: string]: unknown;
             };
@@ -5709,7 +5709,7 @@ export interface components {
             reports?: {
                 [key: string]: unknown;
             }[];
-            /** @description With `matchingPolicy`, the map revision read, in the `resolution` form of `recall`. */
+            /** @description With `matchingPolicy`, the map revision read (`policy`, `version`, `revision` and `number`), plus `entities` for mapped identities referenced by the returned reports in a global answer. */
             resolution?: {
                 [key: string]: unknown;
             };

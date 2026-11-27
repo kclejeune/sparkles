@@ -917,6 +917,57 @@ pub(crate) fn probe(root: &std::path::Path, _checksums: bool) -> TextProbe {
     p
 }
 
+/// The longest prefix of `text` that fits in `max_bytes` on a UTF-8 character boundary,
+/// matching the literal prefix the full-text index analyzes.
+pub fn truncate_text(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// The default full-text analyzer (`SimpleTokenizer`, `RemoveLongFilter(40)`,
+/// `LowerCaser`, `AsciiFoldingFilter`), matching the index's `text` field.
+#[cfg(feature = "text")]
+pub struct StandardAnalyzer(tantivy::tokenizer::TextAnalyzer);
+
+#[cfg(feature = "text")]
+impl Default for StandardAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "text")]
+impl StandardAnalyzer {
+    pub fn new() -> Self {
+        Self(imp::standard_analyzer())
+    }
+
+    /// Stream every analyzed token of `text` to `each` without allocating per token.
+    pub fn for_each_token(&mut self, text: &str, mut each: impl FnMut(&str)) {
+        let mut stream = self.0.token_stream(text);
+        while let Some(tok) = stream.next() {
+            each(&tok.text);
+        }
+    }
+}
+
+/// Placeholder when the `text` feature is disabled.
+#[cfg(not(feature = "text"))]
+#[derive(Default)]
+pub struct StandardAnalyzer;
+
+#[cfg(not(feature = "text"))]
+impl StandardAnalyzer {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn for_each_token(&mut self, _text: &str, _each: impl FnMut(&str)) {}
+}
+
 #[cfg(feature = "text")]
 pub(crate) use imp::read_config as imp_read_config;
 #[cfg(feature = "text")]
@@ -1060,15 +1111,16 @@ mod imp {
         format!("sparkles_{}", a.name())
     }
 
+    pub(super) fn standard_analyzer() -> TextAnalyzer {
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(MAX_TOKEN))
+            .filter(LowerCaser)
+            .filter(AsciiFoldingFilter)
+            .build()
+    }
+
     fn register_tokenizer(index: &Index, config: &TextConfig) -> Result<()> {
-        index.tokenizers().register(
-            TOKENIZER,
-            TextAnalyzer::builder(SimpleTokenizer::default())
-                .filter(RemoveLongFilter::limit(MAX_TOKEN))
-                .filter(LowerCaser)
-                .filter(AsciiFoldingFilter)
-                .build(),
-        );
+        index.tokenizers().register(TOKENIZER, standard_analyzer());
         for a in Analyzer::every().filter(|a| !a.needs_dictionary()) {
             index
                 .tokenizers()
@@ -2202,14 +2254,11 @@ mod imp {
                 }
                 d.add_text(f.lang, &tag);
             }
-            let mut end = lex.len().min(cfg.max_text_bytes);
-            while !lex.is_char_boundary(end) {
-                end -= 1;
-            }
-            d.add_text(f.text, &lex[..end]);
+            let prefix = super::truncate_text(lex, cfg.max_text_bytes);
+            d.add_text(f.text, prefix);
             // a language with an analyzer: the stemmed text too
             if let Some((field, _)) = lang.and_then(|t| f.stemmed_for(&t.to_ascii_lowercase())) {
-                d.add_text(field, &lex[..end]);
+                d.add_text(field, prefix);
             }
             Some(Doc {
                 key,
