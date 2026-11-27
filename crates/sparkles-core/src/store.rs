@@ -5580,11 +5580,12 @@ impl Store {
                 .expect("uncancellable family entry"),
         );
         let mut guard = self.writer.lock();
-        if !self.speculative_base(kind, &opts, &guard) {
+        let idle_group = self.clear_idle_group(&mut guard);
+        if !idle_group && !self.speculative_base(kind, &opts, &guard) {
             self.drain_group(&mut guard, None).ok();
         }
         drop(waiting);
-        self.begin(WriterGuard { guard, family }, kind, opts)
+        self.begin(WriterGuard { guard, family }, kind, opts, idle_group)
     }
 
     /// Write transactions waiting for the writer lock right now. A long holder of the
@@ -5602,27 +5603,46 @@ impl Store {
         opts: crate::guard::WriteOptions,
     ) -> Result<WriteTxn<'_>> {
         let mut guard = self.raw_writer(&opts)?;
-        // A write that will not wait must not start from a speculative head either: its
-        // commit would then wait for the fence that makes that head durable. A failed group
-        // never becomes idle again, so that write is refused as poisoned, not as busy.
-        if opts.no_wait
-            && let Some(g) = &self.group
-        {
-            if g.failed() {
-                return Err(Error::Poisoned);
+        let idle_group = self.clear_idle_group(&mut guard);
+        if idle_group {
+            if self.group.is_some() {
+                opts.check()?;
             }
-            if !g.idle() {
-                return Err(Error::WriterBusy);
+        } else {
+            // A no-wait write needs a durable base and must not park behind a fence.
+            // Recheck idle here because a previous fence may have finished since the
+            // first check.
+            if opts.no_wait
+                && let Some(g) = &self.group
+            {
+                if g.failed() {
+                    return Err(Error::Poisoned);
+                }
+                if !g.idle() {
+                    return Err(Error::WriterBusy);
+                }
             }
-        }
-        if !self.speculative_base(kind, &opts, &guard) {
-            self.drain_group(&mut guard, Some(&opts))?;
+            if !self.speculative_base(kind, &opts, &guard) {
+                self.drain_group(&mut guard, Some(&opts))?;
+            }
         }
         self.check_write_options(&opts, &mut guard)?;
         if guard.poisoned {
             return Err(Error::Poisoned);
         }
-        Ok(self.begin(guard, kind, opts))
+        Ok(self.begin(guard, kind, opts, idle_group))
+    }
+
+    /// A healthy idle group stays idle while this caller holds the writer lock and
+    /// before it queues its own commit. Only the writer can enqueue, and with no
+    /// queued or running fence there is no leader that can fail the group.
+    fn clear_idle_group(&self, w: &mut WriterState) -> bool {
+        if self.group.as_ref().is_some_and(|g| !g.idle()) {
+            return false;
+        }
+        // Keep the published snapshot as the base after a completed fence.
+        w.staged = None;
+        true
     }
 
     /// Enter before any branch writer or lifecycle table lock. Internal shutdown
@@ -5791,7 +5811,7 @@ impl Store {
         o: &crate::guard::WriteOptions,
         w: &WriterState,
     ) -> bool {
-        self.group_check(kind, o, w).is_ok()
+        self.group_check(kind, o, w, false).is_ok()
     }
 
     /// `Ok` when a commit with these options may join a group. `Err(None)` when group
@@ -5803,18 +5823,20 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
         w: &WriterState,
+        idle_group: bool,
     ) -> std::result::Result<(), Option<Fallback>> {
         use Fallback::*;
         if !self.opts.group_commit || w.wal.is_none() || o.dry_run.is_some() {
             return Err(None);
         }
-        let first = if w.poisoned || self.group.as_ref().is_some_and(|g| g.failed()) {
-            Some(Poisoned)
-        } else if !(kind == CommitKind::Transaction || Self::speculative_kind(kind)) {
-            Some(Kind)
-        } else {
-            self.index_fallback()
-        };
+        let first =
+            if w.poisoned || (!idle_group && self.group.as_ref().is_some_and(|g| g.failed())) {
+                Some(Poisoned)
+            } else if !(kind == CommitKind::Transaction || Self::speculative_kind(kind)) {
+                Some(Kind)
+            } else {
+                self.index_fallback()
+            };
         first.map_or(Ok(()), |f| Err(Some(f)))
     }
 
@@ -5970,6 +5992,7 @@ impl Store {
         guard: WriterGuard<'a>,
         kind: CommitKind,
         opts: crate::guard::WriteOptions,
+        idle_group: bool,
     ) -> WriteTxn<'a> {
         let base = guard.staged.clone().unwrap_or_else(|| self.snapshot());
         let mark = base.generation.dvocab.mark();
@@ -5982,6 +6005,7 @@ impl Store {
             mark,
             start_bnode,
             guard: TxnGuard(Some(guard)),
+            idle_group,
             log: Vec::new(),
             bulk: Vec::new(),
             kind,
@@ -7571,6 +7595,8 @@ pub struct WriteTxn<'s> {
     base: Arc<Snapshot>,
     delta: Delta,
     guard: TxnGuard<'s>,
+    /// No predecessor can be queued or fenced while this transaction holds the writer.
+    idle_group: bool,
     log: Vec<(u8, [Id; 4])>,
     /// large insert batches applied by rebuilding the generation on commit
     bulk: Vec<[Id; 4]>,
@@ -8264,15 +8290,20 @@ impl WriteTxn<'_> {
         sync: &mut Option<(SyncPath, std::time::Duration)>,
     ) -> Result<Receipt> {
         self._callback_owner.check()?;
-        if self.guard.poisoned || self.store.group.as_ref().is_some_and(|g| g.failed()) {
+        if self.guard.poisoned
+            || (!self.idle_group && self.store.group.as_ref().is_some_and(|g| g.failed()))
+        {
             return Err(Error::Poisoned);
         }
         let grouped = self.group_admitted();
         // A dependent no-op, preview, validation, bulk rebuild or other fallback
         // cannot acknowledge or capture a speculative predecessor.
         if !grouped || (self.net_ins == 0 && self.net_del == 0) {
-            self.store.drain_group(&mut self.guard, Some(&self.opts))?;
-        } else if self.opts.no_wait && self.store.group.as_ref().is_some_and(|g| !g.idle()) {
+            self.drain_predecessors()?;
+        } else if !self.idle_group
+            && self.opts.no_wait
+            && self.store.group.as_ref().is_some_and(|g| !g.idle())
+        {
             // A write that will not wait must not park behind another commit's fence.
             // On an idle coordinator it seals and leads its own group of one directly.
             return Err(Error::WriterBusy);
@@ -8394,7 +8425,10 @@ impl WriteTxn<'_> {
     /// Whether this commit joins a group. A commit of a store with group commit on that
     /// does not is counted under the first reason it fell back for.
     fn group_admitted(&self) -> bool {
-        let why = match self.store.group_check(self.kind, &self.opts, &self.guard) {
+        let why = match self
+            .store
+            .group_check(self.kind, &self.opts, &self.guard, self.idle_group)
+        {
             Err(None) => return false,
             Err(Some(why)) => Some(why),
             Ok(()) if !self.bulk.is_empty() => Some(Fallback::Bulk),
@@ -8419,6 +8453,16 @@ impl WriteTxn<'_> {
             return why == Some(Fallback::Noop);
         }
         true
+    }
+
+    fn drain_predecessors(&mut self) -> Result<()> {
+        if !self.idle_group {
+            return self.store.drain_group(&mut self.guard, Some(&self.opts));
+        }
+        if self.store.group.is_some() {
+            self.opts.check()?;
+        }
+        Ok(())
     }
 
     /// Publish a commit of an in-memory store, which has no write-ahead log (X16 Phase 6).

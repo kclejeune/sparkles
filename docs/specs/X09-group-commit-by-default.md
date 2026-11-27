@@ -1718,8 +1718,8 @@ processes the drive slowed. The serial gates of the spatial dataset at 10.5M ran
 with five blocks on `atlas` and on `forge`, described below, and all six checks were met
 on both. On `atlas` the paired ratios of grouped to ordinary were 0.984 at p50 and 0.973
 at p90 for literal inserts, 0.999 and 1.000 for IRI inserts, and 1.016 and 1.019 for
-deletes. The 0.1% to 0.3% of instructions is the tradeoff of the admission checks, and it
-stays. [ROADMAP](../ROADMAP.md) item 448 follows up that cost and the delete ratios.
+deletes. Phase 4 accepted the 0.1% to 0.3% instruction overhead of the admission checks.
+[ROADMAP](../ROADMAP.md) item 448 follows up that cost and the delete ratios.
 
 **Four writers on `atlas`.** Five blocks of four writers inserting literals at 1.05M ran
 on `atlas` on 2026-10-31 under the amended throughput gate, which they judged before any of
@@ -1786,6 +1786,20 @@ section 17.10. The rerun after item 110 had no text process above the 50 ms lag 
 size, so this delay stays within the load-quality rule there. The model test has no write
 transaction that searches text, so the wait of a search on a speculative head has only
 unit tests.
+
+**Idle writer admission (item 448).** The writer checks the coordinator once after
+acquiring the writer lock. A healthy idle coordinator cannot gain another queued commit
+until that writer releases the lock, and there is no running fence that can fail. The
+transaction uses the published snapshot and skips speculative index and guard admission,
+predecessor drains, and the queue and WAL checks for pending predecessors. Its WAL record
+reports zero unfenced predecessors. Commit-time index eligibility, validation, and
+per-commit size limits still apply. The writer enqueues and synchronizes through the
+existing fence, so arriving writers and publication follow the same ordering.
+
+Regression tests check the transition from an idle coordinator to a running fence and
+back, refusal before publication, a failed fence with a queued successor, and removal
+from a ready spatial index. An Intel writes comparison remains for serial spatial inserts
+and deletes at 10.5M and the spatial reader cell at 1.05M under mixed load.
 
 **Write-through fences (item 446).** A grouped transaction no longer writes to the log.
 It encodes its records and its commit record, with the unfenced count of section 6, takes
