@@ -170,6 +170,11 @@ impl<T> Evicted<T> {
             .saturating_add(alloc_bytes(self.holds.allocation_size()))
     }
 
+    fn min_bytes(&self) -> u64 {
+        self.payload_bytes
+            .saturating_add(min_map_bytes::<usize, EvictedHold<T>>(self.holds.len()))
+    }
+
     fn remember(&mut self, weak: Weak<T>, bytes: u64) {
         let ptr = weak.as_ptr() as usize;
         if weak.strong_count() > 0
@@ -519,8 +524,8 @@ impl AdmissionFootprint {
     }
 }
 
-/// Minimum retained bytes of a cache holding only `(key, table)`.
-fn standalone_entry_bytes(key: &Key, table: &Table) -> u64 {
+/// Minimum retained bytes for a single entry, excluding the key's string buffers.
+fn standalone_table_bytes(table: &Table) -> u64 {
     let mut distinct_chunks = 0u64;
     let mut chunk_count = 0usize;
     if table.chunks.len() <= 8 {
@@ -546,8 +551,8 @@ fn standalone_entry_bytes(key: &Key, table: &Table) -> u64 {
     let min_maps = min_map_bytes::<Key, Entry>(1)
         .saturating_add(min_map_bytes::<usize, SharedHold>(1))
         .saturating_add(min_map_bytes::<usize, SharedHold>(chunk_count));
-    key.heap_bytes()
-        .saturating_add(table.own_bytes())
+    table
+        .own_bytes()
         .saturating_add(distinct_chunks)
         .saturating_add(min_maps)
 }
@@ -615,7 +620,7 @@ impl Cache {
     }
 
     fn put(&self, key: Key, table: Arc<Table>) {
-        let standalone = standalone_entry_bytes(&key, &table);
+        let table_bytes = standalone_table_bytes(&table);
         #[cfg(test)]
         if let Some(before_lock) = &self.before_insert_lock {
             before_lock();
@@ -623,17 +628,23 @@ impl Cache {
         let mut inner = self.inner.lock();
         // A shrink that completed while this insertion waited must win.
         let cap = self.capacity.load(Ordering::Relaxed);
-        if cap == 0 {
+        if cap == 0 || table_bytes > cap {
             return;
         }
+        let replacement = inner.map.get(&key);
+        let key_bytes = replacement.map_or_else(|| key.heap_bytes(), |entry| entry.key_bytes);
+        let standalone = table_bytes.saturating_add(key_bytes);
+        if standalone > cap {
+            return;
+        }
+        let replacing = replacement.is_some();
         inner.prune_evicted_held();
-        let fits_without_growth = !inner.map.contains_key(&key)
+        let fits_without_growth = !replacing
             && inner.map.len() < inner.map.capacity()
             && inner.tables.len() < inner.tables.capacity()
             && table.chunks.len() <= inner.chunks.capacity() - inner.chunks.len()
             && inner.total_bytes().saturating_add(standalone) <= cap;
-        let fits_empty =
-            inner.map.is_empty() && inner.caller_held_evicted_bytes() == 0 && standalone <= cap;
+        let fits_empty = inner.map.is_empty() && inner.caller_held_evicted_bytes() == 0;
         let victims = if fits_without_growth || fits_empty {
             Vec::new()
         } else if let Some(victims) = inner.admission_victims(&key, &table, cap) {
@@ -651,14 +662,13 @@ impl Cache {
             drop(new_table);
             inner.release_table(old_table);
         } else {
-            let kb = key.heap_bytes();
             inner.retain_table(&table);
-            inner.key_bytes = inner.key_bytes.saturating_add(kb);
+            inner.key_bytes = inner.key_bytes.saturating_add(key_bytes);
             inner.map.insert(
                 key,
                 Entry {
                     table,
-                    key_bytes: kb,
+                    key_bytes,
                     used,
                 },
             );
@@ -725,32 +735,26 @@ fn evict(inner: &mut Inner, cap: u64, victims: Option<Vec<Reverse<Victim>>>) {
         inner.clear_all();
         return;
     }
-    if inner.total_bytes() <= cap {
-        if inner.map.is_empty() {
-            inner.reset_maps();
-        }
-        return;
-    }
-    inner.evicted_tables.shrink_to_fit();
-    inner.evicted_chunks.shrink_to_fit();
     let mut pending = victims;
     let mut queue = None;
     loop {
-        if inner.map.is_empty() {
-            inner.reset_maps();
-            return;
-        }
         if inner.total_bytes() <= cap {
+            if inner.map.is_empty() {
+                inner.reset_maps();
+            }
             return;
         }
-        if inner
-            .payload_bytes()
-            .saturating_add(inner.min_map_overhead_bytes())
-            .saturating_add(inner.caller_held_evicted_bytes())
-            <= cap
+        // Evicting a borrowed entry can grow its weak map. Recompute the minimum
+        // for both sets of maps before deciding that another entry must go.
+        if inner.map.is_empty()
+            || inner
+                .payload_bytes()
+                .saturating_add(inner.min_map_overhead_bytes())
+                .saturating_add(inner.evicted_tables.min_bytes())
+                .saturating_add(inner.evicted_chunks.min_bytes())
+                <= cap
         {
-            inner.shrink_maps();
-            return;
+            break;
         }
 
         // A put already identified the unborrowed victims before changing ownership.
@@ -769,18 +773,15 @@ fn evict(inner: &mut Inner, cap: u64, victims: Option<Vec<Reverse<Victim>>>) {
                     .collect()
             }))
         });
-        if let Some(Reverse(victim)) = queue.pop() {
-            inner.remove_at_tick(victim.used);
-        } else {
-            // A replacement can create chunk holds as the last victim is removed.
-            // Recover any tracking buckets still allocated above the projected floor.
-            inner.evicted_tables.shrink_to_fit();
-            inner.evicted_chunks.shrink_to_fit();
-            inner.shrink_maps();
-            debug_assert!(inner.total_bytes() <= cap);
-            return;
-        }
+        let Some(Reverse(victim)) = queue.pop() else {
+            break;
+        };
+        inner.remove_at_tick(victim.used);
     }
+    inner.shrink_maps();
+    inner.evicted_tables.shrink_to_fit();
+    inner.evicted_chunks.shrink_to_fit();
+    debug_assert!(inner.map.is_empty() || inner.total_bytes() <= cap);
 }
 
 pub(crate) fn get(key: &Key) -> Option<Arc<Table>> {
@@ -832,6 +833,10 @@ mod tests {
             chunks: vec![Arc::new(vec![[value, 2, 3]])],
             keys: Vec::new(),
         })
+    }
+
+    fn standalone_entry_bytes(key: &Key, table: &Table) -> u64 {
+        standalone_table_bytes(table).saturating_add(key.heap_bytes())
     }
 
     /// Legacy uncalibrated estimator (item 192) for side-by-side calibration diagnostics.
@@ -972,6 +977,58 @@ mod tests {
             (s.capacity_bytes, s.estimated_bytes, s.tables),
             (same_bytes, same_bytes, 1)
         );
+    }
+
+    #[test]
+    fn oversized_publication_skips_pruning_and_admission_planning() {
+        let candidate = table_with_facts(1000);
+        let candidate_key = key("oversized");
+        let cap = standalone_entry_bytes(&candidate_key, &candidate) - 1;
+        let cache = Cache::new(cap);
+        for i in 0..8 {
+            cache.put(key(&format!("warm-{i}")), table(i));
+        }
+        let stale = table(0);
+        cache
+            .inner
+            .lock()
+            .evicted_tables
+            .remember(Arc::downgrade(&stale), stale.own_bytes());
+        drop(stale);
+
+        // The standalone charge for one chunk needs no scratch. Building the
+        // admission footprint or collecting victims would allocate under the lock.
+        let ((), _, largest) =
+            alloc_probe::peak_and_largest_of(|| cache.put(candidate_key, candidate));
+        let inner = cache.inner.lock();
+        assert_eq!(largest, 0);
+        assert_eq!(inner.map.len(), 8);
+        assert_eq!(inner.evicted_tables.holds.len(), 1);
+    }
+
+    #[test]
+    fn replacement_size_limit_uses_the_stored_key_capacity() {
+        for stored_padded in [false, true] {
+            let mut stored = key("replacement");
+            let mut incoming = stored.clone();
+            if stored_padded {
+                stored.demand.reserve(1024);
+            } else {
+                incoming.demand.reserve(1024);
+            }
+            let old = table(1);
+            let replacement = table_with_facts(1000);
+            let cap = standalone_entry_bytes(&incoming, &replacement)
+                .min(standalone_entry_bytes(&stored, &replacement));
+            let lookup = incoming.clone();
+            let cache = Cache::new(cap);
+            cache.put(stored, old);
+            cache.put(incoming, replacement.clone());
+            assert_eq!(
+                Arc::ptr_eq(&cache.get(&lookup).unwrap(), &replacement),
+                !stored_padded
+            );
+        }
     }
 
     #[test]
@@ -1156,6 +1213,72 @@ mod tests {
         assert!(stats.estimated_bytes <= cap);
         drop(cache);
         assert_eq!(alloc_probe::live_bytes(), before);
+    }
+
+    #[test]
+    fn resize_shrinks_a_grown_caller_hold_map_before_evicting_again() {
+        use std::hash::BuildHasher;
+
+        let empty_table = || {
+            Arc::new(Table {
+                chunks: Vec::new(),
+                keys: Vec::new(),
+            })
+        };
+        let cache = Cache::new(1 << 20);
+        let older = empty_table();
+        let newer = empty_table();
+        let old_key = key("older");
+        let new_key = key("newer");
+        cache.put(old_key.clone(), older.clone());
+        cache.put(new_key.clone(), newer.clone());
+
+        let mut inner = cache.inner.lock();
+        let holds = &mut inner.evicted_tables;
+        holds.holds.reserve(56);
+        let original_allocation = holds.holds.allocation_size();
+        let old_ptr = Arc::as_ptr(&older) as usize;
+        let old_bucket = FxBuildHasher.hash_one(old_ptr) & 63;
+        let mut callers = Vec::new();
+        // Use fixture keys to fill consecutive buckets regardless of allocator
+        // addresses. Leave the real older table's home bucket empty so inserting
+        // it cannot reuse a tombstone. Pruning the middle creates tombstones.
+        for offset in 1..=56 {
+            let bucket = (old_bucket + offset) & 63;
+            let mut fixture_key = 0;
+            while FxBuildHasher.hash_one(fixture_key) & 63 != bucket {
+                fixture_key += 1;
+            }
+            let caller = empty_table();
+            holds.holds.insert(
+                fixture_key,
+                EvictedHold {
+                    weak: Arc::downgrade(&caller),
+                    bytes: caller.own_bytes(),
+                },
+            );
+            holds.payload_bytes += caller.own_bytes();
+            if !(18..=38).contains(&offset) {
+                callers.push(caller);
+            }
+        }
+        holds.prune();
+        assert_eq!(holds.holds.len(), 35);
+        assert_eq!(holds.holds.capacity(), 35);
+        assert_eq!(holds.holds.allocation_size(), original_allocation);
+        let cap = standalone_entry_bytes(&new_key, &newer) + holds.bytes() + older.own_bytes();
+        drop(inner);
+
+        cache.set_capacity(cap);
+        let inner = cache.inner.lock();
+        assert!(!inner.map.contains_key(&old_key));
+        assert!(inner.map.contains_key(&new_key));
+        assert_eq!(inner.evicted_tables.holds.len(), 36);
+        assert_eq!(
+            inner.evicted_tables.holds.allocation_size(),
+            original_allocation
+        );
+        assert_eq!(inner.total_bytes(), cap);
     }
 
     fn table_with_facts(facts: usize) -> Arc<Table> {
