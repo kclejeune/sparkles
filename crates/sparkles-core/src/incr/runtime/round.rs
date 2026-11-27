@@ -167,7 +167,17 @@ impl Runtime {
                 if let Some(hook) = self.busy_locked_hook.lock().clone() {
                     hook();
                 }
-                return (!self.mode_changed_since(target)).then_some(st);
+                // Hosts can consult the registry while a catalog attach holds it
+                // and waits for this cell. Release state before probing the host.
+                drop(st);
+                if self.mode_changed_since(target) {
+                    return None;
+                }
+                if let Some(st) = cell.state.try_lock() {
+                    return (!self.closed.load(Ordering::Acquire)
+                        && self.mode_is_current(target.generation, target.host_seq))
+                    .then_some(st);
+                }
             }
             #[cfg(test)]
             self.busy_waits.fetch_add(1, Ordering::Release);

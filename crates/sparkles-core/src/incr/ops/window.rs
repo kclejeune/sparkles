@@ -287,22 +287,23 @@ impl Window {
     }
 
     fn segment_slices(&self) -> impl Iterator<Item = (&Entry, i64, i64, u64)> {
+        self.scan_segments().flatten()
+    }
+
+    fn scan_segments(&self) -> impl Iterator<Item = Option<(&Entry, i64, i64, u64)>> {
         let big = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         let start = big(self.offset);
         let end = start.saturating_add(big(self.limit));
-        self.kept
-            .iter()
-            .scan(0i64, move |at, e| {
-                if *at >= end {
-                    return None;
-                }
-                let lo = (*at).max(start);
-                let hi = (*at + e.w).min(end);
-                let slice = (lo < hi).then(|| (e, lo - *at, hi - *at, (lo - start) as u64));
-                *at += e.w;
-                Some(slice)
-            })
-            .flatten()
+        self.kept.iter().scan(0i64, move |at, e| {
+            if *at >= end {
+                return None;
+            }
+            let lo = (*at).max(start);
+            let hi = (*at + e.w).min(end);
+            let slice = (lo < hi).then(|| (e, lo - *at, hi - *at, (lo - start) as u64));
+            *at += e.w;
+            Some(slice)
+        })
     }
 
     /// The slots of the kept rows' vector, for tests of its memory.
@@ -319,6 +320,23 @@ impl Window {
     ) -> std::result::Result<(), E> {
         self.segment_slices()
             .try_for_each(|(e, lo, hi, _)| f(&e.row, hi - lo))
+    }
+
+    /// Poll even on entries skipped by the window's offset.
+    pub(crate) fn for_each_row_checked<E>(
+        &self,
+        mut check: impl FnMut() -> std::result::Result<(), E>,
+        mut f: impl FnMut(&Row, i64) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        for (i, segment) in self.scan_segments().enumerate() {
+            if i.is_multiple_of(256) {
+                check()?;
+            }
+            if let Some((e, lo, hi, _)) = segment {
+                f(&e.row, hi - lo)?;
+            }
+        }
+        Ok(())
     }
 
     /// The number of runs in the current window.

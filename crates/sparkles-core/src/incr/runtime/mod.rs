@@ -271,6 +271,8 @@ pub struct Runtime {
     #[cfg(test)]
     busy_locked_hook: Mutex<Option<TestHook>>,
     #[cfg(test)]
+    before_mode_host_hook: Mutex<Option<TestHook>>,
+    #[cfg(test)]
     wait_info_hook: Mutex<Option<TestHook>>,
     #[cfg(test)]
     note_pass_hook: Mutex<Option<TestHook>>,
@@ -340,6 +342,8 @@ impl Runtime {
             observer_wait_hook: Mutex::new(None),
             #[cfg(test)]
             busy_locked_hook: Mutex::new(None),
+            #[cfg(test)]
+            before_mode_host_hook: Mutex::new(None),
             #[cfg(test)]
             wait_info_hook: Mutex::new(None),
             #[cfg(test)]

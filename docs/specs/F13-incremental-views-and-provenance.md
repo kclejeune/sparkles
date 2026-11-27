@@ -1740,19 +1740,22 @@ The registry tracks a monotonically increasing mode generation alongside the dat
 inference, aggregate-error reading, and host revision. Mode sampling runs outside the
 registry lock. A host replacement or settings change invalidates the published mode until
 a fresh sample is recorded. Timed readers use the published mode without calling the host,
-and planning uses it only when the registry is immediately available.
+and planning uses it only after a host has published a current mode and the registry is
+immediately available. A newer host revision takes precedence over older samples.
 
 Idle circuits recompile outside the registry lock. A worker or live join can start a
 replacement build after the old operators have been dropped and their detached budget
 leases have returned credit to the pool. Worker rounds process idle circuits before busy
-circuits and recheck the host mode after waiting for a busy circuit. A new RDFS setting
+circuits and recheck the host mode outside circuit state after waiting for a busy circuit.
+They check the published revision again when they reacquire state. A new RDFS setting
 with an unchanged checkpoint key still starts a new mode generation. Rounds release their
 busy-cell references before garbage collection and checkpointing.
 
 View reads revalidate the runtime mode inside the circuit lock before accepting a version
 or preparing a fallback. Both streaming and eager reads honor deadlines and cancellation,
-including while waiting for an `allowStale` read and during a fallback evaluation. A missing
-view returns `view-not-found` when the registry entry is checked. Metadata for a view waiting
+including while waiting for an `allowStale` read and when circuit metadata is busy. An
+eager fallback checks both controls while installing and decoding its results. It does
+not freeze terms or publish a shared version for its private circuit. A missing view returns `view-not-found` when the registry entry is checked. Metadata for a view waiting
 on a mode change reports a build in progress and omits the previous plan and row count.
 `wait_built` uses one metadata snapshot to decide whether the build completed and returns
 current metadata with the commit and row count published by that pass. Its timeout bounds
@@ -1761,9 +1764,13 @@ boundary when dropping an unswitched dead circuit.
 
 Tests synchronize competing worker and live-join builds while the old pool credit is still
 held, pause mode sampling while timed operations run, replace an equal-schema RDFS setting
-during Pass 2, and change the reading between the Pass 2 probe and admission. They complete a
-build between the catalog's snapshot and its return decision, check metadata while worker and
-live builders are about to publish, and cancel an eager fallback as it allocates work. Other
+during Pass 2, and change the reading between the Pass 2 probe and admission. They hold
+the registry during a catalog attach while a Pass 2 host callback consults runtime stats
+and publish a new host revision after a concurrent sample of the old revision. Tests
+hold circuit metadata past the read deadline and reopen a dataset with a nondefault
+aggregate-error reading before its first plan. They also complete a build between the
+catalog's snapshot and its return decision, check metadata while worker and live builders
+are about to publish, and cancel an eager fallback during result installation. Other
 tests synchronize GC ownership release before checkpointing, change mode after the reader's
 first generation check, advance the epoch at expiration, and cancel eager and streaming
 queries after an incomplete view read has waited.

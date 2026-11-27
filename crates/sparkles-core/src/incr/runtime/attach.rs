@@ -303,17 +303,24 @@ impl Runtime {
     /// Sample the host outside runtime locks and publish the result in observation order.
     pub(super) fn refresh_mode(&self) {
         loop {
-            let sample = self.next_mode_sample.fetch_add(1, Ordering::Relaxed) + 1;
+            #[cfg(test)]
+            {
+                let hook = self.before_mode_host_hook.lock().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             let (seq, Some(host)) = self.current_host() else {
                 return;
             };
+            let sample = self.next_mode_sample.fetch_add(1, Ordering::Relaxed) + 1;
             let now = host.inference();
             let errors = host.aggregate_errors();
             let mut reg = self.reg.lock();
             if self.host_seq() != seq {
                 continue;
             }
-            if sample <= reg.mode_sample {
+            if (seq, sample) <= (reg.host_seq, reg.mode_sample) {
                 return;
             }
             reg.mode_sample = sample;
@@ -1148,6 +1155,97 @@ mod switch_tests {
         check_pass_two_rotation(true);
     }
 
+    #[test]
+    fn pass_two_samples_host_outside_state_during_catalog_attach() {
+        use crate::sparql::AggregateErrors;
+        use std::sync::mpsc::channel;
+
+        struct InspectingHost {
+            probe: TestHook,
+        }
+
+        impl Host for InspectingHost {
+            fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+                Ok(None)
+            }
+            fn stored_query(&self, _: &str) -> Result<String> {
+                Err(Error::NotFound("none".into()))
+            }
+            fn aggregate_errors(&self) -> AggregateErrors {
+                (self.probe)();
+                AggregateErrors::Jena
+            }
+        }
+
+        let store = Arc::new(Store::in_memory(StoreOptions::default()));
+        let rt = Runtime::open(None, store.dataset_id(), RuntimeOptions::default());
+        rt.set_host(Arc::new(OpenHost));
+        let def = ViewDef::table("SELECT ?s WHERE { ?s <urn:p> ?o }");
+        rt.put(&store, "busy", def.clone()).unwrap();
+        rt.round(&store);
+        let busy = rt.reg.lock().view("busy").unwrap().cell.clone().unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let probe = armed.clone();
+        let probe_cell = Arc::downgrade(&busy);
+        let probe_runtime = Arc::downgrade(&rt);
+        let probe_store = store.clone();
+        rt.set_host(Arc::new(InspectingHost {
+            probe: Arc::new(move || {
+                if probe.swap(false, Ordering::AcqRel) {
+                    // Bound the failure on the old lock order so the catalog and the
+                    // worker can unwind instead of leaving the test deadlocked.
+                    let cell = probe_cell.upgrade().unwrap();
+                    let state = cell.state.try_lock_for(Duration::from_secs(1));
+                    assert!(state.is_some(), "host callback ran under circuit state");
+                    drop(state);
+                    assert_eq!(
+                        probe_runtime
+                            .upgrade()
+                            .unwrap()
+                            .stats(&probe_store)
+                            .circuits,
+                        1
+                    );
+                }
+            }),
+        }));
+
+        let (locked, at_lock) = channel();
+        let (attaching, at_attach) = channel();
+        let at_attach = Mutex::new(at_attach);
+        *rt.busy_locked_hook.lock() = Some(Arc::new(move || {
+            locked.send(()).unwrap();
+            at_attach
+                .lock()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            armed.store(true, Ordering::Release);
+        }));
+        std::thread::scope(|scope| {
+            let guard = busy.state.lock();
+            let waits = rt.busy_waits.load(Ordering::Acquire);
+            let round = scope.spawn(|| rt.round(&store));
+            let until = Instant::now() + Duration::from_secs(5);
+            while rt.busy_waits.load(Ordering::Acquire) == waits {
+                assert!(Instant::now() < until, "round did not reach Pass 2");
+                std::thread::yield_now();
+            }
+            drop(guard);
+            at_lock.recv_timeout(Duration::from_secs(5)).unwrap();
+            let catalog = scope.spawn(|| {
+                let mut deferred = DeferredDrops::default();
+                let mut reg = rt.reg.lock();
+                reg.views
+                    .insert("alias".into(), ViewEntry::new("alias", def, None));
+                attaching.send(()).unwrap();
+                rt.attach(&store, &mut reg, "alias", &mut deferred.retired)
+                    .unwrap();
+            });
+            catalog.join().unwrap();
+            round.join().unwrap();
+        });
+    }
+
     fn check_pass_two_rotation(acquired: bool) {
         use crate::sparql::AggregateErrors;
         use crate::sparql::rdfs::{RdfsOnRead, SchemaSource};
@@ -1723,6 +1821,113 @@ mod switch_tests {
     }
 
     #[test]
+    fn a_new_host_revision_publishes_after_a_concurrent_older_revision() {
+        use crate::sparql::AggregateErrors;
+        use std::sync::mpsc::channel;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let rt = Runtime::open(None, store.dataset_id(), RuntimeOptions::default());
+        let host = Arc::new(ModeHost {
+            errors: Mutex::new(AggregateErrors::Jena),
+            inference: Mutex::new(None),
+        });
+        rt.set_host(host.clone());
+
+        let (before_host, paused) = channel();
+        let (resume, resumed) = channel();
+        let resumed = Mutex::new(resumed);
+        let once = AtomicBool::new(true);
+        *rt.before_mode_host_hook.lock() = Some(Arc::new(move || {
+            if once.swap(false, Ordering::AcqRel) {
+                before_host.send(()).unwrap();
+                resumed.lock().recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }));
+
+        std::thread::scope(|scope| {
+            let refresh = scope.spawn(|| rt.refresh_mode());
+            paused.recv_timeout(Duration::from_secs(5)).unwrap();
+            rt.refresh_mode();
+            assert_eq!(rt.reg.lock().host_seq, rt.host_seq());
+            *host.errors.lock() = AggregateErrors::Sparkles;
+            rt.mode_changed();
+            resume.send(()).unwrap();
+            refresh.join().unwrap();
+        });
+        let reg = rt.reg.lock();
+        assert_eq!(reg.host_seq, rt.host_seq());
+        assert_eq!(reg.aggregate_errors, AggregateErrors::Sparkles);
+        assert_eq!(reg.mode_gen, 1);
+    }
+
+    #[test]
+    fn timed_view_read_expires_while_metadata_is_held() {
+        use std::sync::mpsc::channel;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let rt = Runtime::open(
+            None,
+            store.dataset_id(),
+            RuntimeOptions {
+                view_wait: Duration::from_secs(5),
+                ..RuntimeOptions::default()
+            },
+        );
+        rt.set_host(Arc::new(OpenHost));
+        rt.put(
+            &store,
+            "v",
+            ViewDef::table("SELECT ?s WHERE { ?s <urn:p> ?o }"),
+        )
+        .unwrap();
+        rt.round(&store);
+        let cell = rt.reg.lock().view("v").unwrap().cell.clone().unwrap();
+
+        let (probed, after_probe) = channel();
+        let (resume, resumed) = channel();
+        let resumed = Mutex::new(resumed);
+        *rt.before_read_state_hook.lock() = Some(Arc::new(move || {
+            probed.send(()).unwrap();
+            resumed.lock().recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        let (waiting, waited) = channel();
+        *rt.observer_wait_hook.lock() = Some(Arc::new(move |_| {
+            waiting.send(()).unwrap();
+        }));
+        let (done, completed) = channel();
+        std::thread::scope(|scope| {
+            let read = scope.spawn(|| {
+                let snap = store.snapshot();
+                done.send(
+                    rt.read(&ViewRead {
+                        name: "v",
+                        at: snap.commit,
+                        snap: Some(&snap),
+                        caller: None,
+                        allow_stale: true,
+                        deadline: Some(Instant::now() + Duration::from_secs(1)),
+                        aggregate_errors: None,
+                        memory_parent: None,
+                        memory_pool: None,
+                        max_memory_bytes: None,
+                    })
+                    .map(|_| ()),
+                )
+                .unwrap();
+            });
+            after_probe.recv_timeout(Duration::from_secs(5)).unwrap();
+            let metadata = cell.info.lock();
+            resume.send(()).unwrap();
+            let observed = waited.recv_timeout(Duration::from_secs(2));
+            let result = completed.recv_timeout(Duration::from_secs(2));
+            drop(metadata);
+            read.join().unwrap();
+            observed.expect("the read did not reach a bounded wait with metadata held");
+            assert!(matches!(result, Ok(Err(Error::Timeout))), "{result:?}");
+        });
+    }
+
+    #[test]
     fn timed_view_observers_do_not_sample_a_paused_host() {
         struct PausedHost {
             entered: std::sync::mpsc::Sender<()>,
@@ -1955,6 +2160,65 @@ mod switch_tests {
             "fallback did not begin allocating"
         );
         assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn eager_view_fallback_stops_installing_rows_after_cancellation() {
+        use crate::sparql::AggregateErrors;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let rt = Runtime::open(None, store.dataset_id(), RuntimeOptions::default());
+        rt.set_host(Arc::new(OpenHost));
+        let values = (0..300)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        rt.put(
+            &store,
+            "v",
+            ViewDef::table(format!("SELECT * WHERE {{ VALUES ?n {{ {values} }} }}")),
+        )
+        .unwrap();
+        rt.round(&store);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let installed = Arc::new(AtomicU64::new(0));
+        let admitted = installed.clone();
+        let row_bytes = crate::incr::zset::row_bytes(1);
+        // Inline integer VALUES needs no budget reservation before result installation.
+        // Refuse rounded credit so each installed row reaches the parent separately.
+        let parent = sparkles_budget::MemoryDomain::unpooled().parent(
+            move |bytes| {
+                if bytes > row_bytes {
+                    return Err(sparkles_budget::ParentRefused::Overflow);
+                }
+                assert_eq!(bytes, row_bytes);
+                admitted.fetch_add(1, Ordering::Relaxed);
+                flag.store(true, Ordering::Release);
+                Ok(())
+            },
+            |_| {},
+        );
+        let snap = store.snapshot();
+        let result = rt.read_controlled(
+            &ViewRead {
+                name: "v",
+                at: snap.commit,
+                snap: Some(&snap),
+                allow_stale: true,
+                caller: None,
+                deadline: None,
+                aggregate_errors: Some(AggregateErrors::Sparkles),
+                memory_parent: Some(&|| Ok(parent.clone())),
+                memory_pool: None,
+                max_memory_bytes: None,
+            },
+            &|| Ok(()),
+            &|| crate::task::Cancellation::from_flags([cancelled.clone()]),
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(installed.load(Ordering::Relaxed), 256);
     }
 
     /// `wait_built` enforces its timeout while the registry is held, and both `open_view`
