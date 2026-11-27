@@ -7332,7 +7332,9 @@ pub(super) enum OptionalColumn {
 /// rows with `unevaluated`, which must be an id that no term carries. The rows that
 /// finished keep their values, so the caller releases its optional state and evaluates
 /// only the marked rows the ordinary way (see [`with_row_eval`]), without repeating the
-/// work of the finished rows. On one worker the finished rows are the rows before the
+/// work of the finished rows. An unfinished row that interned an intermediate term after
+/// an earlier transient allocation before refusing can still repeat that transient
+/// allocation on retry beside the retained intermediate term (roadmap item 1322). On one worker the finished rows are the rows before the
 /// refused one. On several, they are the rows that finished while the refusal stopped
 /// the others. The caller checks the context before it uses the values, since a
 /// cancellation or a latched failure leaves `UNDEF` in rows that look finished.

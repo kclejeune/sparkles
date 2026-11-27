@@ -2330,7 +2330,11 @@ long triple term, is not met a second time after later rows' results are retaine
 remaining key is evaluated the ordinary way at its first row, in row order, where it meets
 the retained terms that the evaluation without the map has at that row, and a refusal
 there fails the query as it would without the map. On one worker a batch therefore fits
-the budget whenever its evaluation without the map fits. On several workers the finished
+the budget whenever its evaluation without the map fits, except in the intra-row case
+where an unfinished miss takes a large transient allocation, interns an intermediate
+query-local term, and then meets a memory refusal later in the same expression so that
+retrying that row repeats the transient allocation beside the retained intermediate term
+(tracked in item 1322). On several workers the finished
 misses are those that completed while the refusal stopped the others, an order that the
 parallel evaluation without the map can also take. A geometry constructor keeps the charge of each
 geometry it builds until the query ends, so an expression that can call one, directly or

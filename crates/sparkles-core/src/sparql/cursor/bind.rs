@@ -1175,7 +1175,9 @@ impl Reuse {
             // as it would after a latched one, so it takes no arm that the ordinary
             // evaluation skips and interns no discarded value. The misses that finished
             // keep their values, and the rest of the batch is answered by
-            // `finish_refused`. Geometry constructors, whose charge lasts until the
+            // `finish_refused` (retrying an unfinished row that interned an intermediate
+            // term after an earlier transient allocation before refusing is tracked in
+            // roadmap item 1322). Geometry constructors, whose charge lasts until the
             // query ends, never reach this pass (see `prepare`).
             let values =
                 match exec::column_rows_split_optional(ctx, &misses, expr, par, UNEVALUATED)

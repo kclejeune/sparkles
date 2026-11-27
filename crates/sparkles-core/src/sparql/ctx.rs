@@ -2639,7 +2639,9 @@ impl Ctx {
     /// query's budget as it would without the cache, provided the caller has released
     /// its optional state and does not evaluate again an input whose earlier evaluation
     /// finished, which would meet that evaluation's transient memory beside the terms
-    /// that later inputs retained. That holds only for evaluations that keep no
+    /// that later inputs retained, except when the unfinished input itself interned an
+    /// intermediate term after an earlier transient allocation and then refused later in
+    /// the same expression (roadmap item 1322). That holds only for evaluations that keep no
     /// charge past their value, so callers keep out geometry constructors, whose charge
     /// lasts until the query ends. Every other refusal, and refusals met on other
     /// contexts or other threads, still fail the next check. A scope opened inside a
