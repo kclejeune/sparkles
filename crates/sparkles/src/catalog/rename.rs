@@ -115,6 +115,10 @@ pub(super) fn sync_registry(dir: &Path) -> Result<()> {
 #[cfg(test)]
 thread_local! {
     static CRASH_AFTER: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "failpoints"))]
+thread_local! {
     pub(super) static FAIL_AT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
@@ -125,14 +129,19 @@ pub(super) const FAIL_ROLLBACK_REOPEN: u8 = 2;
 /// Refuse intent publication after a successful actual ownership close.
 pub(super) const FAIL_PREPARE_WRITE: u8 = 3;
 
-/// Fail like an I/O error would at `_point` in tests. Unlike [`crash_point`], the
-/// rename handles the error as it handles a real one.
+/// Fail once like an I/O error would at `_point`. Unlike [`crash_point`], the rename
+/// handles the error as it handles a real one.
 pub(super) fn fail_point(_point: u8) -> Result<()> {
-    #[cfg(test)]
-    if FAIL_AT.get() & (1 << _point) != 0 {
-        return Err(Error::Io(std::io::Error::other(format!(
-            "injected failure {_point}"
-        ))));
+    #[cfg(any(test, feature = "failpoints"))]
+    {
+        let mask = 1 << _point;
+        let pending = FAIL_AT.get();
+        if pending & mask != 0 {
+            FAIL_AT.set(pending & !mask);
+            return Err(Error::Io(std::io::Error::other(format!(
+                "injected failure {_point}"
+            ))));
+        }
     }
     Ok(())
 }

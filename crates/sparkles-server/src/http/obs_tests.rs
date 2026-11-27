@@ -209,6 +209,46 @@ async fn persistent_rename_recovery_moves_request_metrics_before_source_reuse() 
     assert_eq!(sample(&after, &peaks("b")), Some(2.0));
 }
 
+#[tokio::test]
+async fn persistent_rename_with_detached_destination_clears_source_request_metrics() {
+    let s = server_with(|st| st.metrics = crate::obs::Metrics::new(true, 3));
+    let original = {
+        let a = s.state.create("a", DbType::Persistent).unwrap();
+        a.dataset
+            .update("INSERT DATA { <urn:original> <urn:p> 1 }")
+            .unwrap();
+        a.store.dataset_id()
+    };
+    let query = "/a/sparql?query=SELECT%20*%20WHERE%20%7B%3Fs%20%3Fp%20%3Fo%7D";
+    let rows = r#"sparkles_rows_produced_total{dataset="a"}"#;
+    let peaks = r#"sparkles_query_memory_peak_bytes_count{dataset="a"}"#;
+    assert_eq!(get(&s.app, query).await.status, StatusCode::OK);
+    let before = metrics_once(&s.app, peaks, 1.0).await;
+    assert!(sample(&before, rows).unwrap() > 0.0);
+
+    sparkles::Catalog::fail_next_rename_registry_sync();
+    sparkles::Catalog::fail_next_rename_recovery_reopen();
+    let error = s.state.rename("a", "b").unwrap_err().to_string();
+    assert!(
+        error.contains("injected rename registry sync failure"),
+        "{error}"
+    );
+    assert!(
+        error.contains("reopening the dataset failed too"),
+        "{error}"
+    );
+    assert_eq!(s.state.catalog.closed(), ["b"]);
+    assert!(s.state.get("b").is_none());
+
+    let recreated = s.state.create("a", DbType::Persistent).unwrap();
+    assert_ne!(recreated.store.dataset_id(), original);
+    let fresh = metrics(&s.app).await;
+    assert_eq!(
+        (sample(&fresh, rows), sample(&fresh, peaks)),
+        (Some(0.0), None)
+    );
+}
+
 async fn get(app: &Router, uri: &str) -> Resp {
     send(app, Request::get(uri).body(Body::empty()).unwrap()).await
 }

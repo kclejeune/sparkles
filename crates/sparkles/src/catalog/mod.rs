@@ -273,6 +273,7 @@ thread_local! {
 pub enum RenameEvent<'a> {
     Closed(u64, &'a crate::store::Store),
     Publishing(u64),
+    DestinationDetached,
 }
 
 pub(crate) struct CatalogIdentities(
@@ -1394,6 +1395,13 @@ impl Catalog {
         FAIL_NEXT_RENAME_REGISTRY_SYNC.set(true);
     }
 
+    /// Fail to reopen the store during the next persistent rename recovery on this thread.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub fn fail_next_rename_recovery_reopen() {
+        rename::FAIL_AT.set(1 << rename::FAIL_ROLLBACK_REOPEN);
+    }
+
     /// Rename an alias, retaining its UUID. Persistent datasets must have no live
     /// handles, including branch handles, so that the old store can be closed. As in
     /// [`delete`](Self::delete), the dataset's own views workers do not count.
@@ -1403,8 +1411,9 @@ impl Catalog {
 
     /// Notify the server at the same managed close boundary as
     /// [`Self::delete_observed`] and just before the destination becomes visible,
-    /// including when recovery publishes it after an I/O error. In-memory renames
-    /// preserve their opening and only send the latter notification.
+    /// including when recovery publishes it after an I/O error. Recovery also reports
+    /// when the registry names the destination but leaves it closed. In-memory renames
+    /// preserve their opening and only notify before publication.
     #[doc(hidden)]
     pub fn rename_observed(
         &self,
@@ -1607,6 +1616,10 @@ impl Catalog {
                     None => (from.to_string(), original),
                 };
                 detached.insert(name.clone(), registration);
+                drop(detached);
+                if name == to {
+                    observe(RenameEvent::DestinationDetached);
+                }
                 Error::Corrupt(format!(
                     "renaming /{from} to /{to} failed: {err}; reopening the dataset failed too: \
                      {again}. config.json still registers it as /{name}, and opening the \

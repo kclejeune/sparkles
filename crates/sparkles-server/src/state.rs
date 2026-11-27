@@ -1733,6 +1733,11 @@ impl AppState {
                     .move_rename_series(from, to, leaving.open_id, id);
                 published = Some(id);
             }
+            RenameEvent::DestinationDetached => {
+                // The source alias is reusable and the destination has no live opening.
+                self.metrics.commit_delete(from, leaving.open_id);
+                leaving.disarm_metrics();
+            }
         });
         let Some(open_id) = published else {
             drop(leaving);
