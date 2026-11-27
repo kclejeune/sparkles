@@ -280,13 +280,17 @@ one-ended Pareto-pruned search. When a reverse search for an unbound source enco
 weights or overflow, it finishes the reverse search to record each node's minimum backward
 edge distance and the shortest budget admitting two simple suffixes with distinct first
 edges. A suffix that returns to the node it would extend is deferred until the search can
-check for an exit that avoids that node. The postpass uses shortest-hop subtree intervals
-to test ancestry and skip subtrees with no exit. Each exit walk marks its visited nodes
-with the source's interval number. The query memory budget covers the branch hops,
-interval index and postpass frontier. A reverse search with weights known to be constant
-and too small to overflow skips collecting branch hops. A source reconstructs directly when its reverse tree path has no
-competing suffix within the remaining edge budget. The other sources run bounded searches
-in source order, pruned by the minimum backward edge distances. Weighted `path:allShortest`
+check for an exit that avoids that node. The postpass discards a backtrack whose only
+next hop returns to its source before building the shortest-hop interval index. It uses
+those intervals to test ancestry and summarize possible exits. A child subtree contributes
+exits to its ancestors only when a non-tree hop can enter it from outside. Hops from the
+virtual endpoint for cycles through the target do not take part in this summary. Each exit
+walk marks its visited nodes with the source's interval number. The query memory budget
+covers the branch hops, interval index and postpass frontier. A reverse search with weights
+known to be constant and too small to overflow skips collecting branch hops. A source
+reconstructs directly when its reverse tree path has no competing suffix within the
+remaining edge budget. The other sources run bounded searches in source order, pruned by
+the minimum backward edge distances. Weighted `path:allShortest`
 with `path:maxLength` requires both ends bound because it enumerates tied short paths through
 Yen's algorithm. Lengths still count edges.
 
@@ -965,6 +969,8 @@ both the eager engine and the streaming cursor reader.
   with distinct first edges. The postpass follows deferred hops through the reverse
   search's topology to find exits that avoid the node the hop would revisit. Subtree
   intervals bound ancestry checks and rule out closed subtrees before a walk starts.
+  The interval index ignores the virtual cycle endpoint and omits exits from subtrees
+  with no entry hop. An immediate backtrack with only a return hop needs no index.
   Each walk uses source-specific visit marks, so earlier marks need no clearing.
   Both engines skip collecting branch hops when the planner knows all weights are
   constant and too small to overflow. A source's
@@ -991,8 +997,9 @@ both the eager engine and the streaming cursor reader.
   cross-form ranking, visit-budget preservation on unique-route reverse wide-weight graphs
   (separate single-edge paths, a 500-edge chain, and a chain beside a wide-weight diamond),
   self-loops and cycles within tight visit budgets, deferred backtracks with a valid exit,
-  remaining edge budgets on shared prefixes, first-row work on a bidirectional chain,
-  memory admission for dense branches with fixed default weights, visit marks across
+  remaining edge budgets on shared prefixes, eager and streaming first-row work on
+  bidirectional chains with an unreachable sibling exit or target cycle, memory admission
+  for a sparse dead backtrack with overflow and dense branches with fixed default weights, visit marks across
   large and small exit walks, eager edge-buffer charge transfer, streaming
   eager weight lookups on a 5,000-reifier edge, eager frontier memory
   pre-admission and release across repeated pairs, single-visit `VIRT` pruning, and eager

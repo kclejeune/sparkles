@@ -1451,6 +1451,14 @@ impl ReverseAlternatives {
                 poll()?;
                 let len = tree.dist[&u] + 1;
                 if y != VIRT && tree.dist[&u] > tree.dist[&y] {
+                    // A single-hop child can only return to y. Rule it out before
+                    // allocating an index for the whole tree.
+                    if tree.dist[&u] - tree.dist[&y] == 1
+                        && !self.hops.contains_key(&u)
+                        && tree.parent[&(u, len - 1)].node == y
+                    {
+                        continue;
+                    }
                     let index = match &mut index {
                         Some(index) => index,
                         slot => {
@@ -1495,6 +1503,8 @@ impl ReverseAlternatives {
         drop(seeds);
         drop(self);
         charge.resize(base.saturating_add(map_bytes(&direct_multi)))?;
+        #[cfg(test)]
+        test_hooks::REVERSE_POSTPASS_STEPS.with(|count| count.set(count.get() + steps));
         Ok(direct_multi)
     }
 }
@@ -1505,29 +1515,46 @@ struct ReverseHopTree<'a> {
     dist: &'a HbMap<u64, u32>,
 }
 
+#[derive(Default)]
 struct ReverseHopNode {
     first_child: Option<u64>,
     next_sibling: Option<u64>,
     start: usize,
     end: usize,
-    min_hop: usize,
-    max_hop: usize,
+    incoming: HopBounds,
+    outgoing: HopBounds,
     may_escape: bool,
     seen_from: usize,
 }
 
-impl Default for ReverseHopNode {
+#[derive(Clone, Copy)]
+struct HopBounds {
+    min: usize,
+    max: usize,
+}
+
+impl Default for HopBounds {
     fn default() -> Self {
         Self {
-            first_child: None,
-            next_sibling: None,
-            start: 0,
-            end: 0,
-            min_hop: usize::MAX,
-            max_hop: 0,
-            may_escape: false,
-            seen_from: 0,
+            min: usize::MAX,
+            max: 0,
         }
+    }
+}
+
+impl HopBounds {
+    fn include(&mut self, start: usize) {
+        self.min = self.min.min(start);
+        self.max = self.max.max(start);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+    }
+
+    fn crosses(self, start: usize, end: usize) -> bool {
+        self.min < start || self.max >= end
     }
 }
 
@@ -1543,14 +1570,26 @@ impl ReverseHopIndex {
         mut base: u64,
         poll: &mut impl FnMut() -> Result<()>,
     ) -> Result<(Self, u64)> {
-        let mut nodes = HbMap::<u64, ReverseHopNode>::default();
+        // The virtual endpoint represents a completed cycle. No exit walk can
+        // reach it or follow its outgoing hops.
+        let count = tree.dist.len() - usize::from(tree.dist.contains_key(&VIRT));
+        let reserved = super::charged::table_bound(count, size_of::<(u64, ReverseHopNode)>());
+        charge.resize(base.saturating_add(reserved))?;
+        let mut nodes =
+            HbMap::<u64, ReverseHopNode>::with_capacity_and_hasher(count, Default::default());
+        let allocated = map_bytes(&nodes);
+        debug_assert!(allocated <= reserved);
+        base = base.saturating_add(allocated);
+        charge.resize(base)?;
         for &node in tree.dist.keys() {
             poll()?;
-            (_, base) = insert_hb_map(&mut nodes, node, ReverseHopNode::default(), charge, base)?;
+            if node != VIRT {
+                nodes.insert(node, ReverseHopNode::default());
+            }
         }
         for (&node, &depth) in tree.dist {
             poll()?;
-            if depth > 0 {
+            if depth > 0 && node != VIRT {
                 let parent = tree.parent[&(node, depth)].node;
                 let sibling = nodes.get_mut(&parent).unwrap().first_child.replace(node);
                 nodes.get_mut(&node).unwrap().next_sibling = sibling;
@@ -1582,10 +1621,28 @@ impl ReverseHopIndex {
             break;
         }
 
-        // Accumulate the extreme destinations of hops from strict descendants.
-        // A walk that avoids the forbidden node cannot leave its subtree if all
-        // those destinations are inside the interval. Tree edges to parents stay
-        // inside every strict ancestor's subtree and need no entry here.
+        // Record the origins of incoming non-tree hops. A tree edge leads to a parent,
+        // so it cannot enter a subtree from outside it or exit a strict ancestor's
+        // subtree without first revisiting that ancestor.
+        for (&node, next_hops) in hops {
+            poll()?;
+            if node == VIRT {
+                continue;
+            }
+            let parent = tree.parent[&(node, tree.dist[&node])].node;
+            let start = nodes[&node].start;
+            for &dest in next_hops {
+                poll()?;
+                if dest != parent {
+                    nodes.get_mut(&dest).unwrap().incoming.include(start);
+                }
+            }
+        }
+
+        // A walk from outside a child subtree needs a non-tree hop into it.
+        // Only propagate exits from children whose subtree can be entered.
+        // A child's own hops count only for its ancestors, since an exit walk
+        // for that child must avoid revisiting it.
         for &node in preorder.iter().rev() {
             poll()?;
             let depth = tree.dist[&node];
@@ -1593,24 +1650,29 @@ impl ReverseHopIndex {
                 break;
             }
             let parent = tree.parent[&(node, depth)].node;
-            let entry = &nodes[&node];
-            let (end, mut min_hop, mut max_hop) = (entry.end, entry.min_hop, entry.max_hop);
-            let may_escape = min_hop < entry.start || max_hop >= end;
-            if let Some(next_hops) = hops.get(&node) {
+            let ReverseHopNode {
+                start,
+                end,
+                incoming,
+                mut outgoing,
+                ..
+            } = nodes[&node];
+            nodes.get_mut(&node).unwrap().may_escape = outgoing.crosses(start, end);
+            let can_enter = incoming.crosses(start, end);
+            if can_enter && let Some(next_hops) = hops.get(&node) {
                 for &dest in next_hops {
                     poll()?;
                     if dest != parent {
-                        let start = nodes[&dest].start;
-                        min_hop = min_hop.min(start);
-                        max_hop = max_hop.max(start);
+                        outgoing.include(nodes[&dest].start);
                     }
                 }
             }
-            nodes.get_mut(&node).unwrap().may_escape = may_escape;
             let entry = nodes.get_mut(&parent).unwrap();
             entry.end = entry.end.max(end);
-            entry.min_hop = entry.min_hop.min(min_hop);
-            entry.max_hop = entry.max_hop.max(max_hop);
+            entry.incoming.merge(incoming);
+            if can_enter {
+                entry.outgoing.merge(outgoing);
+            }
         }
         base = base.saturating_sub(vec_bytes::<u64>(preorder.capacity()));
         drop(preorder);
@@ -12686,12 +12748,16 @@ impl Reader {
 #[doc(hidden)]
 #[cfg(any(test, feature = "failpoints"))]
 pub mod test_hooks {
+    #[cfg(test)]
+    use std::cell::Cell;
     use std::cell::RefCell;
 
     thread_local! {
         static ON_TRAVERSAL_POLL: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
         #[cfg(test)]
         static ON_PRUNE_POLL: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+        #[cfg(test)]
+        pub(super) static REVERSE_POSTPASS_STEPS: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Restores the thread-local traversal poll hook when dropped.
@@ -14447,7 +14513,7 @@ mod tree_tests {
 
     fn reverse_first_rows(
         ttl: String,
-        query_body: &str,
+        properties: &str,
         memory: Option<u64>,
     ) -> [(Term, usize); 2] {
         use crate::io::Source;
@@ -14464,18 +14530,22 @@ mod tree_tests {
             )])
             .unwrap();
         let snap = store.snapshot();
-        let q = format!(
-            "PREFIX ex: <http://example.org/> PREFIX path: <urn:x-sparkles:path#> {query_body}"
-        );
+        let query_text = |limit: &str| {
+            format!(
+                "PREFIX ex: <http://example.org/> PREFIX path: <urn:x-sparkles:path#> \
+                 SELECT ?src {{ SERVICE path:search {{ [] {properties}{limit} }} }}"
+            )
+        };
         let opts = QueryOptions {
             no_cache: true,
             max_memory_bytes: memory,
             ..Default::default()
         };
-        let checks = || super::super::ctx::CHECKS.with(Cell::get);
-        let eager_start = checks();
-        let result = query(snap.clone(), &q, &opts).expect("eager first row");
-        let eager_checks = checks() - eager_start;
+        let take_steps = || test_hooks::REVERSE_POSTPASS_STEPS.with(|count| count.replace(0));
+        take_steps();
+        let result =
+            query(snap.clone(), &query_text(" ; path:limit 1"), &opts).expect("eager first row");
+        let eager_steps = take_steps();
         let rows = result.rows().unwrap();
         assert_eq!(rows.len(), 1);
         let eager = rows.iter().next().unwrap().values()[0].clone().unwrap();
@@ -14485,12 +14555,30 @@ mod tree_tests {
             fallback: FallbackPolicy::RejectMaterialization,
             ..Default::default()
         };
-        let mut cursor = select_cursor(snap, &q, &opts, &cursor_opts).unwrap();
-        let cursor_start = checks();
+        let mut cursor = select_cursor(snap, &query_text(""), &opts, &cursor_opts).unwrap();
+        let mut plans = vec![cursor.plan()];
+        let path_plan = loop {
+            let plan = plans.pop().expect("path-search operator in cursor plan");
+            if plan.operator.operator == "PathSearch" {
+                break plan;
+            }
+            plans.extend(&plan.children);
+        };
+        assert!(
+            !path_plan.materializes
+                && !path_plan.full_input_before_output
+                && path_plan
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("streams matching paths")),
+            "{path_plan:?}"
+        );
+        take_steps();
         let batch = cursor.next_batch().expect("cursor first pull").unwrap();
-        let cursor_checks = checks() - cursor_start;
+        let cursor_steps = take_steps();
+        assert_eq!(batch.len(), 1);
         let streamed = batch.row(0).unwrap().values()[0].clone().unwrap();
-        [(eager, eager_checks), (streamed, cursor_checks)]
+        [(eager, eager_steps), (streamed, cursor_steps)]
     }
 
     #[test]
@@ -14509,30 +14597,46 @@ mod tree_tests {
                 write!(ttl, "ex:x{i} ex:p ex:x{} . ", i + 1).unwrap();
             }
         }
-        let q = format!(
-            "SELECT ?src {{ SERVICE path:search {{ [] path:source ?src ; path:target ex:x0 ; \
-             path:predicate ex:p ; path:weight ex:w ; path:limit 1 ; \
-             path:maxLength {} ; path:maxVisited {} }} }}",
-            n + 1,
-            n + 3
+        // The r -> xN edge wins the equal-length parent choice.
+        let mut sibling_exit =
+            format!("ex:r ex:p ex:x{n} . ex:r ex:p ex:z{n} {{| ex:w 2.0e0 |}} . ");
+        for i in 1..=n {
+            let prev = if i == 1 {
+                "x0".to_owned()
+            } else {
+                format!("z{}", i - 1)
+            };
+            write!(sibling_exit, "ex:z{i} ex:p ex:{prev} . ").unwrap();
+        }
+        let target_cycle = format!(
+            "ex:x0 ex:p ex:x{n} . ex:x0 ex:p ex:a {{| ex:w {}e0 |}} . ",
+            n + 2
         );
         let expected = Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap());
-        // Both graphs do the same reverse traversal. Only the wide graph runs
-        // the postpass. Replaying every closed subtree exceeds this check budget
-        // even with constant-time ancestry tests.
-        let narrow = ttl.replace("ex:w 1e12", "ex:w 2.0e0");
-        let wide_rows = reverse_first_rows(ttl, &q, None);
-        let narrow_rows = reverse_first_rows(narrow, &q, None);
-        for ((first, wide_checks), (narrow_first, narrow_checks)) in
-            wide_rows.into_iter().zip(narrow_rows)
-        {
-            assert_eq!(first, expected);
-            assert_eq!(narrow_first, expected);
-            assert!(
-                wide_checks <= narrow_checks + 32,
-                "first row took {wide_checks} checks with wide weights and {narrow_checks} with narrow weights"
+        let mut regressions = Vec::new();
+        for (case, extra, max_visited) in [
+            ("closed chain", "", n + 3),
+            ("unreachable sibling exit", sibling_exit.as_str(), 2 * n + 4),
+            ("target cycle", target_cycle.as_str(), n + 4),
+        ] {
+            let properties = format!(
+                "path:source ?src ; path:target ex:x0 ; path:predicate ex:p ; \
+                 path:weight ex:w ; path:maxLength {} ; path:maxVisited {max_visited}",
+                n + 2
             );
+            // Count topology operations directly so the budget is independent
+            // of graph scans or weight lookups before the postpass.
+            let rows = reverse_first_rows(format!("{ttl}{extra}"), &properties, None);
+            for (engine, (first, steps)) in ["eager", "cursor"].into_iter().zip(rows) {
+                assert_eq!(first, expected);
+                if !(1..=20 * max_visited).contains(&steps) {
+                    regressions.push(format!(
+                        "{engine} {case} took {steps} postpass steps for {max_visited} settled nodes"
+                    ));
+                }
+            }
         }
+        assert!(regressions.is_empty(), "{regressions:#?}");
     }
 
     #[test]
@@ -14550,14 +14654,39 @@ mod tree_tests {
                 write!(ttl, "ex:s{j} ex:p ex:d{i} . ").unwrap();
             }
         }
-        let q = "SELECT ?src { SERVICE path:search { [] path:source ?src ; path:target ex:t ; \
-                 path:predicate ex:p ; path:weight ex:absent ; path:maxLength 2 ; path:limit 1 } }";
+        let properties = "path:source ?src ; path:target ex:t ; path:predicate ex:p ; \
+                          path:weight ex:absent ; path:maxLength 2";
         // The branch destinations alone would take at least 8 * n^2 bytes.
-        for (first, _) in reverse_first_rows(ttl, q, Some(320 * 1024)) {
+        for (first, steps) in reverse_first_rows(ttl, properties, Some(320 * 1024)) {
             let Term::NamedNode(source) = first else {
                 panic!("expected an IRI, got {first}");
             };
             assert!(source.as_str().starts_with("http://example.org/d"));
+            assert_eq!(steps, 0);
+        }
+    }
+
+    #[test]
+    fn reverse_sparse_dead_backtrack_fits_under_a_memory_cap() {
+        use std::fmt::Write as _;
+
+        // Just past the 7/8 load factor of an 8192-bucket index. The cap admits
+        // the reverse search but cannot absorb the interval index.
+        let n = 7 * 8192 / 8 + 1;
+        let mut ttl = String::from("@prefix ex: <http://example.org/> . ex:x1 ex:p ex:x2 . ");
+        for i in 1..=n {
+            write!(ttl, "ex:x{i} ex:p ex:x{} . ", i - 1).unwrap();
+        }
+        let properties = format!(
+            "path:source ?src ; path:target ex:x0 ; path:predicate ex:p ; path:weight ex:absent ; \
+             path:defaultWeight 1e308 ; path:maxLength {} ; path:maxVisited {}",
+            n + 1,
+            n + 1
+        );
+        let expected = Term::NamedNode(oxrdf::NamedNode::new("http://example.org/x1").unwrap());
+        for (first, steps) in reverse_first_rows(ttl, &properties, Some(2700 * 1024)) {
+            assert_eq!(first, expected);
+            assert_eq!(steps, 3);
         }
     }
 
@@ -14672,6 +14801,10 @@ mod tree_tests {
         for (y, u) in pairs {
             alternatives
                 .record(y, u, Some(root), &mut charge, base + alternatives.bytes)
+                .unwrap();
+            // Parallel hops keep the child on the indexed path without giving it an exit.
+            alternatives
+                .record(u, y, Some(y), &mut charge, base + alternatives.bytes)
                 .unwrap();
         }
 
