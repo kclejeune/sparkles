@@ -4010,6 +4010,7 @@ mod tests {
             b"\"aa".to_vec(),
             format!("\"a{}", "b".repeat(64 << 10)).into_bytes(),
             b"\"az".to_vec(),
+            format!("\"az{}", "alpha_beta_gamma_delta_".repeat(3)).into_bytes(),
         ];
         for fsst in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -4046,6 +4047,32 @@ mod tests {
                 Ok(Some(keys[2].clone())),
             );
             assert_eq!(key.as_ptr(), allocation);
+
+            if fsst {
+                let codes = v
+                    .entry_coded_len(3)
+                    .expect("the last suffix must be FSST-coded");
+                // The entire preceding key is the shared prefix. Admit exactly the
+                // worst-case expansion plus headroom to reach the length-scan shortcut.
+                assert_eq!(
+                    v.get_with_shared_prefix(3, |shared, _| shared),
+                    Some(Some(keys[2].len())),
+                );
+                let cap = keys[2].len() + codes * 8 + FSST_ROOM;
+                let mut key = Vec::with_capacity(cap);
+                assert_eq!(key.capacity(), cap);
+                let allocation = key.as_ptr();
+                assert_eq!(
+                    v.get_with_checked_in(
+                        3,
+                        &mut key,
+                        |need| panic!("unexpected growth to {need}"),
+                        |k| k.to_vec(),
+                    ),
+                    Ok::<_, usize>(Some(keys[3].clone())),
+                );
+                assert_eq!(key.as_ptr(), allocation);
+            }
         }
     }
 

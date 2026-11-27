@@ -2024,6 +2024,15 @@ following from the candidate checkout on forge in a named terminal. It reuses th
 historical queries and CPU placement, compares the candidate against its base and the
 pre-1069 baseline, and records a same-binary control for each thread count.
 
+At both one and 12 threads, require valid summaries, matching answers and zero timed
+request errors in all three comparisons. Judge server execution time against the
+corresponding query's same-binary control. The control's largest deviation from parity
+across the pooled and per-round ratios must be at most 3%. The candidate must stay
+within that noise bound against its base on all three queries and against the pre-1069
+baseline on `str-pair-colleague`. Reject any of those comparisons when every round is
+slower and the pooled median adds more than 0.5 µs, even if it falls within the control's
+noise bound. Retain the summaries for both thread counts when closing item 1088.
+
 ```bash
 export BASE_BIN TIP_BIN PRE1069_BIN
 flock "$HOME/lanes/.heavy.lock" bash -s <<'SH'
@@ -2075,8 +2084,51 @@ EOF
         python3 scripts/nsc-bench-summary.py "$out" >"$out/summary.md"
     done
 done
-for out in "$runs"/{1,12}-{control,candidate,recovery}; do
-    python3 scripts/nsc-bench-summary.py --check "$out/summary.json" first
-done
+python3 - "$runs" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+runs = Path(sys.argv[1])
+queries = ("str-pair-colleague", "str-pair-names", "str-pair-lt")
+failures = []
+for threads in (1, 12):
+    comparisons = {}
+    for comparison in ("control", "candidate", "recovery"):
+        path = runs / f"{threads}-{comparison}" / "summary.json"
+        result = subprocess.run(
+            [sys.executable, "scripts/nsc-bench-summary.py", "--check", str(path), "first"]
+        )
+        summary = json.loads(path.read_text())
+        if summary["errors"]:
+            failures.append(f"{threads}t {comparison}: timed request errors {summary['errors']}")
+        if result.returncode:
+            failures.append(f"{threads}t {comparison}: invalid summary")
+            continue
+        comparisons[comparison] = summary["queries"]
+    if len(comparisons) != 3:
+        continue
+
+    for query in queries:
+        control = comparisons["control"][query]["exec_ms"]
+        ratios = [control["ratio"], *control["rounds"]]
+        bound = max(max(r, 1 / r) for r in ratios)
+        if len(control["rounds"]) != 12 or bound > 1.03:
+            failures.append(f"{threads}t {query}: incomplete or noisy control ({bound:.4f}x)")
+            continue
+
+        for comparison in ("candidate", "recovery") if query == queries[0] else ("candidate",):
+            stats = comparisons[comparison][query]["exec_ms"]
+            ratio = stats["ratio"]
+            added_us = (stats["b"] - stats["a"]) * 1000
+            print(f"{threads}t {comparison} {query}: {ratio:.4f}x, control limit {bound:.4f}x")
+            if len(stats["rounds"]) != 12:
+                failures.append(f"{threads}t {comparison} {query}: incomplete timing rounds")
+            elif ratio > bound or (added_us > 0.5 and all(r > 1 for r in stats["rounds"])):
+                failures.append(f"{threads}t {comparison} {query}: regression ({ratio:.4f}x)")
+if failures:
+    sys.exit("\n".join(failures))
+PY
 SH
 ```
