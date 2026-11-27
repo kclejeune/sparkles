@@ -1517,6 +1517,26 @@ struct MemoryFailure {
     failed: AtomicBool,
 }
 
+thread_local! {
+    /// The optional evaluation this thread runs, as the address of its context and
+    /// whether a memory refusal met it (see [`Ctx::optional_eval`]).
+    static OPTIONAL_EVAL: std::cell::Cell<Option<(usize, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether `error` refuses query or server memory, which an optional cache yields to
+/// the ordinary evaluation instead of failing the query with it. A memory parent's
+/// limit gives one of these. Its other refusals, such as an overflow or a foreign
+/// parent, are ownership errors that ordinary evaluation meets as well, so they fail
+/// the query.
+pub(crate) fn is_memory_refusal(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::BudgetExceeded(budget)
+            if matches!(budget.kind, BudgetKind::Memory | BudgetKind::ServerMemory)
+    )
+}
+
 /// Resource and ownership refusals, the unconfigured extension refusal and the strict
 /// cursor policy's refusals become sticky. Ordinary expression and SERVICE errors keep
 /// their existing semantics, so a failed SERVICE inside an EXISTS is still false.
@@ -2554,9 +2574,17 @@ impl Ctx {
     }
 
     /// Record the first supported execution refusal met by infallible code, so
-    /// the next check preserves its original typed outcome in both modes.
+    /// the next check preserves its original typed outcome in both modes. A refusal of
+    /// memory inside [`Ctx::optional_eval`] on this context is the one exception, which
+    /// the optional evaluation reports to its caller instead. Every state that the
+    /// refused code leaves behind holds correct values, such as interned terms, decoded
+    /// values, compiled regular expressions and parsed geometries, so the ordinary
+    /// evaluation that follows can reuse it.
     pub(crate) fn fail_memory(&self, error: &Error) {
         if self.memory_failure.failed.load(Ordering::Acquire) {
+            return;
+        }
+        if is_memory_refusal(error) && self.note_optional_refusal() {
             return;
         }
         let strict = self.strict_cursor.load(Ordering::Relaxed);
@@ -2565,6 +2593,42 @@ impl Ctx {
             failure.failure.lock().get_or_insert(refusal);
             failure.failed.store(true, Ordering::Release);
         }
+    }
+
+    /// Run `f` as optional evaluation on this thread, such as the misses of an optional
+    /// cache, and return its value with whether a refusal of memory met it. Inside `f`, a
+    /// memory refusal that infallible code meets on this context sets that result and
+    /// does not fail the query, so the caller must discard the value of `f` when it is
+    /// set and evaluate the same input the ordinary way, which then meets the query's
+    /// budget as it would without the cache. Every other refusal, and refusals met on
+    /// other contexts or other threads, still fail the next check. `f` must not hand work
+    /// to the pool, where another job of the query could run inside the scope.
+    pub(crate) fn optional_eval<T>(&self, f: impl FnOnce() -> T) -> (T, bool) {
+        struct Restore(Option<(usize, bool)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OPTIONAL_EVAL.with(|scope| scope.set(self.0));
+            }
+        }
+        let me = std::ptr::from_ref(self) as usize;
+        let _restore = Restore(OPTIONAL_EVAL.with(|scope| scope.replace(Some((me, false)))));
+        let value = f();
+        let refused = OPTIONAL_EVAL.with(|scope| scope.get().is_some_and(|(_, refused)| refused));
+        (value, refused)
+    }
+
+    /// Record a memory refusal for the optional evaluation of this context that this
+    /// thread runs, if any, and say whether there was one.
+    #[cold]
+    fn note_optional_refusal(&self) -> bool {
+        let me = std::ptr::from_ref(self) as usize;
+        OPTIONAL_EVAL.with(|scope| match scope.get() {
+            Some((ctx, _)) if ctx == me => {
+                scope.set(Some((ctx, true)));
+                true
+            }
+            _ => false,
+        })
     }
 
     /// Build a disposable trial context for optional planning estimation (such as FILTER
@@ -2737,7 +2801,8 @@ impl Ctx {
     /// Charge `bytes` more of query-local terms and memos, which stay until the context
     /// drops, in both accounting modes. Infallible expression interning must not turn a
     /// resource failure into an ordinary unbound BIND, so a refusal is recorded and fails
-    /// the next check, and `false` tells the caller not to allocate.
+    /// the next check, or goes to the caller of [`Ctx::optional_eval`], and `false` tells
+    /// the caller not to allocate.
     pub(crate) fn retain_bytes(&self, bytes: u64) -> bool {
         match self.try_retain_bytes(bytes) {
             Ok(()) => true,
@@ -2925,7 +2990,8 @@ impl Ctx {
     }
 
     /// Reserve the same envelope for an infallible scalar caller. Its failure stays
-    /// sticky so an expression cannot become unbound.
+    /// sticky so an expression cannot become unbound, except inside
+    /// [`Ctx::optional_eval`], whose caller discards the expression's value.
     #[inline]
     pub(super) fn reserve_decode(&self, bytes: usize) -> bool {
         match self.reserve_decode_checked(bytes) {
@@ -6180,6 +6246,60 @@ mod charge_tests {
     use super::*;
     use crate::builder::{BuildOptions, VocabCodec};
     use crate::store::{Store, StoreOptions};
+
+    /// Item 293: optional evaluation keeps a memory refusal of its own context out of the
+    /// query's latch, and every other refusal, other contexts and the code after the
+    /// scope still latch theirs.
+    #[test]
+    fn optional_eval_keeps_only_its_own_memory_refusals_out_of_the_latch() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let other = Ctx::new(store.snapshot());
+        let memory = ctx.memory_exceeded(64);
+
+        let ((), refused) = ctx.optional_eval(|| ctx.fail_memory(&memory));
+        assert!(refused);
+        ctx.check().unwrap();
+
+        let ((), refused) = ctx.optional_eval(|| ());
+        assert!(!refused);
+
+        // A nested scope restores the outer one, which still sees its own refusal.
+        let ((), refused) = ctx.optional_eval(|| {
+            let ((), inner) = other.optional_eval(|| ());
+            assert!(!inner);
+            ctx.fail_memory(&memory);
+        });
+        assert!(refused);
+        ctx.check().unwrap();
+
+        let ((), refused) = ctx.optional_eval(|| other.fail_memory(&memory));
+        assert!(!refused);
+        assert!(matches!(
+            other.check(),
+            Err(Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Memory,
+                ..
+            }))
+        ));
+        ctx.check().unwrap();
+
+        let ((), refused) = ctx.optional_eval(|| ctx.fail_memory(&Error::Cancelled));
+        assert!(!refused);
+        assert!(matches!(ctx.check(), Err(Error::Cancelled)));
+
+        let fresh = Ctx::new(store.snapshot());
+        let ((), refused) = fresh.optional_eval(|| ());
+        assert!(!refused);
+        fresh.fail_memory(&memory);
+        assert!(matches!(
+            fresh.check(),
+            Err(Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Memory,
+                ..
+            }))
+        ));
+    }
 
     #[test]
     fn eager_charge_transfer_keeps_the_actual_fast_credit_at_the_limit() {

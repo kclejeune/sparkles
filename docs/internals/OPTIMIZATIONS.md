@@ -176,9 +176,9 @@ earlier implementation and always apply. `EXPLAIN` shows which fast paths ran.
   entries, charged at about 6 MiB, and dense inline integers cap at 16,384 entries. A
   full cache still answers the keys it holds and evaluates each distinct missed key once
   for the batch without keeping it. A cache whose growth the budget refuses keeps the
-  entries it holds. A refused batch charge, or an expression result that cannot be
-  interned while the cache holds its charges, releases the cache and evaluates the batch
-  the ordinary way, and an operator that ends its input releases the cache too. Identity copies, volatile expressions and application callbacks never
+  entries it holds. A refused batch charge, or any refusal of memory that the
+  evaluation of the cache's misses meets while the cache holds its charges, releases the
+  cache and evaluates the batch the ordinary way, and an operator that ends its input releases the cache too. Identity copies, volatile expressions and application callbacks never
   enter this cache.
 * **Numeric range scans.** A FILTER comparing a scan's sort column with numeric constants
   reads only matching ID ranges (`IndexRangeScan`). Inline integers and single-scale inline

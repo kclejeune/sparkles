@@ -3,8 +3,10 @@
 //! observed in a pilot batch, a sampled sketch across batches or each batch's exact
 //! distinct count, and weak repetition of a parallel-capable expression must also pass
 //! a cost guard. Map misses and the ordinary evaluation share one split controller that
-//! retries the pool after a cooldown. Optional cache entries never weaken query budgets.
-use crate::error::{Error, Result};
+//! retries the pool after a cooldown. Optional cache entries never weaken query budgets,
+//! and a refusal of memory that the map's state causes yields the batch to ordinary
+//! evaluation instead of failing the query.
+use crate::error::Result;
 use crate::id::{Id, PAYLOAD_MASK, Tag};
 use crate::index::{O, P, Perm, S};
 use crate::sparql::ctx::RetainedCharge;
@@ -1149,10 +1151,12 @@ impl Reuse {
                 MapSplitPolicy::Iri(bucket) => self.iri_split.allow(bucket),
                 MapSplitPolicy::Default => self.allow_map_split(misses.len(), expr),
             };
-            // An expression result that the budget cannot intern while the map and the
-            // batch's scratch hold their charges releases both, and the ordinary
-            // evaluation of the batch interns it instead. Terms that the evaluation
-            // interns on its way to the result still record a refusal for the query.
+            // A refusal of memory that the evaluation of the misses meets while the map
+            // and the batch's scratch hold their charges releases both, and the ordinary
+            // evaluation of the batch runs under the budget it would have without the
+            // map. This covers the result and the terms, decode envelopes and regular
+            // expressions that the evaluation interns or grows on its way to it, none of
+            // which records a refusal for the query.
             let values = match exec::column_rows_split_optional(ctx, &misses, expr, par)
                 .and_then(|values| ctx.check().map(|()| values))
             {
@@ -1180,11 +1184,7 @@ impl Reuse {
                     // Another refusal of memory that nothing latched, such as a charge of
                     // the evaluation beside the map, yields to ordinary evaluation too.
                     ctx.check()?;
-                    if matches!(
-                        &error,
-                        Error::BudgetExceeded(budget)
-                            if matches!(budget.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory)
-                    ) {
+                    if crate::sparql::ctx::is_memory_refusal(&error) {
                         return Ok(false);
                     }
                     return Err(error);
@@ -3727,6 +3727,85 @@ mod tests {
             };
             ctx.check().unwrap();
             assert_eq!(strings(&ctx, &values), expected);
+        });
+    }
+
+    /// Item 293 round 2: a refusal that the evaluation of the misses meets before its
+    /// result, here the interning of 512 `xsd:short` literals of about 72 KiB beside
+    /// the map's batch scratch, releases the optional state without failing the query.
+    /// The ordinary evaluation of the batch fits the same 100 KiB budget, both for the
+    /// derived literal as the result and for an integer result computed from it.
+    #[test]
+    fn optional_map_yields_refusals_met_before_the_result() {
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        single.install(|| {
+            let store = Store::in_memory(StoreOptions::default());
+            let keys: Vec<Id> = (0..1024)
+                .map(|row| Id::from_i64(1000 + (row % 512) as i64).unwrap())
+                .collect();
+            type Build = fn(VarId) -> Expr;
+            let cases: [(&str, Build); 2] = [
+                ("xsd:short", |input| {
+                    Expr::Call(
+                        Func::Cast(xsd::SHORT.into_owned()),
+                        vec![Expr::Var(input)],
+                    )
+                }),
+                ("xsd:integer(xsd:short)", |input| {
+                    Expr::Call(
+                        Func::Cast(xsd::INTEGER.into_owned()),
+                        vec![Expr::Call(
+                            Func::Cast(xsd::SHORT.into_owned()),
+                            vec![Expr::Var(input)],
+                        )],
+                    )
+                }),
+            ];
+            for (name, build) in cases {
+                let terms = |ctx: &Ctx, values: &[Id]| -> Vec<Option<Term>> {
+                    values.iter().map(|id| ctx.term(*id)).collect()
+                };
+                let ordinary = cursor_context(&store, 100 << 10);
+                let input = ordinary.var("input");
+                let expr = build(input);
+                let values = exec::column_rows(&ordinary, &batch(input, &keys), &expr).unwrap();
+                ordinary.check().unwrap();
+                let expected = terms(&ordinary, &values);
+                assert!(expected.iter().all(Option::is_some), "{name}");
+
+                let ctx = cursor_context(&store, 100 << 10);
+                let input = ctx.var("input");
+                let target = ctx.var("bound");
+                let expr = build(input);
+                let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+                let mut table = batch(input, &keys);
+                let reused = reuse.apply(&ctx, &mut table, target, &expr).unwrap_or_else(|error| {
+                    panic!("{name}: the optional map must not refuse a batch that ordinary evaluation fits: {error}")
+                });
+                ctx.check().unwrap_or_else(|error| {
+                    panic!("{name}: the optional map latched a refusal: {error}")
+                });
+                assert!(!reused, "{name}: the map cannot hold this batch's intermediates");
+                assert_eq!(reuse.mode, Mode::Off, "{name}");
+                assert!(reuse.values.is_empty(), "{name}");
+                assert!(reuse.charge.as_ref().unwrap().bytes() <= 512, "{name}");
+                let mut report = crate::sparql::exprcache::Report::default();
+                let values = exec::compute_column_controlled(
+                    &ctx,
+                    &table,
+                    &expr,
+                    &mut report,
+                    |n| reuse.allow_fallback_split(n, &expr),
+                    |n| reuse.want_cost_timing(n, &expr),
+                )
+                .unwrap()
+                .0;
+                ctx.check().unwrap();
+                assert_eq!(terms(&ctx, &values), expected, "{name}");
+            }
         });
     }
 

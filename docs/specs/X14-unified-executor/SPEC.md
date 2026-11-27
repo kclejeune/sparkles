@@ -2318,9 +2318,12 @@ its rows. An admitted map evaluates its misses once per distinct key, holds a pe
 entry for a missed key until then, and is released when it answers fewer than one row in
 sixteen. The sketch, the map and each batch's scratch are charged to the query's memory
 budget. A sketch or a map whose growth the budget refuses keeps what it holds. A refused
-pilot or batch charge, or an expression result that the budget cannot intern while the map
-and the batch's scratch hold their charges, releases the sketch and the map and evaluates
-the batch the ordinary way. A BIND that ends its input releases them for the operators
+pilot or batch charge, or any refusal of memory that the evaluation of the misses meets
+while the map and the batch's scratch hold their charges, releases the sketch and the map
+and evaluates the batch the ordinary way. The misses run as optional evaluation, which
+keeps a memory refusal of the result or of a term, decode envelope or regular expression
+on the way to it out of the query's sticky failure, so the ordinary evaluation meets the
+budget it would have without the map. A BIND that ends its input releases them for the operators
 above it, and every loop checks cancellation. The batch charge is a bound sized by the batch, so the memory audit's
 `bind` fixture allows its ledger to stand above its heap until item 1320 tightens it.
 

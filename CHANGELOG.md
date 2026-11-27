@@ -1039,8 +1039,9 @@ first batch on more than one worker. Before, a first batch without enough repeti
 ended reuse for the query, so an input whose keys repeated only after 65,536 rows
 evaluated every row. A map that stops paying is released, and the sketch and the map are
 charged to the query's memory budget, about 128 KiB and 6 MiB when full. A refused batch
-charge, or an expression result that the budget cannot intern beside the map, releases
-them and evaluates the batch the ordinary way, and a BIND that ends its input releases
+charge, or any refusal of memory that the evaluation of the map's misses meets beside the
+map, including the terms it interns on the way to its result, releases them and evaluates
+the batch the ordinary way, and a BIND that ends its input releases
 them for the operators above it. On more than one
 worker, weak repetition of a parallel-capable expression admits the map only when the
 measured evaluation rate says it pays. The map's misses and the ordinary evaluation share

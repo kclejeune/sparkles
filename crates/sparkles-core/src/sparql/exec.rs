@@ -7312,10 +7312,13 @@ pub(super) fn column_rows_split(
 }
 
 /// [`column_rows_split`] for the misses of an optional cache, such as cursor BIND reuse.
-/// A refusal to intern a computed result is returned as `Ok(None)` instead of being
-/// recorded as the query's memory failure, so the caller can release its optional state
-/// and evaluate the rows the ordinary way, which then charges the same results again.
-/// The rows after a refusal are not evaluated.
+/// Each row runs as [`Ctx::optional_eval`], so a refusal of memory that the evaluation
+/// meets, whether it interns the result or a term on the way to it, grows a decode
+/// envelope or a regular expression cache, is returned as `Ok(None)` instead of being
+/// recorded as the query's memory failure. The caller then releases its optional state
+/// and evaluates the rows the ordinary way, which meets the same budget as it would
+/// without the cache. The rows after a refusal are not evaluated. Expressions that an
+/// optional cache admits are pure, so none has an EXISTS that hands work to the pool.
 pub(super) fn column_rows_split_optional(
     ctx: &Ctx,
     t: &Table,
@@ -7323,6 +7326,7 @@ pub(super) fn column_rows_split_optional(
     par: bool,
 ) -> Result<Option<(Vec<Id>, Option<Split>)>> {
     let nested = super::exists::nested(ctx, t, &[e])?;
+    debug_assert!(nested.is_none(), "an optional cache admits no EXISTS");
     let exists = nested.as_ref().map(|n| &n.answers);
     let dec = decode_for(ctx, t, &[e])?;
     let map = t.var_map(ctx.nvars());
@@ -7331,24 +7335,27 @@ pub(super) fn column_rows_split_optional(
         if refused.load(AtomicOrdering::Relaxed) {
             return Id::UNDEF;
         }
-        match eval(
-            e,
-            &Row {
-                table: t,
-                i,
-                map: &map,
-                dec: Decoded::cols(&dec),
-                exists,
-            },
-            ctx,
-        ) {
-            Ok(Val::V(v)) => ctx.try_intern_value(&v).unwrap_or_else(|_| {
-                refused.store(true, AtomicOrdering::Relaxed);
-                Id::UNDEF
-            }),
-            Ok(v) => v.into_id(ctx),
-            Err(_) => Id::UNDEF,
+        let (id, refusal) = ctx.optional_eval(|| {
+            match eval(
+                e,
+                &Row {
+                    table: t,
+                    i,
+                    map: &map,
+                    dec: Decoded::cols(&dec),
+                    exists,
+                },
+                ctx,
+            ) {
+                Ok(v) => v.into_id(ctx),
+                Err(_) => Id::UNDEF,
+            }
+        });
+        if refusal {
+            refused.store(true, AtomicOrdering::Relaxed);
+            return Id::UNDEF;
         }
+        id
     };
     let par = par && e.parallel();
     let values = if t.len() <= PAR_THRESHOLD {
