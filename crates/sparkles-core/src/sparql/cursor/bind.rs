@@ -1164,7 +1164,9 @@ impl Reuse {
             // evaluation of the batch runs under the budget it would have without the
             // map. This covers the result and the terms, decode envelopes and regular
             // expressions that the evaluation interns or grows on its way to it, none of
-            // which records a refusal for the query. Geometry constructors, whose charge
+            // which records a refusal for the query. After the refusal the expression
+            // gives up as it would after a latched one, so it takes no arm that the
+            // ordinary evaluation skips and interns no discarded value. Geometry constructors, whose charge
             // lasts until the query ends, never reach this pass (see `prepare`).
             let values = match exec::column_rows_split_optional(ctx, &misses, expr, par)
                 .and_then(|values| ctx.check().map(|()| values))
@@ -3951,6 +3953,259 @@ mod tests {
             let dimension = call(format!("{GEOF}dimension"), vec![Expr::Var(input)]);
             assert!(Reuse::prepare(&ctx, &dimension, None).is_some());
         });
+    }
+
+    /// Runs the batch that `build` makes on its context through the map and its ordinary
+    /// fallback at budgets around the smallest that its evaluation fits, and checks each
+    /// run against the cursor's evaluation of the batch without the map. A run that
+    /// succeeds must match its answers, query-local terms and plan warnings, so a
+    /// refusal that the misses meet leaves nothing behind that the evaluation without
+    /// the map would not. A run that fails must fail without the map at a budget 4 KiB
+    /// smaller, which covers the charge that a declined map keeps. Returns how many
+    /// successful runs declined the map after evaluating its misses.
+    fn refused_misses_with_no_skipped_arm(
+        name: &str,
+        build: impl Fn(&Ctx) -> (VarId, Expr, Vec<Id>) + Sync,
+    ) -> usize {
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        single.install(|| {
+            let store = Store::in_memory(StoreOptions::default());
+            let terms = |ctx: &Ctx, values: &[Id]| -> Vec<Option<Term>> {
+                values.iter().map(|id| ctx.term(*id)).collect()
+            };
+            let codes = |ctx: &Ctx| -> Vec<&'static str> {
+                ctx.warnings().iter().map(|w| w.code).collect()
+            };
+            // The cursor's evaluation of the batch without the map, or with `rows`, the
+            // row-by-row evaluation that sets the lower end of the budgets.
+            let ordinary = |memory: u64, rows: bool| {
+                let ctx = cursor_context(&store, memory);
+                let (input, expr, keys) = build(&ctx);
+                let table = batch(input, &keys);
+                let values = if rows {
+                    exec::column_rows(&ctx, &table, &expr).ok()?
+                } else {
+                    let mut report = crate::sparql::exprcache::Report::default();
+                    exec::compute_column_controlled(
+                        &ctx,
+                        &table,
+                        &expr,
+                        &mut report,
+                        |_| false,
+                        |_| false,
+                    )
+                    .ok()?
+                    .0
+                };
+                ctx.check().ok()?;
+                Some((ctx, values))
+            };
+            let smallest = |rows: bool| {
+                let (mut refused, mut fits) = (0u64, 16u64 << 20);
+                assert!(ordinary(fits, rows).is_some(), "{name}");
+                while fits - refused > 256 {
+                    let mid = refused + (fits - refused) / 2;
+                    if ordinary(mid, rows).is_some() {
+                        fits = mid;
+                    } else {
+                        refused = mid;
+                    }
+                }
+                fits
+            };
+            let (plain, expected) = ordinary(16 << 20, false).unwrap();
+            let expected = (terms(&plain, &expected), plain.local_len(), codes(&plain));
+            let (low, high) = (smallest(true), smallest(false) + (64 << 10));
+            let step = usize::try_from(((high - low) / 512).max(512)).unwrap();
+            let mut declined = 0;
+            for budget in (low..high).step_by(step) {
+                let ctx = cursor_context(&store, budget);
+                let (input, expr, keys) = build(&ctx);
+                let target = ctx.var("bound");
+                let mut reuse = new_reuse(&ctx, &expr, None)
+                    .unwrap_or_else(|| panic!("{name}: the map admits the expression"));
+                let mut table = batch(input, &keys);
+                let run = reuse.apply(&ctx, &mut table, target, &expr).and_then(|reused| {
+                    ctx.check()?;
+                    let values = if reused {
+                        table.cols[1].clone()
+                    } else {
+                        let mut report = crate::sparql::exprcache::Report::default();
+                        exec::compute_column_controlled(
+                            &ctx,
+                            &table,
+                            &expr,
+                            &mut report,
+                            |n| reuse.allow_fallback_split(n, &expr),
+                            |n| reuse.want_cost_timing(n, &expr),
+                        )?
+                        .0
+                    };
+                    ctx.check()?;
+                    Ok((reused, values))
+                });
+                let (reused, values) = match run {
+                    Ok(run) => run,
+                    Err(error) => {
+                        assert!(
+                            ordinary(budget - (4 << 10), false).is_none(),
+                            "{name} at {budget}: the map fails a batch that the evaluation without it fits: {error}"
+                        );
+                        continue;
+                    }
+                };
+                if !reused && reuse.evaluations > 0 {
+                    declined += 1;
+                }
+                let found = (terms(&ctx, &values), ctx.local_len(), codes(&ctx));
+                assert_eq!(found.0, expected.0, "{name} at {budget}");
+                assert_eq!(
+                    found.1, expected.1,
+                    "{name} at {budget}: a refused miss interned a term that the evaluation without the map does not"
+                );
+                assert_eq!(
+                    found.2, expected.2,
+                    "{name} at {budget}: a refused miss raised a warning that the evaluation without the map does not"
+                );
+            }
+            declined
+        })
+    }
+
+    fn simple(ctx: &Ctx, value: &str) -> Expr {
+        Expr::Const(ctx.intern_term(&Term::Literal(Literal::new_simple_literal(value))))
+    }
+
+    /// `CONCAT("fallback-", STR(?input))`, an arm that the ordinary evaluation of the
+    /// tests below never takes and whose result is a new query-local term.
+    fn fallback(ctx: &Ctx, input: VarId) -> Expr {
+        Expr::Call(
+            Func::Builtin(Function::Concat),
+            vec![
+                simple(ctx, "fallback-"),
+                Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]),
+            ],
+        )
+    }
+
+    fn integer_keys() -> Vec<Id> {
+        (0..1024)
+            .map(|row| Id::from_i64(1000 + (row % 512) as i64).unwrap())
+            .collect()
+    }
+
+    /// `sameTerm(CONCAT(STR(?input), "a"…), CONCAT(STR(?input), "b"…))` with 1 KiB of
+    /// padding. Its two sides are distinct new terms, so it is false, but when the budget
+    /// refuses both interns each side is `UNDEF`, and a `sameTerm` that does not give up
+    /// would answer true.
+    fn padded_same_term(ctx: &Ctx, input: VarId) -> Expr {
+        let padded = |pad: &str| {
+            Expr::Call(
+                Func::Builtin(Function::Concat),
+                vec![
+                    Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]),
+                    simple(ctx, &pad.repeat(1024)),
+                ],
+            )
+        };
+        Expr::SameTerm(Box::new(padded("a")), Box::new(padded("b")))
+    }
+
+    /// `IF(sameTerm(…), ?input / 0, 1)`, which is 1 and whose other arm fails.
+    fn one_unless_same_term(ctx: &Ctx, input: VarId) -> Expr {
+        Expr::If(
+            Box::new(padded_same_term(ctx, input)),
+            Box::new(Expr::Arith(
+                Box::new(Expr::Var(input)),
+                Box::new(Expr::Const(Id::from_i64(0).unwrap())),
+                crate::sparql::expr::ArithOp::Div,
+            )),
+            Box::new(Expr::Const(Id::from_i64(1).unwrap())),
+        )
+    }
+
+    /// Item 293 round 4: once the budget refuses an intern of `COALESCE`'s first arm
+    /// during the misses, `COALESCE` gives up as it does after a latched refusal, and
+    /// does not evaluate and intern the fallback arm that the evaluation without the map
+    /// never reaches. A first arm whose regular expression the budget refuses does not
+    /// serve here, because every budget at which the map's misses refuse the program is
+    /// too small for the evaluation without the map, so no run both declines the map and
+    /// fits the batch.
+    #[test]
+    fn a_refused_coalesce_arm_does_not_evaluate_the_fallback() {
+        let declined =
+            refused_misses_with_no_skipped_arm("COALESCE(IF(sameTerm), CONCAT)", |ctx| {
+                let input = ctx.var("input");
+                let expr =
+                    Expr::Coalesce(vec![one_unless_same_term(ctx, input), fallback(ctx, input)]);
+                (input, expr, integer_keys())
+            });
+        assert!(
+            declined > 0,
+            "some budget declines the map after its misses"
+        );
+    }
+
+    /// Item 293 round 4: `sameTerm` gives up after a refusal during the misses instead
+    /// of answering true and sending `IF` to the arm that the evaluation without the map
+    /// never takes.
+    #[test]
+    fn a_refused_same_term_does_not_choose_the_other_if_arm() {
+        let declined = refused_misses_with_no_skipped_arm("IF(sameTerm, CONCAT, 1)", |ctx| {
+            let input = ctx.var("input");
+            let expr = Expr::If(
+                Box::new(padded_same_term(ctx, input)),
+                Box::new(fallback(ctx, input)),
+                Box::new(Expr::Const(Id::from_i64(1).unwrap())),
+            );
+            (input, expr, integer_keys())
+        });
+        assert!(
+            declined > 0,
+            "some budget declines the map after its misses"
+        );
+    }
+
+    /// Item 293 round 4: the geometry arm of `COALESCE` after a refusal in its first arm
+    /// would parse an EPSG:27700 point and raise `geo-crs-approximate`, which the
+    /// evaluation without the map never does.
+    #[cfg(feature = "geo-epsg")]
+    #[test]
+    fn a_refused_coalesce_arm_raises_no_crs_warning() {
+        use crate::geo::vocab::{GEOF, WKT_LITERAL};
+        let points = |ctx: &Ctx| -> Vec<Id> {
+            let points: Vec<Id> = (0..512)
+                .map(|n| {
+                    ctx.intern_term(&Term::Literal(Literal::new_typed_literal(
+                        format!(
+                            "<http://www.opengis.net/def/crs/EPSG/0/27700> POINT({} 100000)",
+                            400_000 + n
+                        ),
+                        oxrdf::NamedNode::new_unchecked(WKT_LITERAL),
+                    )))
+                })
+                .collect();
+            (0..1024).map(|row| points[row % 512]).collect()
+        };
+        let dimension = |input: VarId| {
+            Expr::Call(
+                Func::Ext(format!("{GEOF}dimension")),
+                vec![Expr::Var(input)],
+            )
+        };
+        let declined =
+            refused_misses_with_no_skipped_arm("COALESCE(IF(sameTerm), geof:dimension)", |ctx| {
+                let input = ctx.var("input");
+                let expr = Expr::Coalesce(vec![one_unless_same_term(ctx, input), dimension(input)]);
+                (input, expr, points(ctx))
+            });
+        assert!(
+            declined > 0,
+            "some budget declines the map after its misses"
+        );
     }
 
     /// Item 293 round 1: an admitted map whose batch scratch the budget refuses releases

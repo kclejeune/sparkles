@@ -2322,10 +2322,13 @@ pilot or batch charge, or any refusal of memory that the evaluation of the misse
 while the map and the batch's scratch hold their charges, releases the sketch and the map
 and evaluates the batch the ordinary way. The misses run as optional evaluation, which
 keeps a memory refusal of the result or of a term, decode envelope or regular expression
-on the way to it out of the query's sticky failure, so the ordinary evaluation meets the
-budget it would have without the map. A geometry constructor keeps the charge of each
+on the way to it out of the query's sticky failure. After such a refusal the row's
+expression gives up as it does after a sticky failure, so it evaluates no arm that the
+ordinary evaluation skips and interns no discarded value, and the ordinary evaluation meets
+the budget it would have without the map. A geometry constructor keeps the charge of each
 geometry it builds until the query ends, so an expression that can call one, directly or
-through `fn:apply` or `afn:eval`, never enters the map. A CRS warning that the budget
+through `fn:apply` or `afn:eval`, never enters the map, and item 1321 tracks a releasable
+charge that would admit it. A CRS warning that the budget
 refuses during the misses is raised again by the ordinary evaluation. A BIND that ends its input releases them for the operators
 above it, and every loop checks cancellation. The batch charge is a bound sized by the batch, so the memory audit's
 `bind` fixture allows its ledger to stand above its heap until item 1320 tightens it.

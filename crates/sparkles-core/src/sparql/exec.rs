@@ -7315,9 +7315,11 @@ pub(super) fn column_rows_split(
 /// Each row runs as [`Ctx::optional_eval`], so a refusal of memory that the evaluation
 /// meets, whether it interns the result or a term on the way to it, grows a decode
 /// envelope or a regular expression cache, is returned as `Ok(None)` instead of being
-/// recorded as the query's memory failure. The caller then releases its optional state
-/// and evaluates the rows the ordinary way, which meets the same budget as it would
-/// without the cache. The rows after a refusal are not evaluated. Expressions that an
+/// recorded as the query's memory failure. After the refusal the row's expression takes
+/// no arm that the ordinary evaluation would skip, and its value is not interned. The
+/// caller then releases its optional state and evaluates the rows the ordinary way,
+/// which meets the same budget as it would without the cache. The rows after a refusal
+/// are not evaluated. Expressions that an
 /// optional cache admits are pure, so none has an EXISTS that hands work to the pool,
 /// and they construct no geometry, whose charge would outlast a discarded row.
 pub(super) fn column_rows_split_optional(
@@ -7348,6 +7350,8 @@ pub(super) fn column_rows_split_optional(
                 },
                 ctx,
             ) {
+                // A refused row's value is discarded, so it is not interned.
+                Ok(_) if ctx.has_memory_failure() => Id::UNDEF,
                 Ok(v) => v.into_id(ctx),
                 Err(_) => Id::UNDEF,
             }
