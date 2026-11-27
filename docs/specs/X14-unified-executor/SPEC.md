@@ -2073,6 +2073,10 @@ ROUNDS=12
 REPS=16
 WARMUP=3
 ORDERS="A B B A;B A A B"
+BINARY_OF_A=A
+BINARY_OF_B=B
+EXPECTED_ANSWER_CHANGE=0
+EXPECTED_ANSWER_CHANGE_REASON=""
 RAYON_THREADS=$threads
 SERVER_CPU=$server_cpu
 CLIENT_CPU=$client_cpu
@@ -2080,7 +2084,8 @@ SPIN=$spin
 EXECUTION=streaming
 PORT=31941
 EOF
-        bash "$out/nsc-bench-remote.sh"
+        env -u BINARY_OF_A -u BINARY_OF_B -u EXPECTED_ANSWER_CHANGE -u EXPECTED_ANSWER_CHANGE_REASON \
+            bash "$out/nsc-bench-remote.sh"
         python3 scripts/nsc-bench-summary.py "$out" >"$out/summary.md"
     done
 done
@@ -2103,6 +2108,10 @@ for threads in (1, 12):
         summary = json.loads(path.read_text())
         if summary["errors"]:
             failures.append(f"{threads}t {comparison}: timed request errors {summary['errors']}")
+        for query in queries:
+            answers = summary["queries"].get(query, {}).get("answers")
+            if answers != "same":
+                failures.append(f"{threads}t {comparison} {query}: answers {answers!r} != 'same'")
         if result.returncode:
             failures.append(f"{threads}t {comparison}: invalid summary")
             continue
