@@ -14,7 +14,7 @@ timing rules and answer checks.
 | Synthetic suite | 28 HTTP SPARQL queries at 1.05M and 10.5M triples, warm, cold, changed-store and mixed-load | [Methodology](synthetic/README.md) | [Results](synthetic/RESULTS.md) |
 | WatDiv | 20 basic templates (88 instances) at 10.97M triples | [Methodology](watdiv/README.md) | [Results](watdiv/RESULTS.md) |
 | SP²Bench | Bibliographic queries at 10M triples under a 12 GiB server cap | [Methodology](sp2bench/README.md) | [Results](sp2bench/RESULTS.md) |
-| LUBM and reasoning | Materialized OWL 2 RL query times, Nemo materialization comparisons and query-time reasoning | [Methodology](reasoning/README.md) | [Results](reasoning/RESULTS.md) |
+| LUBM and reasoning | Materialized OWL 2 RL query times, Nemo materialization comparisons and query-time reasoning | [Methodology](reasoning/README.md) | [Results](reasoning/RESULTS.md) and [derived-table cache calibration](reasoning/RESULTS.md#derived-table-cache-calibration) |
 | OWL 2 EL classification | GO, ChEBI lite and ORE 2015 against ELK, Konclude, Whelk, HermiT and ROBOT | [Methodology](el-classification/README.md) | [All results](el-classification/RESULTS.md) and [Horn rules with individuals](el-classification/RESULTS.md#guarded-horn-rules-with-individuals) |
 | DBpedia | 50M slice and full 1.24B-triple English DBpedia loads and queries | [Methodology](dbpedia/README.md) | [Results](dbpedia/RESULTS.md) |
 | BSBM | Explore and Business Intelligence queries and driver mixes at 10M triples | [Methodology](bsbm/README.md) | [Results](bsbm/RESULTS.md) |
