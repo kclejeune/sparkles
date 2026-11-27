@@ -357,6 +357,12 @@ impl std::fmt::Debug for PoolGrant {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    // Grant releases on this thread, including zero-byte calls that touch the counter.
+    pub(super) static GRANT_RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl PoolGrant {
     fn with(pool: Arc<QueryPool>, bytes: u64) -> PoolGrant {
         PoolGrant {
@@ -465,6 +471,8 @@ impl PoolGrant {
     /// Account for `bytes` less, and give back granules the query no longer needs.
     #[inline]
     pub fn release(&self, bytes: u64) {
+        #[cfg(test)]
+        let _ = GRANT_RELEASES.try_with(|n| n.set(n.get() + 1));
         let prior = self.used.fetch_sub(bytes, Ordering::SeqCst);
         debug_assert!(prior >= bytes, "grant released {bytes} of {prior} bytes");
         let used = prior.wrapping_sub(bytes);

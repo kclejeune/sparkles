@@ -227,7 +227,7 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
 479 of stage 2. Stage 4's accounting model, mode-neutral kernels and decoding twins have
-shipped, and the hierarchical budget of item 675 remains. Stage 5's
+shipped, including the hierarchical budget of item 675. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
 
@@ -1801,6 +1801,34 @@ instead of at the line's start, so item 696 follows it with `join_pairs`.
 The eager costs of 1% to 4% that stage 4 added to filters and aggregates, such as
 `subquery-agg` at 1.040 of 005df56d at 10.5M triples and `contains` at 1.036 at 1.05M
 triples, are unchanged, and item 682 holds them.
+
+### Fixed cost of the hierarchical budget
+
+An eager SELECT stores its charged projection metadata inline in the result backing.
+The query admits the vectors and names before building them and admits the inline
+storage as part of the result header before publishing it. Cursors still use one
+shared allocation for their variables and the batches that can outlive them.
+The common result header is larger for collected cursor, ASK and graph results.
+The fast account also owns a single grant reference and skips returning credit when
+it held none. Admission and pool granules are unchanged.
+
+Item 884 remains open pending a valid wall-time comparison on `atlas`. Set
+`BASE_BIN` and `TIP_BIN` to the server binaries built on the same Boat worker with
+the same compiler and release settings from `0c425e86` and the item 884 commit.
+Set `PEOPLE_100K_ZST` to the 1.05M-triple synthetic dataset. Run the staged A/B
+under the timing kit's atlas locks and compare the HTTP wall and execution results
+for the four small queries, with matching answers and a valid same-binary control.
+
+```sh
+python3 scripts/timing-kit.py stage --out .artifacts/884-atlas \
+  --base "A=$BASE_BIN" --tip "B=$TIP_BIN" --data "$PEOPLE_100K_ZST" \
+  --only count-all,distinct-obj,predicate-counts,employee-docs,class-predicates,contains,two-hop-count \
+  --controls class-predicates,contains,two-hop-count --execution auto \
+  --serve-args="--total-query-memory-mb 256" --rounds 16 --reps 200 --rotate \
+  --rerun-rounds 24 --rerun-reps 300 --early-stop-rules bound,every-round
+python3 scripts/timing-kit.py preflight .artifacts/884-atlas
+python3 scripts/timing-kit.py launch --host atlas --unit item-884-atlas .artifacts/884-atlas
+```
 
 ### Checked result output
 

@@ -2,7 +2,7 @@
 //! cancellation and dataset description.
 
 use super::pool::PoolGrant;
-use super::query_memory::{PRIMARY, QueryMemoryLease, QueryMemoryLedger, same};
+use super::query_memory::{PRIMARY, QueryMemoryLease, QueryMemoryLedger};
 use super::table::VarId;
 use super::value::Value;
 use crate::access::{Preparation, PreparationText, Reservation};
@@ -1281,9 +1281,6 @@ pub struct Ctx {
     /// Budget for the estimated bytes of intermediate results alive at once
     /// (`u64::MAX`: unlimited). See [`Ctx::charge`] and [`Ctx::check_output`].
     pub mem_limit: u64,
-    /// The grant the query charges, fixed before its first charge (see [`Ctx::set_grant`]).
-    /// Contributions retain the grant they were admitted under.
-    grant: Option<Arc<super::pool::PoolGrant>>,
     /// The query's disk reservation for spill files, when spill is on.
     pub(crate) spill: Option<Arc<crate::spill::QuerySpill>>,
     /// Budget for the rows all operators produce together (`u64::MAX`: unlimited). See
@@ -1424,8 +1421,9 @@ struct FastMemory {
     peak: AtomicU64,
     /// the account's admitted contribution to `grant`, kept until the context drops
     eager: AtomicU64,
-    /// the grant the account charges, fixed at its first use
-    grant: std::sync::OnceLock<Option<Arc<PoolGrant>>>,
+    /// The grant fixed before the first charge. A promoted account owns its credit
+    /// through the ledger, which shares this grant.
+    grant: Option<Arc<PoolGrant>>,
     /// serializes growth of `eager` with the hand-over to the ledger
     resize: parking_lot::Mutex<()>,
 }
@@ -1462,10 +1460,12 @@ impl FastMemory {
 impl Drop for FastMemory {
     /// An account the ledger never took over returns its eager contribution here.
     fn drop(&mut self) {
-        if *self.live.get_mut() & PROMOTED == 0
-            && let Some(Some(grant)) = self.grant.get()
+        let eager = *self.eager.get_mut();
+        if eager != 0
+            && *self.live.get_mut() & PROMOTED == 0
+            && let Some(grant) = &self.grant
         {
-            grant.release(*self.eager.get_mut());
+            grant.release(eager);
         }
     }
 }
@@ -1623,12 +1623,8 @@ impl Ctx {
         let _resize = fast.resize.lock();
         let live = fast.live.fetch_or(PROMOTED, Ordering::AcqRel);
         debug_assert_eq!(live & PROMOTED, 0, "one hand-over");
-        let grant = match fast.grant.get() {
-            Some(grant) => grant.clone(),
-            None => self.grant.clone(),
-        };
         QueryMemoryLedger::seeded(
-            grant,
+            fast.grant.clone(),
             live,
             fast.eager.load(Ordering::Acquire),
             fast.peak.load(Ordering::Acquire),
@@ -1646,7 +1642,7 @@ impl Ctx {
     /// its existing lazy fast account. The child retains accounting, not this Ctx.
     pub fn memory_parent(&self) -> Result<sparkles_budget::ParentHandle> {
         self.memory()
-            .child_parent(self.grant.clone(), self.mem_limit)
+            .child_parent(self.fast.grant.clone(), self.mem_limit)
     }
 
     /// Attach a seed subcontext to its outer query before any charge. It retains
@@ -1665,8 +1661,7 @@ impl Ctx {
             ));
         }
         let factory = self
-            .grant
-            .as_ref()
+            .grant()
             .map_or(sparkles_budget::MemoryDomain::unpooled(), |g| {
                 g.memory_domain()
             });
@@ -1679,7 +1674,7 @@ impl Ctx {
                 ),
             )));
         }
-        let ledger = QueryMemoryLedger::nested(self.grant.clone(), parent);
+        let ledger = QueryMemoryLedger::nested(self.fast.grant.clone(), parent);
         self.memory
             .set(ledger)
             .map_err(|_| Error::invalid("query memory already initialized"))?;
@@ -1689,13 +1684,11 @@ impl Ctx {
 
     /// The grant the query charges, if it has one.
     pub fn grant(&self) -> Option<&Arc<PoolGrant>> {
-        self.grant.as_ref()
+        self.fast.grant.as_ref()
     }
 
-    /// Set the grant before any charge, and fix it as the fast account's grant without
-    /// a lazy initialization on the first charge. A grant that changes after a charge
-    /// would leave charges on the old one, so a call after the first charge is a bug
-    /// that debug builds refuse.
+    /// Set the grant before any charge. The fast account borrows this same reference
+    /// on each charge and returns its contribution before dropping it.
     pub(crate) fn set_grant(&mut self, grant: Option<Arc<PoolGrant>>) {
         debug_assert!(
             self.memory.get().is_none()
@@ -1704,26 +1697,18 @@ impl Ctx {
                 && self.fast.peak.load(Ordering::Relaxed) == 0,
             "the grant is set before the first charge"
         );
-        self.fast.grant = std::sync::OnceLock::from(grant.clone());
-        self.grant = grant;
+        self.fast.grant = grant;
     }
 
-    /// Change the grant after charges were made, to test that the ledger keeps each
-    /// contribution on the grant it was admitted under.
+    /// Preserve the old fast account in the ledger before testing a change of grant.
     #[cfg(test)]
     pub(crate) fn reconfigure_grant(&mut self, grant: Option<Arc<PoolGrant>>) {
-        self.grant = grant;
-    }
-
-    /// The fast account's grant, or `None` when the ledger must take the request: it
-    /// exists already, or the public grant changed since the fast account began.
-    #[inline]
-    fn fast_grant(&self) -> Option<Option<&Arc<PoolGrant>>> {
-        if self.memory.get().is_some() {
-            return None;
+        if self.fast.peak.load(Ordering::Relaxed) != 0
+            && !super::query_memory::same(self.grant(), grant.as_ref())
+        {
+            self.memory();
         }
-        let grant = self.fast.grant.get_or_init(|| self.grant.clone()).as_ref();
-        same(grant, self.grant.as_ref()).then_some(grant)
+        self.fast.grant = grant;
     }
 
     /// Admit `bytes` more live estimate (`add`) or check a transient output of
@@ -1731,7 +1716,10 @@ impl Ctx {
     /// owner. `None` when the ledger must take the request.
     #[inline]
     fn fast_admit(&self, bytes: u64, add: bool) -> Option<Result<()>> {
-        let grant = self.fast_grant()?;
+        if self.memory.get().is_some() {
+            return None;
+        }
+        let grant = self.grant();
         let fast = &self.fast;
         let mut cur = fast.live.load(Ordering::Acquire);
         loop {
@@ -1899,7 +1887,6 @@ impl Ctx {
             prepared_var_names: Default::default(),
             max_rows: 200_000_000,
             mem_limit: u64::MAX,
-            grant: None,
             spill: None,
             max_rows_produced: u64::MAX,
             rows_produced: Arc::new(AtomicU64::new(0)),
@@ -2449,7 +2436,7 @@ impl Ctx {
                 if self.streams
                     && let Some(ledger) = self.memory.get()
                 {
-                    ledger.trim_zero(self.grant.as_ref());
+                    ledger.trim_zero(self.grant());
                 }
             }
         }
@@ -2457,7 +2444,7 @@ impl Ctx {
 
     /// The bytes this query holds in the server's query memory pool (0 without a pool).
     pub fn granted_bytes(&self) -> u64 {
-        self.grant.as_ref().map_or(0, |g| g.granted())
+        self.grant().map_or(0, |g| g.granted())
     }
 
     pub(super) fn memory_remaining(&self) -> u64 {
@@ -2468,7 +2455,7 @@ impl Ctx {
     /// what the server pool has free plus the unused part of the query's grant.
     pub(super) fn memory_room(&self) -> u64 {
         let own = self.memory_remaining();
-        match &self.grant {
+        match self.grant() {
             Some(grant) => {
                 let pool = grant.pool();
                 let free = pool.capacity().saturating_sub(pool.granted());
@@ -2558,7 +2545,7 @@ impl Ctx {
         self.check()?;
         let mut trial = Ctx::new(self.snap.clone());
         trial.mem_limit = self.memory_remaining();
-        trial.set_grant(self.grant.clone());
+        trial.set_grant(self.fast.grant.clone());
         if self.has_ledger() {
             trial.set_memory_parent(self.memory_parent()?)?;
             trial.enable_cursor_accounting()?;
@@ -2782,11 +2769,7 @@ impl Ctx {
             if eager_need > covered {
                 let extra = eager_need - covered;
                 if extra <= self.memory_remaining() {
-                    let _ = ledger.grow_active_prefetch(
-                        self.grant.as_ref(),
-                        self.mem_limit,
-                        eager_need,
-                    );
+                    let _ = ledger.grow_active_prefetch(self.grant(), self.mem_limit, eager_need);
                 }
             }
             return Ok(PrefetchScratch::Cursor {
@@ -2800,7 +2783,7 @@ impl Ctx {
         let remaining = self.memory_remaining();
         if eager_need > min_need && eager_need - covered <= remaining {
             if ledger
-                .admit_prefetch(self.grant.as_ref(), self.mem_limit, eager_need)
+                .admit_prefetch(self.grant(), self.mem_limit, eager_need)
                 .is_ok()
             {
                 return Ok(PrefetchScratch::Cursor {
@@ -2818,7 +2801,7 @@ impl Ctx {
         } else if min_need - covered > remaining {
             return Err(self.memory_exceeded(self.live_bytes().saturating_add(min_need - covered)));
         }
-        ledger.admit_prefetch(self.grant.as_ref(), self.mem_limit, min_need)?;
+        ledger.admit_prefetch(self.grant(), self.mem_limit, min_need)?;
         Ok(PrefetchScratch::Cursor {
             ctx: self,
             ledger,
@@ -2899,7 +2882,7 @@ impl Ctx {
             // Reserve decode bytes directly on the ledger's decode envelope while
             // `envelope.state` is unlocked so synchronous pool wakes can re-enter safely
             // and optional cursor prefetch shares the envelope with zero extra ledger ops.
-            let account = ledger.owner(self.grant.as_ref())?;
+            let account = ledger.owner(self.grant())?;
             ledger.reserve_decode_to(&account, self.mem_limit, target)?;
             let mut state = envelope.state.lock();
             if need > state.0 {
@@ -3117,7 +3100,7 @@ impl Ctx {
         if let Some(checked) = self.fast_admit(bytes, false) {
             return checked;
         }
-        let owner = self.memory().owner(self.grant.as_ref())?;
+        let owner = self.memory().owner(self.grant())?;
         self.memory().check_output(&owner, self.mem_limit, bytes)
     }
 
@@ -3139,7 +3122,7 @@ impl Ctx {
     /// context also retains its admitted pool peak until the context drops.
     pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
         let ledger = self.memory();
-        let owner = ledger.owner(self.grant.as_ref())?;
+        let owner = ledger.owner(self.grant())?;
         ledger.reserve(&owner, self.mem_limit, bytes, false)?;
         Ok(QueryMemoryLease {
             ledger: ledger.clone(),
@@ -3172,10 +3155,8 @@ impl Ctx {
         }
         let fast = match self.memory.get() {
             Some(_) => None,
-            None => match self.fast.grant.get() {
-                Some(Some(_)) => Some(self.fast.eager.load(Ordering::Acquire)),
-                _ => return Ok(()),
-            },
+            None if self.grant().is_some() => Some(self.fast.eager.load(Ordering::Acquire)),
+            None => return Ok(()),
         };
         // The output columns hold no lease, so the result keeps them on top of the
         // live charges.
@@ -5634,7 +5615,7 @@ impl Charge<'_> {
         let ledger = self.ctx.memory();
         let owner = match self.owner.get() {
             Some(id) => ledger.owner_by_id(id),
-            None => ledger.owner(self.ctx.grant.as_ref())?,
+            None => ledger.owner(self.ctx.grant())?,
         };
         ledger.reserve(&owner, self.ctx.mem_limit, bytes, false)?;
         self.owner.set(Some(owner.id));
@@ -5697,7 +5678,7 @@ impl Charge<'_> {
             .owner
             .get()
             .map(|id| ledger.owner_by_id(id))
-            .map_or_else(|| ledger.owner(self.ctx.grant.as_ref()), Ok)?;
+            .map_or_else(|| ledger.owner(self.ctx.grant()), Ok)?;
         self.disarm();
         Ok(QueryMemoryLease {
             ledger: ledger.clone(),
@@ -5814,7 +5795,7 @@ impl PrefetchScratch<'_> {
                 if extra > ctx.memory_remaining() {
                     return Err(ctx.memory_exceeded(ctx.live_bytes().saturating_add(extra)));
                 }
-                ledger.grow_active_prefetch(ctx.grant.as_ref(), ctx.mem_limit, need)
+                ledger.grow_active_prefetch(ctx.grant(), ctx.mem_limit, need)
             }
         }
     }
@@ -5844,7 +5825,7 @@ impl OutputCredit {
             return Ok(ctx.charge(bytes)?.into_output(ctx));
         }
         let ledger = ctx.memory();
-        let owner = ledger.owner(ctx.grant.as_ref())?;
+        let owner = ledger.owner(ctx.grant())?;
         ledger.reserve_receiving(&owner, ctx.mem_limit, bytes)?;
         Ok(Self {
             ctx: ctx.clone(),
@@ -6077,7 +6058,7 @@ impl OwnedCharge {
     }
     pub(crate) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
         let ledger = ctx.memory();
-        let owner = ledger.owner(ctx.grant.as_ref())?;
+        let owner = ledger.owner(ctx.grant())?;
         ledger.reserve(&owner, ctx.mem_limit, bytes, false)?;
         Ok(Self {
             ctx: ctx.clone(),
@@ -6635,6 +6616,33 @@ mod charge_tests {
         let mut ctx = Ctx::new(store.snapshot());
         ctx.set_grant(Some(grant.clone()));
         ctx
+    }
+
+    #[test]
+    fn a_zero_charge_context_keeps_one_grant_reference_and_does_not_touch_its_credit() {
+        use super::super::pool::{GRANT_RELEASES, QueryPool};
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = QueryPool::new(64 << 10);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = Ctx::new(store.snapshot());
+        let releases = GRANT_RELEASES.with(|n| n.get());
+        let grows = super::FAST_GROWS.with(|n| n.get());
+        let ledger_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        let (_, stats) = crate::test_alloc::record_alloc_stats(|| {
+            ctx.set_grant(Some(grant.clone()));
+            assert_eq!(Arc::strong_count(&grant), 2);
+            drop(ctx.charge(0).unwrap());
+            ctx.check_output(0, 0).unwrap();
+            drop(ctx);
+        });
+        assert_eq!(stats.total_alloc, 0);
+        assert_eq!(super::FAST_GROWS.with(|n| n.get()), grows);
+        assert_eq!(GRANT_RELEASES.with(|n| n.get()), releases);
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            ledger_ops
+        );
+        assert_eq!((grant.used(), pool.granted()), (0, 0));
     }
 
     /// A plain query's estimate grows a few bytes at a time. The fast account admits a
