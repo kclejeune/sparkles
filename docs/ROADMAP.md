@@ -216,21 +216,20 @@ once Waves A, B and C clear their prerequisites.
 * Reasoning and explanations complete the separate derived layer and canonical equality
   representatives in items 9 and 941 to 943. Query-time reasoning finishes OWL 2 QL
   extensions, per-pattern `auto` selection and demand `DESCRIBE` in items 19, 190, 193,
-  757, 909, 910, 913, 985 and 986. Explanations add result-cell actions in item 285 and
+  909, 910, 913, 985 and 986. Explanations add result-cell actions in item 285 and
   unbound why-not abduction in item 286.
 * Full-text and vector search complete online, uncommitted and historical search,
   multi-field documents and Lucene analyzer parity in items 23, 35, 50, 250 and 251,
   together with vector quantization, caching and statistics in items 34 and 82.
-* Paths, graph algorithms and GeoSPARQL complete weighted path length bounds in item
-  275, path-search cost measurement and recovery in item 276, Graphalytics acceptance
-  and background progress in item 8 and GeoSPARQL completion in item 24.
+* Paths, graph algorithms and GeoSPARQL complete path-search cost measurement and
+  recovery in item 276, Graphalytics acceptance and background progress in item 8 and
+  GeoSPARQL completion in item 24.
 * Storage, history, validation and server integration complete adaptive compaction in
   item 14, branch preallocation quota accounting in items 560 and 561, and pin rebasing,
   per-quad periods, graph feeds and settings history in item 52. Remote and archive
   cloning and relink ship in item 45, GraphQL Phase 2 in item 37, Fuseki and ARQ
   compatibility leftovers in items 38, 39, 51 and 76, combined ShEx guards in item 54,
-  shape-driven form gaps in items 612 to 615, and OTLP metrics and degraded-index
-  startup in items 342 and 402.
+  shape-driven form gaps in items 612 to 615, and degraded-index startup in item 402.
 
 ### Wave E: competitive benchmarks and scale optimization
 

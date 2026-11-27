@@ -10327,11 +10327,37 @@ export interface components {
                 groupCommit: boolean;
                 name: string;
                 quads: number;
+                queryMemoryPeak: {
+                    /** @description Cumulative counts for `queryMemoryPeakBucketBounds` plus +Inf. The last one equals `count`. */
+                    buckets: number[];
+                    count: number;
+                    sumBytes: number;
+                } | null;
                 /** @description 0 means unlimited. */
                 quotaBytes: number;
                 rateLimited: {
                     [key: string]: number;
                 } | null;
+                rebuilds: {
+                    bulk: {
+                        count: number;
+                        duration: {
+                            /** @description Cumulative counts for `rebuildDurationBucketBounds` plus +Inf. The last one equals `count`. */
+                            buckets: number[];
+                            count: number;
+                            sumSeconds: number;
+                        } | null;
+                    };
+                    compact: {
+                        count: number;
+                        duration: {
+                            /** @description Cumulative counts for `rebuildDurationBucketBounds` plus +Inf. The last one equals `count`. */
+                            buckets: number[];
+                            count: number;
+                            sumSeconds: number;
+                        } | null;
+                    };
+                };
                 resultCache: {
                     bytes: number;
                     capacityBytes: number;
@@ -10341,13 +10367,19 @@ export interface components {
                     misses: number;
                 };
                 resultRows: number;
+                /** @description Rows produced by all operators of queries and updates. */
+                rowsProduced: number;
                 walBytes: number;
             }[];
             /** @constant */
             formatVersion: 1;
             limits: components["schemas"]["Limits"];
             processResidentBytes: number | null;
+            /** @description Upper bounds in bytes of `datasets[*].queryMemoryPeak.buckets`, without +Inf. */
+            queryMemoryPeakBucketBounds: number[];
             ready: boolean;
+            /** @description Upper bounds in seconds of `datasets[*].rebuilds.*.duration.buckets`, without +Inf. */
+            rebuildDurationBucketBounds: number[];
             requests: {
                 /** @description Cumulative counts. The last one, for +Inf, equals `count`. */
                 buckets: number[];
