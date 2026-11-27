@@ -21,8 +21,10 @@ completed items.
 The current priorities are engine correctness, performance and standard features in
 Wave A, followed by embedded agent memory and the ontology platform, including its
 editor, in Waves B and C, which run alongside them. Shared entity representation follows
-memory. Packaging, recovery and the API compatibility contract advance alongside capability
-completion. The [delivery priorities](#delivery-priorities) explain their dependencies.
+memory. Waves D, E and F then close the remaining partially complete capabilities,
+competitive benchmark and scale gates, binding API parity, web UI completion and
+pre-release backup work ahead of the first release artifacts and API stabilization.
+The [delivery priorities](#delivery-priorities) explain their dependencies.
 The numbered tiers are the detailed backlog, and [Completed](#completed) records finished
 items.
 
@@ -99,12 +101,16 @@ resources and source identity go ahead of unrelated feature expansion.
 
 The first release fixes the storage formats that later versions must read and completes
 backup. Item 479 set the first-release format cutoff, item 343 settles the dataset-local
-codec settings before the release fixture, and item 61 completes backup. The feature waves below come
-first, and these items take only capacity that the waves leave free. Published artifacts follow the first release: the server
-binaries and container images of item 59 and the PyPI, Maven Central and npm packages of
-item 58, both after the format cutoff. The later encryption phases of item 65, security and audit in item 466, the developer ecosystem of
-items 468 and 47, the remaining notification work in item 785, the per-crate Nix builds of item 92 and the
-replication refresh of item 280 follow the first release.
+codec settings in Wave E before the release fixture, and item 61 completes backup in
+Wave F. Waves A through F complete their declared scope ahead of cutting the first
+release, and items 343 and 61 may also use capacity that earlier waves leave free.
+The first release publishes the server binaries and container images of item 59 and
+the PyPI, Maven Central and npm packages of item 58 after the format cutoff, while
+the remaining X12 Phase 4 compatibility policy checks of item 60 may follow the first
+release as [X12](specs/X12-release-engineering.md) specifies. The later encryption
+phases of item 65, security and audit in item 466, the developer ecosystem of items
+468 and 47, the remaining notification work in item 785, the per-crate Nix builds of
+item 92 and the replication refresh of item 280 follow the first release.
 
 ### Wave A: engine quality and consolidation
 
@@ -198,13 +204,86 @@ Plan a later GPUI migration once the UI and its interactions have stabilized, wi
 measured performance and parity checks before the cutover. This work does not
 displace correctness repairs or performance recovery.
 
+### Wave D: core database and standards completeness
+
+Wave D completes the remaining partially complete database, reasoning, search, graph,
+validation and server capabilities in the [capability matrix](FEATURES.md#capability-status)
+once Waves A, B and C clear their prerequisites.
+
+* Incremental views and live queries complete F13 through items 17, 221 to 227, 265,
+  420 to 430, 528, 530, 531, 1294 to 1296 and 1298. That work covers graph and branch
+  views, commit-time maintenance, the view-free commit baseline, transports, per-fact
+  provenance, recursion and the remaining access and guard gaps.
+* Reasoning and explanations complete the separate derived layer and canonical equality
+  representatives in items 9 and 941 to 943. Query-time reasoning finishes OWL 2 QL
+  extensions, per-pattern `auto` selection and demand `DESCRIBE` in items 19, 190, 193,
+  757, 909, 910, 913, 985 and 986. Explanations add result-cell actions in item 285 and
+  unbound why-not abduction in item 286.
+* Full-text and vector search complete online, uncommitted and historical search,
+  multi-field documents and Lucene analyzer parity in items 23, 35, 50, 250 and 251,
+  together with vector quantization, caching and statistics in items 34 and 82.
+* Paths, graph algorithms and GeoSPARQL complete weighted path length bounds in item
+  275, path-search cost measurement and recovery in item 276, Graphalytics acceptance
+  and background progress in item 8 and GeoSPARQL completion in item 24.
+* Storage, history, validation and server integration complete adaptive compaction in
+  item 14, branch preallocation quota accounting in items 560 and 561, and pin rebasing,
+  per-quad periods, graph feeds and settings history in item 52. Remote and archive
+  cloning and relink ship in item 45, GraphQL Phase 2 in item 37, Fuseki and ARQ
+  compatibility leftovers in items 38, 39, 51 and 76, combined ShEx guards in item 54,
+  shape-driven form gaps in items 612 to 615, and OTLP metrics and degraded-index
+  startup in items 342 and 402.
+
+### Wave E: competitive benchmarks and scale optimization
+
+Wave E works through the remaining benchmark coverage, large-scale gates and engine
+tuning items in [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) and specs X06 to
+X11 before the first release. It keeps the existing completion rule that documented
+close cases and deferrals are acceptable and that a benchmark loss alone does not block
+completion.
+
+* Benchmark coverage and large-scale gates run sustained-write, 100M BSBM, BI-driver,
+  table-regeneration and competitive refreshes in item 1, large SP²Bench answers in
+  item 91, and targeted cost checks and tuning such as durable writes, thread placement
+  and query-history aging in items 290 to 292, 299, 306, 328 and 575 to 577. Cold-start
+  I/O, counter-cost and 1.01B dense export follow-ups run in items 516, 572 to 574,
+  1273 and 1274.
+* Spill, memory footprint, group-commit and codec optimization cover spill execution
+  and cache accounting in items 88 and 210, idle server RSS, Python process RSS and
+  full-text index footprint in item 40, parallel checkpoint reader tail and indexed
+  group-commit overhead in items 170 and 448, FSST and front-coding lookup costs in
+  items 160 and 241, and dataset-local codec settings in item 343. Item 448 may run ahead
+  of Wave E whenever Wave A needs it as a prerequisite for item 833.
+
+### Wave F: bindings parity, web UI and operational completion
+
+Wave F finishes binding APIs ahead of the compatibility policy in item 60 and completes
+the remaining web UI, mapping, virtual-graph and pre-release backup work before cutting
+the first release artifacts of items 58 and 59. Later encryption phases in item 65 stay
+post-release as [Release](#release) specifies.
+
+* Binding parity completes dynamic and foreign query callbacks in item 25 and reusable
+  plans in item 32 before API stabilization freezes library contracts. Binding overhead,
+  memory footprint, benchmark controls and test hooks follow in items 33, 40, 329 and
+  405.
+* Web UI completion delivers live query profiling in item 27, server-cached large-graph
+  layouts and binary transfer in items 29 and 737 to 739, per-commit data-quality
+  timelines and the schema diagram in items 31, 120 and 121, visual query builder Phase
+  3 in item 101 and the remaining linked-view controls in items 140 to 142.
+* Mappings and virtual graphs complete Phase 1 source, conformance and function gaps in
+  items 230, 233, 234, 236 to 239, 404 and 450, followed by Phase 2 virtual graphs with
+  pushdown in item 43.
+* Pre-release backup work completes whole-server and multi-dataset backup and retention
+  in item 61 and carries paused view definitions into in-memory clones in item 401.
+
 ### How the waves share capacity
 
-The waves run in parallel, and each has its own capacity. Waves A and C take the
-capacity first, and Wave B runs when a stream is free of them. When work competes for gate, review or benchmark time, the
-dependency order and how ready the work is decide which goes first, not the wave it
-belongs to. The goal at the start of this section states what Sparkles optimizes
-for, and it does not order the waves.
+The waves run in parallel, and each has its own capacity. Waves A and C take capacity
+first, Wave B runs alongside them when a stream is free, and Waves D, E and F take
+ready items as earlier streams open. A prerequisite in a later wave, such as item 448
+for item 833, runs ahead of the work that depends on it. When work competes for gate,
+review or benchmark time, dependency order and readiness decide which goes first, not
+the wave it belongs to. The goal at the start of this section states what Sparkles
+optimizes for, and it does not order the waves.
 
 The waves group the work by delivery, and the tiers below rate its value. A wave can
 therefore hold items from several tiers. Within a wave, the order its section gives
