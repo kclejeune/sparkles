@@ -53,6 +53,7 @@ mod group_index_tests;
 #[cfg(test)]
 mod group_model;
 mod history_limited;
+mod history_probe;
 pub(crate) use history_limited::SnapshotCharge;
 mod history_query;
 mod holds;
@@ -143,6 +144,8 @@ pub use deltas::{CommitDelta, DeltaPage, DeltaSubscription};
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, IdChange, StateMark, key_id};
 pub use diff_groups::{CHANGE_BYTES, ClassGroup, ClassGroups, MAX_GROUPS, ObjectGroup};
+#[doc(hidden)]
+pub use history_probe::HistoryPattern;
 pub use history_query::{HistoryBound, HistoryChange, HistoryQuery, HistoryResult};
 #[cfg(feature = "failpoints")]
 pub use history_query::{HistoryCheckObserver, HistoryCheckOutcome, set_history_check_observer};
@@ -1147,15 +1150,7 @@ impl Snapshot {
         match state.as_ref() {
             crate::managed::ManagedState::Unavailable { .. } => true,
             crate::managed::ManagedState::Installed(installed) => {
-                if installed.configuration_history.is_some()
-                    || installed
-                        .graphs
-                        .owners
-                        .contains_key(&crate::managed::OwnerKind::Evidence)
-                    || installed
-                        .settings
-                        .contains_key(&crate::managed::OwnerKind::Evidence)
-                {
+                if installed.may_have_evidence_history() {
                     return true;
                 }
                 match installed.evidence_visibility() {
@@ -4095,23 +4090,13 @@ impl Store {
         if access.reads_everything() {
             return false;
         }
-        if self.configuration_activated() {
-            return true;
-        }
         let Some(state) = self.family.managed.load_full() else {
             return false;
         };
         match state.as_ref() {
             crate::managed::ManagedState::Unavailable { .. } => true,
             crate::managed::ManagedState::Installed(installed) => {
-                if installed
-                    .graphs
-                    .owners
-                    .contains_key(&crate::managed::OwnerKind::Evidence)
-                    || installed
-                        .settings
-                        .contains_key(&crate::managed::OwnerKind::Evidence)
-                {
+                if installed.may_have_evidence_history() {
                     return true;
                 }
                 match installed.evidence_visibility() {

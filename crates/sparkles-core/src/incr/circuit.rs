@@ -3,7 +3,7 @@
 
 use super::budget::ViewBudget;
 use super::compile::{Compiled, Kind};
-use super::footprint::{Footprint, Resolved};
+use super::footprint::{FGraph, Footprint, Resolved};
 use super::inference::Inference;
 use super::ops::{Node, Op, PlanNode};
 use super::pass::{Pass, PassStats, Vis};
@@ -1792,6 +1792,32 @@ impl Circuit {
         Ok(ChargedAdvance::Changed(out, out_lease))
     }
 
+    fn support_gated_footprint(&self, snap: &Snapshot) -> bool {
+        use crate::access::triples::evidence::EvidenceConfig;
+
+        let cfg = match snap.evidence_projection_config() {
+            EvidenceConfig::Active(cfg) => cfg,
+            EvidenceConfig::Unavailable(_) => return true,
+            EvidenceConfig::None => return false,
+        };
+        let access = self.access.as_ref().expect("restricted circuit");
+        let union = snap.union_default_graph
+            || self
+                .snap
+                .as_ref()
+                .is_some_and(|prev| prev.union_default_graph);
+        cfg.settings.policies.values().any(|policy| {
+            access.read.allows_named_iri(&policy.output)
+                && (self.footprint.all
+                    || self.footprint.entries.iter().any(|entry| match &entry.g {
+                        FGraph::Any | FGraph::Named => true,
+                        FGraph::Default => union,
+                        FGraph::Graph(Term::NamedNode(graph)) => graph.as_str() == policy.output,
+                        FGraph::Graph(_) => false,
+                    }))
+        })
+    }
+
     /// Like [`advance`](Self::advance), keeping the returned [`Changes`] vector covered
     /// by its [`ScratchLease`] until the caller finishes consuming and drops it.
     pub(crate) fn advance_charged(
@@ -1819,7 +1845,7 @@ impl Circuit {
             }
         }
         let ev_restricted = self.access.as_ref().is_some_and(|a| !a.reads_everything());
-        let (eval_snap, new_gen, new_ev_key) = if ev_restricted {
+        let (mut eval_snap, new_gen, new_ev_key) = if ev_restricted {
             let frozen = snap.pin_live_evidence();
             let new_gen = frozen.managed_generation();
             let new_ev_key = frozen.evidence_visibility_key();
@@ -1827,17 +1853,27 @@ impl Circuit {
         } else {
             (snap.clone(), 0, None)
         };
-        let ev_active_or_changed = ev_restricted
-            && (new_ev_key.is_some()
-                || self.evidence_key.is_some()
-                || self.managed_generation != new_gen);
         let whole = super::runtime::whole_reason(self.access.as_ref()).is_some();
-        // If support-aware projection visibility is active or unavailable (or just turned
-        // off) on a restricted circuit, rebuild over the controlled masked snapshot so
-        // hidden projections never leak via deltas and masking stays under circuit controls.
-        if ev_active_or_changed {
+        // With an unchanged evidence configuration, a stateless accumulator can
+        // count deltas when its footprint excludes policy outputs. A change to the managed stamp
+        // still requires rebuilding, including when an output was just unprotected.
+        let stamp_changed = self.evidence_key != new_ev_key || self.managed_generation != new_gen;
+        let needs_masked_reset = new_ev_key.is_some()
+            && (self.keep_result
+                || !self.prov.is_none()
+                || !self.root.is_stateless()
+                || whole
+                || self.inference.is_some()
+                || self.support_gated_footprint(&eval_snap));
+        if ev_restricted && (stamp_changed || needs_masked_reset) {
             let (diff, lease) = self.reset_charged(d, control)?;
             return Ok(ChargedAdvance::Reset(diff, lease));
+        }
+        if new_ev_key.is_some() {
+            // Only this pass has proved its footprint cannot read the policy output.
+            // Expression contexts can then use the ordinary mask without reading it.
+            Arc::make_mut(&mut eval_snap).pinned_evidence =
+                Some(crate::access::triples::evidence::EvidenceConfig::None);
         }
         #[cfg(test)]
         circuit_test_hook(CircuitTestPhase::AfterAdvanceSample);

@@ -253,6 +253,8 @@ pub struct AskOptions {
     pub preparation: Option<AskPreparation>,
     /// answer from the data, from community reports, or as the question needs
     pub mode: AskMode,
+    /// The HTTP Ask surface supports review and matching policies in global answers.
+    pub policy_scoped_global: bool,
     /// use only reviewed community reports (`reviewedOnly`, C22 A7)
     pub reviewed_only: bool,
     /// the draft and repair pairs may receive rows, so their grounding may hold the
@@ -305,6 +307,7 @@ impl Default for AskOptions {
             grant: None,
             preparation: None,
             mode: AskMode::Auto,
+            policy_scoped_global: false,
             reviewed_only: false,
             report_context: false,
             explore: true,
@@ -977,7 +980,15 @@ impl Asking<'_, '_> {
         if let Err(e) = self.server.dataset(self.principal, Some(&self.o.dataset)) {
             return self.error(&e.code, e.message);
         }
-        if self.o.review_policy.is_some() || self.o.matching_policy.is_some() {
+        let has_policy = self.o.review_policy.is_some() || self.o.matching_policy.is_some();
+        let can_route_global = !has_policy || self.o.policy_scoped_global;
+        if has_policy {
+            if self.o.mode == AskMode::Global && !can_route_global {
+                return self.error(
+                    "bad-argument",
+                    "reviewPolicy and matchingPolicy require HTTP Ask in global mode",
+                );
+            }
             // the policies and the store's configuration history are checked before
             // any model call, so a refused policy costs nothing
             if let Err(e) = self.claims_recall(&[]) {
@@ -1003,7 +1014,7 @@ impl Asking<'_, '_> {
                 Ok(None) => self.reports = None,
                 Err(e) => return self.error(&e.code, e.message),
             }
-        } else if self.o.run && self.o.mode == AskMode::Auto {
+        } else if self.o.run && self.o.mode == AskMode::Auto && can_route_global {
             match self.report_probe() {
                 Ok(reports) => self.reports = reports,
                 Err(e) => return self.error(&e.code, e.message),

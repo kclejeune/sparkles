@@ -3958,73 +3958,28 @@ fn receipt(
         }
         _ => None,
     };
-    // Keep the receipt as an ID until its nonce and publication metadata authenticate.
-    // Check masked fields before reporting invalid metadata so the refusal matches a miss.
+    // Check field visibility without loading their terms. A masked field must be
+    // indistinguishable from a miss even when another field fails authentication.
     let mut masked = false;
-    fn field<T>(
-        lookups: &mut Lookups<'_>,
-        subject: Id,
-        predicate: &str,
-        graph: Id,
-        masked: &mut bool,
-        parse: impl FnOnce(Option<&Term>) -> Option<T>,
-    ) -> Result<Option<T>> {
+    let mut field_id = |subject, predicate: &str| -> Result<Option<Id>> {
         let Some(predicate) = lookups.iri(predicate)? else {
             return Ok(None);
         };
-        match lookups.object_ids(subject, predicate, graph)?.as_slice() {
-            [id] => lookups
-                .preparation
-                .with_term(lookups.snap(), *id, |t| Ok(parse(t))),
+        match lookups.object_ids(subject, predicate, graph_id)?.as_slice() {
+            [id] => Ok(Some(*id)),
             [] => {
-                *masked |= lookups.has_hidden_object(subject, predicate, graph)?;
+                masked |= lookups.has_hidden_object(subject, predicate, graph_id)?;
                 Ok(None)
             }
             _ => Ok(None),
         }
-    }
+    };
     let protection = format!("{EV}graphProtection");
-    let record_nonce =
-        field(lookups, iri_id, &protection, graph_id, &mut masked, uuid).map_err(classify_error)?;
-    let receipt_nonce = field(
-        lookups,
-        receipt_id,
-        &protection,
-        graph_id,
-        &mut masked,
-        uuid,
-    )
-    .map_err(classify_error)?;
-    let dataset = field(
-        lookups,
-        receipt_id,
-        &format!("{EV}datasetId"),
-        graph_id,
-        &mut masked,
-        uuid,
-    )
-    .map_err(classify_error)?;
-    let branch = field(
-        lookups,
-        receipt_id,
-        &format!("{EV}branchId"),
-        graph_id,
-        &mut masked,
-        uuid,
-    )
-    .map_err(classify_error)?;
-    let commit = field(
-        lookups,
-        receipt_id,
-        &format!("{EV}commit"),
-        graph_id,
-        &mut masked,
-        |term| match term {
-            Some(Term::Literal(l)) => integer(l),
-            _ => None,
-        },
-    )
-    .map_err(classify_error)?;
+    let record_nonce = field_id(iri_id, &protection).map_err(classify_error)?;
+    let receipt_nonce = field_id(receipt_id, &protection).map_err(classify_error)?;
+    let dataset = field_id(receipt_id, &format!("{EV}datasetId")).map_err(classify_error)?;
+    let branch = field_id(receipt_id, &format!("{EV}branchId")).map_err(classify_error)?;
+    let commit = field_id(receipt_id, &format!("{EV}commit")).map_err(classify_error)?;
     let operation_type = lookups
         .iri(&format!("{EV}Operation"))
         .map_err(classify_error)?;
@@ -4045,12 +4000,38 @@ fn receipt(
     if masked {
         return Err(unavailable(key));
     }
+    let (Some(nonce), Some(record_nonce), Some(receipt_nonce)) =
+        (nonce, record_nonce, receipt_nonce)
+    else {
+        return Err(origin(key));
+    };
+    let read_uuid = |id| {
+        lookups
+            .preparation
+            .with_term(lookups.snap(), id, |term| Ok(uuid(term)))
+            .map_err(classify_error)
+    };
+    if !is_operation
+        || read_uuid(record_nonce)? != Some(nonce)
+        || read_uuid(receipt_nonce)? != Some(nonce)
+    {
+        return Err(origin(key));
+    }
     let (Some(dataset), Some(branch), Some(commit)) = (dataset, branch, commit) else {
         return Err(origin(key));
     };
-    if nonce.is_none() || record_nonce != nonce || receipt_nonce != nonce || !is_operation {
-        return Err(origin(key));
-    }
+    let dataset = read_uuid(dataset)?.ok_or_else(|| origin(key))?;
+    let branch = read_uuid(branch)?.ok_or_else(|| origin(key))?;
+    let commit = lookups
+        .preparation
+        .with_term(lookups.snap(), commit, |term| {
+            Ok(match term {
+                Some(Term::Literal(l)) => integer(l),
+                _ => None,
+            })
+        })
+        .map_err(classify_error)?
+        .ok_or_else(|| origin(key))?;
 
     let mut scratch;
     let held = if let Some(held) = retained {

@@ -682,6 +682,15 @@ impl Installed {
         })
     }
 
+    /// Whether a raw history read may reach evidence writes. A pristine registry
+    /// can have configuration history, but installing any owner advances its
+    /// revision. Later revisions may have exported or removed evidence graphs.
+    pub(crate) fn may_have_evidence_history(&self) -> bool {
+        (self.configuration_history.is_some() && self.graphs.revision != 0)
+            || self.graphs.owners.contains_key(&OwnerKind::Evidence)
+            || self.settings.contains_key(&OwnerKind::Evidence)
+    }
+
     /// Evidence review-policy configuration for support-aware projection visibility,
     /// resolved once at registry installation.
     pub(crate) fn evidence_visibility(&self) -> crate::access::triples::evidence::EvidenceConfig {

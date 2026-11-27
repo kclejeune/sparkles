@@ -312,6 +312,7 @@ async fn ask_route(
         // read on the request's task: the pipeline runs on a blocking thread
         grant: crate::server_memory::current_grant(),
         mode: b.mode,
+        policy_scoped_global: true,
         reviewed_only: b.reviewed_only,
         report_context,
         review_policy: b.review_policy.clone(),

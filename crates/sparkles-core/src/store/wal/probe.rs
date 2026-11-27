@@ -733,6 +733,7 @@ pub(crate) fn prove_prefix_recording<
         visit,
         record_used,
         false,
+        None,
     )
 }
 
@@ -766,6 +767,7 @@ pub(crate) fn prove_prefix_recording_through<
         visit,
         record_used,
         true,
+        None,
     )
 }
 
@@ -796,7 +798,61 @@ pub(crate) fn prove_prefix_through<R: Read + Seek>(
         visit,
         &mut |_, _| Ok(()),
         true,
+        None,
     )
+}
+
+/// Probe published transactions from an indexed boundary, streaming at most
+/// `records` fixed-size records. A result is only conclusive if the reader
+/// verifies the commit at `through`. The caller supplies the matching vocabulary
+/// bound from the live snapshot and never uses this read to establish durability.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::store) fn changed_through(
+    mut file: File,
+    path: &Path,
+    from: WalPoint,
+    after: u64,
+    through: u64,
+    dvocab_len: u64,
+    records: u64,
+    budget: &ColdBudget<'_>,
+    matches: impl Fn([Id; 4]) -> bool,
+) -> Result<Option<bool>> {
+    use std::cell::Cell;
+
+    const BUFFER_BYTES: usize = 8192;
+    budget.owned_limit()?.check(BUFFER_BYTES as u64)?;
+    let version = descriptor_version(&mut file, path)?;
+    let extent = file.metadata()?.len().min(
+        from.offset
+            .saturating_add(records.saturating_mul(WAL_REC as u64)),
+    );
+    let mut reader = BufReader::with_capacity(BUFFER_BYTES, file);
+    let previous = Cell::new(from.seq);
+    let mut matched = false;
+    let proof = prove_prefix_bounded(
+        &mut reader,
+        extent,
+        from.seq,
+        through,
+        dvocab_len,
+        None,
+        path,
+        budget,
+        &mut |commit| {
+            previous.set(commit.point.seq);
+            Ok(())
+        },
+        &mut |_, record| {
+            if previous.get() >= after && wal_is_quad(record[0]) && matches(record_quad(record)) {
+                matched = true;
+            }
+            Ok(())
+        },
+        true,
+        Some((from, version)),
+    )?;
+    Ok(proof.selected.map(|_| matched))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -812,24 +868,28 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
     visit: &mut dyn FnMut(WalCommitObservation) -> Result<()>,
     record_used: &mut F,
     stop_at_target: bool,
+    published_start: Option<(WalPoint, u32)>,
 ) -> Result<ProvenWal> {
-    reader.seek(SeekFrom::Start(0))?;
-    let mut head = WalPoint {
-        seq: base,
-        offset: 0,
-    };
-    let mut selected = (target == base).then_some(head);
+    let (mut head, mut wal_version) = published_start.unwrap_or((
+        WalPoint {
+            seq: base,
+            offset: 0,
+        },
+        0,
+    ));
+    let start = head.offset;
+    reader.seek(SeekFrom::Start(start))?;
+    let mut selected = (target == head.seq).then_some(head);
     if stop_at_target && selected.is_some() {
         budget.check()?;
         return Ok(ProvenWal { head, selected });
     }
     let mut crc = flate2::Crc::new();
     let mut needed = 0;
-    let mut wal_version = 0;
     let mut configuration = ConfigurationRecords::default();
     let mut record = [0; WAL_REC];
     let corrupt = || Error::Corrupt(format!("{}: invalid committed WAL prefix", path.display()));
-    for index in 0..(extent / WAL_REC as u64) as usize {
+    for index in (start / WAL_REC as u64) as usize..(extent / WAL_REC as u64) as usize {
         budget.key_step("WAL prefix record", index)?;
         reader.read_exact(&mut record)?;
         if index == 0 && record[0] != WAL_HEADER {
@@ -868,7 +928,9 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
                     match commit::open_wal_commit_with_crc(&record, crc) {
                         Some(Ok(meta)) if needed <= dvocab_len => meta,
                         _ => {
-                            if durable_after(reader, extent, index, next, budget)? {
+                            if published_start.is_some()
+                                || durable_after(reader, extent, index, next, budget)?
+                            {
                                 return Err(corrupt());
                             }
                             break;
@@ -909,7 +971,8 @@ fn prove_prefix_bounded<R: Read + Seek, F: FnMut(u64, &[u8; WAL_REC]) -> Result<
             }
             _ => {
                 let next = head.seq.checked_add(1).ok_or_else(corrupt)?;
-                if durable_after(reader, extent, index, next, budget)? {
+                if published_start.is_some() || durable_after(reader, extent, index, next, budget)?
+                {
                     return Err(corrupt());
                 }
                 break;

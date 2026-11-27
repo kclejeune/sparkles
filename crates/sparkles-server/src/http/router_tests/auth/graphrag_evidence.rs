@@ -2783,3 +2783,113 @@ async fn global_ask_and_community_reports_enforce_policy_and_footprint_authoriza
     // AuthorityFence stopped reduce before calling the provider a second time.
     assert_eq!(fenced_mock.requests().len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restricted_ordinary_auto_refresh_keeps_counts_with_evidence_enabled() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    tokio::task::spawn_blocking(|| {
+        for graph in [ORG, "urn:g:*"] {
+            let e = env(true);
+            let ds = e.ds();
+            let claim = propose(&ds.dataset, "advisory", leads());
+            decide(&ds.dataset, &claim, Disposition::Accepted, 1);
+            let settings = settings(serde_json::json!({
+                "principal": "rhide",
+                "reviewPolicy": null,
+                "projection": { "graphs": [graph] },
+                "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 1.0 }
+            }));
+            e.run(settings, Mode::Build).unwrap();
+            let state = e.s.state.graphrag.state(ds.store.dataset_id());
+            let build = state.last_build.unwrap();
+            let community = build
+                .communities
+                .iter()
+                .find(|c| c.members.iter().any(|m| m == "<http://ex/x0>"))
+                .unwrap();
+            let fact_count = community.facts.len();
+            assert!(fact_count > 1);
+
+            let mut now = Instant::now();
+            let mut watches: HashMap<String, Watch> = HashMap::new();
+            let mut tick = || {
+                tick_once(&e.s.state, &mut watches, now);
+                now += Duration::from_secs(1);
+                tick_once(&e.s.state, &mut watches, now);
+                now += Duration::from_secs(1);
+                watches["ev"].private().runs
+            };
+            let tasks = || {
+                e.s.state
+                    .tasks
+                    .lock()
+                    .iter()
+                    .filter(|t| t.kind == build::TASK_KIND)
+                    .count()
+            };
+            let initial_checks = tick();
+            assert_eq!(tasks(), 0);
+
+            // This graph is outside the configured projection.
+            ds.dataset
+                .update("INSERT DATA { GRAPH <urn:other> { <http://ex/x0> <urn:note> 0 } }")
+                .unwrap();
+            let after_unrelated = tick();
+            assert_eq!(
+                tasks(),
+                0,
+                "an unrelated commit must leave the task list unchanged"
+            );
+            if graph == ORG {
+                assert_eq!(
+                    after_unrelated, initial_checks,
+                    "the exact graph can count changes"
+                );
+            } else {
+                assert!(
+                    after_unrelated > initial_checks,
+                    "the wildcard needs a private input check"
+                );
+            }
+
+            ds.dataset
+                .update(&format!(
+                    "INSERT DATA {{ GRAPH <{ORG}> {{ <http://ex/x0> <urn:note> 1 }} }}"
+                ))
+                .unwrap();
+            let after_one_fact = tick();
+            assert_eq!(tasks(), 0, "one fact is below the configured threshold");
+            if graph == ORG {
+                assert_eq!(after_one_fact, initial_checks);
+            }
+
+            // Spread the facts across the community to stay inside the report's
+            // per-member literal cap, including when the private check rebuilds inputs.
+            let remaining = (2..=fact_count)
+                .map(|n| {
+                    let member = &community.members[(n - 1) % community.members.len()];
+                    format!("{member} <urn:note> {n} .")
+                })
+                .collect::<String>();
+            ds.dataset
+                .update(&format!(
+                    "INSERT DATA {{ GRAPH <{ORG}> {{ {remaining} }} }}"
+                ))
+                .unwrap();
+            let checks_at_threshold = tick();
+            assert_eq!(
+                tasks(),
+                1,
+                "{graph}: {fact_count} changes reached the threshold after {checks_at_threshold} private checks"
+            );
+            if graph == ORG {
+                assert_eq!(checks_at_threshold, initial_checks);
+            }
+        }
+    })
+    .await
+    .unwrap();
+}

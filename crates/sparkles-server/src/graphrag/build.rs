@@ -1389,9 +1389,9 @@ impl Run<'_> {
         (plans, why)
     }
 
-    /// The private check of the automatic refresh under a review policy (spec C25,
-    /// "Refresh"): a refresh's preparation and plan, read as the principal at the Head
-    /// evidence view, with no estimate, model call, commit, state change or task. It
+    /// A refresh's preparation and plan, read privately as the principal at the head
+    /// with no estimate, model call, commit, state change or task. Under a review
+    /// policy, it reads the Head evidence view (spec C25, "Refresh"). It
     /// answers why the dataset needs a refresh for a change of a report's input, and
     /// `None` when it does not. Pending, failed and stale reports are not such a reason.
     pub(crate) fn private_check(&self) -> Result<Option<String>, RunError> {

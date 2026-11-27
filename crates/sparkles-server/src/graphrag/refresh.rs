@@ -13,7 +13,7 @@
 //! community's changed facts reach `minChangedFraction` of the facts its report was
 //! written from, when an entity joins a community, or when the accumulator cannot cover
 //! every commit (a bulk commit, a change-log gap, memory eviction, a circuit failure, or
-//! data-dependent protections), the loop starts a refresh task. The refresh compares the
+//! data-dependent protections), the loop can start a refresh task. The refresh compares the
 //! fact digests of every report, as a manual refresh does, so it rewrites exactly the
 //! reports that changed enough and keeps the rest, then discards the acted-on counts. It
 //! needs no confirmation, and the daily token budget bounds it.
@@ -26,13 +26,15 @@
 //! Under a review policy, a report's input can change without any change that the
 //! principal's view lists (spec C25, "Refresh"). The loop then runs a private check in
 //! place of a refresh: when a commit changes the policy's decisions or supports graph or
-//! adds a withdrawal to a proposal graph, which it reads from the feed without the
-//! principal's view, when the selected evidence configuration or the access policy's
+//! changes a withdrawal in a proposal graph, which it checks with a bounded raw history
+//! probe, when the selected evidence configuration or the access policy's
 //! generation differs from the one it last checked, when it first sees the dataset, and
 //! when the accumulator cannot cover every commit. The check is a refresh's preparation
 //! and plan with no model call, commit, state change or task, and it starts a refresh
 //! only for a change of a report's input. It keeps its own backoff, so a check that fails
-//! never holds back what the principal's view starts.
+//! never holds back what the principal's view starts. The loop also checks privately
+//! when an evidence-enabled dataset's restricted circuit loses its count range without
+//! a configured review policy.
 
 use super::build::{self, Mode};
 use super::runtime::RefreshCircuit;
@@ -40,10 +42,14 @@ use super::settings::{GraphragSettings, RefreshMode};
 use super::state::BuildState;
 use crate::auth::Endpoint;
 use crate::state::{AppState, Dataset, task_state};
-use oxrdf::{GraphName, Term};
+#[cfg(test)]
+use oxrdf::GraphName;
+use oxrdf::Term;
 use sparkles::commit::CommitKind;
 use sparkles::incr::{Counts, InternalAccess, InternalCircuit, InternalSpec};
+#[cfg(test)]
 use sparkles::store::ChangesOptions;
+use sparkles::store::HistoryPattern;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -69,14 +75,9 @@ const CIRCUIT_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// skips commits to unrelated graphs in one hash probe.
 const MAX_EXACT_GRAPHS_UNION: usize = 16;
 
-/// The most commits one page of the evidence feed lists.
-const PAGE_COMMITS: usize = 1000;
-
-/// The most changes one page of the evidence feed lists.
-const PAGE_QUADS: u64 = 200_000;
-
-/// How long one reading of the evidence feed may take.
-const FEED_DEADLINE: Duration = Duration::from_secs(60);
+/// Work and time allowed for one private evidence history probe.
+const EVIDENCE_PROBE_WORK: u64 = 200_000;
+const EVIDENCE_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 
 const RDF_TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
 
@@ -414,9 +415,7 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
                 .is_none_or(|t| now.duration_since(t) >= debounce);
         // a private check that failed is retried after its own backoff, which an
         // outstanding backoff of the loop holds back as well
-        let private_retry = settings.review_policy.is_some()
-            && w.private.ready(now)
-            && w.retry_at.is_none_or(|t| now >= t);
+        let private_retry = w.private.ready(now) && w.retry_at.is_none_or(|t| now >= t);
         if !w.wants_check(head, now, debounce, build::today()) && !policy_due && !private_retry {
             continue;
         }
@@ -510,7 +509,7 @@ fn private_check(
         detach_if_not_live(st, ds);
         return PrivateOutcome::NotLive;
     }
-    if settings.review_policy.is_none() || !w.private.ready(now) {
+    if !w.private.ready(now) {
         return PrivateOutcome::None;
     }
     w.private.runs += 1;
@@ -543,7 +542,12 @@ fn private_check(
             }
             // the refresh it starts clears the check once it ends well
             tracing::debug!(target: "sparkles::graphrag", dataset = %ds.name, "automatic refresh check: {why}");
-            PrivateOutcome::Reason(CHECK_REASON.into())
+            let reason = if settings.review_policy.is_some() {
+                CHECK_REASON
+            } else {
+                "a private check found reports whose input changed"
+            };
+            PrivateOutcome::Reason(reason.into())
         }
         Err(e) => {
             if !is_live_dataset(st, ds) {
@@ -560,15 +564,15 @@ fn private_check(
 /// Note what makes a private check due under the review policy `e`: the dataset seen
 /// for the first time, as when the server starts, another evidence configuration or
 /// access policy generation, and a commit since the last look that changed the
-/// policy's decisions or supports graph or added a withdrawal to a proposal graph, read
-/// from the feed without the principal's view.
+/// policy's decisions or supports graph or a withdrawal in a proposal graph. The
+/// probe uses raw history because the eventual input check enforces the principal's view.
 fn note_private(st: &AppState, ds: &Dataset, e: &super::evidence::Evidence, w: &mut Watch) {
     let p = &mut w.private;
     if p.configuration.as_deref() != Some(e.policy.configuration.as_str()) {
         p.configuration = Some(e.policy.configuration.clone());
         p.due = true;
     }
-    let access = st.auth.as_ref().map_or(0, |a| a.epoch());
+    let access = st.access_epoch();
     if p.access != Some(access) {
         p.access = Some(access);
         p.due = true;
@@ -583,59 +587,52 @@ fn note_private(st: &AppState, ds: &Dataset, e: &super::evidence::Evidence, w: &
         return;
     }
     p.evidence_seen = Some(head);
-    if !p.due && evidence_changed(ds, e, after, head) {
+    if !p.due
+        && evidence_changed(
+            &ds.store,
+            &e.policy.decisions,
+            &e.policy.supports,
+            &e.proposals,
+            after,
+            head,
+        )
+    {
         p.due = true;
     }
 }
 
 /// Whether a commit in `after..=head` changed the decisions or supports graph of `e`'s
-/// policy or added a withdrawal to a proposal graph, or may have when the feed cannot
-/// list it.
-fn evidence_changed(ds: &Dataset, e: &super::evidence::Evidence, after: u64, head: u64) -> bool {
-    // The private watcher checks raw history. The caller's view is enforced when
-    // the report is rebuilt, and a restricted change feed cannot observe evidence.
-    let o = ChangesOptions {
-        max_commits: PAGE_COMMITS,
-        max_quads: PAGE_QUADS,
-        cancel: None,
-        deadline: Some(Instant::now() + FEED_DEADLINE),
-        graphs: None,
-    };
-    let mut after = after;
-    while after < head {
-        let Ok(page) = ds.store.changes(after, &o) else {
-            return true;
-        };
-        for c in &page.commits {
-            if c.commit.seq > head {
-                return false;
-            }
-            if !c.complete() {
-                return true;
-            }
-            for (_, q) in c.iter() {
-                let GraphName::NamedNode(g) = &q.graph_name else {
-                    continue;
-                };
-                let g = g.as_str();
-                if g == e.policy.decisions || g == e.policy.supports {
-                    return true;
-                }
-                if e.proposals.iter().any(|proposal| proposal == g)
-                    && q.predicate.as_str() == super::store::RDF_TYPE
-                    && matches!(&q.object, Term::NamedNode(o) if o.as_str() == WITHDRAWAL)
-                {
-                    return true;
-                }
-            }
-        }
-        let next = page.next();
-        if page.commits.is_empty() || next >= head.min(page.head.seq) {
-            break;
-        }
-        after = next;
-    }
-    false
+/// policy or changed a withdrawal in a proposal graph, or may have when history is
+/// unavailable or the probe exhausts its budget.
+fn evidence_changed(
+    store: &sparkles::store::Store,
+    decisions: &str,
+    supports: &str,
+    proposals: &[String],
+    after: u64,
+    head: u64,
+) -> bool {
+    let patterns = [decisions, supports]
+        .into_iter()
+        .map(|graph| HistoryPattern {
+            graph,
+            predicate_object: None,
+        })
+        .chain(proposals.iter().map(|graph| HistoryPattern {
+            graph,
+            predicate_object: Some((super::store::RDF_TYPE, WITHDRAWAL)),
+        }));
+    // Unavailable history or a spent budget also makes a private check due.
+    !matches!(
+        store.probe_raw_history(
+            after,
+            head,
+            patterns,
+            EVIDENCE_PROBE_WORK,
+            Instant::now() + EVIDENCE_PROBE_DEADLINE,
+        ),
+        Ok(Some(false))
+    )
 }
 
 /// The memory cap of the refresh accumulator circuit on `st`.
@@ -1408,7 +1405,22 @@ fn due_outcome(
                     live_settings: Box<GraphragSettings>,
                     msg: String|
      -> Result<DueOutcome, String> {
-        if has_evidence {
+        // A restricted circuit can lose its count range when it may read a
+        // support-gated graph, even without a configured review policy. Check
+        // the principal's report inputs before making that loss observable.
+        let private = has_evidence
+            || (require_auto
+                && (ds.store.configuration_history_activated()
+                    || ds.store.snapshot().has_evidence_projection_or_unavailable())
+                && build::authorized_principal(st, ds, &live_settings.principal)?
+                    .view(&ds.name, Endpoint::Query)
+                    .is_some_and(|access| !access.reads_everything()));
+        if private {
+            let access = st.access_epoch();
+            if w.private.access != Some(access) {
+                w.private.access = Some(access);
+                w.private.covered = None;
+            }
             w.private.uncounted(head);
             Ok(DueOutcome::None(live_settings))
         } else {
@@ -1706,6 +1718,53 @@ mod tests {
 
     fn iri(s: &str) -> oxrdf::NamedNode {
         oxrdf::NamedNode::new(s).unwrap()
+    }
+
+    #[test]
+    fn evidence_history_skips_a_large_unrelated_memory_commit() {
+        let store = sparkles::store::Store::in_memory(Default::default());
+        store
+            .set_retention(sparkles::history::Retention {
+                keep_commits: Some(5),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut txn = store.write();
+        let s = txn.intern(&iri("urn:s").into()).unwrap();
+        let p = txn.intern(&iri("urn:p").into()).unwrap();
+        let unrelated = txn.intern(&iri("urn:unrelated").into()).unwrap();
+        let decisions = txn.intern(&iri("urn:decisions").into()).unwrap();
+        txn.insert([s, p, sparkles::id::Id::from_i64(-1).unwrap(), decisions])
+            .unwrap();
+        txn.commit().unwrap();
+        let after = store.head_commit().seq;
+        let mut txn = store.write();
+        for n in 0..200_001 {
+            txn.insert([s, p, sparkles::id::Id::from_i64(n).unwrap(), unrelated])
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        let head = store.head_commit().seq;
+        assert!(!evidence_changed(
+            &store,
+            "urn:decisions",
+            "urn:supports",
+            &[],
+            after,
+            head,
+        ));
+        let mut txn = store.write();
+        txn.insert([s, p, sparkles::id::Id::from_i64(0).unwrap(), decisions])
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(evidence_changed(
+            &store,
+            "urn:decisions",
+            "urn:supports",
+            &[],
+            head,
+            store.head_commit().seq,
+        ));
     }
 
     #[test]

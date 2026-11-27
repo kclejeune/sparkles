@@ -6312,3 +6312,41 @@ fn record_charged_covers_verified_result_and_skips_unauthenticated_receipt_decod
         "nonce check must reject planted record before decoding the 10 KiB receipt IRI"
     );
 }
+
+#[test]
+fn invalid_receipt_protection_is_rejected_before_publication_values_are_decoded() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    evidence::detach(&ds, SOURCES).unwrap();
+    let oversized = "x".repeat(10_000);
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{SOURCES}> {{
+           <urn:planted-revision> a <urn:x-sparkles:evidence:SourceRevision> ;
+             <urn:x-sparkles:evidence:availabilityReceipt> <urn:planted-receipt> ;
+             <urn:x-sparkles:evidence:graphProtection> \"wrong\" .
+           <urn:planted-receipt> a <urn:x-sparkles:evidence:Operation> ;
+             <urn:x-sparkles:evidence:graphProtection> \"wrong\" ;
+             <urn:x-sparkles:evidence:datasetId> \"{oversized}\" ;
+             <urn:x-sparkles:evidence:branchId> \"{}\" ;
+             <urn:x-sparkles:evidence:commit> 1 .
+         }} }}",
+        ds.store().branch_id(),
+    ))
+    .unwrap();
+    configured(&ds);
+
+    let mut capped = Resolution::with_memory(Control::none(), 256 * 1024).unwrap();
+    let result = capped.record_charged(
+        "k",
+        &ds,
+        &ds,
+        Some(Arc::new(GraphAccess::all())),
+        &iri("urn:planted-revision"),
+        &[RecordKind::SourceRevision],
+        None,
+    );
+    assert_eq!(
+        code(result.map(|(record, _)| record)),
+        "origin-not-reproduced"
+    );
+}

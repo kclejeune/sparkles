@@ -1697,12 +1697,9 @@ impl<'a> Reads<'a> {
         let (Some(s), Some(p), Some(g)) = (self.id(s)?, self.id(p)?, self.id(g)?) else {
             return Ok((Vec::new(), false));
         };
-        const ROW: u64 = std::mem::size_of::<Id>() as u64;
-        const CHUNK: usize = 1024;
         const OUT_ROW: u64 = std::mem::size_of::<Term>() as u64;
         const OUT_CHUNK: usize = 256;
-        let mut rows_held = self.preparation.reserve(0)?;
-        let mut ids: Vec<Id> = Vec::new();
+        let mut ids: Buffer<Id> = Buffer::new(self.preparation)?;
         let mut more = false;
         self.preparation
             .scan(self.snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
@@ -1710,17 +1707,12 @@ impl<'a> Reads<'a> {
                     more = true;
                     return Ok(false);
                 }
-                if ids.len() == ids.capacity() {
-                    let add = limit.saturating_sub(ids.len()).clamp(1, CHUNK);
-                    rows_held.grow_by((add as u64).saturating_mul(ROW))?;
-                    ids.reserve_exact(add);
-                }
-                ids.push(q[2]);
+                ids.push(q[2])?;
                 Ok(true)
             })?;
         let mut out: Vec<Term> = Vec::new();
         let total = ids.len();
-        for (i, id) in ids.into_iter().enumerate() {
+        for (i, &id) in ids.iter().enumerate() {
             if out.len() == out.capacity() {
                 let add = total.saturating_sub(i).clamp(1, OUT_CHUNK);
                 held.grow_by((add as u64).saturating_mul(OUT_ROW))?;
