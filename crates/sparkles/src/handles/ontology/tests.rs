@@ -2971,6 +2971,28 @@ mod classification {
         }
 
         let req = OntologyRequest::default();
+        // Warm terminology only. The sweep sets the budget for a fresh classifier
+        // and its staged axiom references. Cold decode has its own refusal test.
+        let staging_bytes = |ds: &Dataset, assertions: bool| {
+            let h = ds.ontology();
+            let options = opts();
+            let opened = h.open(&req, &options).unwrap();
+            let work = super::classify::working(&options, &opened);
+            let mut count = opened.ontology.axioms.len();
+            if assertions {
+                opened
+                    .assertions(&options, |ax, _, _| {
+                        if let Some(ax) = ax {
+                            super::classify::stage_assertion(&work, &ax)?;
+                            count += 1;
+                        }
+                        Ok(true)
+                    })
+                    .unwrap();
+            }
+            super::classify::stage_axioms(&work, count).unwrap();
+            work.lock().bytes()
+        };
         for (tier, body) in [("el", el_body), ("horn", horn_body)] {
             let full = dataset(&body)
                 .ontology()
@@ -2982,8 +3004,9 @@ mod classification {
             let (ds, part) = (1..20)
                 .find_map(|k| {
                     let ds = dataset(&body);
+                    let staged = staging_bytes(&ds, false);
                     let o = QueryOptions {
-                        max_memory_bytes: Some(peak * k / 20),
+                        max_memory_bytes: Some(staged + peak * k / 20),
                         ..opts()
                     };
                     match ds.ontology().classify(&req, &partial_request(), &o) {
@@ -3046,8 +3069,9 @@ mod classification {
             let (assert_ds, part_assert) = (1..20)
                 .find_map(|k| {
                     let ds = dataset(&assert_body);
+                    let staged = staging_bytes(&ds, true);
                     let o = QueryOptions {
-                        max_memory_bytes: Some(assert_peak * k / 20),
+                        max_memory_bytes: Some(staged + assert_peak * k / 20),
                         ..opts()
                     };
                     match ds.ontology().classify(&req, &assert_req, &o) {

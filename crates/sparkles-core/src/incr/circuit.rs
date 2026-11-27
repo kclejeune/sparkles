@@ -329,7 +329,7 @@ pub struct Circuit {
     pub(crate) version_allocs: usize,
     /// query pool backing this circuit's accounting domain, when attached
     pool: Option<Arc<QueryPool>>,
-    standalone_pool: bool,
+    defer_retired: bool,
     /// hierarchical budget for operator state, result, terms, provenance, history/tally,
     /// pass scratch, and nested SPARQL evaluation. Declared last so all payloads drop
     /// strictly before parent credit returns.
@@ -546,18 +546,33 @@ impl Circuit {
             #[cfg(test)]
             version_allocs: 0,
             pool: None,
-            standalone_pool: false,
+            defer_retired: false,
             budget: ViewBudget::new(None, None),
         }
     }
 
     /// Bind this circuit's accounting before building state. An explicit parent
-    /// supplies the caller's limits. Otherwise the circuit reserves from the pool.
+    /// supplies the caller's limits. Pair a query-pool parent with its pool so nested
+    /// SPARQL shares that domain. Without an explicit parent the pool supplies one.
     pub fn set_pool(&mut self, pool: Option<Arc<QueryPool>>, parent: Option<ParentHandle>) {
-        self.standalone_pool = pool.is_some() && parent.is_none();
         self.budget
             .set_parent(parent.or_else(|| pool.as_ref().map(QueryPool::work_parent)));
         self.pool = pool;
+    }
+
+    pub(crate) fn set_runtime_pool(
+        &mut self,
+        pool: Option<Arc<QueryPool>>,
+        parent: Option<ParentHandle>,
+    ) {
+        self.defer_retired = true;
+        self.set_pool(pool, parent);
+    }
+
+    fn drain_standalone(&self) {
+        if !self.defer_retired {
+            drop(self.drain_retired());
+        }
     }
 
     /// Set the circuit's local byte limit (`None`: unlimited locally).
@@ -618,6 +633,7 @@ impl Circuit {
 
     /// Install a transferred pool and budget onto a fresh replacement circuit.
     pub(crate) fn install_budget(&mut self, pool: Option<Arc<QueryPool>>, budget: ViewBudget) {
+        self.defer_retired = true;
         self.pool = pool;
         self.budget = budget;
         self.budget.set_local_limit(self.max_memory_bytes);
@@ -890,22 +906,31 @@ impl Circuit {
         })
     }
 
-    /// The circuit's charge excludes allocations with independent publication credit.
-    fn accounted_bytes(&self) -> u64 {
-        if self.version_pool.is_some() && self.budget.backs_publication() {
-            self.bytes().saturating_sub(self.version_bytes())
-        } else {
-            self.bytes()
-        }
+    pub(crate) fn published_bytes(&self) -> u64 {
+        self.version
+            .as_ref()
+            .map_or(0, |version| version.published_bytes())
     }
 
-    fn publication_installed(&self) {
-        let local = if self.version_pool.is_some() && self.budget.backs_publication() {
+    /// The circuit's charge excludes allocations with independent publication credit.
+    fn accounted_bytes(&self) -> u64 {
+        self.bytes().saturating_sub(self.detached_bytes())
+    }
+
+    fn detached_bytes(&self) -> u64 {
+        if !self.budget.backs_publication() {
+            return 0;
+        }
+        let version = if self.version_pool.is_some() {
             self.version_bytes()
         } else {
             0
         };
-        self.budget.set_publication_local(local);
+        version.saturating_add(self.terms.detached_bytes())
+    }
+
+    fn publication_installed(&self) {
+        self.budget.set_publication_local(self.detached_bytes());
     }
 
     /// The approximate memory of the state and the result.
@@ -978,12 +1003,7 @@ impl Circuit {
         let terms_bytes = if reusing_terms {
             0
         } else {
-            let terms = self.terms.projected_frozen_bytes(has_pool)?;
-            if has_pool && self.budget.backs_publication() {
-                terms.saturating_add(self.terms.new_publication_key_bytes())
-            } else {
-                terms
-            }
+            self.terms.projected_frozen_bytes(has_pool)?
         };
         let version_hdr = if has_pool {
             (std::mem::size_of::<ViewVersion>() + 16 + std::mem::size_of::<PublishedBytes>() + 16)
@@ -1152,6 +1172,13 @@ impl Circuit {
     }
 
     pub(crate) fn set_version_pool(&mut self, pool: Option<Arc<AtomicU64>>) -> Result<()> {
+        if pool.is_none() {
+            self.version_pool = None;
+            self.version = None;
+            self.publication_installed();
+            self.budget.abort_pass(self.accounted_bytes());
+            return Ok(());
+        }
         // A live-only circuit already has a version, so preserve it if new publication
         // admission fails when the first named view attaches.
         let old_pool = std::mem::replace(&mut self.version_pool, pool);
@@ -1159,7 +1186,7 @@ impl Circuit {
         let old_version = self.version.take();
         self.publication_installed();
         let publish = (|| {
-            if self.version_pool.is_none() || self.snap.is_none() {
+            if self.snap.is_none() {
                 return Ok(());
             }
             let (rows, bytes) = self.projected_version_alloc_bytes(false)?;
@@ -1173,7 +1200,7 @@ impl Circuit {
                 self.publication_installed();
             })
         })();
-        if let Err(error) = publish {
+        if let Err(error) = publish.and_then(|()| self.budget.commit_pass(self.accounted_bytes())) {
             self.version_pool = old_pool;
             self.version = old_version;
             self.publication_installed();
@@ -1181,7 +1208,7 @@ impl Circuit {
             return Err(error);
         }
         drop(old_version);
-        self.budget.commit_pass(self.accounted_bytes())
+        Ok(())
     }
 
     /// Advance the version's commit and snapshot without copying rows or terms,
@@ -1225,14 +1252,30 @@ impl Circuit {
                 .version
                 .as_ref()
                 .is_none_or(|version| version.commit != commit)
-            && let Err(error) = self
+        {
+            let version = self.version.clone();
+            if let Err(error) = self
                 .bump_version_budgeted(commit, snap.clone())
                 .and_then(|()| self.budget.commit_pass(self.accounted_bytes()))
-        {
-            self.applied = previous;
-            return Err(error);
+            {
+                self.applied = previous;
+                self.version = version;
+                self.publication_installed();
+                self.budget.abort_pass(self.accounted_bytes());
+                return Err(error);
+            }
         }
         Ok(())
+    }
+
+    fn skip_to(&mut self, snap: Arc<Snapshot>) -> Result<ChargedAdvance> {
+        let commit = snap.commit;
+        let previous = self.snap.replace(snap);
+        if let Err(error) = self.set_applied(commit) {
+            self.snap = previous;
+            return Err(error);
+        }
+        Ok(ChargedAdvance::Skipped)
     }
 
     fn pass<'a>(
@@ -1413,11 +1456,8 @@ impl Circuit {
 
     /// Evaluate the circuit from scratch at `snap`.
     pub fn build(&mut self, snap: Arc<Snapshot>, control: &Control) -> Result<()> {
-        if !self.standalone_pool {
-            return self.build_inner(snap, control);
-        }
         let result = self.build_inner(snap, control);
-        drop(self.drain_retired());
+        self.drain_standalone();
         result
     }
 
@@ -1513,9 +1553,7 @@ impl Circuit {
     /// The state as checkpoint bytes, its terms read from `snap`.
     pub fn encode(&self, snap: &Snapshot) -> Result<Vec<u8>> {
         let body = self.encode_charged(snap).map(|(body, _lease)| body);
-        if self.standalone_pool {
-            drop(self.drain_retired());
-        }
+        self.drain_standalone();
         body
     }
 
@@ -1536,10 +1574,12 @@ impl Circuit {
     pub fn decode(&mut self, body: &[u8], snap: &Arc<Snapshot>) -> Result<()> {
         self.budget.set_local_limit(self.max_memory_bytes);
         let mut body_lease = self.budget.scratch_lease();
-        body_lease.try_reserve(body.len() as u64)?;
-        let res = self.decode_with_input_charged(body, snap);
+        let result = body_lease
+            .try_reserve(body.len() as u64)
+            .and_then(|()| self.decode_with_input_charged(body, snap));
         drop(body_lease);
-        res
+        self.drain_standalone();
+        result
     }
 
     /// Like [`decode`](Self::decode), when the caller already holds a [`ScratchLease`]
@@ -1595,9 +1635,9 @@ impl Circuit {
 
     /// Evaluate again at `d.snapshot` and return the change of the result.
     pub fn reset(&mut self, d: &DeltaSet, control: &Control) -> Result<Changes> {
-        let (diff, lease) = self.reset_charged(d, control)?;
-        drop(lease);
-        Ok(diff)
+        let result = self.reset_charged(d, control).map(|(diff, _lease)| diff);
+        self.drain_standalone();
+        result
     }
 
     /// Like [`reset`](Self::reset), returning the [`ScratchLease`] covering the diff
@@ -1610,7 +1650,7 @@ impl Circuit {
         let snap = d.snapshot.clone();
         if !self.keep_result {
             // no result to compare with: the change is not known
-            self.build(snap, control)?;
+            self.build_inner(snap, control)?;
             return Ok((Vec::new(), self.budget.scratch_lease()));
         }
         // the old result in the new id space, to compare with
@@ -1621,13 +1661,22 @@ impl Circuit {
         }
         self.budget.set_local_limit(self.max_memory_bytes);
         let width = self.root.schema.len();
-        let before_bytes = self.result.bytes(width).saturating_add(self.terms.bytes());
+        let before_bytes =
+            self.result
+                .bytes(width)
+                .saturating_add(self.terms.bytes().saturating_sub(
+                    if self.budget.backs_publication() {
+                        self.terms.detached_bytes()
+                    } else {
+                        0
+                    },
+                ));
         // Declare `before_lease` before `before` and `old_terms` so Rust drops payloads
         // strictly before releasing their scratch credit on every exit path.
         let before_lease = self.budget.move_state_to_scratch(before_bytes)?;
         let before = std::mem::take(&mut self.result);
         let old_terms = std::mem::take(&mut self.terms);
-        self.build(snap.clone(), control)?;
+        self.build_inner(snap.clone(), control)?;
         let mut diff_lease = self.budget.scratch_lease();
         let diff = if old_terms.is_empty() {
             let diff = Self::minus_budgeted(&self.result, &before, width, &mut diff_lease)?;
@@ -1720,17 +1769,15 @@ impl Circuit {
 
     /// Apply the net changes `d` (whose `after` must be the circuit's commit).
     pub fn advance(&mut self, d: &DeltaSet, control: &Control) -> Result<Advance> {
-        match self.advance_charged(d, control)? {
-            ChargedAdvance::Skipped => Ok(Advance::Skipped),
-            ChargedAdvance::Changed(out, lease) => {
-                drop(lease);
-                Ok(Advance::Changed(out))
-            }
-            ChargedAdvance::Reset(out, lease) => {
-                drop(lease);
-                Ok(Advance::Reset(out))
-            }
-        }
+        let result = self
+            .advance_charged(d, control)
+            .map(|advance| match advance {
+                ChargedAdvance::Skipped => Advance::Skipped,
+                ChargedAdvance::Changed(out, _lease) => Advance::Changed(out),
+                ChargedAdvance::Reset(out, _lease) => Advance::Reset(out),
+            });
+        self.drain_standalone();
+        result
     }
 
     /// Apply the output of a delta pass to persistent result and annotation state while
@@ -1877,10 +1924,7 @@ impl Circuit {
                 _ => d.added.is_empty() && d.removed.is_empty(),
             };
             if skip {
-                let commit = snap.commit;
-                self.snap = Some(snap);
-                self.set_applied(commit)?;
-                return Ok(ChargedAdvance::Skipped);
+                return self.skip_to(snap);
             }
             let old = d.old()?;
             let (mut p, root) =
@@ -1916,10 +1960,7 @@ impl Circuit {
             .expect("resolved above")
             .touches(added.iter().chain(removed.iter()));
         if !touched {
-            let commit = snap.commit;
-            self.snap = Some(snap);
-            self.set_applied(commit)?;
-            return Ok(ChargedAdvance::Skipped);
+            return self.skip_to(snap);
         }
         let old = d.old()?;
         let (mut p, root) = self.pass(snap.clone(), Some(old), &added, &removed, &vis, control);
@@ -2172,6 +2213,37 @@ impl Circuit {
 mod tests {
     use super::*;
     use crate::sparql::{QueryOptions, parse_query, update};
+
+    #[test]
+    fn published_term_keys_have_one_credit_until_the_last_owner() {
+        let store = Store::in_memory(Default::default());
+        let text = format!(
+            r#"SELECT ?key WHERE {{ BIND(UCASE("{}") AS ?key) }}"#,
+            "a".repeat(128 << 10)
+        );
+        let query = crate::sparql::parse_query(&text, None, &[]).unwrap();
+        let mut c = Circuit::new(super::super::compile::compile(&query, None).unwrap(), None);
+        let pool = QueryPool::new(8 << 20);
+        c.set_pool(Some(pool.clone()), None);
+        let snap = store.snapshot();
+        c.build(snap, &Control::none()).unwrap();
+        let published = Arc::new(AtomicU64::new(0));
+        c.set_version_pool(Some(published)).unwrap();
+        drop(c.drain_retired());
+        assert!(c.terms.bytes() > 64 << 10);
+        assert_eq!(
+            c.budget.live_credit() + c.published_bytes(),
+            c.bytes(),
+            "the same key was charged twice"
+        );
+        let version = c.version.clone().unwrap();
+        c.set_version_pool(None).unwrap();
+        drop(c.drain_retired());
+        drop(c);
+        assert!(pool.granted() > 64 << 10);
+        drop(version);
+        assert_eq!(pool.granted(), 0);
+    }
 
     #[test]
     fn root_absorbs_long_property_path_witness_without_an_effective_copy() {

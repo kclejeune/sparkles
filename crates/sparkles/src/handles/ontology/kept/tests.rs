@@ -333,7 +333,15 @@ fn mutation_errors_and_unwinds_discard_both_owners_but_not_a_read_arc() {
             h.with_kept(&o, &req(), false, &opts(), "dlQuery", |e| {
                 e.run_over(&o, vec![], |s, axioms, changes| {
                     let par = super::super::classify::admit(1, &opts())?;
-                    super::super::classify::saturate(s, axioms, changes, par, false, &opts())?;
+                    super::super::classify::saturate(
+                        s,
+                        axioms,
+                        changes,
+                        par,
+                        false,
+                        &opts(),
+                        &super::super::classify::working(&opts(), &o),
+                    )?;
                     if panic {
                         panic!("controlled mutation unwind");
                     }
@@ -1331,19 +1339,21 @@ fn isolated_names_never_redecide_graph_guards_after_triple_masking() {
     partial.complete_for_taken = false;
     partial.consistency = sparkles_owl::classify::Consistency::Unknown;
     c.classification = Arc::new(partial);
-    c.publication = KeptClassification::capture(
-        &ds.ontology(),
-        &request,
-        &ClassifyRequest {
-            partial: true,
-            ..Default::default()
-        },
-        &c.opened,
-        c.classification.clone(),
-        c.excluded.clone(),
-        &c.read_options,
-    )
-    .unwrap();
+    c.publication = Arc::new(
+        KeptClassification::capture(
+            &ds.ontology(),
+            &request,
+            &ClassifyRequest {
+                partial: true,
+                ..Default::default()
+            },
+            &c.opened,
+            ((*c.classification).clone(), (*c.excluded).clone()),
+            &c.read_options,
+            &super::super::classify::working(&c.read_options, &c.opened),
+        )
+        .unwrap(),
+    );
     let partial_frame = super::super::wire::classify_body(
         "fixture",
         &c,

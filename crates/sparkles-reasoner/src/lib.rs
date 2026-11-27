@@ -1315,7 +1315,16 @@ fn materialize_admitted(
 ) -> anyhow::Result<ReasonReport> {
     let mut laps = Laps::new(t0);
     let staging = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
-    let (mut txn, raw, resolved) = lock_with_changes(store, inc, opts, &staging, &mut laps)?;
+    let full = Incremental {
+        since: None,
+        cache: None,
+    };
+    let staged = if matches!(profile, Profile::ShaclAf(_)) {
+        full
+    } else {
+        inc
+    };
+    let (mut txn, raw, resolved) = lock_with_changes(store, staged, opts, &staging, &mut laps)?;
     drop(staging);
     let snap = txn.base().clone();
     let inspected = match &opts.inspect {

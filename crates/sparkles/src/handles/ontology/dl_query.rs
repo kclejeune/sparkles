@@ -53,6 +53,7 @@ use sparkles_owl::classify::{Changes, Description, Excluded, Gap, Saturation};
 use sparkles_owl::manchester::{self, Parsed, Vocabulary, What};
 use sparkles_owl::profiles::{self, Profile};
 use sparkles_owl::{Axiom, AxiomKind, Class, ClassExpression, EntityKind, Individual, write};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The fresh class a query defines as equivalent to its expression.
@@ -273,6 +274,7 @@ pub struct DlQueryAnswer {
     /// again only what the query reaches
     pub incremental: bool,
     pub elapsed: Duration,
+    _memory: Option<Arc<crate::reasoning::memory::Memory>>,
 }
 
 /// The query's defining axiom.
@@ -433,6 +435,8 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<DlQueryAnswer> {
         let start = Instant::now();
+        let defaults = self.ds.with_query_defaults(opts);
+        let opts = &defaults;
         if req.inferences {
             return Err(Error::invalid(
                 "a DL query reasons over the asserted axioms: leave out 'inferences'",
@@ -536,6 +540,9 @@ impl Ontologies {
         why: String,
         opts: &QueryOptions,
     ) -> Result<DlQueryAnswer> {
+        use super::classify::{copy_excluded, stage_assertion, stage_axioms, working};
+        let work = working(opts, o);
+        let mut retained = 0;
         let qc = Class::new(QUERY_CLASS);
         let mut answer = DlQueryAnswer {
             opened: o.clone(),
@@ -559,6 +566,7 @@ impl Ontologies {
             instances: None,
             incremental: false,
             elapsed: Duration::ZERO,
+            _memory: None,
         };
         // saturates `axioms` with the defining axiom and describes the query class, on
         // the threads of the request
@@ -567,19 +575,23 @@ impl Ontologies {
                         changes: Option<Changes<'_>>,
                         par: Par|
          -> Result<(bool, Description, Vec<Excluded>, u64)> {
-            let r = saturate(s, axioms, changes, par, q.el_only, opts)?;
+            let staged = work.lock().bytes();
+            let r = saturate(s, axioms, changes, par, q.el_only, opts, &work)?;
+            work.lock()
+                .shrink_to(staged.saturating_add(r.stats.memory as u64));
+            work.lock().grow(s.description_memory() as u64)?;
             let d = s.describe(&qc).ok_or_else(|| {
                 Error::invalid("the classifier holds no saturation of the query class")
             })?;
             Ok((
                 r.consistent,
                 d,
-                s.excluded().to_vec(),
-                r.stats.memory as u64,
+                copy_excluded(s, &work)?,
+                r.stats.memory.saturating_add(s.cached_description_bytes()) as u64,
             ))
         };
         if q.answers.classes() {
-            let keep = opts.graphs.is_none() && o.snapshot.cacheable;
+            let keep = self.can_keep(o, opts) && opts.graphs.is_none() && o.snapshot.cacheable;
             let (consistent, d, excluded) = if keep {
                 answer.incremental = true;
                 // the kept saturation reads the defining axiom beside the ontology's, and
@@ -588,6 +600,8 @@ impl Ontologies {
                     // the threads come first: a wait that ends at the deadline leaves the
                     // kept state as it was
                     let par = admit(q.threads, opts)?;
+                    e.stage_input(o, 1, &work)?;
+                    stage_assertion(&work, ax)?;
                     let (c, d, ex, memory) =
                         e.run_over(o, vec![ax.kind.clone()], |s, axioms, changes| {
                             describe(s, axioms, changes, par)
@@ -596,6 +610,7 @@ impl Ontologies {
                     Ok(((c, d, ex), keep))
                 })?
             } else {
+                stage_axioms(&work, o.ontology.axioms.len() + 1)?;
                 let mut axioms = logical_axioms(&o.ontology);
                 axioms.push(&ax.kind);
                 let par = admit(q.threads, opts)?;
@@ -604,34 +619,49 @@ impl Ontologies {
             };
             answer.consistent = Some(consistent);
             answer.satisfiable = Some(d.satisfiable);
+            retained += 1024 + sparkles_owl::classify::excluded_copy_bytes(&excluded) * 3;
+            retained += [
+                &d.equivalents,
+                &d.superclasses,
+                &d.direct_superclasses,
+                &d.subclasses,
+                &d.direct_subclasses,
+            ]
+            .iter()
+            .flat_map(|classes| classes.iter())
+            .map(|class| 48 + class.as_str().len())
+            .sum::<usize>();
+            work.lock().grow(retained as u64)?;
             answer.reasoning.gaps = gaps_of(&excluded);
             answer.reasoning.complete = excluded.is_empty();
             let a = &q.answers;
-            answer.equivalents = a.equivalents.then(|| d.equivalents.clone());
-            answer.superclasses = a.superclasses.then(|| d.superclasses.clone());
-            answer.direct_superclasses =
-                a.direct_superclasses.then(|| d.direct_superclasses.clone());
-            answer.subclasses = a.subclasses.then(|| d.subclasses.clone());
-            answer.direct_subclasses = a.direct_subclasses.then(|| d.direct_subclasses.clone());
+            answer.equivalents = a.equivalents.then_some(d.equivalents);
+            answer.superclasses = a.superclasses.then_some(d.superclasses);
+            answer.direct_superclasses = a.direct_superclasses.then_some(d.direct_superclasses);
+            answer.subclasses = a.subclasses.then_some(d.subclasses);
+            answer.direct_subclasses = a.direct_subclasses.then_some(d.direct_subclasses);
             if a.instances {
                 answer.reasoning.notes.push(
                     "the class answers read the terminology, and the instances the terminology with the assertions"
                         .into(),
                 );
             }
+            work.lock().shrink_to(retained as u64);
         }
         if q.answers.instances {
             // the assertions take part in this classification only, which the dataset
             // does not keep
             let mut assertions: Vec<Axiom> = Vec::new();
-            o.assertions(opts, |a, _, _| {
+            o.assertions_with_memory(opts, Some(&work), |a, _, _| {
                 if let Some(a) = a {
+                    stage_assertion(&work, &a)?;
                     assertions.push(a);
                 }
                 Ok(true)
             })?;
             // an individual that only a declaration names is an instance of owl:Thing,
             // which gives it a context of its own
+            stage_axioms(&work, o.ontology.axioms.len() * 2 + assertions.len() + 1)?;
             let declared: Vec<Axiom> = o
                 .ontology
                 .entities(EntityKind::NamedIndividual)
@@ -659,6 +689,15 @@ impl Ontologies {
             if answer.satisfiable.is_none() {
                 answer.satisfiable = Some(d.satisfiable);
             }
+            let added = d
+                .instances
+                .iter()
+                .map(|i| 64 + i.as_str().len())
+                .sum::<usize>()
+                + sparkles_owl::classify::excluded_copy_bytes(&excluded) * 3
+                + 256;
+            work.lock().grow(added as u64)?;
+            retained += added;
             answer.instances = Some(d.instances.into_iter().map(Individual::Named).collect());
             answer.reasoning.instances_complete = Some(excluded.is_empty());
             for g in gaps_of(&excluded) {
@@ -670,6 +709,7 @@ impl Ontologies {
                 answer.reasoning.complete = excluded.is_empty();
             }
         }
+        answer._memory = Some(Arc::new(work.lock().split(retained as u64)?));
         Ok(answer)
     }
 }
@@ -732,7 +772,7 @@ fn rl(
     why: String,
     opts: &QueryOptions,
 ) -> Result<DlQueryAnswer> {
-    let mut memory = crate::reasoning::memory::Memory::query(opts);
+    let mut memory = crate::reasoning::memory::Memory::query_after(opts, o.request_bytes);
     let mut quads = Vec::new();
     let mut push = |triple: &oxrdf::Triple| -> Result<()> {
         check(opts)?;
@@ -976,6 +1016,7 @@ fn rl(
         instances,
         incremental: false,
         elapsed: Duration::ZERO,
+        _memory: None,
     })
 }
 

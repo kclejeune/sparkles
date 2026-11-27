@@ -249,7 +249,7 @@ impl Runtime {
                 c.inference = rebuild.inference.clone();
                 c.aggregate_errors = Some(rebuild.aggregate_errors);
                 c.max_memory_bytes = rebuild.max_memory_bytes;
-                c.set_pool(pool, parent);
+                c.set_runtime_pool(pool, parent);
                 if let Some(limit) = r.max_memory_bytes {
                     let effective = c.max_memory_bytes.map_or(limit, |m| m.min(limit));
                     c.set_local_limit(Some(effective));

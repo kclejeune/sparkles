@@ -162,7 +162,12 @@ fn facade_reasoning_operations_return_exact_pool_credit_to_zero() {
     // 6. Entailment diff, justify, diagnostics
     let diff = ds.reasoning().diff(&DiffRequest::new("1", "head")).unwrap();
     assert!(diff.added > 0);
-    assert_eq!(pool.granted(), 0, "entailment diff must return credit");
+    assert!(
+        pool.granted() > 0,
+        "the live diff report must keep its credit"
+    );
+    drop(diff);
+    assert_eq!(pool.granted(), 0, "dropping the diff must return credit");
 
     let _just = ds
         .reasoning()
@@ -639,6 +644,31 @@ fn classifier_and_rl_dl_query_respect_pool_without_explicit_grant() {
     drop(sibling);
     assert_eq!(pool.granted(), 0);
 
+    let partial_room = pool.work_parent().reserve(pool.capacity() - 4096).unwrap();
+    let error = ds
+        .ontology()
+        .open(&req, &Default::default())
+        .err()
+        .expect("cold decoding must fail even after graph discovery fits");
+    assert!(is_server_memory(&error), "{error:?}");
+    assert_eq!(pool.granted(), partial_room.bytes());
+    drop(partial_room);
+
+    assert!(
+        !ds.ontology()
+            .open(&req, &Default::default())
+            .unwrap()
+            .cached
+    );
+    assert!(
+        ds.ontology()
+            .open(&req, &Default::default())
+            .unwrap()
+            .cached
+    );
+    let open_credit = pool.granted();
+    assert!(open_credit > 0);
+
     let grant = Arc::new(pool.empty_grant());
     grant.charge(128).unwrap();
     let answer = ds
@@ -652,10 +682,14 @@ fn classifier_and_rl_dl_query_respect_pool_without_explicit_grant() {
             },
         )
         .unwrap();
-    assert_eq!(grant.used(), 128);
+    assert!(
+        grant.used() > 128,
+        "the live one-shot classification owns caller credit"
+    );
     drop(answer);
+    assert_eq!(grant.used(), 128);
     drop(grant);
-    assert_eq!(pool.granted(), 0);
+    assert_eq!(pool.granted(), open_credit);
 
     let kept = ds
         .ontology()
@@ -719,5 +753,133 @@ fn cold_rdfs_explanation_respects_the_dataset_pool() {
     assert_eq!(pool.granted(), sibling.bytes());
     drop(sibling);
     ds.reasoning().explain(&req).unwrap();
+    assert_eq!(pool.granted(), 0);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn classification_retention_refusal_leaves_a_request_owned_answer() {
+    use sparkles::handles::ontology::OntologyRequest;
+    use sparkles::store::{Store, StoreOptions};
+
+    let data = "INSERT DATA { <urn:A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:B> }";
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 4 * MIB).unwrap();
+    let ds = Dataset::from_store_with(
+        Store::in_memory(StoreOptions::default()),
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        },
+    );
+    ds.update(data).unwrap();
+    let request = OntologyRequest::default();
+    let retained = pool.retained_parent().reserve(4 * MIB).unwrap();
+    let answer = ds
+        .ontology()
+        .classify(&request, &Default::default(), &Default::default())
+        .unwrap();
+    assert!(answer.classification.complete);
+    assert!(pool.granted() > 0);
+    drop(answer);
+    assert_eq!(pool.granted(), 0);
+    drop(retained);
+
+    let unpooled = Dataset::memory();
+    unpooled.update(data).unwrap();
+    for use_grant in [true, false] {
+        let grant = Arc::new(pool.empty_grant());
+        let opts = QueryOptions {
+            grant: use_grant.then(|| grant.clone()),
+            pool: (!use_grant).then(|| pool.clone()),
+            ..Default::default()
+        };
+        let answer = unpooled
+            .ontology()
+            .classify(&request, &Default::default(), &opts)
+            .unwrap();
+        assert!(pool.granted() > 0);
+        assert!(!answer.reused);
+        drop(answer);
+        assert_eq!(grant.used(), 0);
+        drop(opts);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+    let grant = Arc::new(pool.empty_grant());
+    let opened = unpooled
+        .ontology()
+        .open(
+            &request,
+            &QueryOptions {
+                grant: Some(grant.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ontology = opened.ontology.clone();
+    drop(opened);
+    assert!(
+        grant.used() > 0,
+        "the shared ontology owns its decoding credit"
+    );
+    drop(ontology);
+    assert_eq!(grant.used(), 0);
+    let error = unpooled
+        .ontology()
+        .classify(
+            &request,
+            &Default::default(),
+            &QueryOptions {
+                max_memory_bytes: Some(1),
+                grant: Some(grant),
+                ..Default::default()
+            },
+        )
+        .err()
+        .expect("cold opening obeys the request limit");
+    assert!(matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory));
+}
+
+#[test]
+fn fetching_resolved_imports_polls_and_admits_discovery_without_load() {
+    use sparkles::reasoning::reasoner::{ImportMode, Inputs, fetch_imports};
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    ds.update(
+        "INSERT DATA { <urn:source> <http://www.w3.org/2002/07/owl#imports> <urn:import> .
+         GRAPH <urn:import> { <urn:a> <urn:p> <urn:b> } }",
+    )
+    .unwrap();
+    let inputs = Inputs {
+        imports: ImportMode::Fetch,
+        ..Default::default()
+    };
+    let before = ds.head_commit();
+    let sibling = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        ..Default::default()
+    };
+    let error = fetch_imports(ds.store(), &inputs, &[], &opts).unwrap_err();
+    assert!(
+        error.downcast_ref::<Error>().is_some_and(is_server_memory),
+        "{error:#}"
+    );
+    drop(sibling);
+    let late = QueryOptions {
+        deadline: Some(std::time::Instant::now()),
+        ..opts.clone()
+    };
+    let error = fetch_imports(ds.store(), &inputs, &[], &late).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<Error>(),
+        Some(Error::Timeout)
+    ));
+    assert!(
+        fetch_imports(ds.store(), &inputs, &[], &opts)
+            .unwrap()
+            .fetched
+            .is_empty()
+    );
+    assert_eq!(ds.head_commit().seq, before.seq);
     assert_eq!(pool.granted(), 0);
 }

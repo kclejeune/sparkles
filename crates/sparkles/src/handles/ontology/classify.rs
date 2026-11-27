@@ -288,23 +288,38 @@ impl CacheEntry {
         &mut self,
         pool: Option<&Arc<sparkles_core::sparql::pool::QueryPool>>,
     ) -> bool {
-        let Some(pool) = pool else { return true };
         let bytes = self
             .retained_bytes
             .saturating_sub(self.taxonomy_memory())
             .saturating_sub(self.result.as_ref().map_or(0, |p| p.auxiliary_bytes))
             as u64;
-        if self
-            .memory
-            .as_ref()
-            .is_some_and(|held| held.bytes() >= bytes)
-        {
-            return true;
-        }
+        self.admit_retention_bytes(pool, bytes)
+    }
+
+    fn admit_retention_bytes(
+        &mut self,
+        pool: Option<&Arc<sparkles_core::sparql::pool::QueryPool>>,
+        bytes: u64,
+    ) -> bool {
+        let Some(pool) = pool else { return true };
         let held = self.memory.get_or_insert_with(|| {
             crate::reasoning::memory::Memory::new(None, Some(super::kept::cache_parent(pool)))
         });
-        held.grow(bytes - held.bytes()).is_ok()
+        if held.cover(bytes).is_err() {
+            return false;
+        }
+        held.shrink_to(bytes);
+        true
+    }
+
+    pub(super) fn stage_input(&self, o: &Opened, extra: usize, work: &Working) -> Result<()> {
+        stage_axioms(
+            work,
+            o.ontology.axioms.len()
+                + self.ontology.as_ref().map_or(0, |old| old.axioms.len())
+                + self.extra.len()
+                + extra,
+        )
     }
 
     /// Runs `go` on the kept saturation over the logical axioms of `o` and `extra`, with
@@ -348,6 +363,25 @@ impl CacheEntry {
 }
 
 /// The logical axioms of an ontology, in its order.
+pub(super) type Working = Arc<parking_lot::Mutex<crate::reasoning::memory::Memory>>;
+
+pub(super) fn working(opts: &QueryOptions, opened: &Opened) -> Working {
+    Arc::new(parking_lot::Mutex::new(
+        crate::reasoning::memory::Memory::query_after(opts, opened.request_bytes),
+    ))
+}
+
+pub(super) fn stage_axioms(memory: &Working, count: usize) -> Result<()> {
+    // Includes the reference vectors, the old and new sets and their delta lists.
+    memory.lock().grow((128 + count.saturating_mul(96)) as u64)
+}
+
+pub(super) fn stage_assertion(memory: &Working, axiom: &Axiom) -> Result<()> {
+    memory
+        .lock()
+        .grow((2 * sparkles_owl::classify::axiom_copy_bytes(&axiom.kind)) as u64)
+}
+
 pub(crate) fn logical_axioms(o: &sparkles_owl::read::Ontology) -> Vec<&AxiomKind> {
     o.axioms
         .keys()
@@ -410,39 +444,71 @@ impl Ontologies {
         opts.graphs = opts.graphs.as_ref().map(|access| access.bound(&snap));
         let o = self.open_at(&snap, req, &opts)?;
         // a run that skips the modules' pass answers differently, so it is not kept
-        let keep = opts.graphs.is_none() && snap.cacheable && !c.assertions && !c.skip_coverage;
+        let keep = self.can_keep(&o, &opts)
+            && opts.graphs.is_none()
+            && snap.cacheable
+            && !c.assertions
+            && !c.skip_coverage;
         let (publication, reused) = if keep {
             self.classify_kept(&o, req, c, &opts)?
         } else {
+            let work = working(&opts, &o);
             let mut assertions: Vec<Axiom> = Vec::new();
             // the assertion triples that map to no axiom
             let mut unread = Unmapped::default();
             if c.assertions {
-                o.assertions(&opts, |ax, t, _| {
+                o.assertions_with_memory(&opts, Some(&work), |ax, t, _| {
                     match ax {
-                        Some(ax) => assertions.push(ax),
-                        None => unread.push(t),
+                        Some(ax) => {
+                            stage_assertion(&work, &ax)?;
+                            assertions.push(ax);
+                        }
+                        None => {
+                            if unread.triples.len() < sparkles_owl::classify::UNMAPPED_LISTED {
+                                let subject = match &t.subject {
+                                    oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+                                    oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+                                };
+                                work.lock().grow(
+                                    (256 + subject
+                                        + t.predicate.as_str().len()
+                                        + crate::explain::term_bytes(&t.object))
+                                        as u64,
+                                )?;
+                            }
+                            unread.push(t);
+                        }
                     }
                     Ok(true)
                 })?;
             }
+            stage_axioms(&work, o.ontology.axioms.len() + assertions.len())?;
             let mut axioms = logical_axioms(&o.ontology);
             axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
-            let seen = RefCell::new(None);
-            let mut dropped = dropped_assertions(&o, &opts, &seen);
-            let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
-            let unmapped = || unmapped_of(&o.ontology, &unread, &seen);
-            let (out, excluded) = classify_once(&axioms, c, &opts, dropped, &unmapped)?;
+            let (out, excluded) = {
+                let seen = RefCell::new(None);
+                let mut dropped = dropped_assertions(&o, &opts, &seen);
+                let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
+                let unmapped = || unmapped_of(&o.ontology, &unread, &seen);
+                classify_once_working(&axioms, c, &opts, dropped, &unmapped, &work)?
+            };
+            drop(axioms);
+            drop(assertions);
+            drop(unread);
+            work.lock().shrink_to(
+                (out.stats.taxonomy_memory + sparkles_owl::classify::excluded_copy_bytes(&excluded))
+                    as u64,
+            );
             (
-                KeptClassification::capture(
+                Arc::new(KeptClassification::capture(
                     self,
                     req,
                     c,
                     &o,
-                    Arc::new(out),
-                    Arc::new(excluded),
+                    (out, excluded),
                     &opts,
-                )?,
+                    &work,
+                )?),
                 false,
             )
         };
@@ -526,6 +592,7 @@ impl Ontologies {
                 return Ok((p, true));
             }
         }
+        let work = working(opts, o);
         self.with_kept(o, req, c.el_only, opts, "classify", |e| {
             if let Some(p) = &e.result
                 && p.source.commit == o.snapshot.commit
@@ -540,6 +607,7 @@ impl Ontologies {
             let mut dropped = dropped_assertions(o, opts, &seen);
             let none = Unmapped::default();
             let unmapped = || unmapped_of(&o.ontology, &none, &seen);
+            e.stage_input(o, 0, &work)?;
             let (out, witness) = e.run_over(o, Vec::new(), |s, axioms, changes| {
                 run(
                     s,
@@ -550,6 +618,7 @@ impl Ontologies {
                     c,
                     Some(&mut dropped),
                     &unmapped,
+                    &work,
                 )
             })?;
             #[cfg(test)]
@@ -578,26 +647,36 @@ impl Ontologies {
             } else {
                 out
             };
-            let mut excluded = e.saturation.excluded().to_vec();
+            work.lock().shrink_to(out.stats.memory as u64);
+            let mut excluded = copy_excluded(&e.saturation, &work)?;
             excluded.extend(witness);
-            let p = KeptClassification::capture(
-                self,
-                req,
-                c,
-                o,
-                Arc::new(out),
-                Arc::new(excluded),
-                opts,
-            )?;
+            let mut p = KeptClassification::capture(self, req, c, o, (out, excluded), opts, &work)?;
             let retained_bytes = classification_retained_bytes(e, &p);
             let keep = p.classification.complete_for_taken && retained_bytes <= retention_cap();
             // A modules' pass that the deadline stopped answers by timing, so the next
             // request takes the pass again over the kept saturation.
             let publish = keep && !p.classification.stats.coverage_stopped;
-            e.result = publish.then(|| p.clone());
-            if keep {
-                e.retained_bytes = retained_bytes;
-            }
+            let pool = state.pool.as_ref();
+            // Mutable saturation and immutable taxonomy must both have cache credit.
+            // A refusal leaves the answer under its request credit.
+            let keep = if keep {
+                e.retained_bytes = if publish {
+                    retained_bytes
+                } else {
+                    retained_bytes - p.classification.stats.taxonomy_memory - p.auxiliary_bytes
+                };
+                let publication_bytes = if publish {
+                    p.classification.stats.taxonomy_memory + p.auxiliary_bytes
+                } else {
+                    0
+                };
+                e.admit_retention_bytes(pool, (e.retained_bytes - publication_bytes) as u64)
+                    && (!publish || p.admit_retention(opts, pool))
+            } else {
+                false
+            };
+            let p = Arc::new(p);
+            e.result = (keep && publish).then(|| p.clone());
             Ok(((p, false), keep))
         })
     }
@@ -873,12 +952,36 @@ pub(crate) fn classify_once(
     dropped: Option<&mut Dropped<'_>>,
     unmapped: &dyn Fn() -> Unmapped,
 ) -> Result<(Classification, Vec<Excluded>)> {
+    let work = Arc::new(parking_lot::Mutex::new(
+        crate::reasoning::memory::Memory::query(opts),
+    ));
+    classify_once_working(axioms, c, opts, dropped, unmapped, &work)
+}
+
+fn classify_once_working(
+    axioms: &[&AxiomKind],
+    c: &ClassifyRequest,
+    opts: &QueryOptions,
+    dropped: Option<&mut Dropped<'_>>,
+    unmapped: &dyn Fn() -> Unmapped,
+    work: &Working,
+) -> Result<(Classification, Vec<Excluded>)> {
     let mut s = Saturation::new();
     let par = admit(c.threads, opts)?;
-    let (out, witness) = run(&mut s, axioms, None, par, opts, c, dropped, unmapped)?;
-    let mut excluded = s.excluded().to_vec();
+    let staged = work.lock().bytes();
+    let (out, witness) = run(&mut s, axioms, None, par, opts, c, dropped, unmapped, work)?;
+    work.lock()
+        .shrink_to(staged.saturating_add(out.stats.memory as u64));
+    let mut excluded = copy_excluded(&s, work)?;
     excluded.extend(witness);
     Ok((out, excluded))
+}
+
+pub(super) fn copy_excluded(saturation: &Saturation, work: &Working) -> Result<Vec<Excluded>> {
+    let excluded = saturation.excluded();
+    work.lock()
+        .grow(sparkles_owl::classify::excluded_slice_copy_bytes(excluded) as u64)?;
+    Ok(excluded.to_vec())
 }
 
 /// The assertions of an open ontology, as the axioms a classification of its terminology
@@ -946,8 +1049,9 @@ fn run(
     c: &ClassifyRequest,
     dropped: Option<&mut Dropped<'_>>,
     unmapped: &dyn Fn() -> Unmapped,
+    work: &Working,
 ) -> Result<(Classification, Option<Excluded>)> {
-    bounded(par, opts, |limits| {
+    bounded(par, opts, work, |limits| {
         let limits = Limits {
             el_only: c.el_only,
             partial: c.partial,
@@ -971,8 +1075,9 @@ pub(super) fn saturate(
     par: Par,
     el_only: bool,
     opts: &QueryOptions,
+    work: &Working,
 ) -> Result<sparkles_owl::classify::Saturated> {
-    bounded(par, opts, |limits| {
+    bounded(par, opts, work, |limits| {
         let limits = Limits {
             el_only,
             ..limits.clone()
@@ -986,24 +1091,31 @@ pub(super) fn saturate(
 fn bounded<T>(
     par: Par,
     opts: &QueryOptions,
+    memory: &Working,
     f: impl FnOnce(&Limits) -> std::result::Result<T, sparkles_owl::classify::Error>,
 ) -> Result<T> {
     let cancel = opts.cancel.clone();
     let cancellation = opts.cancellation.clone();
     // The classifier reports growth of its admitted peak. Own that debit here so
     // success, refusal and unwind all restore the enclosing grant's live usage.
-    let memory = parking_lot::Mutex::new(crate::reasoning::memory::Memory::query(opts));
+    let max_memory = {
+        let memory = memory.lock();
+        memory
+            .limit()
+            .map(|limit| limit.saturating_sub(memory.bytes()) as usize)
+    };
+    let memory = memory.clone();
     let pooled = opts.grant.is_some() || opts.pool.is_some();
     let limits = Limits {
         el_only: false,
         threads: par.threads(),
         deadline: opts.deadline,
-        max_memory: opts.max_memory_bytes.map(|m| m as usize),
+        max_memory,
         cancelled: Some(Arc::new(move || {
             cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
                 || cancellation.as_ref().is_some_and(|c| c.check().is_err())
         })),
-        charge: pooled.then(|| {
+        charge: (pooled || max_memory.is_some()).then(|| {
             Arc::new(move |bytes: usize| memory.lock().grow(bytes as u64).is_ok())
                 as Arc<dyn Fn(usize) -> bool + Send + Sync>
         }),
@@ -1020,7 +1132,7 @@ fn bounded<T>(
             incomplete(sparkles_owl::classify::refusal(&excluded), &excluded)
         }
         sparkles_owl::classify::Error::Memory { limit, used } => {
-            let over_budget = opts.max_memory_bytes.is_some_and(|m| used as u64 > m);
+            let over_budget = max_memory.is_some_and(|m| used > m);
             Error::BudgetExceeded(Budget {
                 kind: if over_budget || !pooled {
                     BudgetKind::Memory
@@ -1032,4 +1144,22 @@ fn bounded<T>(
             })
         }
     })
+}
+
+#[cfg(test)]
+#[test]
+fn retained_saturation_shrinks_to_its_current_size() {
+    let dataset = crate::Dataset::memory();
+    let ontology = dataset.ontology();
+    let request = OntologyRequest::default();
+    let snapshot = dataset.store().snapshot();
+    let mut entry = CacheEntry::new(InputKey::of(&ontology, &request, &snapshot), false);
+    let pool =
+        sparkles_core::sparql::pool::QueryPool::with_retained_capacity(8 << 20, 4 << 20).unwrap();
+    entry.retained_bytes = 1 << 20;
+    assert!(entry.admit_retention(Some(&pool)));
+    assert!(pool.domain_stats().retained_reserved >= 1 << 20);
+    entry.retained_bytes = 0;
+    assert!(entry.admit_retention(Some(&pool)));
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
 }

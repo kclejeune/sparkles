@@ -9,6 +9,14 @@ pub(crate) struct Memory {
     credit: Option<LiveCredit>,
 }
 
+impl std::fmt::Debug for Memory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Memory")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Memory {
     pub fn new(limit: Option<u64>, parent: Option<ParentHandle>) -> Self {
         Self {
@@ -19,16 +27,69 @@ impl Memory {
     }
 
     pub fn query(opts: &crate::sparql::QueryOptions) -> Self {
+        Self::query_after(opts, 0)
+    }
+
+    pub fn query_after(opts: &crate::sparql::QueryOptions, overlap: u64) -> Self {
         let parent = opts
             .grant
             .as_ref()
             .map(|g| g.memory_parent())
             .or_else(|| opts.pool.as_ref().map(|p| p.work_parent()));
-        Self::new(opts.max_memory_bytes, parent)
+        Self::new(
+            opts.max_memory_bytes
+                .map(|limit| limit.saturating_sub(overlap)),
+            parent,
+        )
+    }
+
+    pub fn limit(&self) -> Option<u64> {
+        self.limit
     }
 
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    pub fn shrink_to(&mut self, bytes: u64) {
+        if bytes < self.bytes {
+            if let Some(credit) = &mut self.credit {
+                credit
+                    .remove(self.bytes - bytes)
+                    .expect("shrinking owned credit");
+                drop(credit.trim_detached());
+            }
+            self.bytes = bytes;
+        }
+    }
+
+    pub fn split(&mut self, bytes: u64) -> Result<Self> {
+        self.cover(bytes)?;
+        let credit = self
+            .credit
+            .as_mut()
+            .map(|c| c.split_live(bytes))
+            .transpose()
+            .map_err(parent_error)?;
+        self.bytes -= bytes;
+        Ok(Self {
+            bytes,
+            limit: self.limit,
+            credit,
+        })
+    }
+
+    pub fn absorb(&mut self, other: &mut Self) -> Result<()> {
+        if let (Some(credit), Some(other_credit)) = (&mut self.credit, &mut other.credit) {
+            credit.try_merge(other_credit).map_err(parent_error)?;
+        }
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        other.bytes = 0;
+        Ok(())
+    }
+
+    pub fn into_lease(self) -> Option<sparkles_budget::MemoryLease> {
+        self.credit.map(LiveCredit::into_lease)
     }
 
     pub fn cover(&mut self, bytes: u64) -> Result<()> {

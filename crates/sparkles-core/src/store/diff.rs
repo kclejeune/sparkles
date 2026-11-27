@@ -1002,30 +1002,31 @@ impl Store {
             return Ok(None);
         }
         let mut net: FxHashMap<[Id; 4], bool> = FxHashMap::default();
+        let mut table_bytes = 0;
         walk_wal(&mut cursor, after, to.commit, o, &mut |op, q| {
-            if !graphs.contains(&q[3]) {
+            if !graphs.contains(&q[3]) || net.remove(&q).is_some() {
                 return Ok(());
             }
-            if let Some(admit) = admission
-                && !net.contains_key(&q)
-            {
-                admit(256)?;
+            if let Some(admit) = admission {
+                use sparkles_budget::sizes::{table_bytes_for, table_capacity};
+                let needed = table_bytes_for::<IdChange>(table_capacity(net.len() + 1));
+                if needed > table_bytes {
+                    admit((needed - table_bytes) as u64)?;
+                    table_bytes = needed;
+                }
             }
-            match net.entry(q) {
-                Entry::Occupied(e) => {
-                    e.remove();
-                }
-                Entry::Vacant(e) => {
-                    e.insert(op == WAL_INSERT);
-                    if net.len() & 0xFFFF == 0 {
-                        o.over(net.len() as u64)?;
-                    }
-                }
+            net.insert(q, op == WAL_INSERT);
+            if net.len() & 0xFFFF == 0 {
+                o.over(net.len() as u64)?;
             }
             Ok(())
         })?;
         o.over(net.len() as u64)?;
-        let mut changes: Vec<IdChange> = net.into_iter().collect();
+        if let Some(admit) = admission {
+            admit((net.len() as u64).saturating_mul(size_of::<IdChange>() as u64))?;
+        }
+        let mut changes = Vec::with_capacity(net.len());
+        changes.extend(net);
         changes.sort_unstable_by_key(|(q, added)| (*added, [q[3].0, q[0].0, q[1].0, q[2].0]));
         Ok(Some(changes))
     }

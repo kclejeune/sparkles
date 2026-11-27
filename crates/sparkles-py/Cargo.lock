@@ -3182,6 +3182,7 @@ dependencies = [
  "parking_lot",
  "rustc-hash 2.1.3",
  "serde_json",
+ "sparkles-budget",
 ]
 
 [[package]]

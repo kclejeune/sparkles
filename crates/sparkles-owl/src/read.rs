@@ -441,9 +441,17 @@ pub struct Ontology {
     /// ontology nodes, which are never anonymous individuals
     pub reification_nodes: FxHashSet<BlankNode>,
     pub ontology_nodes: FxHashSet<NamedOrBlankNode>,
+    memory: Option<std::sync::Arc<sparkles_budget::MemoryLease>>,
 }
 
 impl Ontology {
+    /// Keep decoding credit with the shared ontology, including when the caller
+    /// takes just this part of an opened ontology.
+    #[doc(hidden)]
+    pub fn keep_memory(&mut self, memory: Option<std::sync::Arc<sparkles_budget::MemoryLease>>) {
+        self.memory = memory;
+    }
+
     /// The ontology of axioms that a structural syntax gives, as the functional-style
     /// syntax does, read as one graph: the header in graph 0, each axiom once with an
     /// origin that names no triple, and the declared typing. A read of the same axioms
@@ -751,6 +759,7 @@ pub(crate) fn read_scoped(
         terminology_only: opts.terminology_only,
         reification_nodes: rind,
         ontology_nodes: onodes,
+        memory: None,
     }
 }
 

@@ -3456,14 +3456,25 @@ fn held_bytes_of(ax: &AxiomKind) -> usize {
     bytes
 }
 
+/// The size of an owned logical axiom, including its nested allocations.
+#[doc(hidden)]
+pub fn axiom_copy_bytes(axiom: &AxiomKind) -> usize {
+    std::mem::size_of::<Axiom>().saturating_add(dl_reduce::axiom_retained_heap_bytes(axiom))
+}
+
 /// Exact allocation-free estimate of heap bytes owned by a retained copy of `excluded`,
 /// including anonymous blank-node labels, literals, containers, repeated AST payloads,
 /// and `Gap::Outside` strings. This is not a process RSS bound.
 pub fn excluded_copy_bytes(excluded: &Vec<Excluded>) -> usize {
-    use std::mem::size_of;
+    excluded_slice_copy_bytes(excluded)
+        .saturating_add((excluded.capacity() - excluded.len()) * std::mem::size_of::<Excluded>())
+}
+
+#[doc(hidden)]
+pub fn excluded_slice_copy_bytes(excluded: &[Excluded]) -> usize {
     excluded
-        .capacity()
-        .saturating_mul(size_of::<Excluded>())
+        .len()
+        .saturating_mul(std::mem::size_of::<Excluded>())
         .saturating_add(
             excluded
                 .iter()

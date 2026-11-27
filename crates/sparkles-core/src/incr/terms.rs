@@ -20,41 +20,74 @@ use std::sync::{Arc, Weak};
 #[derive(Debug)]
 struct Key {
     bytes: Arc<[u8]>,
-    published: Mutex<Weak<PublishedBytes>>,
+    publication: Mutex<KeyPublication>,
 }
 
+#[derive(Debug, Default)]
+struct KeyPublication {
+    // The lease follows the backing. The metric follows the frozen tables.
+    memory: Option<sparkles_budget::MemoryLease>,
+    metric: Weak<PublishedBytes>,
+}
+
+impl Drop for KeyPublication {
+    fn drop(&mut self) {
+        if let Some(memory) = self.memory.take() {
+            super::runtime::RuntimeOperation::release_publication(memory);
+        }
+    }
+}
+
+const KEY_PUBLICATION_BYTES: u64 = (std::mem::size_of::<PublishedBytes>() + 16) as u64;
+
 impl Key {
+    fn storage_bytes(len: usize) -> u64 {
+        (len + std::mem::size_of::<Self>() + 32) as u64
+    }
+
     fn retained_bytes(&self) -> u64 {
-        (self.bytes.len() + std::mem::size_of::<Self>() + 32) as u64
+        Self::storage_bytes(self.bytes.len())
     }
 
     fn freeze(
         self: &Arc<Self>,
         pool: Option<&Arc<AtomicU64>>,
         credit: &mut impl FnMut(u64) -> Option<sparkles_budget::MemoryLease>,
-    ) -> FrozenKey {
+    ) -> (FrozenKey, u64) {
+        let mut detached = 0;
         let published = pool.map(|pool| {
-            let mut last = self.published.lock();
-            if let Some(held) = last.upgrade() {
-                return held;
+            let mut publication = self.publication.lock();
+            let bytes = self.retained_bytes();
+            if publication.memory.is_none() {
+                publication.memory = credit(bytes);
             }
-            let bytes = self.retained_bytes() + (std::mem::size_of::<PublishedBytes>() + 16) as u64;
-            let held = Arc::new(PublishedBytes::new(pool, bytes, credit(bytes)));
-            *last = Arc::downgrade(&held);
-            held
+            if publication.memory.is_some() {
+                detached = bytes;
+            }
+            if let Some(metric) = publication.metric.upgrade() {
+                return metric;
+            }
+            let metric = Arc::new(PublishedBytes::new(
+                pool,
+                bytes + KEY_PUBLICATION_BYTES,
+                credit(KEY_PUBLICATION_BYTES),
+            ));
+            publication.metric = Arc::downgrade(&metric);
+            metric
         });
-        FrozenKey {
-            key: self.clone(),
-            published,
-        }
+        (
+            FrozenKey {
+                key: self.clone(),
+                published,
+            },
+            detached,
+        )
     }
 }
 
 #[derive(Debug)]
 struct FrozenKey {
     key: Arc<Key>,
-    // A live-only circuit may retain the same bytes after the last view detaches.
-    // Only a published table owns a strong reference to the view-pool charge.
     published: Option<Arc<PublishedBytes>>,
 }
 
@@ -64,6 +97,7 @@ pub struct Terms {
     index: FxHashMap<Arc<[u8]>, u64>,
     keys: Vec<Arc<Key>>,
     bytes: u64,
+    detached_bytes: u64,
 }
 
 /// An immutable term table frozen with one view version so streaming cursors can decode
@@ -123,7 +157,9 @@ impl ViewTerms {
 
     /// The bytes an unshared term table keeps allocated on the heap.
     pub fn retained_bytes(&self) -> u64 {
-        self.table_bytes() + self.key_bytes
+        self.table_bytes()
+            + self.key_bytes
+            + self.published_key_bytes.saturating_sub(self.key_bytes)
     }
 }
 
@@ -202,7 +238,7 @@ impl Terms {
     }
 
     pub(crate) fn key_retained_bytes(key_len: usize) -> Option<u64> {
-        u64::try_from(key_len).ok()?.checked_mul(2)?.checked_add(48)
+        Key::storage_bytes(key_len).checked_add(48)
     }
 
     pub(crate) fn insert_peak_bytes(&self, key_len: usize) -> Option<u64> {
@@ -244,48 +280,64 @@ impl Terms {
         if !has_pool {
             return Ok(table);
         }
-        let per_key_pub = (std::mem::size_of::<PublishedBytes>() + 16) as u64;
         table
             .checked_add(16)
-            .and_then(|n| n.checked_add(keys.checked_mul(per_key_pub)?))
+            .and_then(|n| n.checked_add(keys.checked_mul(KEY_PUBLICATION_BYTES)?))
             .ok_or_else(|| super::budget::budget_error(sparkles_budget::ParentRefused::Overflow))
     }
 
-    pub(crate) fn new_publication_key_bytes(&self) -> u64 {
-        self.keys.iter().map(|key| key.retained_bytes()).sum()
+    pub(crate) fn detached_bytes(&self) -> u64 {
+        self.detached_bytes
     }
 
     /// Freeze the current local term table into an immutable snapshot.
     pub fn snapshot(&self) -> ViewTerms {
-        self.snapshot_in(None, |_| None)
+        self.frozen(None, &mut |_| None).0
     }
 
-    pub(crate) fn snapshot_in(
+    fn frozen(
         &self,
         pool: Option<&Arc<AtomicU64>>,
-        mut credit: impl FnMut(u64) -> Option<sparkles_budget::MemoryLease>,
-    ) -> ViewTerms {
+        credit: &mut impl FnMut(u64) -> Option<sparkles_budget::MemoryLease>,
+    ) -> (ViewTerms, u64) {
         if self.keys.is_empty() {
-            return ViewTerms::default();
+            return (ViewTerms::default(), 0);
         }
         let mut key_bytes = 0;
         let mut published_key_bytes = 0;
+        let mut detached_bytes = 0;
         let keys = self
             .keys
             .iter()
             .map(|key| {
-                let frozen = key.freeze(pool, &mut credit);
-                key_bytes += key.retained_bytes();
-                published_key_bytes += frozen.published.as_deref().map_or(0, PublishedBytes::bytes);
-                frozen
+                let (key, detached) = key.freeze(pool, credit);
+                key_bytes += key.key.retained_bytes();
+                published_key_bytes += key.published.as_deref().map_or(0, PublishedBytes::bytes);
+                detached_bytes += detached;
+                key
             })
             .collect();
-        ViewTerms {
-            keys,
-            key_bytes,
-            published_key_bytes,
-            published: None,
+        (
+            ViewTerms {
+                keys,
+                key_bytes,
+                published_key_bytes,
+                published: None,
+            },
+            detached_bytes,
+        )
+    }
+
+    pub(crate) fn snapshot_in(
+        &mut self,
+        pool: Option<&Arc<AtomicU64>>,
+        mut credit: impl FnMut(u64) -> Option<sparkles_budget::MemoryLease>,
+    ) -> ViewTerms {
+        let (table, detached) = self.frozen(pool, &mut credit);
+        if pool.is_some() {
+            self.detached_bytes = detached;
         }
+        table
     }
 
     /// The id of the term with vocabulary key `key`.
@@ -354,7 +406,7 @@ impl Terms {
         let bytes: Arc<[u8]> = Arc::from(key);
         self.keys.push(Arc::new(Key {
             bytes: bytes.clone(),
-            published: Mutex::new(Weak::new()),
+            publication: Mutex::new(KeyPublication::default()),
         }));
         self.index.insert(bytes, n);
         self.bytes = self.bytes.saturating_add(added);

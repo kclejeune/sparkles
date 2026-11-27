@@ -275,6 +275,36 @@ fn hold_state(
     memory.grow(additional as u64)
 }
 
+fn literal_typing_bytes(typings: &sparkles_reasoner::diagnostics::GuardedLiteralTypings) -> usize {
+    typings
+        .facts
+        .iter()
+        .map(|(literal, datatype)| {
+            128 + literal.value().len() * 2
+                + literal.language().map_or(0, str::len) * 2
+                + literal.datatype().as_str().len() * 2
+                + datatype.as_str().len() * 2
+        })
+        .sum()
+}
+
+fn diagnostic_bytes(finding: &sparkles_reasoner::diagnostics::Finding) -> usize {
+    use sparkles_reasoner::diagnostics::Evidence;
+    256 + finding.message.len()
+        + crate::explain::term_bytes(&finding.focus)
+        + finding
+            .evidence
+            .iter()
+            .map(|(name, evidence)| {
+                name.len()
+                    + match evidence {
+                        Evidence::One(term) => crate::explain::term_bytes(term),
+                        Evidence::Many(terms) => terms.iter().map(crate::explain::term_bytes).sum(),
+                    }
+            })
+            .sum::<usize>()
+}
+
 fn decode_fact(
     snapshot: &Snapshot,
     quad: &[crate::id::Id; 4],
@@ -340,14 +370,9 @@ pub(crate) fn stored(
     let typings = typings.unwrap_or_default();
     let mut asserted = Facts::new();
     let mut closure = Facts::new();
-    let mut bytes = typings
-        .facts
-        .iter()
-        .map(|(literal, datatype)| {
-            128 + literal.to_string().len() * 2 + datatype.as_str().len() * 2
-        })
-        .sum();
-    hold_state(share, &mut bytes, &mut memory, 0)?;
+    let typings_bytes = literal_typing_bytes(&typings);
+    let mut bytes = 0;
+    hold(share, &mut bytes, typings_bytes)?;
     let (graphs, graphs_bytes) = input_graphs_controlled(
         snapshot,
         program,
@@ -446,17 +471,14 @@ pub(crate) fn stored(
         }
     }
     for finding in &diagnostics.findings {
-        hold(
-            share,
-            &mut bytes,
-            256 + super::diff::finding_key(finding).len() * 2 + finding.message.len(),
-        )?;
+        hold(share, &mut bytes, diagnostic_bytes(finding))?;
     }
+    drop(typings);
     Ok(State {
         asserted,
         closure,
         diagnostics,
-        bytes,
+        bytes: bytes - typings_bytes,
         warnings: Vec::new(),
         _memory: memory,
         _diagnostics_memory: diagnostics_memory,
@@ -685,18 +707,8 @@ fn analyze_with_cache_limit(
     let typings = context
         .take_literal_typings_guarded(snapshot.commit)
         .ok_or_else(|| budget("the analysis did not retain its generalized diagnostics"))?;
-    hold_state(
-        share,
-        &mut bytes,
-        &mut memory,
-        typings
-            .facts
-            .iter()
-            .map(|(literal, datatype)| {
-                128 + literal.to_string().len() * 2 + datatype.as_str().len() * 2
-            })
-            .sum(),
-    )?;
+    let typings_bytes = literal_typing_bytes(&typings);
+    hold(share, &mut bytes, typings_bytes)?;
     let (diagnostics, diagnostics_memory) =
         sparkles_reasoner::diagnostics::diagnose_controlled_guarded(
             snapshot,
@@ -722,25 +734,14 @@ fn analyze_with_cache_limit(
         .map_err(|error| control.error(crate::handles::from_anyhow(error)))?;
     control.check()?;
     for finding in &diagnostics.findings {
-        let mut size = 256 + finding.message.len() + crate::explain::term_bytes(&finding.focus);
-        for (name, evidence) in &finding.evidence {
-            size += name.len();
-            size += match evidence {
-                sparkles_reasoner::diagnostics::Evidence::One(term) => {
-                    crate::explain::term_bytes(term)
-                }
-                sparkles_reasoner::diagnostics::Evidence::Many(terms) => {
-                    terms.iter().map(crate::explain::term_bytes).sum()
-                }
-            };
-        }
-        hold(share, &mut bytes, size)?;
+        hold(share, &mut bytes, diagnostic_bytes(finding))?;
     }
+    drop(typings);
     Ok(State {
         asserted,
         closure,
         diagnostics,
-        bytes,
+        bytes: bytes - typings_bytes,
         warnings: outcome.warnings,
         _memory: memory,
         _diagnostics_memory: diagnostics_memory,
@@ -885,7 +886,14 @@ mod review_regressions {
     use super::*;
     #[test]
     fn declined_optional_cache_does_not_erase_generalized_diagnostics() {
-        let dataset = Dataset::memory();
+        let pool = crate::sparql::pool::QueryPool::new(16 << 20);
+        let dataset = Dataset::from_store_with(
+            crate::store::Store::in_memory(Default::default()),
+            crate::DatasetOptions {
+                pool: Some(pool.clone()),
+                ..Default::default()
+            },
+        );
         dataset
             .update("INSERT DATA {<urn:s> <urn:p> <urn:o> . <urn:literal> <urn:value> \"abc\"}")
             .unwrap();
@@ -912,6 +920,32 @@ mod review_regressions {
                 .any(|finding| finding.check == "literal-not-in-datatype"),
             "optional caching lost an entailed literal typing conflict"
         );
+        let diagnostics = state
+            .diagnostics
+            .findings
+            .iter()
+            .map(diagnostic_bytes)
+            .sum::<usize>();
+        assert_eq!(state.bytes, state._memory.bytes() as usize + diagnostics);
+        // The grounded and generalized versions have identical retained RDF facts.
+        // The generalized literal typing must not get a second state reservation.
+        let plain = analyze(
+            &dataset,
+            &dataset.store().snapshot(),
+            &AnalysisProgram {
+                profile: Profile::Rules(
+                    "[identity: (<urn:s> <urn:p> <urn:o>) -> (<urn:s> <urn:p> <urn:o>)]".into(),
+                ),
+                ..program
+            },
+            &options,
+            &control,
+            0,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(state._memory.bytes(), plain._memory.bytes());
     }
     #[test]
     fn cancellation_during_diagnostic_capture_is_not_a_memory_refusal() {

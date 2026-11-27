@@ -618,7 +618,7 @@ pub(crate) struct Cell {
 impl Cell {
     /// Detach view `name` from the circuit and recompute its effective local limit,
     /// returning the number of views still attached.
-    pub(super) fn release_view(&self, name: &str) -> usize {
+    pub(super) fn release_view(&self, name: &str, retired: &mut Vec<MemoryLease>) -> usize {
         let mut st = self.state.lock();
         st.view_limits.remove(name);
         st.recompute_local_limit();
@@ -626,7 +626,11 @@ impl Cell {
             st.circuit
                 .set_version_pool(None)
                 .expect("detaching a version cannot grow state");
+            let mut info = self.info.lock();
+            info.bytes = st.circuit.bytes();
+            info.published_bytes = st.circuit.published_bytes();
         }
+        retired.extend(st.circuit.drain_retired());
         st.view_limits.len()
     }
 }
@@ -717,7 +721,7 @@ mod drop_order_tests {
 
         let q = parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
         let mut circuit = Circuit::new(compile(&q, None).unwrap(), None);
-        circuit.set_pool(None, Some(parent));
+        circuit.set_runtime_pool(None, Some(parent));
         circuit.set_reclaim_external(Some(Slot::history_reclaim_hook(&history)));
         circuit.build(store.snapshot(), &Control::none()).unwrap();
         let vars: Arc<[String]> = circuit.columns().into();

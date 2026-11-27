@@ -277,6 +277,26 @@ pub(super) fn cache_parent(
     }
 }
 
+/// Acquire independent dataset cache credit before returning the caller's credit.
+pub(super) fn admit_cached_memory(
+    opts: &QueryOptions,
+    pool: &Arc<sparkles_core::sparql::pool::QueryPool>,
+    memory: &mut crate::reasoning::memory::Memory,
+) -> bool {
+    if opts.grant.is_none()
+        && opts.pool.as_ref().is_some_and(|p| Arc::ptr_eq(p, pool))
+        && pool.domain_stats().retained_capacity == 0
+    {
+        return true;
+    }
+    let mut cached = crate::reasoning::memory::Memory::new(None, Some(cache_parent(pool)));
+    if cached.grow(memory.bytes()).is_err() {
+        return false;
+    }
+    *memory = cached;
+    true
+}
+
 /// One immutable computation, published only when the retained policy permits it.
 pub(super) struct KeptClassification {
     pub id: Uuid,
@@ -293,18 +313,17 @@ impl KeptClassification {
         req: &OntologyRequest,
         c: &ClassifyRequest,
         o: &Opened,
-        classification: Arc<Classification>,
-        excluded: Arc<Vec<Excluded>>,
+        answer: (Classification, Vec<Excluded>),
         opts: &QueryOptions,
-    ) -> Result<Arc<Self>> {
-        let parent = h.ds.pool().map(cache_parent).or_else(|| {
-            opts.grant
-                .as_ref()
-                .map(|g| g.memory_parent())
-                .or_else(|| opts.pool.as_ref().map(|p| p.work_parent()))
-        });
-        let mut memory = crate::reasoning::memory::Memory::new(None, parent);
-        memory.grow(classification.stats.taxonomy_memory as u64)?;
+        working: &super::classify::Working,
+    ) -> Result<Self> {
+        let (classification, excluded) = answer;
+        let taxonomy_bytes = classification.stats.taxonomy_memory;
+        let excluded_bytes = sparkles_owl::classify::excluded_copy_bytes(&excluded);
+        // Admit the source strings and the source rows written during hashing.
+        working
+            .lock()
+            .grow((1024 + o.source_bytes().saturating_mul(4)) as u64)?;
         let controls = super::classify::result_options(
             opts,
             !super::classify::acknowledged_stop(&classification),
@@ -314,19 +333,30 @@ impl KeptClassification {
         let content_fingerprint = content_fingerprint(&classification, &excluded, opts)?;
         let auxiliary_bytes = size_of::<Self>()
             .saturating_add(source.owned_bytes())
-            .saturating_add(sparkles_owl::classify::excluded_copy_bytes(&excluded))
+            .saturating_add(excluded_bytes)
             .saturating_add(content_fingerprint.capacity());
-        memory.grow(auxiliary_bytes as u64)?;
-        Ok(Arc::new(Self {
+        let memory = working
+            .lock()
+            .split((taxonomy_bytes + auxiliary_bytes) as u64)?;
+        Ok(Self {
             id: Uuid::new_v4(),
             source,
-            classification,
-            excluded,
+            classification: Arc::new(classification),
+            excluded: Arc::new(excluded),
             content_fingerprint,
             auxiliary_bytes,
             _memory: memory,
-        }))
+        })
     }
+
+    pub(super) fn admit_retention(
+        &mut self,
+        opts: &QueryOptions,
+        pool: Option<&Arc<sparkles_core::sparql::pool::QueryPool>>,
+    ) -> bool {
+        pool.is_none_or(|pool| admit_cached_memory(opts, pool, &mut self._memory))
+    }
+
     pub fn identity(&self) -> J {
         self.source.identity(&self.content_fingerprint)
     }

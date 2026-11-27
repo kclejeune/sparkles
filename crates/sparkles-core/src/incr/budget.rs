@@ -296,8 +296,7 @@ impl BudgetState {
         }
     }
 
-    fn check_local_limit_after_reclaim(&mut self) -> Result<()> {
-        let cur = self.local_live();
+    fn check_local_limit_after_reclaim(&mut self, cur: u64) -> Result<()> {
         if cur > self.local_limit {
             let freed = self.reclaim(cur - self.local_limit);
             if freed > 0 {
@@ -306,7 +305,7 @@ impl BudgetState {
                     self.trim_raw();
                 }
             }
-            let after = self.local_live();
+            let after = cur.saturating_sub(freed);
             if after > self.local_limit {
                 return Err(Error::BudgetExceeded(Budget {
                     kind: BudgetKind::Memory,
@@ -656,6 +655,15 @@ impl ViewBudget {
         s.parent = parent;
     }
 
+    #[cfg(test)]
+    pub(super) fn live_credit(&self) -> u64 {
+        self.inner
+            .lock()
+            .credit
+            .as_ref()
+            .map_or(0, LiveCredit::live)
+    }
+
     pub(crate) fn backs_publication(&self) -> bool {
         self.inner.lock().credit.is_some()
     }
@@ -751,7 +759,8 @@ impl ViewBudget {
             s.release_raw(delta);
         }
         s.state_bytes = next_state_bytes;
-        s.check_local_limit_after_reclaim()?;
+        let local = s.local_live();
+        s.check_local_limit_after_reclaim(local)?;
         if s.total_live() == 0 {
             s.trim_raw();
         }
@@ -803,6 +812,11 @@ impl ViewBudget {
             .state_bytes
             .saturating_add(s.pass_bytes)
             .saturating_add(release_scratch);
+        let next_local = s
+            .local_live()
+            .saturating_sub(prev_combined)
+            .saturating_add(next_state_bytes);
+        s.check_local_limit_after_reclaim(next_local)?;
         if next_state_bytes > prev_combined {
             let delta = next_state_bytes - prev_combined;
             s.reserve_raw(delta).map_err(budget_error)?;
@@ -814,7 +828,6 @@ impl ViewBudget {
         s.pass_bytes = 0;
         s.scratch_bytes -= release_scratch;
         let _ = out_lease.take_bytes();
-        s.check_local_limit_after_reclaim()?;
         if s.total_live() == 0 {
             s.trim_raw();
         }

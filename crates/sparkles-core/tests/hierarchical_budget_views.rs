@@ -711,12 +711,11 @@ fn reentrant_pool_waker_never_deadlocks_during_view_lifecycle() {
     let view_granted = pool.granted();
     assert!(view_granted > 0);
 
-    // QueryPool::enter rounds waiter requests up to GRANULE (4 MiB). Reserve
-    // `capacity - 4 MiB` so the 4 MiB waiter does not fit while the view holds credit,
-    // and wakes synchronously the instant the view releases its credit.
+    // One byte must be enough to make the queued grant eligible. This also
+    // exercises drops of individual publications while the cell still lives.
     let filler = pool
         .work_parent()
-        .reserve(pool.capacity() - 4 * MB)
+        .reserve(pool.capacity() - 4 * MB - view_granted + 1)
         .unwrap();
     let woke = Arc::new(AtomicUsize::new(0));
     let woke_cb = woke.clone();
@@ -759,7 +758,7 @@ fn reentrant_pool_waker_never_deadlocks_during_view_lifecycle() {
     assert!(g2 > 0);
     let filler2 = pool
         .work_parent()
-        .reserve(pool.capacity() - 4 * MB)
+        .reserve(pool.capacity() - 4 * MB - g2 + 1)
         .unwrap();
     let woke2 = Arc::new(AtomicUsize::new(0));
     let woke2_cb = woke2.clone();
@@ -2542,6 +2541,78 @@ fn owned_and_published_view_rows_hold_distinct_credit() {
     rt.delete("items").unwrap();
     assert!(pool.granted() > 0);
     assert_eq!(version.table.len(), 129);
+    drop(version);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn refused_named_view_attachment_restores_the_live_only_circuit() {
+    use sparkles_core::sparql::viewsvc::{OpenedView, ViewOpen, ViewRead};
+    let store = Store::in_memory(StoreOptions::default());
+    // The duplicate row table must exceed the live allocator's spare granules.
+    load_rows(&store, "attach", 60_000, 16);
+    let pool = QueryPool::new(128 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    rt.set_host(Arc::new(OpenHost));
+    let query = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let live = rt
+        .live(
+            &store,
+            query,
+            None,
+            &LiveOptions {
+                max_memory_bytes: Some(64 * MB),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let baseline = pool.granted();
+    let sibling = pool
+        .work_parent()
+        .reserve(pool.capacity() - baseline)
+        .unwrap();
+    let attachment = rt.put(&store, "items", ViewDef::table(query));
+    assert!(
+        matches!(
+            &attachment,
+            Err(Error::BudgetExceeded(budget)) if budget.kind == BudgetKind::ServerMemory
+        ),
+        "{attachment:?}"
+    );
+    assert!(rt.definitions().is_empty());
+    assert_eq!(pool.granted(), pool.capacity());
+    drop(sibling);
+
+    rt.put(&store, "items", ViewDef::table(query)).unwrap();
+    assert_eq!(rt.stats(&store).circuits, 1);
+    let open = ViewOpen {
+        read: ViewRead {
+            name: "items",
+            at: store.snapshot().commit,
+            snap: None,
+            allow_stale: false,
+            caller: None,
+            deadline: None,
+            aggregate_errors: None,
+            memory_parent: None,
+            memory_pool: None,
+            max_memory_bytes: None,
+        },
+    };
+    let OpenedView::Shared(version) = rt.open_view(&open, &|| Ok(()), &mut |_| Ok(())).unwrap()
+    else {
+        panic!("the ready circuit should publish its version");
+    };
+    rt.delete("items").unwrap();
+    drop(live);
+    rt.round(&store);
+    assert_eq!(rt.stats(&store).circuits, 0);
+    assert!(pool.granted() > 0);
     drop(version);
     assert_eq!(pool.granted(), 0);
 }

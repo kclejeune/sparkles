@@ -108,11 +108,7 @@ impl Runtime {
         info.applied = st.circuit.applied;
         info.rows = st.circuit.result.total().max(0) as u64;
         info.bytes = st.circuit.bytes();
-        info.published_bytes = st
-            .circuit
-            .version
-            .as_ref()
-            .map_or(0, |v| v.published_bytes());
+        info.published_bytes = st.circuit.published_bytes();
         if skipped {
             info.skipped += 1;
             self.counters.skipped.fetch_add(1, Ordering::Relaxed);
@@ -561,7 +557,7 @@ impl Runtime {
 
     /// Suspend the views whose circuit passed their budget or the pool's.
     pub(super) fn budgets(&self, cells: &[(Arc<Cell>, u64)]) {
-        let mut detached: Vec<Arc<Cell>> = Vec::new();
+        let mut detached = DeferredDrops::default();
         {
             let mut reg = self.reg.lock();
             let mut seen = rustc_hash::FxHashSet::default();
@@ -601,12 +597,12 @@ impl Runtime {
                     tracing::warn!(target: "sparkles::incr::runtime", "view {n} suspended: {why}");
                     e.suspended = Some(why);
                     if let Some(c) = e.cell.take() {
-                        if c.release_view(&n) == 0 {
+                        if c.release_view(&n, &mut detached.retired) == 0 {
                             let info = c.info.lock();
                             state = state
                                 .saturating_sub(info.bytes.saturating_sub(info.published_bytes));
                         }
-                        detached.push(c);
+                        detached.cells.push(c);
                     }
                 }
             }

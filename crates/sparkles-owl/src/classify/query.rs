@@ -36,6 +36,30 @@ pub struct Description {
 }
 
 impl Saturation {
+    /// Budget for a class description, including names, temporary hierarchy
+    /// indexes and the two cached root closures.
+    #[doc(hidden)]
+    pub fn description_memory(&self) -> usize {
+        let interner = &self.interner;
+        1024usize
+            .saturating_add(interner.classes.name_bytes().saturating_mul(8))
+            .saturating_add(interner.classes.len().saturating_mul(256))
+            .saturating_add(interner.individuals.name_bytes().saturating_mul(4))
+            .saturating_add(interner.individuals.len().saturating_mul(96))
+            .saturating_add(interner.canon_bytes().saturating_mul(4))
+    }
+
+    /// Heap added to the saturation by a description's cached closures.
+    #[doc(hidden)]
+    pub fn cached_description_bytes(&self) -> usize {
+        self.query_cache.get().map_or(0, |closure| {
+            [closure.top.capacity(), closure.bottom.capacity()]
+                .into_iter()
+                .map(|capacity| super::saturate::table_bytes(capacity, size_of::<Ex>()))
+                .sum()
+        })
+    }
+
     /// What the last run says about the class `c`, from its saturated contexts and
     /// without building a taxonomy. `None` when no run has saturated its axioms, as
     /// before the first run and after a run that stopped part way, and when `c` is not

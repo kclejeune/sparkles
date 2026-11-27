@@ -2057,3 +2057,95 @@ fn view_group_decimal_boundary_ties_sample_and_cancel() {
         );
     }
 }
+
+#[test]
+fn standalone_circuit_releases_explicit_parent_credit_and_rolls_back_skipped_commit() {
+    use crate::error::{BudgetKind, Error};
+    use crate::sparql::pool::QueryPool;
+    let store = Store::in_memory(Default::default());
+    crate::sparql::update::update(
+        &store,
+        "INSERT DATA { <urn:s> <urn:p> 1 }",
+        &Default::default(),
+    )
+    .unwrap();
+    let query = crate::sparql::parse_query("SELECT ?s WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
+    for include_pool in [false, true] {
+        let mut c = Circuit::new(compile(&query, None).unwrap(), None);
+        let pool = QueryPool::new(8 << 20);
+        let parent = if include_pool {
+            pool.work_parent()
+        } else {
+            let lease = Arc::new(parking_lot::Mutex::new(
+                pool.work_parent().reserve(0).unwrap(),
+            ));
+            let take = lease.clone();
+            sparkles_budget::MemoryDomain::unpooled().parent(
+                move |bytes| take.lock().try_grow(bytes),
+                move |bytes| {
+                    let released = lease.lock().split(bytes).unwrap();
+                    drop(released);
+                },
+            )
+        };
+        c.set_pool(include_pool.then(|| pool.clone()), Some(parent));
+        let snap = store.snapshot();
+        c.build(snap.clone(), &Control::none()).unwrap();
+        let body = c.encode(&snap).unwrap();
+        c.decode(&body, &snap).unwrap();
+        assert!(c.drain_retired().is_empty());
+        c.reset(&DeltaSet::at(snap.clone()), &Control::none())
+            .unwrap();
+        assert!(c.drain_retired().is_empty());
+
+        upd(
+            &store,
+            &format!("INSERT DATA {{ <urn:s{include_pool}> <urn:unrelated> 1 }}"),
+        )
+        .unwrap();
+        let next = store.snapshot();
+        let delta = DeltaSet::read(&store, snap.commit, &Control::none());
+        let filler = pool
+            .work_parent()
+            .reserve(pool.capacity() - pool.granted())
+            .unwrap();
+        c.set_local_limit(Some(c.bytes()));
+        assert!(matches!(
+            c.advance(&delta, &Control::none()),
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+        ));
+        assert_eq!(c.applied, snap.commit);
+        assert_eq!(c.snap.as_ref().unwrap().commit, snap.commit);
+        assert_eq!(c.version.as_ref().unwrap().commit, snap.commit);
+        assert!(c.drain_retired().is_empty());
+        drop(filler);
+        // A bump that clears the version can reach the final local commit check
+        // without any new allocation. Its failure must restore the old publication.
+        c.keep_result = false;
+        c.set_local_limit(Some(1));
+        assert!(c.set_applied(next.commit).is_err());
+        assert_eq!(c.version.as_ref().unwrap().commit, snap.commit);
+        assert_eq!(c.applied, snap.commit);
+        c.keep_result = true;
+        c.set_local_limit(None);
+        c.advance(&delta, &Control::none()).unwrap();
+        assert!(c.drain_retired().is_empty());
+
+        let control = Control::none();
+        control.cancel.cancel();
+        assert!(matches!(
+            c.build(next.clone(), &control),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(pool.granted(), 0);
+        c.build(next.clone(), &Control::none()).unwrap();
+        assert!(matches!(
+            c.reset(&DeltaSet::at(next.clone()), &control),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(pool.granted(), 0);
+        c.build(next.clone(), &Control::none()).unwrap();
+        assert!(c.decode(&[], &next).is_err());
+        assert_eq!(pool.granted(), 0);
+    }
+}

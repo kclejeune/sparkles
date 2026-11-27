@@ -1055,3 +1055,51 @@ fn diff_performance() {
     assert!(s.head_commit().bulk);
     time("compare across a bulk commit", before, s.head_commit().seq);
 }
+
+#[test]
+fn changed_id_admission_reuses_capacity_across_cancelled_wal_toggles() {
+    use sparkles_core::id::Id;
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(
+        &dir.path().join("db"),
+        StoreOptions {
+            bulk_threshold: 10_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    s.set_retention(keep_all()).unwrap();
+    let before = s.snapshot().commit;
+    for _ in 0..32 {
+        update(&s, "INSERT DATA { <urn:s> <urn:p> 1 }", &Default::default()).unwrap();
+        update(&s, "DELETE DATA { <urn:s> <urn:p> 1 }", &Default::default()).unwrap();
+    }
+    update(&s, "INSERT DATA { <urn:s> <urn:p> 1 }", &Default::default()).unwrap();
+    let held = std::cell::Cell::new(0);
+    let head = s.snapshot();
+    let admission = |bytes| {
+        let next = held.get() + bytes;
+        if next > 512 {
+            return Err(Error::BudgetExceeded(sparkles_core::error::Budget {
+                kind: sparkles_core::error::BudgetKind::Memory,
+                limit: 512,
+                requested: next,
+            }));
+        }
+        held.set(next);
+        Ok(())
+    };
+    let changes = s
+        .changed_ids_with_admission(
+            before,
+            &head,
+            &[Id::DEFAULT_GRAPH],
+            &DiffOptions::default(),
+            Some(&admission),
+        )
+        .unwrap()
+        .expect("the WAL is retained");
+    assert_eq!(changes.len(), 1);
+    assert!(changes[0].1);
+    assert!(held.get() > size_of::<([Id; 4], bool)>() as u64);
+}

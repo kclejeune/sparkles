@@ -332,6 +332,62 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     #[test]
+    fn partial_pool_headroom_admits_input_resolution_but_refuses_copy() {
+        let pool = crate::sparql::pool::QueryPool::new(8 << 20);
+        let dataset = Dataset::from_store_with(
+            crate::store::Store::in_memory(Default::default()),
+            crate::DatasetOptions {
+                pool: Some(pool.clone()),
+                ..Default::default()
+            },
+        );
+        dataset
+            .update(&format!(
+                r#"INSERT DATA {{ <urn:s> <urn:p> "{}" }}"#,
+                "x".repeat(64 << 10)
+            ))
+            .unwrap();
+        let snapshot = dataset.store().snapshot();
+        let options = AnalysisOptions {
+            program: Some(AnalysisProgram {
+                profile: sparkles_reasoner::Profile::RdfsSimple,
+                inputs: Default::default(),
+                extras: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let program = analysis::program(&dataset, &options).unwrap();
+        let control = AnalysisControl::new(&options).unwrap();
+        let filler = pool
+            .work_parent()
+            .reserve(pool.capacity() - (8 << 10))
+            .unwrap();
+        let (graphs, _) = analysis::input_graphs_controlled(
+            &snapshot,
+            &program,
+            &options,
+            &control,
+            None,
+            Some(pool.work_parent()),
+        )
+        .unwrap();
+        let error = copy_visible(
+            dataset.store(),
+            &snapshot,
+            Default::default(),
+            &control,
+            Some(pool.work_parent()),
+            |quad| Ok(graphs.contains(&quad[3])),
+        )
+        .err()
+        .expect("the visible copy must charge the pool");
+        assert!(
+            matches!(error, Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::ServerMemory)
+        );
+        assert_eq!(pool.granted(), filler.bytes());
+    }
+
+    #[test]
     fn private_copy_timeout_is_bounded_but_caller_cancel_propagates() {
         let dataset = Dataset::memory();
         dataset.update("INSERT DATA {<urn:s> <urn:p> 1}").unwrap();

@@ -399,7 +399,7 @@ impl Runtime {
         let whole = whole_reason(graphs.as_ref()).map(str::to_string);
         let compiled = compile(&q, whole.as_deref())?;
         let mut circuit = Circuit::new(compiled, graphs.clone());
-        circuit.set_pool(self.pool.clone(), self.circuit_parent());
+        circuit.set_runtime_pool(self.pool.clone(), self.circuit_parent());
         circuit.set_local_limit(Some(spec.max_memory_bytes));
         // the dataset's reading of errors in aggregates when the circuit attaches
         let errors = self.host_or_open().aggregate_errors();
@@ -1147,7 +1147,7 @@ mod charge_tally_tests {
         let q = parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
         let mut circuit = Circuit::new(compile(&q, None).unwrap(), None);
         let pool = QueryPool::new(1 << 20);
-        circuit.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+        circuit.set_runtime_pool(Some(pool.clone()), Some(pool.work_parent()));
 
         // Populate 50 commits (VecDeque capacity 64), then discard 1..=45, keeping
         // 46..=50 (5 entries) while retaining spare VecDeque capacity (`64 <= 5 + 1 + 64`).
