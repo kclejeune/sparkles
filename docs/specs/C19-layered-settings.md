@@ -1211,9 +1211,12 @@ patterns, is in
   non-table document in `IngestPanel.svelte` asks for confirmation before sending
   `extract: false` to store the document as a source without facts. Source-only
   previews still wait for approval, and automatic uploads run the merge checks.
-  The UI retries a stale enable write only while the displayed changes and recipients
-  agree with the approved proposal. The server checks the approved fields and
-  recipients again with the write. Both Rust
+  Document uploads that expect facts send `extract: true`, and retries keep that
+  choice. If the server has no extraction model, the panel refreshes its status and
+  offers a source-only upload with a separate confirmation.
+  The UI retries a stale enable write only while the displayed fields, recipients and
+  model configuration revision agree with the approved proposal. The server checks
+  the same conditions under the write locks. Both Rust
   (`memory_cmd::ops::plan_enable_ingest`) and TypeScript (`ui/src/lib/settings.ts`
   `planEnableIngest` and `enableIngest`) are verified against the shared fixture
   `testsuite/settings/enable-ingest.json`, alongside Vitest tests and Playwright

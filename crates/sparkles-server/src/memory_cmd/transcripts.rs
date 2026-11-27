@@ -298,8 +298,8 @@ pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
     let digests = session_digests(run.conn, &run.sync.prefix)?;
     let mut reports = Vec::new();
     let mut budget = run.opts.max_bytes;
-    let seg = run.project.segment();
-    let project_iri = run.ctx.project_iri(&run.project.key);
+    let project_key = run.project.redacted_key(run.policy);
+    let seg = sparkles_memory_import::project::segment_of(&project_key);
     for f in found {
         let path_key = f.path.display().to_string();
         let mut rep = FileReport {
@@ -475,7 +475,7 @@ pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
                 run,
                 &s,
                 &graph,
-                &project_iri,
+                &project_key,
                 f.harness,
                 &f.path,
                 names.len(),
@@ -551,12 +551,13 @@ fn session_facts(
     run: &Run,
     s: &Session,
     graph: &str,
-    project_iri: &str,
+    project_key: &str,
     harness: Harness,
     path: &Path,
     redactions: usize,
 ) -> Vec<Fact> {
     let id = s.id.clone().unwrap_or_default();
+    let project_iri = &run.ctx.project_iri(project_key);
     let sess = run.ctx.session_iri(harness.segment(), &id);
     let mut f = vec![
         fact(graph, &mem("harness"), Obj::Iri(harness.iri())),
@@ -577,11 +578,7 @@ fn session_facts(
         ),
         fact(graph, vocab::PROV_GENERATED_BY, Obj::Iri(sess.clone())),
         fact(project_iri, vocab::RDF_TYPE, Obj::Iri(mem("Project"))),
-        fact(
-            project_iri,
-            vocab::RDFS_LABEL,
-            Obj::lit(run.project.key.clone()),
-        ),
+        fact(project_iri, vocab::RDFS_LABEL, Obj::lit(project_key)),
         fact(&sess, vocab::RDF_TYPE, Obj::Iri(mem("Session"))),
         fact(&sess, &mem("sessionId"), Obj::lit(id.clone())),
         fact(&sess, &mem("harness"), Obj::Iri(harness.iri())),

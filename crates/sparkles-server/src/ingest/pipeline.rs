@@ -344,20 +344,27 @@ pub fn run(ctx: &Ctx, req: &Request) -> (Result<Value, Value>, Value) {
 }
 
 /// The policy for one ingestion, shared by its text and retained metadata.
-pub(super) struct Redaction {
+pub(crate) struct Redaction {
     mode: crate::assist::ServerIngestRedaction,
     policy: sparkles_memory_import::redact::Policy,
 }
 
 impl Redaction {
     pub fn new(r: &Run, ds: &crate::state::Dataset) -> Self {
-        let st = &r.ctx.server.state;
+        Self::for_dataset(&r.ctx.server.state, ds, r.ctx.principal)
+    }
+
+    pub(crate) fn for_dataset(
+        st: &crate::state::AppState,
+        ds: &crate::state::Dataset,
+        principal: &Principal,
+    ) -> Self {
         let memory = crate::assist::memory_settings(st, ds);
         let mode = memory.server_ingest_redaction();
         let known = if mode != crate::assist::ServerIngestRedaction::Off
             && memory.redaction_known_values()
         {
-            crate::settings::secrets::known_values(st, r.ctx.principal)
+            crate::settings::secrets::known_values(st, principal)
         } else {
             Vec::new()
         };
@@ -417,7 +424,13 @@ impl Redaction {
     > {
         use crate::assist::ServerIngestRedaction::{Redact, Refuse};
         if self.mode == Redact {
-            return self.policy.redact_checked(text, || r.check());
+            return self.policy.redact_bounded(text, convert::MAX_TEXT_BYTES, || r.check(), || {
+                Refusal::new(
+                    "too-large",
+                    413,
+                    "redaction would exceed the rendition's size or replacement limit: split the document",
+                ).into()
+            });
         }
         if self.mode == Refuse
             && let Some((name, at)) = self.first_match(r, text)?
@@ -467,9 +480,26 @@ impl Redaction {
     }
 
     fn matches_locator(&self, r: &Run, value: &str) -> Result<bool, Failed> {
+        self.matches_locator_checked(value, || r.check())
+    }
+
+    pub(crate) fn matches_locator_checked<E>(
+        &self,
+        value: &str,
+        mut check: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if self.mode == crate::assist::ServerIngestRedaction::Off {
+            return Ok(false);
+        }
+        if self
+            .policy
+            .first_match_checked(value, &mut check)?
+            .is_some()
+        {
+            return Ok(true);
+        }
         let decoded = percent_encoding::percent_decode_str(value).decode_utf8_lossy();
-        Ok(self.first_match(r, value)?.is_some()
-            || (decoded != value && self.first_match(r, &decoded)?.is_some()))
+        Ok(decoded != value && self.policy.first_match_checked(&decoded, check)?.is_some())
     }
 
     /// Fetch URLs with userinfo or query strings may identify private resources.
@@ -732,7 +762,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
             Mode::Auto => {
                 let b = branch.as_deref().expect("auto has a branch");
                 let message = format!("Ingest {}", title.as_deref().unwrap_or("a document"));
-                merge_if(r, b, &message, None, &mut out)?;
+                merge_if(r, b, &message, None, req.branch.is_none(), &mut out)?;
             }
             Mode::Branch | Mode::Memory | Mode::Claims => {}
         }
@@ -773,7 +803,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
             let b = branch.as_deref().expect("auto has a branch");
             let message = format!("Ingest {}", title.as_deref().unwrap_or("a document"));
             let why = auto_blocker(&proposals, &limits);
-            merge_if(r, b, &message, why, &mut out)?;
+            merge_if(r, b, &message, why, req.branch.is_none(), &mut out)?;
         }
         Mode::Branch | Mode::Memory | Mode::Claims => {}
     }
@@ -817,12 +847,14 @@ pub(super) fn confirm_estimate(
 }
 
 /// Merge `branch` into `main` when nothing blocks it and the merge preview finds no
-/// conflict or guard finding, then delete it. Otherwise say why in `autoFallback`.
+/// conflict or guard finding. Clean up a task-created branch if its commits were
+/// all merged. Otherwise report why the merge was skipped in `autoFallback`.
 pub(crate) fn merge_if(
     r: &Run,
     branch: &str,
     message: &str,
     mut why: Option<String>,
+    cleanup: bool,
     out: &mut Value,
 ) -> Result<(), Failed> {
     // the merge preview: the guard of main and conflicts keep the branch
@@ -847,15 +879,10 @@ pub(crate) fn merge_if(
                         "expect": p["expect"] }),
                 None,
             )?;
-            let _ = r.tool(
-                "delete_branch",
-                json!({ "name": branch, "force": true }),
-                None,
-            );
             out["outcome"] = "merged".into();
             out["merge"] = m;
-            if let Some(o) = out.as_object_mut() {
-                o.remove("review");
+            if cleanup {
+                cleanup_merged_branch(r, branch, out);
             }
         }
         (w, _) => {
@@ -863,6 +890,15 @@ pub(crate) fn merge_if(
         }
     }
     Ok(())
+}
+
+pub(super) fn cleanup_merged_branch(r: &Run, branch: &str, out: &mut Value) {
+    if r.tool("delete_branch", json!({ "name": branch }), None)
+        .is_ok()
+        && let Some(o) = out.as_object_mut()
+    {
+        o.remove("review");
+    }
 }
 
 /// An IRI as a tool returned it, `<…>` or a prefixed name of `prefixes`, made bare.
@@ -1027,7 +1063,7 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
         let b = branch.as_deref().expect("auto has a branch");
         let message = format!("Ingest {}", title.as_deref().unwrap_or("a source"));
         let why = auto_blocker(&proposals, &limits);
-        merge_if(r, b, &message, why, &mut out)?;
+        merge_if(r, b, &message, why, req.branch.is_none(), &mut out)?;
     }
     ctx.progress.status(Status::Writing, 0.99, None);
     Ok(out)
@@ -1289,7 +1325,7 @@ fn discard_branch(r: &Run, req: &Request, branch: Option<&str>) {
     if let Some(b) = branch
         && req.branch.as_deref() != Some(b)
     {
-        let _ = r.tool("delete_branch", json!({ "name": b, "force": true }), None);
+        let _ = r.tool("delete_branch", json!({ "name": b }), None);
     }
 }
 
@@ -1301,24 +1337,10 @@ pub fn approve(ctx: &Ctx, dataset: &str, a: &Approval) -> Result<Value, Value> {
         dataset: dataset.to_string(),
         usage: Usage::default(),
     };
-    let ds = ctx
-        .server
-        .dataset(ctx.principal, Some(dataset))
-        .map_err(|e| Failed::from(e).0)?;
-    let head = ds.store.snapshot().commit;
-    if head != a.head {
-        return Err(json!({
-            "code": "conflict",
-            "status": 409,
-            "message": format!("the dataset changed since the preview (head {} then, {head} now): ingest the document again", a.head),
-        }));
-    }
+    let mut args = a.register.clone();
+    args.insert("ifHead".into(), a.head.into());
     let reg = r
-        .tool(
-            "register_converted",
-            Value::Object(a.register.clone()),
-            None,
-        )
+        .tool("register_converted", Value::Object(args), None)
         .map_err(|e| Failed::from(e).0)?;
     let mut commits = Vec::new();
     for call in &a.asserts {

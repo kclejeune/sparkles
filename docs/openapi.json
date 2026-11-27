@@ -2761,6 +2761,10 @@
                 "description": "Whether server-side document ingestion can extract facts with an `extract` provider.",
                 "type": "boolean"
               },
+              "modelRevision": {
+                "description": "Opaque revision of the installed model configuration for ingestion enable confirmation.",
+                "type": "string"
+              },
               "models": {
                 "type": "boolean"
               },
@@ -55018,7 +55022,7 @@
             "$ref": "#/components/parameters/kind"
           },
           {
-            "description": "For an assistant ingestion enable patch, percent-encoded JSON naming the approved settings fields and document recipients. A changed proposal returns 412.",
+            "description": "For an assistant ingestion enable patch, percent-encoded JSON naming the approved settings fields, document recipients, and the modelRevision from assistant status. A changed proposal returns 412.",
             "in": "header",
             "name": "If-Ingest-Confirmation",
             "schema": {

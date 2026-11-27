@@ -5891,6 +5891,8 @@ export interface components {
                 historyDays: number;
                 /** @description Whether server-side document ingestion can extract facts with an `extract` provider. */
                 ingest?: boolean;
+                /** @description Opaque revision of the installed model configuration for ingestion enable confirmation. */
+                modelRevision?: string;
                 models: boolean;
                 reason?: string;
                 /** @description Whether an answer can carry a summary. */
@@ -25264,7 +25266,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description For an assistant ingestion enable patch, percent-encoded JSON naming the approved settings fields and document recipients. A changed proposal returns 412. */
+                /** @description For an assistant ingestion enable patch, percent-encoded JSON naming the approved settings fields, document recipients, and the modelRevision from assistant status. A changed proposal returns 412. */
                 "If-Ingest-Confirmation"?: string;
                 /** @description The `etag` of the runtime layer the change is based on. */
                 "If-Match"?: string;

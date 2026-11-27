@@ -44,19 +44,22 @@
   const settingsHref = (field?: string) =>
     `${base}/datasets/${enc(ds)}?tab=settings${field ? `#setting-assistant-${field}` : ''}`;
 
-  async function load() {
+  let reads = 0;
+
+  export async function load() {
     const name = ds;
+    const read = ++reads;
     loading = true;
     try {
       const [kRes, aRes] = await Promise.allSettled([
         readKind(datasetKindUrl(name, 'assistant')),
         askApi.assistantSettings(name),
       ]);
-      if (name !== ds) return;
+      if (name !== ds || read !== reads) return;
       kind = kRes.status === 'fulfilled' ? kRes.value : null;
       assistant = aRes.status === 'fulfilled' ? aRes.value : null;
     } finally {
-      if (name === ds) {
+      if (name === ds && read === reads) {
         loading = false;
       }
     }

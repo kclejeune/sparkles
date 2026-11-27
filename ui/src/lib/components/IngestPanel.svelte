@@ -31,8 +31,15 @@
   let allowPartial = $state(false);
   let busy = $state(false);
   let ingestStatus = $state({ on: false, known: false, loading: true });
-  let lastExtract: boolean | undefined;
-  let storeOnlyConfirm = $state(false);
+  type Upload = {
+    file: File;
+    mode: review.IngestMode;
+    partial: boolean;
+    extract?: boolean;
+  };
+  let lastUpload = $state<Upload | null>(null);
+  let storeOnly = $state<Upload | null>(null);
+  let statusPanel: ReturnType<typeof ServerIngestStatus> | undefined = $state();
   /** The task this panel follows. */
   let task = $state<review.IngestTask | null>(null);
   /** The mapping draft as editable JSON, and what its dry run said. */
@@ -93,6 +100,7 @@
         task = next;
       }
       if (draftOf(task?.result, 0)?.mapping) mappingText = mappingOf(task?.result);
+      if (task?.error?.code === 'no-model' && lastUpload?.extract) void statusPanel?.load();
     } catch (e) {
       if (!(e instanceof DOMException && e.name === 'AbortError'))
         toasts.error('Could not get the ingestion status', e);
@@ -106,24 +114,22 @@
 
   function requestStart() {
     if (!file || ingestStatus.loading) return;
-    if (!ingestStatus.on && !isTableFile(file)) {
-      storeOnlyConfirm = true;
-      return;
-    }
-    void start(allowPartial, ingestStatus.on ? undefined : false);
+    const upload = { file, mode, partial: allowPartial };
+    if (isTableFile(file)) void start({ ...upload, extract: ingestStatus.on ? undefined : false });
+    else if (ingestStatus.on) void start({ ...upload, extract: true });
+    else storeOnly = upload;
   }
 
-  async function start(partial = allowPartial, extract?: boolean) {
-    if (!file) return;
+  async function start(upload: Upload) {
     busy = true;
-    storeOnlyConfirm = false;
+    storeOnly = null;
     try {
-      const t = await review.startIngest(ds, file, {
-        mode,
-        allowPartial: partial || undefined,
-        extract,
+      const t = await review.startIngest(ds, upload.file, {
+        mode: upload.mode,
+        allowPartial: upload.partial || undefined,
+        extract: upload.extract,
       });
-      lastExtract = extract;
+      lastUpload = upload;
       void follow(t);
     } catch (e) {
       toasts.error('Could not start the ingestion', e);
@@ -150,7 +156,7 @@
     } catch (e) {
       toasts.error(
         what === 'approve'
-          ? 'Could not write the facts'
+          ? 'Could not write to main'
           : what === 'confirm'
             ? 'Could not continue the ingestion'
             : 'Could not cancel the ingestion',
@@ -213,14 +219,25 @@
   <section class="panel" aria-label="Ingest" hidden={!canWrite}>
     <div class="panel-head"><h2>Ingest a document</h2></div>
     <div class="panel-body ingest">
-      <ServerIngestStatus {ds} {canAdmin} onstate={(s) => (ingestStatus = s)} />
+      <ServerIngestStatus
+        bind:this={statusPanel}
+        {ds}
+        {canAdmin}
+        onstate={(s) => (ingestStatus = s)}
+      />
       <p class="faint small">
         Markdown, HTML, text{caps.pdf ? ', PDF' : ''}{caps.office
           ? ', Word, PowerPoint, OpenDocument'
-          : ''}, CSV, TSV{caps.office ? ' or Excel' : ''}. {#if !ingestStatus.loading && !ingestStatus.on}Documents
-          are registered as sources without extracting facts while server ingestion is off.{:else}Documents
-          are registered as sources, and the model proposes facts from them.{/if} Tables and sheets get
-        a draft mapping instead.{caps.pdf && !caps.ocr ? ' Scanned PDF pages are not read.' : ''}
+          : ''}, CSV, TSV{caps.office ? ' or Excel' : ''}.
+        {#if ingestStatus.known && ingestStatus.on}
+          Documents are registered as sources, and the model proposes facts from them.
+        {:else if ingestStatus.known}
+          Documents are registered as sources without extracting facts while server ingestion is
+          off.
+        {/if}
+        Tables and sheets get a draft mapping instead.{caps.pdf && !caps.ocr
+          ? ' Scanned PDF pages are not read.'
+          : ''}
       </p>
       <div class="row">
         <label class="btn file-btn">
@@ -306,16 +323,22 @@
                 </ul>
               {/if}
             </div>
-            {#if err.code === 'needs-ocr' && file}
-              <div class="row">
-                <button
-                  class="btn sm"
-                  disabled={busy || ingestStatus.loading}
-                  onclick={() =>
-                    start(true, ingestStatus.on && lastExtract !== false ? undefined : false)}
-                  >Ingest the readable pages</button
+            {#if lastUpload}
+              {@const upload = lastUpload}
+              {#if err.code === 'needs-ocr'}
+                <div class="row">
+                  <button
+                    class="btn sm"
+                    disabled={busy}
+                    onclick={() => start({ ...upload, partial: true })}
+                    >Ingest the readable pages</button
+                  >
+                </div>
+              {:else if err.code === 'no-model' && upload.extract}
+                <button class="btn sm" disabled={busy} onclick={() => (storeOnly = upload)}
+                  >Store without facts…</button
                 >
-              </div>
+              {/if}
             {/if}
           {/if}
 
@@ -483,19 +506,26 @@
   </section>
 
   <Modal
-    bind:open={storeOnlyConfirm}
+    bind:open={
+      () => storeOnly !== null,
+      (open) => {
+        if (!open) storeOnly = null;
+      }
+    }
     title="Store this document as a source without facts?"
     width={440}
     closeDisabled={busy}
   >
     <p class="small">
-      {ingestStatus.known
-        ? 'Server ingestion is off for this dataset.'
-        : 'Server ingestion status is unavailable.'}
-      <code class="mono">{file?.name}</code>
-      {#if mode === 'preview'}
+      {storeOnly?.extract
+        ? 'No model was available to extract facts from this document.'
+        : ingestStatus.known
+          ? 'Server ingestion is off for this dataset.'
+          : 'Server ingestion status is unavailable.'}
+      <code class="mono">{storeOnly?.file.name}</code>
+      {#if storeOnly?.mode === 'preview'}
         will be previewed and stored on main after approval.
-      {:else if mode === 'auto'}
+      {:else if storeOnly?.mode === 'auto'}
         will be stored on main when the merge checks pass, or kept on a review branch.
       {:else}
         will be stored on a review branch.
@@ -503,10 +533,11 @@
       No model will run.
     </p>
     {#snippet actions()}
-      <button class="btn sm" disabled={busy} onclick={() => (storeOnlyConfirm = false)}
-        >Cancel</button
-      >
-      <button class="btn primary sm" disabled={busy} onclick={() => start(allowPartial, false)}
+      <button class="btn sm" disabled={busy} onclick={() => (storeOnly = null)}>Cancel</button>
+      <button
+        class="btn primary sm"
+        disabled={busy}
+        onclick={() => storeOnly && start({ ...storeOnly, extract: false })}
         >Store without facts</button
       >
     {/snippet}

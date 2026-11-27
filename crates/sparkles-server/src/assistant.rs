@@ -1470,14 +1470,18 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/models/usage", get(usage))
 }
 
-/// The extract role before send limits, omitting providers that no longer exist.
+/// The extract role before send limits, filtered against the current provider allow-lists.
 pub(crate) fn configured_extract_pairs(models: &Models, s: &AssistantSettings) -> Vec<Pair> {
     let mut pairs = s
         .roles
         .get(&Role::Extract)
         .cloned()
         .unwrap_or_else(|| models.pairs(Role::Extract));
-    pairs.retain(|p| models.provider(&p.provider).is_some());
+    pairs.retain(|p| {
+        models
+            .provider(&p.provider)
+            .is_some_and(|provider| provider.allows(&p.model))
+    });
     pairs
 }
 
@@ -1485,12 +1489,14 @@ pub(crate) fn configured_extract_pairs(models: &Models, s: &AssistantSettings) -
 /// pairs they use.
 fn settings_json(st: &AppState, s: &AssistantSettings) -> Value {
     let mut v = serde_json::to_value(s).unwrap_or_default();
+    let models = st.models();
     let mut status = json!({
-        "models": st.models().is_some(),
+        "models": models.is_some(),
         "historyDays": s.history_days(st),
     });
-    if let Some(m) = st.models() {
-        let extract = configured_extract_pairs(&m, s);
+    if let Some(m) = &models {
+        status["modelRevision"] = m.revision.to_string().into();
+        let extract = configured_extract_pairs(m, s);
         status["extract"] = serde_json::to_value(&extract).unwrap_or_default();
         status["ingest"] = (s.enabled
             && s.ingest
@@ -1504,7 +1510,7 @@ fn settings_json(st: &AppState, s: &AssistantSettings) -> Value {
     match ask_status(st, s) {
         Ok(()) => {
             status["ask"] = true.into();
-            if let Some(m) = st.models() {
+            if let Some(m) = &models {
                 let draft = s
                     .roles
                     .get(&Role::Draft)

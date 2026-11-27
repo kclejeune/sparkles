@@ -960,6 +960,7 @@ export type IngestAvailability = {
   modelsConfigured: boolean;
   providers: ExtractProviderView[];
   activeProviders: ExtractProviderView[];
+  modelRevision?: string;
   /** Providers and send levels after applying the enable patch. */
   enableProviders: ExtractProviderView[];
   plan: EnableIngestPlan | null;
@@ -1022,6 +1023,7 @@ export function describeIngestState(
       modelsConfigured,
       providers,
       activeProviders,
+      modelRevision: status?.modelRevision,
       enableProviders,
       plan,
       canEnableDirectly: false,
@@ -1057,6 +1059,7 @@ export function describeIngestState(
   const canEnableDirectly =
     plan != null &&
     plan.wouldEnable &&
+    !!status?.modelRevision &&
     Object.keys(plan.patch).length > 0 &&
     wouldHaveActiveProvider;
 
@@ -1065,6 +1068,7 @@ export function describeIngestState(
     modelsConfigured,
     providers,
     activeProviders,
+    modelRevision: status?.modelRevision,
     enableProviders,
     plan,
     blockingField,
@@ -1097,7 +1101,7 @@ function ingestConfirmation(s: IngestAvailability): string {
   const recipients = s.enableProviders
     .filter((p) => p.receivesDocuments)
     .map((p) => [p.provider, p.model]);
-  return JSON.stringify({ fields, recipients });
+  return JSON.stringify({ fields, recipients, modelRevision: s.modelRevision });
 }
 
 /** Apply the approved enable patch and retry a stale write only for the same plan. */

@@ -13188,12 +13188,13 @@ ingestion writes nothing the caller could not write with those tools.
 
 **`GET /$/assistant/{ds}`** includes `status.ingest`, which says if server extraction
 is on, and `status.extract`, which lists the configured extract provider and model
-pairs before their send limits. Providers removed from the server are excluded.
-The Web UI confirms the proposed enable patch and its document recipients. It sends
+pairs before their send limits. Only pairs allowed by the installed model configuration
+appear in the list. The Web UI confirms the proposed enable patch and its document recipients. It sends
 `If-Match` and `If-Ingest-Confirmation` on the assistant settings PATCH. The latter
 is percent-encoded JSON with `fields` in the order `enabled`, `ingest`, `send`, each
-as `[field, currentValue, source]`, and `recipients` as the proposed ordered
-`[provider, model]` pairs. A changed field or recipient list fails with `412`.
+as `[field, currentValue, source]`, `recipients` as the proposed ordered
+`[provider, model]` pairs, and `modelRevision` from `status.modelRevision`.
+A change to the approved fields, recipients or installed model revision fails with `412`.
 
 **`POST /$/ingest/{ds}`** starts a task and answers `202` with it and a `Location`
 header. The document is the `file` part of a multipart upload, with the options as
@@ -13263,8 +13264,9 @@ extraction from a stored rendition requiring replacement fails with
 `422 redaction-required` before model calls or writes. Register a redacted rendition
 before retrying. A table draft applies the policy to the model sample and reports the
 sample's counts. A workbook also reports the sum of its sheet counts. The preview
-and table upload use the original rows. Task listings keep the request mode, format
-and size when supplied and omit raw file names and locators.
+and table upload use the original rows. Task listings keep the request mode, canonical
+media type and size when available. When redaction would exceed the rendition size
+or replacement limit, the task fails with `too-large`.
 
 Before any model call the task estimates the extraction's tokens from the chunks, the
 profile and the answer, and its cost from the first pair's pricing. Above the dataset's

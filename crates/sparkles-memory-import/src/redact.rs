@@ -239,16 +239,55 @@ impl Policy {
     pub fn redact_checked<E>(
         &self,
         text: &str,
+        check: impl FnMut() -> Result<(), E>,
+    ) -> Result<(Redacted, Vec<Edit>), E> {
+        self.replace(text, usize::MAX, usize::MAX, check, || {
+            unreachable!("an uncapped replacement has no redaction budget")
+        })
+    }
+
+    /// Redact a bounded input, checking the caller's deadline or cancellation during
+    /// matching and refusing a rendition that exceeds its byte or replacement budget.
+    pub fn redact_bounded<E>(
+        &self,
+        text: &str,
+        max_output: usize,
+        check: impl FnMut() -> Result<(), E>,
+        too_large: impl Fn() -> E,
+    ) -> Result<(Redacted, Vec<Edit>), E> {
+        const MAX_REPLACEMENTS: usize = 32 * 1024;
+        self.replace(text, max_output, MAX_REPLACEMENTS, check, too_large)
+    }
+
+    fn replace<E>(
+        &self,
+        text: &str,
+        max_output: usize,
+        max_replacements: usize,
         mut check: impl FnMut() -> Result<(), E>,
+        too_large: impl Fn() -> E,
     ) -> Result<(Redacted, Vec<Edit>), E> {
         let mut found = BTreeMap::new();
         self.visit(text, &mut check, |candidate| {
-            merge_match(&mut found, candidate)
+            merge_match(&mut found, candidate);
+            if found.len() > max_replacements {
+                return Err(too_large());
+            }
+            Ok(())
         })?;
 
-        let mut out = String::with_capacity(text.len());
-        let mut names = Vec::new();
-        let mut edits = Vec::new();
+        const MARKER_OVERHEAD: usize = "[redacted:]".len();
+        let mut len = text.len();
+        for (&start, &(end, _, name)) in &found {
+            check()?;
+            len = len - (end - start) + MARKER_OVERHEAD + name.len();
+        }
+        if len > max_output {
+            return Err(too_large());
+        }
+        let mut out = String::with_capacity(len);
+        let mut names = Vec::with_capacity(found.len());
+        let mut edits = Vec::with_capacity(found.len());
         let mut at = 0;
         for (start, (end, _, name)) in found {
             check()?;
@@ -283,6 +322,7 @@ impl Policy {
             if first.is_none_or(|(s, p, _)| (start, priority) < (s, p)) {
                 first = Some((start, priority, name));
             }
+            Ok(())
         })?;
         Ok(first.map(|(start, _, name)| (name.to_string(), start)))
     }
@@ -291,7 +331,7 @@ impl Policy {
         &'a self,
         text: &str,
         check: &mut impl FnMut() -> Result<(), E>,
-        mut visit: impl FnMut((usize, usize, usize, &'a str)),
+        mut visit: impl FnMut((usize, usize, usize, &'a str)) -> Result<(), E>,
     ) -> Result<(), E> {
         static MARKER: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(r"\[redacted:([A-Za-z0-9_-]{1,64})\]").expect("marker regex compiles")
@@ -339,14 +379,15 @@ impl Policy {
                 i > 0 && ranges[i - 1].1 >= e
             };
             if s < e && !covered(&allowed) && (priority == 0 || !covered(&markers)) {
-                visit((s, e, priority, name));
+                visit((s, e, priority, name))?;
             }
+            Ok(())
         };
         if let Some(ac) = &self.known_matcher {
             check()?;
             for m in ac.find_overlapping_iter(text) {
                 check()?;
-                candidate(m.start(), m.end(), 0, &self.known_label);
+                candidate(m.start(), m.end(), 0, &self.known_label)?;
             }
         }
         for (pi, p) in self.patterns.iter().enumerate() {
@@ -354,24 +395,22 @@ impl Policy {
             for c in p.regex.captures_iter(text) {
                 check()?;
                 let m = c.name("v").or_else(|| c.get(0)).expect("group 0");
-                candidate(m.start(), m.end(), 1 + pi, &p.name);
+                candidate(m.start(), m.end(), 1 + pi, &p.name)?;
             }
         }
         let personal_base = 1 + self.patterns.len();
         for (ci, cat) in self.personal.iter().enumerate() {
             check()?;
-            for (s, e) in find_personal(*cat, text) {
-                check()?;
-                candidate(s, e, personal_base + ci, cat.as_str());
-            }
+            visit_personal(*cat, text, check, |s, e| {
+                candidate(s, e, personal_base + ci, cat.as_str())
+            })?;
         }
         if let Some(cfg) = self.entropy {
             check()?;
             let prio = personal_base + self.personal.len();
-            for (s, e) in find_high_entropy(text, cfg) {
-                check()?;
-                candidate(s, e, prio, "high-entropy");
-            }
+            visit_high_entropy(text, cfg, check, |s, e| {
+                candidate(s, e, prio, "high-entropy")
+            })?;
         }
         check()
     }
@@ -497,6 +536,20 @@ where
         .map(|(_, v)| v.as_ref().trim().to_string())
         .filter(|v| v.chars().count() >= MIN_KNOWN_VALUE_CHARS)
         .collect()
+}
+
+/// Remap a byte offset after redaction, snapping offsets inside a replacement to its start.
+pub(crate) fn remap_byte_offset(edits: &[Edit], offset: usize) -> usize {
+    let i = edits.partition_point(|&(start, ..)| start <= offset);
+    if i == 0 {
+        return offset;
+    }
+    let (_, end, new_start, new_end) = edits[i - 1];
+    if offset < end {
+        new_start
+    } else {
+        new_end + (offset - end)
+    }
 }
 
 /// Remap a sorted list of code-point offsets in `orig` after byte edits from
@@ -629,10 +682,16 @@ pub fn shannon_entropy(s: &str) -> f64 {
     h
 }
 
-fn find_high_entropy(text: &str, cfg: EntropyConfig) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
+fn visit_high_entropy<E>(
+    text: &str,
+    cfg: EntropyConfig,
+    check: &mut impl FnMut() -> Result<(), E>,
+    mut visit: impl FnMut(usize, usize) -> Result<(), E>,
+) -> Result<(), E> {
     for re in ENTROPY_CONTEXTS.iter() {
+        check()?;
         for cap in re.captures_iter(text) {
+            check()?;
             let Some(m) = cap.name("v") else {
                 continue;
             };
@@ -648,11 +707,11 @@ fn find_high_entropy(text: &str, cfg: EntropyConfig) -> Vec<(usize, usize)> {
                 continue;
             }
             if shannon_entropy(s) >= cfg.min_bits_per_char {
-                out.push((m.start(), m.end()));
+                visit(m.start(), m.end())?;
             }
         }
     }
-    out
+    check()
 }
 
 // --- personal data detectors ------------------------------------------------------------
@@ -683,38 +742,55 @@ static IPV6_CANDIDATE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[0-9A-Fa-f:]{2,39}(?:\.[0-9]{1,3}){0,3}").expect("ipv6 regex compiles")
 });
 
-fn find_personal(cat: PersonalCategory, text: &str) -> Vec<(usize, usize)> {
+fn visit_personal<E>(
+    cat: PersonalCategory,
+    text: &str,
+    check: &mut impl FnMut() -> Result<(), E>,
+    visit: impl FnMut(usize, usize) -> Result<(), E>,
+) -> Result<(), E> {
     match cat {
-        PersonalCategory::Email => find_emails(text),
-        PersonalCategory::Phone => find_phones(text),
-        PersonalCategory::PaymentCard => find_cards(text),
-        PersonalCategory::Iban => find_ibans(text),
-        PersonalCategory::Ip => find_ips(text),
+        PersonalCategory::Email => visit_emails(text, check, visit),
+        PersonalCategory::Phone => visit_phones(text, check, visit),
+        PersonalCategory::PaymentCard => visit_cards(text, check, visit),
+        PersonalCategory::Iban => visit_ibans(text, check, visit),
+        PersonalCategory::Ip => visit_ips(text, check, visit),
     }
 }
 
-fn find_emails(text: &str) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
+fn visit_emails<E>(
+    text: &str,
+    check: &mut impl FnMut() -> Result<(), E>,
+    mut visit: impl FnMut(usize, usize) -> Result<(), E>,
+) -> Result<(), E> {
     let mut at = 0;
     let mut userinfo = false;
     for m in EMAIL_RE.find_iter(text) {
+        check()?;
         // Skip URL userinfo like `https://user@host.example` or `postgres://user:pass@host.example`.
         let before = &text[at..m.start()];
-        if let Some(i) = before.rfind(|c: char| c == '/' || c.is_whitespace()) {
-            userinfo = text[..at + i + 1].ends_with("://");
+        if let Some((i, c)) = before
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| c == '/' || c.is_whitespace())
+        {
+            userinfo = text[..at + i + c.len_utf8()].ends_with("://");
         }
         if !userinfo {
-            out.push((m.start(), m.end()));
+            visit(m.start(), m.end())?;
         }
         at = m.end();
     }
-    out
+    check()
 }
 
-fn find_phones(text: &str) -> Vec<(usize, usize)> {
+fn visit_phones<E>(
+    text: &str,
+    check: &mut impl FnMut() -> Result<(), E>,
+    mut visit: impl FnMut(usize, usize) -> Result<(), E>,
+) -> Result<(), E> {
     let bytes = text.as_bytes();
-    let mut out = Vec::new();
     for m in PHONE_RE.find_iter(text) {
+        check()?;
         let s = m.start();
         let e = m.end();
         if s > 0 {
@@ -731,10 +807,10 @@ fn find_phones(text: &str) -> Vec<(usize, usize)> {
         }
         let digits = m.as_str().bytes().filter(u8::is_ascii_digit).count();
         if (7..=15).contains(&digits) {
-            out.push((s, e));
+            visit(s, e)?;
         }
     }
-    out
+    check()
 }
 
 fn luhn_valid(digits: &[u8]) -> bool {
@@ -754,10 +830,14 @@ fn luhn_valid(digits: &[u8]) -> bool {
     sum.is_multiple_of(10)
 }
 
-fn find_cards(text: &str) -> Vec<(usize, usize)> {
+fn visit_cards<E>(
+    text: &str,
+    check: &mut impl FnMut() -> Result<(), E>,
+    mut visit: impl FnMut(usize, usize) -> Result<(), E>,
+) -> Result<(), E> {
     let bytes = text.as_bytes();
-    let mut out = Vec::new();
     for m in CARD_RE.find_iter(text) {
+        check()?;
         let s = m.start();
         let e = m.end();
         if s > 0 {
@@ -774,10 +854,10 @@ fn find_cards(text: &str) -> Vec<(usize, usize)> {
         }
         let digits: Vec<u8> = m.as_str().bytes().filter(u8::is_ascii_digit).collect();
         if (13..=19).contains(&digits.len()) && luhn_valid(&digits) {
-            out.push((s, e));
+            visit(s, e)?;
         }
     }
-    out
+    check()
 }
 
 fn iban_valid(raw: &str) -> bool {
@@ -814,20 +894,28 @@ fn iban_valid(raw: &str) -> bool {
     rem == 1
 }
 
-fn find_ibans(text: &str) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
+fn visit_ibans<E>(
+    text: &str,
+    check: &mut impl FnMut() -> Result<(), E>,
+    mut visit: impl FnMut(usize, usize) -> Result<(), E>,
+) -> Result<(), E> {
     for m in IBAN_RE.find_iter(text) {
+        check()?;
         if iban_valid(m.as_str()) {
-            out.push((m.start(), m.end()));
+            visit(m.start(), m.end())?;
         }
     }
-    out
+    check()
 }
 
-fn find_ips(text: &str) -> Vec<(usize, usize)> {
+fn visit_ips<E>(
+    text: &str,
+    check: &mut impl FnMut() -> Result<(), E>,
+    mut visit: impl FnMut(usize, usize) -> Result<(), E>,
+) -> Result<(), E> {
     let bytes = text.as_bytes();
-    let mut out = Vec::new();
     for m in IPV4_RE.find_iter(text) {
+        check()?;
         let s = m.start();
         let e = m.end();
         if s > 0 && (bytes[s - 1] == b'.' || bytes[s - 1].is_ascii_alphanumeric()) {
@@ -838,9 +926,11 @@ fn find_ips(text: &str) -> Vec<(usize, usize)> {
         {
             continue;
         }
-        out.push((s, e));
+        visit(s, e)?;
     }
+    check()?;
     for m in IPV6_CANDIDATE_RE.find_iter(text) {
+        check()?;
         let s = m.start();
         let e = m.end();
         let cand = m.as_str();
@@ -866,10 +956,10 @@ fn find_ips(text: &str) -> Vec<(usize, usize)> {
             }
         }
         if cand.parse::<Ipv6Addr>().is_ok() {
-            out.push((s, e));
+            visit(s, e)?;
         }
     }
-    out
+    check()
 }
 
 fn continues_dotted_address(bytes: &[u8], end: usize) -> bool {
@@ -879,6 +969,70 @@ fn continues_dotted_address(bytes: &[u8], end: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn email_after_multibyte_whitespace() {
+        let mut policy = Policy::from_patterns(Vec::new());
+        policy.personal = vec![PersonalCategory::Email];
+        for space in ['\u{00a0}', '\u{2009}', '\u{3000}'] {
+            let text = format!(
+                "Contact{space}alice@example.com https://user@host.example{space}bob@example.com"
+            );
+            let expected = format!(
+                "Contact{space}[redacted:email] https://user@host.example{space}[redacted:email]"
+            );
+            let redacted = policy.redact(&text);
+            assert_eq!(redacted.text, expected);
+            assert_eq!(redacted.names, ["email", "email"]);
+        }
+    }
+
+    #[test]
+    fn dense_redaction_respects_replacement_and_output_budgets() {
+        let policy = Policy::from_patterns(vec![Pattern::new("letter", "a").unwrap()]);
+        let text = "a".repeat(2 << 20);
+        let result = policy.redact_bounded(&text, usize::MAX, || Ok(()), || "too large");
+        assert_eq!(result, Err("too large"));
+        let result = policy.redact_bounded("aa", 4, || Ok(()), || "too large");
+        assert_eq!(result, Err("too large"));
+        let (result, edits) = policy
+            .redact_bounded("aa", 34, || Ok(()), || "too large")
+            .unwrap();
+        assert_eq!(result.text, "[redacted:letter][redacted:letter]");
+        assert_eq!(edits.len(), 2);
+    }
+
+    #[test]
+    fn personal_and_entropy_detectors_visit_incrementally_and_honor_cancellation() {
+        use std::cell::Cell;
+
+        let seen = Cell::new(0);
+        let mut check = || {
+            if seen.get() == 2 {
+                Err("cancelled")
+            } else {
+                Ok(())
+            }
+        };
+        let visit = |_, _| {
+            seen.set(seen.get() + 1);
+            Ok(())
+        };
+        let emails = "someone@example.org ".repeat(100);
+        assert_eq!(
+            visit_personal(PersonalCategory::Email, &emails, &mut check, visit),
+            Err("cancelled")
+        );
+        assert_eq!(seen.get(), 2);
+
+        seen.set(0);
+        let tokens = "custom_cred = 9fK2mP7qX4vL8nR1wZ6cB3tY0hJ5\n".repeat(100);
+        assert_eq!(
+            visit_high_entropy(&tokens, EntropyConfig::default(), &mut check, visit),
+            Err("cancelled")
+        );
+        assert_eq!(seen.get(), 2);
+    }
 
     #[test]
     fn builtin_patterns() {

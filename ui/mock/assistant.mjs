@@ -176,6 +176,7 @@ function settingsOf(name) {
     status: enabled
       ? {
           models: true,
+          modelRevision: 'mock-model-revision',
           historyDays: days,
           ask: s.ask !== false,
           draft: DRAFT,
@@ -185,6 +186,7 @@ function settingsOf(name) {
         }
       : {
           models: true,
+          modelRevision: 'mock-model-revision',
           historyDays: days,
           ask: false,
           reason: 'the dataset has no assistant (PUT /$/assistant/{ds} with enabled)',

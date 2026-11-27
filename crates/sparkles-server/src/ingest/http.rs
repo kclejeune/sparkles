@@ -293,9 +293,12 @@ async fn start(
     }
     let mut input = json!({ "mode": mode.as_str() });
     // Task listings can be read by dataset admins as well as the uploader.
-    // A raw filename, fetch URL or source locator can contain credentials.
-    if let Some(m) = &media_type {
-        input["format"] = m.clone().into();
+    // Keep only a recognized format's canonical media type, without caller parameters.
+    if let Some(format) = media_type
+        .as_deref()
+        .and_then(super::convert::Format::parse)
+    {
+        input["format"] = format.media_type().into();
     }
     if o.source.is_none() && !fetched {
         input["bytes"] = bytes.len().into();

@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sparkles::commit::CommitKind;
 use sparkles::error::Error;
+use sparkles::guard::Precondition;
+use sparkles::store::Snapshot;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -958,7 +960,7 @@ fn bookkeeping(iri: &str) -> bool {
 
 impl Tools<'_> {
     pub(crate) fn register_source(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
-        self.register_source_with(args, None, false)
+        self.register_source_with(args, None, false, None)
     }
 
     /// `register_source` for a converted document (`POST /$/ingest`): its arguments with
@@ -980,7 +982,14 @@ impl Tools<'_> {
             Some(Value::Bool(b)) => b,
             Some(_) => return Err(ToolError::bad_argument("plan is true or false")),
         };
-        self.register_source_with(args, Some(&extras), plan)
+        let if_head = match args.remove("ifHead") {
+            None => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .ok_or_else(|| ToolError::bad_argument("ifHead is a commit number"))?,
+            ),
+        };
+        self.register_source_with(args, Some(&extras), plan, if_head)
     }
 
     fn register_source_with(
@@ -988,6 +997,7 @@ impl Tools<'_> {
         args: Map<String, Value>,
         converted: Option<&RenditionExtras>,
         plan: bool,
+        if_head: Option<u64>,
     ) -> Result<Outcome, ToolError> {
         let t0 = Instant::now();
         let a: RegisterArgs = parse(args)?;
@@ -1122,6 +1132,40 @@ impl Tools<'_> {
             format.starts_with("text/markdown") && format.contains("profile=transcript");
         let bounds = chunk_bounds(&text, transcript);
         let length = text.chars().count();
+        let main_ds = ds.main();
+        let main_ds = main_ds.as_deref().unwrap_or(&ds);
+        let check = || {
+            if self.call.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(ToolError::new(
+                    "cancelled",
+                    499,
+                    "registration was cancelled",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(ToolError::new(
+                    "timeout",
+                    504,
+                    "the registration deadline passed",
+                ));
+            }
+            Ok(())
+        };
+        if converted.is_some() && (a.iri.is_some() || a.graph.is_some()) {
+            // Conversion checked the request spelling. Check explicit locators again
+            // once the writer has expanded them using its actual prefix map.
+            let redaction =
+                crate::ingest::pipeline::Redaction::for_dataset(&self.server.state, main_ds, p);
+            for (explicit, resolved) in [(a.iri.is_some(), &source), (a.graph.is_some(), &graph)] {
+                if explicit && redaction.matches_locator_checked(resolved.as_str(), check)? {
+                    return Err(ToolError::new(
+                        "sensitive-locator",
+                        422,
+                        "a source or graph IRI matches the redaction policy: use a different IRI",
+                    ));
+                }
+            }
+        }
         // the caller's write view
         let mut opts = self
             .query_options(&ds.name, Endpoint::Update, false, deadline, &prefix_map)
@@ -1144,14 +1188,9 @@ impl Tools<'_> {
                 ),
             ));
         }
-        // Internal conversion already applied serverIngest, including when it is off.
-        // Direct registration applies the import graph policy before retaining any text.
         if converted.is_none() {
-            let main_ds = ds.main();
-            let memory = crate::assist::memory_settings(
-                &self.server.state,
-                main_ds.as_deref().unwrap_or(&ds),
-            );
+            // Direct registration applies the import graph policy.
+            let memory = crate::assist::memory_settings(&self.server.state, main_ds);
             let check_secrets = memory.redaction_everywhere()
                 || memory
                     .imports
@@ -1175,29 +1214,31 @@ impl Tools<'_> {
                         .as_deref()
                         .and_then(|b| std::str::from_utf8(b).ok()),
                 );
-                secret_check(&self.server.state, p, &memory, &texts, || {
-                    if self.call.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Err(ToolError::new(
-                            "cancelled",
-                            499,
-                            "registration was cancelled",
-                        ));
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(ToolError::new(
-                            "timeout",
-                            504,
-                            "the registration deadline passed",
-                        ));
-                    }
-                    Ok(())
-                })?;
+                secret_check(&self.server.state, p, &memory, &texts, check)?;
             }
         }
         let mut ropts = opts.clone();
         ropts.union_default_graph = Some(false);
         ropts.default_graph_extra.clear();
-        let r = Reader::from_snapshot(ds.store.snapshot(), ropts, deadline, false);
+        let precondition = if_head.map(|expected| {
+            Precondition::new(move |head: &Snapshot| {
+                if head.commit != expected {
+                    return Err(Error::PreconditionFailed(format!(
+                        "the dataset changed since the preview (head {expected} then, {} now): ingest the document again",
+                        head.commit
+                    )));
+                }
+                Ok(())
+            })
+        });
+        let head = ds.store.snapshot();
+        let conflict = |m| ToolError::new("conflict", 409, m);
+        if let Some(p) = &precondition
+            && let Err(Error::PreconditionFailed(m)) = p.check(&head)
+        {
+            return Err(conflict(m));
+        }
+        let r = Reader::from_snapshot(head, ropts, deadline, false);
         let eng = |e: Error| ctx.engine(e);
         let g1 = std::slice::from_ref(&graph);
         // what the graph already says of the source
@@ -1448,7 +1489,7 @@ impl Tools<'_> {
             report_limit: None,
             message,
             author: crate::http::author(p),
-            precondition: None,
+            precondition,
             no_wait: false,
             preview_as_new_branch: false,
             before_publish: None,
@@ -1486,6 +1527,7 @@ impl Tools<'_> {
                     "the source does not conform to the dataset's validation guard; nothing was written",
                 ));
             }
+            Err(Error::PreconditionFailed(m)) if if_head.is_some() => return Err(conflict(m)),
             Err(e) => return Err(ctx.engine(e)),
             Ok(stats) => {
                 let Some(receipt) = stats.commit else {

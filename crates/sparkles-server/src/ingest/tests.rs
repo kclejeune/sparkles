@@ -32,6 +32,7 @@ const MEMBER_OF: &str = "http://www.w3.org/ns/org#memberOf";
 fn app(urls: Option<[&str; 2]>) -> (Arc<AppState>, Router) {
     let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
     if let Some(urls) = urls {
+        st.outbound.allow_private = true;
         let mut providers = serde_json::Map::new();
         for (name, url) in ["cheap", "top"].into_iter().zip(urls) {
             providers.insert(
@@ -3235,21 +3236,25 @@ async fn source_only_ingestion_honors_branch_preview_and_auto() {
 
 #[tokio::test]
 async fn confirmed_recipients_are_checked_against_current_model_configuration() {
-    let m = proposals_mock();
-    let (_st, app) = app(Some([&m.url(), &m.url()]));
-    let confirm = |recipients: Value| {
+    let original = proposals_mock();
+    let replacement = proposals_mock();
+    let (st, app) = app(Some([&original.url(), &original.url()]));
+    let uri = "/$/settings/org/assistant";
+    let settings = |revision: &Value, recipients: Value, etag: &str| {
         let mut request = req(
             "PATCH",
-            "/$/settings/org/assistant",
-            json!({
-                "enabled": true, "ingest": true, "send": "documents"
-            }),
+            uri,
+            json!({ "enabled": true, "ingest": true, "send": "documents" }),
         );
         let value = json!({
             "fields": [["enabled", false, "default"], ["ingest", false, "default"],
                        ["send", "schema", "default"]],
             "recipients": recipients,
+            "modelRevision": revision,
         });
+        request
+            .headers_mut()
+            .insert(header::IF_MATCH, etag.parse().unwrap());
         request.headers_mut().insert(
             "if-ingest-confirmation",
             percent_encoding::utf8_percent_encode(
@@ -3262,12 +3267,288 @@ async fn confirmed_recipients_are_checked_against_current_model_configuration() 
         );
         request
     };
-    let (status, v) = send(&app, confirm(json!([["cheap", "m"]]))).await;
+    let read_etag = async || {
+        let res = app
+            .clone()
+            .oneshot(req("GET", uri, Value::Null))
+            .await
+            .unwrap();
+        res.headers()[header::ETAG].to_str().unwrap().to_string()
+    };
+    let etag = read_etag().await;
+    let (_, old) = send(&app, req("GET", "/$/assistant/org", Value::Null)).await;
+    let old_revision = &old["status"]["modelRevision"];
+    let pairs = json!([["cheap", "m"], ["top", "m"]]);
+    let (status, v) = send(&app, settings(old_revision, json!([["cheap", "m"]]), &etag)).await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{v}");
+
+    let mut config = st.models().unwrap().config.clone();
+    config.providers.get_mut("cheap").unwrap().endpoint = replacement.url();
+    let (status, v) = send(&app, req("PUT", "/$/server/settings/models", json!(config))).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(etag, read_etag().await);
+    let (_, current) = send(&app, req("GET", "/$/assistant/org", Value::Null)).await;
+    assert_eq!(current["status"]["extract"], old["status"]["extract"]);
+    let (status, v) = send(&app, settings(old_revision, pairs.clone(), &etag)).await;
     assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{v}");
     let (_, v) = send(&app, req("GET", "/$/assistant/org", Value::Null)).await;
     assert_eq!(v["status"]["ingest"], false, "{v}");
-    let (status, v) = send(&app, confirm(json!([["cheap", "m"], ["top", "m"]]))).await;
+    let (status, v) = send(
+        &app,
+        settings(&current["status"]["modelRevision"], pairs, &etag),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{v}");
+}
+
+#[tokio::test]
+async fn narrowing_the_model_allow_list_blocks_a_stale_extract_override() {
+    let model = proposals_mock();
+    let (st, app) = app(Some([&model.url(), &model.url()]));
+    let (status, v) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/assistant/org",
+            json!({
+                "enabled": true, "ingest": true, "send": "documents",
+                "roles": {"extract": [{"provider": "cheap", "model": "m"}]}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["status"]["ingest"], true, "{v}");
+    let mut config = st.models().unwrap().config.clone();
+    config.providers.get_mut("cheap").unwrap().allowed_models = Some(vec!["new".into()]);
+    config.roles.remove(&crate::models::Role::Extract);
+    let (status, v) = send(&app, req("PUT", "/$/server/settings/models", json!(config))).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (_, v) = send(&app, req("GET", "/$/assistant/org", Value::Null)).await;
+    assert_eq!(v["status"]["extract"], json!([]), "{v}");
+    assert_eq!(v["status"]["ingest"], false, "{v}");
+
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({"text": NOTES, "extract": true}),
+        ),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], "no-model", "{v}");
+    assert_eq!(st.get("org").unwrap().store.branches().unwrap().len(), 1);
+
+    let failure = st.models().unwrap().call_prompt(
+        Some(crate::models::Role::Extract),
+        &crate::models::Pair::new("cheap", "m"),
+        &crate::models::Prompt::plain("Extract facts", NOTES),
+        &crate::models::OutputSchema {
+            name: "test",
+            schema: json!({"type": "object"}),
+            from_text: |s| serde_json::from_str(s).ok(),
+            text_instruction: "",
+        },
+        std::time::Instant::now() + Duration::from_secs(5),
+        None,
+    );
+    assert!(
+        matches!(failure, Err(f) if matches!(f.error, crate::models::StepError::UnknownPair(_)))
+    );
+    assert!(model.requests().is_empty());
+}
+
+#[tokio::test]
+async fn preview_registration_refuses_a_write_between_read_and_commit() {
+    let (st, app) = app(None);
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({
+                "text": "A source that must remain unpublished.",
+                "graph": "urn:preview:race", "mode": "preview", "extract": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(v["status"], "awaiting-approval", "{v}");
+    let before = head(&st);
+    let ds = st.get("org").unwrap();
+    ds.store.set_failpoint(
+        "writer-acquiring",
+        Some(Arc::new(|store| {
+            store.set_failpoint("writer-acquiring", None);
+            store
+                .load(&[Source::from_bytes(
+                    b"<urn:concurrent> <urn:write> <urn:kept> .".to_vec(),
+                    RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+        })),
+    );
+    let uri = format!("/$/ingest/org/{}/approve", v["id"].as_str().unwrap());
+    let (status, v) = send(&app, req("POST", &uri, Value::Null)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "conflict", "{v}");
+    assert_eq!(head(&st), before + 1);
+    assert!(!ask(&app, "ASK { GRAPH <urn:preview:race> { ?s ?p ?o } }").await);
+}
+
+#[tokio::test]
+async fn automatic_ingestion_keeps_a_caller_named_branch() {
+    let (st, app) = app(None);
+    let (status, v) = send(
+        &app,
+        req("POST", "/$/branches/org", json!({"name": "shared"})),
+    )
+    .await;
+    assert!(status.is_success(), "{v}");
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({
+                "text": "A source on a shared branch.", "graph": "urn:source:shared",
+                "mode": "auto", "branch": "shared", "extract": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(v["result"]["outcome"], "merged", "{v}");
+    assert!(st.get("org").unwrap().store.branch_info("shared").is_ok());
+    assert!(ask(&app, "ASK { GRAPH <urn:source:shared> { ?s ?p ?o } }").await);
+}
+
+#[test]
+fn automatic_cleanup_keeps_a_commit_made_after_the_merge() {
+    use super::pipeline::{Ctx, Quiet, Run, Usage, cleanup_merged_branch};
+
+    let (st, _) = app(None);
+    let cfg = crate::mcp::rest::config(&st, crate::mcp::rest::Mode::Write);
+    let server = crate::mcp::McpServer::new(st.clone(), cfg);
+    let principal = crate::auth::Principal::local();
+    let ctx = Ctx {
+        server: &server,
+        models: None,
+        principal: &principal,
+        progress: &Quiet,
+        deadline: std::time::Instant::now() + Duration::from_secs(60),
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pdf: st.ingest.pdf.clone(),
+        request_id: String::new(),
+    };
+    let r = Run {
+        ctx: &ctx,
+        dataset: "org".into(),
+        usage: Usage::default(),
+    };
+    let branch = "ingest.concurrent-1";
+    r.tool("create_branch", json!({"name": branch}), None)
+        .unwrap();
+    let ds = st.get("org").unwrap();
+    let review = st.branch_dataset(&ds, branch).unwrap();
+    let insert = |subject: &str| {
+        review
+            .store
+            .load(&[Source::from_bytes(
+                format!("<urn:{subject}> <urn:write> <urn:kept> .").into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    };
+    insert("before-merge");
+    let preview = r
+        .tool("merge_branch", json!({"source": branch}), None)
+        .unwrap();
+    assert_eq!(preview["mergeable"], true, "{preview}");
+    r.tool(
+        "merge_branch",
+        json!({"source": branch, "dryRun": false, "expect": preview["expect"]}),
+        None,
+    )
+    .unwrap();
+    insert("after-merge");
+    let mut result = json!({"review": branch});
+    cleanup_merged_branch(&r, branch, &mut result);
+    assert_eq!(result["review"], branch);
+    let info = ds.store.branch_info(branch).unwrap();
+    assert_eq!(info.ahead, 1);
+    assert_eq!(info.head.unwrap().seq, review.store.head_commit().seq);
+}
+
+#[tokio::test]
+async fn expanded_locators_are_checked_for_document_and_claims_ingestion() {
+    let model = proposals_mock();
+    let (st, app) = app(Some([&model.url(), &model.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    let (status, v) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({
+                "redaction": {"patterns": [{"name": "sensitive", "regex": "private-schema"}]}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (status, v) = send(
+        &app,
+        req(
+            "PATCH",
+            "/$/settings/org/prefixes",
+            json!({"source": "urn:private-schema:"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let before = head(&st);
+    for (mode, field) in [("branch", "iri"), ("preview", "graph"), ("claims", "graph")] {
+        let mut input = json!({"text": NOTES, "mode": mode});
+        input[field] = "source:document".into();
+        let v = ingest(&app, req("POST", "/$/ingest/org", input)).await;
+        assert_eq!(v["error"]["code"], "sensitive-locator", "{v}");
+        assert!(!v.to_string().contains("private-schema"), "{v}");
+    }
+    assert_eq!(head(&st), before);
+    assert!(model.requests().is_empty());
+}
+
+#[tokio::test]
+async fn ingest_task_metadata_uses_only_a_recognized_media_type() {
+    let (_st, app) = app(None);
+    for (format, canonical) in [
+        (
+            "Text/Markdown; key=private-parameter",
+            json!("text/markdown"),
+        ),
+        (
+            "application/private-parameter; key=private-parameter",
+            Value::Null,
+        ),
+    ] {
+        let v = ingest(
+            &app,
+            req(
+                "POST",
+                "/$/ingest/org",
+                json!({
+                    "text": "Plain body", "format": format, "extract": false
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(v["input"]["format"], canonical, "{v}");
+        assert!(!v.to_string().contains("private-parameter"), "{v}");
+    }
 }
 
 #[cfg(feature = "office")]

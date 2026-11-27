@@ -1598,6 +1598,7 @@ fn asking(put: &mut dyn FnMut(&str, J)) {
                     })), "The repair turns of the dataset's asks, which a request may override."),
                     "status": with_desc(obj(&["models", "historyDays", "ask"], json!({
                         "models": boolean(),
+                        "modelRevision": with_desc(string(), "Opaque revision of the installed model configuration for ingestion enable confirmation."),
                         "historyDays": int(),
                         "ask": boolean(),
                         "reason": string(),

@@ -630,7 +630,16 @@ describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
         locked: [],
         overridden: [],
       }),
-      { status: { ask: false, historyDays: 30, models: true, ingest: false, extract } },
+      {
+        status: {
+          ask: false,
+          historyDays: 30,
+          models: true,
+          modelRevision: 'v1',
+          ingest: false,
+          extract,
+        },
+      },
     );
     expect(offDefault.on).toBe(false);
     expect(offDefault.canEnableDirectly).toBe(true);
@@ -644,7 +653,16 @@ describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
         locked: ['send'],
         overridden: [],
       }),
-      { status: { ask: false, historyDays: 30, models: true, ingest: false, extract } },
+      {
+        status: {
+          ask: false,
+          historyDays: 30,
+          models: true,
+          modelRevision: 'v1',
+          ingest: false,
+          extract,
+        },
+      },
     );
     expect(lockedSend.on).toBe(false);
     expect(lockedSend.canEnableDirectly).toBe(false);
@@ -695,9 +713,10 @@ describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
     ]);
   });
 
-  it.each([false, true])(
-    'rechecks the approved plan after 412 with changed recipients %s',
-    async (changed) => {
+  it.each(['none', 'pairs', 'revision'] as const)(
+    'rechecks the approved plan after 412 when the change is %s',
+    async (change) => {
+      const changed = change !== 'none';
       const baseKind = kind({
         effective: { enabled: false, ingest: false, send: 'schema', sendByProvider: {} },
         sources: { enabled: 'default', ingest: 'default', send: 'default' },
@@ -731,6 +750,7 @@ describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
           ask: false,
           historyDays: 30,
           models: true,
+          modelRevision: 'v1',
           ingest: false,
           extract: [{ provider: 'local', model: 'm' }],
         },
@@ -752,9 +772,11 @@ describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
           });
           if (method === 'GET') {
             const payload = url.includes('/$/assistant/')
-              ? changed && patchCount === 1
+              ? patchCount === 1 && change === 'pairs'
                 ? { status: { ...assistant.status, extract: [{ provider: 'other', model: 'n' }] } }
-                : assistant
+                : patchCount === 1 && change === 'revision'
+                  ? { status: { ...assistant.status, modelRevision: 'v2' } }
+                  : assistant
               : patchCount >= 2
                 ? enabledKind
                 : baseKind;
@@ -792,10 +814,14 @@ describe('assistant server ingestion (C19 §8.1 / item 77)', () => {
             ['send', 'schema', 'default'],
           ],
           recipients: [['local', 'm']],
+          modelRevision: 'v1',
         });
       }
       if (changed) {
-        expect(res.assistant.status?.extract?.[0].provider).toBe('other');
+        expect(res.assistant.status?.extract?.[0].provider).toBe(
+          change === 'pairs' ? 'other' : 'local',
+        );
+        expect(res.assistant.status?.modelRevision).toBe(change === 'revision' ? 'v2' : 'v1');
         return;
       }
       expect(res.kind.etag).toBe('"v2"');

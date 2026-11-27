@@ -166,19 +166,23 @@ pub struct Scan {
 
 /// Run the adapters of `req`.
 pub fn scan(req: &Request) -> Scan {
-    scan_inner(req, None)
+    scan_inner(req, &redact::Policy::from_patterns(req.patterns.to_vec()))
 }
 
 /// Run the adapters of `req` with a full redaction [`redact::Policy`] instead of
 /// `req.patterns`.
 pub fn scan_with_policy(req: &Request, policy: &redact::Policy) -> Scan {
-    scan_inner(req, Some(policy))
+    scan_inner(req, policy)
 }
 
-fn scan_inner(req: &Request, policy: Option<&redact::Policy>) -> Scan {
+fn scan_inner(req: &Request, policy: &redact::Policy) -> Scan {
     let mut s = Scanner {
         req,
         policy,
+        project_key: req
+            .project
+            .as_ref()
+            .map(|p| p.redacted_key(policy).into_owned()),
         out: Scan::default(),
         seen: HashSet::new(),
     };
@@ -203,12 +207,14 @@ struct Read {
     bytes: Vec<u8>,
     text: String,
     redactions: Vec<String>,
+    edits: Vec<redact::Edit>,
     modified: String,
 }
 
 struct Scanner<'a> {
     req: &'a Request<'a>,
-    policy: Option<&'a redact::Policy>,
+    policy: &'a redact::Policy,
+    project_key: Option<String>,
     out: Scan,
     /// graphs already produced
     seen: HashSet<String>,
@@ -352,14 +358,12 @@ impl Scanner<'_> {
     }
 
     fn project_key(&self) -> Option<&str> {
-        self.req.project.as_ref().map(|p| p.key.as_str())
+        self.project_key.as_deref()
     }
 
     fn project_segment(&self) -> String {
-        self.req
-            .project
-            .as_ref()
-            .map_or_else(|| "user".to_string(), Project::segment)
+        self.project_key()
+            .map_or_else(|| "user".to_string(), project::segment_of)
     }
 
     /// Read a file: the size limit, UTF-8, the generated marker, then redaction.
@@ -386,24 +390,29 @@ impl Scanner<'_> {
         if crate::is_generated(text) {
             return skip(self, "generated");
         }
-        let r = self.redact(text);
+        let Ok((r, edits)) = self.policy.redact_bounded(
+            text,
+            MAX_FILE_BYTES as usize,
+            || Ok(()),
+            || "redaction-too-large",
+        ) else {
+            return skip(self, "redaction-too-large");
+        };
         Some(Read {
             modified: mtime(&meta),
             text: r.text,
             redactions: r.names,
+            edits,
             bytes,
         })
     }
 
     fn redact(&self, value: &str) -> redact::Redacted {
-        match self.policy {
-            Some(p) => p.redact(value),
-            None => redact::redact(value, self.req.patterns),
-        }
+        self.policy.redact(value)
     }
 
     fn path_key(&self, path: &str) -> String {
-        if self.redact(path).names.is_empty() {
+        if self.policy.first_match(path).is_none() {
             path_key(path)
         } else {
             // Keep distinct files distinct without embedding the matched path in their IRIs.
@@ -592,7 +601,7 @@ impl Scanner<'_> {
         }
         let label = match &name {
             Some((n, l)) => (n.clone(), Some(l.clone())),
-            None => (heading_or_name(doc.body, path), None),
+            None => (heading_or_name(doc.body, path, self.policy), None),
         };
         facts.push(fact(&m, RDFS_LABEL, Obj::lit(label.0), label.1.as_deref()));
         if let Some((d, l)) = doc.scalar("description") {
@@ -676,7 +685,19 @@ impl Scanner<'_> {
         let mut facts = Vec::new();
         let mut position = 0usize;
         let mut done = HashSet::new();
-        for line in read.text.lines() {
+        let keys: std::collections::HashMap<_, _> = self
+            .out
+            .files
+            .iter()
+            .filter(|f| f.kind == FileKind::Memory && f.path.starts_with(memdir))
+            .map(|f| (f.path.as_path(), f.key.as_str()))
+            .collect();
+        let original = std::str::from_utf8(&read.bytes).expect("read checked UTF-8");
+        let offset = |at| redact::remap_byte_offset(&read.edits, at);
+        let mut end = 0;
+        for line in original.split_inclusive('\n') {
+            let start = end;
+            end += line.len();
             let Some(c) = LINK.captures(line) else {
                 continue;
             };
@@ -689,29 +710,26 @@ impl Scanner<'_> {
                 continue;
             }
             position += 1;
-            // the memory's key is its name when the file has one
-            let key = std::fs::read_to_string(&file)
-                .ok()
-                .and_then(|t| {
-                    frontmatter::parse(&t)
-                        .scalar("name")
-                        .map(|(n, _)| norm_name(n))
-                })
-                .filter(|k| !k.is_empty())
-                .unwrap_or_else(|| {
-                    norm_name(
-                        &file
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                    )
-                });
-            let m = self.ctx().memory_iri(harness.segment(), project_key, &key);
+            let fallback;
+            let key = match keys.get(file.as_path()) {
+                Some(&key) => key,
+                None => {
+                    let stem = file.file_stem().unwrap_or_default().to_string_lossy();
+                    fallback = if self.policy.first_match(&stem).is_some() {
+                        self.path_key(&rel(&file, memdir))
+                    } else {
+                        norm_name(&stem)
+                    };
+                    &fallback
+                }
+            };
+            let m = self.ctx().memory_iri(harness.segment(), project_key, key);
             if !done.insert(m.clone()) {
                 continue;
             }
             let m0 = c.get(0).expect("group 0");
-            let text = line[m0.end()..]
+            let quote = read.text[offset(start)..offset(end)].trim();
+            let text = read.text[offset(start + m0.end())..offset(end)]
                 .trim()
                 .trim_start_matches(['—', '–', '-', ':'])
                 .trim();
@@ -719,15 +737,10 @@ impl Scanner<'_> {
                 &m,
                 &mem("indexPosition"),
                 Obj::typed(position.to_string(), XSD_INTEGER),
-                Some(line.trim()),
+                Some(quote),
             ));
             if !text.is_empty() {
-                facts.push(fact(
-                    &m,
-                    &mem("indexText"),
-                    Obj::lit(text),
-                    Some(line.trim()),
-                ));
+                facts.push(fact(&m, &mem("indexText"), Obj::lit(text), Some(quote)));
             }
         }
         let rel_path = rel(path, memdir);
@@ -927,7 +940,8 @@ impl Scanner<'_> {
     fn claude_code(&mut self) {
         let roots = self.req.roots.clone();
         if let Some(project) = self.req.project.clone() {
-            let seg = project.segment();
+            let key = self.project_key().expect("project key").to_string();
+            let seg = self.project_segment();
             self.out
                 .areas
                 .push(self.ctx().area(Harness::ClaudeCode.segment(), &seg));
@@ -935,21 +949,25 @@ impl Scanner<'_> {
                 && let Some(pdir) = roots.claude_project_dir(&project)
             {
                 let memdir = pdir.join("memory");
+                let mut index = None;
                 for f in markdown_files(&memdir, &["md"]) {
                     let r = rel(&f, &memdir);
                     if r == "MEMORY.md" {
-                        self.index(&f, &memdir, &project.key, &seg);
-                    } else {
-                        self.memory(
-                            Adapter::ClaudeCode,
-                            Harness::ClaudeCode,
-                            &f,
-                            r,
-                            &project.key,
-                            &seg,
-                            false,
-                        );
+                        index = Some(f);
+                        continue;
                     }
+                    self.memory(
+                        Adapter::ClaudeCode,
+                        Harness::ClaudeCode,
+                        &f,
+                        r,
+                        &key,
+                        &seg,
+                        false,
+                    );
+                }
+                if let Some(index) = index {
+                    self.index(&index, &memdir, &key, &seg);
                 }
             }
             let root = project.root.clone();
@@ -1026,7 +1044,7 @@ impl Scanner<'_> {
             self.out.areas.push(format!(
                 "{}instructions/",
                 self.ctx()
-                    .area(Harness::Codex.segment(), &project.segment())
+                    .area(Harness::Codex.segment(), &self.project_segment())
             ));
             // one file per directory, from the repository's root down to the project's
             let mut dirs = vec![project.dir.clone()];
@@ -1102,12 +1120,12 @@ impl Scanner<'_> {
 
     fn generic(&mut self) {
         let roots = self.req.roots.clone();
-        if let Some(project) = self.req.project.clone() {
+        if let Some(project) = self.req.project.as_ref() {
             let root = project.root.clone();
             for h in [Harness::GeminiCli, Harness::Cursor, Harness::Generic] {
                 self.out.areas.push(format!(
                     "{}instructions/",
-                    self.ctx().area(h.segment(), &project.segment())
+                    self.ctx().area(h.segment(), &self.project_segment())
                 ));
             }
             let mut files: Vec<(PathBuf, Harness, Scope)> = vec![
@@ -1151,9 +1169,11 @@ impl Scanner<'_> {
         for p in self.req.paths.clone() {
             let p = project::absolute(&p);
             let (root, pk, seg) = match &self.req.project {
-                Some(pr) if p.starts_with(&pr.root) => {
-                    (pr.root.clone(), pr.key.clone(), pr.segment())
-                }
+                Some(pr) if p.starts_with(&pr.root) => (
+                    pr.root.clone(),
+                    self.project_key().expect("project key").to_string(),
+                    self.project_segment(),
+                ),
                 _ => (
                     p.parent().map(Path::to_path_buf).unwrap_or_default(),
                     "user".to_string(),
@@ -1204,7 +1224,7 @@ impl Scanner<'_> {
 }
 
 /// A file's label when its frontmatter has no name: its first heading, else its name.
-fn heading_or_name(body: &str, path: &Path) -> String {
+fn heading_or_name(body: &str, path: &Path, policy: &redact::Policy) -> String {
     body.lines()
         .find_map(|l| {
             let t = l.trim_start();
@@ -1213,9 +1233,8 @@ fn heading_or_name(body: &str, path: &Path) -> String {
                 .filter(|h| !h.is_empty())
         })
         .unwrap_or_else(|| {
-            path.file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            policy.redact(&stem).text
         })
 }
 

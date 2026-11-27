@@ -186,7 +186,8 @@ impl Format {
                 .to_ascii_lowercase();
             // a generic type says nothing: look further
             if base != "application/octet-stream" {
-                return Format::parse(d).ok_or_else(|| Refusal::unsupported(d));
+                return Format::parse(d)
+                    .ok_or_else(|| Refusal::unsupported("the declared media type"));
             }
         }
         if let Some(f) = Format::sniff(bytes) {

@@ -4888,7 +4888,7 @@ fn assist(p: &mut Paths) {
     p.add(kind_body(
         op(PATCH, "/$/settings/{ds}/{kind}", "patchSettings", "Datasets", "Change settings fields")
             .doc("Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. A change to a locked field is a `409` with `locked-by-config` and `fields`, and an `endpoint` or `apiKey` anywhere is a `400`. Needs `admin`.")
-            .header("If-Ingest-Confirmation", json!({ "type": "string" }), "For an assistant ingestion enable patch, percent-encoded JSON naming the approved settings fields and document recipients. A changed proposal returns 412.")
+            .header("If-Ingest-Confirmation", json!({ "type": "string" }), "For an assistant ingestion enable patch, percent-encoded JSON naming the approved settings fields, document recipients, and the modelRevision from assistant status. A changed proposal returns 412.")
             .see("settings"),
     ));
     p.add(kind_body(

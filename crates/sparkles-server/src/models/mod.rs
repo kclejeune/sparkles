@@ -374,6 +374,8 @@ struct PairStatus {
 /// The providers, the role lists and their state.
 pub struct Models {
     pub config: ModelsConfig,
+    /// An opaque identity for this installed model configuration.
+    pub(crate) revision: uuid::Uuid,
     secrets: BTreeMap<String, SecretSource>,
     outbound: sparkles::outbound::OutboundPolicy,
     /// shared with the views that [`Models::with_secrets`] makes
@@ -437,6 +439,7 @@ impl Models {
         }
         Models {
             config,
+            revision: uuid::Uuid::new_v4(),
             secrets,
             outbound,
             runtime: Arc::new(runtime),
@@ -510,6 +513,7 @@ impl Models {
     pub fn with_secrets(&self, secrets: BTreeMap<String, SecretSource>) -> Models {
         Models {
             config: self.config.clone(),
+            revision: self.revision,
             secrets,
             outbound: self.outbound.clone(),
             runtime: self.runtime.clone(),
@@ -752,6 +756,15 @@ impl Models {
                 rec,
             );
         };
+        if !p.allows(&pair.model) {
+            return fail(
+                StepError::UnknownPair(format!(
+                    "provider {} does not allow model {:?}",
+                    pair.provider, pair.model
+                )),
+                rec,
+            );
+        }
         if p.kind == Kind::Local {
             return fail(
                 StepError::UnknownPair(format!(

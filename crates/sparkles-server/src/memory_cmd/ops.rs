@@ -1686,7 +1686,7 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
         sparkles_memory_import::ids::segment(&ctx.principal)
     );
     let (listed, _) = sync::list_sources(&conn, &prefix)?;
-    let seg = project.segment();
+    let seg = sparkles_memory_import::project::segment_of(&project.redacted_key(&policy));
     let areas: Vec<String> = scan
         .areas
         .iter()

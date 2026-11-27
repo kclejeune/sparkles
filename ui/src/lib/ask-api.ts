@@ -224,6 +224,8 @@ export type Pair = { provider: string; model: string };
 /** What `GET /$/assistant/{ds}` says about asking and server ingestion. */
 export type AssistantStatus = {
   models: boolean;
+  /** Opaque revision of the installed model configuration. */
+  modelRevision?: string;
   historyDays: number;
   ask: boolean;
   reason?: string;

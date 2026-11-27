@@ -401,7 +401,10 @@ fn check_ingest_confirmation(
             }
         }
     }
-    if recipients.is_empty() || *confirmed != json!({ "fields": fields, "recipients": recipients })
+    let revision = models.map(|m| m.revision.to_string());
+    if recipients.is_empty()
+        || *confirmed
+            != json!({ "fields": fields, "recipients": recipients, "modelRevision": revision })
     {
         return Err(err_code(
             StatusCode::PRECONDITION_FAILED,

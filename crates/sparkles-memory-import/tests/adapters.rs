@@ -414,3 +414,92 @@ fn filenames_and_relative_paths_are_redacted_in_published_metadata() {
             .all(|fact| !format!("{fact:?}").contains(hidden))
     );
 }
+
+#[test]
+fn project_keys_are_redacted_in_remote_and_local_graphs_and_labels() {
+    let f = fixture();
+    let c = ctx();
+    let dir = f._dir.path().join("private-local");
+    let remote = f._dir.path().join("remote");
+    write(
+        &remote.join(".git/config"),
+        "[remote \"origin\"]\nurl = https://example.org/private-remote/repo.git\n",
+    );
+    let patterns = [redact::Pattern::new("private-project", "private-(local|remote)").unwrap()];
+    for root in [dir, remote] {
+        let path = root.join("AGENTS.md");
+        write(&path, "# Safe instructions");
+        let req = Request {
+            ctx: &c,
+            roots: &f.roots,
+            adapters: vec![Adapter::Generic],
+            project: Some(Project::of(&root)),
+            user_scope: false,
+            paths: vec![path],
+            instructions_only: false,
+            patterns: &patterns,
+        };
+        let scan = scan(&req);
+        let file = scan.files.first().unwrap();
+        assert!(file.graph.contains("/redacted-project."), "{}", file.graph);
+        assert!(scan.areas.iter().all(|area| !area.contains("private-")));
+        assert!(file.facts.iter().any(|fact| {
+            fact.p == RDFS_LABEL && matches!(&fact.o, Obj::Literal { value, .. } if value.starts_with("redacted-project."))
+        }));
+        assert!(!format!("{:?}", file.facts).contains("private-"));
+    }
+}
+
+#[test]
+fn index_links_use_published_memory_keys_and_redacted_quotes() {
+    let f = fixture();
+    let c = ctx();
+    let named = f.memdir.join("named.md");
+    let unnamed = f.memdir.join("private-file.md");
+    write(
+        &named,
+        "---\nname: \"Notes private-name\"\n---\nA safe body.\n",
+    );
+    write(&unnamed, "A body without a Markdown heading.\n");
+    write(
+        &f.memdir.join("MEMORY.md"),
+        "- [First](named.md) — first detail\n- [Second](private-file.md) — second detail\n",
+    );
+    let patterns = [redact::Pattern::new("metadata", "private-(file|name)").unwrap()];
+    let req = Request {
+        ctx: &c,
+        roots: &f.roots,
+        adapters: vec![Adapter::ClaudeCode],
+        project: Some(Project::of(&f.repo)),
+        user_scope: false,
+        paths: Vec::new(),
+        instructions_only: false,
+        patterns: &patterns,
+    };
+    let scan = scan(&req);
+    let ix = scan
+        .files
+        .iter()
+        .find(|f| f.kind == FileKind::Index)
+        .unwrap();
+    for (path, expected) in [(&named, "first detail"), (&unnamed, "second detail")] {
+        let file = scan.files.iter().find(|f| &f.path == path).unwrap();
+        let entity = file.entity.as_deref().unwrap();
+        if path == &unnamed {
+            assert!(has(
+                file,
+                entity,
+                RDFS_LABEL,
+                &Obj::lit("[redacted:metadata]")
+            ));
+        }
+        assert!(has(ix, entity, &mem("indexText"), &Obj::lit(expected)));
+        assert!(!format!("{:?}", file.facts).contains("private-"));
+    }
+    assert!(!format!("{:?}", ix.facts).contains("private-"));
+    assert!(ix.facts.iter().any(|fact| {
+        fact.quote
+            .as_deref()
+            .is_some_and(|q| q.contains("[redacted:metadata].md"))
+    }));
+}
