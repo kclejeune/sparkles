@@ -1570,24 +1570,28 @@ impl ReverseAlternatives {
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
         enum Work {
             Visit,
-            IndexedReturns,
             TreeChildren,
+            IndexedReturns,
             CheckIntervals,
         }
         let mut queue = BinaryHeap::new();
         let mut intervals = BinaryHeap::new();
-        // Once the index exists, groups take turns behind visits at each bound.
-        // Before then the tie budget admits each cheap scan as a whole.
+        // Visits run first. Groups at the same bound take turns dispatching them.
+        // Different suffix depths need separate return groups even at one node.
+        let mut return_runs = Vec::new();
+        let mut runs_by_bound = HbMap::default();
+        let mut next_runs = HbMap::default();
         let mut turn = 0u64;
         let mut tie_budget = tree.dist.len();
         let mut prefixes = HbMap::default();
         let mut base = push_heap(
             &mut queue,
-            Reverse((depth, 0, Work::Visit, source, 0u32, (0, usize::MAX))),
+            Reverse((depth, (0, 0), Work::Visit, source, 0u32, (0, usize::MAX))),
             &mut scratch,
             0,
         )?;
         loop {
+            let mut charged_scan = false;
             let next = match (queue.peek(), intervals.peek()) {
                 (
                     Some(Reverse((bound, _, work, u, _, (start, end)))),
@@ -1604,6 +1608,7 @@ impl ReverseAlternatives {
                         && let Some(left) = tie_budget.checked_sub(1 + (hops.min(*end) - start))
                     {
                         tie_budget = left;
+                        charged_scan = true;
                         queue.pop()
                     } else {
                         intervals.pop()
@@ -1635,7 +1640,7 @@ impl ReverseAlternatives {
             // the bound and the shortest known prefix when dispatching it.
             let mut children = None;
             let mut deferred = None;
-            let mut indexed_returns = None;
+            let mut indexed_returns: Option<(u32, usize, usize)> = None;
             let record_group = |group: &mut Option<(u32, usize, usize)>, lower: u32, offset| {
                 let (min, _, end) = group.get_or_insert((lower, offset, offset + 1));
                 *min = (*min).min(lower);
@@ -1670,6 +1675,12 @@ impl ReverseAlternatives {
                             true
                         } else {
                             // A later exit in this slice may prune all returns.
+                            if let Some(run) = indexed_returns
+                                && run.0 != lower
+                            {
+                                base = push_vec(&mut return_runs, run, &mut scratch, base)?;
+                                indexed_returns = None;
+                            }
                             record_group(&mut indexed_returns, lower, offset);
                             continue;
                         }
@@ -1678,7 +1689,7 @@ impl ReverseAlternatives {
                     Work::TreeChildren if child => false,
                     // Every indexed exit in this slice already set or tied
                     // the threshold. Only returning hops survive the bound.
-                    Work::IndexedReturns if needs_index => false,
+                    Work::IndexedReturns if needs_index && lower == bound => false,
                     _ => continue,
                 };
                 if avoids {
@@ -1697,35 +1708,80 @@ impl ReverseAlternatives {
                     (_, base) = insert_hb_map(&mut prefixes, v, next_prefix, &mut scratch, base)?;
                     base = push_heap(
                         &mut queue,
-                        Reverse((lower, 0, Work::Visit, v, next_prefix, (0, usize::MAX))),
+                        Reverse((lower, (0, 0), Work::Visit, v, next_prefix, (0, usize::MAX))),
                         &mut scratch,
                         base,
                     )?;
                     let remainder = match work {
-                        Work::TreeChildren if tree.ancestry.is_some() => &mut children,
+                        Work::TreeChildren => &mut children,
                         Work::IndexedReturns => &mut indexed_returns,
                         _ => continue,
                     };
                     if offset + 1 < end {
+                        if charged_scan {
+                            // Admission reserved the full slice. Its continuation
+                            // will reserve the unscanned hops on its own turn.
+                            tie_budget += end - (offset + 1);
+                        }
                         *remainder = Some((bound, offset + 1, end));
                     }
                     break;
                 }
             }
+            if work == Work::IndexedReturns
+                && indexed_returns.is_none()
+                && let Some((start, end)) = next_runs.remove(&(u, prefix, end))
+            {
+                indexed_returns = Some((bound, start, end));
+            }
+
+            // Reverse settlement order can interleave suffix depths. Link
+            // disjoint runs of the same bound so only one is ready at a time
+            // and resuming it never rescans runs belonging to other depths.
+            if !return_runs.is_empty() {
+                for (lower, start, end) in return_runs.drain(..).chain(indexed_returns.take()) {
+                    poll()?;
+                    if second.is_some_and(|len| len <= lower) {
+                        continue;
+                    }
+                    if let Some((_, last_end)) = runs_by_bound.get_mut(&lower) {
+                        (_, base) = insert_hb_map(
+                            &mut next_runs,
+                            (u, prefix, *last_end),
+                            (start, end),
+                            &mut scratch,
+                            base,
+                        )?;
+                        *last_end = end;
+                    } else {
+                        (_, base) = insert_hb_map(
+                            &mut runs_by_bound,
+                            lower,
+                            (start..end, end),
+                            &mut scratch,
+                            base,
+                        )?;
+                    }
+                }
+            }
             // Start the narrower of two new slices first. In particular, a
             // singleton can expose its exit before a tied clique grows the heap.
-            let mut groups = [
+            turn = turn.saturating_add(1);
+            let groups = [
                 (Work::TreeChildren, children),
                 (Work::IndexedReturns, indexed_returns),
                 (Work::CheckIntervals, deferred),
             ];
-            groups.sort_unstable_by_key(|(_, group)| group.map(|(_, start, end)| end - start));
-            for (kind, group) in groups {
+            let mixed_bounds = !runs_by_bound.is_empty();
+            let other_groups = runs_by_bound
+                .drain()
+                .map(|(lower, (run, _))| (Work::IndexedReturns, Some((lower, run.start, run.end))));
+            for (kind, group) in groups.into_iter().chain(other_groups) {
                 if let Some((lower, start, end)) = group
                     && second.is_none_or(|len| lower < len)
                 {
-                    if tree.ancestry.is_some() {
-                        turn = turn.saturating_add(1);
+                    if mixed_bounds {
+                        poll()?;
                     }
                     base = push_heap(
                         if kind == Work::CheckIntervals {
@@ -1733,7 +1789,7 @@ impl ReverseAlternatives {
                         } else {
                             &mut queue
                         },
-                        Reverse((lower, turn, kind, u, prefix, (start, end))),
+                        Reverse((lower, (turn, end - start), kind, u, prefix, (start, end))),
                         &mut scratch,
                         base,
                     )?;
@@ -14552,13 +14608,18 @@ mod tree_tests {
         );
     }
 
+    struct FirstBatchWork {
+        steps: usize,
+        enqueues: usize,
+    }
+
     fn reverse_first_rows(
         ttl: String,
         properties: &str,
         memory: Option<u64>,
     ) -> [(Term, usize); 2] {
         reverse_first_batches(ttl, properties, memory, 1)
-            .map(|(rows, steps)| (rows.unwrap().pop().unwrap(), steps))
+            .map(|(rows, work)| (rows.unwrap().pop().unwrap(), work.steps))
     }
 
     fn reverse_first_batches(
@@ -14566,7 +14627,7 @@ mod tree_tests {
         properties: &str,
         memory: Option<u64>,
         batch_rows: usize,
-    ) -> [(Result<Vec<Term>>, usize); 2] {
+    ) -> [(Result<Vec<Term>>, FirstBatchWork); 2] {
         use crate::io::Source;
         use crate::sparql::{CursorOptions, FallbackPolicy, QueryOptions, query, select_cursor};
         use crate::store::{Store, StoreOptions};
@@ -14592,8 +14653,17 @@ mod tree_tests {
             max_memory_bytes: memory,
             ..Default::default()
         };
-        let take_steps = || test_hooks::REVERSE_SUFFIX_STEPS.with(|count| count.replace(0));
-        take_steps();
+        let mut last_enqueues = 0;
+        let mut take_work = || {
+            let total = test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.get());
+            let work = FirstBatchWork {
+                steps: test_hooks::REVERSE_SUFFIX_STEPS.with(|count| count.replace(0)),
+                enqueues: total - last_enqueues,
+            };
+            last_enqueues = total;
+            work
+        };
+        take_work();
         let limit = format!(" ; path:limit {batch_rows}");
         let eager = query(snap.clone(), &query_text(&limit), &opts).and_then(|result| {
             let rows = result.rows()?;
@@ -14603,7 +14673,7 @@ mod tree_tests {
                 .map(|row| row.values()[0].clone().unwrap())
                 .collect())
         });
-        let eager_steps = take_steps();
+        let eager_work = take_work();
 
         let cursor_opts = CursorOptions {
             batch_rows,
@@ -14635,7 +14705,7 @@ mod tree_tests {
                 .map(|i| batch.row(i).unwrap().values()[0].clone().unwrap())
                 .collect()
         });
-        [(eager, eager_steps), (streamed, take_steps())]
+        [(eager, eager_work), (streamed, take_work())]
     }
 
     #[test]
@@ -14855,6 +14925,40 @@ mod tree_tests {
     }
 
     #[test]
+    fn reverse_walk_mixed_bound_clique_waits_for_tied_tree_exit() {
+        // The return through s has six edges. Each clique return ties the
+        // seven-edge exit through the tree child x.
+        let edges = "ex:b1 ex:p ex:a . ex:b2 ex:p ex:b1 . ex:r2 ex:p ex:b1 . \
+                     ex:u ex:p ex:b2, ex:s, ex:x . ex:r3 ex:p ex:r2 . ex:s ex:p ex:r2 {| ex:w 1.1e0 |} . \
+                     ex:x ex:p ex:u, ex:z . ex:z ex:p ex:y1 . ex:y1 ex:p ex:y2 . ex:y2 ex:p ex:y3 . \
+                     ex:y3 ex:p ex:t {| ex:w 10e0 |} . ex:a ex:p ex:u {| ex:w 2e0 |} . ";
+        assert_dense_first_row(edges, "r3", 128, 7, 16, Some(5));
+
+        // Reverse cost puts this second six-edge return after the entire
+        // seven-edge clique. Resuming it reaches y1 before x can run.
+        let interleaved = format!(
+            "{edges} ex:u ex:p ex:late . ex:r2b ex:p ex:b1 . \
+             ex:late ex:p ex:r2b {{| ex:w 2.5e0 |}}, ex:y1 . "
+        );
+        assert_dense_first_row(&interleaved, "r3", 128, 7, 18, Some(6));
+    }
+
+    #[test]
+    fn reverse_walk_pre_index_clique_yields_to_returning_interval() {
+        // Checking v's interval finds a return via r. Visiting v then
+        // exposes the exit through z at the same bound as the clique.
+        assert_dense_first_row(
+            "ex:u ex:p ex:a, ex:v . ex:r ex:p ex:a . ex:a ex:p ex:u {| ex:w 2e0 |} . \
+             ex:v ex:p ex:r, ex:z . ex:z ex:p ex:y . ex:y ex:p ex:t {| ex:w 10e0 |} . ",
+            "u",
+            128,
+            5,
+            10,
+            Some(4),
+        );
+    }
+
+    #[test]
     fn reverse_walk_tied_shallow_children_have_bounded_work() {
         assert_dense_first_row(
             "ex:a ex:p ex:u {| ex:w 2e0 |} . ex:u ex:p ex:a, ex:h . \
@@ -14938,21 +15042,22 @@ mod tree_tests {
              path:weight ex:w ; path:maxLength {max_len} ; path:maxVisited {}",
             n + visits
         );
-        test_hooks::REVERSE_WALK_ENQUEUES.with(|count| count.set(0));
-        let rows = reverse_first_rows(ttl, &properties, None);
-        let steps = rows.each_ref().map(|(_, steps)| *steps);
+        let rows = reverse_first_batches(ttl, &properties, None, 1);
+        let steps = rows.each_ref().map(|(_, work)| work.steps);
         assert!(
             steps.iter().all(|&count| count <= 6 * n + 64),
             "eager and cursor suffix steps {steps:?} for {n} clique nodes"
         );
-        for (first, _) in rows {
+        for (batch, work) in rows {
             assert_eq!(
-                first,
-                Term::NamedNode(oxrdf::NamedNode::new("http://example.org/a").unwrap())
+                batch.unwrap(),
+                [Term::NamedNode(
+                    oxrdf::NamedNode::new("http://example.org/a").unwrap()
+                )]
             );
-        }
-        if let Some(per_engine) = enqueues {
-            test_hooks::REVERSE_WALK_ENQUEUES.with(|count| assert_eq!(count.get(), 2 * per_engine));
+            if let Some(expected) = enqueues {
+                assert_eq!(work.enqueues, expected);
+            }
         }
     }
 
@@ -15081,7 +15186,7 @@ mod tree_tests {
             sources.sort_unstable();
             assert_eq!(sources, expected);
         }
-        let steps = batches.map(|(_, steps)| steps);
+        let steps = batches.map(|(_, work)| work.steps);
         // Include the single linear ancestry build when the depth gap exceeds one.
         let bound = if extra_depth == 0 {
             8 * n

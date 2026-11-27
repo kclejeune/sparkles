@@ -297,14 +297,16 @@ intervals first if the next scan would exceed that allowance or the children are
 too deep to reach a shallow exit. The walk keeps offsets into a node's hop list for
 its deeper tree children, pending interval checks and hops whose indexed suffix
 returns to the branch. It settles exits before enqueuing those returning hops, so
-a shorter exit can discard the whole group. Once the index exists, the walk starts
-the shorter hop slice first when two new groups tie. Each group schedules one visit
-and then waits behind other groups at the same bound before scheduling another.
+a shorter exit can discard the whole group. It groups indexed returns by their exact
+lower bound and links offset ranges when other depths fall between them. When new
+tree children and indexed returns tie, the shorter slice starts first. Each group
+schedules one visit per turn, including tree children that run before the ancestry
+index exists.
 Each node expands at its shortest prefix. The walk stops when the remaining bounds cannot improve the threshold.
 The virtual endpoint represents a completed cycle and can only appear as a source of
 recorded hops. The query memory budget covers retained hops and intervals, the
-temporary child links used to build the intervals, the queue and the shortest known
-prefixes. A reverse search skips collecting
+temporary child links used to build the intervals, the return ranges and their links,
+the queue and the shortest known prefixes. A reverse search skips collecting
 branch hops when the weights are known to be constant and too small to overflow. A
 source reconstructs directly when its reverse tree path has no competing suffix within
 the remaining edge budget. The other sources run bounded searches in source order, pruned by
