@@ -850,7 +850,7 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
 }
 
 /// A registered source, named by its graph or IRI, and the text of its current
-/// rendition.
+/// rendition, captured at one branch commit.
 pub(super) struct ReadSource {
     pub found: Value,
     pub prefixes: Value,
@@ -858,6 +858,7 @@ pub(super) struct ReadSource {
     pub rendition: String,
     pub text: String,
     pub chunks: Vec<(usize, usize)>,
+    pub commit: Option<u64>,
 }
 
 /// Read a registered source and its current rendition's text, chunk by chunk, on
@@ -875,6 +876,7 @@ pub(super) fn read_source(
         json!({ "graphs": [format!("<{source}>")], "limit": 50 }),
         branch,
     )?;
+    let commit = listed["commit"].as_u64();
     let prefixes = listed["prefixes"].clone();
     let found = listed["sources"]
         .as_array()
@@ -896,17 +898,18 @@ pub(super) fn read_source(
         })?;
     let graph = expand_iri(found["graph"].as_str().unwrap_or(""), &prefixes);
     let rendition = expand_iri(found["rendition"].as_str().unwrap_or(""), &prefixes);
-    // 2. the text, chunk by chunk
+    // 2. the text, chunk by chunk, pinned to the same commit as list_sources
     let mut text = String::new();
     let mut chunks: Vec<(usize, usize)> = Vec::new();
     let mut from = 0u64;
     loop {
         r.check()?;
-        let page = r.tool(
-            "read_chunks",
-            json!({ "rendition": format!("<{rendition}>"), "from": from, "count": 20 }),
-            branch,
-        )?;
+        let mut page_args =
+            json!({ "rendition": format!("<{rendition}>"), "from": from, "count": 20 });
+        if let Some(c) = commit {
+            page_args["atCommit"] = c.into();
+        }
+        let page = r.tool("read_chunks", page_args, branch)?;
         for c in page["chunks"].as_array().into_iter().flatten() {
             let (Some(a), Some(b), Some(t)) =
                 (c["start"].as_u64(), c["end"].as_u64(), c["text"].as_str())
@@ -935,6 +938,7 @@ pub(super) fn read_source(
         rendition,
         text,
         chunks,
+        commit,
     })
 }
 

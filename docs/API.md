@@ -13276,7 +13276,12 @@ A `preview` task ends in `awaiting-approval` with the proposals in its result.
 caller, and fails with `409` when `main` changed since the preview. An `auto` task
 merges its branch when no fact failed, no entity is ambiguous, the guard reported
 nothing, every fact's confidence is at least `autoConfidence` and the merge preview has
-no conflict. Otherwise it keeps the branch and gives the reason as `autoFallback`.
+no conflict. Otherwise it keeps the branch and gives the reason as `autoFallback`. A
+`claims` task publishes an evidence batch and reports the evidence `operation`,
+`revision`, `evidenceRendition`, `records`, `recordCounts` and `previousRevision` (the
+linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`,
+and omitted when no predecessor evidence revision is linked, when the recorded link is
+hidden from the caller or when `outcome` is `already-proposed`).
 
 The review page's sources carry `pages` with each page's number and start, and
 `ocrPages` and `omittedPages`, so the UI shows the page of each fact.
@@ -13740,7 +13745,11 @@ update endpoint and counts as an update. The design is in
 ```
 
 A record names another record of the batch as `{"key"}` and an existing authenticated
-record as `{"iri"}`. Content is `{"text"}`, `{"base64"}` or the `{"digest"}` of content
+record as `{"iri"}`. A source revision's optional `wasRevisionOf` names its predecessor
+`SourceRevision` the same way, is written as `prov:wasRevisionOf`, and is verified as an
+authenticated, caller-readable `SourceRevision` before publication. Self-links and cycles
+among batch revisions are refused, and a revision without `wasRevisionOf` keeps the record
+and payload digests it would have had before the field existed. Content is `{"text"}`, `{"base64"}` or the `{"digest"}` of content
 that is not retained. A proposition, scope value, rights term and conclusion is an
 N-Triples term without blank nodes. A stored fact has the form of
 [evidence resolution](#evidence-resolution). `ifHead`, `dryRun` and `message` have their

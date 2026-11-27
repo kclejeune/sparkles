@@ -115,6 +115,7 @@ fn batch(ds: &Dataset, fact_commit: u64) -> EvidenceInput {
             metadata: Default::default(),
             times: Default::default(),
             lineage: Default::default(),
+            was_revision_of: None,
         }],
         renditions: vec![RenditionInput {
             version: RecordVersion::V1,
@@ -223,6 +224,7 @@ fn small(occurrence: &str, proposition: Triple) -> EvidenceInput {
             metadata: Default::default(),
             times: Default::default(),
             lineage: Default::default(),
+            was_revision_of: None,
         }],
         claims: vec![claim("claim", occurrence, proposition)],
         ..Default::default()
@@ -5907,5 +5909,388 @@ fn propose_same_iri_selection_precedes_incompatible_kind_constraint() {
             hide_pred("urn:x-sparkles:evidence:availabilityReceipt"),
         ),
         absent
+    );
+}
+
+#[test]
+fn source_revision_was_revision_of_authenticates_and_refuses_invalid_predecessors() {
+    let ds = Dataset::memory();
+    configured(&ds);
+
+    // First revision without predecessor.
+    let first_input = small("c1", proposition());
+    let first = propose(&ds, &first_input, &options()).unwrap();
+    let rev1 = iri_of(&first, "rev");
+    let claim1 = iri_of(&first, "claim");
+
+    // Second revision links to the existing authenticated predecessor.
+    let mut second_input = small("c2", proposition());
+    second_input.revisions[0].content = SourceContent::MetadataOnly {
+        digest: sha("Release 1.2 updated text."),
+    };
+    second_input.revisions[0].was_revision_of = Some(RecordRef::Existing(rev1.clone()));
+    let second = propose(&ds, &second_input, &options()).unwrap();
+    let rev2 = iri_of(&second, "rev");
+    assert_ne!(rev2, rev1);
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{SOURCES}> {{ <{}> <http://www.w3.org/ns/prov#wasRevisionOf> <{}> }} }}",
+            rev2.as_str(),
+            rev1.as_str()
+        ))
+        .unwrap()
+    );
+    let verified = record(&ds, &rev2, RecordKind::SourceRevision).unwrap();
+    assert_eq!(verified.record_digest, Some(second.records[0].digest));
+
+    // Re-proposing rev1 with a predecessor conflicts because prov:wasRevisionOf changes its
+    // immutable record digest.
+    let mut mutate_first = first_input.clone();
+    mutate_first.revisions[0].was_revision_of = Some(RecordRef::Existing(rev2.clone()));
+    assert_eq!(
+        code(propose(&ds, &mutate_first, &options())),
+        "immutable-record-conflict"
+    );
+
+    // Batch-local predecessor link writes both revisions and prov:wasRevisionOf in one commit.
+    let mut local_chain = EvidenceInput {
+        revisions: vec![
+            SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("ra"),
+                source: iri("urn:chain"),
+                source_key: key("chain"),
+                upstream_version: None,
+                content: SourceContent::MetadataOnly { digest: sha("a") },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+                was_revision_of: None,
+            },
+            SourceRevisionInput {
+                version: RecordVersion::V1,
+                key: key("rb"),
+                source: iri("urn:chain"),
+                source_key: key("chain"),
+                upstream_version: None,
+                content: SourceContent::MetadataOnly { digest: sha("b") },
+                metadata: Default::default(),
+                times: Default::default(),
+                lineage: Default::default(),
+                was_revision_of: Some(local("ra")),
+            },
+        ],
+        ..Default::default()
+    };
+    let chained = propose(&ds, &local_chain, &options()).unwrap();
+    let ra = iri_of(&chained, "ra");
+    let rb = iri_of(&chained, "rb");
+    assert!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{SOURCES}> {{ <{}> <http://www.w3.org/ns/prov#wasRevisionOf> <{}> }} }}",
+            rb.as_str(),
+            ra.as_str()
+        ))
+        .unwrap()
+    );
+    assert!(record(&ds, &ra, RecordKind::SourceRevision).is_ok());
+    assert!(record(&ds, &rb, RecordKind::SourceRevision).is_ok());
+
+    // Missing predecessor refuses as evidence-unavailable and writes nothing.
+    let head = ds.store().head_commit().seq;
+    let mut missing = small("c3", proposition());
+    missing.revisions[0].content = SourceContent::MetadataOnly { digest: sha("v3") };
+    missing.revisions[0].was_revision_of = Some(RecordRef::Existing(iri(
+        "urn:uuid:00000000-0000-4000-8000-000000000000",
+    )));
+    assert_eq!(
+        code(propose(&ds, &missing, &options())),
+        "evidence-unavailable"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Unauthorized caller (cannot read source graph) gets the same non-disclosing
+    // evidence-unavailable error as a missing predecessor.
+    let deny_sources = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new([CLAIMS], &[])),
+        Graphs::All,
+    ));
+    let mut hidden_input = small("c3", proposition());
+    hidden_input.revisions[0].content = SourceContent::MetadataOnly { digest: sha("v3") };
+    hidden_input.revisions[0].was_revision_of = Some(RecordRef::Existing(rev1.clone()));
+    let hidden = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &hidden_input,
+        &options(),
+        &mut |_, _| Some(deny_sources.clone()),
+        &Control::none(),
+    );
+    assert_eq!(code(hidden), "evidence-unavailable");
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Wrong-kind predecessor (a Claim instead of a SourceRevision) is refused.
+    let mut wrong_kind = small("c3", proposition());
+    wrong_kind.revisions[0].content = SourceContent::MetadataOnly { digest: sha("v3") };
+    wrong_kind.revisions[0].was_revision_of = Some(RecordRef::Existing(claim1));
+    assert_eq!(
+        code(propose(&ds, &wrong_kind, &options())),
+        "immutable-record-conflict"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Existing-IRI self-link is refused before resolution.
+    let mut self_iri = small("c1", proposition());
+    self_iri.revisions[0].was_revision_of = Some(RecordRef::Existing(rev1.clone()));
+    assert!(matches!(
+        propose(&ds, &self_iri, &options()),
+        Err(sparkles::Error::Invalid(_))
+    ));
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // Local self-link is refused.
+    local_chain.revisions[0].was_revision_of = Some(local("ra"));
+    assert!(matches!(
+        propose(&ds, &local_chain, &options()),
+        Err(sparkles::Error::Invalid(_))
+    ));
+    assert_eq!(ds.store().head_commit().seq, head);
+
+    // An unauthenticated predecessor planted while the source graph was detached is refused.
+    evidence::detach(&ds, SOURCES).unwrap();
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{SOURCES}> {{ <urn:fake-rev> a <urn:x-sparkles:evidence:SourceRevision> ; <http://www.w3.org/ns/prov#specializationOf> <urn:bulletin> . }} }}"
+    ))
+    .unwrap();
+    configured(&ds);
+    let head = ds.store().head_commit().seq;
+    let mut planted = small("c4", proposition());
+    planted.revisions[0].content = SourceContent::MetadataOnly { digest: sha("v4") };
+    planted.revisions[0].was_revision_of = Some(RecordRef::Existing(iri("urn:fake-rev")));
+    assert_eq!(
+        code(propose(&ds, &planted, &options())),
+        "origin-not-reproduced"
+    );
+    assert_eq!(ds.store().head_commit().seq, head);
+}
+
+#[test]
+fn if_head_refuses_stale_head_before_resolving_newly_masked_predecessor() {
+    use sparkles::access::{Caller, Limits, Protection, Rule, TripleRules};
+
+    let ds = Dataset::memory();
+    configured(&ds);
+
+    let p1 = propose(&ds, &small("c1", proposition()), &options()).unwrap();
+    let rev1 = iri_of(&p1, "rev");
+    let expected_head = ds.store().head_commit().seq;
+
+    // A triple-level read protection hides subjects typed as <urn:test:HiddenPred>.
+    let hide_pred = Arc::new(Protection {
+        name: "hide_pred".into(),
+        predicates: None,
+        classes: Some(vec!["urn:test:HiddenPred".into()]),
+        subclasses: false,
+        graphs: None,
+        pattern: None,
+        prefixes: Default::default(),
+        hide_inferences: false,
+    });
+    let masked_read = Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: hide_pred,
+                read: Graphs::none(),
+                write: Graphs::All,
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    ));
+
+    // Advance the head by tagging rev1 with the protected class in an ordinary graph.
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <urn:tags> {{ <{}> a <urn:test:HiddenPred> }} }}",
+        rev1.as_str()
+    ))
+    .unwrap();
+    let moved_head = ds.store().head_commit().seq;
+    assert_ne!(moved_head, expected_head);
+
+    let mut input = small("c2", proposition());
+    input.revisions[0].content = SourceContent::MetadataOnly { digest: sha("v2") };
+    input.revisions[0].was_revision_of = Some(RecordRef::Existing(rev1));
+
+    // With stale if_head, propose must report head-changed rather than evidence-unavailable
+    // from resolving against the newer masked snapshot.
+    let mut stale = options();
+    stale.if_head = Some(expected_head);
+    let stale_res = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &input,
+        &stale,
+        &mut |_, _| Some(masked_read.clone()),
+        &Control::none(),
+    );
+    assert_eq!(code(stale_res), "head-changed");
+    assert_eq!(ds.store().head_commit().seq, moved_head);
+
+    // At the current head (where rev1 is genuinely masked), propose still returns
+    // evidence-unavailable.
+    let mut current = options();
+    current.if_head = Some(moved_head);
+    let current_res = evidence::propose(
+        None,
+        &ds,
+        &ds,
+        &input,
+        &current,
+        &mut |_, _| Some(masked_read.clone()),
+        &Control::none(),
+    );
+    assert_eq!(code(current_res), "evidence-unavailable");
+    assert_eq!(ds.store().head_commit().seq, moved_head);
+}
+
+#[test]
+fn record_charged_covers_verified_result_and_skips_unauthenticated_receipt_decode() {
+    let ds = Dataset::memory();
+    configured(&ds);
+
+    let p = propose(&ds, &small("c1", proposition()), &options()).unwrap();
+    let rev = iri_of(&p, "rev");
+
+    // 1. `record_charged` holds memory covering `iri`, `graph`, and `receipt.iri` until
+    //    its returned reservation is dropped.
+    let mut res = Resolution::new(Control::none()).unwrap();
+    let (warm, warm_held) = res
+        .record_charged(
+            "k",
+            &ds,
+            &ds,
+            Some(Arc::new(GraphAccess::all())),
+            &rev,
+            &[RecordKind::SourceRevision],
+            None,
+        )
+        .unwrap();
+    drop(warm);
+    drop(warm_held);
+    let base_used = res.preparation().limit() - res.preparation().available_bytes();
+
+    let (verified, held) = res
+        .record_charged(
+            "k",
+            &ds,
+            &ds,
+            Some(Arc::new(GraphAccess::all())),
+            &rev,
+            &[RecordKind::SourceRevision],
+            None,
+        )
+        .unwrap();
+    let expected_min_bytes = verified.iri.as_str().len() as u64
+        + verified.graph.as_str().len() as u64
+        + verified.receipt.iri.as_str().len() as u64;
+    let used_with_verified = res.preparation().limit() - res.preparation().available_bytes();
+    let one_record = used_with_verified.saturating_sub(base_used);
+    assert!(
+        one_record >= expected_min_bytes,
+        "VerifiedRecord reservation must cover variable-sized strings ({expected_min_bytes} B): {base_used} -> {used_with_verified}"
+    );
+    drop(verified);
+    drop(held);
+    let used_after_drop = res.preparation().limit() - res.preparation().available_bytes();
+    assert_eq!(
+        used_after_drop, base_used,
+        "dropping VerifiedRecord reservation must restore baseline usage"
+    );
+
+    // 2. Under a tight cap where decoding a single ~80 B IRI (~11 KiB) and settings
+    //    decoding (~64 KiB) fit comfortably, holding many live verified results exhausts
+    //    the allowance with `incomplete-evidence`, and dropping them allows reuse.
+    let tight_cap = base_used + 96 * 1024;
+    let mut tight = Resolution::with_memory(Control::none(), tight_cap).unwrap();
+    let mut live = Vec::new();
+    let mut overflow = None;
+    for _ in 0..400 {
+        match tight.record_charged(
+            "k",
+            &ds,
+            &ds,
+            Some(Arc::new(GraphAccess::all())),
+            &rev,
+            &[RecordKind::SourceRevision],
+            None,
+        ) {
+            Ok(pair) => live.push(pair),
+            Err(e) => {
+                overflow = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        !live.is_empty(),
+        "at least one verified record must fit in cap={tight_cap}"
+    );
+    assert_eq!(
+        code::<()>(Err(
+            overflow.expect("retaining verified records must exhaust cap")
+        )),
+        "incomplete-evidence"
+    );
+    live.clear();
+    tight
+        .record_charged(
+            "k",
+            &ds,
+            &ds,
+            Some(Arc::new(GraphAccess::all())),
+            &rev,
+            &[RecordKind::SourceRevision],
+            None,
+        )
+        .unwrap();
+
+    // 3. An unauthenticated record pointing to a 10 KiB receipt IRI (whose `decode_term`
+    //    needs > 1.2 MiB) is rejected as `origin-not-reproduced` under a 256 KiB cap
+    //    because the nonce check runs before decoding or memoizing the receipt IRI.
+    evidence::detach(&ds, SOURCES).unwrap();
+    let huge_receipt = format!("urn:test:huge-receipt:{}", "r".repeat(10_000));
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{SOURCES}> {{ \
+           <urn:planted-huge-receipt> a <urn:x-sparkles:evidence:SourceRevision> ; \
+             <urn:x-sparkles:evidence:availabilityReceipt> <{huge_receipt}> . \
+           <{huge_receipt}> a <urn:x-sparkles:evidence:Operation> ; \
+             <urn:x-sparkles:evidence:datasetId> \"{}\" ; \
+             <urn:x-sparkles:evidence:branchId> \"{}\" ; \
+             <urn:x-sparkles:evidence:commit> 1 . \
+         }} }}",
+        ds.dataset_id(),
+        ds.store().branch_id(),
+    ))
+    .unwrap();
+    configured(&ds);
+
+    let mut capped = Resolution::with_memory(Control::none(), 256 * 1024).unwrap();
+    let err = capped.record_charged(
+        "k",
+        &ds,
+        &ds,
+        Some(Arc::new(GraphAccess::all())),
+        &iri("urn:planted-huge-receipt"),
+        &[RecordKind::SourceRevision],
+        None,
+    );
+    assert_eq!(
+        code(err.map(|(v, _)| v)),
+        "origin-not-reproduced",
+        "nonce check must reject planted record before decoding the 10 KiB receipt IRI"
     );
 }

@@ -27,6 +27,7 @@ ev:SourceRevisionShape a sh:NodeShape ;
   sh:property [ sh:path ev:availabilityReceipt ; sh:nodeKind sh:IRI ; sh:maxCount 1 ] ;
   sh:property [ sh:path ev:upstreamSource ; sh:nodeKind sh:IRI ] ;
   sh:property [ sh:path ev:sourceFamily ; sh:nodeKind sh:IRI ] ;
+  sh:property [ sh:path prov:wasRevisionOf ; sh:nodeKind sh:IRI ; sh:maxCount 1 ] ;
   sh:message "Evidence profile version 1 requires the documented record structure." .
 
 ev:RenditionShape a sh:NodeShape ;

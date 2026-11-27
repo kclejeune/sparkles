@@ -124,13 +124,19 @@ pub struct RecordKey(String);
 impl RecordKey {
     pub const MAX_BYTES: usize = 16 * 1024 * 1024;
 
-    pub fn new(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
+    /// Validate a record key's UTF-8 byte length without allocating an owned copy.
+    pub fn validate(value: &str) -> Result<()> {
         if value.is_empty() || value.len() > Self::MAX_BYTES {
             return Err(Error::invalid(
                 "record key requires 1 through 16 MiB of UTF-8 input",
             ));
         }
+        Ok(())
+    }
+
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        Self::validate(&value)?;
         Ok(Self(value))
     }
 
@@ -345,9 +351,15 @@ mod tests {
 
     #[test]
     fn record_keys_bound_decoded_utf8_bytes_without_ambiguous_separator_rules() {
+        assert!(RecordKey::validate("").is_err());
         assert!(RecordKey::new("").is_err());
-        assert!(RecordKey::new("é".repeat(RecordKey::MAX_BYTES / 2 + 1)).is_err());
-        assert!(RecordKey::new("é".repeat(RecordKey::MAX_BYTES / 2)).is_ok());
+        let too_long = "é".repeat(RecordKey::MAX_BYTES / 2 + 1);
+        let at_limit = "é".repeat(RecordKey::MAX_BYTES / 2);
+        assert!(RecordKey::validate(&too_long).is_err());
+        assert!(RecordKey::validate(&at_limit).is_ok());
+        assert!(RecordKey::new(too_long).is_err());
+        assert!(RecordKey::new(at_limit).is_ok());
+        assert!(RecordKey::validate("source\0occurrence").is_ok());
         assert_eq!(
             RecordKey::new("source\0occurrence").unwrap().as_str(),
             "source\0occurrence"

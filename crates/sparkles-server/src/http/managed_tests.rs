@@ -2241,3 +2241,161 @@ async fn evidence_reauthenticate_http_route_and_openapi_contract() {
         assert_eq!(budget_err["code"], "incomplete-evidence");
     }
 }
+
+/// `POST /{ds}/claims` accepts `wasRevisionOf` on source revisions (existing IRI or
+/// batch-local key), authenticates the resulting revision, and refuses invalid,
+/// missing, wrong-kind and self-referential predecessors.
+#[tokio::test]
+async fn evidence_source_revision_predecessors_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    let ds = state.get("d").unwrap();
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/$/evidence/d/settings",
+        Some("application/json"),
+        r#"{"format":1,"profile":1,"enabled":true,"sourceRecords":["urn:ev:sources"],"proposals":["urn:ev:claims"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let post = |path: &str, body: J| {
+        let app = app.clone();
+        let path = path.to_string();
+        async move {
+            call(
+                &app,
+                "POST",
+                &path,
+                Some("application/json"),
+                &body.to_string(),
+            )
+            .await
+        }
+    };
+    let (status, first) = post(
+        "/d/claims",
+        json!({
+            "revisions": [{
+                "key": "r1",
+                "source": "https://example.org/bulletin",
+                "sourceKey": "bulletin",
+                "content": {"text": "v1"}
+            }],
+            "claims": [{
+                "key": "c1",
+                "occurrenceKey": "c1",
+                "revision": {"key": "r1"},
+                "proposition": "<urn:s> <urn:p> <urn:o>",
+                "kind": "reported",
+                "polarity": "positive",
+                "author": "urn:publisher"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let r1 = first["records"][0]["iri"].as_str().unwrap().to_string();
+    let c1 = first["records"][1]["iri"].as_str().unwrap().to_string();
+
+    // Existing predecessor revision is linked as prov:wasRevisionOf and authenticates.
+    let (status, second) = post(
+        "/d/claims",
+        json!({
+            "revisions": [{
+                "key": "r2",
+                "source": "https://example.org/bulletin",
+                "sourceKey": "bulletin",
+                "content": {"text": "v2"},
+                "wasRevisionOf": {"iri": r1}
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let r2 = second["records"][0]["iri"].as_str().unwrap().to_string();
+    assert!(
+        ds.dataset
+            .ask(&format!(
+                "ASK {{ GRAPH <urn:ev:sources> {{ <{r2}> <http://www.w3.org/ns/prov#wasRevisionOf> <{r1}> }} }}"
+            ))
+            .unwrap()
+    );
+    let (status, resolved) = post(
+        "/d/claims/resolve",
+        json!({"references": [{"key": "rev", "record": {"iri": r2, "kinds": ["SourceRevision"]}}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resolved}");
+    assert_eq!(
+        resolved["resolved"][0]["record"]["recordDigest"],
+        second["records"][0]["recordDigest"]
+    );
+
+    // Batch-local predecessor link in one request.
+    let (status, batch) = post(
+        "/d/claims",
+        json!({
+            "revisions": [
+                {"key": "a", "source": "https://example.org/other", "sourceKey": "other", "content": {"text": "a"}},
+                {"key": "b", "source": "https://example.org/other", "sourceKey": "other", "content": {"text": "b"}, "wasRevisionOf": {"key": "a"}}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{batch}");
+    let ra = batch["records"][0]["iri"].as_str().unwrap();
+    let rb = batch["records"][1]["iri"].as_str().unwrap();
+    assert!(
+        ds.dataset
+            .ask(&format!(
+                "ASK {{ GRAPH <urn:ev:sources> {{ <{rb}> <http://www.w3.org/ns/prov#wasRevisionOf> <{ra}> }} }}"
+            ))
+            .unwrap()
+    );
+
+    // Refusal edge cases: invalid IRI, self-link, missing predecessor, wrong kind.
+    let (status, j) = post(
+        "/d/claims",
+        json!({"revisions": [{"key": "x", "source": "urn:src", "sourceKey": "src", "content": {"text": "x"}, "wasRevisionOf": {"iri": "not an iri"}}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+    let (status, j) = post(
+        "/d/claims",
+        json!({"revisions": [{"key": "x", "source": "urn:src", "sourceKey": "src", "content": {"text": "x"}, "wasRevisionOf": {"key": "x"}}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, j["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid-proposal")),
+        "{j}"
+    );
+    let (status, j) = post(
+        "/d/claims",
+        json!({"revisions": [{"key": "x", "source": "urn:src", "sourceKey": "src", "content": {"text": "x"}, "wasRevisionOf": {"iri": "urn:uuid:00000000-0000-4000-8000-000000000000"}}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, j["code"].as_str()),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("evidence-unavailable")
+        ),
+        "{j}"
+    );
+    let (status, j) = post(
+        "/d/claims",
+        json!({"revisions": [{"key": "x", "source": "urn:src", "sourceKey": "src", "content": {"text": "x"}, "wasRevisionOf": {"iri": c1}}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, j["code"].as_str()),
+        (StatusCode::CONFLICT, Some("immutable-record-conflict")),
+        "{j}"
+    );
+}

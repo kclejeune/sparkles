@@ -45,6 +45,7 @@ fn sample() -> EvidenceInput {
                 reported_available_at: None,
             },
             lineage: SourceLineage::default(),
+            was_revision_of: None,
         }],
         renditions: vec![RenditionInput {
             version: RecordVersion::V1,
@@ -1021,4 +1022,90 @@ fn validity_records_are_framed_and_refused_like_the_v1_shapes() {
         vec![timestamp("2026-06-01T00:00:00Z").into()],
     );
     prepare_input(&input, &Control::none()).unwrap();
+}
+
+#[test]
+fn source_revision_predecessors_preserve_digests_when_absent_and_validate_when_present() {
+    let base = sample();
+    let base_digest = prepare_input(&base, &Control::none())
+        .unwrap()
+        .body_digest();
+    assert_eq!(base_digest.to_string(), PAYLOAD_WITHOUT_VALIDITY);
+
+    // An existing predecessor frames distinctly and adds a SourceRevision requirement.
+    let mut with_existing = sample();
+    let prior = node("urn:uuid:11111111-1111-4111-8111-111111111111");
+    with_existing.revisions[0].was_revision_of = Some(RecordRef::Existing(prior.clone()));
+    let prepared_existing = prepare_input(&with_existing, &Control::none()).unwrap();
+    assert_ne!(prepared_existing.body_digest(), base_digest);
+    assert_eq!(
+        prepared_existing.requirements(),
+        &[ResolutionRequirement::ExistingRecord {
+            record: prior,
+            expected_kinds: vec![RecordKind::SourceRevision],
+        }]
+    );
+
+    // A batch-local predecessor frames distinctly from both absent and existing forms.
+    let mut with_local = sample();
+    let mut earlier = with_local.revisions[0].clone();
+    earlier.key = key("earlier");
+    earlier.content = SourceContent::MetadataOnly {
+        digest: digest(b"earlier bytes"),
+    };
+    with_local.revisions.push(earlier);
+    with_local.revisions[0].was_revision_of = Some(local("earlier"));
+    let prepared_local = prepare_input(&with_local, &Control::none()).unwrap();
+    assert!(prepared_local.requirements().is_empty());
+    assert_ne!(prepared_local.body_digest(), base_digest);
+    assert_ne!(
+        prepared_local.body_digest(),
+        prepared_existing.body_digest()
+    );
+
+    // Invalid IRI is refused.
+    let mut bad_iri = sample();
+    bad_iri.revisions[0].was_revision_of =
+        Some(RecordRef::Existing(NamedNode::new_unchecked("not an iri")));
+    assert!(matches!(
+        prepare_input(&bad_iri, &Control::none()),
+        Err(Error::Invalid(_))
+    ));
+
+    // Unknown local alias is refused.
+    let mut missing = sample();
+    missing.revisions[0].was_revision_of = Some(local("missing"));
+    assert!(matches!(
+        prepare_input(&missing, &Control::none()),
+        Err(Error::Invalid(_))
+    ));
+
+    // Wrong batch-local kind is refused.
+    for wrong in ["text", "claim"] {
+        let mut bad_kind = sample();
+        bad_kind.revisions[0].was_revision_of = Some(local(wrong));
+        assert!(
+            matches!(
+                prepare_input(&bad_kind, &Control::none()),
+                Err(Error::Invalid(_))
+            ),
+            "{wrong}"
+        );
+    }
+
+    // Direct self-link is refused.
+    let mut self_link = sample();
+    self_link.revisions[0].was_revision_of = Some(local("revision"));
+    let err = prepare_input(&self_link, &Control::none())
+        .err()
+        .expect("self-link refused");
+    assert!(err.to_string().contains("cannot revise itself"), "{err}");
+
+    // Multi-revision cycle is refused.
+    let mut cycle = with_local.clone();
+    cycle.revisions[1].was_revision_of = Some(local("revision"));
+    let err = prepare_input(&cycle, &Control::none())
+        .err()
+        .expect("cycle refused");
+    assert!(err.to_string().contains("cycle"), "{err}");
 }

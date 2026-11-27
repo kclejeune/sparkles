@@ -12,7 +12,7 @@
 //! capability.
 
 pub use sparkles_core::evidence::resolve::{
-    MAX_REFERENCES, MEMORY_BYTES, Phase2Outcome, ProposedPassage, ProposedStructured, Receipt,
+    GraphNodes, MAX_REFERENCES, MEMORY_BYTES, SingleObject, Phase2Outcome, ProposedPassage, ProposedStructured, Receipt,
     RecordRequest, SelectionProbe, SelectionRequirements, VerifiedFact, VerifiedRecord,
     VerifiedSpan, check_anchor, kind_iri, unavailable,
 };
@@ -127,6 +127,18 @@ impl Resolution {
         self.resolver.stored_fact(key, main, granted.as_ref(), fact)
     }
 
+    /// The operation's shared preparation context.
+    pub fn preparation(&self) -> &crate::access::Preparation {
+        self.resolver.preparation()
+    }
+
+    /// Pin record and graph lookups on `(main, logical)` to the exact branch commit
+    /// `commit`, so every call in this resolution reads one consistent snapshot.
+    pub fn pin_commit(&mut self, main: &Dataset, logical: &Dataset, commit: u64) {
+        self.resolver
+            .pin_commit(main.store(), logical.store(), commit);
+    }
+
     /// Verify a record reference at the current state of `logical`, which is `main` or
     /// one of its branches, under `access`, what the caller may read there (`None`:
     /// nothing). The record must be an authenticated profile record of the evidence
@@ -141,11 +153,6 @@ impl Resolution {
     ) -> Result<VerifiedRecord> {
         self.resolver
             .record(key, main.store(), logical.store(), access.as_ref(), request)
-    }
-
-    /// The shared preparation context backing this resolution's 64 MiB allowance.
-    pub(crate) fn preparation(&self) -> &sparkles_core::access::Preparation {
-        self.resolver.preparation()
     }
 
     /// Probe a record reference and its selection-target availability without
@@ -331,6 +338,155 @@ impl Resolution {
             access.as_ref(),
             revision,
             references,
+        )
+    }
+
+    /// Verify a record reference as [`Self::record`], borrowing `iri` and returning a
+    /// [`crate::access::Reservation`] that keeps the variable-sized strings inside
+    /// [`VerifiedRecord`] charged to this resolution's preparation allowance until dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_charged(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: Option<Arc<GraphAccess>>,
+        iri: &oxrdf::NamedNode,
+        kinds: &[RecordKind],
+        expected_content_digest: Option<&sparkles_core::evidence::Sha256Digest>,
+    ) -> Result<(VerifiedRecord, crate::access::Reservation)> {
+        self.resolver.record_charged(
+            key,
+            main.store(),
+            logical.store(),
+            access.as_ref(),
+            iri,
+            kinds,
+            expected_content_digest,
+        )
+    }
+
+    /// Whether `s p o` is visible in `graph` at the resolving state of `logical` under
+    /// `access`, bounded by this resolution's preparation allowance and controls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_triple(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        s: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        o: &oxrdf::Term,
+    ) -> Result<bool> {
+        self.resolver
+            .has_triple(key, main.store(), logical.store(), access, graph, s, p, o)
+    }
+
+    /// Whether at least one triple `s p ?o` is visible in `graph` at the resolving state of
+    /// `logical` under `access`, without decoding any object term.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_any_object_in_graph(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        s: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+    ) -> Result<bool> {
+        self.resolver.has_any_object_in_graph(
+            key,
+            main.store(),
+            logical.store(),
+            access,
+            graph,
+            s,
+            p,
+        )
+    }
+
+    /// Inspect the object(s) of `s p ?o` visible in `graph` at the resolving state of
+    /// `logical` under `access`, borrowing the single decoded term inside `parse`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn single_object_in_graph<T>(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        s: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        parse: impl FnOnce(Option<&oxrdf::Term>) -> Result<T>,
+    ) -> Result<SingleObject<T>> {
+        self.resolver.single_object_in_graph(
+            key,
+            main.store(),
+            logical.store(),
+            access,
+            graph,
+            s,
+            p,
+            parse,
+        )
+    }
+
+    /// Named-node objects of `s p ?o` visible in `graph`, collecting at most `limit`
+    /// results and decrementing `remaining_scans` for each scanned quad in `graph`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn objects_in_graph(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        s: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        limit: usize,
+        remaining_scans: &mut u64,
+    ) -> Result<GraphNodes> {
+        self.resolver.objects_in_graph(
+            key,
+            main.store(),
+            logical.store(),
+            access,
+            graph,
+            s,
+            p,
+            limit,
+            remaining_scans,
+        )
+    }
+
+    /// Named-node subjects of `?s p o` visible in `graph`, collecting at most `limit`
+    /// results and decrementing `remaining_scans` only for quads belonging to `graph`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subjects_in_graph(
+        &mut self,
+        key: &str,
+        main: &Dataset,
+        logical: &Dataset,
+        access: &Arc<GraphAccess>,
+        graph: &oxrdf::NamedNode,
+        p: &oxrdf::NamedNode,
+        o: &oxrdf::Term,
+        limit: usize,
+        remaining_scans: &mut u64,
+    ) -> Result<GraphNodes> {
+        self.resolver.subjects_in_graph(
+            key,
+            main.store(),
+            logical.store(),
+            access,
+            graph,
+            p,
+            o,
+            limit,
+            remaining_scans,
         )
     }
 

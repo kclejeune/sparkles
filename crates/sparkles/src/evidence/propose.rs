@@ -569,6 +569,7 @@ fn verify_requirements(
     requirements: &[ResolutionRequirement],
     read: &mut dyn FnMut(&Dataset, &str) -> Option<Arc<GraphAccess>>,
     control: &Control,
+    if_head: Option<u64>,
 ) -> Result<()> {
     verify_requirements_with_memory(
         catalog,
@@ -580,6 +581,7 @@ fn verify_requirements(
         read,
         control,
         MEMORY_BYTES,
+        if_head,
     )
 }
 
@@ -664,6 +666,7 @@ fn verify_requirements_with_memory(
     read: &mut dyn FnMut(&Dataset, &str) -> Option<Arc<GraphAccess>>,
     control: &Control,
     memory_bytes: u64,
+    if_head: Option<u64>,
 ) -> Result<()> {
     if requirements.is_empty() {
         return Ok(());
@@ -676,6 +679,9 @@ fn verify_requirements_with_memory(
         e => e,
     };
     let mut resolution = Resolution::with_memory(control.clone(), memory_bytes).map_err(admit)?;
+    if let Some(expected) = if_head {
+        resolution.pin_commit(main, logical, expected);
+    }
     let prep = resolution.preparation().clone();
     let mut generic_count = 0usize;
     let mut generic_reqs: AdmittedVec<GenericReq<'_>> = AdmittedVec::new(&prep, &admit)?;
@@ -1531,13 +1537,29 @@ pub fn propose(
     // Retain the same dataset handles the resolver read. Reopening by UUID could
     // find a dataset restored in the meantime with different history at that commit.
     let mut resolved_datasets = HashMap::new();
-    verify_requirements(
+    let requirements = prepared.requirements();
+    let check_expected_head = || {
+        if let Some(expected) = options.if_head {
+            let live = store.snapshot().commit;
+            if live != expected {
+                return Err(managed(
+                    ManagedErrorKind::HeadChanged,
+                    format!("ifHead: the head of the branch is commit {live}, not {expected}"),
+                ));
+            }
+        }
+        Ok(())
+    };
+    if !requirements.is_empty() {
+        check_expected_head()?;
+    }
+    let verified = verify_requirements(
         catalog,
         main,
         logical,
         input,
         &plan,
-        prepared.requirements(),
+        requirements,
         &mut |ds, branch| {
             let granted = read(ds, branch)?;
             if ds.dataset_id() != main.dataset_id() {
@@ -1551,7 +1573,20 @@ pub fn propose(
             Some(granted)
         },
         control,
-    )?;
+        options.if_head,
+    );
+    if let Err(e) = verified {
+        if matches!(
+            &e,
+            Error::Managed(m) if matches!(
+                m.kind,
+                ManagedErrorKind::EvidenceUnavailable | ManagedErrorKind::OriginNotReproduced
+            )
+        ) {
+            check_expected_head()?;
+        }
+        return Err(e);
+    }
     main.store().failpoint("evidence-sources-resolved");
     let foreign: Vec<&Dataset> = resolved_datasets.values().collect();
     let (publication_catalog, source_identities) = if foreign.is_empty() {
@@ -2446,6 +2481,7 @@ mod tests {
             },
             &Control::none(),
             exact_classified_bytes - 1,
+            None,
         )
         .unwrap_err();
         assert_eq!(err.code(), "incomplete-evidence");
@@ -2467,6 +2503,7 @@ mod tests {
             },
             &Control::none(),
             exact_classified_bytes,
+            None,
         )
         .unwrap_err();
         assert_eq!(exact_err.code(), "evidence-unavailable");
@@ -2519,6 +2556,7 @@ mod tests {
             },
             &Control::none(),
             4 * 1024,
+            None,
         )
         .unwrap_err();
         assert_eq!(long_err.code(), "incomplete-evidence");
@@ -2597,6 +2635,7 @@ mod tests {
             &mut |_, _| Some(Arc::new(GraphAccess::all())),
             &Control::none(),
             memory_bytes,
+            None,
         )
     }
 

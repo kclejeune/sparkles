@@ -2034,10 +2034,33 @@ link, because extraction does not establish which occurrence corresponds to whic
 
 The two source revisions do correspond, because the registration replaced the current
 rendition of the same source. Both revisions name the same source through
-`prov:specializationOf`, and the C18 renditions keep their `prov:wasRevisionOf` chain.
-The source revision input has no field for a link to a predecessor revision, and adding
-one changes the record digests of revisions, so roadmap item 780 tracks a
-`prov:wasRevisionOf` link between evidence source revisions.
+`prov:specializationOf`, the C18 renditions keep their `prov:wasRevisionOf` chain, and
+the new evidence source revision carries an optional `wasRevisionOf` reference written as
+`prov:wasRevisionOf` to the prior authenticated `ev:SourceRevision` when one exists. The
+field is framed into the request payload digest only when present and omitted from the
+immutable triples when absent, so revisions without a predecessor keep their earlier
+record and payload digests. Self-links and cycles within a batch are refused, and an
+existing predecessor must resolve as an authenticated, caller-readable
+`ev:SourceRevision`. Claims ingestion sets `wasRevisionOf` automatically from the
+replaced C18 rendition's authenticated evidence source revision when the C18 relationship
+is visible under the caller's query policy, reading C18 edges and authenticating evidence
+records at one pinned branch commit (the registration plan head for uploads or the read
+commit for registered sources). It walks up to 64 source-attributable C18
+`prov:wasRevisionOf` renditions when intermediate renditions had no claims ingestion and
+also combines prior original-byte variants on the same normalized rendition with C18
+predecessors so restorations and byte-only updates both resolve chronologically. When
+multiple candidates survive, chronology is recovered from authenticated evidence
+`prov:wasRevisionOf` ancestry across configured evidence graphs and branch commit order,
+and `wasRevisionOf` is omitted when lineage remains ambiguous, encounters an
+unattributable transition shared with another source or under a query protection that can
+hide competing source memberships, or would otherwise choose from a partial frontier past
+the 64-rendition walk bound. For registered-source runs whose branch head moves before
+publication, publication retries at the new head only while the source still resolves to
+the same live rendition and provably equal observed digest, and otherwise refuses with
+`head-changed` without writing. When the same source revision already exists as an
+authenticated record in the target source-record graph, re-ingestion under another profile
+references that existing revision directly so its immutable record is preserved without
+disclosing masked edges.
 
 The rejected alternative applies the supersession of C18 §7.9 and withdraws the earlier
 occurrences that the new extraction does not repeat. A model omitting a fact is not
@@ -2079,7 +2102,10 @@ typing triple already supplies.
 
 The task result has `outcome` set to `proposed`, `already-proposed` or `no-facts`, and
 `mode` set to `claims`. A proposed result carries the operation, commit, branch, first
-availability and hold of the receipt, the revision and rendition IRIs, the counts of
+availability and hold of the receipt, the revision and rendition IRIs, `previousRevision`
+when an earlier authenticated evidence `SourceRevision` is linked (distinct from the C18
+`previousRendition` IRI and omitted when no predecessor is linked, when the recorded link
+is hidden from the caller or on an `already-proposed` response), the counts of
 records by kind, the records of the receipt, and the `failed` and `flagged` lists, with
 the registration's members that the other modes report. A run that extracts no fact
 still publishes the registration with a batch of its revision and rendition alone, and

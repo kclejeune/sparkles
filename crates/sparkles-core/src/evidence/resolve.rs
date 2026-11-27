@@ -37,6 +37,7 @@ pub const MAX_REFERENCES: usize = 10_000;
 
 const EV: &str = "urn:x-sparkles:evidence:";
 const PROV_WAS_DERIVED_FROM: &str = "http://www.w3.org/ns/prov#wasDerivedFrom";
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
 const OA: &str = "http://www.w3.org/ns/oa#";
@@ -377,6 +378,52 @@ struct RecordGraphs {
     _held: Reservation,
 }
 
+/// Result of inspecting the object(s) of `s p ?o` in one graph under the caller's access policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SingleObject<T> {
+    /// The graph is unreadable or has no visible object triple for `(s, p)`.
+    None,
+    /// Exactly one visible object triple exists for `(s, p)`, mapped by the caller's parser.
+    One(T),
+    /// Two or more visible object triples exist for `(s, p)`.
+    Many,
+}
+
+/// Bounded named-node results from a controlled graph scan, keeping their preparation
+/// memory charge live until dropped.
+pub struct GraphNodes {
+    nodes: Vec<NamedNode>,
+    truncated: bool,
+    _held: Reservation,
+}
+
+impl GraphNodes {
+    /// The decoded named nodes retained by this result.
+    pub fn nodes(&self) -> &[NamedNode] {
+        &self.nodes
+    }
+
+    /// Whether the scan stopped at the caller's result limit before exhausting the match.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Whether no named nodes were collected.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Number of named nodes collected.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Iterate over the retained named nodes without releasing their reservation.
+    pub fn iter(&self) -> std::slice::Iter<'_, NamedNode> {
+        self.nodes.iter()
+    }
+}
+
 /// One operation's resolution state. Views prepared for one reference are reused by
 /// later references to the same commit under the same access, and stay charged to
 /// the operation's allowance until the resolver is dropped.
@@ -386,6 +433,7 @@ pub struct Resolver {
     /// The record graphs of one dataset under one installed registry, charged while
     /// they are kept.
     record_graphs: Option<RecordGraphs>,
+    pinned: Option<(Uuid, Uuid, u64)>,
 }
 
 impl Resolver {
@@ -395,12 +443,20 @@ impl Resolver {
             preparation: Preparation::new(control, memory_bytes)?,
             views: BTreeMap::new(),
             record_graphs: None,
+            pinned: None,
         })
     }
 
     /// The operation's preparation context.
     pub fn preparation(&self) -> &Preparation {
         &self.preparation
+    }
+
+    /// Pin `record`, `has_triple`, `objects_in_graph`, and `subjects_in_graph` reads of
+    /// `(main, logical)` to the exact branch commit `commit`, so every lookup in this
+    /// resolution sees one consistent snapshot even if the branch advances concurrently.
+    pub fn pin_commit(&mut self, main: &Store, logical: &Store, commit: u64) {
+        self.pinned = Some((main.dataset_id(), logical.branch_id(), commit));
     }
 
     /// Verify a stored-fact reference. `main` is the main store of the dataset the
@@ -531,18 +587,7 @@ impl Resolver {
         {
             return Err(unavailable(key));
         }
-        let live = logical.snapshot();
-        let view_key = ViewKey {
-            dataset: main.dataset_id(),
-            branch: logical.branch_id(),
-            commit: live.commit,
-        };
-        let (_, index) = self
-            .view(view_key, access, |_| {
-                Ok((live.clone(), logical.branch_id(), SnapshotCharge::shared()))
-            })
-            .map_err(|e| classify(key, e))?;
-        Ok((view_key, index))
+        self.logical_view(key, main, logical, access)
     }
 
     /// Verify a record reference against the current state of `logical`, a store of
@@ -570,8 +615,33 @@ impl Resolver {
             request.content_digest.as_ref(),
             SelectionRequirements::default(),
             None,
+            None,
         )?;
         Ok(verified)
+    }
+
+    /// Verify a record reference as [`Self::record`], borrowing `iri` and returning a
+    /// [`Reservation`] that keeps the variable-sized strings inside [`VerifiedRecord`]
+    /// charged to this resolver's preparation allowance until dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_charged(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: Option<&Arc<GraphAccess>>,
+        iri: &NamedNode,
+        kinds: &[RecordKind],
+        expected_content_digest: Option<&Sha256Digest>,
+    ) -> Result<(VerifiedRecord, Reservation)> {
+        let (view_key, index) = self.prepare_record_view(key, main, logical, access)?;
+        let mut held = self.preparation.reserve(std::mem::size_of::<VerifiedRecord>() as u64)
+            .map_err(|e| classify(key, e))?;
+        let (record, _) = self.record_in_view(
+            key, view_key, index, main, iri, kinds, expected_content_digest,
+            SelectionRequirements::default(), None, Some(&mut held),
+        )?;
+        Ok((record, held))
     }
 
     /// Verify a record reference without allocating an owned [`RecordRequest`] or
@@ -612,7 +682,7 @@ impl Resolver {
     ) -> Result<()> {
         let (view_key, index) = self.prepare_record_view(key, main, logical, access)?;
         let _ = self.record_in_view(
-            key, view_key, index, main, iri, kinds, None, selection, None,
+            key, view_key, index, main, iri, kinds, None, selection, None, None,
         )?;
         Ok(())
     }
@@ -664,6 +734,7 @@ impl Resolver {
             None,
             selection,
             Some(req_idx),
+            None,
         )?;
         Ok(probe)
     }
@@ -895,7 +966,7 @@ impl Resolver {
                 .get(&(view_key, index))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let mut lookups = Lookups::new(&self.preparation, &cached.view);
+            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
             let preparation = &self.preparation;
             lookups
                 .one_text(
@@ -1016,7 +1087,7 @@ impl Resolver {
             let rg = self.record_graphs.as_ref().expect("prepared");
             let (graphs, _filtered) =
                 readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, key)?;
-            let mut lookups = Lookups::new(&self.preparation, &cached.view);
+            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
             let Some((graph, kind)) = find_record(&mut lookups, &graphs, iri, key)? else {
                 return Err(unavailable(key));
             };
@@ -1142,6 +1213,7 @@ impl Resolver {
         expected_content_digest: Option<&Sha256Digest>,
         selection: SelectionRequirements,
         defer_req_idx: Option<usize>,
+        mut result_held: Option<&mut Reservation>,
     ) -> Result<(VerifiedRecord, SelectionProbe)> {
         enum DeferredWork {
             None,
@@ -1163,7 +1235,7 @@ impl Resolver {
             let rg = self.record_graphs.as_ref().expect("prepared");
             let (graphs, _filtered) =
                 readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, key)?;
-            let mut lookups = Lookups::new(&self.preparation, &cached.view);
+            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
             let Some((graph, kind)) = find_record(&mut lookups, &graphs, iri, key)? else {
                 return Err(unavailable(key));
             };
@@ -1189,6 +1261,7 @@ impl Resolver {
                 iri,
                 main,
                 key,
+                result_held.as_deref_mut(),
             )?;
             if let Some(expected) = expected_content_digest
                 && auth.content_digest.as_ref() != Some(expected)
@@ -1658,9 +1731,19 @@ impl Resolver {
         if let Some(e) = state.err {
             return Err(e);
         }
+        let iri = if let Some(held) = result_held {
+            if let Some(span) = &state.span {
+                held.grow_by(span.rendition.as_str().len() as u64)
+                    .map_err(|e| classify(key, e))?;
+            }
+            NamedNode::new_unchecked(self.preparation.copy_string(iri.as_str(), held)
+                .map_err(|e| classify(key, e))?)
+        } else {
+            iri.clone()
+        };
         Ok((
             VerifiedRecord {
-                iri: iri.clone(),
+                iri,
                 kind: state.auth.kind,
                 graph: state.auth.graph,
                 receipt: state.auth.receipt,
@@ -1848,7 +1931,7 @@ impl Resolver {
                 }
             };
             let protections = &rg.protections;
-            let mut lookups = Lookups::new(&self.preparation, &cached.view);
+            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
             let auth = match authenticate_record(
                 &mut lookups,
                 &graphs,
@@ -2341,7 +2424,7 @@ impl Resolver {
             let rg = self.record_graphs.as_ref().expect("prepared");
             let (graphs, _filtered) =
                 readable_record_graphs(&self.preparation, &cached.view, &rg.graphs, target_key)?;
-            let mut lookups = Lookups::new(&self.preparation, &cached.view);
+            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
             let cached_hit = rg
                 .verified_passages
                 .get(&(view_key, index))
@@ -2531,7 +2614,7 @@ impl Resolver {
                 }
             };
             let protections = &rg.protections;
-            let mut lookups = Lookups::new(&self.preparation, &cached.view);
+            let mut lookups = Lookups::new(&self.preparation, &cached.view).map_err(|e| classify(key, e))?;
             let auth = match authenticate_record(
                 &mut lookups,
                 &graphs,
@@ -2782,6 +2865,389 @@ impl Resolver {
             shape_confirmed: true,
             failed_req_idx: None,
         }
+    }
+
+    /// Prepare, or reuse, the controlled view of `key` under `access`, and return the
+    /// serving branch and the view's index among the views of `key`.
+    /// Prepare or reuse the controlled view of `logical` (at the pinned commit when set,
+    /// or the live snapshot otherwise) under `access`.
+    fn logical_view(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+    ) -> Result<(ViewKey, usize)> {
+        let dataset = main.dataset_id();
+        let branch = logical.branch_id();
+        let (commit, live_opt) = match self.pinned {
+            Some((d, b, c)) if d == dataset && b == branch => (c, None),
+            _ => {
+                let live = logical.snapshot();
+                (live.commit, Some(live))
+            }
+        };
+        let view_key = ViewKey {
+            dataset,
+            branch,
+            commit,
+        };
+        let (_, index) = self
+            .view(view_key, access, |preparation| {
+                if let Some(live) = live_opt {
+                    return Ok((live, branch, SnapshotCharge::shared()));
+                }
+                let live = logical.snapshot();
+                if live.commit == commit {
+                    return Ok((live, branch, SnapshotCharge::shared()));
+                }
+                let (snapshot, resolved, served_by, charge) = main
+                    .snapshot_of_branch_limited_charged(
+                        branch,
+                        &At::Commit(commit),
+                        &preparation.history_options(),
+                        preparation.room(),
+                    )?;
+                if resolved.commit.seq != commit {
+                    return Err(Error::NotFound("commit".into()));
+                }
+                Ok((snapshot, served_by, charge))
+            })
+            .map_err(|e| classify(key, e))?;
+        Ok((view_key, index))
+    }
+
+    /// Prepare or reuse the controlled view of `logical` under `access` for `graph`,
+    /// returning `Ok(None)` when the caller cannot read `graph` or the store pair does
+    /// not match.
+    fn graph_view(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+        graph: &NamedNode,
+    ) -> Result<Option<(ViewKey, usize)>> {
+        self.preparation.check()?;
+        if main.is_branch()
+            || logical.owner_dataset_id() != main.dataset_id()
+            || logical.owner_dataset_id() != main.owner_dataset_id()
+        {
+            return Ok(None);
+        }
+        let graph_term = Term::NamedNode(graph.clone());
+        if !access.may_read(Some(&graph_term)) {
+            return Ok(None);
+        }
+        let (view_key, index) = self.logical_view(key, main, logical, access)?;
+        let cached = &self.views[&view_key][index];
+        if !cached.view.access().readable(Some(&graph_term)) {
+            return Ok(None);
+        }
+        Ok(Some((view_key, index)))
+    }
+
+    fn empty_nodes(&self, key: &str) -> Result<GraphNodes> {
+        let held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
+        Ok(GraphNodes {
+            nodes: Vec::new(),
+            truncated: false,
+            _held: held,
+        })
+    }
+
+    fn decode_named_nodes(
+        &self,
+        key: &str,
+        snap: &Snapshot,
+        ids: &[Id],
+        truncated: bool,
+    ) -> Result<GraphNodes> {
+        let mut out_held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
+        let mut nodes: Vec<NamedNode> = Vec::new();
+        if !ids.is_empty() {
+            out_held
+                .grow_by((ids.len() as u64).saturating_mul(std::mem::size_of::<NamedNode>() as u64))
+                .map_err(|e| classify(key, e))?;
+            nodes
+                .try_reserve_exact(ids.len())
+                .map_err(|_| classify(key, self.preparation.exhausted()))?;
+        }
+        for &id in ids {
+            self.preparation.check()?;
+            let node = self
+                .preparation
+                .with_term(snap, id, |t| match t {
+                    Some(Term::NamedNode(n)) => {
+                        let s = self.preparation.copy_string(n.as_str(), &mut out_held)?;
+                        Ok(Some(NamedNode::new_unchecked(s)))
+                    }
+                    _ => Ok(None),
+                })
+                .map_err(|e| classify(key, e))?;
+            if let Some(n) = node {
+                nodes.push(n);
+            }
+        }
+        Ok(GraphNodes {
+            nodes,
+            truncated,
+            _held: out_held,
+        })
+    }
+
+    /// Whether `s p o` is visible in `graph` at the resolving state of `logical` under
+    /// `access`, bounded by this resolver's preparation allowance and controls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_triple(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+        graph: &NamedNode,
+        s: &NamedNode,
+        p: &NamedNode,
+        o: &Term,
+    ) -> Result<bool> {
+        let Some((view_key, index)) = self.graph_view(key, main, logical, access, graph)? else {
+            return Ok(false);
+        };
+        let snap = self.views[&view_key][index].view.snapshot();
+        let (Some(g), Some(s), Some(p), Some(o)) = (
+            self.preparation
+                .lookup_iri(snap, graph.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, s.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, p.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_term(snap, o)
+                .map_err(|e| classify(key, e))?,
+        ) else {
+            return Ok(false);
+        };
+        snap.contains(&[s, p, o, g]).map_err(|e| classify(key, e))
+    }
+
+    /// Whether at least one triple `s p ?o` is visible in `graph` at the resolving state of
+    /// `logical` under `access`, without decoding any object term.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_any_object_in_graph(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+        graph: &NamedNode,
+        s: &NamedNode,
+        p: &NamedNode,
+    ) -> Result<bool> {
+        let Some((view_key, index)) = self.graph_view(key, main, logical, access, graph)? else {
+            return Ok(false);
+        };
+        let snap = self.views[&view_key][index].view.snapshot();
+        let (Some(g), Some(s), Some(p)) = (
+            self.preparation
+                .lookup_iri(snap, graph.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, s.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, p.as_str())
+                .map_err(|e| classify(key, e))?,
+        ) else {
+            return Ok(false);
+        };
+        let mut found = false;
+        self.preparation
+            .scan(snap, Perm::Gspo, &[g.0, s.0, p.0], |_| {
+                found = true;
+                Ok(false)
+            })
+            .map_err(|e| classify(key, e))?;
+        Ok(found)
+    }
+
+    /// Inspect the object(s) of `s p ?o` visible in `graph` at the resolving state of
+    /// `logical` under `access`. Calls `parse` while borrowing the single decoded term, so
+    /// no variable-sized decoded text is retained past the callback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn single_object_in_graph<T>(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+        graph: &NamedNode,
+        s: &NamedNode,
+        p: &NamedNode,
+        parse: impl FnOnce(Option<&Term>) -> Result<T>,
+    ) -> Result<SingleObject<T>> {
+        let Some((view_key, index)) = self.graph_view(key, main, logical, access, graph)? else {
+            return Ok(SingleObject::None);
+        };
+        let snap = self.views[&view_key][index].view.snapshot();
+        let (Some(g), Some(s), Some(p)) = (
+            self.preparation
+                .lookup_iri(snap, graph.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, s.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, p.as_str())
+                .map_err(|e| classify(key, e))?,
+        ) else {
+            return Ok(SingleObject::None);
+        };
+        let mut first: Option<Id> = None;
+        let mut many = false;
+        self.preparation
+            .scan(snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                if first.is_none() {
+                    first = Some(q[2]);
+                    Ok(true)
+                } else {
+                    many = true;
+                    Ok(false)
+                }
+            })
+            .map_err(|e| classify(key, e))?;
+        if many {
+            return Ok(SingleObject::Many);
+        }
+        let Some(id) = first else {
+            return Ok(SingleObject::None);
+        };
+        self.preparation
+            .with_term(snap, id, |t| Ok(SingleObject::One(parse(t)?)))
+            .map_err(|e| classify(key, e))
+    }
+
+    /// Named-node objects of `s p ?o` visible in `graph` at the resolving state of
+    /// `logical`, collecting at most `limit` results and decrementing `remaining_scans`
+    /// for each scanned quad in `graph`. The returned [`GraphNodes`] retains its memory
+    /// reservation until dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn objects_in_graph(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+        graph: &NamedNode,
+        s: &NamedNode,
+        p: &NamedNode,
+        limit: usize,
+        remaining_scans: &mut u64,
+    ) -> Result<GraphNodes> {
+        let Some((view_key, index)) = self.graph_view(key, main, logical, access, graph)? else {
+            return self.empty_nodes(key);
+        };
+        let snap = self.views[&view_key][index].view.snapshot();
+        let (Some(g), Some(s), Some(p)) = (
+            self.preparation
+                .lookup_iri(snap, graph.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, s.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, p.as_str())
+                .map_err(|e| classify(key, e))?,
+        ) else {
+            return self.empty_nodes(key);
+        };
+        let mut ids_held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
+        let mut ids: Vec<Id> = Vec::new();
+        let mut truncated = false;
+        self.preparation
+            .scan(snap, Perm::Gspo, &[g.0, s.0, p.0], |q| {
+                self.preparation.check()?;
+                if *remaining_scans == 0 {
+                    return Err(incomplete(key));
+                }
+                *remaining_scans -= 1;
+                if ids.len() >= limit {
+                    truncated = true;
+                    return Ok(false);
+                }
+                ids_held.grow_by(std::mem::size_of::<Id>() as u64)?;
+                ids.try_reserve(1)
+                    .map_err(|_| self.preparation.exhausted())?;
+                ids.push(q[2]);
+                Ok(true)
+            })
+            .map_err(|e| classify(key, e))?;
+        self.decode_named_nodes(key, snap, &ids, truncated)
+    }
+
+    /// Named-node subjects of `?s p o` visible in `graph` at the resolving state of
+    /// `logical`, collecting at most `limit` results and decrementing `remaining_scans`
+    /// only for quads belonging to `graph` (so rows in unreadable graphs cannot alter
+    /// the caller-visible scan-budget outcome while physical traversal stays bounded by
+    /// the preparation's cancellation and deadline). The returned [`GraphNodes`] retains
+    /// its memory reservation until dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subjects_in_graph(
+        &mut self,
+        key: &str,
+        main: &Store,
+        logical: &Store,
+        access: &Arc<GraphAccess>,
+        graph: &NamedNode,
+        p: &NamedNode,
+        o: &Term,
+        limit: usize,
+        remaining_scans: &mut u64,
+    ) -> Result<GraphNodes> {
+        let Some((view_key, index)) = self.graph_view(key, main, logical, access, graph)? else {
+            return self.empty_nodes(key);
+        };
+        let snap = self.views[&view_key][index].view.snapshot();
+        let (Some(g), Some(p), Some(o)) = (
+            self.preparation
+                .lookup_iri(snap, graph.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_iri(snap, p.as_str())
+                .map_err(|e| classify(key, e))?,
+            self.preparation
+                .lookup_term(snap, o)
+                .map_err(|e| classify(key, e))?,
+        ) else {
+            return self.empty_nodes(key);
+        };
+        let mut ids_held = self.preparation.reserve(0).map_err(|e| classify(key, e))?;
+        let mut ids: Vec<Id> = Vec::new();
+        let mut truncated = false;
+        self.preparation
+            .scan(snap, Perm::Pos, &[p.0, o.0], |q| {
+                self.preparation.check()?;
+                if q[3] != g {
+                    return Ok(true);
+                }
+                if *remaining_scans == 0 {
+                    return Err(incomplete(key));
+                }
+                *remaining_scans -= 1;
+                if ids.len() >= limit {
+                    truncated = true;
+                    return Ok(false);
+                }
+                ids_held.grow_by(std::mem::size_of::<Id>() as u64)?;
+                ids.try_reserve(1)
+                    .map_err(|_| self.preparation.exhausted())?;
+                ids.push(q[0]);
+                Ok(true)
+            })
+            .map_err(|e| classify(key, e))?;
+        self.decode_named_nodes(key, snap, &ids, truncated)
     }
 
     /// Prepare, or reuse, the controlled view of `key` under `access`, and return the
@@ -3170,19 +3636,22 @@ fn decode_base64_controlled(
 }
 
 /// Controlled lookups in one prepared view, with the view's graph policy applied.
+/// Every memoized IRI key stays charged to `held` for the lifetime of this struct.
 struct Lookups<'a> {
     preparation: &'a Preparation,
     view: &'a PreparedView,
     ids: BTreeMap<String, Option<Id>>,
+    held: Reservation,
 }
 
 impl<'a> Lookups<'a> {
-    fn new(preparation: &'a Preparation, view: &'a PreparedView) -> Self {
-        Self {
+    fn new(preparation: &'a Preparation, view: &'a PreparedView) -> Result<Self> {
+        Ok(Self {
             preparation,
             view,
             ids: BTreeMap::new(),
-        }
+            held: preparation.reserve(0)?,
+        })
     }
 
     fn snap(&self) -> &'a Snapshot {
@@ -3194,7 +3663,9 @@ impl<'a> Lookups<'a> {
             return Ok(*id);
         }
         let id = self.preparation.lookup_iri(self.snap(), iri)?;
-        self.ids.insert(iri.to_string(), id);
+        let owned = self.preparation.copy_string(iri, &mut self.held)?;
+        self.held.grow_by(64)?;
+        self.ids.insert(owned, id);
         Ok(id)
     }
 
@@ -3229,7 +3700,13 @@ impl<'a> Lookups<'a> {
         else {
             return Ok(false);
         };
-        let mask = self.snap().mask.as_deref().expect("checked mask");
+        self.has_hidden_object(s, p, g)
+    }
+
+    fn has_hidden_object(&self, s: Id, p: Id, g: Id) -> Result<bool> {
+        let Some(mask) = self.snap().mask.as_deref() else {
+            return Ok(false);
+        };
         let start = mask.hidden.partition_point(|k| (k[0], k[1]) < (s.0, p.0));
         for (i, quad) in mask.hidden[start..].iter().enumerate() {
             if i.is_multiple_of(4096) {
@@ -3243,27 +3720,6 @@ impl<'a> Lookups<'a> {
             }
         }
         Ok(false)
-    }
-
-    /// Whether the view's triple mask hid the exact quad `(s, p, o, graph)`.
-    fn has_hidden_spog(&mut self, s: &str, p: &str, o: &str, graph: &NamedNode) -> Result<bool> {
-        if self.snap().mask.is_none() || !self.readable(graph) {
-            return Ok(false);
-        }
-        let (Some(s), Some(p), Some(o), Some(g)) = (
-            self.iri(s)?,
-            self.iri(p)?,
-            self.iri(o)?,
-            self.iri(graph.as_str())?,
-        ) else {
-            return Ok(false);
-        };
-        Ok(self
-            .snap()
-            .mask
-            .as_deref()
-            .expect("checked mask")
-            .hides(&[s.0, p.0, o.0, g.0]))
     }
 
     /// Up to two objects of `s p ?o` in `graph`, decoded.
@@ -3363,36 +3819,22 @@ impl<'a> Lookups<'a> {
         }
     }
 
-    fn objects(&mut self, s: &str, p: &str, graph: &NamedNode) -> Result<Vec<Term>> {
+    /// Inspect up to two matching object IDs before decoding a single term.
+    fn one(&mut self, s: &str, p: &str, graph: &NamedNode) -> Result<One> {
         if !self.readable(graph) {
-            return Ok(Vec::new());
+            return Ok(One::None);
         }
         let (Some(s), Some(p), Some(g)) = (self.iri(s)?, self.iri(p)?, self.iri(graph.as_str())?)
         else {
-            return Ok(Vec::new());
+            return Ok(One::None);
         };
-        let ids = self.object_ids(s, p, g)?;
-        let mut out = Vec::new();
-        for id in ids {
-            if let Some(term) = self
-                .preparation
-                .with_term(self.snap(), id, |t| Ok(t.cloned()))?
-            {
-                out.push(term);
-            }
+        match self.object_ids(s, p, g)?.as_slice() {
+            [] => Ok(One::None),
+            [id] => self.preparation.with_term(self.snap(), *id, |term| {
+                Ok(term.cloned().map_or(One::None, One::Some))
+            }),
+            _ => Ok(One::Many),
         }
-        Ok(out)
-    }
-
-    /// The one object of `s p ?o` in `graph`; `Ok(None)` when there is none, and
-    /// `Err(())` inside `Ok` when there is more than one.
-    fn one(&mut self, s: &str, p: &str, graph: &NamedNode) -> Result<One> {
-        let mut values = self.objects(s, p, graph)?;
-        Ok(match values.len() {
-            0 => One::None,
-            1 => One::Some(values.pop().expect("one value")),
-            _ => One::Many,
-        })
     }
 }
 
@@ -3447,153 +3889,98 @@ fn receipt(
     iri: &NamedNode,
     key: &str,
     nonce: Option<Uuid>,
+    retained: Option<&mut Reservation>,
 ) -> Result<Receipt> {
-    enum Field<T> {
-        Some(T),
-        Masked,
-        Invalid,
-    }
-    let receipt = match lookups
-        .one(iri.as_str(), &format!("{EV}availabilityReceipt"), graph)
-        .map_err(|e| classify(key, e))?
-    {
-        One::Some(Term::NamedNode(r)) => r,
-        One::None
-            if lookups
-                .has_hidden_spg(iri.as_str(), &format!("{EV}availabilityReceipt"), graph)
-                .map_err(|e| classify(key, e))? =>
-        {
+    let classify_error = |e| classify(key, e);
+    let (Some(graph_id), Some(iri_id)) = (
+        lookups.iri(graph.as_str()).map_err(classify_error)?,
+        lookups.iri(iri.as_str()).map_err(classify_error)?,
+    ) else {
+        return Err(origin(key));
+    };
+    let receipt_pred = format!("{EV}availabilityReceipt");
+    let Some(receipt_pred) = lookups.iri(&receipt_pred).map_err(classify_error)? else {
+        return Err(origin(key));
+    };
+    let receipt_id = match lookups.object_ids(iri_id, receipt_pred, graph_id).map_err(classify_error)?.as_slice() {
+        [id] => *id,
+        [] if lookups.has_hidden_object(iri_id, receipt_pred, graph_id).map_err(classify_error)? => {
             return Err(unavailable(key));
         }
         _ => return Err(origin(key)),
     };
-    let mut uuid_of = |p: &str| -> Result<Field<Uuid>> {
-        let pred = format!("{EV}{p}");
-        Ok(
-            match lookups
-                .one(receipt.as_str(), &pred, graph)
-                .map_err(|e| classify(key, e))?
-            {
-                One::Some(Term::Literal(l))
-                    if l.datatype().as_str() == "http://www.w3.org/2001/XMLSchema#string" =>
-                {
-                    match Uuid::parse_str(l.value()) {
-                        Ok(u) => Field::Some(u),
-                        Err(_) => Field::Invalid,
-                    }
-                }
-                One::None
-                    if lookups
-                        .has_hidden_spg(receipt.as_str(), &pred, graph)
-                        .map_err(|e| classify(key, e))? =>
-                {
-                    Field::Masked
-                }
-                _ => Field::Invalid,
-            },
-        )
+
+    let uuid = |term: Option<&Term>| match term {
+        Some(Term::Literal(l)) if l.datatype().as_str() == XSD_STRING => Uuid::parse_str(l.value()).ok(),
+        _ => None,
     };
-    let dataset = uuid_of("datasetId")?;
-    let branch = uuid_of("branchId")?;
-    let commit = {
-        let pred = format!("{EV}commit");
-        match lookups
-            .one(receipt.as_str(), &pred, graph)
-            .map_err(|e| classify(key, e))?
-        {
-            One::Some(Term::Literal(l)) => match integer(&l) {
-                Some(c) => Field::Some(c),
-                None => Field::Invalid,
-            },
-            One::None
-                if lookups
-                    .has_hidden_spg(receipt.as_str(), &pred, graph)
-                    .map_err(|e| classify(key, e))? =>
-            {
-                Field::Masked
+    // Keep the receipt as an ID until its nonce and publication metadata authenticate.
+    // Check masked fields before reporting invalid metadata so the refusal matches a miss.
+    let mut masked = false;
+    fn field<T>(
+        lookups: &mut Lookups<'_>,
+        subject: Id,
+        predicate: &str,
+        graph: Id,
+        masked: &mut bool,
+        parse: impl FnOnce(Option<&Term>) -> Option<T>,
+    ) -> Result<Option<T>> {
+        let Some(predicate) = lookups.iri(predicate)? else {
+            return Ok(None);
+        };
+        match lookups.object_ids(subject, predicate, graph)?.as_slice() {
+            [id] => lookups.preparation.with_term(lookups.snap(), *id, |t| Ok(parse(t))),
+            [] => {
+                *masked |= lookups.has_hidden_object(subject, predicate, graph)?;
+                Ok(None)
             }
-            _ => Field::Invalid,
+            _ => Ok(None),
         }
-    };
-    // The operation marker of decision 1 of the resolution step.
-    let is_operation = if lookups
-        .has(receipt.as_str(), RDF_TYPE, &format!("{EV}Operation"), graph)
-        .map_err(|e| classify(key, e))?
-    {
-        Field::Some(())
-    } else if lookups
-        .has_hidden_spog(receipt.as_str(), RDF_TYPE, &format!("{EV}Operation"), graph)
-        .map_err(|e| classify(key, e))?
-    {
-        Field::Masked
+    }
+    let protection = format!("{EV}graphProtection");
+    let record_nonce = field(lookups, iri_id, &protection, graph_id, &mut masked, uuid)
+        .map_err(classify_error)?;
+    let receipt_nonce = field(lookups, receipt_id, &protection, graph_id, &mut masked, uuid)
+        .map_err(classify_error)?;
+    let dataset = field(lookups, receipt_id, &format!("{EV}datasetId"), graph_id, &mut masked, uuid)
+        .map_err(classify_error)?;
+    let branch = field(lookups, receipt_id, &format!("{EV}branchId"), graph_id, &mut masked, uuid)
+        .map_err(classify_error)?;
+    let commit = field(lookups, receipt_id, &format!("{EV}commit"), graph_id, &mut masked, |term| match term {
+        Some(Term::Literal(l)) => integer(l),
+        _ => None,
+    }).map_err(classify_error)?;
+    let operation_type = lookups.iri(&format!("{EV}Operation")).map_err(classify_error)?;
+    let type_pred = lookups.iri(RDF_TYPE).map_err(classify_error)?;
+    let is_operation = if let (Some(p), Some(o)) = (type_pred, operation_type) {
+        let quad = [receipt_id, p, o, graph_id];
+        let visible = lookups.snap().contains(&quad).map_err(classify_error)?;
+        masked |= !visible && lookups.snap().mask.as_deref().is_some_and(|m| m.hides(&quad.map(|id| id.0)));
+        visible
     } else {
-        Field::Invalid
+        false
     };
-    // The record and its operation both carry the nonce. A record planted while the
-    // graph was detached cannot, even when it names an operation that a later typed
-    // write records with the current nonce.
-    let mut protection_of = |subject: &str| -> Result<Field<Uuid>> {
-        let pred = format!("{EV}graphProtection");
-        match lookups
-            .one(subject, &pred, graph)
-            .map_err(|e| classify(key, e))?
-        {
-            One::Some(Term::Literal(l))
-                if l.datatype().as_str() == "http://www.w3.org/2001/XMLSchema#string" =>
-            {
-                match Uuid::parse_str(l.value()) {
-                    Ok(u) if Some(u) == nonce => Ok(Field::Some(u)),
-                    _ => Ok(Field::Invalid),
-                }
-            }
-            One::None
-                if lookups
-                    .has_hidden_spg(subject, &pred, graph)
-                    .map_err(|e| classify(key, e))? =>
-            {
-                Ok(Field::Masked)
-            }
-            _ => Ok(Field::Invalid),
-        }
-    };
-    let receipt_prot = protection_of(receipt.as_str())?;
-    let record_prot = protection_of(iri.as_str())?;
-    // If any required receipt triple was hidden by the caller's triple mask, report
-    // `evidence-unavailable` before `origin-not-reproduced` so masked records remain
-    // indistinguishable from absent or graph-denied records.
-    if matches!(dataset, Field::Masked)
-        || matches!(branch, Field::Masked)
-        || matches!(commit, Field::Masked)
-        || matches!(is_operation, Field::Masked)
-        || matches!(receipt_prot, Field::Masked)
-        || matches!(record_prot, Field::Masked)
-    {
+    if masked {
         return Err(unavailable(key));
     }
-    let (
-        Field::Some(dataset),
-        Field::Some(branch),
-        Field::Some(commit),
-        Field::Some(()),
-        Field::Some(_),
-        Field::Some(_),
-    ) = (
-        dataset,
-        branch,
-        commit,
-        is_operation,
-        receipt_prot,
-        record_prot,
-    )
-    else {
+    let (Some(dataset), Some(branch), Some(commit)) = (dataset, branch, commit) else {
         return Err(origin(key));
     };
-    Ok(Receipt {
-        iri: receipt,
-        dataset,
-        branch,
-        commit,
-    })
+    if nonce.is_none() || record_nonce != nonce || receipt_nonce != nonce || !is_operation {
+        return Err(origin(key));
+    }
+
+    let mut scratch;
+    let held = if let Some(held) = retained {
+        held
+    } else {
+        scratch = lookups.preparation.reserve(0).map_err(classify_error)?;
+        &mut scratch
+    };
+    let receipt_iri = lookups.preparation.with_iri(lookups.snap(), receipt_id, |text| {
+        text.map(|text| lookups.preparation.copy_string(text, held)).transpose()
+    }).map_err(classify_error)?.ok_or_else(|| origin(key))?;
+    Ok(Receipt { iri: NamedNode::new_unchecked(receipt_iri), dataset, branch, commit })
 }
 
 /// A non-negative `xsd:integer` value, also from a stored inline literal.
@@ -3634,9 +4021,10 @@ fn authenticate_record(
     if !kinds.is_empty() && !kinds.contains(&kind) {
         return Err(conflict(key, wrong_kind_msg));
     }
-    authenticate_record_body(lookups, graph, kind, protections, iri, main, key)
+    authenticate_record_body(lookups, graph, kind, protections, iri, main, key, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Complete record authentication once `find_record` has resolved `(graph, kind)`.
 fn authenticate_record_body(
     lookups: &mut Lookups<'_>,
@@ -3646,13 +4034,18 @@ fn authenticate_record_body(
     iri: &NamedNode,
     main: &Store,
     key: &str,
+    mut result_held: Option<&mut Reservation>,
 ) -> Result<AuthenticatedRecord> {
+    if let Some(held) = result_held.as_deref_mut() {
+        held.grow_by(graph.as_str().len() as u64).map_err(|e| classify(key, e))?;
+    }
     let rec = receipt(
         lookups,
         &graph,
         iri,
         key,
         protections.get(graph.as_str()).copied(),
+        result_held,
     )?;
     if rec.dataset != main.dataset_id()
         || !main
@@ -3803,6 +4196,7 @@ fn prepare_passage_metadata(
         &rendition,
         key,
         protections.get(rendition_graph.as_str()).copied(),
+        None,
     )?;
     if receipt.dataset != main.dataset_id()
         || !main

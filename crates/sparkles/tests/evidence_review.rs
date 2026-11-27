@@ -97,6 +97,7 @@ fn revision(source_key: &str) -> SourceRevisionInput {
         metadata: Default::default(),
         times: Default::default(),
         lineage: Default::default(),
+        was_revision_of: None,
     }
 }
 

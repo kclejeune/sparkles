@@ -33,6 +33,7 @@ fn input(occurrence: &str, object: &str) -> EvidenceInput {
             metadata: Default::default(),
             times: Default::default(),
             lineage: Default::default(),
+            was_revision_of: None,
         }],
         claims: vec![ClaimInput {
             version: RecordVersion::V1,
@@ -2520,4 +2521,75 @@ fn record_digest_distinguishes_duplicate_isomorphic_blank_expected_triples() {
         single, two_distinct,
         "two distinct RDF blank-node expectedTriple values must not collapse to one digest"
     );
+}
+
+fn source_revision_predecessor_writes_prov_was_revision_of_and_rejects_cycles() {
+    let s = settings(&["urn:s"], &["urn:c"]);
+    let base = input("o1", "urn:o");
+    let p_base = plan_of(&base, &s, Some("k")).unwrap();
+    let rev_iri = p_base.records[0].iri.clone();
+    let rev_digest = p_base.records[0].digest;
+    assert!(
+        !p_base.records[0]
+            .triples
+            .iter()
+            .any(|t| t.predicate.as_str() == "http://www.w3.org/ns/prov#wasRevisionOf")
+    );
+
+    // Linking an existing predecessor keeps the revision's identity, writes
+    // prov:wasRevisionOf, and changes both recordDigest and payloadDigest.
+    let prior = iri("urn:uuid:22222222-2222-4222-8222-222222222222");
+    let mut linked = base.clone();
+    linked.revisions[0].was_revision_of = Some(RecordRef::Existing(prior.clone()));
+    let p_linked = plan_of(&linked, &s, Some("k")).unwrap();
+    assert_eq!(p_linked.records[0].iri, rev_iri);
+    assert_ne!(p_linked.records[0].digest, rev_digest);
+    assert_ne!(p_linked.payload_digest, p_base.payload_digest);
+    assert!(p_linked.records[0].triples.iter().any(|t| {
+        t.subject == rev_iri.clone().into()
+            && t.predicate.as_str() == "http://www.w3.org/ns/prov#wasRevisionOf"
+            && t.object == prior.clone().into()
+    }));
+    let nonce = Uuid::new_v4();
+    let stamp = Stamp {
+        dataset: DATASET,
+        branch: DATASET,
+        commit: 3,
+        time_ms: 1_767_261_600_000,
+    };
+    let quads = p_linked.quads(&stamp, |_| Some(nonce), None, &[]).unwrap();
+    assert!(quads.iter().any(|q| {
+        q.subject == rev_iri.clone().into()
+            && q.predicate.as_str() == "http://www.w3.org/ns/prov#wasRevisionOf"
+            && q.object == prior.clone().into()
+            && q.graph_name == GraphName::NamedNode(iri("urn:s"))
+    }));
+
+    // An existing-IRI self-link (targeting the revision's own minted IRI) is refused.
+    let mut self_iri = base.clone();
+    self_iri.revisions[0].was_revision_of = Some(RecordRef::Existing(rev_iri.clone()));
+    let err = plan_of(&self_iri, &s, None).unwrap_err();
+    assert!(err.to_string().contains("cannot revise itself"), "{err}");
+
+    // A mixed Local/Existing cycle across two batch revisions is refused.
+    let c = Control::none();
+    let mut rev2 = base.revisions[0].clone();
+    rev2.key = RecordKey::new("rev2").unwrap();
+    rev2.content = SourceContent::MetadataOnly {
+        digest: Sha256Digest::of_bytes(b"other-bytes", &c).unwrap(),
+    };
+    let mut two = base.clone();
+    two.revisions.push(rev2);
+    let p_two = plan_of(&two, &s, None).unwrap();
+    let rev2_iri = p_two
+        .records
+        .iter()
+        .find(|r| r.key == "rev2")
+        .unwrap()
+        .iri
+        .clone();
+    two.revisions[0].was_revision_of = Some(RecordRef::Existing(rev2_iri));
+    two.revisions[1].was_revision_of = Some(RecordRef::Local(RecordKey::new("rev").unwrap()));
+    let err = plan_of(&two, &s, None).unwrap_err();
+    assert!(err.to_string().contains("cycle"), "{err}");
 }

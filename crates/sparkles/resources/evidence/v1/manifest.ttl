@@ -3,7 +3,7 @@ PREFIX ev: <urn:x-sparkles:evidence:>
 <urn:x-sparkles:evidence:profile:1> ev:profileVersion 1 ;
   ev:contentDigest "sha256:7954e242332395544c0f07a33784a2820d98d1e7c356620b9128c714413c1fd5" .
 <urn:x-sparkles:evidence:shapes:1> ev:profileVersion 1 ;
-  ev:contentDigest "sha256:97eb39cafbf38cb5d4271be50b8560b36743375cf477d0c71ebd9935e489b13f" .
+  ev:contentDigest "sha256:8468b2db89a00879876817e1e5cee79450a1444de8bf4a2709f933eec4874b09" .
 <urn:x-sparkles:evidence:query:1:assertion-status.rq> ev:profileVersion 1 ;
   ev:contentDigest "sha256:f29e85f04e4c361166ba58cbb54047d28335db3ddef54fc4ff9bf80158c5c747" .
 <urn:x-sparkles:evidence:query:1:claim-occurrences.rq> ev:profileVersion 1 ;

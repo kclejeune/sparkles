@@ -212,6 +212,7 @@ fn claim(ds: &sparkles::Dataset) -> (NamedNode, Sha256Digest) {
             metadata: Default::default(),
             times: Default::default(),
             lineage: Default::default(),
+            was_revision_of: None,
         }],
         claims: vec![ClaimInput {
             version: RecordVersion::V1,
@@ -924,6 +925,7 @@ async fn a_supplied_query_reads_no_claims() {
                 metadata: Default::default(),
                 times: Default::default(),
                 lineage: Default::default(),
+                was_revision_of: None,
             }],
             claims: vec![ClaimInput {
                 version: RecordVersion::V1,

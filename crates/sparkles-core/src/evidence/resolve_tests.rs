@@ -2444,3 +2444,321 @@ fn probe_plus_verify_reads_each_retained_literal_once_on_compacted_store() {
     );
     assert_eq!(TYPED_LITERAL_READS.with(std::cell::Cell::get), 1);
 }
+
+/// `GraphNodes` returned by `objects_in_graph` and `subjects_in_graph` keep their
+/// preparation memory reservation live until dropped, so simultaneously live nested
+/// results cannot exceed the configured allowance in aggregate.
+#[test]
+fn graph_nodes_retain_memory_charge_and_reject_nested_overflow() {
+    let (_dir, s) = setup();
+    let g = iri("urn:mem-g");
+    let p = iri("urn:mem-p");
+    let s1 = iri("urn:mem-s1");
+    let o_shared = iri("urn:mem-shared");
+    // Insert 40 long IRIs (~1 KiB each, ~42 KiB per result set) shared across lookups
+    // so delta-vocabulary overhead stays small relative to multiple live GraphNodes.
+    let pad = "x".repeat(1000);
+    let mut ins = String::from("INSERT DATA { GRAPH <urn:mem-g> {\n");
+    for i in 0..40 {
+        ins.push_str(&format!(
+            "  <urn:mem-s1> <urn:mem-p> <urn:node:{i:02}:{pad}> .\n\
+             <urn:node:{i:02}:{pad}> <urn:mem-p> <urn:mem-shared> .\n"
+        ));
+    }
+    ins.push_str("} }");
+    upd(&s, &ins);
+
+    // 1. Live GraphNodes hold memory until dropped.
+    let mut r = resolver();
+    let mut scans = 10_000;
+    let first = r
+        .objects_in_graph("k", &s, &s, &all(), &g, &s1, &p, 100, &mut scans)
+        .unwrap();
+    assert_eq!(first.len(), 40);
+    let used_with_first = r.preparation().inner_used();
+    let second = r
+        .subjects_in_graph(
+            "k",
+            &s,
+            &s,
+            &all(),
+            &g,
+            &p,
+            &Term::NamedNode(o_shared.clone()),
+            100,
+            &mut scans,
+        )
+        .unwrap();
+    assert_eq!(second.len(), 40);
+    let used_with_both = r.preparation().inner_used();
+    let one_set = used_with_both.saturating_sub(used_with_first);
+    assert!(
+        one_set > 30_000,
+        "second live GraphNodes must add to preparation usage: {used_with_first} -> {used_with_both}"
+    );
+    drop(second);
+    let used_after_second_drop = r.preparation().inner_used();
+    assert!(
+        used_after_second_drop < used_with_both - 30_000,
+        "dropping second GraphNodes must release its reservation: {used_with_both} -> {used_after_second_drop}"
+    );
+    drop(first);
+    let base_used = r.preparation().inner_used();
+    assert!(
+        base_used < used_with_first - 30_000,
+        "dropping first GraphNodes must release its reservation: {used_with_first} -> {base_used}"
+    );
+
+    // 2. Under an aggregate cap that comfortably fits any single lookup (including
+    //    delta-vocabulary workspace) but cannot hold 6 simultaneous live GraphNodes,
+    //    retaining nested results fails with incomplete-evidence, and dropping them
+    //    frees the allowance so a subsequent lookup succeeds.
+    let cap = base_used + one_set * 5;
+    let mut tight = Resolver::new(Control::none(), cap).unwrap();
+    let mut scans = 10_000;
+    let mut live = Vec::new();
+    let mut overflow = None;
+    for _ in 0..8 {
+        match tight.objects_in_graph("k", &s, &s, &all(), &g, &s1, &p, 100, &mut scans) {
+            Ok(nodes) => {
+                assert_eq!(nodes.len(), 40);
+                live.push(nodes);
+            }
+            Err(e) => {
+                overflow = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        !live.is_empty(),
+        "at least one GraphNodes lookup must fit within cap={cap}"
+    );
+    let err = overflow.expect("holding nested GraphNodes live must exceed aggregate cap");
+    assert_eq!(err.code(), "incomplete-evidence");
+    live.clear();
+    let after_drop = tight
+        .subjects_in_graph(
+            "k",
+            &s,
+            &s,
+            &all(),
+            &g,
+            &p,
+            &Term::NamedNode(o_shared),
+            100,
+            &mut scans,
+        )
+        .unwrap();
+    assert_eq!(after_drop.len(), 40);
+}
+
+/// Rows in a graph denied by `GraphAccess` must not decrement `remaining_scans` or alter
+/// the outcome of `subjects_in_graph` on a readable graph.
+#[test]
+fn subjects_in_graph_ignores_denied_graph_rows_for_scan_budget() {
+    let (_dir, s) = setup();
+    let allowed = iri("urn:allowed");
+    let p = iri("urn:p-shared");
+    let obj = Term::Literal(Literal::new_simple_literal("same-key"));
+    let mut ins = String::from("INSERT DATA {\n");
+    ins.push_str("  GRAPH <urn:allowed> { <urn:ok:1> <urn:p-shared> \"same-key\" . <urn:ok:2> <urn:p-shared> \"same-key\" . }\n");
+    ins.push_str("  GRAPH <urn:denied> {\n");
+    for i in 0..40 {
+        ins.push_str(&format!(
+            "    <urn:hidden:{i:02}> <urn:p-shared> \"same-key\" .\n"
+        ));
+    }
+    ins.push_str("  }\n}");
+    upd(&s, &ins);
+
+    let access = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["urn:allowed"], &[])),
+        Graphs::none(),
+    ));
+    let mut r = resolver();
+    let mut scans = 5;
+    let found = r
+        .subjects_in_graph("k", &s, &s, &access, &allowed, &p, &obj, 10, &mut scans)
+        .unwrap();
+    assert_eq!(found.len(), 2);
+    assert!(!found.is_truncated());
+    assert_eq!(
+        scans, 3,
+        "only the 2 quads in the readable graph should consume remaining_scans"
+    );
+}
+
+/// `pin_commit` keeps `has_triple`, `objects_in_graph`, and `subjects_in_graph` on one
+/// historical snapshot even after newer commits advance the live branch head.
+#[test]
+fn pin_commit_keeps_graph_lookups_on_one_snapshot_after_head_advances() {
+    let (_dir, s) = setup();
+    // setup() inserted <urn:a> <urn:p> <urn:b> at commit 1 and deleted it at commit 2.
+    upd(
+        &s,
+        &format!("INSERT DATA {{ GRAPH <{G}> {{ <urn:a> <urn:p> <urn:c> }} }}"),
+    );
+    let g = iri(G);
+    let a = iri("urn:a");
+    let p = iri("urn:p");
+    let b = Term::NamedNode(iri("urn:b"));
+    let c = Term::NamedNode(iri("urn:c"));
+
+    let mut r = resolver();
+    r.pin_commit(&s, &s, 1);
+    assert!(r.has_triple("k", &s, &s, &all(), &g, &a, &p, &b).unwrap());
+    assert!(!r.has_triple("k", &s, &s, &all(), &g, &a, &p, &c).unwrap());
+    let mut scans = 100;
+    let objs = r
+        .objects_in_graph("k", &s, &s, &all(), &g, &a, &p, 10, &mut scans)
+        .unwrap();
+    assert_eq!(objs.nodes(), &[iri("urn:b")]);
+    let subjs = r
+        .subjects_in_graph("k", &s, &s, &all(), &g, &p, &b, 10, &mut scans)
+        .unwrap();
+    assert_eq!(subjs.nodes(), &[iri("urn:a")]);
+}
+
+/// `Lookups::iri` charges every owned memo key to its `Reservation` for the lifetime of
+/// `Lookups`, releases it on drop, and refuses when accumulated memo keys exhaust the
+/// preparation allowance even while individual `lookup_iri` calls fit.
+#[test]
+fn lookups_charges_memoized_iris_and_refuses_when_allowance_exhausted() {
+    let (_dir, s) = setup();
+    let snap = s.snapshot();
+    let prep = Preparation::new(Control::none(), MEMORY_BYTES).unwrap();
+    let view = all().masked_controlled(&snap, &prep).unwrap();
+    let base_used = prep.inner_used();
+
+    let long_iri = format!("urn:memo:{}", "a".repeat(2048));
+    {
+        let mut lookups = Lookups::new(&prep, &view).unwrap();
+        let _ = lookups.iri(&long_iri).unwrap();
+        let after_first = prep.inner_used();
+        assert!(
+            after_first >= base_used + long_iri.len() as u64,
+            "memoized IRI must stay charged while Lookups lives: {base_used} -> {after_first}"
+        );
+        // Repeated lookup hits the memo and adds no further charge.
+        let _ = lookups.iri(&long_iri).unwrap();
+        assert_eq!(prep.inner_used(), after_first);
+    }
+    assert_eq!(
+        prep.inner_used(),
+        base_used,
+        "dropping Lookups must release memo key charges"
+    );
+
+    // Under a tight cap where one `lookup_iri` call (~3.5 KiB for a 1 KiB IRI) fits
+    // comfortably, accumulating 20 distinct 1 KiB memo keys must hit BudgetExceeded.
+    let pad = "b".repeat(1000);
+    let tight_cap = base_used + 12_000;
+    let tight = Preparation::new(Control::none(), tight_cap).unwrap();
+    let tight_view = all().masked_controlled(&snap, &tight).unwrap();
+    let mut lookups = Lookups::new(&tight, &tight_view).unwrap();
+    let mut succeeded = 0usize;
+    let mut overflow = None;
+    for i in 0..20 {
+        let key = format!("urn:memo:{i:02}:{pad}");
+        match lookups.iri(&key) {
+            Ok(_) => succeeded += 1,
+            Err(e) => {
+                overflow = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        succeeded >= 1,
+        "at least one 1 KiB lookup must fit within cap={tight_cap}"
+    );
+    assert!(
+        matches!(overflow, Some(Error::BudgetExceeded(_))),
+        "accumulating memo keys must fail with BudgetExceeded, got {overflow:?}"
+    );
+}
+
+/// `has_any_object_in_graph` and `single_object_in_graph` report exact cardinality under
+/// the caller's access policy, distinguishing absent, unique, and multi-valued objects.
+#[test]
+fn single_object_in_graph_distinguishes_none_one_and_many() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { GRAPH <urn:g> { \
+           <urn:s> <urn:one> \"alpha\" . \
+           <urn:s> <urn:two> \"first\" , \"second\" . \
+         } }",
+    );
+    let g = iri("urn:g");
+    let subj = iri("urn:s");
+    let p_none = iri("urn:none");
+    let p_one = iri("urn:one");
+    let p_two = iri("urn:two");
+
+    let mut r = resolver();
+    assert!(
+        !r.has_any_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_none)
+            .unwrap()
+    );
+    assert!(
+        r.has_any_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_one)
+            .unwrap()
+    );
+    let none = r
+        .single_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_none, |t| {
+            Ok(t.map(ToString::to_string))
+        })
+        .unwrap();
+    assert_eq!(none, SingleObject::None);
+    let one = r
+        .single_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_one, |t| {
+            Ok(match t {
+                Some(Term::Literal(l)) => Some(l.value().to_string()),
+                _ => None,
+            })
+        })
+        .unwrap();
+    assert_eq!(one, SingleObject::One(Some("alpha".to_string())));
+    let many = r
+        .single_object_in_graph("k", &s, &s, &all(), &g, &subj, &p_two, |t| {
+            Ok(t.map(ToString::to_string))
+        })
+        .unwrap();
+    assert_eq!(many, SingleObject::Many);
+
+    // A pattern protection hiding one of the two values leaves a unique visible value.
+    let hide_second = Protection {
+        name: "hide_second".into(),
+        predicates: Some(vec!["urn:two".into()]),
+        classes: None,
+        subclasses: false,
+        graphs: None,
+        pattern: Some("?s <urn:two> ?o . FILTER(?o != \"second\")".into()),
+        prefixes: Default::default(),
+        hide_inferences: false,
+    };
+    let masked = Arc::new(GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(hide_second),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Default::default(),
+            limits: Default::default(),
+        },
+    ));
+    let filtered = r
+        .single_object_in_graph("k", &s, &s, &masked, &g, &subj, &p_two, |t| {
+            Ok(match t {
+                Some(Term::Literal(l)) => Some(l.value().to_string()),
+                _ => None,
+            })
+        })
+        .unwrap();
+    assert_eq!(filtered, SingleObject::One(Some("first".to_string())));
+}

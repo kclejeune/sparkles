@@ -570,7 +570,8 @@ pub fn legacy_record_digest(
 /// passages go to the source-record graph, and evidence references, claims, evidence
 /// links and assessments to the proposal graph. Refuses a batch without records, a
 /// graph the settings do not give the role, blank nodes in record content other than
-/// a stored fact's expected triple, and an assessment cycle.
+/// a stored fact's expected triple, source-revision self-links or cycles, and an
+/// assessment cycle.
 pub fn plan<'i>(
     prepared: &PreparedInput<'i>,
     dataset: Uuid,
@@ -683,6 +684,59 @@ pub fn plan<'i>(
     }
     let sg = source_graph.as_ref();
     let pg = proposal_graph.as_ref();
+    // Reject self-links and cycles across batch revisions after all revision IRIs are
+    // minted, catching local, existing-IRI and mixed references alike.
+    if input.revisions.iter().any(|r| r.was_revision_of.is_some()) {
+        let mut links: BTreeMap<&str, NamedNode> = BTreeMap::new();
+        for source in &input.revisions {
+            let Some(predecessor) = &source.was_revision_of else {
+                continue;
+            };
+            let iri = &b.local[source.key.as_str()];
+            let pred = b.resolve(predecessor)?;
+            if pred == *iri {
+                return Err(Error::invalid(
+                    "revisions.wasRevisionOf: a source revision cannot revise itself",
+                ));
+            }
+            links.insert(iri.as_str(), pred);
+        }
+        let mut state: BTreeMap<&str, u8> = BTreeMap::new();
+        let mut path: Vec<&str> = Vec::new();
+        for &start in links.keys() {
+            if state.get(start).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            path.clear();
+            let mut cur = start;
+            loop {
+                control.check()?;
+                state.insert(cur, 1);
+                path.push(cur);
+                let Some(next) = links.get(cur) else {
+                    break;
+                };
+                let next = next.as_str();
+                match state.get(next).copied().unwrap_or(0) {
+                    1 => {
+                        return Err(Error::invalid(
+                            "revisions.wasRevisionOf: the batch's source revisions revise each other in a cycle",
+                        ));
+                    }
+                    2 => break,
+                    _ => {
+                        if !links.contains_key(next) {
+                            break;
+                        }
+                        cur = next;
+                    }
+                }
+            }
+            for &node in &path {
+                state.insert(node, 2);
+            }
+        }
+    }
     for source in &input.revisions {
         control.check()?;
         let iri = b.local[source.key.as_str()].clone();
@@ -696,6 +750,9 @@ pub fn plan<'i>(
         r.add(ev("sourceKey"), string(source.source_key.as_str()));
         if let Some(v) = &source.upstream_version {
             r.add(ev("upstreamVersion"), string(v.as_str()));
+        }
+        if let Some(predecessor) = &source.was_revision_of {
+            r.add(prov("wasRevisionOf"), b.resolve(predecessor)?);
         }
         if let SourceContent::Retained { bytes, .. } = &source.content {
             r.add(ev("retainedBytes"), base64_literal(bytes));
