@@ -613,12 +613,16 @@ async fn kept_axiom_pages_are_admitted_to_the_query_memory_pool() {
     let j: J = serde_json::from_str(&body).unwrap();
     assert_eq!(j["budget"], "server-memory");
     drop(held);
+    let before_retry = pool(&s).granted();
     let (status, _, body) = get(&s.app, KEPT).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let j: J = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["status"], "available", "{j}");
     let after_retry = pool(&s).granted();
-    // the retry may re-cache the ontology, but its own page charge must be gone
-    let before_check = pool(&s).granted();
-    assert_eq!(after_retry, before_check);
+    assert_eq!(
+        after_retry, before_retry,
+        "the retry must release its own charge"
+    );
     // the asserted listing is not admitted to the pool, and keeps its own caching
     let before = pool(&s).stats().admitted;
     let (status, headers, body) = get(&s.app, "/$/ontology/ds/axioms").await;

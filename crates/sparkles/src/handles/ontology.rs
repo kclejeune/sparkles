@@ -1528,6 +1528,8 @@ impl Ontologies {
                 "an ontology opens only at a state of its own open dataset and branch",
             ));
         }
+        let defaults = self.ds.with_query_defaults(opts);
+        let opts = &*defaults;
         let request_parent = opts.grant.is_some() || opts.pool.is_some();
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let view = match &access {
