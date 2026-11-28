@@ -226,7 +226,7 @@ once Waves A, B and C clear their prerequisites.
   item 14, branch preallocation quota accounting in items 560 and 561, and pin rebasing,
   per-quad periods, graph feeds and settings history in item 52. Remote and archive
   cloning and relink ship in item 45, GraphQL Phase 2 in item 37, Fuseki and ARQ
-  compatibility leftovers in items 38, 39, 51 and 76, combined ShEx guards in item 54,
+  compatibility leftovers in items 38, 39, 51 and 76,
   shape-driven form gaps in items 612 to 615, and degraded-index startup in item 402.
 
 ### Wave E: competitive benchmarks and scale optimization
@@ -491,7 +491,6 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [F21](specs/F21-ontology-api.md#outcome) | 539, 559, 565, 578 | Enforce the read budget, measure the A7 targets, fetch imports through the outbound policy, and read inferences and entity reports over MCP and the CLI. |
 | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | 43, 230, 233, 234, 236, 237, 238, 239, 404, 450 | Finish the named source, UI/task, conformance, function and term-identity gaps before claiming Phase 1 complete. Phase 2 virtual graphs must match materialized SPARQL answers with pushdown, access, cancellation and source-failure behavior tested. |
 | [G01](specs/G01-geosparql/SPEC.md#outcome) | 24 | Complete per-row nearest-neighbour joins, QLever's spatial syntax, metric-property rewrites, polygon approximations, datum shifts and curved GML segments as item 24 lists them. Keep intentional default divergences explicit, since item 70's Jena-compatible mode is not adopted. |
-| [G02](specs/G02-shex/SPEC.md#outcome) | 54 | Complete combined guards, graph-plus-file schemas and CLI outbound controls with the adopted ShEx conformance and incremental/full equivalence tests. Unsupported reference syntax remains a stated language boundary rather than a claim of universal ShEx parity. |
 | [P01](specs/P01-python-bindings.md#outcome) | 32, 33, 40, 58 | Complete release/platform and further async administration and bulk coverage, reusable plans and the remaining bounded per-call and footprint assessment. Validate package installation and the Python API suite on the claimed runtimes while preserving cancellation, term identity and snapshots. |
 | [P03](specs/P03-query-extensions.md#outcome) | 25 | Complete dynamic registered dispatch, foreign callbacks, batching and the adopted aggregate arities. Verify captured-view access, duplicate invocation, error, cancellation and transaction behavior, and measure callback costs. |
 | [P04](specs/P04-jvm-bindings/SPEC.md#outcome) | 25, 32, 33, 58, 76, 405 | Complete the named callback, plan, integration-harness, metrics and release gaps with the accepted Jena contract tests. Keep fallback BGP batching and optional module/allocator/transaction choices explicit, and substantiate performance claims with matched bridge measurements. |
@@ -1211,7 +1210,6 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 51 | **ARQ.** Parallel LATERAL, user DESCRIBE handlers, and the remaining client options and builder methods. Sparkles does not evaluate `shortest(…)`, and ARQ does not either. | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M |
 | 52 | **History.** Pin rebasing, periods per quad, change feeds per graph, reconstruction of expired states, and history of settings. Restore the derived text index of a named snapshot from backup. Let indexed snapshot builds run while RDF commits continue. | [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12) | M |
 | 53 | **Inference settings.** Input-graph and RDFS settings in the UI, the remaining RDFS-on-read surfaces, and controls for the import policy. | [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 54 | **ShEx.** Combined SHACL and ShEx guards, schemas from a graph plus a file, and CLI outbound controls. | [G02](specs/G02-shex/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 | 55 | **Completions and OpenAPI.** Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas. This follow-up is outside the completion of formatting, linting and command-line tools. | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 56 | **Legacy MCP resource subscriptions.** | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
 | 74 | **RDF Patch.** Patches with several transactions applied as several commits, blank-node identity across datasets, and patch logs. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | M |
@@ -1300,6 +1298,8 @@ for them.
 | 70 | **Jena-compatible GeoSPARQL mode.** Not adopted. Sparkles keeps the answers that [COMPARISON.md](COMPARISON.md#geosparql) describes, and the number stays listed so that it is not reused. | [G01](specs/G01-geosparql/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 
 ## Completed
+
+- **54.** A dataset can enforce SHACL and ShEx together and return ordered reports for both checks. ShEx schemas can combine ShExR named graphs with a copied file. The ShEx validation and guard-setting commands accept the outbound policy flags. [G02](specs/G02-shex/OUTCOME.md#guards-schema-sources-and-cli-controls)
 
 - **23.** Full-text indexes can be enabled and reconfigured online. Text searches see staged writes in their transaction and can read retained commits through a bounded adjustment or an indexed named snapshot. [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12)
 - **1231.** Rooted runs that miss entailments about individuals reached from individuals. `Limits::rooted_marker_repair` is on by default in its filtered mode and delivers a context's conditional ground facts to the contexts registered for their individuals, and `Limits::rooted_decline`, the partial check that withdrew such answers, is off by default. Over the 18,870 generated ontologies with a usable HermiT reference, in 36,360 result rows on one thread and with four threads requested, the default rooted run claims 2,136 more answers than the previous default and gives HermiT's answers except where every setting differs. Against a run with the repair and the check off it derives 3 to 13% more conclusions on the larger corpora, which item 1326 follows. [F24](specs/F24-owl-classification/SPEC.md#outcome)

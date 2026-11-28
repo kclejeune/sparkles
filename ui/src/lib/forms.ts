@@ -140,7 +140,7 @@ export type FormModel = {
   graph: string | null;
   closed: boolean;
   save: { to: 'main' | 'branch'; branch: string; exists: boolean; mainProtected: boolean };
-  guard: { language: 'shacl' | 'shex'; mode: 'reject' | 'warn' | 'off' } | null;
+  guard: { language: 'shacl' | 'shex' | 'combined'; mode: 'reject' | 'warn' | 'off' } | null;
   /** With `nested=true`: the stored blank-node children and the templates of new ones. */
   nestedNodes?: NestedNode[];
   templates?: NestedTemplate[];
@@ -839,7 +839,7 @@ export function savePlan(
   problems: number,
   check: { conforms: boolean | null; rejected: boolean; current: boolean } | null,
 ): SavePlan {
-  if (guard?.language === 'shacl' && guard.mode === 'reject') {
+  if (guard && guard.language !== 'shex' && guard.mode === 'reject') {
     if (!check?.current) return 'check';
     return check.rejected ? 'blocked' : 'save';
   }

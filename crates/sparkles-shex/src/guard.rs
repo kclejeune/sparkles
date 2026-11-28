@@ -46,8 +46,7 @@ use crate::ir::{Ir, PairKind};
 use crate::resolve::Resolver;
 use crate::typing::Verdict;
 use crate::{
-    CompiledSchema, NoImports, NodeSelector, PrefixMap, ResultMap, SchemaFormat, ShapeMap,
-    ValidateOptions,
+    CompiledSchema, NoImports, NodeSelector, ResultMap, SchemaFormat, ShapeMap, ValidateOptions,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
@@ -69,13 +68,19 @@ use sparkles_core::validation::DataGraph;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub use sparkles_core::guard::config::{SHEX_SCHEMA_SHEXC_FILE, SHEX_SCHEMA_SHEXJ_FILE};
 
 /// The `format` of a ShEx `validation.json`.
 pub const CONFIG_FORMAT: u32 = 3;
+/// The configuration version that allows a schema in graphs and a copied file.
+pub const COMPOSED_CONFIG_FORMAT: u32 = 4;
+
+/// Largest file source or closed schema copy, before parsing or storing it.
+pub const MAX_SCHEMA_BYTES: usize = 16 << 20;
+const MAX_SCHEMA_GRAPH_TRIPLES: u64 = 100_000;
 
 /// Write-time ShEx validation of one dataset (`validation.json`, format 3; format 2 is also read).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -148,7 +153,7 @@ pub struct SchemaSource {
     #[serde(default, skip_serializing)]
     pub inline: Option<String>,
     /// named graphs of the dataset that hold the schema in ShExR, read from the state
-    /// being validated (instead of a copied file)
+    /// being validated (optionally alongside a copied file)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphs: Option<Vec<String>>,
 }
@@ -164,9 +169,9 @@ pub enum MapSource {
 impl ShexValidationConfig {
     /// Check the fields (not the schema or the shape map).
     pub fn check(&self) -> Result<()> {
-        if !(2..=CONFIG_FORMAT).contains(&self.format) {
+        if !(2..=COMPOSED_CONFIG_FORMAT).contains(&self.format) {
             bail!(
-                "a ShEx configuration is validation.json format 2 or {CONFIG_FORMAT}, not {}",
+                "a ShEx configuration is validation.json format 2, 3 or {COMPOSED_CONFIG_FORMAT}, not {}",
                 self.format
             );
         }
@@ -182,13 +187,11 @@ impl ShexValidationConfig {
         self.data_graph.check()?;
         let s = &self.schema;
         if self.mode != GuardMode::Off
-            && usize::from(s.file.is_some())
-                + usize::from(s.inline.is_some())
-                + usize::from(s.graphs.is_some())
-                != 1
+            && (s.file.is_some() && s.inline.is_some()
+                || s.file.is_none() && s.inline.is_none() && s.graphs.is_none())
         {
             bail!(
-                "schema: give the schema inline, the file it was copied to, or the graphs that hold it in ShExR"
+                "schema: give an inline schema or its stored copy, ShExR graphs, or both a file source and graphs"
             );
         }
         if let Some(gs) = &s.graphs {
@@ -289,7 +292,7 @@ impl Model {
         Model {
             reads: read_predicates(loaded.compiled.ir(), &map),
             plan: incremental::Plan::new(loaded.compiled.ir(), &map),
-            digest: sha256_hex(loaded.text.as_bytes()),
+            digest: sha256_hex(loaded.source.as_ref().map_or(&[], |s| s.text.as_bytes())),
             schema: Arc::new(loaded.compiled),
             map,
             shape_count: loaded.shape_count,
@@ -348,6 +351,12 @@ enum TypingUpdate {
     Drop,
 }
 
+enum Before<'a> {
+    Establish,
+    Known(&'a Arc<Snapshot>, &'a Model),
+    Unproven,
+}
+
 /// Write-time ShEx validation of one store.
 pub struct ShexGuard {
     cfg: ShexValidationConfig,
@@ -371,6 +380,9 @@ pub struct ShexGuard {
     /// the schema copy an in-memory dataset keeps for backups (a persistent one has
     /// it in its directory)
     copy: Option<String>,
+    graph_file: Option<Arc<Schema>>,
+    /// A bypass may have changed the graphs that the active model came from.
+    graph_dirty: AtomicBool,
     history: CheckHistory,
 }
 
@@ -381,6 +393,12 @@ impl ShexGuard {
         map: ShapeMap,
         persist: Option<(PathBuf, String)>,
     ) -> ShexGuard {
+        let graph_file = cfg
+            .schema
+            .graphs
+            .as_ref()
+            .and(loaded.source.as_ref())
+            .map(|s| Arc::new(s.schema.clone()));
         ShexGuard {
             model: parking_lot::RwLock::new(Arc::new(Model::new(loaded, map))),
             exact: Mutex::new(None),
@@ -395,18 +413,28 @@ impl ShexGuard {
             associations: AtomicU64::new(u64::MAX),
             warnings: Mutex::new(Vec::new()),
             copy: None,
+            graph_file,
+            graph_dirty: AtomicBool::new(false),
             history: CheckHistory::default(),
         }
     }
 
     /// An independent guard for a memory branch with its own validation state.
     pub fn fork_for_store(&self, store: &Store) -> Result<Arc<Self>> {
+        let fork = self.fork_detached(&store.snapshot())?;
+        store.set_guard(Some(fork.clone()));
+        store.set_guard_required(true);
+        Ok(fork)
+    }
+
+    #[doc(hidden)]
+    pub fn fork_detached(&self, snap: &Snapshot) -> Result<Arc<Self>> {
         let model = if self.cfg.schema.graphs.is_some() {
-            Arc::new(load_graph_model(&self.cfg, &store.snapshot())?)
+            Arc::new(self.load_graph_model(snap, &WriteOptions::default())?)
         } else {
             self.model.read().clone()
         };
-        let fork = Arc::new(Self {
+        Ok(Arc::new(Self {
             cfg: self.cfg.clone(),
             model: parking_lot::RwLock::new(model),
             pending: Mutex::new(None),
@@ -420,11 +448,18 @@ impl ShexGuard {
             associations: AtomicU64::new(u64::MAX),
             warnings: Mutex::new(Vec::new()),
             copy: self.copy.clone(),
+            graph_file: self.graph_file.clone(),
+            graph_dirty: AtomicBool::new(false),
             history: CheckHistory::default(),
-        });
-        store.set_guard(Some(fork.clone()));
-        store.set_guard_required(true);
-        Ok(fork)
+        }))
+    }
+
+    fn load_graph_model(&self, snap: &Snapshot, opts: &WriteOptions) -> Result<Model> {
+        let schema = schema_from_graphs(&self.cfg, snap, opts)?;
+        let merged = compose_config(&self.cfg, self.graph_file.as_deref(), Some(schema))?;
+        let loaded = compile_schema(&merged, None)?;
+        let map = parse_map(&self.cfg.shape_map, &loaded.compiled)?;
+        Ok(Model::new(loaded, map))
     }
 
     pub fn config(&self) -> &ShexValidationConfig {
@@ -537,18 +572,19 @@ impl ShexGuard {
         &self,
         m: &Model,
         view: &Arc<Snapshot>,
-        before: Option<(&Arc<Snapshot>, &Model)>,
+        before: Before<'_>,
         o: &WriteOptions,
     ) -> sparkles_core::Result<(ValidationSummary, PairValues)> {
         let t0 = Instant::now();
         let deadline = self.deadline(t0, o);
         let (rm, typing) = self.validate_map(m, view, o, deadline)?;
         let introduced = match before {
-            Some((base, bm)) if self.grandfather() => {
+            Before::Known(base, bm) if self.grandfather() => {
                 let (pre, _) = self.validate_map(bm, base, o, deadline)?;
                 Some(new_nonconformant(&rm.results, &pre.results))
             }
-            _ if self.grandfather() => Some(vec![false; rm.results.len()]),
+            Before::Establish if self.grandfather() => Some(vec![false; rm.results.len()]),
+            Before::Unproven if self.grandfather() => Some(vec![true; rm.results.len()]),
             _ => None,
         };
         let ms = t0.elapsed().as_millis() as u64;
@@ -602,12 +638,13 @@ impl ShexGuard {
     fn full(
         &self,
         m: &Model,
-        before: &Model,
+        before: Option<&Model>,
         c: &Candidate<'_>,
         reason: &str,
     ) -> sparkles_core::Result<Checked> {
         let base = Arc::new(c.base.clone());
-        let (mut s, typing) = self.validate_state(m, &c.view, Some((&base, before)), c.opts)?;
+        let before = before.map_or(Before::Unproven, |model| Before::Known(&base, model));
+        let (mut s, typing) = self.validate_state(m, &c.view, before, c.opts)?;
         s.fallback = Some(reason.to_string());
         s.focus_nodes = Some(s.total);
         let exact = Exact {
@@ -836,18 +873,18 @@ impl ShexGuard {
     fn check_data(&self, m: &Model, c: &Candidate<'_>) -> sparkles_core::Result<Checked> {
         let t0 = Instant::now();
         let Changes::Log(log) = c.changes else {
-            return self.full(m, m, c, "bulk");
+            return self.full(m, Some(m), c, "bulk");
         };
         if m.plan.sparql {
-            return self.full(m, m, c, "sparql");
+            return self.full(m, Some(m), c, "sparql");
         }
         let exact = *self.exact.lock();
         let Some(exact) = exact.filter(|e| e.commit == c.base.commit) else {
-            return self.full(m, m, c, "baseline");
+            return self.full(m, Some(m), c, "baseline");
         };
         if self.cfg.mode == GuardMode::Reject && !self.grandfather() && exact.nonconformant > 0 {
             // the report must show the associations that block every write
-            return self.full(m, m, c, "baseline");
+            return self.full(m, Some(m), c, "baseline");
         }
         let mut graphs: FxHashMap<u64, bool> = FxHashMap::default();
         let mut seen: FxHashSet<[Id; 3]> = FxHashSet::default();
@@ -884,7 +921,7 @@ impl ShexGuard {
         let pre = state(&base)?;
         match self.propagated(m, c, &changes, &exact, &post, &pre, t0)? {
             Propagation::Done(checked) => return Ok(*checked),
-            Propagation::Budget => return self.full(m, m, c, "budget"),
+            Propagation::Budget => return self.full(m, Some(m), c, "budget"),
             Propagation::Unknown => {}
         }
         let affected = m.plan.affected(
@@ -894,7 +931,7 @@ impl ShexGuard {
             MAX_FOCUS,
         )?;
         let Some(affected) = affected else {
-            return self.full(m, m, c, "budget");
+            return self.full(m, Some(m), c, "budget");
         };
         let nodes: Vec<(Id, oxrdf::Term)> = affected
             .into_iter()
@@ -921,7 +958,7 @@ impl ShexGuard {
         );
         match self.moved(c, &exact, after, &before.results, counts, t0) {
             Some(checked) => Ok(checked),
-            None => self.full(m, m, c, "baseline"),
+            None => self.full(m, Some(m), c, "baseline"),
         }
     }
 
@@ -932,11 +969,26 @@ impl ShexGuard {
     fn schema_write(
         &self,
         c: &Candidate<'_>,
-        old: &Arc<Model>,
+        old: Option<&Model>,
         seq: u64,
         live: bool,
     ) -> sparkles_core::Result<ValidationSummary> {
-        let new = match load_graph_model(&self.cfg, &c.view) {
+        let opts = WriteOptions {
+            deadline: Some(self.deadline(Instant::now(), c.opts)),
+            ..c.opts.clone()
+        };
+        let candidate = Candidate {
+            base: c.base,
+            view: c.view.clone(),
+            kind: c.kind,
+            changes: c.changes,
+            opts: &opts,
+        };
+        let c = &candidate;
+        opts.check()?;
+        let loaded = self.load_graph_model(&c.view, &opts);
+        opts.check()?;
+        let new = match loaded {
             Ok(m) => Arc::new(m),
             Err(e) => {
                 let mut s = ValidationSummary::empty(
@@ -1029,6 +1081,7 @@ impl ShexGuard {
             focus_nodes: None,
             fallback: None,
             report_turtle: None,
+            guards: Vec::new(),
         }
     }
 
@@ -1123,9 +1176,10 @@ impl CommitGuard for ShexGuard {
             && !c.base.cacheable
             && matches!(c.changes, Changes::Log(_))
             && self.cfg.schema.graphs.is_some()
+            && !self.graph_dirty.load(Ordering::Relaxed)
         {
             c.opts.check()?;
-            let loaded = load_graph_model(&self.cfg, c.base);
+            let loaded = self.load_graph_model(c.base, c.opts);
             c.opts.check()?;
             match loaded {
                 Ok(model) => Arc::new(model),
@@ -1151,8 +1205,21 @@ impl CommitGuard for ShexGuard {
             _ => &c.view,
         };
         let (relevant, schema_changed) = self.relevant(&model, change_view, &c.changes);
+        if self.graph_dirty.load(Ordering::Relaxed) {
+            // After a bypass the old cache is no longer evidence of the previous
+            // schema. A repair can proceed even if the previous schema is unusable.
+            let before = if self.grandfather() && matches!(c.changes, Changes::Log(_)) {
+                c.opts.check()?;
+                let loaded = self.load_graph_model(c.base, c.opts);
+                c.opts.check()?;
+                loaded.ok()
+            } else {
+                None
+            };
+            return self.schema_write(c, before.as_ref(), seq, live);
+        }
         if schema_changed {
-            return self.schema_write(c, &model, seq, live);
+            return self.schema_write(c, Some(&model), seq, live);
         }
         if !relevant {
             if !live {
@@ -1180,6 +1247,8 @@ impl CommitGuard for ShexGuard {
                     typing: TypingUpdate::Keep,
                     model: None,
                 });
+            } else {
+                self.discard_pending(seq);
             }
             let mut s =
                 ValidationSummary::empty(GuardStatus::Skipped, self.cfg.mode, Severity::Violation);
@@ -1217,6 +1286,7 @@ impl CommitGuard for ShexGuard {
                 }
                 if let Some(m) = p.model {
                     *self.model.write() = m;
+                    self.graph_dirty.store(false, Ordering::Relaxed);
                 }
                 *self.baseline.lock() = Some(p.baseline);
                 *self.exact.lock() = p.exact;
@@ -1259,7 +1329,11 @@ impl CommitGuard for ShexGuard {
         self.rekey_typing(old, new);
     }
 
-    fn bypassed(&self, _seq: u64) {
+    fn bypassed(&self, seq: u64) {
+        self.discard_pending(seq);
+        if !self.cfg.schema_graphs().is_empty() {
+            self.graph_dirty.store(true, Ordering::Relaxed);
+        }
         self.forget_saved_typing();
         self.counters.count(GuardStatus::Bypassed);
         if let Some(b) = self.baseline.lock().as_mut() {
@@ -1331,121 +1405,173 @@ struct Loaded {
     compiled: CompiledSchema,
     /// shape declarations, imports included
     shape_count: usize,
-    /// the copy: its file name, `format` and text
+    source: Option<SchemaCopy>,
+}
+
+struct SchemaCopy {
+    schema: Schema,
     file: &'static str,
     format: &'static str,
     text: String,
-    /// the prefixes the copy cannot hold (a ShExJ copy of a schema that had some)
-    prefixes: PrefixMap,
-    /// the base of the closed schema (`BASE`, or the one given)
-    base: Option<String>,
 }
 
-/// Parse a schema text, resolve its imports and EXTERNAL shapes through `resolver`,
-/// check and compile it, and choose its copy: the text itself when nothing was
-/// resolved into it (ShExC or ShExJ), otherwise the closed schema as ShExJ. `prefixes`
-/// stand in for a text without its own (a ShExJ copy).
-fn load(
-    text: String,
-    format: Option<&str>,
-    base: Option<&str>,
-    prefixes: &BTreeMap<String, String>,
-    resolver: &dyn Resolver,
-) -> Result<Loaded> {
-    let format = match format {
+/// Read at most one file source, including for callers that configure the guard locally.
+pub fn read_schema_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_SCHEMA_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    check_schema_size(bytes.len())?;
+    Ok(String::from_utf8(bytes)?)
+}
+
+fn check_schema_size(bytes: usize) -> Result<()> {
+    anyhow::ensure!(
+        bytes <= MAX_SCHEMA_BYTES,
+        "schema text exceeds the limit of {MAX_SCHEMA_BYTES} bytes"
+    );
+    Ok(())
+}
+
+/// Close the file over its own imports, before it meets any graph declarations.
+fn source(text: String, cfg: &SchemaSource, resolver: &dyn Resolver) -> Result<SchemaCopy> {
+    check_schema_size(text.len())?;
+    let format = match cfg.format.as_deref() {
         Some(f) => SchemaFormat::from_name(f)
             .with_context(|| format!("schema.format must be shexc, shexj or shexr, not {f:?}"))?,
         None if text.trim_start().starts_with('{') => SchemaFormat::ShExJ,
         None => SchemaFormat::ShExC,
     };
-    let mut parsed =
-        crate::parse_schema(&text, base, Some(format)).map_err(|e| anyhow!("schema: {e}"))?;
-    if parsed.prefixes.is_empty() {
-        parsed.prefixes = prefixes
-            .iter()
-            .map(|(p, ns)| (p.clone(), ns.clone()))
-            .collect();
-    }
-    let (compiled, closed) = compile_schema(&parsed, resolver)?;
-    let verbatim = parsed.imports.is_empty() && closed == parsed;
+    let parsed = crate::parse_schema(&text, cfg.base.as_deref(), Some(format))
+        .map_err(|e| anyhow!("schema: {e}"))?;
+    let mut schema =
+        crate::resolve::close(&parsed, resolver).map_err(|e| anyhow!("schema: {e}"))?;
+    let verbatim = parsed.imports.is_empty() && schema == parsed;
+    schema.imports.clear();
     let (file, format, text) = match format {
         SchemaFormat::ShExC if verbatim => (SHEX_SCHEMA_SHEXC_FILE, "shexc", text),
         SchemaFormat::ShExJ if verbatim => (SHEX_SCHEMA_SHEXJ_FILE, "shexj", text),
         _ => {
-            let merged = Schema {
-                imports: Vec::new(),
-                ..closed.clone()
-            };
-            let text = serde_json::to_string_pretty(&merged.to_shexj())?;
+            let text = serde_json::to_string(&schema.to_shexj())?;
+            check_schema_size(text.len())?;
             (SHEX_SCHEMA_SHEXJ_FILE, "shexj", text)
         }
     };
-    Ok(Loaded {
-        compiled,
-        shape_count: closed.shapes.len(),
+    Ok(SchemaCopy {
+        schema,
         file,
         format,
         text,
-        prefixes: if file == SHEX_SCHEMA_SHEXJ_FILE {
-            closed.prefixes.clone()
-        } else {
-            Vec::new()
-        },
-        base: closed.base.clone(),
     })
 }
 
-/// Close a parsed schema over its imports, refuse EXTERNAL shapes without a definition,
-/// and check and compile it.
-fn compile_schema(parsed: &Schema, resolver: &dyn Resolver) -> Result<(CompiledSchema, Schema)> {
-    let closed = crate::resolve::close(parsed, resolver).map_err(|e| anyhow!("schema: {e}"))?;
-    if let Some(d) = closed
+/// Combine the published declarations before structural checks so references can run
+/// in either direction. The ordinary compiler checks shape and triple label uniqueness.
+fn compose(file: Option<&Schema>, graph: Option<Schema>) -> Result<Schema> {
+    match (file, graph) {
+        (Some(file), Some(mut graph)) => {
+            anyhow::ensure!(
+                file.start.is_none() || graph.start.is_none(),
+                "schema: the file and the schema graphs both define START"
+            );
+            let mut merged = file.clone();
+            if merged.start.is_none() {
+                merged.start = graph.start.take();
+            }
+            merged.start_acts.append(&mut graph.start_acts);
+            merged.shapes.append(&mut graph.shapes);
+            Ok(merged)
+        }
+        (Some(file), None) => Ok(file.clone()),
+        (None, Some(graph)) => Ok(graph),
+        (None, None) => bail!("schema: no schema source"),
+    }
+}
+
+fn compile_schema(schema: &Schema, source: Option<SchemaCopy>) -> Result<Loaded> {
+    if let Some(d) = schema
         .shapes
         .iter()
         .find(|d| matches!(d.expr, crate::ShapeExpr::External))
     {
-        bail!(
-            "schema: the EXTERNAL shape {} has no definition (write-time validation takes none)",
-            d.label
-        );
+        bail!("schema: the EXTERNAL shape {} has no definition", d.label);
     }
-    let checked = crate::check::check(&closed).map_err(|e| anyhow!("schema: {e}"))?;
-    let compiled =
-        crate::compile::compile(&closed, &checked).map_err(|e| anyhow!("schema: {e}"))?;
-    Ok((compiled, closed))
+    let checked = crate::check::check(schema).map_err(|e| anyhow!("schema: {e}"))?;
+    let compiled = crate::compile::compile(schema, &checked).map_err(|e| anyhow!("schema: {e}"))?;
+    Ok(Loaded {
+        compiled,
+        shape_count: schema.shapes.len(),
+        source,
+    })
 }
 
-/// The triples of the named graphs `graphs` of `snap`, as one graph (graphs the
-/// snapshot does not have add nothing).
-fn graphs_of(snap: &Snapshot, graphs: &[String]) -> sparkles_core::Result<oxrdf::Graph> {
+/// Materialize only the configured ShExR graphs. Bound the rows and the decoded
+/// lexical data, including repeated quads, before retaining them in the graph.
+fn graphs_of(snap: &Snapshot, graphs: &[String], opts: &WriteOptions) -> Result<oxrdf::Graph> {
     use sparkles_core::index::Perm;
     use sparkles_core::store::Chunk;
     let mut g = oxrdf::Graph::new();
+    let mut rows = 0;
+    let mut bytes = 0usize;
     for iri in graphs {
+        opts.check()?;
         let Some(id) = snap.lookup_iri(iri) else {
             continue;
         };
-        snap.scan(Perm::Gspo, &[id.0], |c| {
-            let mut add = |k: &sparkles_core::index::Key| {
-                if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(k)) {
+        snap.scan_checked(
+            Perm::Gspo,
+            &[id.0],
+            || opts.check(),
+            |c| {
+                let mut add = |k: &sparkles_core::index::Key| -> sparkles_core::Result<()> {
+                    opts.check()?;
+                    rows += 1;
+                    if rows > MAX_SCHEMA_GRAPH_TRIPLES {
+                        return Err(sparkles_core::Error::invalid(format!(
+                            "schema graphs exceed the limit of {MAX_SCHEMA_GRAPH_TRIPLES} triples"
+                        )));
+                    }
+                    let q = snap.quad_to_terms(&Perm::Gspo.to_quad(k)).ok_or_else(|| {
+                        sparkles_core::Error::invalid("cannot decode schema graph triple")
+                    })?;
+                    let s = match &q.subject {
+                        oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str(),
+                        oxrdf::NamedOrBlankNode::BlankNode(n) => n.as_str(),
+                    };
+                    bytes = bytes
+                        .saturating_add(s.len())
+                        .saturating_add(q.predicate.as_str().len())
+                        .saturating_add(sparkles_core::explain::term_bytes(&q.object));
+                    if bytes > MAX_SCHEMA_BYTES {
+                        return Err(sparkles_core::Error::invalid(format!(
+                            "schema graphs exceed the limit of {MAX_SCHEMA_BYTES} term bytes"
+                        )));
+                    }
                     g.insert(&oxrdf::Triple::from(q));
+                    Ok(())
+                };
+                match c {
+                    Chunk::Block(b, s, e) => {
+                        for i in s..e {
+                            add(&b.key(i))?;
+                        }
+                    }
+                    Chunk::Row(k) => add(&k)?,
                 }
-            };
-            match c {
-                Chunk::Block(b, s, e) => (s..e).for_each(|i| add(&b.key(i))),
-                Chunk::Row(k) => add(&k),
-            }
-            Ok(true)
-        })?;
+                Ok(true)
+            },
+        )?;
     }
     Ok(g)
 }
 
-/// The schema a configuration keeps in ShExR graphs, read from `snap`. Imports are not
-/// fetched (a write never fetches anything); the shape map may use the configuration's
-/// `schema.prefixes`, or full IRIs.
-fn load_graphs(cfg: &ShexValidationConfig, snap: &Snapshot) -> Result<Loaded> {
-    let g = graphs_of(snap, cfg.schema_graphs())?;
+fn schema_from_graphs(
+    cfg: &ShexValidationConfig,
+    snap: &Snapshot,
+    opts: &WriteOptions,
+) -> Result<Schema> {
+    let g = graphs_of(snap, cfg.schema_graphs(), opts)?;
     if g.is_empty() {
         bail!(
             "schema: the schema graphs {} hold no triples",
@@ -1456,41 +1582,50 @@ fn load_graphs(cfg: &ShexValidationConfig, snap: &Snapshot) -> Result<Loaded> {
                 .join(", ")
         );
     }
-    let mut parsed = crate::shexr::from_graph(&g, cfg.schema.base.as_deref())
+    let mut schema = crate::shexr::from_graph(&g, cfg.schema.base.as_deref())
         .map_err(|e| anyhow!("schema: {e}"))?;
-    if !parsed.imports.is_empty() {
-        bail!("schema: a schema in graphs cannot import other schemas (nothing is fetched)");
+    if !schema.imports.is_empty() {
+        bail!("schema: a schema in graphs cannot import other schemas");
     }
-    if parsed.prefixes.is_empty() {
-        parsed.prefixes = cfg
-            .schema
-            .prefixes
-            .iter()
-            .map(|(p, ns)| (p.clone(), ns.clone()))
-            .collect();
-    }
-    let (compiled, closed) = compile_schema(&parsed, &NoImports)?;
-    Ok(Loaded {
-        compiled,
-        shape_count: closed.shapes.len(),
-        file: "",
-        format: "shexr",
-        text: String::new(),
-        prefixes: Vec::new(),
-        base: closed.base.clone(),
-    })
+    schema.prefixes = cfg
+        .schema
+        .prefixes
+        .iter()
+        .map(|(p, ns)| (p.clone(), ns.clone()))
+        .collect();
+    Ok(schema)
 }
 
-/// The schema and shape map of a configuration whose schema is in graphs, from `snap`.
-fn load_graph_model(cfg: &ShexValidationConfig, snap: &Snapshot) -> Result<Model> {
-    let loaded = load_graphs(cfg, snap)?;
-    let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
-    Ok(Model::new(loaded, map))
+fn load(cfg: &ShexValidationConfig, snap: &Snapshot, source: Option<SchemaCopy>) -> Result<Loaded> {
+    let graph = cfg
+        .schema
+        .graphs
+        .as_ref()
+        .map(|_| schema_from_graphs(cfg, snap, &WriteOptions::default()))
+        .transpose()?;
+    let schema = compose_config(cfg, source.as_ref().map(|s| &s.schema), graph)?;
+    compile_schema(&schema, source)
 }
 
-/// Load the copy of the schema a configuration names (nothing is resolved: the copy
-/// holds its imports).
-fn load_copy(cfg: &ShexValidationConfig, root: &Path) -> Result<Loaded> {
+fn compose_config(
+    cfg: &ShexValidationConfig,
+    file: Option<&Schema>,
+    graph: Option<Schema>,
+) -> Result<Schema> {
+    let mut schema = compose(file, graph)?;
+    // The shape map sees declared file prefixes plus configured map prefixes.
+    for (p, ns) in &cfg.schema.prefixes {
+        if let Some((_, old)) = schema.prefixes.iter().find(|(name, _)| name == p) {
+            anyhow::ensure!(old == ns, "schema: conflicting prefix {p:?}");
+        } else {
+            schema.prefixes.push((p.clone(), ns.clone()));
+        }
+    }
+    Ok(schema)
+}
+
+/// Load the copy of the schema a configuration names. The copy already holds its imports.
+fn load_copy(cfg: &ShexValidationConfig, root: &Path) -> Result<SchemaCopy> {
     let file = cfg.schema.file.as_deref().unwrap_or_default();
     let format = match file {
         SHEX_SCHEMA_SHEXC_FILE => "shexc",
@@ -1499,8 +1634,7 @@ fn load_copy(cfg: &ShexValidationConfig, root: &Path) -> Result<Loaded> {
             "schema.file must be {SHEX_SCHEMA_SHEXC_FILE} or {SHEX_SCHEMA_SHEXJ_FILE} (the copy in the database), not {file:?}"
         ),
     };
-    let text =
-        std::fs::read_to_string(root.join(file)).with_context(|| format!("reading {file}"))?;
+    let text = read_schema_file(&root.join(file)).with_context(|| format!("reading {file}"))?;
     match cfg.schema.copy_sha256.as_deref() {
         Some(expected) if sha256_hex(text.as_bytes()) != expected => bail!(
             "schema.copySha256 does not match {file}; restore the configured copy or set the schema again"
@@ -1511,13 +1645,11 @@ fn load_copy(cfg: &ShexValidationConfig, root: &Path) -> Result<Loaded> {
         ),
         _ => {}
     }
-    load(
-        text,
-        Some(format),
-        cfg.schema.base.as_deref(),
-        &cfg.schema.prefixes,
-        &NoImports,
-    )
+    let src = SchemaSource {
+        format: Some(format.into()),
+        ..cfg.schema.clone()
+    };
+    source(text, &src, &NoImports)
 }
 
 /// Parse a configuration's shape map against the schema: labels it does not define,
@@ -1559,9 +1691,16 @@ fn read_config_hashed(root: &Path) -> Result<Option<(ShexValidationConfig, Strin
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let cfg: ShexValidationConfig =
-        serde_json::from_slice(&bytes).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    let raw = serde_json::from_slice(&bytes).with_context(|| format!("{}", path.display()))?;
+    sparkles_core::formats::check_settings(CONFIG_FILE, &raw)?;
+    let cfg: ShexValidationConfig = serde_json::from_value(raw)?;
     cfg.check()?;
+    if cfg.schema.graphs.is_some() && cfg.schema.file.is_some() {
+        anyhow::ensure!(
+            cfg.format == COMPOSED_CONFIG_FORMAT,
+            "a graph and file schema requires format {COMPOSED_CONFIG_FORMAT}"
+        );
+    }
     Ok(Some((cfg, sha256_hex(&bytes))))
 }
 
@@ -1585,10 +1724,13 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
     }
     let snap = Arc::new(txn.view());
     let legacy_copy = cfg.schema.graphs.is_none() && cfg.schema.copy_sha256.is_none();
-    let loaded = match &cfg.schema.graphs {
-        Some(_) => load_graphs(&cfg, &snap)?,
-        None => load_copy(&cfg, root)?,
-    };
+    let source = cfg
+        .schema
+        .file
+        .as_ref()
+        .map(|_| load_copy(&cfg, root))
+        .transpose()?;
+    let loaded = load(&cfg, &snap, source)?;
     let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
     let g = Arc::new(ShexGuard::new(
         cfg,
@@ -1608,7 +1750,8 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         // legitimately differ from a converted or import-closed copy. Establish the
         // current copy's state without trusting either persisted baseline or typing.
         let model = g.model();
-        let (summary, typing) = g.validate_state(&model, &snap, None, &WriteOptions::default())?;
+        let (summary, typing) =
+            g.validate_state(&model, &snap, Before::Establish, &WriteOptions::default())?;
         *g.exact.lock() = Some(Exact {
             commit: head,
             nonconformant: summary.blocking,
@@ -1643,7 +1786,7 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
 fn stored_copy_check(cfg: &ShexValidationConfig, root: &Path) -> Result<ShexValidationConfig> {
     let stored = read_config_hashed(root)?
         .map(|(c, _)| c)
-        .filter(|c| c.schema.graphs.is_none() && c.schema.file.is_some())
+        .filter(|c| c.schema.file.is_some())
         .context("schema: the database keeps no schema copy to reuse; give the schema inline")?;
     if stored.schema.file != cfg.schema.file {
         bail!(
@@ -1683,7 +1826,7 @@ pub fn set_config(
 ) -> Result<SetOutcome> {
     let root = store.root().map(Path::to_path_buf);
     let txn = store.write_as(CommitKind::Transaction);
-    let Some(mut cfg) = cfg.filter(|c| c.mode != GuardMode::Off) else {
+    let Some(cfg) = cfg.filter(|c| c.mode != GuardMode::Off) else {
         store.set_guard(None);
         store.set_guard_required(false);
         if let Some(r) = &root {
@@ -1693,91 +1836,143 @@ pub fn set_config(
         drop(txn);
         return Ok(SetOutcome::Removed);
     };
-    cfg.check()?;
     let view = Arc::new(txn.view());
-    let in_graphs = cfg.schema.graphs.is_some();
-    let loaded = match cfg.schema.inline.take() {
-        _ if in_graphs => load_graphs(&cfg, &view)?,
-        Some(text) => {
-            cfg.schema.sha256 = Some(sha256_hex(text.as_bytes()));
-            load(
-                text,
-                cfg.schema.format.as_deref(),
-                cfg.schema.base.as_deref(),
-                &cfg.schema.prefixes,
-                resolver,
-            )?
-        }
-        None => {
-            let r = root
-                .as_deref()
-                .context("schema: give the schema inline (an in-memory dataset keeps no copy)")?;
-            load_copy(&stored_copy_check(&cfg, r)?, r)?
-        }
-    };
-    let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
-    // the configuration as written
-    cfg.format = CONFIG_FORMAT;
-    cfg.updated = Some(sparkles_core::guard::config::now_rfc3339());
-    if in_graphs {
-        cfg.schema.copy_sha256 = None;
-    } else {
-        cfg.schema.copy_sha256 = Some(sha256_hex(loaded.text.as_bytes()));
-        cfg.schema.file = Some(loaded.file.to_string());
-        cfg.schema.format = Some(loaded.format.to_string());
-        cfg.schema.prefixes = loaded.prefixes.iter().cloned().collect();
-        if loaded.file == SHEX_SCHEMA_SHEXJ_FILE && cfg.schema.base.is_none() {
-            cfg.schema.base = loaded.base.clone();
-        }
-    }
-    let file = loaded.file;
-    // the model keeps the text's digest, so the text stays in `loaded` until then
-    let text = loaded.text.clone();
-    let mut guard = ShexGuard::new(cfg, loaded, map, None);
-    if root.is_none() && !in_graphs {
-        guard.copy = Some(text.clone());
-    }
-
-    let model = guard.model();
-    let (summary, typing) = guard.validate_state(&model, &view, None, &WriteOptions::default())?;
-    if guard.cfg.mode == GuardMode::Reject && !guard.grandfather() && summary.blocking > 0 {
+    let (mut guard, summary) = prepare(cfg, root.as_deref(), &view, resolver, true)?;
+    if guard.rejects_initial(&summary) {
         return Ok(SetOutcome::NotConforming(summary));
     }
-    let head = txn.base().commit;
-    let baseline = baseline_of(&summary, head);
     if let Some(r) = &root {
-        // a configuration of either language this one replaces leaves nothing behind
-        // a schema in graphs keeps no copy
-        let keep: &[&str] = if in_graphs {
-            &[CONFIG_FILE]
-        } else {
-            &[CONFIG_FILE, file]
-        };
-        sparkles_core::guard::config::remove_files(r, keep)?;
-        StatusFile::remove(r)?;
-        if !in_graphs {
+        let file = guard.cfg.schema.file.as_deref();
+        let mut keep = vec![CONFIG_FILE];
+        if let Some((file, text)) = guard.schema_copy() {
+            keep.push(file);
             write_atomic(&r.join(file), text.as_bytes())?;
         }
         let bytes = serde_json::to_vec_pretty(&guard.cfg)?;
         write_atomic(&r.join(CONFIG_FILE), &bytes)?;
+        sparkles_core::guard::config::remove_files(r, &keep)?;
+        StatusFile::remove(r)?;
+        if file.is_some() {
+            guard.copy = None;
+        }
         let hash = sha256_hex(&bytes);
-        StatusFile::of(&baseline, &hash).write(r)?;
+        StatusFile::of(&baseline_of(&summary, view.commit), &hash).write(r)?;
         guard.persist = Some((r.clone(), hash));
     }
-    *guard.exact.lock() = Some(Exact {
-        commit: head,
-        nonconformant: summary.blocking,
-        total: summary.total,
-    });
-    if model.keeps_typing() {
-        *guard.typing.lock() = Some(HeadTyping::new(head, view.generation.uid, typing));
-    }
-    *guard.baseline.lock() = Some(baseline);
     let guard = Arc::new(guard);
     store.set_guard(Some(guard.clone()));
     store.set_guard_required(true);
     drop(txn);
     Ok(SetOutcome::Installed(guard, summary))
+}
+
+/// Build a guard on a caller-owned writer snapshot without changing the store.
+#[doc(hidden)]
+pub fn prepare_detached(
+    cfg: ShexValidationConfig,
+    snap: &Arc<Snapshot>,
+    resolver: &dyn Resolver,
+    establish: bool,
+) -> Result<(Arc<ShexGuard>, ValidationSummary)> {
+    anyhow::ensure!(
+        cfg.schema.file.is_none(),
+        "schema: give the file source inline"
+    );
+    let (guard, summary) = prepare(cfg, None, snap, resolver, establish)?;
+    Ok((Arc::new(guard), summary))
+}
+
+fn prepare(
+    mut cfg: ShexValidationConfig,
+    root: Option<&Path>,
+    snap: &Arc<Snapshot>,
+    resolver: &dyn Resolver,
+    establish: bool,
+) -> Result<(ShexGuard, ValidationSummary)> {
+    cfg.check()?;
+    let file = match cfg.schema.inline.take() {
+        Some(text) => {
+            let digest = sha256_hex(text.as_bytes());
+            if !establish {
+                anyhow::ensure!(
+                    cfg.schema.copy_sha256.as_deref() == Some(digest.as_str()),
+                    "schema.copySha256 does not match the embedded schema copy"
+                );
+            } else {
+                cfg.schema.sha256 = Some(digest);
+            }
+            Some(source(text, &cfg.schema, resolver)?)
+        }
+        None if cfg.schema.file.is_some() => {
+            let root = root.context("schema: give the schema inline")?;
+            Some(load_copy(&stored_copy_check(&cfg, root)?, root)?)
+        }
+        None => None,
+    };
+    let loaded = load(&cfg, snap, file)?;
+    let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
+    cfg.format = if cfg.schema.graphs.is_some() && loaded.source.is_some() {
+        COMPOSED_CONFIG_FORMAT
+    } else {
+        CONFIG_FORMAT
+    };
+    if establish {
+        cfg.updated = Some(sparkles_core::guard::config::now_rfc3339());
+    }
+    cfg.schema.copy_sha256 = loaded
+        .source
+        .as_ref()
+        .map(|source| sha256_hex(source.text.as_bytes()));
+    let copy = loaded.source.as_ref().map(|source| {
+        cfg.schema.file = Some(source.file.to_string());
+        cfg.schema.format = Some(source.format.to_string());
+        if source.file == SHEX_SCHEMA_SHEXJ_FILE {
+            for (prefix, iri) in &source.schema.prefixes {
+                cfg.schema.prefixes.insert(prefix.clone(), iri.clone());
+            }
+            if cfg.schema.base.is_none() {
+                cfg.schema.base = source.schema.base.clone();
+            }
+        }
+        source.text.clone()
+    });
+    let mut guard = ShexGuard::new(cfg, loaded, map, None);
+    guard.copy = copy;
+    let summary = if establish {
+        let model = guard.model();
+        let (summary, typing) =
+            guard.validate_state(&model, snap, Before::Establish, &WriteOptions::default())?;
+        let head = snap.commit;
+        *guard.exact.lock() = Some(Exact {
+            commit: head,
+            nonconformant: summary.blocking,
+            total: summary.total,
+        });
+        *guard.baseline.lock() = Some(baseline_of(&summary, head));
+        if model.keeps_typing() {
+            *guard.typing.lock() = Some(HeadTyping::new(head, snap.generation.uid, typing));
+        }
+        summary
+    } else {
+        ValidationSummary::empty(GuardStatus::Skipped, guard.cfg.mode, Severity::Violation)
+    };
+    Ok((guard, summary))
+}
+
+impl ShexGuard {
+    /// Discard a candidate's state when a different guard refused it.
+    #[doc(hidden)]
+    pub fn discard_pending(&self, seq: u64) {
+        let mut pending = self.pending.lock();
+        if pending.as_ref().is_some_and(|p| p.seq >= seq) {
+            *pending = None;
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn rejects_initial(&self, summary: &ValidationSummary) -> bool {
+        self.cfg.mode == GuardMode::Reject && !self.grandfather() && summary.blocking > 0
+    }
 }
 
 #[cfg(test)]

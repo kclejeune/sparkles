@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Combined SHACL and ShEx write-time validation
+
+A dataset can enforce both languages with independent modes, data graphs and baseline
+policies. Writes and merges evaluate both guards on the same candidate state and return
+one report section per guard. ShEx can combine a checked file copy with ShExR from named
+graphs. Both `shex validate` and `validation` accept the local outbound policy flags
+for schema imports.
+
 ### Online, transactional and historical full-text search
 
 Live datasets can enable or reconfigure full-text indexing while writes continue.
@@ -1593,6 +1601,11 @@ item 318). `scripts/eval-ask --profile-stages` records the Ask stage diagnostics
 each evaluation child.
 
 ### Compatibility
+
+Combined configurations add the `combined` write-summary language with a `guards`
+array. Clients reading status for a dataset with both validators can read the
+configuration and status sections for each language. Standalone guards retain their
+existing response fields.
 
 - The enabled full-text index status can include an optional `pendingConfig`
   field during online configuration. Existing status fields and the disabled

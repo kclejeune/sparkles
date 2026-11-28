@@ -924,28 +924,57 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
 // -------------------------------------------------------------- validation --
 
 fn validation(put: &mut dyn FnMut(&str, J)) {
+    let single = obj(
+        &["mode"],
+        json!({
+            "format": { "type": "integer", "description": "2 for stored SHACL, 3 for standalone ShEx with one source kind, or 4 for ShEx with a file and graphs. Earlier versions remain readable." },
+            "language": string_enum(&["shacl", "shex"]),
+            "mode": string_enum(&["reject", "warn", "off"]),
+            "shapes": { "type": "object", "additionalProperties": true, "description": "SHACL: `{graphs?, inline?, format?}`, stored with `file` and `sha256`." },
+            "schema": { "type": "object", "additionalProperties": true, "description": "ShEx: set `inline`, `graphs`, or both. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`. Guards in a list keep the copy inline." },
+            "shapeMap": { "oneOf": [string(), array(obj(&["node", "shape"], json!({ "node": string(), "shape": string() })))] },
+            "dataGraph": { "oneOf": [string_enum(&["default", "union"]), strings()] },
+            "includeInferences": boolean(),
+            "threshold": string_enum(&["violation", "warning", "info"]),
+            "baseline": string_enum(&["strict", "grandfather"]),
+            "timeoutSeconds": num(),
+            "reportLimit": int(),
+            "updated": string(),
+        }),
+    );
     put(
         "ValidationConfig",
         doc(
+            single.clone(),
+            "A standalone SHACL or ShEx guard.",
+            "write-time-validation",
+        ),
+    );
+    let guards = json!({
+        "type": "array", "minItems": 1, "maxItems": 2, "items": sref("ValidationConfig")
+    });
+    put(
+        "CombinedValidationConfig",
+        doc(
             obj(
-                &["mode"],
-                json!({
-                    "format": { "type": "integer", "description": "2 for stored SHACL configurations and 3 for stored ShEx configurations. ShEx format 2 is also read." },
-                    "language": string_enum(&["shacl", "shex"]),
-                    "mode": string_enum(&["reject", "warn", "off"]),
-                    "shapes": { "type": "object", "additionalProperties": true, "description": "SHACL: `{graphs?, inline?, format?}`, stored with `file` and `sha256`." },
-                    "schema": { "type": "object", "additionalProperties": true, "description": "ShEx: `{inline, format?, base?, source?}` or `{graphs, prefixes?, base?}`. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`." },
-                    "shapeMap": { "oneOf": [string(), array(obj(&["node", "shape"], json!({ "node": string(), "shape": string() })))] },
-                    "dataGraph": { "oneOf": [string_enum(&["default", "union"]), strings()] },
-                    "includeInferences": boolean(),
-                    "threshold": string_enum(&["violation", "warning", "info"]),
-                    "baseline": string_enum(&["strict", "grandfather"]),
-                    "timeoutSeconds": num(),
-                    "reportLimit": int(),
-                    "updated": string(),
-                }),
+                &["format", "guards"],
+                json!({ "format": {"const": 4}, "guards": guards }),
             ),
-            "A write-time validation configuration, SHACL or ShEx.",
+            "A format 4 list with the guards in evaluation order.",
+            "write-time-validation",
+        ),
+    );
+    let mut props = single["properties"].clone();
+    props["guards"] = guards;
+    put(
+        "ValidationConfigRequest",
+        doc(
+            json!({
+                "type": "object",
+                "properties": props,
+                "anyOf": [sref("ValidationConfig"), sref("CombinedValidationConfig")],
+            }),
+            "A standalone guard or a format 4 list of guards.",
             "write-time-validation",
         ),
     );
@@ -961,6 +990,20 @@ fn validation(put: &mut dyn FnMut(&str, J)) {
                     obj(
                         &["config"],
                         json!({ "config": { "type": "null" }, "unionDefaultGraph": boolean() }),
+                    ),
+                    obj(
+                        &["language", "config", "status"],
+                        json!({
+                            "language": {"const": "combined"},
+                            "config": sref("CombinedValidationConfig"),
+                            "unionDefaultGraph": boolean(),
+                            "status": obj(&["guards"], json!({
+                                "guards": array(obj(&["language", "status"], json!({
+                                    "language": string_enum(&["shacl", "shex"]),
+                                    "status": {"type": "object", "additionalProperties": true},
+                                }))),
+                            })),
+                        }),
                     ),
                     obj(
                         &["language", "config", "status"],

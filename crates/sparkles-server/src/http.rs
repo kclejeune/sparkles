@@ -2726,6 +2726,10 @@ pub(crate) fn write_error(e: Error, restricted: bool) -> ApiError {
                 "head": r.head,
             }),
         ),
+        Error::GuardMissing(_) if restricted => Error::GuardMissing(
+            "the dataset requires a validation guard; contact a dataset administrator".into(),
+        )
+        .into(),
         e => e.into(),
     }
 }
@@ -6142,27 +6146,23 @@ async fn shacl(
             "storedBlankNodes needs RDF with explicit blank labels, not SHACLC",
         ));
     }
-    let guard_shapes = match source.as_deref() {
-        None => None,
-        Some("guard") => {
-            if params.has("graph") {
-                return Err(err(
-                    StatusCode::BAD_REQUEST,
-                    "shapes=guard validates the guard's data graph: leave out graph",
-                ));
-            }
-            match ds.validation.read().clone() {
-                Some(crate::write_validation::Validation::Shacl(g)) => Some(g),
-                #[cfg(feature = "shex")]
-                Some(crate::write_validation::Validation::Shex(_)) => {
+    let guard_shapes =
+        match source.as_deref() {
+            None => None,
+            Some("guard") => {
+                if params.has("graph") {
                     return Err(err(
                         StatusCode::BAD_REQUEST,
-                        format!(
-                            "the write-time guard of /{} validates ShEx: use /{}/shex?schema=guard",
-                            ds.name, ds.name
-                        ),
+                        "shapes=guard validates the guard's data graph: leave out graph",
                     ));
                 }
+                match ds.validation.read().as_ref() {
+                Some(g) => Some(g.shacl().cloned().ok_or_else(|| {
+                    err(StatusCode::BAD_REQUEST, format!(
+                            "the write-time guard of /{} validates ShEx: use /{}/shex?schema=guard",
+                            ds.name, ds.name
+                        ))
+                })?),
                 None => {
                     return Err(err(
                         StatusCode::NOT_FOUND,
@@ -6170,17 +6170,17 @@ async fn shacl(
                     ));
                 }
             }
-        }
-        Some(iri) => {
-            oxrdf::NamedNode::new(iri).map_err(|e| {
-                err(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid shapes '{iri}' (guard or a graph IRI): {e}"),
-                )
-            })?;
-            None
-        }
-    };
+            }
+            Some(iri) => {
+                oxrdf::NamedNode::new(iri).map_err(|e| {
+                    err(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid shapes '{iri}' (guard or a graph IRI): {e}"),
+                    )
+                })?;
+                None
+            }
+        };
     let shapes_graph = source.filter(|s| s != "guard");
     let graph = GraphParam::parse(params.get("graph").unwrap_or("default"))
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;

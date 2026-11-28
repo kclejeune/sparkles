@@ -155,10 +155,8 @@ pub fn guard_shapes(
     guard: Option<WriteGuard>,
     store: &Store,
 ) -> Option<(sparkles_shacl::guard::ValidationConfig, oxrdf::Graph)> {
-    #[allow(irrefutable_let_patterns)]
-    let WriteGuard::Shacl(g) = guard? else {
-        return None;
-    };
+    let guard = guard?;
+    let g = guard.shacl()?;
     let cfg = g.config().clone();
     let mut graph = oxrdf::Graph::new();
     let snap = store.snapshot();

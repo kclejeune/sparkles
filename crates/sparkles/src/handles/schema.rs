@@ -688,35 +688,38 @@ fn guard_constraints_layer(
     };
     let mut layer = ConstraintsLayer::default();
     if req.guard != Some(false) {
-        let source = match ds.write_guard() {
-            Some(crate::write_guard::WriteGuard::Shacl(g)) => g
-                .config()
-                .shapes
-                .graphs
-                .iter()
-                .flatten()
-                .all(|s| readable(s))
-                .then(|| sparkles_shacl::constraints::guard_source(&g)),
-            #[cfg(feature = "shex")]
-            Some(crate::write_guard::WriteGuard::Shex(g)) => g
-                .config()
-                .schema
-                .graphs
-                .iter()
-                .flatten()
-                .all(|s| readable(s))
-                .then(|| sparkles_shex::constraints::guard_source(&g)),
-            None => None,
-        };
-        match source {
-            Some(s) => layer.sources.push(s),
-            None if req.guard == Some(true) => {
-                return Err(Error::NotFound(format!(
-                    "dataset {} has no write-time validation whose shapes this caller may read",
-                    ds.name().unwrap_or("")
-                )));
+        if let Some(guard) = ds.write_guard() {
+            if let Some(g) = guard.shacl()
+                && g.config()
+                    .shapes
+                    .graphs
+                    .iter()
+                    .flatten()
+                    .all(|s| readable(s))
+            {
+                layer
+                    .sources
+                    .push(sparkles_shacl::constraints::guard_source(g));
             }
-            None => {}
+            #[cfg(feature = "shex")]
+            if let Some(g) = guard.shex()
+                && g.config()
+                    .schema
+                    .graphs
+                    .iter()
+                    .flatten()
+                    .all(|s| readable(s))
+            {
+                layer
+                    .sources
+                    .push(sparkles_shex::constraints::guard_source(g));
+            }
+        }
+        if layer.sources.is_empty() && req.guard == Some(true) {
+            return Err(Error::NotFound(format!(
+                "dataset {} has no write-time validation whose shapes this caller may read",
+                ds.name().unwrap_or("")
+            )));
         }
     }
     Ok((!layer.is_empty()).then_some(layer))

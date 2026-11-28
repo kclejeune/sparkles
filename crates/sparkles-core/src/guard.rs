@@ -53,6 +53,13 @@ pub trait CommitGuard: Send + Sync {
     fn rekey(&self, _old: &Snapshot, _new: &Snapshot) {}
     /// A short description, for errors and status.
     fn describe(&self) -> String;
+    /// The summary of an authorized bypass, including any constituent guards.
+    fn bypass_summary(&self) -> ValidationSummary {
+        let mut summary =
+            ValidationSummary::empty(GuardStatus::Bypassed, GuardMode::Off, Severity::Violation);
+        summary.language = self.language();
+        summary
+    }
     /// The shape language this guard validates with.
     fn language(&self) -> GuardLanguage {
         GuardLanguage::Shacl
@@ -294,16 +301,18 @@ pub enum GuardLanguage {
     #[default]
     Shacl,
     Shex,
+    Combined,
 }
 
 impl GuardLanguage {
-    pub const ALL: [GuardLanguage; 2] = [GuardLanguage::Shacl, GuardLanguage::Shex];
+    pub const ALL: [GuardLanguage; 3] = [Self::Shacl, Self::Shex, Self::Combined];
 
     /// `shacl` or `shex` (the `language` label of the validation metrics).
     pub fn name(self) -> &'static str {
         match self {
             GuardLanguage::Shacl => "shacl",
             GuardLanguage::Shex => "shex",
+            GuardLanguage::Combined => "combined",
         }
     }
 
@@ -312,6 +321,7 @@ impl GuardLanguage {
         match self {
             GuardLanguage::Shacl => "SHACL",
             GuardLanguage::Shex => "ShEx",
+            GuardLanguage::Combined => "SHACL and ShEx",
         }
     }
 
@@ -383,6 +393,9 @@ pub struct ValidationSummary {
     /// the same results as a Turtle `sh:ValidationReport`, for rejections
     #[serde(skip)]
     pub report_turtle: Option<String>,
+    /// Individual decisions in configuration order for a combined guard.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<ValidationSummary>,
 }
 
 impl ValidationSummary {
@@ -407,7 +420,50 @@ impl ValidationSummary {
             focus_nodes: None,
             fallback: None,
             report_turtle: None,
+            guards: Vec::new(),
         }
+    }
+
+    /// Aggregate decisions on one candidate state. Child report limits, findings and
+    /// policies stay with their corresponding sections.
+    pub fn combined(guards: Vec<Self>) -> Self {
+        let mut summary = Self::empty(GuardStatus::Skipped, GuardMode::Off, Severity::Violation);
+        summary.language = GuardLanguage::Combined;
+        let rank = |status| match status {
+            GuardStatus::Skipped => 0,
+            GuardStatus::Bypassed => 1,
+            GuardStatus::Passed => 2,
+            GuardStatus::Warned => 3,
+            GuardStatus::Rejected => 4,
+        };
+        for g in &guards {
+            if rank(g.status) > rank(summary.status) {
+                summary.status = g.status;
+            }
+            if g.mode == GuardMode::Reject || summary.mode == GuardMode::Off {
+                summary.mode = g.mode;
+            }
+            if g.strategy == Strategy::Full || summary.strategy == Strategy::None {
+                summary.strategy = g.strategy;
+            }
+            summary.conforms &= g.conforms && g.shapes_error.is_none();
+            summary.blocking = summary.blocking.saturating_add(g.blocking);
+            summary.total = summary.total.saturating_add(g.total);
+            summary.by_severity.violation = summary
+                .by_severity
+                .violation
+                .saturating_add(g.by_severity.violation);
+            summary.by_severity.warning = summary
+                .by_severity
+                .warning
+                .saturating_add(g.by_severity.warning);
+            summary.by_severity.info = summary.by_severity.info.saturating_add(g.by_severity.info);
+            summary.limit = summary.limit.saturating_add(g.limit);
+            summary.truncated |= g.truncated;
+            summary.millis = summary.millis.saturating_add(g.millis);
+        }
+        summary.guards = guards;
+        summary
     }
 
     /// Whether a ShEx or SHACL summary's results block in its mode: in grandfather mode
@@ -417,7 +473,8 @@ impl ValidationSummary {
     }
 
     /// `Sparkles-Validation` header value (an RFC 9651 Dictionary). A ShEx guard's adds
-    /// `lang=shex` after `strategy`; a SHACL guard's has no `lang`, as before format 2.
+    /// `lang=shex` after `strategy`. A combined header adds `lang=combined` and the
+    /// status of each constituent. A standalone SHACL header has no `lang`.
     pub fn header(&self) -> String {
         let mode = match self.mode {
             GuardMode::Reject => "reject",
@@ -432,12 +489,13 @@ impl ValidationSummary {
         let lang = match self.language {
             GuardLanguage::Shacl => "",
             GuardLanguage::Shex => ", lang=shex",
+            GuardLanguage::Combined => ", lang=combined",
         };
         let introduced = match self.introduced {
             Some(n) => format!(", introduced={n}"),
             None => String::new(),
         };
-        format!(
+        let mut header = format!(
             "status={}, mode={}, strategy={}{lang}, blocking={}{introduced}, total={}, violations={}, warnings={}, infos={}, ms={}",
             self.status.name(),
             mode,
@@ -448,7 +506,17 @@ impl ValidationSummary {
             self.by_severity.warning,
             self.by_severity.info,
             self.millis
-        )
+        );
+        use std::fmt::Write as _;
+        for guard in &self.guards {
+            let _ = write!(
+                header,
+                ", {}-status={}",
+                guard.language.name(),
+                guard.status.name()
+            );
+        }
+        header
     }
 }
 
@@ -463,6 +531,9 @@ pub struct Rejection {
 
 impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.summary.language == GuardLanguage::Combined {
+            return write!(f, "write-time validation failed; nothing was committed");
+        }
         if self.summary.language == GuardLanguage::Shex {
             let n = self.summary.introduced.unwrap_or(self.summary.blocking);
             let new = if self.summary.introduced.is_some() {

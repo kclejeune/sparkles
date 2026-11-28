@@ -23,6 +23,11 @@ use serde_json::{Value as J, json};
 #[cfg(any(feature = "shacl", feature = "shex"))]
 use std::sync::Arc;
 
+#[cfg(all(feature = "shacl", feature = "shex"))]
+pub(crate) mod combined;
+#[cfg(all(feature = "shacl", feature = "shex"))]
+pub use combined::{CombinedGuard, GuardConfig, parse_configs};
+
 /// The write-time validation installed on a dataset. It has no variants in a build
 /// without the `shacl` and `shex` features.
 #[derive(Clone)]
@@ -31,6 +36,8 @@ pub enum WriteGuard {
     Shacl(Arc<sparkles_shacl::guard::ShaclGuard>),
     #[cfg(feature = "shex")]
     Shex(Arc<sparkles_shex::guard::ShexGuard>),
+    #[cfg(all(feature = "shacl", feature = "shex"))]
+    Combined(Arc<CombinedGuard>),
 }
 
 impl std::fmt::Debug for WriteGuard {
@@ -48,6 +55,113 @@ impl WriteGuard {
             WriteGuard::Shacl(_) => GuardLanguage::Shacl,
             #[cfg(feature = "shex")]
             WriteGuard::Shex(_) => GuardLanguage::Shex,
+            #[cfg(all(feature = "shacl", feature = "shex"))]
+            WriteGuard::Combined(_) => GuardLanguage::Combined,
+        }
+    }
+
+    /// The strictest mode of the installed guards.
+    pub fn mode(&self) -> crate::guard::GuardMode {
+        #[cfg(all(feature = "shacl", feature = "shex"))]
+        use crate::guard::GuardMode;
+        match *self {
+            #[cfg(feature = "shacl")]
+            Self::Shacl(ref guard) => guard.config().mode,
+            #[cfg(feature = "shex")]
+            Self::Shex(ref guard) => guard.config().mode,
+            #[cfg(all(feature = "shacl", feature = "shex"))]
+            Self::Combined(ref guard) => {
+                if guard
+                    .guards()
+                    .iter()
+                    .any(|guard| guard.mode() == GuardMode::Reject)
+                {
+                    GuardMode::Reject
+                } else {
+                    GuardMode::Warn
+                }
+            }
+        }
+    }
+
+    /// The SHACL guard, when configured individually or with ShEx.
+    #[cfg(feature = "shacl")]
+    pub fn shacl(&self) -> Option<&Arc<sparkles_shacl::guard::ShaclGuard>> {
+        match self {
+            Self::Shacl(guard) => Some(guard),
+            #[cfg(all(feature = "shacl", feature = "shex"))]
+            Self::Combined(guard) => guard.guards().iter().find_map(Self::shacl),
+            #[cfg(feature = "shex")]
+            Self::Shex(_) => None,
+        }
+    }
+
+    /// The ShEx guard, when configured individually or with SHACL.
+    #[cfg(feature = "shex")]
+    pub fn shex(&self) -> Option<&Arc<sparkles_shex::guard::ShexGuard>> {
+        match self {
+            Self::Shex(guard) => Some(guard),
+            #[cfg(all(feature = "shacl", feature = "shex"))]
+            Self::Combined(guard) => guard.guards().iter().find_map(Self::shex),
+            #[cfg(feature = "shacl")]
+            Self::Shacl(_) => None,
+        }
+    }
+
+    #[cfg(all(feature = "shacl", feature = "shex"))]
+    fn commit_guard(&self) -> &dyn crate::guard::CommitGuard {
+        match self {
+            Self::Shacl(guard) => guard.as_ref(),
+            Self::Shex(guard) => guard.as_ref(),
+            Self::Combined(guard) => guard.as_ref(),
+        }
+    }
+
+    #[cfg(any(feature = "shacl", feature = "shex"))]
+    fn attach(&self, store: &Store) {
+        let guard: Arc<dyn crate::guard::CommitGuard> = match self {
+            #[cfg(feature = "shacl")]
+            Self::Shacl(guard) => guard.clone(),
+            #[cfg(feature = "shex")]
+            Self::Shex(guard) => guard.clone(),
+            #[cfg(all(feature = "shacl", feature = "shex"))]
+            Self::Combined(guard) => guard.clone(),
+        };
+        store.set_guard(Some(guard));
+        store.set_guard_required(true);
+    }
+
+    #[cfg(any(feature = "shacl", feature = "shex"))]
+    fn fork_detached(&self, snap: &crate::store::Snapshot) -> Result<Self> {
+        Ok(match self {
+            #[cfg(feature = "shacl")]
+            Self::Shacl(guard) => Self::Shacl(
+                guard
+                    .fork_detached(snap)
+                    .map_err(crate::catalog::component)?,
+            ),
+            #[cfg(feature = "shex")]
+            Self::Shex(guard) => Self::Shex(
+                guard
+                    .fork_detached(snap)
+                    .map_err(crate::catalog::component)?,
+            ),
+            #[cfg(all(feature = "shacl", feature = "shex"))]
+            Self::Combined(guard) => Self::Combined(guard.fork(snap)?),
+        })
+    }
+
+    pub(crate) fn fork_for_store(&self, store: &Store) -> Result<Self> {
+        #[cfg(any(feature = "shacl", feature = "shex"))]
+        {
+            let guard = self.fork_detached(&store.snapshot())?;
+            guard.attach(store);
+            Ok(guard)
+        }
+        #[cfg(not(any(feature = "shacl", feature = "shex")))]
+        {
+            let _ = store;
+            match *self {}
         }
     }
 
@@ -78,6 +192,18 @@ impl WriteGuard {
                     schema.insert("inline".into(), json!(text));
                 }
                 json!({ "language": "shex", "config": config, "status": g.status() })
+            }
+            #[cfg(all(feature = "shacl", feature = "shex"))]
+            WriteGuard::Combined(ref guard) => {
+                let guards: Vec<_> = guard
+                    .guards()
+                    .iter()
+                    .map(|guard| {
+                        let mut j = guard.json();
+                        json!({ "language": guard.language().name(), "status": j["status"].take() })
+                    })
+                    .collect();
+                json!({ "language": "combined", "config": guard.config(), "status": { "guards": guards } })
             }
         }
     }
@@ -140,6 +266,11 @@ impl WriteGuard {
                 }
                 Err(_) => Vec::new(),
             },
+            #[cfg(all(feature = "shacl", feature = "shex"))]
+            WriteGuard::Combined(ref guard) => match serde_json::to_vec_pretty(&guard.config()) {
+                Ok(bytes) => vec![(config, bytes)],
+                Err(_) => Vec::new(),
+            },
         }
     }
 
@@ -186,6 +317,13 @@ impl WriteGuard {
                 }
                 parts.join(" · ")
             }
+            #[cfg(all(feature = "shacl", feature = "shex"))]
+            WriteGuard::Combined(ref guard) => guard
+                .guards()
+                .iter()
+                .map(Self::stats_line)
+                .collect::<Vec<_>>()
+                .join(" / "),
         }
     }
 }
@@ -222,6 +360,12 @@ pub fn install(store: &Store) -> Result<Option<WriteGuard>> {
         GuardLanguage::Shex => Ok(sparkles_shex::guard::install(store)
             .map_err(failed)?
             .map(WriteGuard::Shex)),
+        #[cfg(all(feature = "shacl", feature = "shex"))]
+        GuardLanguage::Combined => combined::install(store).map(Some),
+        #[cfg(not(all(feature = "shacl", feature = "shex")))]
+        GuardLanguage::Combined => Err(crate::Error::unsupported(
+            "combined write-time validation needs both the `shacl` and `shex` features",
+        )),
         #[allow(unreachable_patterns)]
         l => Err(crate::Error::unsupported(format!(
             "the dataset uses write-time {} validation, but Sparkles was built without the `{}` feature",

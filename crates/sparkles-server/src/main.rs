@@ -2618,39 +2618,53 @@ fn main() -> Result<()> {
 fn rejected_exit(e: anyhow::Error) -> anyhow::Error {
     if let Some(sparkles::Error::Rejected(r)) = e.downcast_ref::<sparkles::Error>() {
         eprintln!("{r}");
-        for res in r.summary.results.iter().take(10) {
-            let t = |k: &str| res[k]["value"].as_str().unwrap_or("").to_string();
-            if r.summary.language == sparkles::guard::GuardLanguage::Shex {
-                // a ShEx result: node, shape (or START) and the first failure
-                let shape = match res["shape"]["type"].as_str() {
-                    Some("start") => "START".to_string(),
-                    _ => t("shape"),
-                };
-                let reason = res["reason"].as_str().unwrap_or("");
-                eprintln!("  {} @ {shape}: {reason}", t("node"));
-                continue;
-            }
-            let msg = res["messages"][0].as_str().unwrap_or("");
-            eprintln!(
-                "  {} at {}{}",
-                t("sourceConstraintComponent")
-                    .rsplit('#')
-                    .next()
-                    .unwrap_or(""),
-                t("focusNode"),
-                if msg.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {msg}")
+        if r.summary.guards.is_empty() {
+            print_validation_findings(&r.summary);
+        } else {
+            for section in &r.summary.guards {
+                eprintln!("{} ({}):", section.language.title(), section.status.name());
+                if let Some(error) = &section.shapes_error {
+                    eprintln!("  {error}");
                 }
-            );
-        }
-        if r.summary.blocking > 10 {
-            eprintln!("  … {} more", r.summary.blocking - 10);
+                print_validation_findings(section);
+            }
         }
         std::process::exit(3);
     }
     e
+}
+
+fn print_validation_findings(s: &sparkles::guard::ValidationSummary) {
+    for res in s.results.iter().take(10) {
+        let t = |k: &str| res[k]["value"].as_str().unwrap_or("").to_string();
+        if s.language == sparkles::guard::GuardLanguage::Shex {
+            // a ShEx result: node, shape (or START) and the first failure
+            let shape = match res["shape"]["type"].as_str() {
+                Some("start") => "START".to_string(),
+                _ => t("shape"),
+            };
+            let reason = res["reason"].as_str().unwrap_or("");
+            eprintln!("  {} @ {shape}: {reason}", t("node"));
+            continue;
+        }
+        let msg = res["messages"][0].as_str().unwrap_or("");
+        eprintln!(
+            "  {} at {}{}",
+            t("sourceConstraintComponent")
+                .rsplit('#')
+                .next()
+                .unwrap_or(""),
+            t("focusNode"),
+            if msg.is_empty() {
+                String::new()
+            } else {
+                format!(": {msg}")
+            }
+        );
+    }
+    if s.blocking > 10 {
+        eprintln!("  … {} more", s.blocking - 10);
+    }
 }
 
 /// The input graphs that `sparkles infer` was given, or `None` when it was given none of

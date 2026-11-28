@@ -819,7 +819,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("queries.json", 1),
     ds("mappings.json", 1),
     ds("algo.json", 2),
-    ds("validation.json", 3),
+    ds("validation.json", 4),
     ds("validation-status.json", 1),
     ds("text.json", 1),
     ds("text.pending.json", 1),
@@ -1098,15 +1098,26 @@ fn registered(name: &str) -> &'static SettingsFile {
 }
 
 fn settings_max_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
-    // Validation format 3 is specific to ShEx's verified schema copies. SHACL
-    // keeps its format 1/2 contract, including files without a language member.
-    if s.name == "validation.json"
-        && v.get("language").and_then(serde_json::Value::as_str) != Some("shex")
-    {
-        2
-    } else {
-        s.writes
+    if s.name != "validation.json" {
+        return s.writes;
     }
+    if v.get("guards").is_some() {
+        return 4;
+    }
+    if v.get("language").and_then(serde_json::Value::as_str) == Some("shex") {
+        if let Some(schema) = v.get("schema")
+            && schema
+                .get("graphs")
+                .is_some_and(serde_json::Value::is_array)
+            && ["file", "inline"]
+                .into_iter()
+                .any(|key| schema.get(key).is_some_and(serde_json::Value::is_string))
+        {
+            return 4;
+        }
+        return 3;
+    }
+    2
 }
 
 /// The version a settings file's content is stamped with. It is the highest version
@@ -1541,7 +1552,7 @@ mod tests {
     #[test]
     fn validation_formats_are_language_specific() {
         use serde_json::json;
-        assert_eq!(settings_file("validation.json").unwrap().writes, 3);
+        assert_eq!(settings_file("validation.json").unwrap().writes, 4);
         for language in [None, Some("shacl"), Some("shex")] {
             let mut value = json!({});
             if let Some(language) = language {
@@ -1569,6 +1580,24 @@ mod tests {
                     assert!(matches!(result, Err(Error::Unsupported(_))));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn validation_format_four_is_reserved_for_composition() {
+        use serde_json::json;
+        for mut cfg in [
+            json!({"guards": [{"language": "shacl"}, {"language": "shex"}]}),
+            json!({"language": "shex", "schema": {"graphs": ["urn:schema"], "file": "validation-schema.json"}}),
+        ] {
+            stamp_settings("validation.json", &mut cfg);
+            assert_eq!(cfg["format"], 4);
+            assert!(check_settings("validation.json", &cfg).is_ok());
+            cfg["format"] = json!(5);
+            assert!(matches!(
+                check_settings("validation.json", &cfg),
+                Err(Error::Unsupported(_))
+            ));
         }
     }
 

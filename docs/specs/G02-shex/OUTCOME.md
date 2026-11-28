@@ -56,7 +56,7 @@ third-party crates were added.
 * Server flags for the import limits, and CLI `--outbound-*` flags for imports, are
   deferred. The import-limit flags came later. `--shex-max-imports`,
   `--shex-max-import-mb` and `--shex-import-timeout` apply to `serve`, `shex validate`
-  and `validation`. The CLI `--outbound-*` flags for imports are still open.
+  and `validation`. The CLI `--outbound-*` flags came with [item 54](#guards-schema-sources-and-cli-controls).
 
 **Chosen during implementation** (open to revision).
 * The SHACL `Sparkles-Validation` header is unchanged, and ShEx adds `lang=shex`.
@@ -341,33 +341,30 @@ compaction. It differs from the design above in where and when it writes.
   it, since it carries a digest of the copy it was written for. The gap is recorded under
   the follow-ups of [C10](../C10-write-time-validation.md).
 
-**Guards, schema sources and CLI controls** (item 54, Tier 5,
-[ROADMAP](../../ROADMAP.md)).
+#### Guards, schema sources and CLI controls
 
-* **SHACL and ShEx guards on one dataset.** `validation.json` holds one `language`
-  (`GuardLanguage` in `crates/sparkles-core/src/guard.rs`). It becomes a list of
-  guards, each with its own language, schema, mode and baseline; the single-guard form
-  stays valid and is read as a list of one. A write runs each guard on the same pending
-  state, in the listed order, and is rejected if any `reject` guard rejects; the
-  report holds one section per guard. The incremental paths are per guard, and a bulk
-  write's fallback applies to each. Metrics already carry the language label.
-* **A schema in graphs merged with a file.** `schema.graphs` and a copied schema file
-  exclude each other today. Both may be given: the file's ShExC or ShExJ is compiled
-  with the graphs' ShExR as one schema, labels from either may refer to the other, and
-  a label defined in both is an error at configuration time and at any write that
-  changes a schema graph. Imports stay refused for the graph part only.
-* **CLI outbound controls.** `sparkles shex validate` builds its import policy in
-  `shex_cmd.rs` with `allow_private: true` and the default outbound settings, and the
-  Outcome lists the `--outbound-*` flags as open. The command flattens the
-  server's `OutboundArgs` (`crates/sparkles-server/src/outbound.rs`:
-  `--outbound-allow-private` or `--outbound-block-private`, `--outbound-allow`,
-  `--outbound-timeout`, `--outbound-max-mb` and the per-request limits) and builds its
-  import policy from them. The local default stays `allow_private: true`, so existing
-  invocations keep working, and `--outbound-block-private` refuses imports from
-  private addresses.
+Item 54 delivers an ordered format 4 configuration with one SHACL and one ShEx guard.
+The two guards validate the same candidate without short-circuiting on findings. A
+rejection prevents publication and discards both guards' staged state. Each guard
+keeps its own mode, baseline policy, report limit and incremental state. Per-language
+reports and metrics use the configuration's languages. Combined guards keep their
+source copies inline in `validation.json` for atomic replacement. They rebuild their
+in-memory baselines as writes resume after a restart.
+
+A standalone ShEx guard with both a copied file and named graphs also uses format 4.
+The file closes over its imports before being copied. On graph edits, the guard
+compiles the retained file declarations with the current ShExR graphs. References
+can cross sources in either direction. A duplicated declaration or two definitions
+of `START` is an error. A file source and its closed copy can each hold up to 16 MiB.
+Graph source materialization is bounded by 100,000 triples and 16 MiB of term data.
+
+`sparkles shex validate` and `sparkles validation` use the local command outbound
+policy. Both accept address controls, a destination allowlist, and per-transfer and
+per-command time and byte caps. The default for local commands allows private
+addresses, and `--outbound-block-private` applies the server's private-address policy.
 
 #### Interop and query surfaces workstream
 
 These phases belong to [ROADMAP](../../ROADMAP.md) item 465, the interop and query surfaces workstream. Each phase gets its own numbered item when it is ready to start.
 
-**Remaining ShEx conformance cases.** Resolve lexical blank-node labels in shape maps, infinities, relative labels, `includeWithCardinality` and the coherence rule, or list each as a boundary. The 99.9% figure hides 42 skipped tests. It depends on item 54.
+**Remaining ShEx conformance cases.** Resolve lexical blank-node labels in shape maps, infinities, relative labels, `includeWithCardinality` and the coherence rule, or list each as a boundary. The 99.9% figure hides 42 skipped tests. It follows item 54.

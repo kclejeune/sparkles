@@ -193,7 +193,7 @@ fn guard_json(ds: &Dataset) -> J {
     match ds.validation.read().as_ref() {
         Some(g) => json!({
             "language": g.language().name(),
-            "mode": g.json()["config"]["mode"],
+            "mode": g.mode(),
         }),
         None => J::Null,
     }

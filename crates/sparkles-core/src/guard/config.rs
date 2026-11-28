@@ -43,7 +43,8 @@ pub const TYPING_FILE: &str = "validation-typing.bin";
 pub use crate::INFERRED_GRAPH;
 
 /// The language of `<root>/validation.json`: `None` without a file, SHACL when the file
-/// has no `language` (format 1). A file that is not JSON, or names another language, is
+/// has no `language` (format 1), or combined when it holds a format 4 `guards` list.
+/// A file that is not JSON, or names another language, is
 /// an error (the store keeps refusing writes until it is fixed).
 pub fn config_language(root: &Path) -> Result<Option<GuardLanguage>> {
     let bytes = match std::fs::read(root.join(CONFIG_FILE)) {
@@ -55,13 +56,23 @@ pub fn config_language(root: &Path) -> Result<Option<GuardLanguage>> {
         .map_err(|e| Error::Invalid(format!("{CONFIG_FILE}: {e}")))?;
     // a version newer than this build writes is refused as unsupported
     crate::formats::check_settings(CONFIG_FILE, &j)?;
-    match j.get("language") {
-        None => Ok(Some(GuardLanguage::Shacl)),
-        Some(l) => serde_json::from_value(l.clone()).map(Some).map_err(|_| {
-            Error::Invalid(format!(
-                "{CONFIG_FILE}: unknown language {l} (\"shacl\" or \"shex\")"
-            ))
-        }),
+    if j.get("guards").is_some() {
+        if j.get("format").and_then(serde_json::Value::as_u64) != Some(4)
+            || j.get("language").is_some()
+        {
+            return Err(Error::invalid(
+                "validation.json: guards requires format 4 and no top-level language",
+            ));
+        }
+        return Ok(Some(GuardLanguage::Combined));
+    }
+    match j.get("language").and_then(serde_json::Value::as_str) {
+        None if j.get("language").is_none() => Ok(Some(GuardLanguage::Shacl)),
+        Some("shacl") => Ok(Some(GuardLanguage::Shacl)),
+        Some("shex") => Ok(Some(GuardLanguage::Shex)),
+        _ => Err(Error::invalid(format!(
+            "{CONFIG_FILE}: language must be shacl or shex"
+        ))),
     }
 }
 
@@ -84,6 +95,16 @@ pub fn remove_files(root: &Path, keep: &[&str]) -> Result<()> {
 /// directory).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     crate::store::write_atomic(path, bytes)
+}
+
+/// Publish the runtime guard after its configuration is visible on disk, while the
+/// caller still holds the writer. If directory sync fails after the rename, the
+/// running store still enforces the configuration visible to readers.
+#[doc(hidden)]
+pub fn write_config(root: &Path, bytes: &[u8], publish: impl FnOnce()) -> Result<()> {
+    let path = root.join(CONFIG_FILE);
+    crate::fsutil::write_atomic_via_then(&path, &path.with_extension("tmp"), bytes, publish)?;
+    Ok(())
 }
 
 /// The SHA-256 of `b` in lowercase hex (`sha256` of a copied shapes or schema file).

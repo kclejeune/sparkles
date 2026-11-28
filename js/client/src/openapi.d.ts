@@ -6651,6 +6651,12 @@ export interface components {
             inferences: "copy" | "drop";
             name: string;
         };
+        /** @description A format 4 list with the guards in evaluation order. */
+        CombinedValidationConfig: {
+            /** @constant */
+            format: 4;
+            guards: components["schemas"]["ValidationConfig"][];
+        };
         Commit: {
             bulk: boolean;
             /** @description Omitted when the caller's grants cover only part of the dataset. */
@@ -14038,12 +14044,12 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** @description A write-time validation configuration, SHACL or ShEx. */
+        /** @description A standalone SHACL or ShEx guard. */
         ValidationConfig: {
             /** @enum {string} */
             baseline?: "strict" | "grandfather";
             dataGraph?: ("default" | "union") | string[];
-            /** @description 2 for stored SHACL configurations and 3 for stored ShEx configurations. ShEx format 2 is also read. */
+            /** @description 2 for stored SHACL, 3 for standalone ShEx with one source kind, or 4 for ShEx with a file and graphs. Earlier versions remain readable. */
             format?: number;
             includeInferences?: boolean;
             /** @enum {string} */
@@ -14051,7 +14057,7 @@ export interface components {
             /** @enum {string} */
             mode: "reject" | "warn" | "off";
             reportLimit?: number;
-            /** @description ShEx: `{inline, format?, base?, source?}` or `{graphs, prefixes?, base?}`. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`. */
+            /** @description ShEx: set `inline`, `graphs`, or both. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`. Guards in a list keep the copy inline. */
             schema?: {
                 [key: string]: unknown;
             };
@@ -14068,9 +14074,54 @@ export interface components {
             timeoutSeconds?: number;
             updated?: string;
         };
+        /** @description A standalone guard or a format 4 list of guards. */
+        ValidationConfigRequest: {
+            /** @enum {string} */
+            baseline?: "strict" | "grandfather";
+            dataGraph?: ("default" | "union") | string[];
+            /** @description 2 for stored SHACL, 3 for standalone ShEx with one source kind, or 4 for ShEx with a file and graphs. Earlier versions remain readable. */
+            format?: number;
+            guards?: components["schemas"]["ValidationConfig"][];
+            includeInferences?: boolean;
+            /** @enum {string} */
+            language?: "shacl" | "shex";
+            /** @enum {string} */
+            mode?: "reject" | "warn" | "off";
+            reportLimit?: number;
+            /** @description ShEx: set `inline`, `graphs`, or both. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`. Guards in a list keep the copy inline. */
+            schema?: {
+                [key: string]: unknown;
+            };
+            shapeMap?: string | {
+                node: string;
+                shape: string;
+            }[];
+            /** @description SHACL: `{graphs?, inline?, format?}`, stored with `file` and `sha256`. */
+            shapes?: {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            threshold?: "violation" | "warning" | "info";
+            timeoutSeconds?: number;
+            updated?: string;
+        } | components["schemas"]["ValidationConfig"] | components["schemas"]["CombinedValidationConfig"];
         /** @description `{language, config, status}`, or `{config: null}` without validation. */
         ValidationStatus: {
             config: null;
+            unionDefaultGraph?: boolean;
+        } | {
+            config: components["schemas"]["CombinedValidationConfig"];
+            /** @constant */
+            language: "combined";
+            status: {
+                guards: {
+                    /** @enum {string} */
+                    language: "shacl" | "shex";
+                    status: {
+                        [key: string]: unknown;
+                    };
+                }[];
+            };
             unionDefaultGraph?: boolean;
         } | {
             config: components["schemas"]["ValidationConfig"];
@@ -14129,6 +14180,7 @@ export interface components {
             fallback?: string;
             /** @description The focus nodes an incremental validation validated. */
             focusNodes?: number;
+            guards?: components["schemas"]["ValidationSummary"][];
             /** @description Rejections: the commit the write ran against. */
             head?: number;
             /** @description Grandfather mode: the blocking results the write introduced. */
@@ -14136,7 +14188,7 @@ export interface components {
             /** @description Rejections: the kind of the commit the write would have made. */
             kind?: string;
             /** @enum {string} */
-            language: "shacl" | "shex";
+            language: "shacl" | "shex" | "combined";
             limit: number;
             millis: number;
             /** @enum {string} */
@@ -26647,7 +26699,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ValidationConfig"];
+                "application/json": components["schemas"]["ValidationConfigRequest"];
             };
         };
         responses: {

@@ -360,18 +360,13 @@ mod enabled {
         let p = params(&st, &ds, &query, &headers)?;
         let at = super::super::history::at_param(&query)?;
         let guard = if p.guard {
-            match ds.validation.read().clone() {
-                Some(crate::write_validation::Validation::Shex(g)) => Some(g),
-                #[cfg(feature = "shacl")]
-                Some(crate::write_validation::Validation::Shacl(_)) => {
-                    return Err(err(
-                        StatusCode::BAD_REQUEST,
-                        format!(
+            match ds.validation.read().as_ref() {
+                Some(g) => Some(g.shex().cloned().ok_or_else(|| {
+                    err(StatusCode::BAD_REQUEST, format!(
                             "the write-time guard of /{} validates SHACL: use /{}/shacl?shapes=guard",
                             ds.name, ds.name
-                        ),
-                    ));
-                }
+                        ))
+                })?),
                 None => {
                     return Err(err(
                         StatusCode::NOT_FOUND,

@@ -1267,6 +1267,9 @@ sparkles shacl parse shapes.ttl > shapes.shaclc              # Turtle to SHACLC;
 sparkles shex parse people.shex --out shexr > people.ttl     # ShExC to ShExR, ShExJ or ShExC
 sparkles validation --loc db --mode reject --shapes shapes.ttl
 sparkles validation --loc db --mode warn --schema people.shex --shape-map '{FOCUS a ex:Person}@ex:PersonShape'
+sparkles validation --loc db --mode reject --lang combined --shapes shapes.ttl \
+  --schema people.shex --schema-graph urn:schemas:shared \
+  --shape-map 'PREFIX ex: <http://example.org/> {FOCUS a ex:Person}@ex:PersonShape'
 sparkles validation --loc db --status                        # the configuration and its counts
 sparkles validation --loc db --off
 ```
@@ -1275,7 +1278,17 @@ Both commands read the default graph unless `--graph` names another, and include
 materialized inferences unless `--no-inferences` is given. `shex validate` also takes a
 shape map file (`--map`) or a single node (`--node`), and Jena's flag names as aliases.
 `--shex-max-imports` and `--shex-max-import-mb` bound what a schema's imports may read,
-64 schemas and 16 MiB by default, as on the server.
+64 schemas and 16 MiB by default, as on the server. Both `shex validate` and
+`validation` accept the [outbound flags](#outbound-requests-service-and-load) for HTTP
+imports. The local commands allow private destinations by default. Use
+`--outbound-block-private` for the server's private-address policy, and repeat
+`--outbound-allow` to restrict destinations. `shex parse` prints schemas without
+resolving their imports.
+
+`validation --lang combined` uses one mode and baseline policy for both guards. Use
+a [format 4 configuration](API.md#write-time-validation) to set these independently.
+`--schema-graph` may accompany `--schema` or supply the whole ShEx schema. Load the
+named graph as ShExR before enabling the guard.
 `validation --grandfather` blocks only the results a write introduces, so a guard in
 `reject` mode can be installed on data that does not conform.
 

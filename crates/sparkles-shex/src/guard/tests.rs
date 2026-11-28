@@ -1497,7 +1497,7 @@ fn unusable_schema_graphs_are_refused() {
         serde_json::json!({"language": "shex", "mode": "warn",
             "schema": {"graphs": []}, "shapeMap": MAP}),
         serde_json::json!({"language": "shex", "mode": "warn",
-            "schema": {"graphs": [SCHEMA_GRAPH], "inline": SCHEMA}, "shapeMap": MAP}),
+            "schema": {"graphs": [SCHEMA_GRAPH], "inline": SCHEMA, "file": SHEX_SCHEMA_SHEXC_FILE}, "shapeMap": MAP}),
         serde_json::json!({"language": "shex", "mode": "warn",
             "schema": {"graphs": ["not an iri"]}, "shapeMap": MAP}),
         serde_json::json!({"language": "shex", "mode": "warn",
@@ -2102,4 +2102,146 @@ fn reused_schema_copy_is_verified_against_the_stored_configuration() {
             &(g.clone() as Arc<dyn CommitGuard>)
         ));
     }
+}
+
+#[test]
+fn graph_and_file_schema_resolve_both_directions_and_keep_the_import_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let store = open(&root);
+    upd(
+        &store,
+        "INSERT DATA {
+        <urn:x> <urn:p> <urn:y> .
+        GRAPH <urn:schema> {
+            [] a <http://www.w3.org/ns/shex#Schema> ;
+                <http://www.w3.org/ns/shex#shapes> <urn:G> .
+            <urn:G> a <http://www.w3.org/ns/shex#ShapeDecl> ;
+                <http://www.w3.org/ns/shex#shapeExpr> <urn:Imported> .
+        }
+    }",
+    )
+    .unwrap();
+    let mut config = cfg(
+        "reject",
+        "PREFIX ex: <urn:> IMPORT <urn:common> START = @ex:F ex:F { ex:p @ex:G }",
+        "<urn:x>@START",
+    );
+    config.schema.graphs = Some(vec!["urn:schema".into()]);
+    let imported = Schema::parse_shexc("<urn:Imported> IRI", None).unwrap();
+    let resolver = FileResolver {
+        inline: [("urn:common".to_string(), imported)].into(),
+        ..Default::default()
+    };
+    installed(set_config(&store, Some(config.clone()), &resolver).unwrap());
+    let file = stored_config(&root);
+    assert_eq!(file["format"], 4);
+    let copy = std::fs::read_to_string(root.join(SHEX_SCHEMA_SHEXJ_FILE)).unwrap();
+    assert!(copy.contains("urn:Imported") && !copy.contains("imports"));
+    assert!(!copy.contains(r#""id":"urn:G""#));
+    drop(store);
+
+    let store = open(&root);
+    let reopened = install(&store).unwrap().unwrap();
+    assert_eq!(reopened.status().shape_count, 3);
+    let head = store.snapshot().commit;
+    for (extra, error) in [
+        ("[] <http://www.w3.org/ns/shex#unused> <urn:x> .", None),
+        (
+            "<urn:G> <http://www.w3.org/ns/shex#shapeExpr> <urn:Missing> .",
+            Some("more than one sx:shapeExpr"),
+        ),
+    ] {
+        let update = format!("INSERT DATA {{ GRAPH <urn:schema> {{ {extra} }} }}");
+        match error {
+            Some(error) => {
+                let Error::Rejected(e) = upd(&store, &update).unwrap_err() else {
+                    panic!()
+                };
+                assert!(e.summary.shapes_error.unwrap().contains(error));
+            }
+            None => {
+                assert_eq!(
+                    summary(&upd(&store, &update).unwrap()).strategy,
+                    Strategy::Full
+                );
+            }
+        }
+    }
+    let duplicate = "PREFIX sx: <http://www.w3.org/ns/shex#>
+        INSERT { GRAPH <urn:schema> { ?schema sx:shapes <urn:F> . <urn:F> a sx:Shape . } }
+        WHERE { GRAPH <urn:schema> { ?schema a sx:Schema } }";
+    let Error::Rejected(e) = upd(&store, duplicate).unwrap_err() else {
+        panic!()
+    };
+    assert!(
+        e.summary
+            .shapes_error
+            .unwrap()
+            .contains("duplicate shape label")
+    );
+    let graph_import = "PREFIX sx: <http://www.w3.org/ns/shex#>
+        INSERT { GRAPH <urn:schema> { ?schema sx:imports <urn:common> } }
+        WHERE { GRAPH <urn:schema> { ?schema a sx:Schema } }";
+    let Error::Rejected(e) = upd(&store, graph_import).unwrap_err() else {
+        panic!()
+    };
+    assert!(e.summary.shapes_error.unwrap().contains("cannot import"));
+    let second_start = "PREFIX sx: <http://www.w3.org/ns/shex#>
+        INSERT { GRAPH <urn:schema> { ?schema sx:start <urn:G> } }
+        WHERE { GRAPH <urn:schema> { ?schema a sx:Schema } }";
+    let Error::Rejected(e) = upd(&store, second_start).unwrap_err() else {
+        panic!()
+    };
+    assert!(
+        e.summary
+            .shapes_error
+            .unwrap()
+            .contains("both define START")
+    );
+    assert_eq!(store.snapshot().commit, head + 1);
+
+    // Reusing the sealed copy needs neither the original file nor the resolver.
+    config.schema.inline = None;
+    config.schema.file = Some(SHEX_SCHEMA_SHEXJ_FILE.into());
+    installed(set_config(&store, Some(config), &NoImports).unwrap());
+    let change = "PREFIX sx: <http://www.w3.org/ns/shex#>
+        DELETE DATA { GRAPH <urn:schema> { <urn:G> sx:shapeExpr <urn:Imported> } };
+        INSERT DATA { GRAPH <urn:schema> { <urn:G> sx:shapeExpr [ a sx:NodeConstraint; sx:nodeKind sx:literal ] } }";
+    assert!(matches!(upd(&store, change), Err(Error::Rejected(_))));
+    let bypass = QueryOptions {
+        write: WriteOptions {
+            bypass_validation: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    update(&store, change, &bypass).unwrap();
+    // The formerly conforming state is now invalid under the newly stored schema.
+    assert!(matches!(
+        upd(&store, "INSERT DATA { <urn:other> <urn:other> 1 }"),
+        Err(Error::Rejected(_))
+    ));
+}
+
+#[test]
+fn composed_schema_file_is_bounded_before_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.shex");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(MAX_SCHEMA_BYTES as u64 + 1)
+        .unwrap();
+    assert!(
+        read_schema_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("schema text exceeds")
+    );
+    let mut config = cfg("warn", &" ".repeat(MAX_SCHEMA_BYTES + 1), MAP);
+    config.schema.graphs = Some(vec!["urn:schema".into()]);
+    let store = Store::in_memory(StoreOptions::default());
+    let error = set_config(&store, Some(config), &NoImports).err().unwrap();
+    assert!(error.to_string().contains("schema text exceeds"));
+    assert!(store.guard().is_none());
 }

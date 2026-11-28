@@ -3830,7 +3830,7 @@ fn settings(p: &mut Paths) {
         "write-time validation",
         "WriteValidation",
         "ValidationStatus",
-        "ValidationConfig",
+        "ValidationConfigRequest",
         "write-time-validation",
     );
     setting(

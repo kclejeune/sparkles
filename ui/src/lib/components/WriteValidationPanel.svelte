@@ -118,7 +118,9 @@
     };
   });
 
-  const v = $derived(loaded?.kind === 'on' ? loaded.v : null);
+  const installed = $derived(loaded?.kind === 'on' ? loaded.v : null);
+  const combined = $derived(installed?.language === 'combined' ? installed : null);
+  const v = $derived(installed?.language !== 'combined' ? installed : null);
   const st = $derived(v?.status ?? null);
   const badge = $derived(st ? baselineBadge(st.baseline) : null);
   const iri = (s: string) => {
@@ -139,10 +141,12 @@
     <h2>Write-time validation</h2>
     <span class="spacer"></span>
     {#if canEdit && loaded && loaded.kind !== 'unsupported'}
-      <button class="btn sm" disabled={disabling} onclick={() => (editing = !editing)}
-        >{editing ? 'Cancel' : v ? 'Configure' : 'Configure validation'}</button
-      >
-      {#if v}<button class="btn ghost sm" disabled={disabling} onclick={disable}
+      {#if !combined}
+        <button class="btn sm" disabled={disabling} onclick={() => (editing = !editing)}
+          >{editing ? 'Cancel' : v ? 'Configure' : 'Configure validation'}</button
+        >
+      {/if}
+      {#if installed}<button class="btn ghost sm" disabled={disabling} onclick={disable}
           >{disabling ? 'Disabling…' : 'Disable'}</button
         >{/if}
     {/if}
@@ -171,6 +175,21 @@
         Writes are not validated.{#if canEdit}
           Configure validation to warn about or reject invalid writes.{/if}
       </p>
+    {:else if combined}
+      <dl class="facts">
+        {#each combined.status.guards as section (section.language)}
+          <div>
+            <dt>{section.language === 'shex' ? 'ShEx' : 'SHACL'}</dt>
+            <dd>
+              {section.status.mode} · {fmtInt(section.status.shapeCount)} shapes
+              {#if section.status.baseline?.conforms != null}
+                · {fmtInt(section.status.baseline.blocking)} blocking at commit
+                {section.status.baseline.commit}
+              {/if}
+            </dd>
+          </div>
+        {/each}
+      </dl>
     {:else if v && st}
       <dl class="facts">
         <div>
@@ -289,7 +308,7 @@
         </div>
       {/if}
     {/if}
-    {#if editing && canEdit && loaded && loaded.kind !== 'unsupported'}
+    {#if editing && !combined && canEdit && loaded && loaded.kind !== 'unsupported'}
       {#key target}
         <ValidationConfigForm
           {target}

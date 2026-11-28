@@ -1315,3 +1315,66 @@ async fn view_metadata_hides_counts_from_narrower_callers() {
         assert_eq!(r.json()["views"][0].get("rows").is_some(), sees, "{user}");
     }
 }
+
+#[cfg(all(feature = "shacl", feature = "shex"))]
+#[tokio::test]
+async fn restricted_write_hides_combined_guard_results() {
+    let s = server();
+    let ds = s.state.datasets().get("graphs").cloned().unwrap();
+    ds.dataset
+        .update("INSERT DATA { GRAPH <http://ex/a/1> { <http://ex/a1> <urn:required> 1 } }")
+        .unwrap();
+    let cfg = serde_json::json!({
+        "format": 4,
+        "guards": [
+            {"language":"shacl", "mode":"reject", "baseline":"grandfather", "dataGraph":"union",
+             "shapes":{"inline":"@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetClass <urn:C> ; sh:property [ sh:path <urn:absent> ; sh:minCount 1 ] ."}},
+            {"language":"shex", "mode":"warn", "dataGraph":"union",
+             "schema":{"inline":"<urn:HiddenShape> { <http://ex/q> @<urn:Related> } <urn:Related> { <urn:required> . }"},
+             "shapeMap":"{FOCUS <http://ex/p> \"secret fox\"}@<urn:HiddenShape>"}
+        ]
+    });
+    let configs = sparkles::write_guard::parse_configs(cfg).unwrap();
+    ds.dataset
+        .validation()
+        .guard()
+        .set_guards(configs, &sparkles_shex::NoImports)
+        .unwrap();
+    let query = "DELETE DATA { GRAPH <http://ex/a/1> { <http://ex/a1> <urn:required> 1 } };
+        INSERT DATA { GRAPH <http://ex/a/1> { <urn:n> a <urn:C> } }";
+    let request = |user: &'static str| {
+        let app = s.app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/graphs/update",
+                &[
+                    ("authorization", &b(user)),
+                    ("content-type", "application/sparql-update"),
+                    ("accept", "text/turtle"),
+                ],
+                query,
+            )
+            .await
+        }
+    };
+    let restricted = request("grad").await;
+    assert_eq!(
+        restricted.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        restricted.text()
+    );
+    assert!(restricted.json()["validation"].is_null());
+    assert!(!restricted.text().contains("HiddenShape"));
+    assert!(!restricted.text().contains("http://ex/b1"));
+
+    let unrestricted = request("gfull").await;
+    assert_eq!(unrestricted.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let report = unrestricted.json();
+    assert_eq!(
+        report["validation"]["guards"][1]["results"][0]["node"]["value"], "http://ex/b1",
+        "{report}"
+    );
+}

@@ -19,8 +19,8 @@ pub struct ValidationArgs {
     /// reject or warn
     #[arg(long, value_parser = ["reject", "warn"])]
     pub mode: Option<String>,
-    /// the shape language: shacl, or shex (the default with --schema or --shape-map)
-    #[arg(long, value_parser = ["shacl", "shex"])]
+    /// the shape language: shacl, shex, or combined
+    #[arg(long, value_parser = ["shacl", "shex", "combined"])]
     pub lang: Option<String>,
     /// shapes graph of the dataset (repeatable; SHACL)
     #[arg(long)]
@@ -39,8 +39,8 @@ pub struct ValidationArgs {
     #[arg(long, value_parser = ["shexc", "shexj", "shexr"], requires = "schema")]
     pub schema_format: Option<String>,
     /// a named graph of the dataset that holds the schema in ShExR (repeatable; ShEx),
-    /// read from the state each write leaves instead of a copied file
-    #[arg(long, value_name = "IRI", conflicts_with = "schema")]
+    /// read from the state each write leaves and combined with --schema when given
+    #[arg(long, value_name = "IRI")]
     pub schema_graph: Vec<String>,
     /// a prefix the shape map may use with --schema-graph, as `ex=http://ex.org/`
     /// (repeatable)
@@ -74,6 +74,8 @@ pub struct ValidationArgs {
     pub format: String,
     #[command(flatten)]
     pub imports: crate::shex_cmd::ImportArgs,
+    #[command(flatten)]
+    pub outbound: crate::outbound::OutboundArgs,
 }
 
 /// The language a `--mode` asks for (`--lang`, or ShEx when `--schema` or `--shape-map`
@@ -82,6 +84,7 @@ fn language(a: &ValidationArgs) -> Result<GuardLanguage> {
     let shex_flags = a.schema.is_some() || a.shape_map.is_some() || !a.schema_graph.is_empty();
     let lang = match a.lang.as_deref() {
         Some("shex") => GuardLanguage::Shex,
+        Some("combined") => GuardLanguage::Combined,
         Some(_) => GuardLanguage::Shacl,
         None if shex_flags => GuardLanguage::Shex,
         None => GuardLanguage::Shacl,
@@ -102,6 +105,7 @@ fn language(a: &ValidationArgs) -> Result<GuardLanguage> {
                 bail!("--threshold is for SHACL: every nonconformant ShEx association blocks");
             }
         }
+        GuardLanguage::Combined => {}
     }
     Ok(lang)
 }
@@ -132,6 +136,20 @@ pub fn run(a: ValidationArgs, opts: StoreOptions) -> Result<()> {
     let outcome = match language(&a)? {
         GuardLanguage::Shacl => set_shacl(&ds, &a, mode)?,
         GuardLanguage::Shex => set_shex(&ds, &a, mode)?,
+        #[cfg(all(feature = "shacl", feature = "shex"))]
+        GuardLanguage::Combined => {
+            use sparkles::write_guard::GuardConfig;
+            let shacl = shacl_config(&a, mode)?;
+            let (shex, resolver) = shex_config(&a, mode)?;
+            ds.validation().guard().set_guards(
+                vec![GuardConfig::Shacl(shacl), GuardConfig::Shex(shex)],
+                &resolver,
+            )?
+        }
+        #[cfg(not(all(feature = "shacl", feature = "shex")))]
+        GuardLanguage::Combined => {
+            bail!("combined validation needs both the `shacl` and `shex` features")
+        }
     };
     let summary = match outcome {
         GuardOutcome::Installed(s) => Ok(s),
@@ -181,6 +199,22 @@ fn status(ds: &Dataset, format: &str) -> Result<()> {
         return Ok(());
     };
     let j = v.json();
+    if v.language() == GuardLanguage::Combined {
+        println!(
+            "validation {}",
+            crate::write_validation::mode_name(v.mode())
+        );
+        for section in j["status"]["guards"].as_array().into_iter().flatten() {
+            let status = &section["status"];
+            println!(
+                "{} {}: {} shapes",
+                section["language"].as_str().unwrap_or_default(),
+                status["mode"].as_str().unwrap_or_default(),
+                status["shapeCount"].as_u64().unwrap_or(0),
+            );
+        }
+        return Ok(());
+    }
     println!(
         "validation {}",
         j["config"]["mode"].as_str().unwrap_or_default()
@@ -207,6 +241,14 @@ fn set_shacl(
     a: &ValidationArgs,
     mode: sparkles::guard::GuardMode,
 ) -> Result<GuardOutcome> {
+    Ok(ds.validation().guard().set_shacl(shacl_config(a, mode)?)?)
+}
+
+#[cfg(feature = "shacl")]
+fn shacl_config(
+    a: &ValidationArgs,
+    mode: sparkles::guard::GuardMode,
+) -> Result<sparkles_shacl::guard::ValidationConfig> {
     use sparkles_shacl::guard::{self, ShapesSource, ValidationConfig};
     let threshold: sparkles::guard::Severity = serde_json::from_value(serde_json::json!(
         a.threshold.as_deref().unwrap_or("violation")
@@ -228,7 +270,7 @@ fn set_shacl(
             shapes.format = Some(syntax.media_type().to_string());
         }
     }
-    let cfg = ValidationConfig {
+    Ok(ValidationConfig {
         format: 2,
         language: Some(GuardLanguage::Shacl),
         mode,
@@ -244,8 +286,7 @@ fn set_shacl(
         timeout_seconds: a.timeout,
         report_limit: a.report_limit,
         updated: None,
-    };
-    Ok(ds.validation().guard().set_shacl(cfg)?)
+    })
 }
 
 #[cfg(not(feature = "shacl"))]
@@ -263,29 +304,69 @@ fn set_shex(
     a: &ValidationArgs,
     mode: sparkles::guard::GuardMode,
 ) -> Result<GuardOutcome> {
+    let (cfg, resolver) = shex_config(a, mode)?;
+    Ok(ds.validation().guard().set_shex(cfg, &resolver)?)
+}
+
+#[cfg(feature = "shex")]
+fn shex_config(
+    a: &ValidationArgs,
+    mode: sparkles::guard::GuardMode,
+) -> Result<(
+    sparkles_shex::guard::ShexValidationConfig,
+    sparkles_shex::FileResolver,
+)> {
     use sparkles_shex::guard::{
         self, CONFIG_FORMAT, MapSource, SchemaSource, ShexValidationConfig,
     };
     let Some(map) = &a.shape_map else {
         bail!("give --schema FILE (or --schema-graph IRI) and --shape-map MAP");
     };
-    if !a.schema_graph.is_empty() {
-        let mut prefixes = std::collections::BTreeMap::new();
-        for p in &a.schema_prefix {
-            let (k, v) = p
-                .split_once('=')
-                .with_context(|| format!("--schema-prefix {p}: expected PREFIX=IRI"))?;
-            prefixes.insert(k.to_string(), v.to_string());
-        }
-        let cfg = ShexValidationConfig {
+    if a.schema.is_none() && a.schema_graph.is_empty() {
+        bail!("give --schema FILE, --schema-graph IRI, or both");
+    }
+    let mut schema = SchemaSource {
+        graphs: (!a.schema_graph.is_empty()).then(|| a.schema_graph.clone()),
+        ..Default::default()
+    };
+    for p in &a.schema_prefix {
+        let (k, v) = p
+            .split_once('=')
+            .with_context(|| format!("--schema-prefix {p}: expected PREFIX=IRI"))?;
+        schema.prefixes.insert(k.to_string(), v.to_string());
+    }
+    let mut dirs = Vec::new();
+    if let Some(path) = &a.schema {
+        let abs = std::path::absolute(path)?;
+        schema.inline = Some(
+            guard::read_schema_file(&abs).with_context(|| format!("reading {}", path.display()))?,
+        );
+        schema.format =
+            a.schema_format
+                .clone()
+                .or_else(|| match path.extension().and_then(|e| e.to_str()) {
+                    Some("json" | "shexj") => Some("shexj".to_string()),
+                    Some("ttl") => Some("shexr".to_string()),
+                    _ => None,
+                });
+        schema.base = Some(sparkles_shex::resolve::file_url(&abs));
+        schema.source = Some(abs.display().to_string());
+        dirs.extend(abs.parent().map(PathBuf::from));
+    }
+    let policy = a.outbound.local_policy()?;
+    let budget = sparkles::outbound::RequestBudget::new(&policy);
+    let resolver = sparkles_shex::FileResolver {
+        dirs,
+        outbound: Some((policy, budget)),
+        limits: a.imports.limits()?,
+        ..Default::default()
+    };
+    Ok((
+        ShexValidationConfig {
             format: CONFIG_FORMAT,
             language: GuardLanguage::Shex,
             mode,
-            schema: SchemaSource {
-                graphs: Some(a.schema_graph.clone()),
-                prefixes,
-                ..Default::default()
-            },
+            schema,
             shape_map: MapSource::Compact(map.clone()),
             data_graph: data_graph(&a.data_graph),
             include_inferences: a.include_inferences,
@@ -297,62 +378,9 @@ fn set_shex(
             timeout_seconds: a.timeout,
             report_limit: a.report_limit,
             updated: None,
-        };
-        return Ok(ds
-            .validation()
-            .guard()
-            .set_shex(cfg, &sparkles_shex::NoImports)?);
-    }
-    let Some(schema) = &a.schema else {
-        bail!("give --schema FILE (or --schema-graph IRI) and --shape-map MAP");
-    };
-    let text = std::fs::read_to_string(schema).with_context(|| format!("{}", schema.display()))?;
-    let format =
-        a.schema_format
-            .clone()
-            .or_else(|| match schema.extension().and_then(|e| e.to_str()) {
-                Some("json" | "shexj") => Some("shexj".to_string()),
-                Some("ttl") => Some("shexr".to_string()),
-                _ => None,
-            });
-    // imports: relative IRIs against the schema's directory, any readable file, and
-    // http(s) with the local commands' outbound defaults
-    let policy = sparkles::outbound::OutboundPolicy {
-        allow_private: true,
-        ..Default::default()
-    };
-    let budget = sparkles::outbound::RequestBudget::new(&policy);
-    let abs = std::path::absolute(schema)?;
-    let resolver = sparkles_shex::FileResolver {
-        dirs: abs.parent().map(PathBuf::from).into_iter().collect(),
-        outbound: Some((policy, budget)),
-        limits: a.imports.limits()?,
-        ..Default::default()
-    };
-    let cfg = ShexValidationConfig {
-        format: CONFIG_FORMAT,
-        language: GuardLanguage::Shex,
-        mode,
-        schema: SchemaSource {
-            inline: Some(text),
-            format,
-            base: Some(sparkles_shex::resolve::file_url(&abs)),
-            source: Some(abs.display().to_string()),
-            ..Default::default()
         },
-        shape_map: MapSource::Compact(map.clone()),
-        data_graph: data_graph(&a.data_graph),
-        include_inferences: a.include_inferences,
-        baseline: if a.grandfather {
-            guard::BaselinePolicy::Grandfather
-        } else {
-            guard::BaselinePolicy::Strict
-        },
-        timeout_seconds: a.timeout,
-        report_limit: a.report_limit,
-        updated: None,
-    };
-    Ok(ds.validation().guard().set_shex(cfg, &resolver)?)
+        resolver,
+    ))
 }
 
 #[cfg(not(feature = "shex"))]

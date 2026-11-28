@@ -24,11 +24,17 @@ fn endpoint() -> (u16, Arc<AtomicUsize>) {
             n.fetch_add(1, Ordering::SeqCst);
             let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
             let head = read_request(&mut c);
+            let large;
             let (ctype, body) = if head.contains(" /sparql ") {
                 (
                     "application/sparql-results+json",
                     r#"{"head":{"vars":["o"]},"results":{"bindings":[{"o":{"type":"literal","value":"from the endpoint"}}]}}"#,
                 )
+            } else if head.contains(" /large.shex") {
+                large = "# comment\n".repeat(120_000);
+                ("text/shex", large.as_str())
+            } else if head.contains(" /common.shex ") {
+                ("text/shex", "<urn:Imported> { <urn:p> . }")
             } else {
                 ("text/turtle", "<urn:a> <urn:p> \"loaded\" .")
             };
@@ -167,4 +173,108 @@ fn local_load_reaches_loopback_by_default() {
         "{}",
         text(&o.stdout)
     );
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn shex_imports_use_the_same_outbound_policy_as_local_commands() {
+    let (port, conns) = endpoint();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data.ttl");
+    let schema = dir.path().join("root.shex");
+    std::fs::write(&data, "<urn:a> <urn:p> \"loaded\" .").unwrap();
+    std::fs::write(
+        &schema,
+        format!("IMPORT <http://127.0.0.1:{port}/common.shex>\nSTART = @<urn:Imported>"),
+    )
+    .unwrap();
+    let args = [
+        "shex",
+        "validate",
+        "--schema",
+        schema.to_str().unwrap(),
+        "--data",
+        data.to_str().unwrap(),
+        "--node",
+        "<urn:a>",
+    ];
+    let run = |extra: &[&str]| {
+        let mut all = args.to_vec();
+        all.extend_from_slice(extra);
+        sparkles(&all)
+    };
+    let refused = run(&["--outbound-block-private"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        text(&refused.stderr).contains("loopback address"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert_eq!(conns.load(Ordering::SeqCst), 0);
+    let refused = run(&["--outbound-allow", "192.0.2.0/24"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(conns.load(Ordering::SeqCst), 0);
+    let refused = run(&["--outbound-request-timeout", "0"]);
+    assert!(text(&refused.stderr).contains("--outbound-request-timeout"));
+    assert_eq!(conns.load(Ordering::SeqCst), 0);
+
+    let default = run(&[]);
+    assert!(default.status.success(), "{}", text(&default.stderr));
+    let allowed = run(&[
+        "--outbound-block-private",
+        "--outbound-allow",
+        "127.0.0.1",
+        "--outbound-timeout",
+        "2",
+        "--outbound-max-mb",
+        "1",
+        "--outbound-request-timeout",
+        "4",
+        "--outbound-request-max-mb",
+        "1",
+    ]);
+    assert!(allowed.status.success(), "{}", text(&allowed.stderr));
+    assert_eq!(conns.load(Ordering::SeqCst), 2);
+
+    std::fs::write(
+        &schema,
+        format!("IMPORT <http://127.0.0.1:{port}/large.shex>\nSTART = @<urn:Imported>"),
+    )
+    .unwrap();
+    let too_large = run(&["--outbound-max-mb", "1"]);
+    assert_eq!(too_large.status.code(), Some(2));
+    assert!(
+        text(&too_large.stderr).contains("outbound limit of 1 MiB"),
+        "{}",
+        text(&too_large.stderr)
+    );
+    assert_eq!(conns.load(Ordering::SeqCst), 5);
+
+    let db = dir.path().join("db");
+    let load = sparkles(&[
+        "load",
+        "--loc",
+        db.to_str().unwrap(),
+        data.to_str().unwrap(),
+    ]);
+    assert!(load.status.success(), "{}", text(&load.stderr));
+    let refused = sparkles(&[
+        "validation",
+        "--loc",
+        db.to_str().unwrap(),
+        "--mode",
+        "warn",
+        "--schema",
+        schema.to_str().unwrap(),
+        "--shape-map",
+        "<urn:a>@START",
+        "--outbound-block-private",
+    ]);
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused.stderr).contains("loopback address"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert_eq!(conns.load(Ordering::SeqCst), 5);
 }

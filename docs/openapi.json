@@ -5251,6 +5251,30 @@
         ],
         "type": "object"
       },
+      "CombinedValidationConfig": {
+        "description": "A format 4 list with the guards in evaluation order.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#write-time-validation"
+        },
+        "properties": {
+          "format": {
+            "const": 4
+          },
+          "guards": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationConfig"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "format",
+          "guards"
+        ],
+        "type": "object"
+      },
       "Commit": {
         "additionalProperties": true,
         "properties": {
@@ -29483,7 +29507,7 @@
         "type": "object"
       },
       "ValidationConfig": {
-        "description": "A write-time validation configuration, SHACL or ShEx.",
+        "description": "A standalone SHACL or ShEx guard.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#write-time-validation"
         },
@@ -29513,7 +29537,7 @@
             ]
           },
           "format": {
-            "description": "2 for stored SHACL configurations and 3 for stored ShEx configurations. ShEx format 2 is also read.",
+            "description": "2 for stored SHACL, 3 for standalone ShEx with one source kind, or 4 for ShEx with a file and graphs. Earlier versions remain readable.",
             "type": "integer"
           },
           "includeInferences": {
@@ -29539,7 +29563,7 @@
           },
           "schema": {
             "additionalProperties": true,
-            "description": "ShEx: `{inline, format?, base?, source?}` or `{graphs, prefixes?, base?}`. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`.",
+            "description": "ShEx: set `inline`, `graphs`, or both. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`. Guards in a list keep the copy inline.",
             "type": "object"
           },
           "shapeMap": {
@@ -29592,6 +29616,129 @@
         ],
         "type": "object"
       },
+      "ValidationConfigRequest": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/ValidationConfig"
+          },
+          {
+            "$ref": "#/components/schemas/CombinedValidationConfig"
+          }
+        ],
+        "description": "A standalone guard or a format 4 list of guards.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#write-time-validation"
+        },
+        "properties": {
+          "baseline": {
+            "enum": [
+              "strict",
+              "grandfather"
+            ],
+            "type": "string"
+          },
+          "dataGraph": {
+            "oneOf": [
+              {
+                "enum": [
+                  "default",
+                  "union"
+                ],
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "format": {
+            "description": "2 for stored SHACL, 3 for standalone ShEx with one source kind, or 4 for ShEx with a file and graphs. Earlier versions remain readable.",
+            "type": "integer"
+          },
+          "guards": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationConfig"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "type": "array"
+          },
+          "includeInferences": {
+            "type": "boolean"
+          },
+          "language": {
+            "enum": [
+              "shacl",
+              "shex"
+            ],
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "reject",
+              "warn",
+              "off"
+            ],
+            "type": "string"
+          },
+          "reportLimit": {
+            "type": "integer"
+          },
+          "schema": {
+            "additionalProperties": true,
+            "description": "ShEx: set `inline`, `graphs`, or both. Copied schemas store `file`, `format`, original-source `sha256` and verified-copy `copySha256`. Guards in a list keep the copy inline.",
+            "type": "object"
+          },
+          "shapeMap": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "properties": {
+                    "node": {
+                      "type": "string"
+                    },
+                    "shape": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "node",
+                    "shape"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "shapes": {
+            "additionalProperties": true,
+            "description": "SHACL: `{graphs?, inline?, format?}`, stored with `file` and `sha256`.",
+            "type": "object"
+          },
+          "threshold": {
+            "enum": [
+              "violation",
+              "warning",
+              "info"
+            ],
+            "type": "string"
+          },
+          "timeoutSeconds": {
+            "type": "number"
+          },
+          "updated": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ValidationStatus": {
         "anyOf": [
           {
@@ -29605,6 +29752,56 @@
             },
             "required": [
               "config"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "config": {
+                "$ref": "#/components/schemas/CombinedValidationConfig"
+              },
+              "language": {
+                "const": "combined"
+              },
+              "status": {
+                "properties": {
+                  "guards": {
+                    "items": {
+                      "properties": {
+                        "language": {
+                          "enum": [
+                            "shacl",
+                            "shex"
+                          ],
+                          "type": "string"
+                        },
+                        "status": {
+                          "additionalProperties": true,
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "language",
+                        "status"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "guards"
+                ],
+                "type": "object"
+              },
+              "unionDefaultGraph": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "language",
+              "config",
+              "status"
             ],
             "type": "object"
           },
@@ -29800,6 +29997,12 @@
             "description": "The focus nodes an incremental validation validated.",
             "type": "integer"
           },
+          "guards": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationSummary"
+            },
+            "type": "array"
+          },
           "head": {
             "description": "Rejections: the commit the write ran against.",
             "type": "integer"
@@ -29815,7 +30018,8 @@
           "language": {
             "enum": [
               "shacl",
-              "shex"
+              "shex",
+              "combined"
             ],
             "type": "string"
           },
@@ -58437,7 +58641,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ValidationConfig"
+                "$ref": "#/components/schemas/ValidationConfigRequest"
               }
             }
           },

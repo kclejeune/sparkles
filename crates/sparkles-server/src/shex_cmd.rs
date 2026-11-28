@@ -83,6 +83,8 @@ pub struct ValidateArgs {
     pub stats: bool,
     #[command(flatten)]
     pub imports: ImportArgs,
+    #[command(flatten)]
+    pub outbound: crate::outbound::OutboundArgs,
 }
 
 /// `--shex-max-imports`, `--shex-max-import-mb` and `--shex-import-timeout`: what the
@@ -111,7 +113,9 @@ impl ImportArgs {
         Ok(sparkles_shex::resolve::ImportLimits {
             max_schemas: self.shex_max_imports,
             max_bytes: self.shex_max_import_mb.saturating_mul(1 << 20),
-            timeout: std::time::Duration::from_secs_f64(self.shex_import_timeout),
+            timeout: std::time::Duration::try_from_secs_f64(self.shex_import_timeout).map_err(
+                |_| anyhow::anyhow!("--shex-import-timeout exceeds the supported range"),
+            )?,
         })
     }
 }
@@ -281,10 +285,7 @@ mod enabled {
         let externs = a.externs.as_deref().map(|x| read_schema(x, None, None));
         // imports: relative IRIs against the schema's directory, any readable file, and
         // http(s) with the local commands' outbound defaults
-        let policy = sparkles::outbound::OutboundPolicy {
-            allow_private: true,
-            ..Default::default()
-        };
+        let policy = a.outbound.local_policy().unwrap_or_else(|e| usage(e));
         let budget = sparkles::outbound::RequestBudget::new(&policy);
         let dir = std::path::absolute(&a.schema)
             .ok()
