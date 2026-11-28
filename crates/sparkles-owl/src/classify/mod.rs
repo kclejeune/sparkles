@@ -735,7 +735,9 @@ const HORN_MEMORY_FACTOR: usize = 64;
 
 /// What bounds a run: the worker threads, a deadline, a memory budget and a cancellation
 /// check, and the rules it may use. The default has every option off except
-/// [`number_order`](Limits::number_order).
+/// [`coverage`](Limits::coverage), [`number_order`](Limits::number_order),
+/// [`dl_steps`](Limits::dl_steps) and
+/// [`rooted_marker_repair`](Limits::rooted_marker_repair).
 #[derive(Clone)]
 pub struct Limits {
     /// classify by the OWL 2 EL rules alone, as ELK does: the Horn rules of item 603
@@ -841,25 +843,29 @@ pub struct Limits {
     /// universal object property.
     pub rooted: bool,
     /// whether a rooted run withdraws an answer that can miss an entailment of a
-    /// conditional ground fact (roadmap item 1231), which is on by default and changes
+    /// conditional ground fact (roadmap item 1231), which is off by default and changes
     /// nothing without [`rooted`](Limits::rooted). After its saturation the run looks for
     /// a context that holds a ground literal as a condition and a context registered with
     /// the root for one of the literal's individuals that the condition does not reach.
     /// When it finds one, the run starts again without the rooted rules, as past its bound,
     /// and reports [`Stats::dl_rooted_declined`]. The check is a partial containment: it
     /// exempts contexts that it assumes the condition reaches some other way, which is
-    /// unproved. A run with the option off keeps the rooted answer, for measurements.
+    /// unproved, and it also withdraws complete answers. The default
+    /// [`rooted_marker_repair`](Limits::rooted_marker_repair) delivers such facts instead.
+    /// True turns the check on, which a run with the repair off needs to keep from
+    /// answering without those entailments.
     pub rooted_decline: bool,
     /// whether a rooted run repairs the delivery of conditional ground facts (roadmap item
-    /// 1231), a prototype that is off by default and changes nothing
-    /// without [`rooted`](Limits::rooted). A context that holds a ground literal as a
-    /// condition tells the root, which sends the literal's marker to the contexts
-    /// registered for its individuals, and the root returns its clauses whose bodies are
-    /// such literals to the contexts that hold them. By default this runs M-return-cf
-    /// (`MREPAIR_ON | MREPAIR_CF`, item 1250), resolving returned clauses only against
-    /// holder premises whose body has no ground or `f_e(u)` literal (at both initial return
-    /// arrival and late-premise replay). `SPARKLES_ROOTED_MARKER_REPAIR` overrides it for
-    /// measurements, with `0` (off), `1` (unfiltered `MREPAIR_ON`), or a sum of the bits of
+    /// 1231), which is on by default and changes nothing without
+    /// [`rooted`](Limits::rooted). A context that holds a ground literal as a condition
+    /// tells the root, which sends the literal's marker to the contexts registered for its
+    /// individuals, and the root returns its clauses whose bodies are such literals to the
+    /// contexts that hold them. The run uses M-return-cf (`MREPAIR_ON | MREPAIR_CF`, items
+    /// 1250 and 1231), which resolves a returned clause only against holder premises whose
+    /// body has no ground or `f_e(u)` literal, both when the return arrives and when a
+    /// premise arrives later. The repair's completeness is not proved. False turns it
+    /// off, and `SPARKLES_ROOTED_MARKER_REPAIR` overrides the setting for measurements,
+    /// with `0` (off), `1` (unfiltered `MREPAIR_ON`), or a sum of the bits of
     /// [`dl_rules::DlRun::mrepair`].
     pub rooted_marker_repair: bool,
     /// whether item 1061 phase 2 rooted constant merging on asserted `SameIndividual`
@@ -944,8 +950,8 @@ impl Default for Limits {
             dl_attempt_width: None,
             counting: false,
             rooted: false,
-            rooted_decline: true,
-            rooted_marker_repair: false,
+            rooted_decline: false,
+            rooted_marker_repair: true,
             rooted_merge: rooted_merge_switch(),
             rooted_eq_split: rooted_eq_split_switch(),
             number_order: true,
@@ -9689,6 +9695,12 @@ impl Saturation {
             // the kept contexts name the clauses of the last run's table by id
             Some(mut d) if reuse => {
                 debug_assert_eq!(d.eager, limits.expansion == Expansion::Eager);
+                // the repair's table lives as long as the rooted run's contexts, which no
+                // run keeps (item 1247)
+                debug_assert!(
+                    d.mtab.get().is_none(),
+                    "a kept run holds the repair's table"
+                );
                 d.begin_run();
                 d
             }
@@ -14774,6 +14786,10 @@ impl Saturation {
             .saturating_add(self.context_bytes())
             .saturating_add(dynamic.map_or(0, |d| d.retained_bytes()))
             .saturating_add(dl_run.map_or(0, |d| d.bytes()))
+            // the marker repair's states live in the run's table rather than in the
+            // contexts (item 1247), and no handler holds one here, so the table's count is
+            // exact
+            .saturating_add(dl_run.map_or(0, |d| d.mtab_bytes()))
             .saturating_add(world_bytes)
             .saturating_add(self.el_deps.bytes())
             .saturating_add(pending_count.saturating_mul(std::mem::size_of::<saturate::Concl>()))
@@ -19265,6 +19281,7 @@ mod admission_handoff_tests {
             threads: 1,
             rooted: true,
             rooted_decline: true,
+            rooted_marker_repair: false,
             ..Limits::default()
         };
         let run = |classifier: &mut Saturation, refuse| {
@@ -20133,6 +20150,8 @@ mod tests {
         let base = Limits {
             threads: 1,
             rooted: true,
+            rooted_decline: true,
+            rooted_marker_repair: false,
             ..Limits::default()
         };
         let out = Classifier::of(&doc.axioms).classify(&base).unwrap();
@@ -20944,6 +20963,10 @@ mod tests {
                 charged.fetch_add(bytes, Ordering::Relaxed);
                 true
             })),
+            // the test charges the scan of the check, which runs with the check on, as it did
+            // before item 1231 turned the repair on
+            rooted_decline: true,
+            rooted_marker_repair: false,
             ..Limits::default()
         };
         let kinds: Vec<_> = doc.axioms.iter().map(|a| &a.kind).collect();

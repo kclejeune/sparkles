@@ -476,18 +476,19 @@ the bounds on counting products and the propagation of an equality between two
 successors of one individual. Item 1229 stays open for the completeness argument for
 ground counting and late Pred replay.
 
-Item 1231 records a loss of rooted runs. A fact that holds in a context only under the
+Item 1231 recorded a loss of rooted runs. A fact that holds in a context only under the
 queried class and concerns an individual reached from another individual must reach the
 contexts registered for that individual, and its consequences there must come back to the
 context, and the departures above keep a context's conditional ground literals in that
 context.
-A rooted run therefore looks after its saturation for such a fact that cannot reach a
-registered context, and when it finds one it classifies again without the rooted rules and
-sets `Stats::dl_rooted_declined`. The check exempts four kinds of context without a proof,
-and it withdraws between 2 and 38 complete answers per generated corpus, so it is partial
-containment, and `Limits::rooted_decline` turns it off for measurement.
+A rooted run with `Limits::rooted_decline` therefore looks after its saturation for such a
+fact that cannot reach a registered context, and when it finds one it classifies again
+without the rooted rules and sets `Stats::dl_rooted_declined`. The check exempts four kinds
+of context without a proof, and it withdraws between 2 and 38 complete answers per generated
+corpus, so it is partial containment. It was on by default until item 1231 turned the
+repair on and the check off.
 
-`Limits::rooted_marker_repair`, off by default, repairs the delivery. A context that holds
+`Limits::rooted_marker_repair`, on by default, repairs the delivery. A context that holds
 a ground literal as a condition tells the root, which sends the literal as a marker to the
 contexts registered for its individuals that the root reaches, also to a context that
 registers or becomes reachable later. The root returns its clauses whose bodies hold such
@@ -651,10 +652,66 @@ mode `129` it takes 251,217 derived conclusions, 32,307 stored clauses and 10.9 
 estimated memory, and on four threads eager it takes 336,298 derived conclusions, 41,450
 stored clauses and 12.6 MB peak estimated memory, against 232,622 conclusions (10.2 MB)
 with repair off and 262,033 conclusions (10.9 MB) with mode `1` on one thread cautious. The
-repair's state costs 8 bytes per context with the repair off, which item 1247 removes, and
-a synthetic family whose conditions nest two or more deep grows with the repair's sends,
-which is item 1251. The repair's completeness is not proved, and the check stays on by
-default.
+synthetic family whose conditions nest two or more deep grows with the repair's sends,
+which is item 1251.
+
+Item 1231 turned the repair on by default in mode `129` and the check off. The measurement
+covers the 33 generated corpus sets of the measurements above. They hold 18,916 input
+files, and 18,870 of them have a usable HermiT 1.4.5 reference. Each of those runs in two
+configurations. The first asks for one thread with the cautious strategy. The second, `4e`,
+asks for four threads with the eager strategy, and since a rooted run with the default
+steps saturates on one thread whatever the caller asks for, its saturation runs no workers
+concurrently. The parser rejects 690 files of `fz` and `gen` in both configurations and in
+every compared build, 1,380 rows in all, which leaves 36,360 result rows, 18,180 for each
+configuration. On those rows the default run claims 34,810 answers against 32,674 for the
+previous default, which had the repair off and the check on, and loses 3 claims, each to
+the rooted work bound. The only answers that differ from HermiT's are the two of s2-g2-150,
+which every setting gives and in which the rooted run derives four subsumptions that HermiT
+does not. Against a run with both the repair and the check off, which differs from HermiT
+on 1,456 answers, the repair leaves those two and loses 9 claims to the work bound, 6 of
+them in item 1251's family. The ratios below compare the default run with that run with
+both off, since the previous default claims no answer of the fixtures built for orders of
+arrival or of item 1251's family. On the larger generated sets the previous default claims
+the same answers as the run with both off, or a subset of them, while peak estimated memory
+differs between the two baselines because the previous default runs the decline check. On
+`g6`, where all three arms claim all 4,000 rows, the new default uses 1.0396 times the peak
+estimated memory of the both-off arm and 0.9904 times that of the previous default, and on
+`p3`, with all 2,400 claims in common, the ratios are 1.0349 and 0.9897. Over
+the answers that the default run and the both-off run both claim, the repair derives 3 to 13% more conclusions on the
+larger generated sets and 6.9% more over all sets, with 1.61 times on `av`, 1.96 times on
+the fixtures built for orders of arrival and 34.6 times on item 1251's family. The peak
+estimated memory of the same answers rises by 2.1 to 4.8% on the larger sets and 4.9% over
+all sets, with 1.20 times on `av`, 1.26 times on the fixtures and 4.4 times on item 1251's
+family. On `p2`, `g2` and `g6`, 93 to 98% of the added conclusions are the conclusion that
+each notice of a held literal charges, and most of those notices send no marker and return
+no clause. On `av` and `ps` the products of returned clauses and their consequences make up
+about half. Item 1337 follows the cost of the notices. Three repeated runs with
+`--no-dl-steps` on four threads, whose saturation does run four workers, on six sets, among
+them `av`, `ps` and the fixtures, and a run through `Classifier` on nine sets give no
+answer that differs from HermiT. On the forest set a run through `Classifier` claims the
+same 976 answers with and without the repair. The 18 forest answers that it does not claim
+against the saturation's pass the rooted bound without the repair too. The repair's
+completeness is not proved, which item 823 records for the rooted run as a whole.
+
+Item 1247 moved the repair's state out of the contexts. A run that uses the repair makes
+one table with the repair's first use and charges it to the memory budget. Each context
+that holds repair state keeps it in a slot of that table and names the slot with a 32-bit
+index in the padding after the flags of its Tier D state. A run without the repair makes no
+table, and each context with constants charges 8 bytes less than when it carried a pointer
+to its state. A handler takes a context's state out of its slot and puts it back when it
+finishes or unwinds. It puts the state back before a drain that can reach the same context
+again, and a second take of state that is out of its slot panics. On the 33 corpus sets, on
+one thread cautious and on four threads eager, the change gives the same claims, agreements
+and counts of derived conclusions as the build before it, with the repair on, with both the
+repair and the check off and with the old default. The one exception is an answer on `p3`
+whose count differs by one between runs of the same build. The peak estimated memory of a
+run with the repair off falls by a multiple of 8 bytes, at most 1,488 bytes. With the
+repair on it rises by a median of 0.03% and at most 512 bytes, which is what the table and
+its slots cost beyond the pointers they replace. Those rows come from the same two
+configurations as item 1231's, so their `4e` rows also saturate on one thread. Two repeated
+runs with `--no-dl-steps` on four threads, whose saturation runs four workers that share
+the table, on six sets, among them `av`, `ps` and the fixtures, give no answer that differs
+from HermiT.
 
 Item 1250 records a conditional argument for the cut. It holds for a run without
 counting, and it rests on the obligations of the journal's proof that the departures of
@@ -2953,8 +3010,8 @@ and JVM bindings and `sparkles ontology classify --partial --expansion` take the
 answer gives `tier` and `consistency`, and a partial one has `partial` true, `complete`
 false and the open classes under `incomplete` with `incompleteCount`. The `complete` of
 the JSON and of `Classified::complete` stays true only for a run that finished and reported
-no axiom left out. A rooted run can miss entailments with the flag true, which item 1231
-records, and a run that counts rests on item 1229's repair, which is not proved. The dataset keeps no partial answer. A request that writes its taxonomy,
+no axiom left out. The completeness of a rooted run with the flag true is not proved, which
+item 823 records, and a run that counts rests on item 1229's repair, which is not proved. The dataset keeps no partial answer. A request that writes its taxonomy,
 asks for the functional-style answer or runs a ROBOT-compatible command refuses or ignores
 the flag, since none of them can say that a taxonomy is partial. The command line takes
 `--timeout`, notes a partial answer on stderr and exits with status 2 for one that is
@@ -5001,7 +5058,7 @@ of a functional property, one with `∃d.xsd:int[1, 2]` and the other with
 and fires on exactly the premises that Hyper would take with them, since a valid clause
 whose body atoms are not all maximal in the context cannot fire there. This makes the
 unrooted run complete in the sense of the existing tiers. The rooted run takes the same
-rule, and its completeness rests on the rooted calculus, which item 1231 records as not
+rule, and its completeness rests on the rooted calculus, which item 823 records as not
 proved. A search or a set of minimal pairs past its bound passes the work bound as the
 case analysis of an inference does. An earlier design kept the data successors as terms
 of the clauses, with data function symbols, equalities between data terms and a data

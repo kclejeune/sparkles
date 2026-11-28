@@ -1068,12 +1068,14 @@ pub struct DlRun {
     /// the most choices of one product that the run makes before it passes its bound on
     /// derived conclusions, zero for no limit (roadmap item 1011)
     width_limit: AtomicUsize,
-    /// row 1231's marker repair (PLAN v3.1's rule M), which is off unless
-    /// [`Limits::rooted_marker_repair`](super::Limits) turns it on: [`MREPAIR_ON`] with
-    /// [`MREPAIR_CF`] by default (M-return-cf, item 1250), with [`MREPAIR_HOLDER`],
+    /// row 1231's marker repair (PLAN v3.1's rule M), which
+    /// [`Limits::rooted_marker_repair`](super::Limits) turns on by default: [`MREPAIR_ON`]
+    /// with [`MREPAIR_CF`] (M-return-cf, item 1250), with [`MREPAIR_HOLDER`],
     /// [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`] for measurements, and [`MREPAIR_NO_RETURN`]
     /// and [`MREPAIR_NO_REPLAY`] for the diagnostic's tests
     pub mrepair: u8,
+    /// the marker repair's state of the run's contexts, made with its first use (item 1247)
+    pub(super) mtab: std::sync::OnceLock<std::sync::Arc<super::dl_root::MTab>>,
     /// whether item 1061 phase 1 unit-only provenance-tagged shared root facts and
     /// constants-only successor replay deduplication are enabled (default off, behind
     /// `SPARKLES_ROOTED_SHARED_FACTS=1`)
@@ -1139,9 +1141,9 @@ pub const MREPAIR_NO_REPLAY: u8 = 64;
 /// function terms of constants, while permitting `x`-only bodies), at both initial return
 /// arrival and late-premise replay. A product with a ground body then never arises, which
 /// would go back to the root and out again through each alternative condition of its body
-/// atoms. Enabled by default whenever [`Limits::rooted_marker_repair`](super::Limits) is on
-/// (`MREPAIR_ON | MREPAIR_CF`, item 1250); `SPARKLES_ROOTED_MARKER_REPAIR=1` selects
-/// unfiltered [`MREPAIR_ON`] for comparison.
+/// atoms. On whenever [`Limits::rooted_marker_repair`](super::Limits) is, which it is by
+/// default (`MREPAIR_ON | MREPAIR_CF`, items 1250 and 1231);
+/// `SPARKLES_ROOTED_MARKER_REPAIR=1` selects unfiltered [`MREPAIR_ON`] for comparison.
 pub const MREPAIR_CF: u8 = 128;
 
 impl DlRun {
@@ -1213,6 +1215,12 @@ impl DlRun {
                     .len()
                     .saturating_mul(std::mem::size_of::<(u32, u32)>()),
             )
+    }
+    /// The bytes of the marker repair's table of the run's contexts, 0 without it. The
+    /// contexts' own counts leave the table out, and so does [`DlRun::bytes`], as it leaves
+    /// out the clause table's admitted bytes, so a recount of the contexts' bytes adds this.
+    pub(super) fn mtab_bytes(&self) -> usize {
+        self.mtab.get().map_or(0, |t| t.bytes())
     }
     pub fn bytes(&self) -> usize {
         self.table.unadmitted_bytes()
@@ -1788,6 +1796,13 @@ pub struct DlSt {
     /// carried remainder `< WORK_READS` of clause-blocker scan reads across calls so
     /// repeated short scans still accrue global work (item 896, R1a)
     blocker_reads: u8,
+    /// in a rooted run with row 1231's marker repair, one more than the index of the
+    /// context's slot in the run's [`MTab`](super::dl_root::MTab), 0 for none, which the
+    /// padding after the flags above holds on a 64-bit target (item 1247). A clone of the context copies the
+    /// slot's index and so names the same slot, which two contexts that run the repair must
+    /// never do. Only the EL and Horn worlds clone a context's state, and a world applies no
+    /// Tier D rule to its copy, so a copied slot is never taken or read.
+    pub(super) mslot: u32,
     /// in a rooted run, the heads of the facts a hypothetical successor sent the root
     pub(super) promoted: FxHashSet<Box<[Lit]>>,
     /// the clauses over the predecessor that successors sent, by successor
@@ -1817,6 +1832,44 @@ pub struct DlSt {
     /// that entails one of them makes its own; [`flush`] releases them
     pending: Vec<Ex>,
 }
+
+// Item 1247: on a 64-bit target the repair's slot shares one aligned 8-byte word with the
+// four flags before it, and every other field of `DlSt` is a whole number of such words,
+// so the struct is exactly its fields with no other padding. Without the slot the flags
+// would still take the word, padded, so the slot adds nothing to a context.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(align_of::<DlSt>() == 8);
+    let slot = offset_of!(DlSt, mslot);
+    let word = slot - slot % 8;
+    assert!(slot + size_of::<u32>() <= word + 8);
+    let flags = [
+        offset_of!(DlSt, empty_core),
+        offset_of!(DlSt, taking_fact),
+        offset_of!(DlSt, given_fact),
+        offset_of!(DlSt, blocker_reads),
+    ];
+    let mut i = 0;
+    while i < flags.len() {
+        assert!(flags[i] >= word && flags[i] < word + 8);
+        i += 1;
+    }
+    assert!(
+        size_of::<DlSt>()
+            == size_of::<Store>()
+                + 8
+                + size_of::<FxHashSet<Box<[Lit]>>>()
+                + size_of::<FxHashMap<Ex, Vec<u32>>>()
+                + size_of::<FxHashSet<(Ex, u32)>>()
+                + 2 * size_of::<Vec<(Ex, Ex)>>()
+                + size_of::<FxHashSet<Ex>>()
+                + size_of::<FxHashSet<(Ex, Ex)>>()
+                + size_of::<FxHashMap<(Role, Ex), u32>>()
+                + 2 * size_of::<Vec<Ex>>()
+                + size_of::<Option<Box<super::dl_root::RootSt>>>()
+    );
+};
 
 impl DlSt {
     pub fn bytes(&self) -> usize {
