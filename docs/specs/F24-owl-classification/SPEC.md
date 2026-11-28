@@ -527,11 +527,14 @@ over `f(x)` or a role atom between `x` and a constant, and the cut keeps all of 
 ground-bodied clause whose head holds a literal over a constant either has that literal
 true in the model, where its consequences follow from the clause with an empty body that
 produces it, or is assumed to reach the query context or the root by Pred with its ground
-body intact, where the second part discharges the body. Pred sends only a clause whose
-body holds atoms over `x`, role atoms `s(y, x)` and literals over constants alone, and
-whose head holds only predecessor triggers. The assumption therefore covers a clause of
-that shape, and a clause of another shape needs a replacement of that shape with the same
-residual head. The fourth part is item 1231's return in mode `129`. The argument resolves
+body intact. In the query context the second part discharges the ground body, while the
+root does not apply the ground-body cut. Pred accepts a clause whose body holds atoms over
+`x`, role atoms `s(y, x)` and literals over constants alone, and whose head holds
+predecessor triggers, constant inequalities or role atoms between `x` and a constant, with
+the role-atom head handled on the rooted path over `f(u)` while ordinary Pred refuses it.
+The assumption therefore covers a clause of a shape that `pred_ready` accepts and the
+corresponding Pred path sends, and a clause of another shape needs a replacement of that
+shape with the same residual head. The fourth part is item 1231's return in mode `129`. The argument resolves
 a returned root clause against producers with an empty body in the query context, or
 against live clauses that subsume them, and the filter keeps those premises, since it
 excludes only holder premises with a ground body literal. The return finds a premise
@@ -586,14 +589,17 @@ eager one, with the selection off, the partners of item 1220's repair off, the c
 bound of 4 million conclusions and HermiT 1.4.5's taxonomy as the reference. These runs use
 `Saturation::classify` over the logical axioms, as the `el_classify` example does, which
 derives fewer conclusions than `Classifier` on the same file, so g1-051_p0012 takes 143,778
-conclusions in mode `129` on one thread here against the 251,217 above. Without the cut and
-with the repair off, 26 files exceed the bound in 50 runs. Of these, 24 exceed it in both
-configurations, H3 only on one thread and min-C3 only on four threads. Without the cut, 37
-files exceed it in 74 runs in each of modes `129` and `1`, and g1-051_p0012 finishes only
-with the repair off, at 455,969 conclusions on one thread. With the cut, every file
-finishes with the repair off except C4, which exceeds the bound with the selection on as
-well. With the repair on, three files of item 1251's family with conditions two deep exceed
-it too. Every complete rooted disjunctive answer agrees with HermiT, in 204 runs with the
+conclusions in mode `129` on one thread here against the 251,217 above. The harness
+records a combined fallback flag (`dl_rooted_over || dl_over_budget`), which covers
+work-limit and memory-budget fallbacks on the cut and uncut arms (where decline is off)
+and also decline fallbacks on the selection-on arms. Without the cut and with the repair
+off, 26 files fall back under the 4 million conclusion limit in 50 runs. Of these, 24 fall
+back in both configurations, H3 only on one thread and min-C3 only on four threads.
+Without the cut, 37 files fall back in 74 runs in each of modes `129` and `1`, and
+g1-051_p0012 finishes only with the repair off, at 455,969 conclusions on one thread. With
+the cut, every file finishes with the repair off except C4, which falls back with the
+selection on as well. With the repair on, three files of item 1251's family with
+conditions two deep fall back too. Every complete rooted disjunctive answer agrees with HermiT, in 204 runs with the
 repair off and 198 in each of modes `129` and `1`. The two runs of `misc/r1_meet.ofn` in
 each mode finish complete in Tier EL, so they are not among those runs, and they agree with
 HermiT as well. g1-051_p0012 takes 141,886 conclusions with the repair off, 143,778 in mode

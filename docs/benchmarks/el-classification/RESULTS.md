@@ -2320,3 +2320,8 @@ The [reference reasoner agreement record](runs/2026-11-02-reasoners-agreement-91
 holds Whelk's and Konclude's output lines and comparisons on the range test ontologies,
 GO, ChEBI lite and the ORE 2015 sample, the ROBOT runs and their checks, and the trace of
 Konclude's extra GO subsumptions. Its times also come from a loaded laptop.
+
+The [F24 outcome](../../specs/F24-owl-classification/SPEC.md#outcome) records the
+conclusion counts and HermiT agreement checks for item 1250's ground-body cut across 104
+generated input files with the selection off. Those figures are synthetic conclusion
+counts rather than benchmark-host timings.
