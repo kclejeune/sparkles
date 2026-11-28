@@ -568,10 +568,15 @@ meter reads these steps.
 
 The upfront bound is gone. A return's premise lists are admitted exactly before they are
 built, and the product charges its own tables as they grow. On a return of 64 × 64 premises
-whose conclusions a stored unit subsumes, a counting allocator measures the heap within the
-charged peak and the charge within four times the heap. A return of 2^57 choices now runs
-until its tables pass the budget, within its second step and before it derives anything,
-where before it stopped at once on an unrepresentable bound. A test harness grows the
+whose conclusions a stored unit subsumes, a counting allocator measures a heap that the
+charged peak covers together with the return's retained record of the clause and its copy of
+it, and the charge stays within four times the heap. A return of 2^57 choices now runs until
+the work bound or its tables' charge against the memory budget stops it, where before it
+stopped at once on an unrepresentable bound. Under a budget of 4 MiB the test fixture stops
+within the product's second step, before the product derives anything. A test refuses each
+check of the bounds in turn during a return's premise lists, an offered clause's index and
+holders, and Join's premises, and finds nothing held, no product of a return pushed, and the
+offer cut short with its store interrupted. A test harness grows the
 premises per literal, the length of a premise, the returned body, the returns of a late
 premise, the holders and body of an offered clause, the stored clauses of the diagnostic's
 test and Join's premises eight times over, and asserts each time that no more than the

@@ -4966,16 +4966,18 @@ pub(super) fn marker_root_gbody(
     let mut rd = Reads::new(poll);
     let mut rg = Vec::new();
     for s in &x.store.clauses {
-        if !rd.read(1 + s.c.body().len()) {
+        // a read for the clause and one for each literal of its body
+        if !rd.read(1) {
             return None;
         }
-        if !s.dead
-            && !s.c.body().is_empty()
-            && s.c
-                .body()
-                .iter()
-                .all(|&l| l.kind() == XL && ground_trigger(lits.view(l, inv)))
-        {
+        let mut triggers = !s.dead && !s.c.body().is_empty();
+        for &l in s.c.body() {
+            if !rd.read(1) {
+                return None;
+            }
+            triggers = triggers && l.kind() == XL && ground_trigger(lits.view(l, inv));
+        }
+        if triggers {
             rg.push(s.c.clone());
         }
     }
@@ -5051,10 +5053,18 @@ pub(super) fn marker_def(
             held.insert(l);
         }
         for c in rg {
-            if !rd.read(1 + c.body().len()) {
+            // a read for the clause and one for each literal of its body
+            if !rd.read(1) {
                 return Err(());
             }
-            if !c.body().iter().all(|l| held.contains(l)) {
+            let mut all = true;
+            for l in c.body() {
+                if !rd.read(1) {
+                    return Err(());
+                }
+                all = all && held.contains(l);
+            }
+            if !all {
                 continue;
             }
             // the premises, each candidate and each literal it tests read
@@ -5956,9 +5966,15 @@ pub(super) mod tests {
                     .is_some()
             );
             let stored = dl(&st).unwrap().store.clauses.len();
+            let before = st.bytes();
+            let copy = run.table.get(cid).bytes();
             let mut out = Stops::new(&run);
             let (go, heap) =
                 super::super::numeric::tests::measure(|| rret(&ix, &mut st, cid, &mut out));
+            // the sink counts no retained growth (`admit_dl`), so the return's record of the
+            // clause under its body literals is added from the state's own count, with the
+            // copy of the clause that the return holds while it runs
+            let retained = st.bytes() - before;
             assert!(go, "mode {mode}");
             assert_eq!(
                 dl(&st).unwrap().store.clauses.len(),
@@ -5967,12 +5983,10 @@ pub(super) mod tests {
             );
             assert!(!dl(&st).unwrap().store.interrupted, "mode {mode}");
             assert_eq!(out.held, 0, "mode {mode}");
-            // the sink counts no retained growth (`admit_dl`), so the return's record of
-            // the clause under its body literals and its copy of the clause stay outside
-            // the comparison, a few hundred bytes
             assert!(
-                out.peak + 4096 >= heap.peak,
-                "mode {mode}: charged {} below the heap's {}",
+                out.peak + retained + copy >= heap.peak,
+                "mode {mode}: charged {} with {retained} retained and a copy of {copy} below \
+                 the heap's {}",
                 out.peak,
                 heap.peak
             );
@@ -6101,6 +6115,125 @@ pub(super) mod tests {
         drop(found);
         drop(guard);
         out.polls.get()
+    }
+
+    #[test]
+    fn a_stop_at_a_check_of_the_meter_leaves_nothing_held() {
+        // A refusal at each check of the bounds in turn, the meter's own checks and the
+        // admissions alike, stops the step with nothing held and nothing pushed or sent.
+        for mode in MODES {
+            // the premise lists of a return, through the count pass, the admission, the
+            // build pass and the pruning
+            let granted = meter_ret_found(mode, 1, 600, 2);
+            assert!(granted >= 4, "mode {mode}: {granted}");
+            for k in [0, 1, 2, 3, granted / 2, granted - 2, granted - 1] {
+                let (ix, run, st, c) = meter_fixture(mode, 1, 600, 2);
+                let mut out = Stops::new(&run);
+                out.refuse = true;
+                out.after = k;
+                let mut found = Found::default();
+                let meter = Meter::checks();
+                let go = {
+                    let mut guard = Guard::new(&mut out);
+                    ret_found(&ix, &st, &c, None, &meter, &mut found, &mut guard)
+                };
+                assert!(!go, "mode {mode} at {k}");
+                assert_eq!(found.products_len(), 0, "mode {mode} at {k}");
+                assert_eq!(out.held, 0, "mode {mode} at {k}");
+            }
+            // the index and the holders of an offered clause
+            let offer = |after: Option<usize>| {
+                let mut sig = Sig::new();
+                let h = sig.class("H");
+                let atoms: Vec<Ex> = (0..4).map(|i| sig.class(&format!("A{i}"))).collect();
+                let u = sig.ind("u");
+                let (ix, _) = probe_ix(sig);
+                let mut run = DlRun::new(false, Default::default());
+                run.mrepair = mode;
+                let ls: Vec<Lit> = atoms.iter().map(|&a| glit(&run, &ix, a, u)).collect();
+                let c = Clause::new(ls.clone(), vec![glit(&run, &ix, h, u)]);
+                let mut st = State::default();
+                let id = ds(&mut st).store.clauses.len() as u32;
+                assert!(ds(&mut st).store.add(c.clone()).is_some());
+                let mut out = Stops::new(&run);
+                let r = rst(&mut st, &out);
+                mrep_new(r, &out);
+                let hs: Vec<Ex> = (0..1200).map(|i| 1000 + i).collect();
+                for &l in &ls {
+                    r.mw().holders.insert(l, hs.clone());
+                    for &e in &hs {
+                        r.mw().hold_set.insert((e, l));
+                    }
+                }
+                if let Some(k) = after {
+                    out.refuse = true;
+                    out.after = k;
+                }
+                m_offer(&ix, &mut st, id, &c, &mut out);
+                let sent = out
+                    .sent
+                    .iter()
+                    .filter(|(_, c)| matches!(c, Concl::RRet(_)))
+                    .count();
+                (
+                    out.polls.get(),
+                    sent,
+                    dl(&st).unwrap().store.interrupted,
+                    out.held,
+                )
+            };
+            let (granted, sent, cut, _) = offer(None);
+            assert!(
+                !cut && sent == 1200 && granted >= 4,
+                "mode {mode}: {granted}"
+            );
+            for k in 0..granted {
+                let (_, sent, cut, held) = offer(Some(k));
+                assert!(
+                    cut && sent < 1200 && held == 0,
+                    "mode {mode} at {k}: {sent}"
+                );
+            }
+        }
+        // Join's premises on the default path
+        let mut sig = Sig::new();
+        let [b, z] = ["B", "Z"].map(|n| sig.class(n));
+        let ks: Vec<Ex> = (0..3000).map(|i| sig.class(&format!("K{i}"))).collect();
+        let u = sig.ind("u");
+        let (ix, _) = probe_ix(sig);
+        let run = DlRun::new(false, Default::default());
+        let gb = glit(&run, &ix, b, u);
+        let mut st = State::default();
+        for &k in &ks {
+            let id = ds(&mut st).store.clauses.len() as u32;
+            assert!(
+                ds(&mut st)
+                    .store
+                    .add(Clause::new(vec![Lit::x(k)], vec![gb]))
+                    .is_some()
+            );
+            ds(&mut st).store.by_xl.entry(gb).or_default().push(id);
+        }
+        let target = Clause::new(vec![gb], vec![Lit::x(z)]);
+        let join = |after: Option<usize>| {
+            let mut out = Stops::new(&run);
+            if let Some(k) = after {
+                out.refuse = true;
+                out.after = k;
+            }
+            let mut found = Found::default();
+            let go = {
+                let mut guard = Guard::new(&mut out);
+                join_body(&ix, &st, &target, &mut found, &mut guard)
+            };
+            (go, found.one_sides().len(), out.polls.get(), out.held)
+        };
+        let (go, n, granted, _) = join(None);
+        assert!(go && n == 3000 && granted >= 2, "{granted}");
+        for k in 0..granted {
+            let (go, n, _, held) = join(Some(k));
+            assert!(!go && n < 3000 && held == 0, "at {k}: {n}");
+        }
     }
 
     #[test]
