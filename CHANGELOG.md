@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### A closure check of the Pred replay and a recorded loss of rooted runs that count
+
+Unit tests now check after every saturation that Pred, run again with every clause a
+successor sent and every restriction that reaches the successor, gives nothing that the
+context does not already hold. With item 1229's replay of late restrictions the check
+finds no context open on the generated and fixture sets of rooted runs and runs that count,
+and with `SPARKLES_COUNTING_LATE_UNIT=0` it finds the inferences that the late restrictions
+left out. A rooted run with `Limits::counting` applies an individual's at-most restrictions
+only in the context of its singleton, and the ground equalities that a merge there gives
+reach no other context, so such a run can still miss a merge of two values of an individual
+and report a complete answer. The F24 spec records the loss and the measured attempts at
+containing it, and roadmap item 1229 stays open for the proof of the replay, the
+containment and the repair.
+
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 
 Term and value decoding in SPARQL UPDATE, ARQ property functions, registered property and aggregate extensions, custom aggregates, hybrid search, history service, path search, vector top-k, remote SERVICE and LATERAL enhancers, GeoSPARQL planner rewrites and aggregates, planner range and lexical probes and RDFS schema and explanation decoding now uses checked decode helpers that enforce live cancellation, deadline and memory controls while keeping decoded-output credit alive across multi-term operations. Plan and error diagnostic rendering decodes terms through `plan_term` so describing a plan never latches a decode refusal, and RDFS explanation keeps its answer memory limit separate from its decode workspace accounting. This lands the first wave of roadmap item 1308.
