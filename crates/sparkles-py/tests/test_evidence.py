@@ -21,6 +21,7 @@ from sparkles import (
     InvalidInputError,
     NotFoundError,
     QueryTimeoutError,
+    StorageError,
     UnsupportedError,
 )
 
@@ -454,16 +455,26 @@ def test_evidence_closed_dataset_and_transaction_guards(tmp_path: Path) -> None:
         with pytest.raises(ConflictError, match="open transaction"):
             ds.evidence.propose(_claim_proposal())
 
-    # Active transaction on a retained handle of a deleted branch also refuses configure/detach.
+    # Non-force branch deletion poisons a retained handle so later write transactions fail.
     ds.branches.create("ephemeral")
     retained = ds.branch("ephemeral")
     ds.branches.delete("ephemeral")
-    with retained.transaction():
+    with pytest.raises(StorageError):
+        with retained.transaction():
+            pass
+    retained.close()
+
+    # Active transaction on a retained handle of a force-deleted branch still refuses
+    # main-handle evidence configure/detach through the family-transaction guard.
+    ds.branches.create("ephemeral-force")
+    retained_force = ds.branch("ephemeral-force")
+    ds.branches.delete("ephemeral-force", force=True)
+    with retained_force.transaction():
         with pytest.raises(ConflictError, match="open transaction"):
             ds.evidence.configure(_settings())
         with pytest.raises(ConflictError, match="open transaction"):
             ds.evidence.detach(ACCEPTED_G)
-    retained.close()
+    retained_force.close()
     work.close()
 
     # Closed dataset refuses both read and write evidence operations before payload serialization.
