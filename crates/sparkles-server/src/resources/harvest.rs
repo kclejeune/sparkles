@@ -273,6 +273,11 @@ fn qleverfile(document: &str) -> Result<Vec<QleverInput>> {
             .map(|row| {
                 let patterns = id(row, "for-each")?;
                 let format = id(row, "format")?;
+                if patterns.trim().is_empty() || format.trim().is_empty() {
+                    return Err(invalid(
+                        "Qleverfile input needs file patterns and an RDF format",
+                    ));
+                }
                 let graph = string(row, "graph").filter(|s| s != "-");
                 if let Some(g) = &graph {
                     super::iri("graph", g)?;
@@ -288,6 +293,9 @@ fn qleverfile(document: &str) -> Result<Vec<QleverInput>> {
     let files = settings.get("INPUT_FILES").ok_or_else(|| {
         invalid("the Qleverfile needs INPUT_FILES or MULTI_INPUT_JSON in [index]")
     })?;
+    if files.trim().is_empty() {
+        return Err(invalid("Qleverfile INPUT_FILES needs at least one pattern"));
+    }
     Ok(vec![QleverInput {
         files: files.split_whitespace().map(str::to_owned).collect(),
         rdf_format: String::new(),

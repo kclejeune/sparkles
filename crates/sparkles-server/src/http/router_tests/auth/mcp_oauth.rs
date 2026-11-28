@@ -24,8 +24,13 @@ async fn server(flags: Option<Vec<&'static str>>, oidc: bool) -> (AuthServer, Ar
 [roles.team-readers]
 datasets = { "team-a" = "read" }
 
+[roles.catalog-admin]
+server = ["server-admin"]
+datasets = { wiki = "write" }
+
 [external.user_roles]
 "alice@example.org" = ["team-readers"]
+"catalog@example.org" = ["catalog-admin"]
 "#,
     );
     if oidc {
@@ -660,4 +665,81 @@ algorithms = ["RS256"]
     )
     .await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.text());
+}
+
+#[tokio::test]
+async fn catalog_tools_follow_the_admin_profile_and_challenge_for_admin_scope() {
+    let (s, m) = server(
+        Some(vec![
+            "--mcp-profile",
+            "admin",
+            "--mcp-allow-update",
+            "--mcp-disable-tool",
+            "catalog_harvest",
+        ]),
+        true,
+    )
+    .await;
+    let credential = |scope| {
+        bearer_of(&token_for(
+            &m,
+            "catalog@example.org",
+            json!(RESOURCE),
+            scope,
+        ))
+    };
+    let read = credential("sparkles:read");
+    let list = mcp(&s, Some(&read), "tools/list", json!({})).await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.text());
+    let body = list.json();
+    let names: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .filter(|name| name.starts_with("catalog_"))
+        .collect();
+    assert_eq!(names.len(), 8, "{names:?}");
+    assert!(names.contains(&"catalog_sources"));
+    assert!(!names.contains(&"catalog_harvest"));
+
+    let needs_admin = mcp(
+        &s,
+        Some(&read),
+        "tools/call",
+        json!({"name": "catalog_sources", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(challenged_scope(&needs_admin), "sparkles:admin");
+    let disabled = mcp(
+        &s,
+        Some(&read),
+        "tools/call",
+        json!({"name": "catalog_harvest", "arguments": {}}),
+    )
+    .await;
+    assert!(
+        disabled.all("www-authenticate").is_empty(),
+        "{}",
+        disabled.text()
+    );
+    let admitted = tool(
+        &s,
+        &credential("sparkles:admin"),
+        "catalog_sources",
+        json!({}),
+    )
+    .await;
+    assert!(
+        admitted["structuredContent"]["resources"].is_array(),
+        "{admitted}"
+    );
+
+    let anonymous = call(&s.app, "GET", "/$/sources/public/manifests/1", &[], "").await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        anonymous.text()
+    );
 }

@@ -14811,7 +14811,7 @@ export interface components {
             version: string | null;
         };
         VocabularyIriMintRequest: {
-            label?: string;
+            label?: string | null;
         };
         VocabularyIriPolicy: {
             namespace: string;

@@ -364,17 +364,9 @@ impl Repository {
             let (dir, m) = (dir.to_path_buf(), m.clone());
             Arc::new(
                 blocking(move || {
-                    if m.files
-                        .iter()
-                        .any(|f| f.definition.is_none() && f.path.contains('/'))
-                    {
-                        std::fs::create_dir(dir.join(&m.generation))?;
-                    }
                     let mut out = Vec::with_capacity(m.files.len());
                     for f in &m.files {
-                        let p = if f.definition.is_some()
-                            || crate::layout::configuration_history_path(&f.path)
-                        {
+                        let p = if f.path.contains('/') {
                             // Nested directories, created here and never through a link.
                             sparkles_core::store::definitions::stage_file(&dir, &f.path)
                                 .map_err(|e| BackupError::invalid_backup("files", e))?

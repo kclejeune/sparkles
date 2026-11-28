@@ -537,7 +537,7 @@ pub(super) fn add_all(p: &mut Paths) {
     openapi(p);
 }
 
-/// The resource catalog of spec C30.
+/// Source load and vocabulary management from spec C30.
 fn source_manager(p: &mut Paths) {
     let tag = "Catalog";
     let base =
@@ -610,6 +610,7 @@ fn source_manager(p: &mut Paths) {
         .json_body(true, "VocabularyIriMintRequest").json("200", "Reserved IRI and commit.", "VocabularyIriReservation")));
 }
 
+/// The resource catalog of spec C30.
 fn resources(p: &mut Paths) {
     source_manager(p);
     let tag = "Catalog";

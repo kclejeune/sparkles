@@ -385,7 +385,13 @@ async fn prepare(
             class: b.class,
             changes: b.changes,
             expect: b.expect,
-            message: b.message,
+            message: b
+                .message
+                .as_deref()
+                .map(sparkles::annotations::validate_user_message)
+                .transpose()?
+                .flatten()
+                .map(|message| message.to_string()),
             settings: s,
             nested: b.nested,
         },

@@ -293,6 +293,7 @@ fn permission(route: &str, need: Option<Need>) -> String {
         Some(Need::Authed) => "signed in".into(),
         Some(Need::Interactive) => "web session".into(),
         Some(Need::Dataset(l)) => l.as_str().into(),
+        Some(Need::DatasetAndServer(l, p)) => format!("{} and {}", l.as_str(), p.as_str()),
         Some(Need::Server(p)) => p.as_str().into(),
         None => ServerPerm::ServerAdmin.as_str().into(),
     }

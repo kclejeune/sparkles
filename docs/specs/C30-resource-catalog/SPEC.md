@@ -329,8 +329,9 @@ HTTP and HTTPS distributions. Credentialed provider ingestion, storage accountin
 cross-dataset term usage, full deprecation lifecycle and branch proposals with gate
 results remain under item 458 and its dependencies.
 
-The server keeps the catalog in `resources.json`, format 1, which `sparkles::formats`
-registers as a server settings file. The code is `crates/sparkles-server/src/resources`.
+The server keeps the catalog in `resources.json`, which `sparkles::formats`
+registers as a server settings file. Basic records use format 1, version IRI or
+snapshot fields use format 2, and IRI policies use format 3. The code is `crates/sparkles-server/src/resources`.
 The model, the licences, the propagation of obligations, the NOTICE, the DCAT
 description, the vocabulary header read and the prefix install follow the plan above.
 The header read runs through `CallerContext::read_options`, so it meets the server's

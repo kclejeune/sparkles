@@ -1,7 +1,7 @@
 # Curated resource catalog records
 
 These catalog documents register public RDF releases by URL, version and SHA-256.
-Use a catalogue administrator account and a running Sparkles server.
+Use a catalog administrator account and a running Sparkles server.
 
 ```sh
 sparkles source add --server "$SPARKLES_SERVER" skos.json
@@ -18,7 +18,11 @@ in the recipe. To install a vocabulary's named graph and namespaces directly, re
 its record and run `sparkles source bundle example-dataset skos 2009`. The files
 [qudt.json](qudt.json) and [schema.json](schema.json) register QUDT and Schema.org releases.
 
-The pinned distributions come from the vocabulary publishers. The DCAT document declares
+The pinned distributions come from the vocabulary publishers. Some publishers update
+their namespace documents at the same URL. If one changes, verify the new bytes
+and register them under a new version before loading the updated distribution.
+
+The DCAT document declares
 CC BY 4.0, QUDT uses CC BY 4.0, and Schema.org uses CC BY-SA 3.0. The SKOS and PROV records
 leave the licence unspecified. [DCAT 3](https://www.w3.org/ns/dcat3),
 [SKOS vocabularies](https://www.w3.org/2004/02/skos/vocabs),

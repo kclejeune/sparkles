@@ -1183,6 +1183,7 @@ async fn recipe_load_and_reload_verify_bytes_and_commit_once() {
             "<urn:a> <urn:p> <urn:b> .\n",
             "<urn:a> <urn:p> <urn:b> .\n",
             "<urn:a> <urn:p> <urn:c> .\n",
+            "<urn:a> <urn:p> <urn:b> .\n",
         ] {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
@@ -1267,6 +1268,36 @@ async fn recipe_load_and_reload_verify_bytes_and_commit_once() {
     assert_eq!(failed.status, StatusCode::BAD_GATEWAY, "{}", failed.text());
     assert_eq!(ds.store.head_commit().seq, seq + 1);
     assert_eq!(ds.store.snapshot().len(), 1);
+    let stop = st.resources.stop.clone();
+    ds.store.set_failpoint(
+        "commit-intent-persisted",
+        Some(Arc::new(move |_| {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+        })),
+    );
+    let cancelled = send(&app, req("POST", &reload_path, None)).await;
+    assert_ne!(cancelled.status, StatusCode::OK, "{}", cancelled.text());
+    assert_eq!(ds.store.head_commit().seq, seq + 1);
+    let orphan = root
+        .join("source-manifests")
+        .join(format!("{}.json", seq + 2));
+    assert!(!orphan.exists(), "the cancelled intent must be retired");
+    ds.store.set_failpoint("commit-intent-persisted", None);
+    st.resources
+        .stop
+        .store(false, std::sync::atomic::Ordering::Release);
+    let update = Request::builder()
+        .method("POST")
+        .uri("/ds/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(
+            "INSERT DATA { <urn:ordinary> <urn:p> <urn:commit> }",
+        ))
+        .unwrap();
+    assert!(send(&app, update).await.status.is_success());
+    assert_eq!(ds.store.head_commit().seq, seq + 2);
+    // A leftover from an older server can still exist at a reused sequence.
+    std::fs::write(&orphan, b"unreferenced").unwrap();
     let backup = ds.store.backup_capture("resource-test").unwrap();
     assert!(
         backup
@@ -1287,6 +1318,79 @@ async fn recipe_load_and_reload_verify_bytes_and_commit_once() {
     let read = send(&app, req("GET", &read_path, None)).await;
     assert_eq!(read.json(), loaded["manifest"]);
     assert_eq!(read.headers[header::CACHE_CONTROL], "no-store");
+    #[cfg(feature = "backup")]
+    {
+        use sparkles_backup::{
+            CreateOptions, Identity, OpenEnv, RepoConfig, Repository, RestoreOptions, VerifyLevel,
+            VerifyOptions, VerifyStatus,
+        };
+
+        let repo = Repository::open(
+            &RepoConfig::from_url("source-test", "memory://").unwrap(),
+            &OpenEnv::default(),
+        )
+        .await
+        .unwrap();
+        repo.create(
+            backup.into(),
+            &CreateOptions {
+                name: "catalog-load".into(),
+                dataset_name: "ds".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let verify = repo
+            .verify(
+                &["catalog-load".into()],
+                &VerifyOptions {
+                    level: VerifyLevel::Restore,
+                    tmp_dir: Some(dir.path().into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(verify.status, VerifyStatus::Ok, "{verify:?}");
+        let restored_dir = tempfile::tempdir().unwrap();
+        let restored_st = Arc::new(
+            AppState::new(
+                restored_dir.path(),
+                StoreOptions::default(),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        for (name, identity, expected) in [
+            ("preserved", Identity::Keep, StatusCode::OK),
+            ("new", Identity::New, StatusCode::NOT_FOUND),
+        ] {
+            let dest = restored_dir.path().join(name);
+            repo.restore(
+                "catalog-load",
+                &dest,
+                &RestoreOptions {
+                    identity,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let restored = restored_st
+                .attach(name, DbType::Persistent, Some(&dest))
+                .unwrap();
+            assert_eq!(restored.store.head_commit().seq, seq + 2);
+            assert_eq!(restored.store.snapshot().len(), 2);
+            let app = crate::http::router(restored_st.clone());
+            let path = format!("/$/sources/{name}/manifests/{seq}");
+            let r = send(&app, req("GET", &path, None)).await;
+            assert_eq!(r.status, expected, "{}", r.text());
+            if identity == Identity::Keep {
+                assert_eq!(r.json(), loaded["manifest"]);
+            }
+        }
+    }
     std::fs::write(manifest, b"corrupted").unwrap();
     let unreadable = send(&app, req("GET", &read_path, None)).await;
     assert_eq!(unreadable.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1438,4 +1542,176 @@ fn source_load_checks_query_and_upload_on_every_target() {
         )
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn automatic_iri_policies_allow_an_omitted_label_and_reserve_unique_terms() {
+    for (name, rule) in [
+        ("uuid", json!({"kind":"uuid"})),
+        ("ulid", json!({"kind":"ulid"})),
+        (
+            "sequence",
+            json!({"kind":"sequence","stem":"S","width":3,"start":7,"end":8}),
+        ),
+        (
+            "obo",
+            json!({"kind":"obo","stem":"O_","width":3,"ranges":{"local":{"start":7,"end":8}}}),
+        ),
+    ] {
+        let s = server(false, license::Policy::Warn);
+        let mut v = vocabulary();
+        v["id"] = json!(name);
+        v["iriPolicy"] = json!({"namespace": "http://ex/v#", "rule": rule});
+        let result = send(&s.app, req("POST", "/$/resources", Some(v))).await;
+        assert_eq!(result.status, StatusCode::CREATED, "{}", result.text());
+        let path = format!("/$/resources/{name}/mint/ds");
+        let mut minted = Vec::new();
+        for _ in 0..2 {
+            let result = send(&s.app, req("POST", &path, Some(json!({})))).await;
+            assert_eq!(result.status, StatusCode::OK, "{}", result.text());
+            minted.push(result.json()["iri"].as_str().unwrap().to_string());
+        }
+        assert_ne!(minted[0], minted[1]);
+        match name {
+            "uuid" => {
+                let suffix = minted[0].strip_prefix("http://ex/v#").unwrap();
+                assert_eq!(uuid::Uuid::parse_str(suffix).unwrap().get_version_num(), 4);
+            }
+            "ulid" => {
+                let suffix = minted[0].strip_prefix("http://ex/v#").unwrap();
+                assert_eq!(suffix.len(), 26);
+                assert!(
+                    suffix
+                        .bytes()
+                        .all(|c| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&c))
+                );
+            }
+            _ => {
+                let stem = if name == "sequence" { "S" } else { "O_" };
+                assert_eq!(
+                    minted,
+                    [
+                        format!("http://ex/v#{stem}007"),
+                        format!("http://ex/v#{stem}008")
+                    ]
+                );
+                let result = send(&s.app, req("POST", &path, Some(json!({})))).await;
+                assert_eq!(result.code(), "iri-unavailable");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn source_load_refuses_unaccepted_import_terms_and_private_destinations() {
+    let s = server(false, license::Policy::Warn);
+    let restricted = json!({
+        "id":"restricted", "kind":"source", "title":"Restricted",
+        "license":"LicenseRef-private", "licenseClass":"restricted",
+        "versions":[{"version":"1"}],
+    });
+    let source = json!({
+        "id":"loader", "kind":"source", "title":"Loader",
+        "versions":[{"version":"1",
+            "imports":[{"resource":"restricted","version":"1"}],
+            "distributions":[{"url":"http://127.0.0.1:1/data.nt", "sha256":"0".repeat(64)}],
+        }],
+    });
+    for item in [restricted, source] {
+        let result = send(&s.app, req("POST", "/$/resources", Some(item))).await;
+        assert_eq!(result.status, StatusCode::CREATED, "{}", result.text());
+    }
+    let ds = s.st.get("ds").unwrap();
+    let head = ds.store.head_commit().seq;
+    let document = json!({"format":1,"kind":"recipe","inputs":[{
+        "source": {"resource":"loader", "version":"1"}, "graph":"urn:example:g"
+    }]});
+    let result = send(
+        &s.app,
+        req("POST", "/$/sources/ds/load", Some(document.clone())),
+    )
+    .await;
+    assert_eq!(result.code(), "license-unaccepted", "{}", result.text());
+    let acceptance = send(
+        &s.app,
+        req("POST", "/$/resources/restricted/acceptance", None),
+    )
+    .await;
+    assert!(acceptance.status.is_success(), "{}", acceptance.text());
+    let result = send(&s.app, req("POST", "/$/sources/ds/load", Some(document))).await;
+    assert_eq!(result.code(), "source-fetch-failed", "{}", result.text());
+    assert!(result.text().contains("loopback"), "{}", result.text());
+    assert_eq!(ds.store.head_commit().seq, head);
+}
+
+#[tokio::test]
+async fn source_download_errors_hide_transport_details_and_classify_timeouts() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        for (path, reply) in [
+            (
+                "/truncated",
+                "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n",
+            ),
+            (
+                "/redirect",
+                "HTTP/1.1 302 Found\r\nLocation: /redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ),
+        ] {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(conn.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(format!("GET {path} ").as_bytes()));
+            conn.write_all(reply.as_bytes()).await.unwrap();
+        }
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut byte = [0u8; 1];
+        while conn.read(&mut byte).await.is_ok_and(|n| n != 0) {}
+    });
+    let policy = sparkles::outbound::OutboundPolicy {
+        allow_private: true,
+        max_redirects: 0,
+        ..Default::default()
+    };
+    let url = |path| format!("http://{address}/{path}");
+    let deadline = || std::time::Instant::now() + Duration::from_secs(2);
+    let mut response = policy
+        .open_download(&url("truncated"), deadline())
+        .await
+        .unwrap();
+    let body_error = response.chunk().await.err().expect("body was truncated");
+    assert!(
+        matches!(body_error, sparkles::Error::Invalid(m) if m == "the download body could not be read")
+    );
+
+    let redirected = policy.open_download(&url("redirect"), deadline()).await;
+    assert!(matches!(redirected, Err(sparkles::Error::Invalid(m)) if m == "more than 0 redirects"));
+    let stalled = policy
+        .open_download(
+            &url("stalled"),
+            std::time::Instant::now() + Duration::from_millis(200),
+        )
+        .await;
+    assert!(matches!(stalled, Err(sparkles::Error::Timeout)));
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn qleverfile_harvest_requires_nonempty_file_patterns() {
+    for document in [
+        "[index]\nINPUT_FILES = ",
+        "[index]\nMULTI_INPUT_JSON = {\"for-each\":\"   \",\"format\":\"ttl\"}",
+    ] {
+        let request: super::harvest::Request =
+            serde_json::from_value(json!({"kind":"qleverfile","document":document})).unwrap();
+        assert!(super::harvest::preview(request).is_err());
+    }
 }

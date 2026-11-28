@@ -81,9 +81,15 @@ impl CommitIntent for Intent<'_> {
     }
 
     fn retire(&self, seq: u64) -> sparkles::Result<()> {
-        // An unreferenced file is invisible and startup will sweep it. Never
-        // remove a file on an ambiguous write error.
-        if self.store.root().is_none() {
+        // Retirement runs only after a definite refusal before publication.
+        if let Some(root) = self.store.root() {
+            match fs::remove_file(location(root, seq)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            sparkles::fsutil::sync_dir(&root.join(DIRECTORY))?;
+        } else {
             self.memory
                 .records
                 .lock()
@@ -140,6 +146,9 @@ pub(crate) fn read(st: &AppState, ds: &Dataset, seq: u64) -> ApiResult<Manifest>
         return Err(unreadable("the content does not match the commit digest"));
     }
     let manifest: Manifest = recipe::decode(&bytes).map_err(|e| unreadable(super::message(&e)))?;
+    if manifest.dataset_id != store.dataset_id() {
+        return Err(missing(seq));
+    }
     Ok(manifest)
 }
 
@@ -207,6 +216,13 @@ fn fetch_error(detail: impl std::fmt::Display) -> crate::http::ApiError {
     )
 }
 
+fn download_error(e: sparkles::Error) -> crate::http::ApiError {
+    match e {
+        sparkles::Error::Timeout => e.into(),
+        other => fetch_error(other),
+    }
+}
+
 pub(crate) fn clean_staging(data_dir: &Path) -> io::Result<()> {
     match fs::remove_dir_all(data_dir.join(STAGING)) {
         Ok(()) => Ok(()),
@@ -252,7 +268,8 @@ fn spool(st: &AppState, plan: &Plan, dir: &Path, opts: &WriteOptions) -> ApiResu
     };
     let deadline = Instant::now() + policy.request_timeout;
     let deadline = opts.deadline.map_or(deadline, |d| d.min(deadline));
-    let runtime = tokio::runtime::Handle::current();
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| unreadable("the source download runtime is unavailable"))?;
     let mut disk = BodyBudget::new(&st.limits);
     let mut total = 0u64;
     let mut sources = Vec::with_capacity(plan.files.len());
@@ -271,7 +288,7 @@ fn spool(st: &AppState, plan: &Plan, dir: &Path, opts: &WriteOptions) -> ApiResu
                     policy.open_download(&file.url, deadline),
                     opts,
                 ))?
-                .map_err(fetch_error)?;
+                .map_err(download_error)?;
             if response.status() != StatusCode::OK {
                 return Err(fetch_error(format!(
                     "source {} returned HTTP {}",
@@ -285,8 +302,9 @@ fn spool(st: &AppState, plan: &Plan, dir: &Path, opts: &WriteOptions) -> ApiResu
             let mut size = 0u64;
             while let Some(chunk) = runtime
                 .block_on(until_cancelled(response.chunk(), opts))?
-                .map_err(fetch_error)?
+                .map_err(download_error)?
             {
+                let chunk = chunk.as_ref();
                 let n = chunk.len();
                 size += n as u64;
                 total += n as u64;
@@ -301,8 +319,8 @@ fn spool(st: &AppState, plan: &Plan, dir: &Path, opts: &WriteOptions) -> ApiResu
                 }
                 disk.read(n)?;
                 disk.disk(dir, n)?;
-                digest.update(&chunk);
-                dest.write_all(&chunk).map_err(sparkles::Error::from)?;
+                digest.update(chunk);
+                dest.write_all(chunk).map_err(sparkles::Error::from)?;
             }
             if file.sha256 != recipe::hex(&digest.finalize()) {
                 return Err(fetch_error(format!(
@@ -502,4 +520,54 @@ pub(crate) fn execute(
         )?
         .1;
     Ok(Loaded { receipt, manifest })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparkles::store::StoreOptions;
+
+    #[test]
+    fn a_failed_manifest_write_refuses_publication_until_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        prepare_manifests(dir.path()).unwrap();
+        let head = store.head_commit().seq;
+        let path = location(dir.path(), head + 1);
+        let blocked = path.with_extension("tmp");
+        fs::create_dir(&blocked).unwrap();
+        let memory = MemoryManifests::default();
+        let intent = Intent {
+            store: &store,
+            memory: &memory,
+            bytes: b"manifest".to_vec(),
+        };
+        let input = Source::from_bytes(
+            b"<urn:s> <urn:p> <urn:o> .".to_vec(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        );
+        let failed = store.replace_with_intent(
+            ReplaceTarget::Default,
+            std::slice::from_ref(&input),
+            CommitKind::Load,
+            &WriteOptions::default(),
+            &intent,
+            BTreeMap::new(),
+        );
+        assert!(failed.is_err());
+        assert!(!path.exists());
+        assert_eq!(store.head_commit().seq, head);
+        assert!(matches!(
+            store.try_write_with(CommitKind::Transaction, WriteOptions::default()),
+            Err(sparkles::Error::Poisoned)
+        ));
+        drop(store);
+        fs::remove_dir(blocked).unwrap();
+
+        let reopened = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        assert_eq!(reopened.head_commit().seq, head);
+        reopened.load(&[input]).unwrap();
+        assert_eq!(reopened.head_commit().seq, head + 1);
+    }
 }

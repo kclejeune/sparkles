@@ -196,7 +196,7 @@ pub(crate) fn run(args: SourceArgs) -> Result<()> {
                 resource_id(&resource)?,
                 dataset_name(&dataset)?
             ),
-            Some(serde_json::to_vec(&json!({"label":label}))?),
+            Some(serde_json::to_vec(&super::mint::Request { label })?),
         ),
     };
     let mut request = remote.req(method, &path);

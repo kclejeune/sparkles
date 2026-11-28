@@ -511,8 +511,9 @@ impl Endpoint {
         let args = message.pointer("/params/arguments");
         let full = p.without_oauth_scopes();
         if tool.is_some_and(|name| {
-            super::catalog::READ.contains(&name)
-                || (super::catalog::WRITE.contains(&name) && name != "catalog_mint_iri")
+            (super::catalog::READ.contains(&name)
+                || (super::catalog::WRITE.contains(&name) && name != "catalog_mint_iri"))
+                && super::catalog::listed(&self.server, p, name)
         }) && full.has(ServerPerm::ServerAdmin)
             && !p.has(ServerPerm::ServerAdmin)
         {

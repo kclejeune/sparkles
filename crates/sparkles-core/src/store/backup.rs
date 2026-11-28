@@ -1414,23 +1414,28 @@ const OPTIONAL_META: [&str; 16] = [
 ];
 
 fn capture_source_manifests(
+    store: &Store,
     root: &Path,
     cut: u64,
     control: &crate::guard::WriteOptions,
 ) -> Result<Vec<CapturedFile>> {
-    use super::source_manifests::{DIRECTORY, file_seq};
+    use super::source_manifests::{DIRECTORY, file_seq, has_reference};
     let entries = match std::fs::read_dir(root.join(DIRECTORY)) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
+    let first = store.catalog.lock().first().map_or(0, |commit| commit.seq);
     let mut files = Vec::new();
     for entry in entries {
         control.check()?;
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if file_seq(&name).is_none_or(|seq| seq > cut) || !entry.file_type()?.is_file() {
+        if file_seq(&name).is_none_or(|seq| {
+            seq < first || seq > cut || !store.annotation(seq).is_some_and(|a| has_reference(&a))
+        }) || !entry.file_type()?.is_file()
+        {
             continue;
         }
         let file = File::open(entry.path())?;
@@ -2025,7 +2030,7 @@ impl Store {
         if let Some(root) = self.root()
             && self.branching.ident.is_none()
         {
-            files.extend(capture_source_manifests(root, head.seq, &control)?);
+            files.extend(capture_source_manifests(self, root, head.seq, &control)?);
         }
         files.extend(history_files);
         files.push(meta_file(
@@ -2503,7 +2508,7 @@ impl Store {
         }
         files.extend(import_journal);
         if self.branching.ident.is_none() {
-            files.extend(capture_source_manifests(root, head.seq, control)?);
+            files.extend(capture_source_manifests(self, root, head.seq, control)?);
         }
         files.extend(history_files);
         files.push(meta(

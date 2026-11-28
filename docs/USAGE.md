@@ -1699,6 +1699,29 @@ With `--server URL --dataset ds` instead of `--loc`, `put`, `get`, `list`, `dele
 mappings as a part or by name, and the Graph Store protocol takes CSV bodies
 ([API](API.md#stored-mappings)).
 
+### Resource catalog commands
+
+Use `sparkles source` with a running Sparkles server. Set `SPARKLES_SERVER` or pass
+`--server` to select it. Use `source add` to register a catalog document, `source list`
+to inspect source versions, and `source harvest` to preview records from a metadata
+file. See the [example catalog records](examples/resource-catalog/README.md) for
+registered distributions and a recipe.
+
+```sh
+sparkles source recipe w3c-vocabularies 1 > recipe.json
+sparkles source plan recipe.json
+sparkles source load my-dataset recipe.json
+sparkles source manifest my-dataset 12
+sparkles source reload my-dataset 12
+```
+
+Replace `12` with the commit sequence returned by the load. The recipe declares
+which named graphs to replace on main. The server checks the registered SHA-256
+digests before replacing any graph. The same command group provides `lock` and
+`check-lock` for pinned imports, `bundle` for vocabulary graphs and prefixes,
+and `mint` for IRI reservations. See the [source manager API](API.md#source-manager)
+for permissions and request details.
+
 ## Formatting
 
 `sparkles fmt` formats SPARQL queries and updates (`.rq`, `.ru`, `.sparql`), Turtle
@@ -3997,7 +4020,7 @@ with the list of valid names.
 | `all` | Every tool. This is the default. |
 | `explore` | Discovery, schema, querying, search, paths, algorithms, history and query diagnostics, with no write tool. |
 | `memory` | Agent memory, which is `recall`, `link_entities`, `assert_facts`, the search tools, document sources and the claim proposal tools. |
-| `admin` | Updates, branches, validation, formatting, ontology axioms, reviews and history. |
+| `admin` | Updates, branches, validation, formatting, ontology axioms, reviews, history and [resource catalog tools](API.md#tool-profiles). |
 
 A profile only narrows the tools. Write tools still need `--allow-update`, a read-only
 server offers none, `--disable-tool` removes a tool from any profile, and every caller

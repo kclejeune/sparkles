@@ -444,7 +444,7 @@ fn manager_schemas(put: &mut dyn FnMut(&str, J)) {
     );
     put(
         "VocabularyIriMintRequest",
-        closed(&[], json!({ "label": string() })),
+        closed(&[], json!({ "label": or_null(string()) })),
     );
     put(
         "VocabularyIriReservation",

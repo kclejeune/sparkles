@@ -22,6 +22,8 @@ pub enum Need {
     Interactive,
     /// that level on the route's `{ds}`
     Dataset(Level),
+    /// A dataset level together with a server permission.
+    DatasetAndServer(Level, ServerPerm),
     Server(ServerPerm),
 }
 
@@ -520,11 +522,13 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // the server's resource catalog (C30); installing a vocabulary's prefixes changes
         // one dataset's settings
         "/$/resources/{id}/install/{ds}" => Dataset(Admin),
-        "/$/sources/{ds}/manifests/{commit}" => Dataset(Read),
+        "/$/sources/{ds}/manifests/{commit}" => DatasetAndServer(Read, ServerPerm::ServerAdmin),
         "/$/sources/{ds}/load"
         | "/$/sources/{ds}/manifests/{commit}/reload"
-        | "/$/resources/{id}/versions/{version}/bundle/{ds}"
-        | "/$/resources/{id}/mint/{ds}" => Dataset(Write),
+        | "/$/resources/{id}/versions/{version}/bundle/{ds}" => {
+            DatasetAndServer(Write, ServerPerm::ServerAdmin)
+        }
+        "/$/resources/{id}/mint/{ds}" => Dataset(Write),
         "/$/resources"
         | "/$/resources/{id}"
         | "/$/resources/{id}/versions"
@@ -959,7 +963,9 @@ fn origin_gated(method: &Method, need: Need) -> bool {
     !safe(method)
         || matches!(
             need,
-            Need::Dataset(Level::Write | Level::Admin) | Need::Server(ServerPerm::ServerAdmin)
+            Need::Dataset(Level::Write | Level::Admin)
+                | Need::DatasetAndServer(_, ServerPerm::ServerAdmin)
+                | Need::Server(ServerPerm::ServerAdmin)
         )
 }
 
@@ -1675,8 +1681,18 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
 
     // 4.–6. decide
     let unauth = |h: &HeaderMap| unauthorized(realm, h, "authentication required", None, basic, "");
+    if let Need::Server(perm) | Need::DatasetAndServer(_, perm) = need
+        && !p.has(perm)
+    {
+        if p.is_anonymous() {
+            return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
+        }
+        count(Denied::Forbidden);
+        let msg = format!("{} permission required", perm.as_str());
+        return finish(forbidden(&p, &msg));
+    }
     match need {
-        Need::Public | Need::Caller => {}
+        Need::Public | Need::Caller | Need::Server(_) => {}
         Need::Authed => {
             if p.is_anonymous() {
                 return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
@@ -1695,17 +1711,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                 ));
             }
         }
-        Need::Server(perm) => {
-            if !p.has(perm) {
-                if p.is_anonymous() {
-                    return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
-                }
-                count(Denied::Forbidden);
-                let msg = format!("{} permission required", perm.as_str());
-                return finish(forbidden(&p, &msg));
-            }
-        }
-        Need::Dataset(lvl) => {
+        Need::Dataset(lvl) | Need::DatasetAndServer(lvl, _) => {
             let ds = ds_of(&route, req.uri()).unwrap_or_default();
             // the branch routes need the dataset visible on some branch; their handlers
             // check each branch a request names

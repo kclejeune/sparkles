@@ -6215,8 +6215,9 @@ carry `versionIri`, `snapshot`, `issued`, `notes`, a `license` that overrides th
 resource's, `distributions` and `imports`. `versionIri` is an absolute IRI unique across
 the catalog that is emitted as `owl:versionIRI` in DCAT output, and `snapshot` is a
 point-in-time selector (`snapshot:NAME`, `commit:N`, `N`, `time:<RFC 3339>` or `head`)
-that pins linked-data reads of that version. Using `versionIri` or `snapshot` writes
-`resources.json` at format 2, while catalogs without them stay at format 1. A version of
+that pins linked-data reads of that version. Catalogs with an `iriPolicy` use format 3
+of `resources.json`. Catalogs with `versionIri` or `snapshot` use format 2 when there is
+no IRI policy. Other catalogs use format 1. A version of
 a dataset resource lists its `graphs`, each with the `sources` it
 was built from. An import or a source is a pin, `{"resource": …, "version": …}`, of a
 version that exists. A version never changes once it is added, so a correction is a new
@@ -6327,7 +6328,18 @@ A load needs server `admin`, Query access to each target graph and write access 
 each through the Upload endpoint. Manifest reads and reloads require full Query
 access to the dataset. Restricted terms must have recorded acceptance before any of
 their bytes are fetched. The load verifies the raw response bytes, including any
-compression, before parsing. A digest or size mismatch leaves the dataset unchanged.
+compression, before parsing. A load also aborts if the server access policy changes
+during execution. A digest or size mismatch leaves the dataset unchanged.
+
+A manifest is bound to the original dataset ID and to a retained commit by the
+digest in its commit annotation. A same-identity restore preserves that reference.
+An identity-changing restore keeps the copied files and returns `404 no-source-manifest`
+for the source dataset's manifest. A matching annotation with incomplete or corrupt
+files returns `503 source-manifest-unreadable`. An I/O failure while persisting a
+manifest leaves the commit unpublished and blocks further writes until the store
+reopens. In-memory datasets share a limit of 128 manifests and 16 MiB of manifest
+data per server. Pruning and dataset removal free those records at the next
+in-memory source load.
 
 A vocabulary resource can carry an `iriPolicy` with `namespace` and `rule`. Rules
 have `kind` of `slug`, `uuid`, `ulid`, `sequence` or `obo`. Slug rules require
@@ -12391,7 +12403,15 @@ profiles are defined in one table of the server.
 | `all` | Every tool. |
 | `explore` | `list_datasets`, `describe_schema`, `draft_shapes`, `diff_schema`, `sparql_query`, `explain_query`, `describe_resource`, `find_paths`, `graph_algorithm`, `list_commits`, `list_changes`, `search_text`, `search_semantic`, `similar_entities`, `check_query`, `similar_queries`, `community_reports`, `why_empty`, `ask`, `share_query`, `explain_inference` and `graphql_query`. |
 | `memory` | `list_datasets`, `describe_schema`, `sparql_query`, `describe_resource`, `search_text`, `search_semantic`, `similar_entities`, `check_query`, `similar_queries`, `link_entities`, `recall`, `community_reports`, `read_chunks`, `list_sources`, `ingest_profile`, `assert_facts`, `register_source`, `propose_claims`, `withdraw_claims`, `resolve_evidence` and `find_evidence_dependents`. |
-| `admin` | `list_datasets`, `describe_schema`, `draft_shapes`, `diff_schema`, `sparql_query`, `explain_query`, `list_commits`, `list_changes`, `validate_shacl`, `validate_shex`, `format`, `lint`, `ontology_axioms`, `entailment_diff`, `review_claims`, `resolve_identities`, `sparql_update` and the branch tools. |
+| `admin` | `list_datasets`, `describe_schema`, `draft_shapes`, `diff_schema`, `sparql_query`, `explain_query`, `list_commits`, `list_changes`, `validate_shacl`, `validate_shex`, `format`, `lint`, `ontology_axioms`, `entailment_diff`, `review_claims`, `resolve_identities`, `sparql_update`, the branch tools and the resource catalog tools. |
+
+The resource catalog tools are `catalog_sources`, `catalog_plan`, `catalog_harvest`,
+`catalog_import_lock`, `catalog_manifest`, `catalog_load`, `catalog_reload`,
+`catalog_install_bundle` and `catalog_mint_iri`. These tools use the same permissions
+as the [source manager routes](#source-manager). Loads, reloads, bundle installation
+and minting require MCP writes to be enabled. On HTTP, a caller with server admin
+grants and a narrower OAuth token can discover the administrative tools and
+request `sparkles:admin` when making the call.
 
 Several profiles and tool names combine into the union of their tools, and `all` among
 them offers every tool. A tool that the build lacks is skipped. An unknown profile or

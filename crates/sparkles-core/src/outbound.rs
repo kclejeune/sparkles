@@ -629,6 +629,27 @@ impl Drop for RequestBudget {
     }
 }
 
+/// A streaming download whose I/O failures are scrubbed before they reach callers.
+pub struct Download(reqwest::Response);
+
+impl Download {
+    pub fn status(&self) -> reqwest::StatusCode {
+        self.0.status()
+    }
+
+    pub async fn chunk(&mut self) -> crate::Result<Option<impl AsRef<[u8]>>> {
+        match self.0.chunk().await {
+            Ok(chunk) => Ok(chunk),
+            Err(e) if e.is_timeout() => Err(crate::Error::Timeout),
+            Err(e) => Err(crate::Error::Invalid(hidden(
+                self.0.url().as_str(),
+                "the download body could not be read",
+                &e,
+            ))),
+        }
+    }
+}
+
 impl OutboundPolicy {
     /// Parse and check a URL: its scheme and, for an IP-literal host, the address.
     /// A host name is checked when it is resolved ([`check_host`](Self::check_host)).
@@ -1015,7 +1036,9 @@ impl OutboundPolicy {
             // so later DNS/connect aborts must never be classified as before-send.
             redirected.store(true, Ordering::SeqCst);
             if a.previous().len() > max {
-                return a.error(format!("more than {max} redirects"));
+                let message = format!("more than {max} redirects");
+                *slot.lock() = Some(Failure::Failed(message.clone()));
+                return a.error(message);
             }
             // the TLS options were given for the first server only
             if custom
@@ -1035,9 +1058,11 @@ impl OutboundPolicy {
                 Ok(()) => a.follow(),
                 Err(f) => {
                     let m = format!("redirect to {}: {f}", a.url());
-                    if matches!(f, Failure::Refused(_)) {
-                        *slot.lock() = Some(Failure::Refused(m.clone()));
-                    }
+                    let failure = match f {
+                        Failure::Refused(_) => Failure::Refused(m.clone()),
+                        other => other,
+                    };
+                    *slot.lock() = Some(failure);
                     a.error(m)
                 }
             }
@@ -1047,16 +1072,13 @@ impl OutboundPolicy {
     /// Open a download through the same checks as the blocking outbound client. The
     /// caller owns the response budget and may drop either a pending send or a body
     /// read to abort it, including while the connection is idle.
-    pub async fn open_download(
-        &self,
-        url: &str,
-        deadline: Instant,
-    ) -> Result<reqwest::Response, Failure> {
+    pub async fn open_download(&self, url: &str, deadline: Instant) -> crate::Result<Download> {
         #[cfg(any(test, feature = "failpoints"))]
         if probe::intercept(url) {
-            return Err(Failure::Failed("owned test refused outbound send".into()));
+            return Err(crate::Error::invalid("owned test refused outbound send"));
         }
-        let u = self.check_url(url)?;
+        let failure = |f: Failure| crate::Error::Invalid(f.to_string());
+        let u = self.check_url(url).map_err(failure)?;
         let failed = Arc::new(Mutex::new(None));
         let redirected = Arc::new(AtomicBool::new(false));
         let mut builder = reqwest::Client::builder()
@@ -1078,7 +1100,7 @@ impl OutboundPolicy {
             }))
             .user_agent(concat!("sparkles/", env!("CARGO_PKG_VERSION")));
         let build_error = |e: reqwest::Error| {
-            Failure::Failed(hidden(url, "the HTTP client could not be built", &e))
+            crate::Error::Invalid(hidden(url, "the HTTP client could not be built", &e))
         };
         if let Some(pem) = &self.tls.extra_roots_pem {
             builder = builder
@@ -1100,14 +1122,25 @@ impl OutboundPolicy {
             .saturating_duration_since(Instant::now())
             .min(self.timeout);
         if remaining.is_zero() {
-            return Err(Failure::Failed(timed_out(remaining)));
+            return Err(crate::Error::Timeout);
         }
-        request.timeout(remaining).send().await.map_err(|e| {
-            failed
-                .lock()
-                .take()
-                .unwrap_or_else(|| Failure::Failed(hidden(url, "the download request failed", &e)))
-        })
+        match request.timeout(remaining).send().await {
+            Ok(response) => Ok(Download(response)),
+            Err(e) => {
+                if let Some(f) = failed.lock().take() {
+                    return Err(failure(f));
+                }
+                if e.is_timeout() || Instant::now() >= deadline {
+                    return Err(crate::Error::Timeout);
+                }
+                let what = if e.is_redirect() {
+                    "the download redirect failed"
+                } else {
+                    "the download request failed"
+                };
+                Err(crate::Error::Invalid(hidden(url, what, &e)))
+            }
+        }
     }
 }
 

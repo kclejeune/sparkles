@@ -1031,7 +1031,12 @@ pub(super) fn propose_now(
     options.source_graph = request.source_graph;
     options.proposal_graph = request.proposal_graph;
     options.identity_graph = request.identity_graph;
-    options.message = request.message.map(Arc::from);
+    options.message = request
+        .message
+        .as_deref()
+        .map(sparkles::annotations::validate_user_message)
+        .transpose()?
+        .flatten();
     options.author = crate::http::author(&p);
     options.write = opts.graphs.clone();
     let drift = crate::settings::evidence::DriftFence::capture(&st, &main)?;

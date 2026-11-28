@@ -31529,7 +31529,14 @@
         "additionalProperties": false,
         "properties": {
           "label": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object"
@@ -55457,7 +55464,7 @@
         "tags": [
           "Catalog"
         ],
-        "x-sparkles-permission": "write"
+        "x-sparkles-permission": "write and server-admin"
       }
     },
     "/$/resources/{id}/versions/{version}/lock": {
@@ -58304,7 +58311,7 @@
         "tags": [
           "Catalog"
         ],
-        "x-sparkles-permission": "write"
+        "x-sparkles-permission": "write and server-admin"
       }
     },
     "/$/sources/{ds}/manifests/{commit}": {
@@ -58356,7 +58363,7 @@
         "tags": [
           "Catalog"
         ],
-        "x-sparkles-permission": "read"
+        "x-sparkles-permission": "read and server-admin"
       }
     },
     "/$/sources/{ds}/manifests/{commit}/reload": {
@@ -58447,7 +58454,7 @@
         "tags": [
           "Catalog"
         ],
-        "x-sparkles-permission": "write"
+        "x-sparkles-permission": "write and server-admin"
       }
     },
     "/$/stats": {

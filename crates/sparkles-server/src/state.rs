@@ -1384,7 +1384,14 @@ impl AppState {
             ..Default::default()
         });
         self.catalog.attach(name, source)?;
-        Ok(self.get(name).expect("attached"))
+        let dataset = self.get(name).expect("attached");
+        if self.data_dir.as_os_str().is_empty()
+            && let Some(root) = dataset.store.root()
+            && let Err(error) = crate::resources::load::clean_staging(root)
+        {
+            tracing::warn!(dataset = name, %error, "could not clear source load staging");
+        }
+        Ok(dataset)
     }
     /// [`attach`](Self::attach) under a name that startup took with
     /// [`sparkles::Catalog::expect`].

@@ -214,11 +214,15 @@ fn catalog_error(e: crate::resources::Error) -> ToolError {
 }
 
 pub(super) fn listed(server: &super::McpServer, p: &crate::auth::Principal, name: &str) -> bool {
-    if READ.contains(&name) {
-        return p.has(ServerPerm::ServerAdmin);
+    if !server.offers(name) {
+        return false;
     }
-    (name == "catalog_mint_iri" || p.has(ServerPerm::ServerAdmin))
-        && server.may_write_somewhere(&p.without_oauth_scopes())
+    let full = p.without_oauth_scopes();
+    if READ.contains(&name) {
+        return full.has(ServerPerm::ServerAdmin);
+    }
+    (name == "catalog_mint_iri" || full.has(ServerPerm::ServerAdmin))
+        && server.may_write_somewhere(&full)
 }
 
 pub(super) fn run(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, ToolError> {

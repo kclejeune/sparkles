@@ -210,7 +210,11 @@ fn prepare(
     options.idempotency_key = idempotency_key;
     options.if_head = if_head;
     options.dry_run = dry_run;
-    options.message = message.map(Arc::from);
+    options.message = message
+        .as_deref()
+        .map(sparkles::annotations::validate_user_message)
+        .transpose()?
+        .flatten();
     options.author = crate::http::author(p);
     options.write = opts.graphs.clone();
     let drift = crate::settings::evidence::DriftFence::capture(st, &main)?;

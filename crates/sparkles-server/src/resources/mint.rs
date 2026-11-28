@@ -163,9 +163,10 @@ fn ulid() -> String {
         .collect()
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Request {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
 
@@ -212,9 +213,12 @@ pub(crate) fn reserve(
     {
         let resource = super::find(&catalog, id).ok_or_else(|| super::no_such(id))?;
         if !resource.input.graphs.iter().any(|g| g.dataset == ds.name) {
-            return Err(
-                invalid("the vocabulary must have a registered graph in this dataset").into(),
-            );
+            if p.has(crate::auth::ServerPerm::ServerAdmin) {
+                return Err(
+                    invalid("the vocabulary must have a registered graph in this dataset").into(),
+                );
+            }
+            return Err(super::no_such(id).into());
         }
         let policy = resource
             .input
