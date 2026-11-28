@@ -616,10 +616,14 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
         }
     }
     let horn_ax = axioms(&horn_body);
+    // The EL runs and the runs that fall back leave the modules' pass to later
+    // (`cover_later`), since the pass's state counts in the peak (roadmap item 1277) and
+    // this test pins the tiers' saturation peaks.
     let el_full = Classifier::of(&horn_ax)
         .classify(&Limits {
             threads: 1,
             el_only: true,
+            cover_later: true,
             ..Limits::default()
         })
         .unwrap();
@@ -648,6 +652,7 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
         let non_partial = Classifier::of(&horn_ax).classify(&Limits {
             threads: 1,
             partial: false,
+            cover_later: true,
             max_memory: Some(cap),
             ..Limits::default()
         });
@@ -698,6 +703,7 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
         .classify(&Limits {
             threads: 1,
             el_only: true,
+            cover_later: true,
             ..Limits::default()
         })
         .unwrap();
@@ -709,6 +715,7 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
         let non_partial = Classifier::of(&dl_ax).classify(&Limits {
             threads: 1,
             partial: false,
+            cover_later: true,
             max_memory: Some(cap),
             ..Limits::default()
         });

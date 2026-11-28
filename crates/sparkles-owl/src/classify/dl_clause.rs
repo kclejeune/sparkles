@@ -80,13 +80,13 @@ pub(super) fn checked_hash_table_bytes(capacity: usize, entry_size: usize) -> Op
 /// Exact heap allocation size of a `FxHashMap`/`FxHashSet` with `capacity` slots of
 /// `entry_size` bytes.
 #[inline]
-pub(super) fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
+pub(crate) fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
     checked_hash_table_bytes(capacity, entry_size).unwrap_or(usize::MAX)
 }
 
 /// Allocation size of the next hashbrown table when a table at `capacity` rehashes.
 #[inline]
-pub(super) fn next_hash_table_bytes(capacity: usize, entry_size: usize) -> Option<usize> {
+pub(crate) fn next_hash_table_bytes(capacity: usize, entry_size: usize) -> Option<usize> {
     let cur = hash_buckets(capacity)?;
     let next = if cur == 0 { 4 } else { cur.checked_mul(2)? };
     table_layout_bytes(next, entry_size)

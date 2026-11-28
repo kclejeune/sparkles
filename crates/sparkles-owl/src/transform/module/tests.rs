@@ -286,7 +286,7 @@ fn past_its_bound_the_pass_leaves_the_undecided_classes_incomplete() {
     with.extend(all.iter().copied());
     assert_eq!(
         coverage(&with, &out, true, classes.iter(), usize::MAX, &|| true),
-        Err(Stopped)
+        Err(Stopped::Caller)
     );
 }
 

@@ -4996,13 +4996,27 @@ fn post_merge_reduction_decline_clears_derived_aliases_and_never_leaks_hub() {
     body_b.push_str(")\n");
     let ax_b = axioms(&body_b);
     let mut fresh_b = Classifier::of(&ax_b);
-    let expected_b = fresh_b
+    // Both runs below take the modules' pass after the run, whose state counts in the peak
+    // when the run admits it (roadmap item 1277), so their peaks compare the saturations.
+    let mut expected_b = fresh_b
         .classify(&Limits {
             threads: 1,
             rooted: false,
+            cover_later: true,
             ..Limits::default()
         })
         .unwrap();
+    let kinds_b: Vec<&AxiomKind> = ax_b.iter().map(|a| &a.kind).collect();
+    let fresh_witness_b = expected_b.cover(
+        &kinds_b,
+        &fresh_b.excluded(),
+        None,
+        &Limits {
+            threads: 1,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(fresh_witness_b, None);
     let fresh_desc_b = fresh_b.describe(&c("Tag")).unwrap();
 
     // Unrestricted merged baseline proves Pass 0 merges and triggers a restart.
@@ -5055,15 +5069,28 @@ fn post_merge_reduction_decline_clears_derived_aliases_and_never_leaks_hub() {
     );
 
     let mut k_b = Classifier::of(&ax_b);
-    let got_b = k_b
+    // The modules' pass of the declined run, whose state the cap would count too, runs
+    // after the capped run, since this part pins the reduction's decline.
+    let mut got_b = k_b
         .classify(&Limits {
             threads: 1,
             rooted: true,
             rooted_merge: true,
             max_memory: Some(cap_b),
+            cover_later: true,
             ..Limits::default()
         })
         .unwrap();
+    let witness_b = got_b.cover(
+        &kinds_b,
+        &k_b.excluded(),
+        None,
+        &Limits {
+            threads: 1,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(witness_b, None);
     assert!(!got_b.complete, "Part B Pass 1 reduction must decline");
     assert!(
         got_b.stats.peak_memory > expected_b.stats.peak_memory,

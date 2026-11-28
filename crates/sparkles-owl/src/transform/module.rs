@@ -62,6 +62,7 @@
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::Cell;
 
 /// The logical axioms of the bottom-locality module of `seed` among `axioms`, and the
 /// declarations of the entities of its signature, in the axioms' order. An axiom of a
@@ -113,12 +114,136 @@ pub struct Coverage {
 /// own deadline.
 pub type Dropped<'d> = dyn FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + 'd;
 
-/// Why [`coverage_refs`] stopped before an answer: its caller's stop said so.
+/// Why [`coverage_refs`] stopped before an answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Stopped;
+pub(crate) enum Stopped {
+    /// its caller's stop said so
+    Caller,
+    /// its [`Meter`] refused a growth of the pass's state
+    Memory,
+}
 
 /// How often an extraction asks its caller whether to stop, in axioms it looks at.
 const POLL_EVERY: usize = 4096;
+
+/// The memory that the modules' pass holds, in estimated bytes: its index, its
+/// extractions, its sets of axioms and its lists of classes. The pass asks `admit` before
+/// each growth that takes the estimate past its peak, so a refusal comes before the
+/// allocation. `admit` sees the peak the pass would reach, and false refuses it. A meter
+/// without `admit` refuses nothing and only counts.
+///
+/// A vector that reallocates holds its old and its new buffer at once, which the peak
+/// counts. The signature walk of one axiom is counted once it is known, before the index
+/// takes anything of that axiom, and freed after it.
+pub(crate) struct Meter<'m> {
+    admit: Option<&'m dyn Fn(usize) -> bool>,
+    live: Cell<usize>,
+    peak: Cell<usize>,
+}
+
+impl<'m> Meter<'m> {
+    pub(crate) fn new(admit: Option<&'m dyn Fn(usize) -> bool>) -> Self {
+        Meter {
+            admit,
+            live: Cell::new(0),
+            peak: Cell::new(0),
+        }
+    }
+
+    /// The most the pass held at once.
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.get()
+    }
+
+    /// What the pass holds now.
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> usize {
+        self.live.get()
+    }
+
+    /// Whether the pass may hold `bytes` at once, which raises its peak when it may.
+    fn reach(&self, bytes: usize) -> bool {
+        if bytes <= self.peak.get() {
+            return true;
+        }
+        if let Some(admit) = self.admit
+            && !admit(bytes)
+        {
+            return false;
+        }
+        self.peak.set(bytes);
+        true
+    }
+
+    /// Admits `bytes` more, held until [`free`](Meter::free) gives them back.
+    pub(crate) fn grow(&self, bytes: usize) -> bool {
+        let live = self.live.get().saturating_add(bytes);
+        if !self.reach(live) {
+            return false;
+        }
+        self.live.set(live);
+        true
+    }
+
+    /// Admits a buffer of `old` bytes that moves to one of `new` bytes, both held while it
+    /// moves.
+    fn regrow(&self, old: usize, new: usize) -> bool {
+        if !self.reach(self.live.get().saturating_add(new)) {
+            return false;
+        }
+        self.live
+            .set(self.live.get().saturating_sub(old).saturating_add(new));
+        true
+    }
+
+    pub(crate) fn free(&self, bytes: usize) {
+        self.live.set(self.live.get().saturating_sub(bytes));
+    }
+
+    /// Pushes `x` onto `v`, admitting the growth of a full vector before it reallocates.
+    pub(crate) fn push<T>(&self, v: &mut Vec<T>, x: T) -> bool {
+        if v.len() == v.capacity() {
+            let size = std::mem::size_of::<T>();
+            let old = v.capacity();
+            let new = next_cap(old, size);
+            if !self.regrow(old.saturating_mul(size), new.saturating_mul(size)) {
+                return false;
+            }
+            v.reserve_exact(new - v.len());
+        }
+        v.push(x);
+        true
+    }
+}
+
+/// The capacity a full vector of `cap` elements of `size` bytes grows to, as the standard
+/// library's vectors grow on a push.
+fn next_cap(cap: usize, size: usize) -> usize {
+    if cap == 0 {
+        match size {
+            1 => 8,
+            0..=1024 => 4,
+            _ => 1,
+        }
+    } else {
+        cap.saturating_mul(2)
+    }
+}
+
+/// Pushes `x` onto `v` through `meter` when there is one, and plainly otherwise.
+fn push<T>(meter: Option<&Meter<'_>>, v: &mut Vec<T>, x: T) -> bool {
+    match meter {
+        Some(m) => m.push(v, x),
+        None => {
+            v.push(x);
+            true
+        }
+    }
+}
+
+fn grow(meter: Option<&Meter<'_>>, bytes: usize) -> bool {
+    meter.is_none_or(|m| m.grow(bytes))
+}
 
 /// Borrowed result of [`coverage_refs`], allowing callers to admit the retained
 /// `Vec<Class>` bytes before cloning any class IRI strings.
@@ -141,7 +266,11 @@ pub(crate) struct CoverageRefs<'c> {
 ///
 /// The extractions look at no more than `budget` axioms in all, after which the classes
 /// not yet decided are incomplete, so that the answer depends on the input alone. `stop`
-/// is asked every few thousand axioms, and true ends the pass with [`Stopped`].
+/// is asked every few thousand axioms, while the index is built and while the
+/// extractions run, and true ends the pass with [`Stopped::Caller`]. `meter` admits every
+/// growth of the pass's state, and a refusal ends the pass with [`Stopped::Memory`]. The
+/// state the pass held is freed when it returns, except the list it answers, which the
+/// meter still counts.
 ///
 /// Returns borrowed references into `classes` without cloning class IRIs so callers can
 /// enforce memory admission before materializing an owned `Vec<Class>`.
@@ -149,19 +278,20 @@ pub(crate) fn coverage_refs<'c>(
     axioms: &[&AxiomKind],
     left_out: &[&AxiomKind],
     consistent: bool,
-    classes: impl IntoIterator<Item = &'c Class>,
+    mut classes: Vec<&'c Class>,
     budget: usize,
     stop: &dyn Fn() -> bool,
+    meter: &Meter<'_>,
 ) -> Result<CoverageRefs<'c>, Stopped> {
-    let classes: Vec<&'c Class> = classes
-        .into_iter()
-        .filter(|c| c.as_str() != vocab::OWL_THING && c.as_str() != vocab::OWL_NOTHING)
-        .collect();
-    let all = |classes: &[&'c Class]| {
+    classes.retain(|c| c.as_str() != vocab::OWL_THING && c.as_str() != vocab::OWL_NOTHING);
+    let all = |classes: &[&'c Class]| -> Result<Vec<&'c Class>, Stopped> {
+        if !meter.grow(std::mem::size_of_val(classes)) {
+            return Err(Stopped::Memory);
+        }
         let mut v: Vec<&'c Class> = classes.to_vec();
         v.sort_unstable();
         v.dedup();
-        v
+        Ok(v)
     };
     if !consistent || left_out.is_empty() {
         // nothing left out, or an inconsistency, which is sound and makes every class
@@ -171,10 +301,21 @@ pub(crate) fn coverage_refs<'c>(
             ..CoverageRefs::default()
         });
     }
-    let mut ix = Index::new(axioms);
-    let wanted: FxHashSet<&AxiomKind> = left_out.iter().copied().collect();
+    let mut ix = Index::build(axioms, Some(meter), stop).map_err(|h| match h {
+        Halt::Memory => Stopped::Memory,
+        Halt::Stopped | Halt::Budget => Stopped::Caller,
+    })?;
+    let set_bytes = crate::classify::hash_table_size(left_out.len(), size_of::<&AxiomKind>());
+    if !meter.grow(set_bytes.saturating_mul(2).saturating_add(ix.axioms.len())) {
+        return Err(Stopped::Memory);
+    }
+    let mut wanted: FxHashSet<&AxiomKind> =
+        FxHashSet::with_capacity_and_hasher(left_out.len(), Default::default());
+    wanted.extend(left_out.iter().copied());
     let mut left = vec![false; ix.axioms.len()];
-    let mut found: FxHashSet<&AxiomKind> = FxHashSet::default();
+    // no more distinct axioms than `wanted` holds, so it never grows
+    let mut found: FxHashSet<&AxiomKind> =
+        FxHashSet::with_capacity_and_hasher(left_out.len(), Default::default());
     for (j, a) in ix.axioms.iter().enumerate() {
         if wanted.contains(a) {
             left[j] = true;
@@ -182,9 +323,11 @@ pub(crate) fn coverage_refs<'c>(
         }
     }
     // the left-out axioms first in each list, so that an extension that reaches one
-    // stops before it checks the others
+    // stops before it checks the others. Each list is in ascending order, so ordering by
+    // the axiom's number after its mark keeps the order a stable sort would, without
+    // the stable sort's buffer.
     for list in ix.by_trigger.iter_mut().chain(ix.by_entity.iter_mut()) {
-        list.sort_by_key(|&j| !left[j as usize]);
+        list.sort_unstable_by_key(|&j| (!left[j as usize], j));
     }
     let ix = ix;
     let work = Work {
@@ -192,19 +335,22 @@ pub(crate) fn coverage_refs<'c>(
         budget,
         stop,
         halted: std::cell::Cell::new(None),
+        meter,
     };
     // the answer when the consistency is not known: every class incomplete
-    let unknown = |over_budget| CoverageRefs {
-        consistency_known: false,
-        incomplete: all(&classes),
-        over_budget,
+    let unknown = |over_budget| {
+        Ok(CoverageRefs {
+            consistency_known: false,
+            incomplete: all(&classes)?,
+            over_budget,
+        })
     };
     // a left-out declaration or annotation is no logical content
     let missing = wanted
         .iter()
         .any(|a| !found.contains(a) && Index::indexed(a));
     if missing {
-        return Ok(unknown(false));
+        return unknown(false);
     }
     // whether the extraction reached a left-out axiom, or None when it halted
     let hits = |x: &mut Extraction<'_>| -> Option<bool> {
@@ -227,11 +373,12 @@ pub(crate) fn coverage_refs<'c>(
             Some(hit)
         }
     };
-    // the answer of a pass that halted: every class incomplete, after the caller's stop
-    // an error
+    // the answer of a pass that halted: every class incomplete past the bound, and an
+    // error after the caller's stop or a refusal of memory
     let halted = || match work.halted.get() {
-        Some(Halt::Stopped) => Err(Stopped),
-        _ => Ok(unknown(true)),
+        Some(Halt::Stopped) => Err(Stopped::Caller),
+        Some(Halt::Memory) => Err(Stopped::Memory),
+        Some(Halt::Budget) | None => unknown(true),
     };
     // layer 1's base, which is also the first test of layer 2
     let mut bottom = Extraction::new(&ix, Mode::Bottom, None, &work);
@@ -244,12 +391,18 @@ pub(crate) fn coverage_refs<'c>(
             return halted();
         };
         if top_hit {
-            return Ok(unknown(false));
+            return unknown(false);
         }
     }
     let consistency_known = true;
     // layer 3 when its gates hold, which decides every class layer 1 decides and more
+    if !meter.grow(ix.axioms.len()) {
+        return Err(Stopped::Memory);
+    }
     let terminology = ix.terminology_gate();
+    if terminology.is_none() {
+        meter.free(ix.axioms.len());
+    }
     let (mut base, base_hit) = match &terminology {
         Some(mask) => {
             let mut t = Extraction::new(&ix, Mode::Bottom, Some(mask), &work);
@@ -263,12 +416,17 @@ pub(crate) fn coverage_refs<'c>(
     if base_hit {
         return Ok(CoverageRefs {
             consistency_known,
-            incomplete: all(&classes),
+            incomplete: all(&classes)?,
             ..CoverageRefs::default()
         });
     }
-    base.freeze();
+    if !base.freeze() {
+        return Err(Stopped::Memory);
+    }
     // what is known of each entity's module: 1 holds no left-out axiom, 2 holds one
+    if !meter.grow(ix.names.len()) {
+        return Err(Stopped::Memory);
+    }
     let mut status = vec![0u8; ix.names.len()];
     for e in base.signature_ids() {
         status[e as usize] = 1;
@@ -278,8 +436,10 @@ pub(crate) fn coverage_refs<'c>(
     for &c in &classes {
         if over_budget {
             // past the bound, a class no clean module covered is incomplete
-            if ix.id(c.as_str()).is_some_and(|id| status[id as usize] != 1) {
-                incomplete.push(c);
+            if ix.id(c.as_str()).is_some_and(|id| status[id as usize] != 1)
+                && !meter.push(&mut incomplete, c)
+            {
+                return Err(Stopped::Memory);
             }
             continue;
         }
@@ -290,7 +450,9 @@ pub(crate) fn coverage_refs<'c>(
         match status[id as usize] {
             1 => continue,
             2 => {
-                incomplete.push(c);
+                if !meter.push(&mut incomplete, c) {
+                    return Err(Stopped::Memory);
+                }
                 continue;
             }
             _ => {}
@@ -319,14 +481,20 @@ pub(crate) fn coverage_refs<'c>(
         if let Some(h) = work.halted.get()
             && !dirty.get()
         {
-            if h == Halt::Stopped {
-                return Err(Stopped);
+            match h {
+                Halt::Stopped => return Err(Stopped::Caller),
+                Halt::Memory => return Err(Stopped::Memory),
+                Halt::Budget => {}
             }
             over_budget = true;
-            incomplete.push(c);
+            if !meter.push(&mut incomplete, c) {
+                return Err(Stopped::Memory);
+            }
         } else if dirty.get() {
             status[id as usize] = 2;
-            incomplete.push(c);
+            if !meter.push(&mut incomplete, c) {
+                return Err(Stopped::Memory);
+            }
         } else {
             // the module of each entity of a clean module is inside it, so clean too
             for e in base.added() {
@@ -344,7 +512,8 @@ pub(crate) fn coverage_refs<'c>(
     })
 }
 
-/// Owned wrapper over [`coverage_refs`] used by module coverage tests.
+/// Owned wrapper over [`coverage_refs`] used by module coverage tests, with a meter that
+/// refuses nothing.
 #[cfg(test)]
 pub(crate) fn coverage<'c>(
     axioms: &[&AxiomKind],
@@ -354,7 +523,9 @@ pub(crate) fn coverage<'c>(
     budget: usize,
     stop: &dyn Fn() -> bool,
 ) -> Result<Coverage, Stopped> {
-    let c = coverage_refs(axioms, left_out, consistent, classes, budget, stop)?;
+    let meter = Meter::new(None);
+    let classes = classes.into_iter().collect();
+    let c = coverage_refs(axioms, left_out, consistent, classes, budget, stop, &meter)?;
     Ok(Coverage {
         consistency_known: c.consistency_known,
         incomplete: c.incomplete.into_iter().cloned().collect(),
@@ -366,18 +537,36 @@ pub(crate) fn coverage<'c>(
 enum Halt {
     Budget,
     Stopped,
+    Memory,
 }
 
-/// The work of a pass: the axioms its extractions looked at, the bound on them and the
-/// caller's stop, which every extraction of the pass shares.
+/// The work of a pass: the axioms its extractions looked at, the bound on them, the
+/// caller's stop and the meter of its memory, which every extraction of the pass shares.
 struct Work<'s> {
     done: std::cell::Cell<usize>,
     budget: usize,
     stop: &'s dyn Fn() -> bool,
     halted: std::cell::Cell<Option<Halt>>,
+    meter: &'s Meter<'s>,
 }
 
 impl Work<'_> {
+    /// Admits `bytes` more through the meter; false halts the pass.
+    fn grow(&self, bytes: usize) -> bool {
+        self.metered(self.meter.grow(bytes))
+    }
+
+    fn push<T>(&self, v: &mut Vec<T>, x: T) -> bool {
+        self.metered(self.meter.push(v, x))
+    }
+
+    fn metered(&self, admitted: bool) -> bool {
+        if !admitted {
+            self.halted.set(Some(Halt::Memory));
+        }
+        admitted
+    }
+
     /// Counts one axiom looked at; false when the pass halts.
     fn step(&self) -> bool {
         if self.halted.get().is_some() {
@@ -423,17 +612,47 @@ impl<'a> Index<'a> {
     }
 
     fn new(given: &[&'a AxiomKind]) -> Index<'a> {
+        match Index::build(given, None, &|| false) {
+            Ok(ix) => ix,
+            Err(_) => unreachable!("an index without a meter or a stop always finishes"),
+        }
+    }
+
+    /// The index of `given`, with each growth admitted through `meter` when there is one.
+    /// `stop` is asked every [`POLL_EVERY`] axioms.
+    fn build(
+        given: &[&'a AxiomKind],
+        meter: Option<&Meter<'_>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Index<'a>, Halt> {
+        let refused = |admitted: bool| if admitted { Ok(()) } else { Err(Halt::Memory) };
+        let n = given.iter().filter(|k| Index::indexed(k)).count();
+        refused(grow(
+            meter,
+            size_of::<Option<u32>>()
+                .saturating_mul(given.len())
+                .saturating_add(
+                    (size_of::<&AxiomKind>()
+                        + size_of::<Vec<u32>>()
+                        + size_of::<Option<Vec<Vec<u32>>>>())
+                    .saturating_mul(n),
+                ),
+        ))?;
         let mut ix = Index {
-            axioms: Vec::new(),
+            axioms: Vec::with_capacity(n),
             place: Vec::with_capacity(given.len()),
-            sigs: Vec::new(),
+            sigs: Vec::with_capacity(n),
             by_entity: Vec::new(),
             by_trigger: Vec::new(),
-            needs: Vec::new(),
+            needs: Vec::with_capacity(n),
             ids: FxHashMap::default(),
             names: Vec::new(),
         };
-        for k in given {
+        let id_entry = size_of::<(String, u32)>();
+        for (i, k) in given.iter().enumerate() {
+            if (i + 1).is_multiple_of(POLL_EVERY) && stop() {
+                return Err(Halt::Stopped);
+            }
             if !Index::indexed(k) {
                 ix.place.push(None);
                 continue;
@@ -443,53 +662,92 @@ impl<'a> Index<'a> {
             ix.axioms.push(k);
             let mut s = Signature::default();
             s.axiom(k);
+            // an axiom with an ill-typed literal is never local, so nothing it needs
+            let alts = bottom_needs(k).filter(|_| !ill_literal(k));
+            let mut deps: Vec<&str> = Vec::new();
+            bottom_deps(k, &mut deps);
+            deps.sort_unstable();
+            deps.dedup();
+            // what the walk of this axiom holds until the index has taken it
+            let walk = crate::classify::btree_set_bytes::<Entity>(s.0.len())
+                .saturating_add(s.0.iter().map(|e| e.iri().as_str().len()).sum())
+                .saturating_add(alts.as_ref().map_or(0, |alts| {
+                    alts.iter()
+                        .map(|set| set.capacity() * size_of::<&str>())
+                        .sum::<usize>()
+                        + alts.capacity() * size_of::<Vec<&str>>()
+                }))
+                .saturating_add(deps.capacity() * size_of::<&str>());
+            refused(grow(meter, walk))?;
+            refused(grow(meter, s.0.len() * size_of::<u32>()))?;
             let mut sig = Vec::with_capacity(s.0.len());
             for e in s.0 {
                 let iri = e.iri().as_str();
                 let id = match ix.ids.get(iri) {
                     Some(&id) => id,
                     None => {
+                        // the key and the name are two copies of the IRI
+                        refused(grow(meter, iri.len().saturating_mul(2)))?;
                         let id = ix.names.len() as u32;
+                        refused(push(meter, &mut ix.names, iri.to_string()))?;
+                        refused(push(meter, &mut ix.by_entity, Vec::new()))?;
+                        refused(push(meter, &mut ix.by_trigger, Vec::new()))?;
+                        // the table moves on the insert, beside everything above
+                        if let Some(m) = meter
+                            && ix.ids.len() == ix.ids.capacity()
+                        {
+                            let cap = ix.ids.capacity();
+                            let old = crate::classify::hash_table_size(cap, id_entry);
+                            let new = crate::classify::next_hash_table_bytes(cap, id_entry)
+                                .unwrap_or(usize::MAX);
+                            refused(m.regrow(old, new))?;
+                        }
                         ix.ids.insert(iri.to_string(), id);
-                        ix.names.push(iri.to_string());
-                        ix.by_entity.push(Vec::new());
-                        ix.by_trigger.push(Vec::new());
                         id
                     }
                 };
                 // an IRI that two kinds of entity share counts once
                 if !sig.contains(&id) {
                     sig.push(id);
-                    ix.by_entity[id as usize].push(j);
+                    refused(push(meter, &mut ix.by_entity[id as usize], j))?;
                 }
             }
             ix.sigs.push(sig);
             // an IRI without a number is in no signature, so a set holding it is never
             // inside one and drops out
-            // an axiom with an ill-typed literal is never local, so nothing it needs
-            let needs = bottom_needs(k).filter(|_| !ill_literal(k)).map(|alts| {
-                alts.into_iter()
-                    .filter_map(|set| {
-                        set.into_iter()
-                            .map(|iri| ix.ids.get(iri).copied())
-                            .collect::<Option<Vec<u32>>>()
-                    })
-                    .collect()
-            });
+            let needs = match alts {
+                None => None,
+                Some(alts) => {
+                    let kept = |set: &Vec<&str>| set.iter().all(|iri| ix.ids.contains_key(*iri));
+                    let bytes = alts.len() * size_of::<Vec<u32>>()
+                        + alts
+                            .iter()
+                            .filter(|set| kept(set))
+                            .map(|set| set.len() * size_of::<u32>())
+                            .sum::<usize>();
+                    refused(grow(meter, bytes))?;
+                    let mut out: Vec<Vec<u32>> = Vec::with_capacity(alts.len());
+                    for set in alts.iter().filter(|set| kept(set)) {
+                        let mut ids = Vec::with_capacity(set.len());
+                        ids.extend(set.iter().map(|iri| ix.ids[*iri]));
+                        out.push(ids);
+                    }
+                    Some(out)
+                }
+            };
             ix.needs.push(needs);
-            let mut deps: Vec<&str> = Vec::new();
-            bottom_deps(k, &mut deps);
-            deps.sort_unstable();
-            deps.dedup();
             for iri in deps {
                 // an entity the signature walk does not name, such as owl:Thing, is never
                 // in a signature that the extraction grows
                 if let Some(&id) = ix.ids.get(iri) {
-                    ix.by_trigger[id as usize].push(j);
+                    refused(push(meter, &mut ix.by_trigger[id as usize], j))?;
                 }
             }
+            if let Some(m) = meter {
+                m.free(walk);
+            }
         }
-        ix
+        Ok(ix)
     }
 
     fn id(&self, iri: &str) -> Option<u32> {
@@ -607,13 +865,21 @@ impl<'i> Extraction<'i> {
         include: Option<&'i Vec<bool>>,
         work: impl Into<Option<&'i Work<'i>>>,
     ) -> Extraction<'i> {
+        let work = work.into();
+        // a refusal halts the pass, which then extends nothing
+        let admitted = work.is_none_or(|w| w.grow(ix.names.len() + ix.axioms.len()));
+        let (base_sig, base_mod) = if admitted {
+            (vec![false; ix.names.len()], vec![false; ix.axioms.len()])
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Extraction {
             ix,
-            work: work.into(),
+            work,
             mode,
             include: include.map(|v| v.as_slice()),
-            base_sig: vec![false; ix.names.len()],
-            base_mod: vec![false; ix.axioms.len()],
+            base_sig,
+            base_mod,
             sig_stamp: Vec::new(),
             mod_stamp: Vec::new(),
             stamp: 0,
@@ -622,12 +888,33 @@ impl<'i> Extraction<'i> {
         }
     }
 
-    fn freeze(&mut self) {
+    /// Keeps the module as the base of later extensions; false when the meter refused
+    /// the stamps, which leaves the extraction unfrozen and the pass halted.
+    fn freeze(&mut self) -> bool {
+        let bytes = (self.ix.names.len() + self.ix.axioms.len()) * size_of::<u32>();
+        if self.work.is_some_and(|w| !w.grow(bytes)) {
+            return false;
+        }
         self.frozen = true;
         // no stamp is current until the first extension begins
         self.stamp = 1;
         self.sig_stamp = vec![0; self.ix.names.len()];
         self.mod_stamp = vec![0; self.ix.axioms.len()];
+        true
+    }
+
+    /// Whether the meter refused a growth of the pass, which then extends nothing more.
+    fn refused(&self) -> bool {
+        self.work
+            .is_some_and(|w| w.halted.get() == Some(Halt::Memory))
+    }
+
+    /// The bytes the meter counts for this extraction.
+    fn bytes(&self) -> usize {
+        self.base_sig.capacity()
+            + self.base_mod.capacity()
+            + (self.sig_stamp.capacity() + self.mod_stamp.capacity() + self.added.capacity())
+                * size_of::<u32>()
     }
 
     /// Starts an extension of the frozen base.
@@ -658,13 +945,24 @@ impl<'i> Extraction<'i> {
         self.base_mod[j] || (self.frozen && self.mod_stamp[j] == self.stamp)
     }
 
+    /// Adds `e` to the signature; false when it was there already or when the meter
+    /// refused the list of added entities, which [`refused`](Extraction::refused) tells.
     fn add_entity(&mut self, e: u32) -> bool {
         if self.has_id(e) {
             return false;
         }
         if self.frozen {
+            let admitted = match self.work {
+                Some(w) => w.push(&mut self.added, e),
+                None => {
+                    self.added.push(e);
+                    true
+                }
+            };
+            if !admitted {
+                return false;
+            }
             self.sig_stamp[e as usize] = self.stamp;
-            self.added.push(e);
         } else {
             self.base_sig[e as usize] = true;
         }
@@ -698,18 +996,39 @@ impl<'i> Extraction<'i> {
         axiom: &mut dyn FnMut(usize) -> Step,
         entity: &mut dyn FnMut(u32) -> Step,
     ) {
+        // a pass that halted extends nothing more
+        if self.work.is_some_and(|w| w.halted.get().is_some()) {
+            return;
+        }
         let mut queue: Vec<u32> = Vec::new();
+        self.extend_with(&mut queue, seed, axiom, entity);
+        if let Some(w) = self.work {
+            w.meter.free(queue.capacity() * size_of::<u32>());
+        }
+    }
+
+    fn extend_with(
+        &mut self,
+        queue: &mut Vec<u32>,
+        seed: &[u32],
+        axiom: &mut dyn FnMut(usize) -> Step,
+        entity: &mut dyn FnMut(u32) -> Step,
+    ) {
         for &e in seed {
             if let Step::Stop = entity(e) {
                 return;
             }
             if self.add_entity(e) {
-                queue.push(e);
+                if !self.queue(queue, e) {
+                    return;
+                }
+            } else if self.refused() {
+                return;
             }
         }
         if !self.frozen {
             for j in 0..self.ix.axioms.len() {
-                if !self.take(j, axiom, entity, &mut queue) {
+                if !self.take(j, axiom, entity, queue) {
                     return;
                 }
             }
@@ -722,9 +1041,20 @@ impl<'i> Extraction<'i> {
         };
         while let Some(e) = queue.pop() {
             for &j in &lists[e as usize] {
-                if !self.take(j as usize, axiom, entity, &mut queue) {
+                if !self.take(j as usize, axiom, entity, queue) {
                     return;
                 }
+            }
+        }
+    }
+
+    /// Pushes `e` onto the queue of an extension, through the meter when there is one.
+    fn queue(&self, queue: &mut Vec<u32>, e: u32) -> bool {
+        match self.work {
+            Some(w) => w.push(queue, e),
+            None => {
+                queue.push(e);
+                true
             }
         }
     }
@@ -768,10 +1098,20 @@ impl<'i> Extraction<'i> {
             if let Step::Stop = entity(e) {
                 return false;
             }
-            self.add_entity(e);
-            queue.push(e);
+            if !self.add_entity(e) || !self.queue(queue, e) {
+                // the entity was not in the signature, so only a refusal stops its add
+                return false;
+            }
         }
         true
+    }
+}
+
+impl Drop for Extraction<'_> {
+    fn drop(&mut self) {
+        if let Some(w) = self.work {
+            w.meter.free(self.bytes());
+        }
     }
 }
 

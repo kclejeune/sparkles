@@ -189,6 +189,24 @@ from 146.6 to 138.6 ms. Item 590 still waits for item 1254, since on `ore_ont_13
 the index build and the checks before it are 0.47 of a run
 that starts again, while item 664 shipped ahead of item 1254 over the index-comparison path.
 
+Item 1277 charges the modules' pass of [completeness for the whole
+ontology](#completeness-for-the-whole-ontology) to the classifier's memory budget and the
+pool's grant, as the saturation is charged. The pass held its index, its extractions and
+its lists outside both, about 107 MiB on ChEBI lite with the EL-only rules. It now admits
+each growth of that state through the run that classified, before it allocates, and a
+vector that moves to a larger buffer counts both buffers while it moves. The state raises
+the run's peak and leaves its held estimate as it was, so the pool is charged the peak
+and the answer keeps only its list of incomplete classes. A refusal fails a run with
+`Error::Memory`, and a partial run answers as a pass that its deadline stopped would,
+once the state is freed. The index now polls the deadline and the cancellation every
+4,096 axioms, as the extractions do. The lists of each entity's axioms and the classes by
+depth are ordered with unstable sorts on keys that tie nowhere, which give the order the
+stable sorts gave without their buffers. On the 400-class test ontology the pass held
+391 KB at its peak, against 435 KB before, and the estimate matched the counting
+allocator's peak to within 16 bytes on four test ontologies of 50 to 20,000 classes.
+`Stats::coverage_memory` reports the peak. The figures on ChEBI and GO are not measured
+again.
+
 Item 664 extends incremental OWL 2 EL classification to edits involving individuals,
 nominals, assertions, keys, context merges, universal roles and conditional worlds. Plain
 EL terminologies without individuals continue to take the bitset invalidation path of
@@ -5878,10 +5896,24 @@ which the classes not yet decided are incomplete, so an answer depends on the in
 alone. `Limits::coverage_work` sets the bound and `Stats::coverage_over` reports it. A
 deadline or cancellation during the pass leaves every class incomplete and the
 consistency unknown with `coverageStopped` set, rather than discard the saturation, and the
-dataset retains the saturation but publishes no such answer. On a loaded laptop with four
-threads the pass took about 0.4 s on GO and 0.8 s and 107 MiB on ChEBI lite with the
-EL-only rules, which leave axioms of both out. These are single approximate runs. `Limits::coverage` false skips it, which the ROBOT-compatible commands
+dataset retains the saturation but publishes no such answer. The index of the pass and
+its extractions poll the deadline and the cancellation every 4,096 axioms. On a loaded
+laptop with four threads the pass took about 0.4 s on GO and 0.8 s and 107 MiB on ChEBI
+lite with the EL-only rules, which leave axioms of both out. These are single
+approximate runs. `Limits::coverage` false skips it, which the ROBOT-compatible commands
 do since they read only the taxonomy.
+
+The pass's index, its extractions and its lists of axioms and classes count against the
+run's memory budget and the pool's grant, as the saturation does, when the pass runs
+through the run that classified, as it does inside a classification and on the server.
+The pass then admits each growth before it allocates, and its peak counts in
+`Stats::peak_memory` and is reported as `Stats::coverage_memory`, while the held
+estimate grows only by the list of incomplete classes. `Classification::cover` on its
+own admits nothing and only reports the peak. When the budget or the pool refuses the pass, the classification fails with
+the memory error, which the server reports as `budget-exceeded`. A run with `partial`
+answers instead as a pass that its deadline stopped would, with every class incomplete,
+the consistency unknown and `coverageStopped` set, and fails only when the full list of
+classes does not fit either.
 
 `strict` on the request, `--strict` on `ontology classify` and `--strict true` on ROBOT's
 `reason`, `reduce` and `materialize` refuse a run that is not complete for the whole

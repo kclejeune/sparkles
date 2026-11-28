@@ -15,6 +15,18 @@ their admitted handles live.
   `AdmittedDlQueryAnswer` provide shared ownership of admitted output. The existing
   diff and DL query methods still return application-owned values.
 
+### The OWL modules' pass in the classifier's memory budget (item 1277)
+
+The modules' pass that decides which classes are incomplete when a classification left
+axioms out now admits its index, its extractions and its lists against the classifier's
+memory budget and the pool's grant before each growth, as the saturation is admitted.
+Its peak counts in `Stats::peak_memory` and is reported as the new
+`Stats::coverage_memory`, and the held estimate grows only by the list of incomplete
+classes. A classification whose pass the budget or the pool refuses fails with the
+memory error, and a `partial` one answers with every class incomplete, the consistency
+unknown and `coverageStopped` set. The pass's index polls the deadline and the
+cancellation every 4,096 axioms. `Stats::coverage_stopped` now also covers that refusal.
+
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 
 Term and value decoding in SPARQL UPDATE, ARQ property functions, registered property and aggregate extensions, custom aggregates, hybrid search, history service, path search, vector top-k, remote SERVICE and LATERAL enhancers, GeoSPARQL planner rewrites and aggregates, planner range and lexical probes and RDFS schema and explanation decoding now uses checked decode helpers that enforce live cancellation, deadline and memory controls while keeping decoded-output credit alive across multi-term operations. Plan and error diagnostic rendering decodes terms through `plan_term` so describing a plan never latches a decode refusal, and RDFS explanation keeps its answer memory limit separate from its decode workspace accounting. This lands the first wave of roadmap item 1308.
