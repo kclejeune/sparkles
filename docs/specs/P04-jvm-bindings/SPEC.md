@@ -1377,7 +1377,7 @@ its items are independent.
 10. **Sharing with P01.** The transaction worker moves into `sparkles::embed`. Default:
     P04 uses it, and the Python bindings move onto it when they next change.
 11. **Generated code's license.** Decided on 2026-10-03. UniFFI is licensed MPL-2.0,
-    which is already in the tree through `imbl` and `option-ext`, and the generated
+    which is already in the tree through `option-ext`, and the generated
     Kotlin comes from its templates. Sparkles uses UniFFI unmodified as a build tool and
     a library. MPL-2.0 is a file-level license, so it covers UniFFI's own files and any
     generated file derived from its templates, and it places no conditions on the rest of

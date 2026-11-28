@@ -1,0 +1,25 @@
+mbx 1.29.1
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo-nextest 0.9.146 (8af696ddc 2026-09-21)
+fd36925 tree-481302bb
+lock held 04:17:37
+== fmt: mbx fmt --all -- --check
+FAIL fmt (1)
+== clippy: mbx clippy -p sparkles-core --all-targets -- -D warnings
+PASS clippy
+== clippy-geo: mbx clippy -p sparkles-core --all-targets --features geo -- -D warnings
+PASS clippy-geo
+== nextest-core: mbx nextest run -p sparkles-core --no-fail-fast
+PASS nextest-core
+     Summary [ 526.387s] 4671 tests run: 4671 passed (3 slow), 38 skipped
+== test-geo-lib: mbx test -p sparkles-core --features geo --lib -- geo:: store::geo store::pmap store::append_vec control::
+PASS test-geo-lib
+test result: ok. 185 passed; 0 failed; 2 ignored; 0 measured; 3345 filtered out; finished in 10.76s
+== test-geo-integration: mbx test -p sparkles-core --features geo --test geo --test geo_jena --test geo_rewrite --test geo_join --test cursor_spatial --test cursor_inventory --test cursor_memory_audit --test graph_access --test history_unopened_origins
+PASS test-geo-integration
+geo integration totals: passed 94 failed 0 ignored 0
+EXPECTED unfixed fails
+thread 'store::pmap::tests::a_panicking_value_clone_leaves_the_map_as_it_was' (1555766) panicked at crates/sparkles-core/src/store/pmap.rs:769:9:
+assertion `left == right` failed
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3345 filtered out; finished in 0.01s
+CHECK-DONE

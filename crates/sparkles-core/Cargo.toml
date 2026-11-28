@@ -17,7 +17,6 @@ spargebra.workspace = true
 sparesults.workspace = true
 json-event-parser.workspace = true
 oxsdatatypes.workspace = true
-imbl.workspace = true
 arc-swap.workspace = true
 parking_lot.workspace = true
 rustc-hash.workspace = true
