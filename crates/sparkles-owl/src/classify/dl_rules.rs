@@ -9515,7 +9515,8 @@ pub(super) struct LemmaCensus {
 /// of a context other than the root holds a literal over a successor term `f_e(u)` of a
 /// constant, and that every body literal of kind XL there is over constants alone. The
 /// expected flags come from the literal views here, not from [`selected_always`], and L2
-/// reads every stored clause, processed or not.
+/// reads every stored clause, processed or not. The expected flags also take the arm from
+/// the test's request and not from [`select_ground`] or [`ground_body_cut`].
 #[cfg(test)]
 pub(super) fn lemma_census(ix: &Index, me: Ex, st: &State, run: &DlRun) -> LemmaCensus {
     use super::dl_clause::{XLit, terms_of};
@@ -9531,6 +9532,10 @@ pub(super) fn lemma_census(ix: &Index, me: Ex, st: &State, run: &DlRun) -> Lemma
     let Some(x) = dl(st) else {
         return c;
     };
+    // the expected flags read the arm that the test requested and not the switches, so
+    // that an arm the switches fail to apply also fails L1
+    let arm =
+        super::rooted_lemma_tests::requested_arm().expect("the census runs under a requested arm");
     let terms = |l: &Lit| terms_of(run.lits.view(*l, inv));
     let fc = |l: &Lit| {
         l.kind() == XL && {
@@ -9574,8 +9579,8 @@ pub(super) fn lemma_census(ix: &Index, me: Ex, st: &State, run: &DlRun) -> Lemma
             (false, false)
         } else {
             (
-                select_ground() && has,
-                (select_ground() || ground_body_cut()) && has,
+                arm.select_ground && has,
+                (arm.select_ground || arm.ground_body_cut) && has,
             )
         };
         if (s.sel, s.gbody) != want {

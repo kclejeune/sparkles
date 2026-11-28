@@ -11,17 +11,20 @@ a constant, so a ground body literal is always over constants and Join takes it 
 The flags of the selection and the cut follow the bodies of the clauses that reach the rules,
 so no clause with an empty body is cut. The fifth obligation is vacuous under the hypotheses
 of the stage of facts, since a live subsumer of a producer has a literally empty body. The
-filter of the return passes every use of the return that the argument makes. The discharge in
+filter of the return passes the two uses of the return that the argument makes, relative to
+the availability of the producers and a completed saturation. The discharge in
 the query context is stated for literals that a clause with an empty body produces in that
 exact form, and not for every literal that holds in the model. Unit tests check the bodies
 and the flags after every finished saturation of the `shoi`, nominal, key and top-property
 fixtures and eleven new ones, in the default arm, the cut with the selection off and the
 uncut control, with expected flags computed independently of the rules. The census of the
-query case now reads every maximal literal of a clause, not only the first. A setting of the
+query case reads every maximal literal of a clause. A setting of the
 three switches and the Join exemption for a test's thread lets one test binary run every arm.
 The first three obligations, counting, the completeness of the repaired selection and the Eq
 and Factor query case stay open. A set of 1,500 generated ontologies built around them gives
-no answer that differs from HermiT 1.4.5. The rules are unchanged.
+8,889 complete answers in 9,000 runs and none that differs from HermiT 1.4.5. The selection
+without its repair, which is known to lose, also agrees there, so the set is regression
+coverage only. The rules are unchanged.
 
 ### SERVICE enhancer cache slices, disk tier, management functions and parallel requests
 

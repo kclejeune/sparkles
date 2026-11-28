@@ -36,8 +36,10 @@ use super::*;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-#[derive(Default)]
 struct Observed {
+    /// the arm that the test requested, which the census's expected flags read instead of
+    /// the switches that the rules read
+    arm: TestArm,
     runs: Vec<Vec<LemmaCensus>>,
     unfinished: usize,
 }
@@ -49,6 +51,11 @@ thread_local! {
 /// Whether a test on this thread observes the census.
 pub(super) fn observing() -> bool {
     CENSUS.with(|a| a.borrow().is_some())
+}
+
+/// The arm that the observing test on this thread requested, if any.
+pub(super) fn requested_arm() -> Option<TestArm> {
+    CENSUS.with(|a| a.borrow().as_ref().map(|o| o.arm))
 }
 
 /// The census of one context of the saturation that is ending.
@@ -87,7 +94,13 @@ struct Observe;
 impl Observe {
     fn start(arm: TestArm) -> Observe {
         set_test_arm(Some(arm));
-        CENSUS.with(|a| *a.borrow_mut() = Some(Observed::default()));
+        CENSUS.with(|a| {
+            *a.borrow_mut() = Some(Observed {
+                arm,
+                runs: Vec::new(),
+                unfinished: 0,
+            })
+        });
         Observe
     }
     fn take(self) -> Observed {
@@ -143,8 +156,8 @@ struct Totals {
     /// ground-bodied clauses with a head over `f_e(u)` in contexts that are neither the
     /// root nor a query context, the holders of item 1250's second obligation
     fc_head_gbody_outside: usize,
-    /// ground-bodied clauses of a query context that has a predecessor-like role, which
-    /// item 1220's query case is about, counted as ground-bodied clauses of query contexts
+    /// ground-bodied clauses in query contexts, a broad count that does not check whether
+    /// the context is reused as a successor
     gbody_in_query: usize,
     /// selected clauses of query contexts with a maximal literal `x ≈ u`, a count of shapes
     /// that witnesses no Eq or Factor step
