@@ -413,8 +413,12 @@ reusable buffer for each key. A full FSST suffix needs no separate length scan w
 the admitted buffer fits the maximum decoded length and the optional decoder headroom.
 For other suffixes the growth check still uses the measured length. Scratch remains
 inside the decoding envelope, and the cursor's checkpoints still report cancellation
-and required decoding refusals. [Forge confirmation](#forge-confirmation-for-item-1088)
-of the streaming cost is pending.
+and required decoding refusals. Unit tests compare bypassed and cached masks with the
+generic filter and with code point order over multi-byte UTF-8, proper prefixes, long
+keys and interleaved language-tagged, typed and IRI terms in both codecs, and check that
+one thread and four leave the same masks, cache state and retained charge. The implementation is
+ready for the [forge confirmation](#forge-confirmation-for-item-1088) of the streaming
+cost, which is pending.
 
 Queries that the floors do not reach also became slower in every round, and item 1089
 holds these costs. The 37-query screens compared 174de1f8, before the shared table, with

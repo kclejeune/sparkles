@@ -320,7 +320,7 @@ pub(super) enum FloorLookup {
     Refused,
 }
 
-/// The query's cache of string floors ([`Ctx::string_floor`]). It lasts the query, so the
+/// The query's cache of string floors ([`Ctx::try_string_floor_in`]). It lasts the query, so the
 /// batches of a cursor share it as the rows of an eager table do, and every worker of a
 /// mask reads and writes the same [`FloorTable`] without a lock.
 ///
@@ -714,7 +714,7 @@ impl FloorMap<'_> {
         &mut self.scratch
     }
 
-    /// Record a floor already computed by [`Ctx::string_floor`] for a base-vocabulary simple
+    /// Record a floor already computed by [`Ctx::try_string_floor_in`] for a base-vocabulary simple
     /// literal `id`. Preserves lookup, hit, read-bit, eviction and test `computed` accounting
     /// identically to [`FloorMap::try_floor`] without recomputing the floor.
     #[inline]
@@ -4985,8 +4985,8 @@ impl Ctx {
         self.string_floor_in(id, &mut FloorScratch::default())
     }
 
-    /// Compute [`Ctx::string_floor`] reusing the caller's scratch buffers without recording
-    /// a sticky memory failure on decoding-envelope refusal. Returns `Ok(Some(floor))` for a
+    /// Compute the string floor of `id` reusing the caller's scratch buffers without
+    /// recording a sticky memory failure on decoding-envelope refusal. Returns `Ok(Some(floor))` for a
     /// base-vocabulary simple literal, `Ok(None)` for any other id, or `Err` when the
     /// cursor's decoding envelope refuses reconstruction or a prior memory failure is
     /// already recorded.

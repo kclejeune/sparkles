@@ -6791,7 +6791,7 @@ fn try_sample_floors(
 
 /// `FILTER(?x < ?y)`, or `<=`, `>` or `>=`, over a table whose values of both variables
 /// are stored simple literals. Their order is read from their base-vocabulary ids and
-/// each string's floor ([`Ctx::string_floor`]), which the query's floor cache keeps for
+/// each string's floor ([`Ctx::try_string_floor_in`]), which the query's floor cache keeps for
 /// each distinct id across tables and the batches of a cursor (see
 /// [`super::ctx::FloorCache`]), so neither column is decoded. When the floor table's hit
 /// rate stays low, a mask bypasses the table and compares the two vocabulary keys
@@ -6799,8 +6799,9 @@ fn try_sample_floors(
 /// that repeat across later batches re-enable floors. A row with another kind of value is
 /// evaluated as the generic filter would. `None` when the table is small or its first
 /// rows hold other values, so that the generic filter decodes the columns instead. The
-/// floors and direct comparisons decode inside the envelope, and a refused decode fails
-/// the mask with the refusal it recorded.
+/// floors and direct comparisons decode inside the envelope. A refused floor lookup is
+/// optional work, so its row falls back to the direct comparison, and only a refusal of
+/// that comparison's required decoding fails the mask with the refusal it recorded.
 fn string_order_mask(
     ctx: &Ctx,
     t: &Table,
@@ -18031,6 +18032,393 @@ mod string_order_tests {
             );
             assert!(ctx.check().is_ok());
         });
+    }
+
+    /// The `k`th of the mixed strings, distinct for every `k`. They hold ASCII, two-,
+    /// three- and four-byte UTF-8, a combining mark and long keys that share a long
+    /// prefix, so their code point order crosses every byte length.
+    fn mixed_string(k: usize) -> String {
+        match k % 6 {
+            0 => format!("k{k:05}"),
+            1 => format!("é{k}"),
+            2 => format!("日本{k}"),
+            3 => format!("\u{1F600}{k}"),
+            4 => format!("e\u{301}{k}"),
+            _ if k % 60 == 5 => format!("L{}{k}", "x".repeat(5000)),
+            _ => format!("L{}{k}", "x".repeat(600 + k % 13)),
+        }
+    }
+
+    /// A store of mixed strings and other terms in one vocabulary codec.
+    struct MixedCorpus {
+        store: Store,
+        /// Strings that the rows of rarely repeating pairs use at most once.
+        general: Vec<Id>,
+        /// A string and one of its proper extensions, beginning with the empty string.
+        prefix_pairs: Vec<(Id, Id)>,
+        /// Language-tagged, directional, typed, numeric and IRI terms.
+        others: Vec<Id>,
+        /// The lexical form of every stored simple literal, by its id.
+        text: std::collections::HashMap<u64, String>,
+    }
+
+    fn mixed_corpus(codec: crate::builder::VocabCodec) -> MixedCorpus {
+        use crate::builder::BuildOptions;
+        use oxrdf::{BaseDirection, Literal, NamedNode, Term};
+        use std::fmt::Write;
+        const GENERAL: usize = 8000;
+        const PREFIXES: usize = 256;
+        let general: Vec<String> = (0..GENERAL).map(mixed_string).collect();
+        let prefix_pairs: Vec<(String, String)> = (0..PREFIXES)
+            .map(|j| {
+                let base = if j == 0 {
+                    String::new()
+                } else {
+                    format!("q{j}")
+                };
+                let ext = match j % 3 {
+                    0 => format!("{base}a"),
+                    1 => format!("{base}é"),
+                    _ => format!("{base}\u{1F600}"),
+                };
+                (base, ext)
+            })
+            .collect();
+        let others: Vec<Term> = vec![
+            Literal::new_language_tagged_literal("k00001", "en")
+                .unwrap()
+                .into(),
+            Literal::new_language_tagged_literal("é1", "en-us")
+                .unwrap()
+                .into(),
+            Literal::new_directional_language_tagged_literal("q1", "ar", BaseDirection::Rtl)
+                .unwrap()
+                .into(),
+            Literal::new_typed_literal("k00002", NamedNode::new("urn:dt").unwrap()).into(),
+            Literal::new_typed_literal("5", oxrdf::vocab::xsd::INTEGER).into(),
+            NamedNode::new("urn:iri").unwrap().into(),
+        ];
+        let simple = |s: &str| -> Term { Literal::new_simple_literal(s).into() };
+        let strings: Vec<Term> = general
+            .iter()
+            .chain(prefix_pairs.iter().flat_map(|(a, b)| [a, b]))
+            .map(|s| simple(s))
+            .collect();
+        let mut nt = String::new();
+        for (i, term) in strings.iter().chain(&others).enumerate() {
+            writeln!(nt, "<urn:s:{i}> <urn:p> {term} .").unwrap();
+        }
+        let store = Store::in_memory(StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(codec),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        store
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        assert_eq!(snap.generation.vocab_codec(), codec);
+        let mut text = std::collections::HashMap::new();
+        let mut id_of = |s: &str| {
+            let id = snap.lookup_term(&simple(s)).unwrap();
+            assert_eq!(id.tag(), Tag::Vocab, "{s:?}");
+            text.insert(id.0, s.to_string());
+            id
+        };
+        let general: Vec<Id> = general.iter().map(|s| id_of(s)).collect();
+        let prefix_pairs: Vec<(Id, Id)> = prefix_pairs
+            .iter()
+            .map(|(a, b)| (id_of(a), id_of(b)))
+            .collect();
+        let others = others
+            .iter()
+            .map(|term| snap.lookup_term(term).unwrap())
+            .collect();
+        drop(snap);
+        MixedCorpus {
+            store,
+            general,
+            prefix_pairs,
+            others,
+            text,
+        }
+    }
+
+    /// `STRING_ORDER_ROWS` rows of string pairs. Rarely repeating rows use every general
+    /// string at most once and pair a string with its proper extension in every 16th row.
+    /// Repeating rows draw both sides from 80 strings. After the sample, every 61st row
+    /// holds another kind of term on one side.
+    fn mixed_rows(c: &MixedCorpus, repeat: bool) -> Vec<[Id; 2]> {
+        let g = &c.general;
+        let pick = |k: usize| g[k * 7919 % g.len()];
+        let hot: Vec<Id> = (0..48)
+            .map(|k| g[k * 167 % g.len()])
+            .chain(c.prefix_pairs.iter().take(16).flat_map(|&(a, b)| [a, b]))
+            .collect();
+        let mut next = 0;
+        (0..STRING_ORDER_ROWS)
+            .map(|i| {
+                let mut row = if repeat {
+                    [hot[i * 7 % hot.len()], hot[(i * 13 + 5) % hot.len()]]
+                } else if i % 16 == 7 {
+                    let (a, b) = c.prefix_pairs[i / 16];
+                    if (i / 16).is_multiple_of(2) {
+                        [a, b]
+                    } else {
+                        [b, a]
+                    }
+                } else {
+                    next += 2;
+                    [pick(next - 2), pick(next - 1)]
+                };
+                if i >= STRING_ORDER_SAMPLE && i % 61 == 3 {
+                    row[(i / 61) % 2] = c.others[(i / 61) % c.others.len()];
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// Bypassed direct comparisons and floors keep the rows that the generic filter and
+    /// code point order keep, over ASCII, multi-byte UTF-8, combining marks, proper
+    /// prefixes, long keys and interleaved language-tagged, directional, typed and IRI
+    /// terms, in both vocabulary codecs, for all four operators and in both modes. Pairs
+    /// that rarely repeat bypass the floor table without allocating it, and pairs that
+    /// repeat keep their floors in it.
+    #[test]
+    fn mixed_strings_compare_exactly_whether_floors_are_bypassed_or_kept() {
+        use super::super::expr::CmpOp;
+        use crate::builder::VocabCodec;
+        for codec in [VocabCodec::Front, VocabCodec::Fsst] {
+            let c = mixed_corpus(codec);
+            for repeat in [false, true] {
+                let rows = mixed_rows(&c, repeat);
+                for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+                    for cursor in [false, true] {
+                        let label = format!("{codec:?} repeat {repeat} {op:?} cursor {cursor}");
+                        let mut ctx = Ctx::new(c.store.snapshot());
+                        ctx.mem_limit = 64 << 20;
+                        if cursor {
+                            ctx.enable_cursor_accounting().unwrap();
+                        }
+                        let (x, y) = (ctx.var("x"), ctx.var("y"));
+                        let mut t = Table::new(vec![x, y]);
+                        for row in &rows {
+                            t.push_row(row);
+                        }
+                        let e = cmp(x, y, op);
+                        let mask = string_order_mask(&ctx, &t, (x, y), op, &e)
+                            .unwrap()
+                            .unwrap_or_else(|| panic!("{label}: the mask applies"));
+                        let generic =
+                            evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                        assert_eq!(mask, generic, "{label}");
+                        let mut strings = 0;
+                        for (i, [a, b]) in rows.iter().enumerate() {
+                            let (Some(sa), Some(sb)) = (c.text.get(&a.0), c.text.get(&b.0)) else {
+                                continue;
+                            };
+                            let ord = sa.as_str().cmp(sb.as_str());
+                            let keep = match op {
+                                CmpOp::Lt => ord.is_lt(),
+                                CmpOp::Le => ord.is_le(),
+                                CmpOp::Gt => ord.is_gt(),
+                                CmpOp::Ge => ord.is_ge(),
+                            };
+                            assert_eq!(mask[i], keep, "{label} row {i}: {sa:?} {op:?} {sb:?}");
+                            strings += 1;
+                        }
+                        assert!(strings > rows.len() * 9 / 10, "{label}: {strings}");
+                        let cache = ctx.floor_cache();
+                        if repeat {
+                            assert_eq!(cache.bypassed(), 0, "{label}");
+                            assert!(cache.entries() > 0, "{label}");
+                        } else {
+                            assert_eq!(cache.bypassed(), 1, "{label}");
+                            assert_eq!(cache.slots(), 0, "{label}: the table stays deferred");
+                            assert_eq!(cache.used(), 0, "{label}");
+                        }
+                        assert!(ctx.check().is_ok(), "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// One thread and four give the same masks and leave the floor cache in the same
+    /// state with the same retained charge after every mask, for a stream of pairs that
+    /// rarely repeat and for a stream of pairs that repeat.
+    #[test]
+    fn floor_bypass_and_floors_are_deterministic_across_thread_counts() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let masks = 6;
+        let (s, ids) = word_store(masks * 2 * rows);
+        // Strings adjacent in the vocabulary share no slot of a table, so no floor evicts
+        // another in an order that depends on the threads.
+        let mut hot = ids.clone();
+        hot.sort_by_key(|id| id.payload());
+        let hot = hot[1000..1048].to_vec();
+        let run = |threads: usize, repeat: bool| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 256 << 20;
+                ctx.enable_cursor_accounting().unwrap();
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let e = cmp(x, y, CmpOp::Lt);
+                let mut states = Vec::new();
+                for m in 0..masks {
+                    let mut t = Table::new(vec![x, y]);
+                    for i in 0..rows {
+                        let row = if repeat {
+                            [hot[(i * 7 + m) % hot.len()], hot[(i * 11 + 3) % hot.len()]]
+                        } else {
+                            let k = 2 * (m * rows + i);
+                            [ids[k], ids[k + 1]]
+                        };
+                        t.push_row(&row);
+                    }
+                    let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                        .unwrap()
+                        .expect("the mask applies");
+                    let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                    assert_eq!(mask, generic, "threads {threads} repeat {repeat} mask {m}");
+                    // The decode envelope reserves a key for every decode worker until
+                    // the work ends, so compare what the query keeps after it ends.
+                    ctx.release_work();
+                    let cache = ctx.floor_cache();
+                    states.push((
+                        mask,
+                        cache.bypassed(),
+                        cache.slots(),
+                        cache.entries(),
+                        cache.used(),
+                        cache.reserved(),
+                        ctx.live_bytes(),
+                    ));
+                }
+                assert!(ctx.check().is_ok(), "threads {threads} repeat {repeat}");
+                states
+            })
+        };
+        for repeat in [false, true] {
+            let one = run(1, repeat);
+            let four = run(4, repeat);
+            for (m, (a, b)) in one.iter().zip(&four).enumerate() {
+                assert_eq!(a.0, b.0, "repeat {repeat} mask {m}: masks");
+                assert_eq!(
+                    (a.1, a.2, a.3, a.4, a.5, a.6),
+                    (b.1, b.2, b.3, b.4, b.5, b.6),
+                    "repeat {repeat} mask {m}: state"
+                );
+            }
+            let last = one.last().unwrap();
+            if repeat {
+                assert!(one.iter().all(|state| state.1 == 0), "repeat: no bypass");
+                assert_eq!(last.3, hot.len(), "repeat: every floor is kept");
+            } else {
+                // every mask but the probe on the fourth bypasses the table
+                assert_eq!(last.1, masks - 1, "low repeat");
+                assert!(last.2 > 0, "low repeat: the probe installs the table");
+            }
+        }
+    }
+
+    /// Colleague-shaped pairs of names that rarely repeat and names-shaped pairs of a few
+    /// repeated names stream through string order masks and keep the rows that the
+    /// decoded comparison keeps, on one thread and on four.
+    #[test]
+    fn streamed_name_pairs_match_the_decoded_comparison_on_any_thread_count() {
+        use crate::sparql::{CursorOptions, QueryOptions, query, select_cursor};
+        use std::fmt::Write;
+        let people = 6000;
+        let name = |i: usize| oxrdf::Literal::new_simple_literal(mixed_string(i));
+        let mut nt = String::new();
+        for i in 0..people {
+            let colleague = (i * 7919 + 1) % people;
+            let known = (i * 13 + 5) % people;
+            writeln!(nt, "<urn:p:{i}> <urn:name> {} .", name(i)).unwrap();
+            writeln!(nt, "<urn:p:{i}> <urn:nick> {} .", name(i % 40 * 150)).unwrap();
+            writeln!(nt, "<urn:p:{i}> <urn:colleague> <urn:p:{colleague}> .").unwrap();
+            writeln!(nt, "<urn:p:{i}> <urn:knows> <urn:p:{known}> .").unwrap();
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let options = QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let text = |t: &Option<oxrdf::Term>| t.as_ref().map(|t| t.to_string());
+        let shapes = [("urn:name", "urn:colleague"), ("urn:nick", "urn:knows")];
+        for (label, link) in shapes {
+            for op in ["<", ">="] {
+                let q = |filter: &str| {
+                    format!(
+                        "SELECT ?p ?q WHERE {{ ?p <{label}> ?n ; <{link}> ?q . \
+                         ?q <{label}> ?m FILTER({filter}) }}"
+                    )
+                };
+                let mut decoded: Vec<_> = query(
+                    s.snapshot(),
+                    &q(&format!("CONCAT(?n, \"\") {op} CONCAT(?m, \"\")")),
+                    &options,
+                )
+                .unwrap()
+                .rows()
+                .unwrap()
+                .iter()
+                .map(|r| r.values().iter().map(text).collect::<Vec<_>>())
+                .collect();
+                decoded.sort();
+                assert!(!decoded.is_empty(), "{label} {op}");
+                assert!(decoded.len() < people, "{label} {op}");
+                for threads in [1, 4] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let before = STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed);
+                    let mut streamed = pool.install(|| {
+                        let cursor_options = CursorOptions {
+                            batch_rows: 1 << 16,
+                            ..Default::default()
+                        };
+                        let q = q(&format!("?n {op} ?m"));
+                        let mut cursor =
+                            select_cursor(s.snapshot(), &q, &options, &cursor_options).unwrap();
+                        let mut streamed = Vec::new();
+                        while let Some(batch) = cursor.next_batch().unwrap() {
+                            for row in 0..batch.len() {
+                                let row = batch.row(row).unwrap();
+                                streamed.push(row.values().iter().map(text).collect::<Vec<_>>());
+                            }
+                        }
+                        streamed
+                    });
+                    assert!(
+                        STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed) > before,
+                        "{label} {op} threads {threads}: a batch reaches the string order mask"
+                    );
+                    streamed.sort();
+                    assert_eq!(streamed, decoded, "{label} {op} threads {threads}");
+                }
+            }
+        }
     }
 }
 
