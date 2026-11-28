@@ -89,7 +89,9 @@ Jena's service enhancer options work on `SERVICE` clauses ([API.md](../API.md#se
 
 * `loop:` invokes the remote endpoint once per incoming solution.
 * `bulk+n:` batches `n` solutions per remote request and retries individual solutions if the endpoint truncates a batch response.
-* `cache:` stores per-solution results in a budgeted, per-dataset cache partitioned by caller, with `cache+clear` and `cache+off` controls.
+* `cache:` stores per-solution results in a budgeted, per-dataset cache partitioned by caller, with `cache+clear` and `cache+off` controls. An entry answers any LIMIT and OFFSET inside the solutions it holds, expires after `--service-cache-ttl`, and can be kept on disk across restarts.
+* `parallel+n:` keeps up to `n` requests of a loop in flight at once, capped by `--service-parallel-max`.
+* `se:cacheLs` lists the caller's entries, and `se:cacheRm` removes them for dataset admins when `--service-cache-mgmt` is on.
 * `urn:x-arq:self` queries the local dataset itself.
 
 ### Planning and execution
@@ -183,7 +185,7 @@ Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
 
 ### SPARQL and formats
 
-* **ARQ and SPARQL language edges.** Sparkles does not implement ARQ JavaScript functions (`js:`), `afn:context`, Leviathan `lfn:` functions, the `JSON` query form, ARQ's `EXISTS { … }` group element, or multi-argument `AGG`. `afn:print` and `afn:execTime` are no-ops, and `afn:collation` orders by Unicode code point rather than locale (roadmap [item 69](../ROADMAP.md)). `shortest(…)` path syntax is not evaluated, matching ARQ (roadmap [item 51](../ROADMAP.md)). Jena's service enhancer lacks a slice-aware cache and `se:cacheRm`/`se:cacheLs` functions (roadmap [item 38](../ROADMAP.md)).
+* **ARQ and SPARQL language edges.** Sparkles does not implement ARQ JavaScript functions (`js:`), `afn:context`, Leviathan `lfn:` functions, the `JSON` query form, ARQ's `EXISTS { … }` group element, or multi-argument `AGG`. `afn:print` and `afn:execTime` are no-ops, and `afn:collation` orders by Unicode code point rather than locale (roadmap [item 69](../ROADMAP.md)). `shortest(…)` path syntax is not evaluated, matching ARQ (roadmap [item 51](../ROADMAP.md)). The dataset setting of the SERVICE cache has no HTTP route, and the cache has no Prometheus series (roadmap [items 1339 and 1340](../ROADMAP.md)).
 * **Numeric edge cases.** `xsd:integer`, derived integer types, and `xsd:decimal` literals beyond fixed-width `i64` and `Decimal` ranges are evaluated at exact precision up to 4,096 significant digits and 4,096 fractional digits. Terminating decimal quotients keep their exact value whenever they fit those bounds. Ordinary non-terminating decimal division truncates towards zero to 18 fractional digits on the fixed-width path. The arbitrary-precision division path retains at least 18 fractional digits, or 18 significant digits on sub-10^-18 quotients and up to the dividend's scale, within the same bounds. For `AVG` of integer and decimal inputs, eager queries, cursors and maintained views follow ARQ. They divide the exact sum by the count, preserve terminating quotients and round repeating quotients to 24 fractional digits using half-even rounding. An average outside the numeric bounds is unbound.
 * **Additional query languages.** openCypher and JSON query languages are not available (roadmap [items 20 and 72](../ROADMAP.md)).
 * **Linter limits.** `sparkles lint` reads files whole and refuses files above `--max-bytes` even in line-oriented formats. It skips embedded SHACL queries in N-Triples, N-Quads, JSON-LD `@index` maps, JSON-LD documents over 8 MiB, ambiguous blank-node holders, or JSON-LD documents whose expansion budget exceeds 4× document size (roadmap [item 444](../ROADMAP.md)).

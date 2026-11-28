@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### SERVICE enhancer cache slices, disk tier, management functions and parallel requests
+
+The cache of remote SERVICE results keys an entry without the outermost LIMIT and OFFSET
+of its request, so a request whose solutions all lie among an entry's rows is answered
+without a request. A short response is not taken as the end of the result, since an
+endpoint may cap its responses. Entries expire after `--service-cache-ttl` seconds
+(3,600), which changes the earlier behaviour of keeping them until eviction. The server
+keeps entries per credential with its OIDC scopes, endpoint, dataset branch and graph
+view, where it used to key them by principal and endpoint. A persistent dataset whose
+`service-cache.json` sets `disk` keeps its entries in `service-cache/` across restarts,
+under a cap and least recently used eviction, in files of the new kind `service-cache`
+(version 1) that hold neither the caller's scope nor credentials. A read-only server
+leaves the directory alone. Jena's `se:cacheLs` lists a caller's own entries, and
+`se:cacheRm` removes them for callers with `admin` on the dataset through the request's
+endpoint when the server runs with `--service-cache-mgmt`. `parallel+n` keeps up to `n`
+requests of a loop in flight, capped by `--service-parallel-max` (4), with the answer of
+one request at a time. The requests of a wave share the outbound time that is left, and
+admit their solutions as they arrive. A failure once the outbound time is spent now
+fails a remote loop under SILENT too, and the eager remote loop charges its answers until
+it joins them. This completes roadmap item 38.
+
+- **Rust compatibility.** `QueryOptions`, `StoreOptions` and `OutboundPolicy` have new
+  public fields, so a literal that names every field needs them. `ServiceCache::get`
+  takes the request's `Slice`, and `ServiceCache::put` takes the key's `Parts` and the
+  `Slice` of the response.
+
 ### Hierarchical memory budgets for reasoning and views
 
 Reasoning, ontology reads and maintained views share the dataset's query memory pool.

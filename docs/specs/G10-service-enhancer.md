@@ -4,7 +4,10 @@
 >
 > **Phases:** One phase, shipped on 2026-10-03: the options `loop`, `bulk` and `cache` in
 > front of a SERVICE IRI, `urn:x-arq:self`, bulk requests as VALUES blocks or as Jena's
-> UNION form, and a per-dataset cache of remote results scoped to the caller.
+> UNION form, and a per-dataset cache of remote results scoped to the caller. Roadmap
+> item 38 added the slice-aware cache, a time to live, a disk tier, `se:cacheLs` and
+> `se:cacheRm`, and `parallel+n` on 2026-11-28
+> ([Outcome](#slices-functions-disk-and-parallel-requests)).
 >
 > **User docs:** [API: SERVICE options](../API.md#service-options-loop-bulk-and-cache) ·
 > [Usage: correlated, bulk and cached SERVICE](../USAGE.md#correlated-bulk-and-cached-service) ·
@@ -331,6 +334,11 @@ capabilities and remaining work are described by the spec status and Outcome.
   - SPARQL 1.1 Query and SPARQL 1.1 Federated Query.
 - **Implementation** (2026-10-03): from the spec and the Sparkles code. The cache uses
   `quick_cache`, already a dependency. **Dependencies:** none new.
+- **Implementation of roadmap item 38** (2026-11-28): from the follow-up sketches, the
+  Sparkles code and the module's documentation page, which gives the `se:` namespace,
+  the signatures of `se:cacheLs` and `se:cacheRm` and the `enableMgmt` context symbol.
+  No Jena code was read or copied for it. **Dependencies:** none new. `sha2` names and
+  seals the disk files.
 - **Rejected** (spec §10):
   - Jena's slice-aware cache and result-size learning;
   - the management functions `se:cacheRm` and `se:cacheLs`;
@@ -405,6 +413,109 @@ function suites at 642 of 655 and 39 of 48. `mise run ci` passes.
 **Not built.** Jena's slice-aware cache and result-size learning, `se:cacheRm` and
 `se:cacheLs`, a disk cache, requests in parallel, Prometheus series for the cache, and
 cross-dataset SERVICE.
+
+### Slices, functions, disk and parallel requests
+
+**Delivered** on 2026-11-28 for roadmap item 38, from the follow-up sketches below:
+- `svccache.rs` keys an entry without the outermost slice of its request. The entry
+  (`Entry`) holds the slice of the request that got its solutions, and answers that
+  request and every request with a limit whose solutions are all among its rows
+  (`Entry::range`). A plain SERVICE records the request text without the slice and the
+  slice on its plan node (`ServiceKey`), and a LIMIT that the planner passes into the
+  request narrows that slice. The streamed SERVICE stores the response to a request with
+  a LIMIT once it holds that many solutions, even when the query reads no further. A
+  remote loop splits the slice off its pattern once
+  (`enhancer::outer_slice`). A miss sends the request as the query writes it, and a
+  response replaces the entry of its request only when the entry cannot answer it and
+  holds fewer solutions.
+- Every entry carries its scope, endpoint and pattern as lengths into its key
+  (`Parts`), so listing and removal compare the caller's scope as a whole and never
+  search the key for a separator. The server's scope names the credential with the
+  bound of its OIDC scopes (`Principal::access_id`), the endpoint, the dataset with its
+  branch, and a SHA-256 of the request's graph view.
+- An entry answers for a time to live, `--service-cache-ttl` (3,600 s) or the dataset's
+  `ttlSeconds`, in memory and on disk, and an expired entry is removed when it is read.
+- `svcdisk.rs` keeps a persistent dataset's entries in `service-cache/` when its
+  `service-cache.json` sets `disk`. Files are named by the SHA-256 of the key, written
+  under a temporary name and renamed, sealed by the SHA-256 of their body, and evicted
+  least recently used first under `diskMb` (default `--service-cache-disk-mb`, 256 MiB).
+  The tier's index and files change under one lock, every file carries a generation that
+  a read checks after it reads, and the removals of `se:cacheRm`, a clear and turning the
+  tier off sync the directory before they return. `formats.rs` registers the files as
+  the kind `service-cache` (version 1) and the settings file `service-cache.json`
+  (format 1). `Store::set_service_cache_settings`, `service_cache_settings` and
+  `service_cache_status` read and change the setting, which is checked and whose tier is
+  opened before the file is written. `StoreOptions::service_cache_files`, which a
+  read-only server turns off, leaves the directory untouched.
+- `svcfn.rs` implements `se:cacheLs` as a VALUES leaf that the planner builds from the
+  caller's entries, and `se:cacheRm` as a function that removes within the caller's scope.
+  `QueryOptions::service_cache_mgmt` grants removal, and the server sets it under
+  `--service-cache-mgmt` for a caller with `admin` on the dataset through the endpoint
+  of the request. The Fuseki converter reports a server-wide `se:enableMgmt true` with
+  that flag, `false` as the default, and a dataset's own `true` as unsupported.
+- `parallel` and `parallel+n` keep up to n requests of a remote loop in flight, capped by
+  `OutboundPolicy::service_parallel_max` (`--service-parallel-max`, 4).
+  `RemoteRun::send` sends each wave of requests on scoped threads in the caller's span
+  and takes their answers in input order. Each request draws on a share of the outbound
+  budget's time (`RequestBudget::share`), which is reserved in the budget until the
+  request ends, and admits each solution on a charge of its own as it arrives. A cut
+  bulk response is retried on the calling thread with the existing admission of each
+  answer.
+
+**Deviations and decisions.**
+- An entry never answers past its rows. The sketch let a response with fewer solutions
+  than its limit answer every later slice, but an endpoint may cap its responses without
+  saying so, and the later slice would then miss solutions that the endpoint has.
+- `se:cacheLs` takes Jena's three positions, the endpoint, the pattern and the values,
+  and three more, the solutions, the bytes and the age in seconds. The sketch named a
+  pattern hash. The pattern text keeps Jena's columns and shows the caller only its own
+  entries. The endpoint is listed, and written to disk, without the user information,
+  query string and fragment of its URL. The disk files hold the SHA-256 of the caller's
+  scope, never the scope itself. The query result cache keeps no result of a query that
+  calls `se:cacheLs`.
+- `se:cacheRm` called by name is refused when the query is planned, so a caller without
+  the right gets `403` and not an unbound value. A call through `fn:apply` or `afn:eval`
+  is an error of the expression that removes nothing, since the planner cannot see its
+  function. It is marked as having side effects, so no cache of results or expressions
+  answers a call of it.
+- The dataset setting is a settings file with a library API. Its HTTP route is roadmap
+  item 1339, and the metrics sketched below are roadmap item 1340.
+- `parallel` alone takes the cap, as `bulk` alone takes the configured size. The shares
+  of a wave split the time the budget has left equally, and a request whose share
+  cannot be reserved is not sent. A failure once the budget's time is spent fails the
+  query under SILENT too. The budget's bytes need no share, because they are counted
+  atomically as responses stream in and bound concurrent requests as they bound one. A
+  loop over an in-process endpoint sends one request at a time. The eager loop now
+  holds its answers on a memory charge until it has joined them, where it used to admit
+  only the joined rows.
+- The time to live changes the behaviour of the memory tier, whose entries used to live
+  until they were evicted. `--service-cache-ttl 0` keeps that behaviour.
+- A lookup admits a slice copied out of an entry before it copies it, and a disk read
+  admits the file's bytes before it reads them and the decoded rows once they are known.
+  Decoding allocates at most 32 times the largest file the tier keeps, an eighth of its
+  cap.
+- A read-only server neither reads nor changes `service-cache/`, so its SERVICE cache
+  is in memory only.
+- Clones and backups carry neither the directory nor `service-cache.json`, so a clone
+  starts with an empty cache and the default setting.
+
+**Tests.** `crates/sparkles-core/tests/service_enhancer.rs` adds ten tests against the
+in-process endpoint. They cover slices answered inside an entry and sent past it, an
+endpoint that caps its responses without saying so, a LIMIT pushed into a plain SERVICE
+in both execution modes, `se:cacheLs` and `se:cacheRm` across two scopes with and
+without the right, `parallel+n` against the requests and the answer of a run one request
+at a time with the endpoint's peak of requests in flight, the deadline that stops
+further waves, the shared outbound time with and without SILENT, the memory admission of
+parallel answers in both modes, and a disk tier read back after the store is opened
+again. Unit tests in `svccache.rs`, `svcdisk.rs`, `store/service_cache.rs`,
+`outbound.rs`, `enhancer.rs`, the server's `auth/api.rs` and the Fuseki converter cover
+slice service, expiry, scope isolation for scopes that are prefixes of one another or
+contain the key's separator, scopes by credential, view and branch, removal through the
+request's endpoint, round trips of every term kind, eviction under the cap, torn,
+changed, misnamed and unknown-version files, files that cannot be removed, admission
+before reads, counts past the end of a file, backups and clones without the tier, a
+refused setting, a read-only store, time shares, the `enableMgmt` values and the option
+parser.
 
 ### Roadmap follow-ups (2026-10-12)
 
