@@ -1079,6 +1079,8 @@ fn existing_server_codec_is_inherited_and_dataset_rename_rebinds_index_policy() 
         assert!(status == 200 || status == 201, "{status} {result}");
     }
 
+    fsst_store(&data.join("databases/legacy"));
+
     let server = Server::start(&data, &["--settings", settings.to_str().unwrap()]);
     let main = "/$/settings/legacy/index";
     let branch = "/$/settings/legacy/index?branch=work";
@@ -1099,13 +1101,21 @@ fn existing_server_codec_is_inherited_and_dataset_rename_rebinds_index_policy() 
         json!({"vocabCodec": "fsst", "patterns": false})
     );
 
+    let (status, response) = server.call("PATCH", main, Some(json!({"vocabCodec": "front"})));
+    assert_eq!(status, 200, "{response}");
+    compact_for_index_test(&server, "legacy?branch=work");
+    let (status, response) = server.call("DELETE", &format!("{main}?field=vocabCodec"), None);
+    assert_eq!(status, 200, "{response}");
+    let (_, main_defaults) = server.call("GET", main, None);
+    let (_, branch_defaults) = server.call("GET", branch, None);
+    assert_eq!(main_defaults["effective"]["vocabCodec"], "fsst");
+    assert_eq!(branch_defaults["effective"]["vocabCodec"], "front");
+    assert_eq!(branch_defaults["sources"]["vocabCodec"], "default");
+
     let fsst = |name: &str| {
         let root = data.join("databases").join(name);
-        let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
-        let meta: J = serde_json::from_slice(
-            &std::fs::read(root.join(current.trim()).join("meta.json")).unwrap(),
-        )
-        .unwrap();
+        let meta = index_meta(&root);
+        assert_eq!(meta["quads"], 1, "{meta}");
         meta["features"]
             .as_array()
             .unwrap()
@@ -1129,4 +1139,252 @@ fn existing_server_codec_is_inherited_and_dataset_rename_rebinds_index_policy() 
     assert!(fsst("renamed"));
     compact_for_index_test(&server, "renamed");
     assert!(!fsst("renamed"));
+}
+
+fn fsst_store(path: &Path) {
+    use sparkles::builder::{BuildOptions, VocabCodec};
+    use sparkles::io::{RdfFormat, Source};
+    use sparkles::store::{Store, StoreOptions};
+
+    let store = Store::open(
+        path,
+        StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Fsst),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    store
+        .load(&[Source::from_bytes(
+            b"<urn:a> <urn:p> <urn:b> .\n".to_vec(),
+            RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+}
+
+#[test]
+fn index_settings_put_omitting_codec_keeps_inherited_fsst() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("db");
+    fsst_store(&db);
+    let loc = format!("demo={}", db.display());
+    let server = Server::start(&temp.path().join("data"), &["--loc", &loc]);
+    let (status, response) = server.call(
+        "PUT",
+        "/$/settings/demo/index",
+        Some(json!({"patterns": false})),
+    );
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["runtime"], json!({"patterns": false}));
+    assert_eq!(response["sources"]["vocabCodec"], "default");
+    assert_eq!(response["effective"]["vocabCodec"], "fsst");
+    compact_for_index_test(&server, "demo");
+    assert!(
+        index_meta(&db)["features"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("fsst-vocab"))
+    );
+}
+
+#[test]
+fn index_settings_put_omitting_patterns_keeps_invocation_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start(
+        &temp.path().join("data"),
+        &["--mem", "demo", "--no-patterns"],
+    );
+    let (status, response) = server.call(
+        "PUT",
+        "/$/settings/demo/index",
+        Some(json!({"vocabCodec": "fsst"})),
+    );
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["runtime"], json!({"vocabCodec": "fsst"}));
+    assert_eq!(response["effective"]["patterns"], false);
+}
+
+#[test]
+fn index_settings_put_explicit_inherited_codec_keeps_a_durable_pin() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("db");
+    let data = temp.path().join("data");
+    fsst_store(&db);
+    let loc = format!("demo={}", db.display());
+    {
+        let server = Server::start(&data, &["--loc", &loc]);
+        let (status, response) = server.call(
+            "PUT",
+            "/$/settings/demo/index",
+            Some(json!({"vocabCodec": "fsst"})),
+        );
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(response["runtime"], json!({"vocabCodec": "fsst"}));
+        assert_eq!(response["sources"]["vocabCodec"], "runtime");
+    }
+    let server = Server::start(&data, &["--vocab-codec", "front", "--loc", &loc]);
+    let (_, response) = server.call("GET", "/$/settings/demo/index", None);
+    assert_eq!(response["effective"]["vocabCodec"], "fsst");
+    assert_eq!(response["sources"]["vocabCodec"], "runtime");
+}
+
+fn index_meta(root: &Path) -> J {
+    let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+    serde_json::from_slice(&std::fs::read(root.join(current.trim()).join("meta.json")).unwrap())
+        .unwrap()
+}
+
+#[cfg(feature = "auth")]
+#[test]
+fn index_settings_diff_uses_the_servers_base() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("db");
+    fsst_store(&db);
+    let loc = format!("demo={}", db.display());
+    for codec_flags in [vec![], vec!["--vocab-codec", "fsst"]] {
+        let mut flags = vec!["--loc", &loc, "--no-patterns"];
+        flags.extend(codec_flags);
+        let server = Server::start(&temp.path().join("data"), &flags);
+        let run_diff = || {
+            cli(
+                &server,
+                temp.path(),
+                &["settings", "diff", "demo", "--json"],
+                "",
+                &[],
+            )
+            .ok()
+            .json()
+        };
+        let url = "/$/settings/demo/index";
+        let (status, response) = server.call(
+            "PUT",
+            url,
+            Some(json!({"vocabCodec": "front", "patterns": true})),
+        );
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(
+            response["base"],
+            json!({"vocabCodec": "fsst", "patterns": false})
+        );
+        let diff = run_diff();
+        assert_eq!(
+            diff["differences"],
+            json!([
+                {"dataset": "demo", "kind": "index", "field": "patterns",
+                 "runtime": true, "base": false, "baseSource": "default"},
+                {"dataset": "demo", "kind": "index", "field": "vocabCodec",
+                 "runtime": "front", "base": "fsst", "baseSource": "default"}
+            ])
+        );
+        let (status, response) = server.call(
+            "PUT",
+            url,
+            Some(json!({"vocabCodec": "fsst", "patterns": false})),
+        );
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(run_diff()["differences"], json!([]));
+    }
+}
+
+#[test]
+fn in_memory_index_settings_rebind_after_dataset_rename() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = temp.path().join("settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"datasets":{"renamed":{"index":{"vocabCodec":"fsst"}}}}"#,
+    )
+    .unwrap();
+    let server = Server::start(
+        &temp.path().join("data"),
+        &["--settings", settings.to_str().unwrap()],
+    );
+    let (status, result) = server.call(
+        "POST",
+        "/$/datasets",
+        Some(json!({"dbName": "original", "dbType": "mem"})),
+    );
+    assert!(status == 200 || status == 201, "{status} {result}");
+    let (status, result) = server.call(
+        "PATCH",
+        "/$/settings/original/index",
+        Some(json!({"patterns": false})),
+    );
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(
+        result["effective"],
+        json!({"vocabCodec": "front", "patterns": false})
+    );
+    let (status, result) = server.call(
+        "POST",
+        "/$/datasets/original/rename",
+        Some(json!({"name": "renamed"})),
+    );
+    assert_eq!(status, 200, "{result}");
+    let (status, result) = server.call("GET", "/$/settings/renamed/index", None);
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["sources"]["vocabCodec"], "declared");
+    assert_eq!(result["runtime"], json!({"patterns": false}));
+    assert_eq!(
+        result["effective"],
+        json!({"vocabCodec": "fsst", "patterns": false})
+    );
+
+    compact_for_index_test(&server, "renamed");
+    std::fs::write(&settings, "{}").unwrap();
+    server.hup();
+    eventually(|| {
+        server.call("GET", "/$/settings/renamed/index", None).1["sources"]["vocabCodec"]
+            == "default"
+    });
+    let (_, result) = server.call("GET", "/$/settings/renamed/index", None);
+    assert_eq!(result["effective"]["vocabCodec"], "fsst");
+}
+
+#[test]
+fn index_settings_override_notices_cover_standalone_build_flags() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("db");
+    let input = temp.path().join("input.nt");
+    std::fs::write(&input, "<urn:a> <urn:p> <urn:b> .\n").unwrap();
+    {
+        let store = sparkles::store::Store::open(&db, Default::default()).unwrap();
+        store
+            .set_index_settings(sparkles::store::IndexSettings {
+                vocab_codec: Some(sparkles::builder::VocabCodec::Fsst),
+                patterns: Some(true),
+            })
+            .unwrap();
+    }
+    for subcommand in ["load", "compact"] {
+        let mut command = Command::new(BIN);
+        command
+            .args([
+                subcommand,
+                "--vocab-codec",
+                "front",
+                "--no-patterns",
+                "--loc",
+            ])
+            .arg(&db);
+        if subcommand == "load" {
+            command.arg(&input);
+        }
+        let out = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("dataset index settings choose vocabulary codec fsst"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("dataset index settings enable predicate patterns"),
+            "{stderr}"
+        );
+    }
 }

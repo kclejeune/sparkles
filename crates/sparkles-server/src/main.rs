@@ -2286,6 +2286,26 @@ enum Cmd {
     Map(map_cmd::MapArgs),
 }
 
+fn report_index_overrides(
+    store: &Store,
+    vocab_codec: Option<sparkles::builder::VocabCodec>,
+    no_patterns: bool,
+) {
+    let saved = store.index_settings_layer();
+    if let (Some(requested), Some(saved)) = (vocab_codec, saved.vocab_codec)
+        && requested != saved
+    {
+        eprintln!(
+            "dataset index settings choose vocabulary codec {saved}. The --vocab-codec {requested} flag supplies the default"
+        );
+    }
+    if no_patterns && saved.patterns == Some(true) {
+        eprintln!(
+            "dataset index settings enable predicate patterns. The --no-patterns flag supplies the default"
+        );
+    }
+}
+
 fn store_opts(cli: &Cli) -> StoreOptions {
     #[cfg(feature = "reasoning")]
     sparkles_reasoner::tables::set_capacity(server_memory::derived_table_cache_bytes(cli));
@@ -3826,6 +3846,7 @@ fn run() -> Result<()> {
                 Some(db) => db,
                 None => open_for_write(&loc, opts, no_validate)?,
             };
+            report_index_overrides(&store, cli.vocab_codec, cli.no_patterns);
             let g = graph.map(oxrdf::NamedNode::new).transpose()?;
             let explicit = match compression.as_str() {
                 "auto" => None,
@@ -4442,14 +4463,7 @@ fn run() -> Result<()> {
                     }
                 }
             }
-            if let (Some(requested), Some(saved)) =
-                (cli.vocab_codec, store.index_settings_layer().vocab_codec)
-                && requested != saved
-            {
-                eprintln!(
-                    "dataset index settings choose vocabulary codec {saved}; --vocab-codec {requested} supplies the default"
-                );
-            }
+            report_index_overrides(&store, cli.vocab_codec, cli.no_patterns);
             let t = Instant::now();
             let rep = store.compact_with(&sparkles::store::CompactOptions {
                 partial,

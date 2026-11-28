@@ -4916,10 +4916,13 @@ fn assist(p: &mut Paths) {
         .json("200", "The kinds.", "DatasetSettings")
         .errors(&[503]),
     );
+    let index_branch = |o: super::Op| {
+        o.query("branch", s(), "For the index kind, the branch whose generation supplies the inherited codec. The runtime layer is shared by the dataset.")
+    };
     let kind_body = |o: super::Op| {
-        o.body(
+        index_branch(o).body(
             true,
-            "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `vocabCodec` (`front` or `fsst`) and the boolean `patterns`.",
+            "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `IndexSettings`.",
             json!({ "application/json": { "schema": { "type": "object", "additionalProperties": true } } }),
         )
         .header(
@@ -4930,33 +4933,33 @@ fn assist(p: &mut Paths) {
         .json("200", "The kind after the change.", "SettingsKind")
         .errors(&[400, 409, 412, 503])
     };
-    p.add(
+    p.add(index_branch(
         op(GET, "/$/settings/{ds}/{kind}", "getSettings", "Datasets", "Get a settings kind")
-            .doc("The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer. The `evidence` kind needs `admin` on the dataset and includes `recorded`.")
+            .doc("The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer. The `evidence` kind needs `admin` on the dataset and includes `recorded`. The `index` kind accepts `?branch=NAME` and includes its resolved `base`.")
             .see("settings")
             .json("200", "The kind.", "SettingsKind")
             .errors(&[401, 403, 404, 503]),
-    );
+    ));
     p.add(kind_body(
         op(PATCH, "/$/settings/{ds}/{kind}", "patchSettings", "Datasets", "Change settings fields")
-            .doc("Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. A change to a locked field is a `409` with `locked-by-config` and `fields`, and an `endpoint` or `apiKey` anywhere is a `400`. Needs `admin`.")
+            .doc("Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. A change to a locked field is a `409` with `locked-by-config` and `fields`, and an `endpoint` or `apiKey` anywhere is a `400`. Needs `admin` on the whole dataset for `index`, including when `?branch=NAME` selects a branch.")
             .header("If-Ingest-Confirmation", json!({ "type": "string" }), "For an assistant ingestion enable patch, percent-encoded JSON naming the approved settings fields, document recipients, and the modelRevision from assistant status. A changed proposal returns 412.")
             .see("settings"),
     ));
     p.add(kind_body(
         op(PUT, "/$/settings/{ds}/{kind}", "putSettings", "Datasets", "Set a settings kind")
-            .doc("Makes the effective object equal to the body, with built-in defaults for the members it leaves out and the current value for locked fields it leaves out. The runtime layer keeps the fields where the body differs from the declared values and the defaults. Needs `admin`.")
+            .doc("Makes the effective object equal to the body, with built-in defaults for the members it leaves out and the current value for locked fields it leaves out. The runtime layer keeps the fields where the body differs from the declared values and the defaults. For `index`, explicit values including equal ones are stored, and omitted or null fields inherit the resolved base. The `index` kind accepts `?branch=NAME` and requires `admin` on the whole dataset.")
             .see("settings"),
     ));
-    p.add(
+    p.add(index_branch(
         op(DELETE, "/$/settings/{ds}/{kind}", "resetSettings", "Datasets", "Reset settings")
-            .doc("Clears the runtime layer, or with `field` one field of it, so the declared values and the defaults apply. Needs `admin`.")
+            .doc("Clears the runtime layer, or with `field` one field of it, so the declared values and the defaults apply. Needs `admin` on the whole dataset for `index`, including when `?branch=NAME` selects a branch.")
             .see("settings")
             .query("field", json!({ "type": "string" }), "A dotted field such as `historyDays` or `budget.perRequest`.")
             .header("If-Match", json!({ "type": "string" }), "The `etag` of the runtime layer the change is based on.")
             .json("200", "The kind after the change.", "SettingsKind")
             .errors(&[400, 409, 412, 503]),
-    );
+    ));
     let server_body = |o: super::Op| {
         o.body(
             true,

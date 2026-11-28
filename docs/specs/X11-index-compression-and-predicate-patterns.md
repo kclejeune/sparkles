@@ -895,15 +895,17 @@ The C19 `index` kind accepts `vocabCodec` as `front` or `fsst` and `patterns` as
 boolean. A new dataset starts with front coding and patterns enabled. A rebuild
 defaults to the current generation's codec. The invocation flags also contribute
 to the default layer, followed by the settings file's defaults and dataset entry
-and then the dataset's runtime layer. The declared locks take precedence. Runtime edits through the HTTP routes and
-`sparkles settings` persist the overrides in `index-settings.json` at format 1. Embedded
-Rust callers can read the effective settings and set or clear the runtime layer through
-`Dataset::settings().index()`. Physical backups preserve each generation's actual
+and then the dataset's runtime layer. The declared locks take precedence. Runtime
+edits through the HTTP routes and `sparkles settings` persist the overrides in
+`index-settings.json` at format 1. Embedded Rust callers can read the effective
+settings and set or clear the runtime layer through `Dataset::settings().index()`.
+Physical backups preserve each generation's actual
 codec and features. They omit the runtime policy file, as they do for automatic
-compaction and quota settings.
+compaction and quota settings. Roadmap item 1323 tracks restoring the index policy.
 
 The build captures both settings before writing generation files. The runtime layer
-belongs to the dataset and applies when a branch builds its own generation.
+belongs to the dataset and applies when a branch builds its own generation. A branch
+relink reuses main's generation, including its codec and pattern tables.
 Compaction can drop patterns in a partial rewrite. It builds in full when the codec
 changes or to build pattern tables for a generation written with patterns disabled
 or without pattern metadata. A prior build that exhausted the pattern memory budget

@@ -566,12 +566,22 @@ fn explicit_patterns_respect_the_budget_without_forcing_full_compaction() {
         old.generation.patterns.missing
     );
 
-    let report = store
-        .compact_with(&CompactOptions {
-            partial: Some(PartialMode::Always),
-            ..Default::default()
-        })
-        .unwrap();
+    let partial = CompactOptions {
+        partial: Some(PartialMode::Always),
+        ..Default::default()
+    };
+    let report = store.compact_with(&partial).unwrap();
     assert_eq!(report.mode, "partial", "{report:?}");
+    assert!(store.snapshot().generation.patterns.file.is_none());
+
+    update(
+        &store,
+        "INSERT DATA { <urn:a> <urn:q> <urn:b> }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let report = store.compact_with(&partial).unwrap();
+    assert_eq!(report.mode, "partial", "{report:?}");
+    assert_eq!(store.snapshot().len(), 3);
     assert!(store.snapshot().generation.patterns.file.is_none());
 }

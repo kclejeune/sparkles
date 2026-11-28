@@ -49,10 +49,10 @@ impl State {
         base: &BuildOptions,
         current: Option<VocabCodec>,
     ) -> BuildOptions {
-        let runtime = self.runtime.lock();
+        let runtime = *self.runtime.lock();
         let source = self.source.read().clone();
-        let settings = source.map_or(*runtime, |source| {
-            (source.0)(*runtime, current.unwrap_or_default())
+        let settings = source.map_or(runtime, |source| {
+            (source.0)(runtime, current.unwrap_or_default())
         });
         let mut build = base.clone();
         build.vocab_codec = settings.vocab_codec.or(base.vocab_codec).or(current);

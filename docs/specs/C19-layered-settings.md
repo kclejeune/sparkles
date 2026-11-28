@@ -1241,6 +1241,10 @@ cannot read are otherwise unchanged, and the Outcome of C17 records the tests.
 The `index` kind accepts a vocabulary codec and a boolean predicate pattern setting.
 Invocation flags belong to the default layer, and an unconfigured codec inherits the
 current generation's codec on a rebuild. The settings file supplies the declared
-defaults, dataset entries and locks. Runtime edits apply to the whole dataset and
-its branches. [X11](X11-index-compression-and-predicate-patterns.md#dataset-local-settings)
+defaults, dataset entries and locks. Runtime edits require admin on the whole dataset
+and apply to all its branches. A `PUT` replaces just the runtime layer. Omitted and
+`null` fields inherit, and explicit values are saved even when they match the base.
+The `base` member of the response shows the values from the default and declared
+layers for the selected branch.
+[X11](X11-index-compression-and-predicate-patterns.md#dataset-local-settings)
 describes how builds and compactions take these settings.

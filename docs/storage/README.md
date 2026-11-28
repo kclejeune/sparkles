@@ -24,8 +24,8 @@ The storage engine combines TDB2-style bulk loads, durable transactions, compact
 ### Dataset index settings
 
 The `index` settings kind controls the codec and pattern tables for future generations
-of a dataset. Choose `vocabCodec` as `front` or `fsst` and set `patterns` to `true` or
-`false`. Front coding and enabled patterns are the built-in defaults. With
+of a dataset. The `vocabCodec` field takes `front` or `fsst`, and `patterns` takes a
+boolean. Front coding and enabled patterns are the built-in defaults. With
 `serve --settings`, the flags `--vocab-codec` and `--no-patterns` supply server
 defaults below the file's `defaults.index` and `datasets.<name>.index` layers.
 An administrator can override an unlocked field at runtime.
@@ -40,12 +40,13 @@ The [settings API](../API.md#index-settings) exposes the same layers and locks.
 Rust callers use `Dataset::settings().index()` to read or update the policy.
 A persistent dataset keeps its runtime overrides in `index-settings.json`. Standalone
 loads and compactions also read this layer. With no configured codec, a rebuild keeps
-the current generation's codec. `sparkles compact` reports when a saved codec overrides
-the `--vocab-codec` flag.
+the current generation's codec. Standalone `sparkles load --loc` and `sparkles compact`
+report when a saved setting overrides `--vocab-codec` or `--no-patterns`.
 
 Bulk loads and compactions capture both options when they start writing a generation.
 A codec change requires a full compaction. Partial compaction can omit pattern tables
 and a full pass builds them when enabled and missing from a prior disabled build.
+A branch relink uses main's generation, including its codec and pattern tables.
 Existing readers keep their generation across a switch. Use `sparkles stats --loc DIR
 --patterns` to see the codec and pattern tables of the current generation.
 

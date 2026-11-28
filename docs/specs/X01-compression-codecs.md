@@ -297,7 +297,8 @@ Only measured numbers go into `docs/BENCHMARKS.md`.
   `docstore_compression: zstd`. Changing `docstoreCompression` to `lz4` rebuilds the
   index, and queries return the same hits.
 - **A8.** In a build without the `zstd` feature, a `.zst` load fails with
-  `Unsupported: built without zstd`. With `zstd-decode-pure` it loads.
+  `Unsupported: built without zstd`. The optional portable decoder remains unbuilt as
+  recorded in [Remaining codec decisions](#remaining-codec-decisions).
 - **A9 (Phase 2).** A generation built with `--block-codec zstd:3` gives the same
   answers as LZ4 on the W3C suite and the benchmark queries, and `sparkles check`
   passes. A pinned old LZ4 generation and a new zstd generation can both be read.

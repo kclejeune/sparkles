@@ -871,7 +871,7 @@ impl Resolved {
             .iter()
             .map(|(p, s)| (path_string(p), Value::from(*s)))
             .collect();
-        json!({
+        let mut value = json!({
             "dataset": dataset,
             "kind": self.kind.name,
             "effective": self.effective,
@@ -894,8 +894,11 @@ impl Resolved {
                 Err(e) => json!({ "valid": false, "error": e }),
             },
             "etag": self.etag,
-        })
-        .tap_warnings(self)
+        });
+        if index::is(self.kind) {
+            value["base"] = self.base.clone();
+        }
+        value.tap_warnings(self)
     }
 
     /// The answer of `GET /$/server/settings/{kind}`: the members of [`json`](Self::json)

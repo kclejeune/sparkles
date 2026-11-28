@@ -61,7 +61,8 @@ pub use schema::{
 };
 pub use settings::{
     AggregateErrorsSetting, AggregateErrorsStatus, ChangeLogSetting, CompactionSetting,
-    DescribeSetting, HistorySettings, HistoryUpdate, QuotaSetting, RetentionSetting, Settings,
+    DescribeSetting, HistorySettings, HistoryUpdate, IndexSetting, QuotaSetting, RetentionSetting,
+    Settings,
 };
 pub use settings::{
     CompactionReadings, CompactionState, CompactionStatus, DescribeStatus, SettingSource,
@@ -87,7 +88,7 @@ impl Dataset {
         Indexes { ds: self.clone() }
     }
 
-    /// The dataset's settings: compaction, DESCRIBE, quota, retention and change log.
+    /// The dataset's settings, including index builds, compaction and retention.
     pub fn settings(&self) -> Settings {
         Settings { ds: self.clone() }
     }

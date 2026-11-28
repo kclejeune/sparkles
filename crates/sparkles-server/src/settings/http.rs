@@ -62,7 +62,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 /// A change to a kind's runtime layer.
 pub enum Write {
-    /// make the effective object equal to the body
+    /// replace the runtime layer for `index`, or set the effective object for other kinds
     Put(Bytes),
     /// merge the body into the runtime layer
     Patch(Bytes),
@@ -112,8 +112,8 @@ fn etag_matches(if_match: &str, etag: &str) -> bool {
 }
 
 /// The runtime layer that `op` makes of `cur`'s (§6): `If-Match` checked, a `PUT`
-/// turned into the fields where the body differs from the declared and default layers,
-/// and the locks of §4.1 applied. A write that leaves a locked field alone or restates
+/// interpreted as a complete runtime layer for index settings or as a diff for other
+/// kinds, and the locks of §4.1 applied. A write that leaves a locked field alone or restates
 /// its value stores nothing for it, and any other is refused with `locked-by-config`.
 /// `owner` names the dataset, or the server, in the messages. The caller checks the
 /// effective object after the change and stores the layer.
@@ -164,6 +164,11 @@ pub(crate) fn plan(
                 }
             }
             new
+        }
+        Op::Put(body) if super::index::is(kind) => {
+            // Keep explicit values even when they match the current base. Omitted
+            // and null values inherit the base again.
+            merged(&Value::Object(Map::new()), &body)
         }
         Op::Put(mut body) => {
             if kind.name == "assistant"

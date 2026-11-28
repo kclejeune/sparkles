@@ -4996,6 +4996,11 @@ server's settings file locks the field, is reported, the other datasets are stil
 patched, and the exit status is 1. Datasets created later do not get the values, which
 is what the settings file of `--settings` is for.
 
+For the `index` kind, `sparkles settings diff` compares overrides with the server's
+resolved base, including the invocation flags and the current generation's codec.
+Standalone `load --loc` and `compact` report when saved index settings override an
+invocation flag.
+
 ### The Settings tab
 
 The dataset page of the web UI has a **Settings** tab with a section for the assistant,

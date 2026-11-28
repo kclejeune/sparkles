@@ -15037,15 +15037,19 @@ included.
 #### Index settings
 
 `GET /$/settings/{ds}/index` reports the choices for the next generation build.
-Set `vocabCodec` to `front` or `fsst` and set `patterns` to a boolean. The built-in
-choices are `front` for a new dataset and `true` for patterns. Without a configured
+The `vocabCodec` field takes `front` or `fsst`, and `patterns` takes a boolean. The
+built-in choices are `front` for a new dataset and `true` for patterns. Without a configured
 codec, an existing dataset or branch inherits its current generation's codec.
 Server invocation flags `--vocab-codec` and `--no-patterns` also contribute to the
 default layer. A runtime edit of a field such as `patterns` follows
-the same locking and reset rules as other kinds. Use `index.patterns` to lock it
-in the settings file. A request with `?branch=NAME` reads the choices for that
+the same locking and reset rules as other kinds. The settings file can lock
+`index.patterns`. A request with `?branch=NAME` reads the choices for that
 branch and writes overrides shared by the dataset. A write requires administration
 rights over the whole dataset.
+
+The response includes `base`, the choices inherited before applying runtime overrides.
+A `PUT` replaces the runtime layer with the explicit values even when they match
+`base`. An omitted or null field inherits its base value again.
 
 The runtime overrides are kept in the dataset's `index-settings.json`. A bulk
 load or compaction captures the effective choices for the generation it builds.
