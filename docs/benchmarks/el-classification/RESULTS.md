@@ -2177,12 +2177,16 @@ sorts could save only part.
 
 ### Default marker repair and side-table state (items 1231 and 1247)
 
-Manual report from the generated-corpus runs on Boat worker `bx_azx7qhs7` comparing the
-default-flip build (`748a4a4f`) and the side-table build (`629fc9d7`) against the previous
-default (repair off, decline check on) and against both repair and decline off. The later
-Round-1 fix commit (`4d50167b`) changes only slot-admission locking, race cleanup, tests
-and documentation, and was verified by the targeted `sparkles-owl` (1,586 tests) and
-`handles::ontology` (214 tests) suites without re-running the generated corpus.
+Manual report from the generated-corpus runs on Boat worker `bx_azx7qhs7`, cataloged in the
+[marker-default and side-table record](runs/2026-11-28-dl-marker-default-boat-4d50167b/record.json).
+The corpus arms ran on two patched measurement builds: `flip` (over tree `edfabf58`, before
+test pins corresponding to commit `748a4a4f`) and `m1247` (over tree `507cc20b`, before
+formatting and test fixes corresponding to commit `629fc9d7`). Both builds were compared
+against the previous default (repair off, decline check on) and against both repair and
+decline off. The later revision `4d50167b` updates slot-admission locking, `OnceLock::set`
+race cleanup, the post-saturation `live_record_bytes` recount, tests and documentation, and
+passed the targeted `sparkles-owl` (1,586 tests) and `handles::ontology` (214 tests) suites
+on `bx_azx7qhs7` without re-running the generated corpus.
 
 The corpus covers 33 generated sets holding 18,916 input files, of which 18,870 have a
 usable HermiT 1.4.5 reference. Each file ran in two configurations: one thread with the
@@ -2219,6 +2223,13 @@ files in `fz` and `gen` in both configurations across every arm (1,380 rows), le
   unified rooted-DL benchmark sweep of item 823.
 
 ## Records
+
+The [marker-default and side-table record](runs/2026-11-28-dl-marker-default-boat-4d50167b/record.json)
+catalogs the six generated-corpus arms on `boat:bx_azx7qhs7`, the relationship between the
+patched measurement builds (`flip` over `edfabf58` and `m1247` over `507cc20b`) and the
+committed revisions (`748a4a4f`, `629fc9d7` and `4d50167b`), the 1c and 4e denominators, the
+baseline-specific memory ratios, and the separate four-worker `--no-dl-steps` and
+`Classifier` correctness runs.
 
 The [record of item 712's reduced automata](runs/2026-11-21-dl-automata-atlas-fd47b7ae/record.json)
 holds every process of the twelve rounds on `atlas` with its report, the analysis, the hash

@@ -1,0 +1,93 @@
+{
+ "suite": "el-classification",
+ "kind": "corpus-agreement-and-accounting",
+ "scale": "33 generated DL corpus sets (18,916 input files, 18,870 usable HermiT 1.4.5 references, 36,360 usable rows across 1c and 4e) plus separate 4-worker --no-dl-steps correctness runs on 6 sets and Classifier runs on 9 sets",
+ "host": {
+  "name": "boat:bx_azx7qhs7",
+  "note": "Boat overflow worker; conclusion counts, HermiT agreement and estimated peak memory are deterministic accounting outputs, while wall-clock timing of the shared side-table mutex on 4 concurrent workers remains open for Intel host atlas"
+ },
+ "manifest": {
+  "arms": {
+   "flip-def": "new default (rooted_marker_repair=true mode 129, rooted_decline=false) on patched flip build",
+   "flip-prev": "previous default (rooted_marker_repair=false, rooted_decline=true) on patched flip build",
+   "flip-off": "both repair and decline off (SPARKLES_ROOTED_MARKER_REPAIR=0, SPARKLES_ROOTED_MARKER_DECLINE=0) on patched flip build",
+   "m1247-def": "new default with side-table MTab on patched m1247 build",
+   "m1247-prev": "previous default with side-table MTab on patched m1247 build",
+   "m1247-off": "both repair and decline off with side-table MTab on patched m1247 build"
+  },
+  "builds": {
+   "flip": "patched checkout over tree edfabf58; subsequent flipfix.patch pinned tests after the corpus run and corresponds to committed revision 748a4a4f",
+   "m1247": "patched checkout over tree 507cc20b (m1247.patch); subsequent formatting and test fixes (final.patch) correspond to committed revision 629fc9d7",
+   "verified_followup": "4d50167b (tree 61796eb7) changes slot-admission locking, OnceLock::set race cleanup, post-saturation live_record_bytes recount, tests and docs; verified by targeted sparkles-owl (1,586 tests) and handles::ontology (214 tests) suites on boat:bx_azx7qhs7 with mbx 1.29.1 and rustc 1.99.1 without re-running the generated corpus"
+  },
+  "commits": {
+   "base": "f60157c0",
+   "flip": "748a4a4f",
+   "side_table": "629fc9d7",
+   "r1_fix": "4d50167b"
+  }
+ },
+ "settings": {
+  "configurations": {
+   "1c": "1 thread, cautious strategy, default fixed rooted steps",
+   "4e": "4 threads requested, eager strategy, default fixed rooted steps (saturates on 1 worker under default rooted steps)",
+   "4w_no_steps": "4 threads with --no-dl-steps (4 concurrent saturation workers sharing MTab), repeated runs on 6 sets (av, ps, fxall and 3 others)",
+   "classifier_api": "Classifier handle runs on 9 sets including forest (976/994 claimed, 18 over bound with and without repair)"
+  },
+  "oracle": "HermiT 1.4.5"
+ },
+ "summary": {
+  "sets": 33,
+  "input_files": 18916,
+  "hermit_references": 18870,
+  "parser_rejections_per_arm": 1380,
+  "parser_rejection_files": {
+   "fz": 633,
+   "gen": 57
+  },
+  "usable_rows_per_arm": 36360,
+  "usable_rows_per_config": 18180,
+  "item_1231_claims": {
+   "new_default": 34810,
+   "previous_default": 32674,
+   "lost_vs_previous_default": 3,
+   "lost_vs_both_off": 9,
+   "lost_vs_both_off_in_item_1251_family": 6
+  },
+  "item_1231_hermit_disagreements": {
+   "both_off": 1456,
+   "previous_default": 2,
+   "new_default": 2,
+   "shared_oracle_exception": "s2-g2-150 (2 rows across 1c/4e where HermiT 1.4.5 omits 4 key-over-universal-property subsumptions)"
+  },
+  "item_1231_work_and_memory_vs_both_off": {
+   "conclusions_ratio_all": 1.069,
+   "conclusions_ratio_large_sets_range": [1.03, 1.13],
+   "conclusions_ratio_av": 1.61,
+   "conclusions_ratio_fxall": 1.96,
+   "conclusions_ratio_item_1251_family": 34.6,
+   "peak_memory_ratio_all": 1.049,
+   "peak_memory_ratio_large_sets_range": [1.021, 1.048],
+   "peak_memory_ratio_av": 1.20,
+   "peak_memory_ratio_fxall": 1.26,
+   "peak_memory_ratio_item_1251_family": 4.4
+  },
+  "item_1231_peak_memory_baseline_comparison": {
+   "g6_common_claims": 4000,
+   "g6_vs_both_off": 1.0396,
+   "g6_vs_previous_default": 0.9904,
+   "p3_common_claims": 2400,
+   "p3_vs_both_off": 1.0349,
+   "p3_vs_previous_default": 0.9897
+  },
+  "item_1247_parity_and_memory": {
+   "matching_rows": 36360,
+   "conclusion_count_variance": "1 p3 row differs by 1 conclusion between runs of the same build",
+   "repair_off_peak_delta_bytes": "non-positive multiples of 8, down to -1488 bytes",
+   "repair_on_peak_delta_median_pct": 0.03,
+   "repair_on_peak_delta_max_bytes": 512,
+   "four_worker_no_steps_hermit_disagreements": 0,
+   "classifier_nine_set_hermit_disagreements": 0
+  }
+ }
+}
