@@ -1748,8 +1748,7 @@ impl RemoteRun {
                                     .map(|v| (v.len() + std::mem::size_of::<String>()) as u64)
                                     .sum();
                                 let per_part = schema_bytes + arc_inner + answer_slot;
-                                let counts_overhead =
-                                    std::mem::size_of_val(chunk) as u64;
+                                let counts_overhead = std::mem::size_of_val(chunk) as u64;
                                 let split_overhead =
                                     chunk.len() as u64 * per_part + counts_overhead;
                                 let admitted = c

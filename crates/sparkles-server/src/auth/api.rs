@@ -498,6 +498,7 @@ mod tests {
                 lifts: vec![],
                 branches: None,
                 server_models: false,
+                views: Default::default(),
             }],
             ..Default::default()
         });
