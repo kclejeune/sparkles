@@ -350,6 +350,23 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         return document(ffi { owner.handle.ffi.ontologyCall(op, args.bytes(), operation.native) }).asObject
     }
 
+    /**
+     * A read of kept, materialized or projected state at the source this thread reads: a
+     * pinned historical view and a read transaction answer at their own commit, and the
+     * live dataset outside a transaction at the head or at [OntologyRead.at]. A write
+     * transaction is refused before any flush. An [OntologyRead.at] other than the pinned
+     * commit is refused.
+     */
+    private fun committedCall(op: String, args: JsonObject, operation: SparklesOperation): JsonObject {
+        val read = owner.committedRead("ontology.$op")
+        val bytes = if (read != null) {
+            ffi { read.ontologyCall(op, args.bytes(), operation.native) }
+        } else {
+            ffi { owner.handle.ffi.ontologyCall(op, args.bytes(), operation.native) }
+        }
+        return document(bytes).asObject
+    }
+
     /** The header, the counts of entities by kind and of axioms by type, the graphs read and the diagnostics. */
     @JvmOverloads public fun summary(read: OntologyRead = OntologyRead()): JsonObject = SparklesOperation().use { summary(read, it) }
     public fun summary(read: OntologyRead, operation: SparklesOperation): JsonObject = call("summary", read.value(), operation, false)
@@ -456,7 +473,6 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         operation: SparklesOperation,
     ): JsonObject {
         require(limit > 0 && offset >= 0)
-        if (read.inferences || read.sourceId != null) owner.checkCapture("ontology materialized hierarchy (use OntologyRead.at for retained history)")
         val args = read.value()
         if (iri != null) args.put("iri", iri)
         args.put("kind", kind)
@@ -467,7 +483,7 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         args.put("limit", limit.toLong())
         args.put("offset", offset)
         after?.let { args.put("after", it) }
-        return call("hierarchy", args, operation, false)
+        return if (read.inferences || read.sourceId != null) committedCall("hierarchy", args, operation) else call("hierarchy", args, operation, false)
     }
 
     /**
@@ -495,7 +511,6 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         operation: SparklesOperation,
     ): JsonObject {
         require(limit in 1..1000)
-        if (read.inferences || read.sourceId != null) owner.checkCapture("ontology materialized individuals (use OntologyRead.at for retained history)")
         val args = read.value()
         type?.let { args.put("type", it) }
         args.put("untyped", untyped)
@@ -503,22 +518,57 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         after?.let { args.put("after", it) }
         args.put("limit", limit.toLong())
         if (languages.isNotEmpty()) args.put("lang", languages.joinToString(","))
-        return call("individuals", args, operation, false)
+        return if (read.inferences || read.sourceId != null) committedCall("individuals", args, operation) else call("individuals", args, operation, false)
     }
 
     /** Read existing immutable classification state only. Missing state never computes.
      * A continuation needs [KeptClassificationQuery.resultId] and the returned commit
-     * in [OntologyRead.at]. Restricted views report unavailable. Use a live dataset
-     * outside a transaction; pinned dataset wrappers are refused rather than routed
-     * to head. Retained history is selected with [OntologyRead.at] on that live dataset. */
+     * in [OntologyRead.at], which a pinned view or a read transaction already names.
+     * Restricted views report unavailable. A pinned dataset wrapper and a read
+     * transaction answer at their own commit, the live dataset outside a transaction at
+     * the head or at [OntologyRead.at], and a write transaction is refused before
+     * anything is flushed. */
     @JvmOverloads public fun keptClassification(read: OntologyRead = OntologyRead(), query: KeptClassificationQuery = KeptClassificationQuery()): JsonObject =
         SparklesOperation().use { keptClassification(read, query, it) }
     public fun keptClassification(read: OntologyRead, query: KeptClassificationQuery, operation: SparklesOperation): JsonObject {
-        owner.checkCapture("ontology.keptClassification (use OntologyRead.at for retained history)")
         require(!read.inferences) { "kept classification reads asserted inputs" }
         val args = read.value()
         query.into(args)
-        return call("keptClassification", args, operation, false)
+        return committedCall("keptClassification", args, operation)
+    }
+
+    /**
+     * A page of the axioms that the kept classification infers, without classifying on a
+     * miss: an `EquivalentClasses` axiom for each group of several equivalent classes and
+     * a `SubClassOf` axiom between the first classes of each group and its direct
+     * parents. `axioms` and `total` are null unless `status` is `available`. Sources
+     * follow [keptClassification].
+     */
+    @JvmOverloads public fun keptAxioms(read: OntologyRead = OntologyRead(), query: KeptAxiomQuery = KeptAxiomQuery()): JsonObject =
+        SparklesOperation().use { keptAxioms(read, query, it) }
+    public fun keptAxioms(read: OntologyRead, query: KeptAxiomQuery, operation: SparklesOperation): JsonObject {
+        require(!read.inferences) { "kept classification reads asserted inputs" }
+        require(read.sourceId == null) { "kept classification does not take a materialization sourceId" }
+        val args = read.value()
+        query.into(args)
+        return committedCall("axioms", args, operation)
+    }
+
+    /**
+     * [entity] with a `classification` member read from the kept classification without
+     * classifying on a miss: the selection's status, result and outcome, the class's
+     * status, and the first pages of its direct parents, direct children and named
+     * equivalents. Sources follow [keptClassification].
+     */
+    @JvmOverloads public fun keptEntity(iri: String, read: OntologyRead = OntologyRead(), query: KeptEntityQuery = KeptEntityQuery()): JsonObject =
+        SparklesOperation().use { keptEntity(iri, read, query, it) }
+    public fun keptEntity(iri: String, read: OntologyRead, query: KeptEntityQuery, operation: SparklesOperation): JsonObject {
+        require(!read.inferences) { "kept classification reads asserted inputs" }
+        require(read.sourceId == null) { "kept classification does not take a materialization sourceId" }
+        val args = read.value()
+        args.put("iri", iri)
+        query.into(args)
+        return committedCall("entity", args, operation)
     }
 
     /**
@@ -543,13 +593,12 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
         operation: SparklesOperation,
     ): JsonObject {
         require(mentions >= 0 && incoming >= 0)
-        if (read.inferences || read.sourceId != null) owner.checkCapture("ontology materialized term (use OntologyRead.at for retained history)")
         val args = read.value()
         args.put("iri", iri)
         args.put("mentions", mentions.toLong())
         args.put("incoming", incoming.toLong())
         if (languages.isNotEmpty()) args.put("lang", languages.joinToString(","))
-        return call("term", args, operation, false)
+        return if (read.inferences || read.sourceId != null) committedCall("term", args, operation) else call("term", args, operation, false)
     }
 
     /**
@@ -615,9 +664,9 @@ public class SparklesOntology internal constructor(private val owner: DatasetGra
     @JvmOverloads public fun classify(read: OntologyRead = OntologyRead(), query: ClassifyQuery = ClassifyQuery()): JsonObject =
         SparklesOperation().use { classify(read, query, it) }
     public fun classify(read: OntologyRead, query: ClassifyQuery, operation: SparklesOperation): JsonObject {
-        if (query.projection != null) owner.checkCapture("ontology frame projection (use OntologyRead.at for retained history)")
         val args = read.value()
         query.into(args)
+        if (query.projection != null && query.target == null) return committedCall("classify", args, operation)
         return call("classify", args, operation, query.target != null)
     }
 
@@ -835,6 +884,53 @@ public data class ClassifyQuery @JvmOverloads public constructor(
         expansion?.let { j.put("expansion", it) }
         projection?.let { j.put("projection", it) }
         if (languages.isNotEmpty()) j.put("lang", languages.joinToString(","))
+    }
+}
+
+/** A page of the axioms one kept classification infers. Nonzero offsets require an exact pin. */
+public data class KeptAxiomQuery @JvmOverloads public constructor(
+    /** axiom types such as `SubClassOf` or `EquivalentClasses`, all when empty */
+    public val types: List<String> = emptyList(),
+    /** a named class the axioms mention */
+    public val about: String? = null,
+    public val offset: Long = 0,
+    public val limit: Int = 100,
+    public val resultId: String? = null,
+    /** read the kept EL-only classification instead of the default classification */
+    public val elOnly: Boolean = false,
+) {
+    internal fun into(j: JsonObject) {
+        require(limit in 1..1000 && offset >= 0)
+        j.put("classification", "kept")
+        if (types.isNotEmpty()) j.put("type", types.joinToString(","))
+        about?.let { j.put("about", it) }
+        j.put("offset", offset)
+        j.put("limit", limit.toLong())
+        resultId?.let { j.put("resultId", it) }
+        if (elOnly) j.put("elOnly", true)
+    }
+}
+
+/** What [SparklesOntology.keptEntity] reads: the asserted entity's selectors and the kept result's. */
+public data class KeptEntityQuery @JvmOverloads public constructor(
+    public val kind: String? = null,
+    public val assertions: Boolean = false,
+    /** the most entries of each list and kept page, from 1 to 1,000 */
+    public val limit: Int = 100,
+    public val resultId: String? = null,
+    public val languages: List<String> = emptyList(),
+    /** read the kept EL-only classification instead of the default classification */
+    public val elOnly: Boolean = false,
+) {
+    internal fun into(j: JsonObject) {
+        require(limit in 1..1000)
+        j.put("classification", "kept")
+        kind?.let { j.put("kind", it) }
+        j.put("assertions", assertions)
+        j.put("limit", limit.toLong())
+        resultId?.let { j.put("resultId", it) }
+        if (languages.isNotEmpty()) j.put("lang", languages.joinToString(","))
+        if (elOnly) j.put("elOnly", true)
     }
 }
 

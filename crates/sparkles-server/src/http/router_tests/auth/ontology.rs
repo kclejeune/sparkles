@@ -46,6 +46,42 @@ async fn kept_classification_reads_do_not_disclose_shared_state_and_scoped_frame
     assert_eq!(denied.headers[header::CACHE_CONTROL], "no-store");
 }
 
+#[tokio::test]
+async fn kept_entity_and_axiom_reads_never_disclose_shared_state_to_a_restricted_reader() {
+    let (_dir, app) = server();
+    let run = as_user(
+        &app,
+        "ofull",
+        "POST",
+        "/$/ontology/ont/classify",
+        &json!({"graph":"http://ex/open"}),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::OK, "{}", run.text());
+    for uri in [
+        format!("/$/ontology/ont/axioms?{OPEN}&classification=kept"),
+        format!("/$/ontology/ont/entity?{OPEN}&iri=http%3A%2F%2Fex%2FA&classification=kept"),
+    ] {
+        let r = as_user(&app, "oopen", "GET", &uri, &json!(null)).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store");
+        let j = r.json();
+        let kept = j.get("classification").unwrap_or(&j);
+        assert_eq!(kept["reason"], "unsupportedScope", "{uri}: {j}");
+        assert!(kept["result"].is_null());
+        assert!(!r.text().contains("http://ex/Hidden"), "{uri}: {j}");
+    }
+    let full = as_user(
+        &app,
+        "ofull",
+        "GET",
+        &format!("/$/ontology/ont/axioms?{OPEN}&classification=kept"),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(full.json()["status"], "available", "{}", full.text());
+}
+
 const DATA: &str = r#"@prefix : <http://ex/> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .

@@ -722,7 +722,11 @@ const RETRY_ENTITIES: usize = 256;
 const COPY_BYTES_PER_TRIPLE: u64 = 256;
 
 /// Bytes charged to a memory grant, released when it drops.
-struct Charged(std::sync::Arc<sparkles_core::sparql::pool::PoolGrant>, u64);
+#[derive(Debug)]
+pub(super) struct Charged(
+    pub(super) std::sync::Arc<sparkles_core::sparql::pool::PoolGrant>,
+    pub(super) u64,
+);
 
 impl Drop for Charged {
     fn drop(&mut self) {

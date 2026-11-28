@@ -932,16 +932,43 @@ pub struct EditOutcome {
 #[derive(Clone)]
 pub struct Ontologies {
     pub(crate) ds: Dataset,
+    /// The snapshot every read of this handle answers at, when it was pinned with
+    /// [`Ontologies::at_snapshot`].
+    pub(crate) pinned: Option<Arc<Snapshot>>,
 }
 
 impl Dataset {
     /// The OWL 2 ontology of this dataset's graphs (spec F21).
     pub fn ontology(&self) -> Ontologies {
-        Ontologies { ds: self.clone() }
+        Ontologies {
+            ds: self.clone(),
+            pinned: None,
+        }
     }
 }
 
 impl Ontologies {
+    /// This handle with its reads pinned to `snap`, a snapshot of the same dataset that a
+    /// read transaction or a historical view holds. Every read then answers at that
+    /// snapshot, as if the request named its commit, without resolving history again,
+    /// so a pinned snapshot stays readable after retention prunes its commit. A request
+    /// whose `at` names anything other than `commit:N` of the snapshot is refused, and
+    /// so are edits, entity removals and classifications that write a taxonomy.
+    pub fn at_snapshot(mut self, snap: Arc<Snapshot>) -> Ontologies {
+        self.pinned = Some(snap);
+        self
+    }
+
+    /// Refuse a write through a handle pinned with [`Ontologies::at_snapshot`].
+    pub(crate) fn check_unpinned(&self, what: &str) -> Result<()> {
+        if self.pinned.is_some() {
+            return Err(Error::invalid(format!(
+                "{what} starts from the head: a pinned ontology read is read-only"
+            )));
+        }
+        Ok(())
+    }
+
     /// A scope over one graph, `"default"` or an IRI, as spec F21 §2.1 writes it:
     /// `ds.ontology().graph(iri).imports(true).open()`. An invalid IRI is reported by
     /// the call that ends the scope.
@@ -1212,6 +1239,18 @@ impl Ontologies {
     ) -> Result<(Arc<Snapshot>, QueryOptions)> {
         let defaults = self.ds.with_query_defaults(opts);
         let opts = crate::overview::one_deadline(&defaults)?.into_owned();
+        if let Some(snap) = &self.pinned {
+            return match &req.at {
+                None => Ok((snap.clone(), opts)),
+                Some(crate::history::At::Commit(n)) if *n == snap.commit => {
+                    Ok((snap.clone(), opts))
+                }
+                Some(_) => Err(Error::invalid(format!(
+                    "a pinned ontology read answers at commit:{}: leave out 'at' or name that commit",
+                    snap.commit
+                ))),
+            };
+        }
         let snap = match &req.at {
             None => self.ds.store().snapshot(),
             Some(at) => {
@@ -1438,6 +1477,8 @@ impl Ontologies {
         F: FnOnce(&Opened) -> std::result::Result<(EditRequest, T), E>,
     {
         base_req.validate().map_err(EditFromHeadError::Store)?;
+        self.check_unpinned("an edit")
+            .map_err(EditFromHeadError::Store)?;
         if base_req.at.is_some() {
             return Err(EditFromHeadError::Store(Error::invalid(
                 "an edit starts from the head: leave out 'at'",
@@ -1531,6 +1572,7 @@ impl Ontologies {
         extra: Extra<'_>,
     ) -> Result<EditOutcome> {
         req.validate()?;
+        self.check_unpinned("an edit")?;
         if req.at.is_some() {
             return Err(Error::invalid(
                 "an edit starts from the head: leave out 'at'",

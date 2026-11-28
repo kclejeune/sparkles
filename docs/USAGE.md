@@ -6740,11 +6740,18 @@ uses its exact graphs, imports and mapping mode. An explicit
 `classify(read, ClassifyQuery(about = iri, projection = "frame"))` computes bounded
 frame clauses when the caller chooses to classify.
 
-These two new conveniences throw `JenaTransactionException` on a dataset returned by
-`at()` or during an active read or write transaction. The guard runs before native work
-or flushing buffered writes. For retained committed history, call them on the live
-dataset with `OntologyRead.at` instead. They do not read uncommitted changes. Wrapper-source
-integration remains in [ROADMAP.md](ROADMAP.md) (item 588); existing ontology methods retain their behavior.
+`dsg.ontology().keptAxioms(read, KeptAxiomQuery(about = iri))` pages the axioms that the
+kept classification infers, and `dsg.ontology().keptEntity(iri, read)` adds a
+`classification` member to the entity's report with its direct parents, children and
+equivalents. Both answer null pages on a miss rather than classifying.
+
+These reads, the frame projection and the materialized hierarchy, individual and term
+reads answer a dataset returned by `at()` and an active read transaction at their own
+commit, so a read transaction opened before a later commit keeps reading the result it
+began with. The live dataset outside a transaction reads the head or `OntologyRead.at`.
+They throw `JenaTransactionException` in a write transaction before native work or
+flushing buffered writes, since they never read uncommitted changes. Other ontology
+methods keep their existing behavior.
 See the [ontology API](API.md#ontology) for read states, provenance and paging contracts.
 
 ### Opening a Jena dataset

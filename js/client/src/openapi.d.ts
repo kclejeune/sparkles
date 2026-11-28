@@ -20974,10 +20974,16 @@ export interface operations {
                 assertions?: boolean;
                 /** @description `json` (the default) or `ofn`. */
                 format?: "json" | "ofn";
-                /** @description The most axioms listed, from 1 to 10,000 (100 by default). */
+                /** @description The most axioms listed, from 1 to 10,000 (100 by default), or to 1,000 with `classification=kept`. */
                 limit?: number;
-                /** @description The axioms skipped. */
+                /** @description The axioms skipped. With `classification=kept`, a nonzero offset needs `resultId` and `at=commit:N`. */
                 offset?: number;
+                /** @description `kept` lists the axioms that the dataset's kept classification infers instead of the asserted axioms, without classifying on a miss. Each group of several equivalent classes gives an `EquivalentClasses` axiom and each direct parent group a `SubClassOf` axiom between the groups' first classes. The answer has the kept read's `status`, `reason`, `result` and `outcome`, and `axioms` and `total` are null unless the status is `available`. It is `Cache-Control: no-store` and refuses `inferences`, `assertions` and `format=ofn`. */
+                classification?: "kept";
+                /** @description With `classification=kept`, read the kept EL-only classification. */
+                elOnly?: boolean;
+                /** @description With `classification=kept`, the immutable result to read. */
+                resultId?: string;
             };
             header?: never;
             path: {
@@ -21537,8 +21543,16 @@ export interface operations {
                 kind?: string;
                 /** @description Also read the instances, types and property assertions the store holds. */
                 assertions?: boolean;
-                /** @description The most entries of each streamed list, from 1 to 10,000 (100 by default). */
+                /** @description The most entries of each streamed list, from 1 to 10,000 (100 by default), and of each kept page, from 1 to 1,000, with `classification=kept`. */
                 limit?: number;
+                /** @description `kept` adds a `classification` member read from the dataset's kept classification without classifying on a miss: the read's `status`, `reason`, `result` and `outcome`, the class's `entity` status, and the first pages of its direct `parents`, direct `children` and named `equivalents`, which are null unless the class is present in an available result. It covers named classes only, is `Cache-Control: no-store` and refuses `inferences`. */
+                classification?: "kept";
+                /** @description With `classification=kept`, read the kept EL-only classification. */
+                elOnly?: boolean;
+                /** @description With `classification=kept`, the immutable result to read. */
+                resultId?: string;
+                /** @description With `classification=kept`, comma-separated preferred label languages of the kept pages, otherwise Accept-Language. */
+                lang?: string;
             };
             header?: never;
             path: {

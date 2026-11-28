@@ -44788,7 +44788,7 @@
             }
           },
           {
-            "description": "The most axioms listed, from 1 to 10,000 (100 by default).",
+            "description": "The most axioms listed, from 1 to 10,000 (100 by default), or to 1,000 with `classification=kept`.",
             "in": "query",
             "name": "limit",
             "schema": {
@@ -44796,11 +44796,39 @@
             }
           },
           {
-            "description": "The axioms skipped.",
+            "description": "The axioms skipped. With `classification=kept`, a nonzero offset needs `resultId` and `at=commit:N`.",
             "in": "query",
             "name": "offset",
             "schema": {
               "type": "integer"
+            }
+          },
+          {
+            "description": "`kept` lists the axioms that the dataset's kept classification infers instead of the asserted axioms, without classifying on a miss. Each group of several equivalent classes gives an `EquivalentClasses` axiom and each direct parent group a `SubClassOf` axiom between the groups' first classes. The answer has the kept read's `status`, `reason`, `result` and `outcome`, and `axioms` and `total` are null unless the status is `available`. It is `Cache-Control: no-store` and refuses `inferences`, `assertions` and `format=ofn`.",
+            "in": "query",
+            "name": "classification",
+            "schema": {
+              "enum": [
+                "kept"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "With `classification=kept`, read the kept EL-only classification.",
+            "in": "query",
+            "name": "elOnly",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "With `classification=kept`, the immutable result to read.",
+            "in": "query",
+            "name": "resultId",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
             }
           }
         ],
@@ -46543,11 +46571,47 @@
             }
           },
           {
-            "description": "The most entries of each streamed list, from 1 to 10,000 (100 by default).",
+            "description": "The most entries of each streamed list, from 1 to 10,000 (100 by default), and of each kept page, from 1 to 1,000, with `classification=kept`.",
             "in": "query",
             "name": "limit",
             "schema": {
               "type": "integer"
+            }
+          },
+          {
+            "description": "`kept` adds a `classification` member read from the dataset's kept classification without classifying on a miss: the read's `status`, `reason`, `result` and `outcome`, the class's `entity` status, and the first pages of its direct `parents`, direct `children` and named `equivalents`, which are null unless the class is present in an available result. It covers named classes only, is `Cache-Control: no-store` and refuses `inferences`.",
+            "in": "query",
+            "name": "classification",
+            "schema": {
+              "enum": [
+                "kept"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "With `classification=kept`, read the kept EL-only classification.",
+            "in": "query",
+            "name": "elOnly",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "With `classification=kept`, the immutable result to read.",
+            "in": "query",
+            "name": "resultId",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "With `classification=kept`, comma-separated preferred label languages of the kept pages, otherwise Accept-Language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
             }
           }
         ],

@@ -283,10 +283,40 @@ pub(super) async fn axioms(
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
     uri: Uri,
+    headers: HeaderMap,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let req = request_of(&st, &ds, &params)?;
+    if let Some(a) = kept_args(
+        &params,
+        &headers,
+        &["type", "about", "assertions", "limit", "offset"],
+    )? {
+        if params.get("format").is_some_and(|f| f != "json") {
+            return Err(bad("classification=kept answers JSON: leave out 'format'"));
+        }
+        let query = onto::wire::kept_axiom_query_of(&a).map_err(ontology_error)?;
+        query.validate(&req).map_err(ontology_error)?;
+        let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+        return no_store(
+            blocking(move || {
+                let found = ds
+                    .dataset
+                    .ontology()
+                    .kept_axioms(&req, &query, &opts)
+                    .map_err(ontology_error)?;
+                let body = onto::wire::kept_axioms_body(&ds.name, &found, &renderer(&ds))
+                    .map_err(ontology_error)?;
+                Ok(with_commit(
+                    Json(body).into_response(),
+                    &ds,
+                    found.read.commit,
+                ))
+            })
+            .await,
+        );
+    }
     let types = match params.get("type") {
         None => None,
         Some(t) => Some(onto::parse_axiom_types(t).map_err(|e| bad(e.to_string()))?),
@@ -418,10 +448,12 @@ pub(super) async fn entity(
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
     uri: Uri,
+    headers: HeaderMap,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let req = request_of(&st, &ds, &params)?;
+    let kept_args = kept_args(&params, &headers, &[])?;
     let iri = params
         .get("iri")
         .ok_or_else(|| bad("iri names the entity"))?
@@ -443,16 +475,83 @@ pub(super) async fn entity(
         assertions: params.get("assertions").is_some_and(truthy),
         limit: number_param(&params, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT)?,
     };
+    let kept = match &kept_args {
+        Some(a) => {
+            let k = onto::wire::kept_entity_query_of(a, &q)
+                .map_err(ontology_error)?
+                .expect("classification=kept");
+            k.validate(&req).map_err(ontology_error)?;
+            Some(k)
+        }
+        None => None,
+    };
     let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
-    blocking(move || {
+    let read = blocking(move || {
         let handle = ds.dataset.ontology();
         let opts = handle.anchored(&opts).map_err(ontology_error)?;
         let o = handle.open(&req, &opts).map_err(ontology_error)?;
-        let j = onto::wire::entity_body(&ds.name, &o, &req, &renderer(&ds), &q, &opts)
+        let mut j = onto::wire::entity_body(&ds.name, &o, &req, &renderer(&ds), &q, &opts)
             .map_err(ontology_error)?;
+        if let Some(k) = &kept {
+            let found = handle
+                .kept_entity_at_opened(&req, &o, k, &opts)
+                .map_err(ontology_error)?;
+            j["classification"] = onto::wire::kept_entity_json(&found).map_err(ontology_error)?;
+        }
         Ok(with_commit(Json(j).into_response(), &ds, o.snapshot.commit))
     })
-    .await
+    .await;
+    if kept_args.is_some() {
+        no_store(read)
+    } else {
+        read
+    }
+}
+
+/// The selectors of a read of the kept classification through `GET .../axioms` or
+/// `GET .../entity` (`classification=kept`, roadmap item 588), as the library's wire
+/// arguments, with `keys` of the route's own members, or `None` when the read does not
+/// select it. `elOnly` and `resultId` need `classification=kept`, and `inferences` does
+/// not go with it.
+fn kept_args(
+    params: &Params,
+    headers: &HeaderMap,
+    keys: &[&str],
+) -> ApiResult<Option<serde_json::Map<String, serde_json::Value>>> {
+    for key in ["classification", "elOnly", "resultId"] {
+        if params.all(key).len() > 1 {
+            return Err(bad(format!("duplicate selector '{key}'")));
+        }
+    }
+    if let Some(value) = params.get("elOnly")
+        && !matches!(value, "true" | "false")
+    {
+        return Err(bad("elOnly: true or false"));
+    }
+    let mut a = browse_args(
+        params,
+        headers,
+        &[&["classification", "resultId"], keys].concat(),
+        &["elOnly", "assertions"],
+    );
+    if let Some(v) = params.get("inferences") {
+        a.insert("inferences".into(), json!(truthy(v)));
+    }
+    if !onto::wire::kept_selected(&a).map_err(ontology_error)? {
+        return Ok(None);
+    }
+    numbers(&mut a, &["offset", "limit"])?;
+    Ok(Some(a))
+}
+
+/// A read of kept state is never cached: availability changes without a data commit.
+fn no_store(answer: ApiResult) -> ApiResult {
+    let mut response = answer.into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
 }
 
 /// `POST /$/ontology/{ds}/check`: one report per profile in `profiles` (`dl` when

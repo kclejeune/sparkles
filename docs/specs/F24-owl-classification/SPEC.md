@@ -986,10 +986,53 @@ The bounded named-class read phase of items 588 and 622, and the availability ro
 of item 726, publish an immutable completed result beside the incremental saturation.
 `GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
 return availability, producer/source identity, consistency and bounded direct-parent,
-equivalence, source/warning and exclusion pages without classifying on a miss. General
-entity accessors, inferred axiom listings, property/individual entailments and matching
-justifications remain in items 588, 622, 609 and F24's remaining phases. This phase adds
-no implicit classification, materialization or explanation source.
+equivalence, source/warning and exclusion pages without classifying on a miss. This phase
+adds no implicit classification, materialization or explanation source.
+
+Item 588 answers the general entity accessors and inferred axiom listings from the same
+kept result. The `entity` read, `GET /$/ontology/{ds}/entity` and
+`Ontologies::kept_entity` take `classification=kept`, which adds a `classification`
+member beside the asserted accessors with the kept read's status, reason, result and
+outcome, the class's status, and the first page of its direct parents, direct children
+and named equivalents. The pages are null unless the class is present in an available
+result. The `axioms` read, `GET /$/ontology/{ds}/axioms` and `Ontologies::kept_axioms`
+take the same selector and list the axioms that the kept taxonomy infers. Each group of
+several equivalent classes gives an `EquivalentClasses` axiom and each direct parent group
+a `SubClassOf` axiom from the group's first class to the parent's first class, in the
+order of `Taxonomy::axioms`, which `format=ofn` writes for a classification. A listing
+walks the retained taxonomy without copying it and builds only its page's rows. It charges
+their estimated bytes to the request's memory limit and the server pool's grant before it
+builds each one, and holds the charge while the answer lives. `about` keeps the axioms that
+mention a class, so a class that is not the first of its group appears only in its group's
+equivalence. A miss classifies, maps and warms nothing and answers its status with null
+axioms, totals and pages, and a restricted view or synthetic snapshot reports
+`unsupportedScope` without observing the shared slot. The selector refuses `inferences`,
+the listing also refuses `assertions` and `format=ofn`, kept pages take limits from 1 to
+1,000, and a continuation is pinned by `resultId` and `at=commit:N`. HTTP answers with the
+selector are `Cache-Control: no-store`. The reads cover named classes. Property and
+individual entailments stay with items 609 and 622, and justifications with F24's
+remaining phases.
+
+`Ontologies::at_snapshot` pins a handle to a snapshot that a read transaction or a
+historical view holds. Every read of the handle answers at that snapshot without
+resolving history again, so a pinned memory snapshot keeps answering after its commit
+has left the history. The pinned snapshot counts as the commit that a kept continuation
+or a materialized read names. A request whose `at` names another state is refused, and
+so are edits, entity removals and classifications that write. The FFI's
+`FfiReadTxn::ontology_call` answers the kept, materialized and frame-projection reads of
+`wire::PINNED_OPERATIONS` through such a handle. The JVM's `keptClassification`,
+`keptAxioms`, `keptEntity`, frame projection and materialized hierarchy, individual and
+term reads answer a pinned `DatasetGraphSparkles` and an active read transaction at their
+own commit, and the live dataset outside a transaction at the head or at
+`OntologyRead.at`. A write transaction is refused before anything is flushed, since kept
+and materialized state describe commits and not pending writes. Library tests in
+`kept/tests.rs` cover misses that admit and map nothing, the pages and their bound, the
+listing's order, filters and continuations against `Taxonomy::axioms`, the memory refusal,
+restricted scopes, mismatches and a pinned snapshot after its commit was pruned. Route
+tests cover both selectors, their refusals and `no-store`, and the JVM's `OntologyTest`
+covers pinned views and read transactions after a later commit and the refusal in a write
+transaction without a flush. The Python and Node.js bindings do not take the selector
+and are item 1319.
 
 ### The OWL 2 EL classifier
 
@@ -1262,8 +1305,9 @@ and bottom groups remain explicit. Entity status identifies a selected equivalen
 representative without changing its asserted edit target. The same revision, publication,
 source and access checks apply to hierarchy continuation and frame clauses. Materialized
 property/individual views use a separate recorded-profile source and never advertise the
-class-only publication as their producer. General classifier-backed entity/axiom reads
-and matching arbitrary-axiom justifications remain open under items 588 and 622.
+class-only publication as their producer. Item 588's entity and axiom reads use the same
+revision, publication, source and access checks. Matching arbitrary-axiom justifications
+remain open under item 622 and F24's remaining phases.
 
 An optional explicit `projection=frame` on classify branches before legacy whole-node
 and ancestor arrays. It preserves useful direct-parent/equivalent clauses even for an
@@ -1415,7 +1459,7 @@ taxonomy.
 individuals and datatypes was item 587, with item 605. The literals and datatypes the
 classifier cannot compare and chains through the top property are item 663, and
 incremental runs that follow merges, keys and worlds were item 664. Reads that
-answer from the classification are item 588. DL queries answer from the kept classifier
+answer from the kept classification were item 588. DL queries answer from the kept classifier
 through `Classifier::saturate` and `Classifier::describe`, as
 [U12's DL Query outcome](../U12-ontology-workbench/SPEC.md#dl-query) describes.
 Durable and automatic classification is item

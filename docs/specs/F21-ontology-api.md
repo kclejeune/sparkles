@@ -617,7 +617,8 @@ and stream bounded lexical pages for classes and object/data properties. Named i
 types include the materialized indirect types, with the existing mapper and admission
 limits. Term statements and axioms retain inferred-graph provenance. These reads do not
 turn F18 fact witnesses into arbitrary-axiom explanations or answer from the class-only
-kept classifier. General classifier-backed entity/axiom reads remain under item 588.
+kept classifier. The kept classifier's named-class entity and axiom reads are item 588's
+`classification=kept` selector, described in F24's Outcome.
 The exact selectors, source metadata and refusal behavior are documented in the
 [ontology API reference](../API.md#ontology).
 

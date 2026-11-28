@@ -1924,3 +1924,445 @@ fn el_only_and_full_classifications_are_keyed_separately_and_never_clobber() {
         );
     }
 }
+
+// ---------------------------------------------------- item 588: kept reads ------
+
+const TAXONOMY: &str = ":A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class . \
+     :E a owl:Class . :B rdfs:subClassOf :A . :C rdfs:subClassOf :A . :D rdfs:subClassOf :B . \
+     :E owl:equivalentClass :D . :N a owl:Class ; rdfs:subClassOf :A , \
+     [ a owl:Class ; owl:complementOf :A ] .";
+const EX: &str = "http://ex.org/";
+fn iri(local: &str) -> String {
+    format!("{EX}{local}")
+}
+fn iris(page: &Option<Page>) -> Vec<String> {
+    page.as_ref()
+        .expect("page")
+        .items
+        .iter()
+        .map(|i| i["iri"].as_str().unwrap().to_string())
+        .collect()
+}
+fn kept_axioms_all(ds: &Dataset, q: &KeptAxiomQuery) -> Vec<sparkles_owl::Axiom> {
+    ds.ontology()
+        .kept_axioms(&req(), q, &opts())
+        .unwrap()
+        .axioms
+        .expect("available")
+}
+
+#[test]
+fn kept_entity_and_axiom_misses_do_not_map_initialize_or_admit() {
+    let ds = ds(TAXONOMY);
+    REFUSE_ADMISSION.with(|f| f.set(true));
+    let e = ds
+        .ontology()
+        .kept_entity(&req(), &KeptEntityQuery::new(iri("B")), &opts())
+        .unwrap();
+    assert_eq!(e.read.status, Status::Unavailable);
+    assert_eq!(e.read.reason, Some("notKept"));
+    assert!(e.read.entity.is_none() && e.parents.is_none() && e.children.is_none());
+    let a = ds
+        .ontology()
+        .kept_axioms(&req(), &KeptAxiomQuery::default(), &opts())
+        .unwrap();
+    assert_eq!(a.read.status, Status::Unavailable);
+    assert!(a.axioms.is_none() && a.total.is_none());
+    let w = super::super::wire::call(&ds, "axioms", &json!({"classification":"kept"}), &opts())
+        .unwrap();
+    assert!(w["axioms"].is_null() && w["total"].is_null(), "{w}");
+    assert_eq!(w["source"], "keptClassification");
+    assert!(REFUSE_ADMISSION.with(|f| f.replace(false)));
+    empty_slot(&ds);
+    assert!(ds.state().ontology_cache.lock().is_empty());
+}
+
+#[test]
+fn kept_entity_reads_direct_relations_equivalents_and_unsatisfiability() {
+    let ds = ds(TAXONOMY);
+    let p = classify(&ds);
+    let e = ds
+        .ontology()
+        .kept_entity(&req(), &KeptEntityQuery::new(iri("B")), &opts())
+        .unwrap();
+    assert_eq!(e.read.status, Status::Available);
+    assert_eq!(e.read.result.as_ref().unwrap().result_id, p.id);
+    assert!(e.read.outcome.is_some());
+    assert_eq!(iris(&e.parents), [iri("A")]);
+    // D and E are one group, which D represents
+    assert_eq!(iris(&e.children), [iri("D")]);
+    assert_eq!(e.children.as_ref().unwrap().items[0]["equivalenceCount"], 2);
+    assert!(iris(&e.equivalents).is_empty());
+    let d = ds
+        .ontology()
+        .kept_entity(&req(), &KeptEntityQuery::new(iri("E")), &opts())
+        .unwrap();
+    assert_eq!(iris(&d.equivalents), [iri("D")]);
+    assert_eq!(iris(&d.parents), [iri("B")]);
+    let entity = d.read.entity.unwrap();
+    assert_eq!(entity.representative.as_deref(), Some(iri("D").as_str()));
+    assert_eq!(entity.unsatisfiable, Some(false));
+    let n = ds
+        .ontology()
+        .kept_entity(&req(), &KeptEntityQuery::new(iri("N")), &opts())
+        .unwrap();
+    assert_eq!(n.read.entity.as_ref().unwrap().unsatisfiable, Some(true));
+    assert!(iris(&n.equivalents).contains(&sparkles_owl::vocab::OWL_NOTHING.to_string()));
+    let missing = ds
+        .ontology()
+        .kept_entity(&req(), &KeptEntityQuery::new(iri("Missing")), &opts())
+        .unwrap();
+    assert_eq!(missing.read.status, Status::Available);
+    assert!(!missing.read.entity.as_ref().unwrap().present);
+    assert!(
+        missing.parents.is_none(),
+        "an absent class is not an empty inference"
+    );
+    // the page bound caps each relation and reports the continuation
+    let mut q = KeptEntityQuery::new(iri("A"));
+    q.limit = 1;
+    let a = ds.ontology().kept_entity(&req(), &q, &opts()).unwrap();
+    let children = a.children.unwrap();
+    // B and C, since the unsatisfiable N sits in the bottom group
+    assert_eq!((children.items.len(), children.total), (1, 2));
+    assert_eq!(children.next_offset, Some(1));
+    q.limit = 1001;
+    assert!(ds.ontology().kept_entity(&req(), &q, &opts()).is_err());
+}
+
+#[test]
+fn kept_axioms_page_the_taxonomy_axioms_in_order_with_exact_filters() {
+    let ds = ds(TAXONOMY);
+    let p = classify(&ds);
+    let expected = p.classification.taxonomy.axioms();
+    let all = kept_axioms_all(
+        &ds,
+        &KeptAxiomQuery {
+            limit: 1000,
+            ..Default::default()
+        },
+    );
+    assert_eq!(all, expected);
+    // pages, continued with the pin, concatenate to the whole listing
+    let commit = p.source.commit;
+    let pin = OntologyRequest {
+        at: Some(At::Commit(commit)),
+        ..req()
+    };
+    let mut paged = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = ds.ontology().kept_axioms(
+            &pin,
+            &KeptAxiomQuery {
+                offset,
+                limit: 2,
+                result_id: (offset != 0).then_some(p.id),
+                ..Default::default()
+            },
+            &opts(),
+        );
+        let page = match page {
+            Ok(page) => page,
+            // a memory dataset keeps only its head, which is the classified commit here
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(page.total, Some(expected.len()));
+        paged.extend(page.axioms.unwrap());
+        match page.next_offset {
+            Some(n) => offset = n,
+            None => break,
+        }
+    }
+    assert_eq!(paged, expected);
+    // `about` keeps exactly the axioms that mention it, in the same order
+    for local in ["A", "B", "D", "E", "N", "Missing"] {
+        let about = iri(local);
+        let got = kept_axioms_all(
+            &ds,
+            &KeptAxiomQuery {
+                about: Some(about.clone()),
+                limit: 1000,
+                ..Default::default()
+            },
+        );
+        let want: Vec<_> = expected
+            .iter()
+            .filter(|a| a.mentions(&about))
+            .cloned()
+            .collect();
+        assert_eq!(got, want, "{local}");
+    }
+    // E is not its group's representative, so only the group's equivalence names it
+    let e = kept_axioms_all(
+        &ds,
+        &KeptAxiomQuery {
+            about: Some(iri("E")),
+            ..Default::default()
+        },
+    );
+    assert_eq!(e.len(), 1);
+    assert_eq!(
+        e[0].axiom_type(),
+        sparkles_owl::AxiomType::EquivalentClasses
+    );
+    let types = Some([sparkles_owl::AxiomType::SubClassOf].into_iter().collect());
+    let sub = kept_axioms_all(
+        &ds,
+        &KeptAxiomQuery {
+            types,
+            limit: 1000,
+            ..Default::default()
+        },
+    );
+    assert!(!sub.is_empty());
+    assert!(
+        sub.iter()
+            .all(|a| a.axiom_type() == sparkles_owl::AxiomType::SubClassOf)
+    );
+    // a continuation needs the exact pin, and inferences are refused
+    for (r, q) in [
+        (
+            req(),
+            KeptAxiomQuery {
+                offset: 1,
+                result_id: Some(p.id),
+                ..Default::default()
+            },
+        ),
+        (
+            pin.clone(),
+            KeptAxiomQuery {
+                offset: 1,
+                ..Default::default()
+            },
+        ),
+        (
+            OntologyRequest {
+                inferences: true,
+                ..req()
+            },
+            KeptAxiomQuery::default(),
+        ),
+        (
+            req(),
+            KeptAxiomQuery {
+                limit: 1001,
+                ..Default::default()
+            },
+        ),
+    ] {
+        assert!(ds.ontology().kept_axioms(&r, &q, &opts()).is_err());
+    }
+}
+
+#[test]
+fn kept_axioms_charge_the_memory_budget_before_building_rows() {
+    let ds = ds(TAXONOMY);
+    classify(&ds);
+    let tight = QueryOptions {
+        max_memory_bytes: Some(64),
+        ..opts()
+    };
+    match ds
+        .ontology()
+        .kept_axioms(&req(), &KeptAxiomQuery::default(), &tight)
+    {
+        Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, crate::BudgetKind::Memory),
+        other => panic!("expected a memory refusal, got {other:?}"),
+    }
+    // a refused page leaves the kept result as it was
+    assert!(result(&ds).is_some());
+    let roomy = QueryOptions {
+        max_memory_bytes: Some(1 << 20),
+        ..opts()
+    };
+    assert!(
+        ds.ontology()
+            .kept_axioms(&req(), &KeptAxiomQuery::default(), &roomy)
+            .unwrap()
+            .axioms
+            .is_some()
+    );
+}
+
+#[test]
+fn kept_reads_keep_their_scope_and_report_mismatch_without_switching() {
+    let ds = ds(TAXONOMY);
+    let p = classify(&ds);
+    // a restricted view never observes the shared slot
+    let restricted = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new(["default"], &[])),
+            Graphs::All,
+        ))),
+        ..opts()
+    };
+    let a = ds
+        .ontology()
+        .kept_axioms(&req(), &KeptAxiomQuery::default(), &restricted)
+        .unwrap();
+    assert_eq!(a.read.reason, Some("unsupportedScope"));
+    assert!(a.axioms.is_none());
+    // a later commit reports the stale result and never reads it as current
+    ds.update(&format!("{BASE} INSERT DATA {{ :F a owl:Class }}"))
+        .unwrap();
+    let e = ds
+        .ontology()
+        .kept_entity(&req(), &KeptEntityQuery::new(iri("B")), &opts())
+        .unwrap();
+    assert_eq!(e.read.status, Status::Mismatch);
+    assert_eq!(e.read.stale_commit, Some(p.source.commit));
+    assert!(e.parents.is_none());
+    let mut q = KeptEntityQuery::new(iri("B"));
+    q.result_id = Some(Uuid::new_v4());
+    classify(&ds);
+    let e = ds.ontology().kept_entity(&req(), &q, &opts()).unwrap();
+    assert_eq!(e.read.reason, Some("resultChanged"));
+}
+
+#[test]
+fn a_pinned_snapshot_reads_its_own_commit_after_memory_history_is_gone() {
+    let ds = ds(TAXONOMY);
+    let p = classify(&ds);
+    let snap = ds.store().snapshot();
+    assert_eq!(snap.commit, p.source.commit);
+    ds.update(&format!(
+        "{BASE} INSERT DATA {{ :F a owl:Class ; rdfs:subClassOf :B }}"
+    ))
+    .unwrap();
+    // the live handle cannot name the pruned commit, and its head is newer
+    let old = OntologyRequest {
+        at: Some(At::Commit(p.source.commit)),
+        ..req()
+    };
+    assert!(matches!(
+        ds.ontology()
+            .kept_classification(&old, &KeptQuery::default(), &opts()),
+        Err(Error::HistoryGone(_))
+    ));
+    let pinned = ds.ontology().at_snapshot(snap.clone());
+    let r = pinned
+        .kept_classification(&req(), &KeptQuery::default(), &opts())
+        .unwrap();
+    assert_eq!(r.status, Status::Available);
+    assert_eq!(r.commit, p.source.commit);
+    // the pin's own commit is accepted, and a continuation needs only the result
+    let q = KeptQuery {
+        part: Part::Children,
+        about: Some(iri("A")),
+        offset: 1,
+        limit: 1,
+        result_id: Some(p.id),
+        ..Default::default()
+    };
+    let page = pinned.kept_classification(&old, &q, &opts()).unwrap();
+    assert_eq!(page.page.unwrap().total, 2);
+    assert!(pinned.kept_classification(&req(), &q, &opts()).is_ok());
+    let e = pinned
+        .kept_entity(&req(), &KeptEntityQuery::new(iri("B")), &opts())
+        .unwrap();
+    assert_eq!(
+        iris(&e.children),
+        [iri("D")],
+        "F is a child only at the head"
+    );
+    let a = pinned
+        .kept_axioms(
+            &req(),
+            &KeptAxiomQuery {
+                limit: 1000,
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    assert_eq!(a.axioms.unwrap(), p.classification.taxonomy.axioms());
+    // another state, an edit and a writing classification are refused
+    let other = OntologyRequest {
+        at: Some(At::Commit(p.source.commit + 1)),
+        ..req()
+    };
+    assert!(
+        pinned
+            .kept_classification(&other, &KeptQuery::default(), &opts())
+            .is_err()
+    );
+    assert!(
+        pinned
+            .edit(&req(), &super::super::EditRequest::default(), &opts())
+            .is_err()
+    );
+    assert!(pinned.remove_entity(&req(), &iri("A"), &opts()).is_err());
+    let write = ClassifyRequest {
+        target: Some(sparkles_reasoner::inputs::GraphRef::Named(
+            "http://ex.org/out".into(),
+        )),
+        ..Default::default()
+    };
+    assert!(pinned.classify(&req(), &write, &opts()).is_err());
+    let head = ds.store().snapshot().commit;
+    assert_ne!(head, snap.commit);
+    // the pinned wire answers its reads and refuses the others
+    let w = super::super::wire::call_at(
+        &ds,
+        snap.clone(),
+        "entity",
+        &json!({"iri": iri("B"), "classification": "kept"}),
+        &opts(),
+    )
+    .unwrap();
+    assert_eq!(w["classification"]["status"], "available", "{w}");
+    assert_eq!(w["classification"]["commit"], snap.commit);
+    assert!(super::super::wire::call_at(&ds, snap, "summary", &json!({}), &opts()).is_err());
+}
+
+#[test]
+fn wire_kept_selectors_refuse_ambiguous_combinations() {
+    let ds = ds(TAXONOMY);
+    for (op, args) in [
+        ("axioms", json!({"elOnly": true})),
+        ("axioms", json!({"resultId": Uuid::new_v4().to_string()})),
+        ("axioms", json!({"classification": "materialized"})),
+        (
+            "axioms",
+            json!({"classification": "kept", "inferences": true}),
+        ),
+        (
+            "axioms",
+            json!({"classification": "kept", "assertions": true}),
+        ),
+        ("axioms", json!({"classification": "kept", "limit": 1001})),
+        ("axioms", json!({"classification": "kept", "offset": 1})),
+        ("entity", json!({"iri": iri("A"), "elOnly": true})),
+        (
+            "entity",
+            json!({"iri": iri("A"), "classification": "kept", "inferences": true}),
+        ),
+        (
+            "entity",
+            json!({"iri": iri("A"), "classification": "kept", "limit": 1001}),
+        ),
+    ] {
+        assert!(
+            super::super::wire::call(&ds, op, &args, &opts()).is_err(),
+            "{op} {args}"
+        );
+    }
+    classify(&ds);
+    let e = super::super::wire::call(
+        &ds,
+        "entity",
+        &json!({"iri": iri("B"), "classification": "kept", "limit": 1}),
+        &opts(),
+    )
+    .unwrap();
+    let c = &e["classification"];
+    assert_eq!(c["status"], "available");
+    assert_eq!(c["source"], "keptClassification");
+    assert_eq!(c["covers"], json!(["namedClass"]));
+    assert_eq!(c["parents"]["items"][0]["iri"], iri("A"));
+    assert!(c.get("page").is_none());
+    // the asserted accessors are unchanged beside it
+    assert!(e["class"]["superClasses"].is_array());
+}

@@ -85,7 +85,8 @@ impl Ontologies {
         source_id: Option<&str>,
         continuation: bool,
     ) -> Result<()> {
-        if !matches!(req.at.as_ref(), Some(At::Commit(_))) {
+        // a pinned snapshot names its commit as `at=commit:N` does
+        if self.pinned.is_none() && !matches!(req.at.as_ref(), Some(At::Commit(_))) {
             return Err(Error::invalid(
                 "an inferred browser read requires at=commit:N",
             ));

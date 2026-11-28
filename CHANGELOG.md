@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Entity and axiom reads from the kept classification (item 588)
+
+`GET /$/ontology/{ds}/entity` and `GET /$/ontology/{ds}/axioms`, the `entity` and `axioms`
+operations of every binding's generic ontology call, and the new `Ontologies::kept_entity`
+and `Ontologies::kept_axioms` take `classification=kept`. The entity report gains a
+`classification` member with the kept read's status, result and outcome and the first
+pages of the class's direct parents, children and equivalents. The axiom listing pages
+the `SubClassOf` and `EquivalentClasses` axioms that the kept taxonomy infers, in the order
+of a classification's `format=ofn`, walking the retained taxonomy and charging each page's
+rows to the memory budget. A miss classifies nothing and answers null pages, and the
+answers are `Cache-Control: no-store`.
+
+`Ontologies::at_snapshot` and `FfiReadTxn::ontology_call` answer reads at a snapshot that a
+read transaction or a historical view holds. On the JVM, `keptClassification`, the new
+`keptAxioms` and `keptEntity`, the frame projection and the materialized hierarchy,
+individual and term reads now answer a dataset returned by `at()` and an active read
+transaction at their own commit, where they threw `JenaTransactionException` before. They
+still throw it in a write transaction, before anything is flushed. Python and Node.js
+selectors are roadmap item 1319.
+
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 
 Term and value decoding in SPARQL UPDATE, ARQ property functions, registered property and aggregate extensions, custom aggregates, hybrid search, history service, path search, vector top-k, remote SERVICE and LATERAL enhancers, GeoSPARQL planner rewrites and aggregates, planner range and lexical probes and RDFS schema and explanation decoding now uses checked decode helpers that enforce live cancellation, deadline and memory controls while keeping decoded-output credit alive across multi-term operations. Plan and error diagnostic rendering decodes terms through `plan_term` so describing a plan never latches a decode refusal, and RDFS explanation keeps its answer memory limit separate from its decode workspace accounting. This lands the first wave of roadmap item 1308.

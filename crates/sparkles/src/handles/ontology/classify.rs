@@ -375,6 +375,9 @@ impl Ontologies {
                 "a classification that writes reads the head: leave out 'at'",
             ));
         }
+        if c.target.is_some() {
+            self.check_unpinned("a classification that writes")?;
+        }
         let (snap, mut opts) = self.state(req, opts)?;
         let caller_graphs = opts.graphs.clone();
         // Decide data-dependent graph guards once on the ORIGINAL snapshot.

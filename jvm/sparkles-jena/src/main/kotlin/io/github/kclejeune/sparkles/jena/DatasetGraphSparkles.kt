@@ -493,6 +493,23 @@ public class DatasetGraphSparkles internal constructor(
     }
 
     internal fun isPinned(): Boolean = pinned != null
+
+    /**
+     * The committed snapshot that a read of `what` answers at on this thread: a pinned
+     * view's, a read transaction's, or `null` for the live dataset outside a transaction.
+     * A write transaction is refused before anything is flushed, since kept and
+     * materialized state describe commits and never the transaction's pending writes.
+     */
+    internal fun committedRead(what: String): FfiReadTxn? {
+        checkOpen()
+        handle.checkNoSink()
+        pinned?.let { return it }
+        val t = txn() ?: return null
+        if (t.mode == ReadWrite.WRITE || t.write != null) {
+            throw JenaTransactionException("$what reads committed state: run it in a read transaction, on a pinned view or outside a transaction")
+        }
+        return t.read ?: throw JenaTransactionException("the transaction has ended")
+    }
     /**
      * The overview of what this thread reads: its transaction, the pinned commit, or the head
      * at the request's own point. Only a read of the head can name a point in history.

@@ -866,9 +866,27 @@ pub const OPERATIONS: [&str; 16] = [
 fn members(op: &str) -> &'static [&'static str] {
     match op {
         "summary" => &["metrics", "view"],
-        "axioms" => &["type", "about", "assertions", "limit", "offset"],
+        "axioms" => &[
+            "type",
+            "about",
+            "assertions",
+            "limit",
+            "offset",
+            "classification",
+            "elOnly",
+            "resultId",
+        ],
         "entities" => &["kind", "limit", "offset"],
-        "entity" => &["iri", "kind", "assertions", "limit"],
+        "entity" => &[
+            "iri",
+            "kind",
+            "assertions",
+            "limit",
+            "classification",
+            "elOnly",
+            "resultId",
+            "lang",
+        ],
         "check" => &["profiles", "assertions", "maxViolations"],
         "edit" => &["add", "remove", "declare", "target", "message"],
         "removeEntity" => &["iri", "message"],
@@ -1115,6 +1133,44 @@ fn profiles_of(a: &Map<String, J>) -> Result<Vec<Profile>> {
 ///   form), `reasoning` (`auto`, `el` or `rl`), `answers` (a list of
 ///   [`DlAnswers::NAMES`]), `limit`, `threads` and `maxDerived`.
 pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> {
+    call_on(&ds.ontology(), op, args, opts)
+}
+
+/// The operations [`call_at`] answers at a pinned snapshot: the reads of the kept
+/// classification, of a materialization and of a frame projection, which a read
+/// transaction or a historical view on a binding answers at its own commit.
+pub const PINNED_OPERATIONS: [&str; 7] = [
+    "keptClassification",
+    "axioms",
+    "entity",
+    "classify",
+    "hierarchy",
+    "individuals",
+    "term",
+];
+
+/// As [`call`], with every read at `snap`, a snapshot of `ds` that a read transaction or
+/// a historical view holds ([`super::Ontologies::at_snapshot`]). Only the operations of
+/// [`PINNED_OPERATIONS`] are answered, and a classification that names a target is
+/// refused, since a pinned read writes nothing.
+pub fn call_at(
+    ds: &Dataset,
+    snap: std::sync::Arc<crate::store::Snapshot>,
+    op: &str,
+    args: &J,
+    opts: &QueryOptions,
+) -> Result<J> {
+    if !PINNED_OPERATIONS.contains(&op) {
+        return Err(bad(format!(
+            "ontology.{op} reads the live dataset outside a transaction; a pinned read answers {}",
+            PINNED_OPERATIONS.join(", ")
+        )));
+    }
+    call_on(&ds.ontology().at_snapshot(snap), op, args, opts)
+}
+
+fn call_on(handle: &super::Ontologies, op: &str, args: &J, opts: &QueryOptions) -> Result<J> {
+    let ds = &handle.ds;
     let empty = Map::new();
     let a = match args {
         J::Null => &empty,
@@ -1141,7 +1197,6 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
     }
     let req = request_of(a)?;
     let name = ds.name().unwrap_or("");
-    let handle = ds.ontology();
     if op == "keptClassification" {
         let query = kept_query_of(a)?;
         let answer = handle.kept_classification(&req, &query, opts)?;
@@ -1166,6 +1221,11 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 j["metrics"] = super::metrics::body(name, &o, &req, &r, &opts)?;
             }
             Ok(j)
+        }
+        "axioms" if kept_selected(a)? => {
+            let q = kept_axiom_query_of(a)?;
+            let answer = handle.kept_axioms(&req, &q, opts)?;
+            kept_axioms_body(name, &answer, &r)
         }
         "axioms" => {
             let q = AxiomQuery {
@@ -1218,9 +1278,18 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 assertions: boolean(a, "assertions")?.unwrap_or(false),
                 limit: number(a, "limit", 1, MAX_LIMIT)?.unwrap_or(DEFAULT_LIMIT),
             };
+            let kept = kept_entity_query_of(a, &q)?;
+            if let Some(k) = &kept {
+                k.validate(&req)?;
+            }
             let opts = handle.anchored(opts)?;
             let o = handle.open(&req, &opts)?;
-            entity_body(name, &o, &req, &r, &q, &opts)
+            let mut j = entity_body(name, &o, &req, &r, &q, &opts)?;
+            if let Some(k) = &kept {
+                j["classification"] =
+                    kept_entity_json(&handle.kept_entity_at_opened(&req, &o, k, &opts)?)?;
+            }
+            Ok(j)
         }
         "check" => {
             let check = CheckRequest {
@@ -1332,7 +1401,7 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
             let (q, limit) = dl_query_of(a)?;
             let opts = handle.anchored(opts)?;
             let o = handle.open(&req, &opts)?;
-            let q = dl_expression(&handle, &o, a, q, &prefixes, &opts)?;
+            let q = dl_expression(handle, &o, a, q, &prefixes, &opts)?;
             let out = handle.dl_query_opened(o, &req, &q, &opts)?;
             Ok(dl_query_body(
                 name,
@@ -2176,6 +2245,116 @@ impl ClassifyQuery {
     }
 }
 
+/// Whether the arguments of an `axioms` or `entity` read select the kept
+/// classification (`classification: "kept"`), which is the only value. `elOnly` and
+/// `resultId` select a kept result and need it.
+pub fn kept_selected(a: &Map<String, J>) -> Result<bool> {
+    match string(a, "classification")? {
+        None => {
+            if let Some(k) = ["elOnly", "resultId"].iter().find(|k| a.contains_key(**k)) {
+                return Err(bad(format!("{k} needs classification=kept")));
+            }
+            Ok(false)
+        }
+        Some("kept") => {
+            if a.get("inferences").is_some_and(|v| v != &J::Bool(false)) {
+                return Err(bad(
+                    "classification=kept reads the kept classification of the asserted axioms: leave out 'inferences'",
+                ));
+            }
+            Ok(true)
+        }
+        Some(v) => Err(bad(format!("classification must be kept, not '{v}'"))),
+    }
+}
+fn result_id_of(a: &Map<String, J>) -> Result<Option<uuid::Uuid>> {
+    string(a, "resultId")?
+        .map(|s| {
+            let id =
+                uuid::Uuid::parse_str(s).map_err(|_| bad("resultId must be a canonical UUID"))?;
+            if id.to_string() != s {
+                return Err(bad("resultId must be a canonical UUID"));
+            }
+            Ok(id)
+        })
+        .transpose()
+}
+/// The kept-classification listing of an `axioms` read with `classification: "kept"`.
+pub fn kept_axiom_query_of(a: &Map<String, J>) -> Result<super::kept::KeptAxiomQuery> {
+    if boolean(a, "assertions")?.unwrap_or(false) {
+        return Err(bad(
+            "classification=kept lists inferred class axioms: leave out 'assertions'",
+        ));
+    }
+    Ok(super::kept::KeptAxiomQuery {
+        types: string(a, "type")?.map(parse_axiom_types).transpose()?,
+        about: iri_arg(a, "about")?,
+        offset: number(a, "offset", 0, usize::MAX)?.unwrap_or(0),
+        limit: number(a, "limit", 1, 1000)?.unwrap_or(DEFAULT_LIMIT),
+        result_id: result_id_of(a)?,
+        el_only: boolean(a, "elOnly")?.unwrap_or(false),
+    })
+}
+/// The kept-classification read of an `entity` read with `classification: "kept"`.
+pub fn kept_entity_query_of(
+    a: &Map<String, J>,
+    q: &EntityQuery,
+) -> Result<Option<super::kept::KeptEntityQuery>> {
+    if !kept_selected(a)? {
+        return Ok(None);
+    }
+    if q.limit > 1000 {
+        return Err(bad("classification=kept takes a limit from 1 to 1000"));
+    }
+    Ok(Some(super::kept::KeptEntityQuery {
+        iri: q.iri.clone(),
+        limit: q.limit,
+        result_id: result_id_of(a)?,
+        languages: languages_of(a)?,
+        el_only: boolean(a, "elOnly")?.unwrap_or(false),
+    }))
+}
+/// The `classification` member of an entity read: the selection's status, result and
+/// outcome, the class's status, and the first page of its direct parents, direct
+/// children and equivalent named classes, which are null unless the class is present
+/// in an available result.
+pub fn kept_entity_json(e: &super::kept::KeptEntityRead) -> Result<J> {
+    let mut v =
+        serde_json::to_value(&e.read).map_err(|e| bad(format!("kept classification: {e}")))?;
+    if let J::Object(m) = &mut v {
+        m.remove("page");
+    }
+    v["source"] = json!("keptClassification");
+    v["covers"] = json!(["namedClass"]);
+    let page = |p: &Option<super::kept::Page>| -> Result<J> {
+        serde_json::to_value(p).map_err(|e| bad(format!("kept classification: {e}")))
+    };
+    v["parents"] = page(&e.parents)?;
+    v["children"] = page(&e.children)?;
+    v["equivalents"] = page(&e.equivalents)?;
+    Ok(v)
+}
+/// The JSON of a kept-classification axiom listing. `axioms` and `total` are null
+/// unless the status is available.
+pub fn kept_axioms_body(name: &str, k: &super::kept::KeptAxioms, r: &Renderer) -> Result<J> {
+    let mut v =
+        serde_json::to_value(&k.read).map_err(|e| bad(format!("kept classification: {e}")))?;
+    if let J::Object(m) = &mut v {
+        m.remove("page");
+        m.remove("entity");
+    }
+    v["dataset"] = json!(name);
+    v["source"] = json!("keptClassification");
+    v["axioms"] = match &k.axioms {
+        Some(list) => J::Array(list.iter().map(|ax| axiom_json(ax, None, r)).collect()),
+        None => J::Null,
+    };
+    v["total"] = json!(k.total);
+    v["offset"] = json!(k.offset);
+    v["limit"] = json!(k.limit);
+    v["next"] = json!(k.next_offset);
+    Ok(v)
+}
 pub fn kept_query_of(a: &Map<String, J>) -> Result<super::kept::KeptQuery> {
     use super::kept::{KeptQuery, Part};
     if a.contains_key("inferences") {
@@ -2195,16 +2374,7 @@ pub fn kept_query_of(a: &Map<String, J>) -> Result<super::kept::KeptQuery> {
             ));
         }
     };
-    let result_id = string(a, "resultId")?
-        .map(|s| {
-            let id =
-                uuid::Uuid::parse_str(s).map_err(|_| bad("resultId must be a canonical UUID"))?;
-            if id.to_string() != s {
-                return Err(bad("resultId must be a canonical UUID"));
-            }
-            Ok(id)
-        })
-        .transpose()?;
+    let result_id = result_id_of(a)?;
     Ok(KeptQuery {
         part,
         about: iri_arg(a, "about")?,
