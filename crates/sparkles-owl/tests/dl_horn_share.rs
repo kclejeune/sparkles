@@ -664,7 +664,7 @@ fn a_bottom_minimum_past_the_tier_d_bound_does_not_refuse() {
 }
 
 /// A maximum of 64 with an empty filler inside the filler of a minimum of two in the head
-/// is in a positive position, where the rooted rules with counting take it, and so are the
+/// is in a positive position, where the rooted rules with counting take it, and so do the
 /// Horn rules. The axiom refuses, and the rooted run answers as the default run does.
 #[test]
 fn a_bottom_maximum_inside_a_minimum_refuses() {

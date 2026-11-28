@@ -40,8 +40,9 @@ const ROLE_DEPTH: usize = 64;
 /// How many role inclusions the search for a chain below one role reads at most before it
 /// calls the role not simple.
 const ROLE_WORK: usize = 1 << 22;
-/// How many comparisons the test of two disjuncts for one normalized expression makes at
-/// most before it calls them distinct.
+/// How many steps the test of two disjuncts for one normalized expression takes at most
+/// before it calls them distinct, counting each comparison and each operand of an
+/// intersection or a union whose shape it builds.
 const SAME_WORK: usize = 4096;
 
 /// The role box that the Horn rules would build for the check.
@@ -894,7 +895,8 @@ impl<'a> Scan<'a> {
     /// operand, as both do. An existential restriction, a minimum of one and a value
     /// restriction are one shape, and a maximum of one in a positive position another.
     /// The construction charges the operands of an intersection or a union before it
-    /// reads them, and answers `None` past [`SAME_WORK`] or once `stop` came.
+    /// reads them, polls as it reads each one, and answers `None` past [`SAME_WORK`] or
+    /// once `stop` came.
     fn shape<'c>(
         &mut self,
         c: &'c ClassExpression,
@@ -915,22 +917,43 @@ impl<'a> Scan<'a> {
                 V::Other => Shape::Class(k),
             },
             C::ObjectIntersectionOf(cs) => {
-                let mut rest = cs.iter().filter(|c| class_of(c) != Some(V::Top));
-                match (rest.next(), rest.next()) {
+                let (mut first, mut kept, mut bottom) = (None, 0usize, false);
+                for c in cs {
+                    if !self.tick() {
+                        return None;
+                    }
+                    match class_of(c) {
+                        Some(V::Top) => continue,
+                        Some(V::Bottom) => bottom = true,
+                        _ => {}
+                    }
+                    first = first.or(Some(c));
+                    kept += 1;
+                }
+                match (first, kept) {
                     (None, _) => Shape::Top,
-                    (Some(c), None) => self.shape(c, pos, work)?,
-                    _ if cs.iter().any(|c| class_of(c) == Some(V::Bottom)) => Shape::Bottom,
+                    (Some(c), 1) => self.shape(c, pos, work)?,
+                    _ if bottom => Shape::Bottom,
                     _ => Shape::Conj(cs),
                 }
             }
             C::ObjectUnionOf(cs) => {
-                if cs.iter().any(|c| class_of(c) == Some(V::Top)) {
-                    return Some(Shape::Top);
+                let (mut first, mut kept) = (None, 0usize);
+                for c in cs {
+                    if !self.tick() {
+                        return None;
+                    }
+                    match class_of(c) {
+                        Some(V::Top) => return Some(Shape::Top),
+                        Some(V::Bottom) => continue,
+                        _ => {}
+                    }
+                    first = first.or(Some(c));
+                    kept += 1;
                 }
-                let mut rest = cs.iter().filter(|c| class_of(c) != Some(V::Bottom));
-                match (rest.next(), rest.next()) {
+                match (first, kept) {
                     (None, _) => Shape::Bottom,
-                    (Some(c), None) => self.shape(c, pos, work)?,
+                    (Some(c), 1) => self.shape(c, pos, work)?,
                     _ => Shape::Opaque,
                 }
             }
@@ -1835,6 +1858,41 @@ mod tests {
         assert_eq!(got, None);
         assert!(s.halted);
         assert_eq!(work, 1);
+    }
+
+    /// A shape within the work limit still polls as it reads its operands, so a stop that
+    /// comes during the scan of a wide intersection ends it.
+    #[test]
+    fn a_shape_polls_while_it_reads_its_operands() {
+        use std::cell::Cell;
+        use std::collections::BTreeSet;
+        let it = Interner::default();
+        let ops: BTreeSet<_> = (0..SAME_WORK - 1)
+            .map(|i| class(&format!("W{i}")))
+            .collect();
+        let wide_and = C::ObjectIntersectionOf(ops);
+        // without a stop, the shape fits the limit exactly and is the intersection
+        let never = || false;
+        let mut s = Scan::new(&[], None, &it, &never);
+        s.ticks = POLL_TICKS - 2;
+        let mut work = 0;
+        let got = s.shape(&wide_and, true, &mut work);
+        assert!(matches!(got, Some(Shape::Conj(_))));
+        assert_eq!(work, SAME_WORK);
+        // a stop due at the first operand ends the scan
+        let calls = Cell::new(0);
+        let stop = || {
+            calls.set(calls.get() + 1);
+            true
+        };
+        let mut s = Scan::new(&[], None, &it, &stop);
+        s.ticks = POLL_TICKS - 2;
+        let mut work = 0;
+        assert!(s.shape(&wide_and, true, &mut work).is_none());
+        assert!(s.halted);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(s.ticks, POLL_TICKS);
+        assert_eq!(work, SAME_WORK);
     }
 
     /// The ontology's EL axioms and interner, and its axioms outside OWL 2 EL with the

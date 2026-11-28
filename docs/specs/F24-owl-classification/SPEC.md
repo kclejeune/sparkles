@@ -476,8 +476,8 @@ the repeats of an interned expression from a disjunction, and the check compares
 disjuncts it can match without interning them, such as an existential restriction and a
 minimum of one with the same filler. Two disjuncts that it cannot match count as distinct,
 and so do two whose comparison reaches its limit of 4,096 steps. The comparison charges the
-operands of an intersection before it reads them, and it stops at that limit or at a
-cancellation without reading the remaining operands. A bounded search for a chain below a
+operands of an intersection or a union before it reads them, polls as it reads each one,
+and stops at that limit or at a cancellation without reading the remaining operands. A bounded search for a chain below a
 role settles its simplicity, reads an equivalence of properties as the ring of inclusions
 that the Horn rules build, and charges and polls every step. It follows that ring one
 inclusion at a time and visits at most 64 roles beyond the one it starts from, so it
