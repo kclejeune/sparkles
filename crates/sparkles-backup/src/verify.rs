@@ -3,11 +3,12 @@
 use crate::blob::HEADER_LEN;
 use crate::error::{Code, Result};
 use crate::layout;
+use crate::lock::LockGuard;
 use crate::{
     BackupError, BackupVerify, LockKind, LockOperation, Manifest, Orphans, Repository, VerifyLevel,
     VerifyOptions, VerifyReport, VerifyRequests, VerifyStatus, lock,
 };
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as Key;
 use serde_json::json;
@@ -78,7 +79,7 @@ impl Repository {
         o.ctl.check()?;
         let started = Instant::now();
         let guard = lock::acquire(self, LockKind::Shared, LockOperation::Verify, &o.ctl).await?;
-        let r = self.verify_locked(names, o, started).await;
+        let r = self.verify_locked(names, o, started, &guard).await;
         if let Err(e) = guard.release().await {
             tracing::warn!(target: "sparkles::backup", "releasing a lock: {e}");
         }
@@ -90,11 +91,13 @@ impl Repository {
         names: &[String],
         o: &VerifyOptions,
         started: Instant,
+        guard: &LockGuard,
     ) -> Result<VerifyReport> {
         let ctl = &o.ctl;
         let mut req = VerifyRequests::default();
         let security = self.security().await?;
         let whole_repo = names.is_empty();
+        let concurrency = self.config.concurrency();
 
         // the manifests
         let mut items: Vec<Item> = Vec::new();
@@ -142,9 +145,9 @@ impl Repository {
         }
         for it in &mut items {
             let Some(m) = &it.manifest else { continue };
-            let bad = match crate::manifest::validate(
+            let bad = match crate::manifest::validate_for_repo(
                 m,
-                self.marker.piece_bytes,
+                &self.marker,
                 sparkles_core::formats::READABLE_INDEX_FORMATS,
             ) {
                 // another index format is intact, only not restorable by this build
@@ -174,6 +177,7 @@ impl Repository {
         let list_blobs = whole_repo || needed.len() > HEAD_LIMIT;
         if list_blobs {
             ctl.check()?;
+            guard.check_live().await?;
             let listed: HashMap<String, u64> = self
                 .store
                 .list(Some(&Key::from(layout::BLOBS)))
@@ -203,8 +207,9 @@ impl Repository {
             }
         } else if o.level == VerifyLevel::Exists {
             let security = &security;
-            let heads: Vec<(String, bool)> = futures::stream::iter(needed.iter())
-                .map(|(id, &size)| async move {
+            let heads: Vec<(String, bool)> = guard
+                .read_batches(&needed, concurrency, ctl)
+                .map_ok(|(id, &size)| async move {
                     ctl.check()?;
                     match self.store.head(&layout::blob_key(id)).await {
                         Ok(m) => Ok((id.clone(), security.plausible_size(size, m.size))),
@@ -212,7 +217,7 @@ impl Repository {
                         Err(e) => Err(BackupError::from(e)),
                     }
                 })
-                .buffer_unordered(self.config.concurrency())
+                .try_buffer_unordered(concurrency)
                 .try_collect()
                 .await?;
             req.head += heads.len() as u64;
@@ -228,15 +233,20 @@ impl Repository {
                 .collect();
             let total = todo.len();
             let mut done = 0usize;
-            let mut results = futures::stream::iter(todo)
-                .map(|(id, size)| {
+            let results = guard
+                .read_batches(todo, concurrency, ctl)
+                .map_ok(|(id, size)| {
                     let security = security.clone();
-                    async move { (id.clone(), self.check_blob(&id, size, ctl, security).await) }
+                    async move {
+                        let state = self.check_blob(&id, size, ctl, security).await?;
+                        Ok((id, state))
+                    }
                 })
-                .buffer_unordered(self.config.concurrency());
-            while let Some((id, r)) = results.next().await {
+                .try_buffer_unordered(concurrency);
+            futures::pin_mut!(results);
+            while let Some((id, state)) = results.try_next().await? {
                 req.get += 1;
-                match r? {
+                match state {
                     BlobState::Ok => {}
                     BlobState::Missing => {
                         missing.insert(id);
@@ -290,12 +300,15 @@ impl Repository {
             };
             if o.level == VerifyLevel::Restore && v.status == VerifyStatus::Ok {
                 // only a backup whose blobs all check out is restored
+                guard.check_live().await?;
                 ctl.report(0.9, &format!("restoring {}", it.name));
                 backups.push(self.verify_restore(&it.name, o).await?);
             } else {
                 backups.push(v);
             }
         }
+        ctl.check()?;
+        guard.check_live().await?;
         let status = if backups.iter().any(|b| b.status == VerifyStatus::Error) {
             VerifyStatus::Error
         } else if orphans.is_some_and(|o| o.blobs > 0) {

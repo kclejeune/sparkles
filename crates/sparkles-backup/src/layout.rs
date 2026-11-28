@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as J;
 use uuid::Uuid;
 
-/// Repository format written and read by this build.
-pub const FORMAT: u32 = sparkles_core::formats::BACKUP_LAYOUT.writes;
+/// The default repository and manifest format.
+pub const FORMAT: u32 = 1;
+const CONFIGURED_FORMAT: u32 = sparkles_core::formats::BACKUP_LAYOUT.writes;
 /// `kind` of the marker.
 pub const MARKER_KIND: &str = "sparkles-backup-repository";
 /// `kind` of a manifest.
@@ -304,8 +305,7 @@ pub fn default_backup_name(dataset: &str, t: chrono::DateTime<chrono::Utc>) -> S
 
 // ----------------------------------------------------------------------- marker ------
 
-/// `sparkles-repo.json`: written once at initialization. Unknown fields are ignored, so
-/// additive changes stay format 1.
+/// `sparkles-repo.json`: the repository identity and required layout settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Marker {
@@ -321,6 +321,12 @@ pub struct Marker {
     /// Optional client encryption descriptor; plaintext repositories store `null`.
     #[serde(default)]
     pub encryption: Option<J>,
+    /// Repository-wide parameters for vocabulary chunking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunking: Option<crate::chunking::Chunking>,
+    /// S3 placement and retention settings for immutable objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_policy: Option<crate::S3WritePolicy>,
 }
 
 impl Marker {
@@ -335,6 +341,8 @@ impl Marker {
             hash: "sha256".to_string(),
             piece_bytes: PIECE_BYTES,
             encryption: None,
+            chunking: None,
+            s3_policy: None,
         }
     }
 
@@ -359,11 +367,27 @@ impl Marker {
                 self.kind
             ));
         }
-        if self.format > FORMAT {
+        let formats = sparkles_core::formats::BACKUP_LAYOUT.reads;
+        if !formats.contains(&self.format) {
             return bad(format!(
-                "repository format {} is newer than this build reads ({FORMAT})",
+                "repository format {} is unsupported; this build reads {formats:?}",
                 self.format
             ));
+        }
+        if (self.format == CONFIGURED_FORMAT)
+            != (self.chunking.is_some() || self.s3_policy.is_some())
+        {
+            return bad("repository format and layout settings disagree".into());
+        }
+        if self
+            .chunking
+            .as_ref()
+            .is_some_and(|c| *c != crate::chunking::V1 || self.piece_bytes < 16 << 20)
+        {
+            return bad("unsupported repository chunking settings".into());
+        }
+        if self.s3_policy.as_ref().is_some_and(|p| !p.valid()) {
+            return bad("invalid S3 storage policy".into());
         }
         if self.encryption.as_ref().is_some_and(|e| !e.is_null()) {
             #[cfg(feature = "encryption")]
@@ -371,8 +395,7 @@ impl Marker {
                 crate::crypto::slots::Descriptor::parse(
                     self.encryption.as_ref().expect("checked"),
                 )?;
-                if self.format != 1
-                    || self.id.is_nil()
+                if self.id.is_nil()
                     || chrono::DateTime::parse_from_rfc3339(&self.created).is_err()
                     || self.hash != "hmac-sha256"
                     || self.piece_bytes == 0
@@ -392,6 +415,17 @@ impl Marker {
             return bad(format!("invalid pieceBytes {}", self.piece_bytes));
         }
         Ok(())
+    }
+
+    pub(crate) fn configure(&mut self, options: &crate::RepositoryOptions) {
+        if options.content_defined_chunking {
+            self.format = CONFIGURED_FORMAT;
+            self.chunking = Some(crate::chunking::V1);
+        }
+        if let Some(policy) = &options.s3_policy {
+            self.format = CONFIGURED_FORMAT;
+            self.s3_policy = Some(policy.clone());
+        }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {

@@ -371,3 +371,35 @@ fn ages() {
     assert_eq!(list_requests(0), 1);
     assert_eq!(list_requests(2500), 3);
 }
+
+#[tokio::test]
+async fn unversioned_sweep_refuses_deletion_after_its_lease_is_broken() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = fixture::fs_repo(temp.path()).await;
+    let orphan = crate::blob::encode(b"orphan", false);
+    let key = layout::blob_key(&orphan.id);
+    repo.store.put(&key, orphan.bytes.into()).await.unwrap();
+
+    let lock_dir = temp.path().join("locks");
+    let options = GcOptions {
+        ctl: Ctl {
+            progress: Some(Arc::new(move |_, message| {
+                if message == "re-reading manifests" {
+                    let leases = std::fs::read_dir(&lock_dir)
+                        .unwrap()
+                        .collect::<std::io::Result<Vec<_>>>()
+                        .unwrap();
+                    assert_eq!(leases.len(), 1);
+                    std::fs::remove_file(leases[0].path()).unwrap();
+                }
+            })),
+            ..Default::default()
+        },
+        ..now_gc()
+    };
+    assert_eq!(
+        repo.gc(&options).await.unwrap_err().code(),
+        Code::RepositoryLocked
+    );
+    assert!(repo.store.head(&key).await.is_ok());
+}

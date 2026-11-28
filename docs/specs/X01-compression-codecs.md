@@ -625,8 +625,12 @@ Section 3's optional `zstd-decode-pure` remains unbuilt, so a build without the 
 feature cannot read zstd. Dropping a retained requirement needs maintainer approval
 and an Outcome entry.
 
-Item 61 owns the decision for reserved repository-zstd encoding, with raw and LZ4
-compatibility and restore and transfer measurements in F05.
+Item 61 retains the reserved repository zstd tag as a clean refusal. Current
+repository writes and copies use raw or LZ4. Adding zstd needs comparative evidence
+for transfer size, CPU and restore time under the F05 workload. Dropping the reserved
+option requires maintainer approval and an Outcome entry. The
+[F05 Outcome](F05-snapshot-repositories/OUTCOME.md#roadmap-follow-ups-2026-10-12)
+records the repository decision.
 
 The accepted compression contract includes the adopted codecs' round-trip and
 feature-matrix tests and the [X11 settings](X11-index-compression-and-predicate-patterns.md#dataset-local-settings).

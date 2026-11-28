@@ -46,6 +46,8 @@ struct Mark {
     listed: u64,
     stored_bytes: u64,
     kept_young: u64,
+    kept_locked: u64,
+    delete_failures: u64,
 }
 
 impl Mark {
@@ -121,19 +123,10 @@ impl Repository {
             }
         };
         if o.dry_run {
-            let r = self.relist(&mut mark, &mut req).await;
+            let r = self.preview_gc(o, &mut mark, &mut req).await;
             let _ = shared.release().await;
-            r?;
-            let bytes: u64 = mark.candidates.values().sum();
-            return Ok(report(
-                o,
-                &mark,
-                &req,
-                bytes,
-                mark.candidates.len() as u64,
-                t0,
-                wait,
-            ));
+            let (deleted, bytes) = r?;
+            return Ok(report(o, &mark, &req, bytes, deleted, t0, wait));
         }
         let _ = shared.release().await;
 
@@ -158,6 +151,68 @@ impl Repository {
             .await;
         let _ = exclusive.release().await;
         r
+    }
+
+    async fn preview_gc(
+        &self,
+        o: &GcOptions,
+        mark: &mut Mark,
+        req: &mut GcRequests,
+    ) -> Result<(u64, u64)> {
+        self.relist(mark, req).await?;
+        #[cfg(feature = "s3")]
+        if self.has_object_lock() {
+            let (deleted, bytes, failure) = self.sweep_object_lock(o, mark, req, None).await?;
+            if let Some(failure) = failure {
+                return Err(failure);
+            }
+            return Ok((deleted, bytes));
+        }
+        let _ = o;
+        Ok((mark.candidates.len() as u64, mark.candidates.values().sum()))
+    }
+
+    #[cfg(feature = "s3")]
+    async fn sweep_object_lock(
+        &self,
+        o: &GcOptions,
+        mark: &mut Mark,
+        req: &mut GcRequests,
+        guard: Option<&LockGuard>,
+    ) -> Result<(u64, u64, Option<BackupError>)> {
+        use crate::storage::DeleteOutcome;
+
+        let mut results = futures::stream::iter(&mark.candidates)
+            .map(|(key, size)| async move {
+                o.ctl.check()?;
+                let mut requests = GcRequests::default();
+                let result = self
+                    .delete_locked_object(key, o.dry_run, &mut requests, guard)
+                    .await;
+                Ok::<_, BackupError>((key, size, requests, result))
+            })
+            .buffer_unordered(self.config.concurrency());
+        let mut deleted = 0;
+        let mut bytes = 0;
+        let mut failure = None;
+        while let Some((key, size, requests, result)) = results.try_next().await? {
+            req.head += requests.head;
+            req.delete += requests.delete;
+            match result {
+                Ok(DeleteOutcome::Eligible | DeleteOutcome::Deleted) => {
+                    deleted += 1;
+                    bytes += size;
+                }
+                Ok(DeleteOutcome::Retained) => mark.kept_locked += 1,
+                Ok(DeleteOutcome::Missing) => {}
+                Err(e) if e.code() == Code::RepositoryLocked => return Err(e),
+                Err(e) => {
+                    mark.delete_failures += 1;
+                    failure.get_or_insert_with(|| e.with("object", key.as_ref()));
+                }
+            }
+        }
+        Ok((deleted, bytes, failure))
     }
 
     /// The mark: every manifest's blobs, and the unreferenced blobs older than the
@@ -265,32 +320,25 @@ impl Repository {
     ) -> Result<GcReport> {
         o.ctl.report(0.6, "re-reading manifests");
         self.relist(mark, req).await?;
-        let mut keys: Vec<Key> = mark.candidates.keys().cloned().collect();
-        keys.sort();
-        let total = keys.len().max(1);
-        let (mut deleted, mut deleted_bytes) = (0u64, 0u64);
-        for (i, batch) in keys.chunks(DELETE_BATCH).enumerate() {
-            o.ctl.check()?;
-            req.delete += 1;
-            let input = futures::stream::iter(batch.to_vec()).map(Ok).boxed();
-            let mut out = self.store.delete_stream(input);
-            while let Some(r) = out.next().await {
-                match r {
-                    Ok(k) => {
-                        deleted += 1;
-                        deleted_bytes += mark.candidates.get(&k).copied().unwrap_or(0);
-                    }
-                    Err(object_store::Error::NotFound { .. }) => {}
-                    Err(e) => return Err(e.into()),
-                }
+        #[cfg(feature = "s3")]
+        let versioned = self.has_object_lock();
+        #[cfg(not(feature = "s3"))]
+        let versioned = false;
+        let (deleted, deleted_bytes, failure) = if versioned {
+            #[cfg(feature = "s3")]
+            {
+                self.sweep_object_lock(o, mark, req, Some(lock)).await?
             }
-            let done = (i * DELETE_BATCH + batch.len()) as f32 / total as f32;
-            o.ctl
-                .report(0.65 + 0.25 * done, &format!("deleted {}", blobs(deleted)));
-        }
+            #[cfg(not(feature = "s3"))]
+            unreachable!("the build has no S3 support")
+        } else {
+            let (deleted, bytes) = self.sweep_unversioned(o, mark, req, lock).await?;
+            (deleted, bytes, None::<BackupError>)
+        };
 
         // leftovers of other operations: stale locks and connection-test probes
         let now = lock.server_time().unwrap_or_else(Utc::now);
+        lock.check_live().await?;
         let locks = lock::list_locks(self.store.as_ref()).await?;
         req.list += 1;
         let probes = list_all(self.store.as_ref(), PROBE).await?;
@@ -307,6 +355,7 @@ impl Repository {
                     .filter(|m| older_than(m.last_modified, now, STALE)),
             );
         for m in stale {
+            lock.check_live().await?;
             req.delete += 1;
             match self.store.delete(&m.location).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
@@ -314,6 +363,7 @@ impl Repository {
             }
         }
 
+        lock.check_live().await?;
         let rep = report(o, mark, req, deleted_bytes, deleted, t0, wait);
         let last = LastGc {
             report: rep.clone(),
@@ -334,8 +384,49 @@ impl Repository {
             kept_young = rep.kept_young,
             "garbage collection finished"
         );
+        if let Some(failure) = failure {
+            return Err(failure.with(
+                "gc",
+                serde_json::to_value(&rep).expect("a report serializes"),
+            ));
+        }
         o.ctl.report(1.0, &format!("deleted {}", blobs(deleted)));
         Ok(rep)
+    }
+
+    async fn sweep_unversioned(
+        &self,
+        o: &GcOptions,
+        mark: &Mark,
+        req: &mut GcRequests,
+        lock: &LockGuard,
+    ) -> Result<(u64, u64)> {
+        let mut keys: Vec<Key> = mark.candidates.keys().cloned().collect();
+        keys.sort();
+        let total = keys.len().max(1);
+        let (mut deleted, mut deleted_bytes) = (0u64, 0u64);
+        for (i, batch) in keys.chunks(DELETE_BATCH).enumerate() {
+            o.ctl.check()?;
+            lock.check_live().await?;
+            req.delete += 1;
+            let input = futures::stream::iter(batch.to_vec()).map(Ok).boxed();
+            let mut out = self.store.delete_stream(input);
+            while let Some(r) = out.next().await {
+                match r {
+                    Ok(k) => {
+                        deleted += 1;
+                        deleted_bytes += mark.candidates.get(&k).copied().unwrap_or(0);
+                    }
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            let done = (i * DELETE_BATCH + batch.len()) as f32 / total as f32;
+            o.ctl
+                .report(0.65 + 0.25 * done, &format!("deleted {}", blobs(deleted)));
+        }
+
+        Ok((deleted, deleted_bytes))
     }
 
     /// The report of the last garbage collection (`gc/last.json`), if one ran.
@@ -369,6 +460,8 @@ fn report(
         deleted,
         deleted_bytes,
         kept_young: mark.kept_young,
+        kept_locked: mark.kept_locked,
+        delete_failures: mark.delete_failures,
         stored_bytes_after: mark.stored_bytes.saturating_sub(deleted_bytes),
         requests: *req,
         millis: t0.elapsed().as_millis() as u64,

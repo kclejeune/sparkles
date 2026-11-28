@@ -416,6 +416,9 @@ pub struct FileEntry {
     pub sha256: String,
     /// the file is the concatenation of these blobs, in order
     pub blobs: Vec<BlobRef>,
+    /// How the writer selected content-defined boundaries, when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunker: Option<crate::chunking::Chunker>,
     /// a dataset-managed definition, such as `views/NAME/view.json`, which the
     /// manifest's `requires` announces (`formats::BACKUP_DEFINITION`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -812,6 +815,8 @@ pub struct GcRequest {
 pub struct GcRequests {
     pub list: u64,
     pub get: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub head: u64,
     pub delete: u64,
 }
 
@@ -828,6 +833,12 @@ pub struct GcReport {
     pub deleted_bytes: u64,
     /// unreferenced blobs younger than the grace period
     pub kept_young: u64,
+    /// Unreferenced blobs protected by provider retention or a legal hold.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub kept_locked: u64,
+    /// Candidate deletes that failed. A run with failures reports an error and its partial result.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub delete_failures: u64,
     pub stored_bytes_after: u64,
     pub requests: GcRequests,
     pub millis: u64,

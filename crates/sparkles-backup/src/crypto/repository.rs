@@ -359,6 +359,7 @@ pub(crate) async fn attach_or_init(
     env: &OpenEnv,
     keys: &KeyState,
     native_root: Option<&(std::path::PathBuf, Arc<std::fs::File>)>,
+    repository_options: &crate::RepositoryOptions,
 ) -> Result<Marker> {
     let options = &keys.options;
     options.check(false)?;
@@ -446,6 +447,7 @@ pub(crate) async fn attach_or_init(
         descriptor.sign(&master)?;
         let slots = wrap_slots(Arc::new(master), options).await?;
         let mut marker = Marker::new(repository, crate::now_rfc3339());
+        marker.configure(repository_options);
         marker.hash = "hmac-sha256".into();
         marker.encryption = Some(serde_json::to_value(descriptor).expect("serializes"));
         let proposed = Intent {
@@ -813,13 +815,21 @@ mod tests {
             let options = super::super::tests::options(47);
             let delayed_keys = KeyState::new(options.clone());
             let winner_keys = KeyState::new(options);
+            let repository_options = crate::RepositoryOptions::default();
             let (loser, winner) = tokio::join!(
-                attach_or_init(&store, &cfg, &env, &delayed_keys, None),
+                attach_or_init(&store, &cfg, &env, &delayed_keys, None, &repository_options),
                 async {
                     delayed.entered.notified().await;
-                    let winner = attach_or_init(&inner, &cfg, &env, &winner_keys, None)
-                        .await
-                        .unwrap();
+                    let winner = attach_or_init(
+                        &inner,
+                        &cfg,
+                        &env,
+                        &winner_keys,
+                        None,
+                        &crate::RepositoryOptions::default(),
+                    )
+                    .await
+                    .unwrap();
                     assert!(inner.head(&Key::from(INIT)).await.is_err());
                     if matches!(pause, Pause::PrefixValidation) {
                         inner
@@ -861,9 +871,16 @@ mod tests {
         };
         let env = OpenEnv::default();
         let keys = KeyState::new(super::super::tests::options(48));
-        let winner = attach_or_init(&store, &cfg, &env, &keys, None)
-            .await
-            .unwrap();
+        let winner = attach_or_init(
+            &store,
+            &cfg,
+            &env,
+            &keys,
+            None,
+            &crate::RepositoryOptions::default(),
+        )
+        .await
+        .unwrap();
         let marker_before = read_bounded(&store, &layout::marker_key(), MAX_SLOT_BYTES as u64)
             .await
             .unwrap();
@@ -925,6 +942,7 @@ mod tests {
             &OpenEnv::default(),
             &KeyState::new(super::super::tests::options(50)),
             None,
+            &crate::RepositoryOptions::default(),
         )
         .await
         .unwrap_err();
@@ -1100,15 +1118,28 @@ mod tests {
             };
             let wrong = super::super::tests::options(33);
             assert!(
-                attach_or_init(&store, &cfg, &env, &KeyState::new(wrong), None)
-                    .await
-                    .is_err()
+                attach_or_init(
+                    &store,
+                    &cfg,
+                    &env,
+                    &KeyState::new(wrong),
+                    None,
+                    &crate::RepositoryOptions::default()
+                )
+                .await
+                .is_err()
             );
             assert!(store.head(&layout::marker_key()).await.is_err());
-            let recovered =
-                attach_or_init(&store, &cfg, &env, &KeyState::new(options.clone()), None)
-                    .await
-                    .unwrap();
+            let recovered = attach_or_init(
+                &store,
+                &cfg,
+                &env,
+                &KeyState::new(options.clone()),
+                None,
+                &crate::RepositoryOptions::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(recovered.id, id);
             assert_eq!(read_slots(&store).await.unwrap().len(), 2);
             assert!(store.head(&Key::from(INIT)).await.is_err());

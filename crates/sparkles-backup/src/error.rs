@@ -39,6 +39,10 @@ pub enum Code {
     RepositoryReadOnly,
     /// a non-stale conflicting lock outlived `lockWait` (409, `holder`)
     RepositoryLocked,
+    /// Storage retention or a legal hold prevents deleting the object (409).
+    ObjectRetained,
+    /// An archived object must be thawed by the storage operator before it can be read (409).
+    ArchiveRestoreRequired,
     DatasetExists,
     /// an in-place restore could not drain requests to the dataset in time (409)
     DatasetBusy,
@@ -76,7 +80,7 @@ pub enum Code {
 }
 
 impl Code {
-    pub const ALL: [Code; 38] = [
+    pub const ALL: [Code; 40] = [
         Code::InvalidName,
         Code::InvalidConfig,
         Code::InvalidRequest,
@@ -96,6 +100,8 @@ impl Code {
         Code::BackupBusy,
         Code::RepositoryReadOnly,
         Code::RepositoryLocked,
+        Code::ObjectRetained,
+        Code::ArchiveRestoreRequired,
         Code::DatasetExists,
         Code::DatasetBusy,
         Code::NotManaged,
@@ -138,6 +144,8 @@ impl Code {
             Code::BackupBusy => "backup-busy",
             Code::RepositoryReadOnly => "repository-read-only",
             Code::RepositoryLocked => "repository-locked",
+            Code::ObjectRetained => "object-retained",
+            Code::ArchiveRestoreRequired => "archive-restore-required",
             Code::DatasetExists => "dataset-exists",
             Code::DatasetBusy => "dataset-busy",
             Code::NotManaged => "not-managed",
@@ -178,6 +186,8 @@ impl Code {
             | Code::BackupBusy
             | Code::RepositoryReadOnly
             | Code::RepositoryLocked
+            | Code::ObjectRetained
+            | Code::ArchiveRestoreRequired
             | Code::DatasetExists
             | Code::DatasetBusy
             | Code::NotManaged
@@ -350,12 +360,19 @@ impl From<object_store::Error> for BackupError {
     /// response bodies ([`redact_bodies`]). Callers that expect `NotFound` or
     /// `AlreadyExists` match on the `object_store::Error` before converting.
     fn from(e: object_store::Error) -> BackupError {
+        let message = redact_bodies(&redact_urls(&e.to_string()));
+        if let object_store::Error::PermissionDenied { path, .. } = &e
+            && message.ends_with(" (InvalidObjectState)")
+        {
+            return BackupError::new(
+                Code::ArchiveRestoreRequired,
+                format!("restore archived object {path:?} in S3 before reading it"),
+            )
+            .with("object", path.as_str());
+        }
         BackupError::new(
             Code::RepositoryUnavailable,
-            format!(
-                "repository unavailable: {}",
-                redact_bodies(&redact_urls(&e.to_string()))
-            ),
+            format!("repository unavailable: {message}"),
         )
     }
 }

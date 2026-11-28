@@ -62,6 +62,11 @@ impl Security {
             None
         }
     }
+    pub(crate) fn manifest_encryption(&self) -> Option<serde_json::Value> {
+        self.epoch()
+            .map(|epoch| serde_json::json!({"scheme":"sparkles-repo-v1","epoch":epoch}))
+    }
+
     pub fn id_hasher(&self) -> IdHasher {
         #[cfg(feature = "encryption")]
         if let Some(keys) = &self.sealed {
