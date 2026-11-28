@@ -1068,7 +1068,9 @@ requested, the failed attempt and the run without counting together, takes 1.28 
 long with the order as without it, 157 ms against 123 ms on one thread. It took 3.1
 times as long, 576 ms against 184 ms, before a context gave way to the contexts it woke.
 The default accepts that cost, and item 896 follows that file and the default of
-counting.
+counting. With item 896's refinements the file finishes with counting, as
+[their subsection](#item-896s-refinements-of-counting) records, and the default of
+counting waits on items 1395 and 1396.
 
 Item 897 gives each compound qualifier of a number restriction
 [a name of its own](#compound-qualifiers-of-number-restrictions) in a counting run. Before
@@ -4549,14 +4551,16 @@ alternative `H` of a definition `=n r.F ⊓ … ⊑ C`. A context with `n` quali
 derives `y ∨ H` with `H` maximal and makes `n + 1` hypothetical witnesses. The file has
 nine such restrictions over the symmetric bond roles, and a witness has a known neighbour,
 its predecessor, so it derives the same alternatives. Three hypothetical successors
-derive 69,109, 63,521 and 58,201 of the attempt's 281,121 conclusions. Two ideas are
-untried. A minimum could be blocked by a strictly stronger one that holds under the same
-clause and not only as a unit. A positive `∃r.F` whose negative name the context already
-holds could stay unexpanded, which needs a proof that the name is witnessed in the model.
-Both, and the default of counting, are item 896. Two other changes to the clause
-set were measured with the order and are not kept, one name per compound expression and
-a name of its own for a negative existential restriction, as
-[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md) records.
+derive 69,109, 63,521 and 58,201 of the attempt's 281,121 conclusions. Two ideas were
+untried at the end of item 894. A minimum could be blocked by a strictly stronger one that
+holds under the same clause and not only as a unit. A positive `∃r.F` whose negative name
+the context already holds could stay unexpanded, which needs a proof that the name is
+witnessed in the model. Item 896 takes up both, with the default of counting, as
+[its subsection](#item-896s-refinements-of-counting) records. Two other changes to the
+clause set were measured with item 894's order and not kept then, one name per compound
+expression and a name of its own for a negative existential restriction, as
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md) records. Item 896 adopts
+the second with the qualifiers rewritten.
 
 This item also found that a counting run missed a maximum over a compound qualifier
 that no other axiom names, with the order or without it, which
@@ -4585,6 +4589,225 @@ that finished without the order in these runs finished with it. The one that dif
 and without it, is the ontology of the qualifier gap above, which item 897 repairs. The fuzz also found the
 cardinality stated twice under a clause, which passed the bound with the order before a
 name beside its representative lost its own witnesses, and that ontology is a regression.
+
+#### Item 896's refinements of counting
+
+This subsection records the design of item 896 and its argument. The item changes four
+things in a run that counts without the root and with the order between number
+restrictions, and nothing in any other run. A minimum is blocked by a stronger minimum
+that holds under the same clause and not only as a unit. A generated inclusion between two
+minimums is applied to units only. An existential restriction over a simple role in a
+negative position gets a name of its own. An exact or minimum cardinality on the left side
+of an axiom keeps the axiom's other conjuncts as its guard. `Limits::number_order` controls
+all four with the order, so the field set to false turns them off with it. The second
+idea of item 894's subsection, a positive existential restriction that stays unexpanded
+where the context holds its negative name, is not built, and the last part of this
+subsection gives the reason.
+
+Each part states the change, the clause set that the run saturates, and why that clause
+set has the consequences of the ontology between its classes and no others. Soundness is
+then the paper's Theorem 8 and completeness its Theorem 9 for that clause set, since both
+hold for any set of DL-clauses, as the subsection on the order states. The parts build on
+`O'`, the weakened clause set of [the order's argument](#the-order-between-number-restrictions),
+in which the told step of a minimum's name `G_2` to its witnesses is
+`G_2(x) → W_2(x) ∨ ⋁ G_1(x)` over the blockers `G_1` of `G_2`.
+
+**A blocker under the same clause.** Item 894 skips the told step from a clause
+`C = Γ → Δ ∨ G_2(x)` whose maximal literal is `G_2` only when the context holds a blocker of
+`G_2` as a unit. The step is now also skipped in two more cases. In the first, a blocker
+`G_1` is an atom of `Γ`. In the second, the context's store holds a live clause
+`D = Γ_D → Δ_D` with a blocker in its head, whose body is within `Γ` and whose head is
+within `Δ`, the conjunction `W_2` and the blockers of `G_2`. `dl_rules::blocked_clause`
+tests the three cases in this order. A unit `G_2` still waits in the context until it has
+taken its units, as item 894 describes.
+
+Each skipped step has a conclusion that the context already contains up to redundancy.
+Hyper on `C` and the clause of `O'` gives `Γ → Δ ∨ W_2(x) ∨ ⋁ G_1(x)`, one clause for each
+existential restriction of `W_2`. A unit blocker subsumes it, as before, and so does `D`
+in the second new case. In the first, the atom `G_1(x)` of the body entered the context
+through the marker `G_1 → G_1` of the hypothesis that a predecessor sent, since every atom
+in the body of a context clause comes from such a marker, and the marker subsumes the
+conclusion. The paper's elimination rule deletes a clause only when another clause of the
+context contains it, so the marker, or `D`, is either kept or replaced by a clause that
+also subsumes the conclusion, which is the unit `G_1`, a stronger blocker clause or the
+empty clause. A context of the run is therefore saturated for `O'` up to redundancy, and
+Theorem 9 applies to `O'` as before. A blocker that arrives after `W_2` was derived leaves
+sound clauses behind, as with units. The scan reads every literal of `C`, every blocker
+and every stored clause it inspects, dead or alive, charges this work to the run in chunks
+with the remainder carried from scan to scan, and polls the run's bounds, so cancellation,
+a deadline, the memory budget and a work bound stop it. A stopped scan marks the context
+interrupted before the told step, so the context's class is reported incomplete.
+
+**Inclusions that only units take.** Among the told inclusions that the order adds, those
+from a name `G_1` to a name `G_2` that `G_1` blocks are generated consequences that a
+clause which is not a unit does not need. They are the inclusions from a representative
+into a weaker one and from a representative into the names it stands for. When no bundle of
+equivalent minimums and no relation was left out at the bound, and every name that lost its
+own witnesses keeps an inclusion to a blocker that is not of this kind, a clause that is not
+a unit does not take these inclusions, and a unit still takes all of them.
+`DlAx::skip_weaken` lists the pairs. A pair is left out when `G_2` is on the left of a told
+inclusion other than its witness inclusion and the order's, when `G_2` is in a disjointness
+set that the order did not add, and when the normalization told the inclusion before the
+order added its own.
+
+Let `O_b` be `O'` without the clauses `G_1(x) → G_2(x)` of these pairs. `O_b` is within
+`O'`, so it is sound. A model of `O_b` becomes a model of `O'` with the same classes of the
+ontology when each such `G_2` is enlarged by every `G_1` of its pairs, repeated until
+nothing changes. A larger name in a head only makes a clause easier to satisfy, and
+outside the excluded cases the name of a minimum occurs in the body of three kinds of
+clause, which the enlargement keeps true. Its witness clause holds at an added element because
+that element is in the blocker `G_1`. An inclusion `G_2 ⊑ G_3` into a weaker minimum is
+matched by the inclusion `G_1 ⊑ G_3`, since entailment is transitive and, with nothing
+left out, the order relates every pair of representatives that entail each other or one
+the other. That inclusion is in `O_b`, or it is a pair of the same kind and the
+enlargement adds `G_1` to `G_3` as well. A disjointness set of `G_2` with the holder `M` of
+a maximum `≤k s.B` that `G_2` contradicts has its counterpart for `G_1`, since `G_1`'s
+minimum has at least `G_2`'s bound, a role below `G_2`'s and a filler below `G_2`'s, so it
+contradicts `M` too. The names that lost their own witnesses keep a route to witnesses on
+every clause, because their inclusion into a blocker is not of this kind. So `O_b` has the
+consequences of `O'` between the ontology's classes. The run applies the removed clauses to
+units as well, which adds conclusions of `O'` and therefore sound ones, and Theorem 9 needs
+only that each context be closed under the rules for `O_b`, which these extra clauses do
+not disturb. When the relations were cut at the bound, `skip_weaken` is empty and every
+clause takes every inclusion, as in item 894.
+
+**Names of negative existential restrictions.** After every axiom is normalized and
+committed, `dl_norm::shadow_negative` replaces each existential restriction `∃r.g` over a
+simple role in a negative position, and every existential restriction in the qualifier of
+a maximum or of item 728's clauses, by a fresh name `N` with the told inclusion
+`g ⊑ ∀r⁻.N`, or `∃r.g ⊑ N` where the role has no inverse in the run. The pass rewrites a
+filler before the restriction around it, so nested restrictions are named from the inside
+out, and one name stands for each role with each rewritten filler. A negative existential
+restriction over a role that is not simple keeps its role, since the automata unfold it,
+and its filler is rewritten. A compound qualifier keeps item 897's name. The pass runs on
+the committed axioms, so an axiom that the normalization refused leaves no name and no
+definition behind. A range `r` with class `c` becomes `⊤ ⊑ ∀r.c` in such a run in place of
+`∃r⁻.⊤ ⊑ c`, which is the same constraint and makes no negative existential restriction.
+
+`N` occurs in a positive position only in its definition. A model of the ontology becomes
+a model of the rewritten set when each `N` is read as `∃r.g`, from the innermost name
+outwards. A model of the rewritten set has `∃r.g ⊆ N`, and `N` replaces `∃r.g` only where
+a larger class makes the constraint stronger. These places are the left side of an
+inclusion, a disjointness set, the body of a clause, the guard of a lazy clause and the
+qualifier of a maximum or of a lazy clause, since a maximum and the body of a lazy clause
+count fewer neighbours in a smaller class. So the model satisfies the original axioms, and
+the two sets have the same consequences between the ontology's classes. A neighbour
+therefore derives `N` and not the positive restriction `∃r.g`, whose successor term the
+at-most rule counted and equated with the neighbour. Item 894's experiment with these names
+left the qualifiers unrewritten, and a maximum over `∃s.C` lost its neighbours. Here the
+qualifiers take the same names as the other negative positions.
+
+**Guarded cardinalities.** Item 728 normalizes an exact cardinality `=n r.F` in a negative
+position on its own, so the definition
+`AcylGroup ≡ CarbonAtom ⊓ =1 hasDoubleBondWith.OxygenAtom ⊓ =2 hasSingleBondWith.OrganicGroup`
+gives clauses that fire for every atom with an oxygen neighbour or two organic neighbours,
+whether or not it is a carbon atom. With the order, `dl_norm::sub_order` normalizes an
+axiom `⊓L ⊑ ⊔R` whose left side holds an exact cardinality or a minimum of two or more as
+one guarded clause. Each `=n r.F` on the left adds `≥(n+1) r.F` to the head, listed among
+the at-least conjunctions `DlAx::low` as item 728's alternative `H` is, and leaves
+`≥n r.F` on the left. A left `≥1 r.F` is the
+negative existential restriction `∃r.B`, with `B` the negative form of `F`, which the
+previous part names. The first of the minimums of two or more on the left, in a fixed
+order, becomes a lazy clause whose guard is the conjunction of the other left atoms with
+a fresh name `Y_i` for each other minimum, and whose head is the head of the axiom. Each
+other minimum `≥n_i r_i.F_i` becomes a lazy clause with the plain guard,
+`n_i` qualified neighbours and the head `Y_i`. A lazy clause has the qualified role of its
+own qualifier, and its neighbours range over the successor terms and the predecessor with
+equalities in the head, as item 728's clauses do.
+
+The guarded set has the consequences of the axiom. A model of the axiom extends to the
+guarded set when `Y_i` is read as `≥n_i r_i.F_i` on the elements of the plain guard. In a
+model of the guarded set, an element of the left side satisfies the plain guard and each
+minimum, so the clauses of the other minimums give each `Y_i`, the first clause applies
+with its `n` qualified neighbours, and the head holds, which is the axiom. The qualifier of
+each clause is the negative form of its filler and the qualified role holds only for
+neighbours in that qualifier, so two neighbours outside `F` never fire a clause. These are
+DL-clauses of the paper's Section 2.4, and the rules that apply item 728's clauses apply
+them, with the guard as a premise that a unit, a maximal literal of a stored clause or a
+later derivation can supply, in any order of arrival. No at-most holder is made for a
+left minimum, which is how this form differs from the experiment that
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md) records for item 728. The
+guarded walk keeps the depth limit of 256 and the limit of 4,096 visited expressions of
+the walk it replaces, and a negative intersection that passes the second limit falls back
+to item 728's form.
+
+**Positive existential restrictions with a known witness.** The second idea leaves the
+expansion of a positive `∃r.F` out where the context already knows that the element has an
+`r`-neighbour in `F`. After the previous parts, the knowledge that the context has takes the
+form of a name `N` of a negative existential restriction `∃r'.B'` with `r' ⊑ r` and
+`B' ⊑ F`, held as a unit, as an atom of a clause's body or in the core. The three forms
+differ in what they need.
+
+The form that blocks the expansion where `N` is a unit is not complete. Take `X ⊑ A ⊔ B`,
+`A ⊑ ∃r.F`, `B ⊑ ∃r.F`, `X ⊑ U_1 ⊔ U_2`, `U_1 ⊑ ∀r.D_1`, `U_2 ⊑ ∀r.D_2`, `F` disjoint
+with `D_1` and with `D_2`, and `∃r.F ⊑ C`, whose name `N` has `F ⊑ ∀r⁻.N`. The ontology
+entails `X ⊑ ⊥`. In one admissible schedule, the context of `X` takes the case `A`, and the
+witness of `∃r.F` sends `N` back through Pred, which gives `B ∨ N`. The case `B` then gives
+the unit `N` through its own witness, and the unit deletes the clauses of `B`'s witness,
+which all hold `N` in their heads. The cases `U_1` and `U_2` then refute the witness of
+`A` and give the unit `B`, which deletes the clauses of `A`'s witness and gives the unit
+`∃r.F`. The unit `N` would block that restriction, and no witness would be left to
+refute. The name was derived from the restriction's own witnesses and then blocked the
+restriction. This is a schedule of the clause-level rules and not a measured run, since
+the ontology needs no counting and so turns no order on. A regression of the form would
+need a trigger of counting and a schedule that the test controls.
+
+The forms that block where `N` is in the body or in the core read `N` from the predecessor,
+so the cycle above cannot occur. Their completeness needs a lemma that the model of
+Theorem 9 makes `N` true at a successor term only where the predecessor is in `B'` with an
+`r'⁻`-edge to it, so that the predecessor witnesses `∃r.F`. An argument by a smaller
+interpretation of `N` and of `∀r'⁻.N`, which Pred, the universal rule and the cuts keep a
+model of the context's clauses, does not cover two cases of the paper's Appendix C. An
+equality of a successor term with the predecessor makes the smaller interpretation give
+the two equal terms different values of `N` unless the modification is defined on the
+classes of equal terms. And where Appendix C stops unfolding at a successor term that is
+equal to another term, there is no fragment of the model for that term, so the step from
+the truth of a successor's clause body in the predecessor to the clause's head has no
+context in which to apply. These forms are not built while the lemma has no proof.
+
+The form whose restriction is unqualified, `∃r.⊤`, needs no lemma. A clause
+`Γ → Δ ∨ G(x)` whose body holds the role atom `s(y, x)` of the edge from the predecessor,
+with `s ⊑ r⁻` told, has the predecessor as its witness. At a successor term `t` of the
+model whose instance of the clause applies, the predecessor `p` has `s(p, t)` and so
+`r(t, p)` holds, which satisfies `∃r.⊤` at `t` after equal terms are identified, under
+either expansion strategy. The root and a test context have no predecessor, so no
+instance of such a body applies there and nothing is blocked in them. This form is a
+candidate if a measurement shows a need for it. ore_ont_6485's attempt after the first
+four parts finishes within the bound, as the measurements below state, so item 896 builds
+none of the three forms.
+
+**Measurements and the default.** The measurements are of commit 95ed2961 on a Boat worker
+with 8 vCPUs and 16 GiB, with one process at a time in a 12 GiB scope. A Boat measurement
+is approximate and decides nothing, so the timings of record wait for `atlas`. The
+timings below are medians of five classifications in one process on one thread, in two
+rounds. With counting, ore_ont_6485 finishes within the bound in 30,056 conclusions and
+28.4 to 28.6 ms, against 7.2 to 7.5 ms without counting and 199 to 215 ms for the failed
+attempt and the run without counting when `Limits::number_order` is false. Its taxonomy
+equals Konclude 0.7.0's, and the run without counting differs from it by 18 missing and
+12 extra direct edges. ore_ont_6952 and ore_ont_10140 finish with counting in 0.97 to
+1.03 s and 0.89 to 0.92 s, against 2.15 to 2.29 s and 3.28 to 3.40 s without counting,
+and their taxonomies equal Konclude's.
+
+The 207 development files of the ORE 2015 DL sample were classified on four threads, once
+without counting and once with it, with 300 s and 12 GiB for each run. The reader refuses
+ore_ont_9881. The other 206 give a taxonomy in both runs, the same bytes on 203 of them.
+The other three are ore_ont_6485, ore_ont_6952 and ore_ont_10140, which finish only with
+counting. Three files pass the bound with counting and classify again without it.
+ore_ont_541 has no number restriction and counts because of one functional property, and
+its classification with counting requested takes 5.7 to 6.0 s against 1.6 to 1.8 s
+without counting, with the order or without it. ore_ont_14817 takes 10.7 to 11.9 s
+against 3.1 to 3.5 s, and 7.0 s when `number_order` is false, whose attempt passes the
+memory budget before the bound of conclusions. ore_ont_9663 takes 10.6 to 11.1 s against
+8.4 to 8.8 s. The single runs on four threads put three more files above twice their time
+without counting, and on one thread ore_ont_8273, ore_ont_11110 and ore_ont_12141 derive
+the same conclusions in both runs and take the same time within the rounds' spread.
+
+Counting stays off by default. The condition of item 896 that no development file costs
+more than twice its run without counting fails on ore_ont_541 and ore_ont_14817 at 3.4
+to 3.5 times, and on ore_ont_6485 at 3.8 to 3.9 times, where only the run with counting
+gives the complete taxonomy. A run that counts also rests on item 1229's repair, which is
+not proved, as the section on the disjunctive rules states. ore_ont_541's attempt is item
+1395, and the cost that the order adds to ore_ont_14817's attempt is item 1396.
 
 #### Compound qualifiers of number restrictions
 

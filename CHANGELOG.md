@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Counting with the order between number restrictions
+
+A run that counts without the root, with `Limits::number_order`, blocks a minimum by a
+stronger minimum that holds under the same clause, applies the inclusions between
+minimums that the order generates to units only, names each negative existential
+restriction over a simple role, and normalizes an exact or minimum cardinality on the
+left of an axiom with the axiom's other conjuncts as its guard. With these,
+ore_ont_6485, ore_ont_6952 and ore_ont_10140 of the ORE 2015 DL sample classify with
+counting and give Konclude 0.7.0's taxonomies. F24 records the argument for each change
+and the second idea of item 896, a positive existential restriction left unexpanded
+where its negative name holds, which is not built. Counting stays off by default, since
+ore_ont_541 and ore_ont_14817 cost 3.4 to 3.5 times their runs without counting with
+counting requested. Roadmap items 1395 and 1396 follow them.
+
 ### SERVICE enhancer cache slices, disk tier, management functions and parallel requests
 
 The cache of remote SERVICE results keys an entry without the outermost LIMIT and OFFSET
