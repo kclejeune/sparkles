@@ -45,7 +45,12 @@
 //! of its successors the markers of its maximal ground atoms and equalities of constants,
 //! so that one edge covers every successor trigger of Definition 4 (the journal's K2).
 //!
-//! The at-most restrictions and the qualified roles of counting are not read in the root.
+//! With counting, a holder at an individual uses the same at-most clause as a holder at
+//! x. Its role premises carry the conditions under which the neighbours exist and belong
+//! to the qualifier. The conclusion stays in their context, where Eq and Pred already
+//! read equalities over constants and their successor terms.
+
+pub(super) mod count;
 
 use super::dl_clause::{
     Clause, Lit, Made, RTerm, Rooted, XL, XLit, admit_lit, hash_table_bytes, hash_table_grow_bound,
@@ -1031,6 +1036,9 @@ fn at_consts<S: Sink>(
     gbody: bool,
 ) -> bool {
     let dx = dix(ix);
+    if dx.counting && !gbody && count::enabled() && !count::on_max(ix, st, v, prem, found, out) {
+        return false;
+    }
     let (ts, n) = terms_of(v);
     for k in 0..n {
         let RTerm::Fc(e, u) = ts[k] else { continue };
@@ -8096,6 +8104,35 @@ pub(super) mod tests {
             assert!(d.has(&[XLit::Eq(lo, hi)]));
             assert!(d.has(&[XLit::Atom(b, lo)]));
             assert!(!d.bottom());
+        }
+    }
+
+    #[test]
+    fn a_qualified_maximum_at_a_successor_of_a_constant_merges_its_values() {
+        for last in 0..5 {
+            let mut s = Sig::new();
+            let [a, b, c0] = ["a", "b", "c"].map(|n| s.ind(n));
+            let [holder, filler] = ["M", "F"].map(|n| s.class(n));
+            let r = s.role("r");
+            let g = s.role("g");
+            let e = s.some_h(g, TOP);
+            s.dl.atmost.push((holder, 1, r, filler));
+            s.dl.counting = true;
+            let done = saturate_seeded(s, None, |ix, _| {
+                let t = RTerm::Fc(e, k(c(a, ix)));
+                let mut facts = [
+                    XLit::Atom(holder, t),
+                    XLit::Role(r, t, c(b, ix)),
+                    XLit::Role(r, t, c(c0, ix)),
+                    XLit::Atom(filler, c(b, ix)),
+                    XLit::Atom(filler, c(c0, ix)),
+                ];
+                facts.rotate_left(last);
+                facts.into_iter().map(|v| (vec![], vec![v])).collect()
+            });
+            let (b, c0) = (c(b, &done.ix), c(c0, &done.ix));
+            assert!(!done.bottom());
+            assert!(done.has(&[XLit::Eq(b.min(c0), b.max(c0))]));
         }
     }
 

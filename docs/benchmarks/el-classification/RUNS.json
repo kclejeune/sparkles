@@ -1601,6 +1601,34 @@
     }
    },
    "metadata_note": "Manual record of roadmap item 1269 on forge: nine rounds of the base, the allocation-free profile check and the tip on ore_ont_13482, GO and ChEBI lite on one and four threads, the separate atlas rounds with the layout probe, the laptop's instruction counts and stage probe, and the taxonomy and exclusion sweep."
+  },
+  {
+   "run_id": "sha256-b8c1354645d8d6d2096e590b944adfa2065e47bd09c7b21479319a28f038fb5b",
+   "path": "runs/2026-11-28-rooted-atmost-boat/record.json",
+   "sha256": "b8c1354645d8d6d2096e590b944adfa2065e47bd09c7b21479319a28f038fb5b",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "rooted-atmost-agreement",
+    "scale": "3,000 generated at-most and 3,000 qualified at-most inputs",
+    "manifest": null,
+    "settings": null,
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": "Boat bx_9cw43z44",
+     "source": {
+      "base": "05e2278eda08247c44a01f37fa6048ac7ba3597e",
+      "base_binary_sha256": "e8420ab0299f8003323a81fc46be1609b6bd9d07d14025f06d745b67d08dad91",
+      "repair_binary_sha256": "de54eb9b1ec04a4cccc050aafc2499837dd881bfee2e3707bca1b0a7f406e3ab",
+      "repair_sources_sha256": {
+       "crates/sparkles-owl/src/classify/dl_root.rs": "60c4fc3298ce61d53d1c01271f199a2ae5100a7c132883d9f125db7e9660a92f",
+       "crates/sparkles-owl/src/classify/dl_root/count.rs": "2b17317fe413744a73ff308ded246c71446e99815dc504c2e994133da18a6fd0",
+       "crates/sparkles-owl/src/classify/dl_rules.rs": "cf0eef4c6c9f05b705721fc09d77763e71507d84f7844e41bde8b8b0c5e5eced"
+      }
+     },
+     "method": "Rust 1.99.1, Mr. Boxington 1.29.1, mbx build --release -j 1 -p sparkles-owl --example el_classify. Ran el_classify with --rooted --counting, default bounds, cautious and eager expansion on one and four threads. HermiT 1.4.5.519 checked consistency, unsatisfiable named classes and the named subsumption closure. The clean base and repaired example ran on the same worker against the same HermiT references. No timings were compared."
+    }
+   },
+   "metadata_note": "Generated rooted-counting agreement and inference counters on the two at-most sets."
   }
  ]
 }

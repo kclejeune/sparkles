@@ -81,19 +81,19 @@ pub struct DlIx {
     /// whether the run takes a number restriction, so that successor terms can be equal
     pub counting: bool,
     /// the first qualified role; qualified role k is `base + 2k`, its inverse `base + 2k + 1`
-    base: Role,
+    pub(super) base: Role,
     /// the role and the filler of each qualified role `S_B`
-    quals: Vec<(Role, Ex)>,
+    pub(super) quals: Vec<(Role, Ex)>,
     /// for each filler B, the qualified roles `S_B`
-    quals_of: FxHashMap<Ex, Vec<Role>>,
+    pub(super) quals_of: FxHashMap<Ex, Vec<Role>>,
     /// the at-most restrictions: for each holder, the bound and the role it counts by
     atmost: FxHashMap<Ex, (u32, Role)>,
     /// the holders, bounds and roles of the at-most restrictions
-    atmosts: Vec<(Ex, u32, Role)>,
+    pub(super) atmosts: Vec<(Ex, u32, Role)>,
     /// item 728 / item 896 (R4) clauses of a cardinality in a negative position: the
     /// optional guard expression over x, the bound the at-most rule counts to, the
     /// qualified role and the head's atoms over x
-    lazy: Vec<LazyIx>,
+    pub(super) lazy: Vec<LazyIx>,
     /// guarded lazy clause ids indexed by their guard expression over x
     lazy_by_guard: FxHashMap<Ex, Vec<u32>>,
     /// for each expression, whether it is an at-least conjunction that the order of a run
@@ -3403,7 +3403,7 @@ pub(super) struct Found {
     extra_bytes: usize,
     /// set when an inference has more choices than a context enumerates, which passes the
     /// run's bound on derived conclusions instead
-    over: bool,
+    pub(super) over: bool,
     /// the rule that makes the conclusions pushed next, for the derivation trace
     pub(super) rule: &'static str,
     /// whether the conclusions are the root's, for the derivation trace
@@ -5718,19 +5718,19 @@ fn at_most<S: Sink>(
 
 /// The most subsets one application of the at-most rule makes before the run passes its
 /// bound on derived conclusions instead.
-const AT_MOST_SUBSETS: usize = 1 << 14;
+pub(super) const AT_MOST_SUBSETS: usize = 1 << 14;
 
 /// The most literals and premise lists the products of one application of the at-most
 /// rule hold before the run passes its bound on derived conclusions instead.
-const AT_MOST_PAYLOAD: usize = 1 << 16;
+pub(super) const AT_MOST_PAYLOAD: usize = 1 << 16;
 
 /// The most terms one application of the at-most rule equates: past it each conclusion has
 /// more than 66 equalities, whose Eq and Factor inferences no context finishes, and the
 /// run passes its bound on derived conclusions instead.
-const AT_MOST_WIDEST: usize = 12;
+pub(super) const AT_MOST_WIDEST: usize = 12;
 
 /// The number of k-element subsets of n, saturating.
-fn choose(n: usize, k: usize) -> usize {
+pub(super) fn choose(n: usize, k: usize) -> usize {
     if k > n {
         return 0;
     }
@@ -6290,6 +6290,14 @@ fn rooted_max<S: Sink>(
     if l.kind() == X && !super::dl_root::univ_from_x(ix, st, l.atom(), prem, found, guard) {
         return false;
     }
+    if dx.counting && !gbody && matches!(l.kind(), X | Y | F) && super::dl_root::count::enabled() {
+        let inv = |s| dx.inv(ix, s);
+        if let super::dl_clause::XLit::Atom(a, t) = guard.dl().lits.view(l, inv)
+            && !super::dl_root::count::on_filler(ix, st, a, t, prem, found, guard)
+        {
+            return false;
+        }
+    }
     let q = super::dl_eq::Eqs {
         ix,
         dx,
@@ -6332,6 +6340,10 @@ fn rooted_unit<S: Sink>(
         root: false,
         query: query_of(ix, me),
     };
+    let count = dx.counting && super::dl_root::count::enabled();
+    if count && !super::dl_root::count::on_filler(ix, st, d, RTerm::X, &u, found, guard) {
+        return false;
+    }
     if !q.on_unit(st, XLit::Atom(d, RTerm::X), found, guard) {
         return false;
     }
@@ -6367,7 +6379,10 @@ fn rooted_unit<S: Sink>(
             return false;
         }
         for &a in dx.core(d) {
-            if a != TOP && !q.on_unit(st, XLit::Atom(a, f), found, guard) {
+            if a != TOP
+                && (!q.on_unit(st, XLit::Atom(a, f), found, guard)
+                    || count && !super::dl_root::count::on_filler(ix, st, a, f, &u, found, guard))
+            {
                 return false;
             }
         }

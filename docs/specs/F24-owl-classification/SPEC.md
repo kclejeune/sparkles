@@ -406,23 +406,26 @@ gave 89,134 answers in full. Apart from one row of a search whose temporary file
 collided, the answers that differ from HermiT's are the four configurations of one of the
 further generated ontologies, which has a second loss. That loss does not come from the
 order of arrival, and ontologies built around individuals
-with at-most restrictions find it often. The at-most rule applies an individual's
-restriction only in the context of its singleton, over that context's successor terms, as
-[the section on at-most restrictions at constants](#item-1229-at-most-restrictions-at-constants)
-describes. The loss is open and not contained, so such a run can still report a complete
-answer that misses a merge of an individual's values. Of 2,623 generated ontologies built
-around at-most restrictions at individuals, 312 of the 10,222 answers in full on one and
-four threads with both strategies differ from HermiT's. Of 3,000 with qualified at-most
-restrictions whose qualifiers the neighbours meet by entailment, 256 of 10,894 differ. A
-check after the saturation for the premises of an at-most inference that no rule makes
-contained every one of these losses when it counted a qualified role by its role, and it
-classified again without counting where it found them. It then gave up the consistent
-cases of item 897's fixture of compound qualifiers, 7,084 answers in full of the qualified
-set that HermiT confirms and 1,748 of the 89,134 answers in full of the other generated
-and fixture sets. Counting only the atoms of the qualified role kept item 897's fixture
-and missed a loss in four runs of the qualified set, since a context can hold a
-neighbour's qualifier without the atom of the qualified role. Item 1229 stays open for
-the proof of the replay, the containment and the repair.
+with at-most restrictions find it often. The original at-most rule applied an individual's restriction only in the
+context of its singleton. Of 10,222 complete answers on the generated at-most set, 312
+differed from HermiT's. On the qualified set 256 of 10,894 differed. A containment that
+counted even unqualified edges found these losses but gave up the consistent cases of
+item 897's compound qualifier. Counting only explicit qualified edges kept those cases
+but missed four answers on a file whose neighbour meets the qualifier under a queried
+class. The broader check gave up 5,346 of the 10,222 answers on the at-most set,
+7,340 of the 10,894 on the qualified set and 1,748 HermiT-confirmed answers on the
+earlier generated and fixture sets.
+
+The [ground at-most rule](#item-1229-at-most-restrictions-at-constants) now derives the
+merge where its premises hold. Four regressions exercise named and anonymous values,
+disjunctive premises and a merge conditional on the queried class. Further tests cover a
+qualifier entailed under a query, a maximum above one, an alternative in the head of a
+guarded restriction and a restriction on a successor of a constant. All 568 previously
+incorrect generated answers now finish and agree with HermiT, including all four
+configurations of the qualified case missed by the narrower containment. The
+[agreement report](../../benchmarks/el-classification/RESULTS.md#rooted-at-most-agreement)
+records coverage and the distribution of derived conclusions. Item 1229 stays open
+for the completeness argument for ground counting and late Pred replay.
 
 Item 1231 records a loss of rooted runs. A fact that holds in a context only under the
 queried class and concerns an individual reached from another individual must reach the
@@ -5394,34 +5397,40 @@ without link-time optimization. Item 1075 follows these equalities.
 
 #### Item 1229: at-most restrictions at constants
 
-The at-most rule of a run that counts takes a holder of `≤n S.B` at `x` and counts the
-neighbours of `x` over S among its successor terms and its predecessor `y`, as the journal's
-rule does for the element of a context. In a rooted run the context of a singleton `N_u`
-has `x ≈ u`, so the rule applies the at-most restrictions of an individual there, over the
-successor terms that its assertions and its restrictions give. No rule applies them
-anywhere else. The rule takes no holder at a constant in a context whose `x` is another
-element, no holder at a successor term of a constant, and no neighbour of `x` that only a
-role atom to a constant gives, and Hyper at a constant in the root applies inequalities but
-not at-most restrictions. The literals of a rooted run also have no equality `f(u) ≈ g(u)`
-between two successor terms of one constant. A merge in the context of `N_u` can give a
-ground consequence, such as an equality of two constants, that no rule carries to the root
-or to the other contexts that hold the constants. A rooted run that counts can therefore
-report a complete answer that leaves out an entailed subsumption. An individual with at
-most one r-value and two asserted r-values `b` and `c` makes `b ≈ c`, and a class whose
-p-value is `b` then has a p-value in every class of `c`, which the run misses. The same
-holds for a named and an anonymous value, for a case of a disjunction that the at-most
-restriction refutes into an equality, and for such a case under a queried class whose
-context reasons about the individual as a constant.
+Without ground counting, the context of a singleton can merge two values of its
+individual without another context learning the equality. For example, suppose that
+`a` has at most one r-value and both `r(a,b)` and `r(a,c)` hold. If every member of a queried
+class has `b` as a p-value, each has a p-value in every class that contains `c`. Counting only over
+the local element `x` can miss that subsumption.
 
-The loss is neither contained nor repaired, and the Outcome records the measured attempts
-at a containment.
+A rooted run that counts also instantiates the at-most clause at a constant or a
+successor term of a constant. It uses maximal premises in the same context and respects
+the rooted cut on clauses with a selected ground body. For a holder of
+`≤n r.B` at term `u`, it takes one qualified edge from `u` to each of `n+1` syntactically
+distinct terms. Its conclusion contains the disjunction of all pairwise equalities of
+those terms. In every interpretation at least two of the values coincide. When a
+conclusion has several alternative equalities, a unit equality already held in this
+context can replace a successor term of a constant by its named value. A pair that
+then coincides already satisfies the conclusion. When the restriction has other class
+disjuncts, the conclusion keeps those alternatives at `u`.
+For example, a maximum of two over three values gives three alternative equalities.
+Choosing any one pair unconditionally would change the meaning.
 
-The repair is an extension of the calculus. The at-most rule would apply at a constant in
-every context that holds the restriction there and at the successor terms of constants,
-count role atoms to constants beside the successor terms, and take equalities between
-successor terms of one constant, and a context's ground equalities would reach the root
-and the other contexts that hold the constants. Each part needs its own argument within the
-proof that item 823 asks for, so item 1229 stays open for it.
+Qualification combines a matching edge, including one on a subrole, with a premise
+for the filler at its other end. Either arrival can complete the inference. Likewise
+a new holder can enumerate its edges, and a new edge can complete a group for an
+existing holder. Each inference retains all premise bodies and all head literals except
+the resolved occurrences. A merge obtained under a query assumption therefore remains
+in its context. A merge from unconditional root premises is available through the
+ordinary root fact delivery and equality rules. These rules already represent and
+rewrite equalities between two successor terms of constants.
+
+The rule draws its terms from the premises and creates neither individuals nor nested
+successor terms. It uses the existing limits on group width, subset count and product
+payload. Scratch space and stored products count against the memory budget. The
+diagnostic switch `SPARKLES_ROOTED_ATMOST=0` disables these additional inferences.
+Relative completeness under the rooted calculus's selection and delivery restrictions,
+and the proof for all orders of late Pred replay, remain part of item 1229.
 
 #### Item 1075: binary splitting over disjunctive equalities of constants
 

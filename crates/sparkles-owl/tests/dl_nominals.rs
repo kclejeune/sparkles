@@ -60,6 +60,10 @@ fn rooted(body: &str, counting: bool, asked: &[(&str, &str)]) -> Classification 
         assert_eq!(out.stats.tier, Tier::Disjunctive);
         assert!(out.stats.clauses > 0, "Tier D took no clause");
         assert!(out.complete);
+        if counting {
+            assert!(!out.stats.dl_counting_over && !out.stats.dl_rooted_over);
+            assert!(!out.stats.dl_rooted_declined);
+        }
         let got = asked
             .iter()
             .map(|(a, b)| out.taxonomy.is_subclass(&c(a), &c(b)))
@@ -76,8 +80,12 @@ fn rooted(body: &str, counting: bool, asked: &[(&str, &str)]) -> Classification 
 
 /// Checks the subsumptions that hold and those that do not, on a consistent ontology.
 fn check(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) {
+    check_subsumptions(body, false, yes, no);
+}
+
+fn check_subsumptions(body: &str, counting: bool, yes: &[(&str, &str)], no: &[(&str, &str)]) {
     let asked: Vec<(&str, &str)> = yes.iter().chain(no).copied().collect();
-    let out = rooted(body, false, &asked);
+    let out = rooted(body, counting, &asked);
     assert_eq!(out.consistency, Consistency::Consistent);
     for (a, b) in yes {
         assert!(
@@ -5763,4 +5771,119 @@ fn split_lifecycle_strict_error_invalidation_incremental_reuse_and_inclusive_bou
         assert!(r2.taxonomy.is_subclass(&c("A"), &c("D")));
         assert!(r2.taxonomy.is_subclass(&c("E"), &c("F")));
     }
+}
+
+#[test]
+fn an_at_most_restriction_at_an_individual_merges_its_named_values() {
+    check_subsumptions(
+        "ClassAssertion(ObjectMaxCardinality(1 :r0 owl:Thing) :a2)
+         ObjectPropertyAssertion(:r0 :a2 :a3)
+         ObjectPropertyAssertion(:r0 :a2 :a4)
+         ClassAssertion(:C1 :a4)
+         SubClassOf(:K ObjectHasValue(:p :a3))
+         SubClassOf(ObjectSomeValuesFrom(:p :C1) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn an_at_most_restriction_at_an_individual_merges_a_named_and_an_anonymous_value() {
+    check_subsumptions(
+        "ClassAssertion(ObjectMaxCardinality(1 :r0 owl:Thing) :a2)
+         ObjectPropertyAssertion(:r0 :a2 :a3)
+         ClassAssertion(:C4 :a2)
+         SubClassOf(:C4 ObjectSomeValuesFrom(:r0 :C1))
+         SubClassOf(:K ObjectHasValue(:p :a3))
+         SubClassOf(ObjectSomeValuesFrom(:p :C1) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn an_at_most_restriction_at_an_individual_refutes_a_case_into_an_equality() {
+    check_subsumptions(
+        "SubClassOf(:C4 ObjectMinCardinality(2 :r0 owl:Thing))
+         ClassAssertion(ObjectUnionOf(ObjectOneOf(:a0) :C4) :a2)
+         ClassAssertion(ObjectMaxCardinality(1 :r0 owl:Thing) :a2)
+         ClassAssertion(:C1 :a2)
+         SubClassOf(:K ObjectHasValue(:p :a0))
+         SubClassOf(ObjectSomeValuesFrom(:p :C1) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn an_at_most_restriction_at_an_individual_refutes_a_case_under_a_class() {
+    check_subsumptions(
+        "ObjectPropertyAssertion(:r5 :a3 :a2)
+         SubClassOf(:K ObjectSomeValuesFrom(:p ObjectIntersectionOf(ObjectOneOf(:a3) ObjectAllValuesFrom(:r5 ObjectUnionOf(:C4 :C5)))))
+         SubClassOf(:C4 ObjectMinCardinality(2 :r0 owl:Thing))
+         ClassAssertion(ObjectMaxCardinality(1 :r0 owl:Thing) :a2)
+         SubClassOf(:K ObjectHasValue(:t :a2))
+         SubClassOf(:L ObjectHasValue(:t :a2))
+         SubClassOf(ObjectSomeValuesFrom(:t :C5) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K"), ("L", "Ans")],
+    );
+}
+
+// A counterexample to A ⊑ B would have to be c. It would qualify for r at a
+// under that assumption, making it equal to the already qualifying B-instance b.
+#[test]
+fn a_conditional_existential_qualifies_a_named_neighbour() {
+    check_subsumptions(
+        "ClassAssertion(ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:s :Q)) :a)
+         ObjectPropertyAssertion(:r :a :b)
+         ObjectPropertyAssertion(:r :a :c)
+         ClassAssertion(:B :b)
+         ObjectPropertyAssertion(:s :b :d)
+         ClassAssertion(:Q :d)
+         SubClassOf(:A ObjectSomeValuesFrom(:s :Q))
+         SubClassOf(owl:Thing ObjectUnionOf(ObjectOneOf(:c) :B))",
+        true,
+        &[("A", "B")],
+        &[("B", "A")],
+    );
+}
+
+#[test]
+fn a_ground_maximum_of_two_derives_the_disjunction_of_all_three_pairs() {
+    let body = "ClassAssertion(ObjectMaxCardinality(2 :r) :a)
+                ObjectPropertyAssertion(:r :a :b)
+                ObjectPropertyAssertion(:r :a :c)
+                ObjectPropertyAssertion(:r :a :d)
+                ClassAssertion(:C :c)
+                SubClassOf(:K ObjectHasValue(:p :b))
+                SubClassOf(ObjectSomeValuesFrom(:p :C) :Ans)";
+    let open = rooted(body, true, &[("K", "Ans")]);
+    assert_eq!(open.consistency, Consistency::Consistent);
+    assert!(!open.taxonomy.is_subclass(&c("K"), &c("Ans")));
+    check_subsumptions(
+        &format!("{body} DifferentIndividuals(:d :b) DifferentIndividuals(:d :c)"),
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn a_counted_clause_at_an_individual_preserves_its_class_disjunct() {
+    check_subsumptions(
+        "SubClassOf(ObjectMinCardinality(2 :r) :C)
+         ObjectPropertyAssertion(:r :a :b)
+         ObjectPropertyAssertion(:r :a :c)
+         DifferentIndividuals(:b :c)
+         SubClassOf(:K ObjectHasValue(:p :a))
+         SubClassOf(ObjectSomeValuesFrom(:p :C) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
 }

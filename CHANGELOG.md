@@ -2,19 +2,23 @@
 
 ## Unreleased
 
-### A closure check of the Pred replay and a recorded loss of rooted runs that count
+### Rooted counting applies at-most restrictions at individuals
 
-Unit tests now check after every saturation that Pred, run again with every clause a
-successor sent and every restriction that reaches the successor, gives nothing that the
-context does not already hold. With item 1229's replay of late restrictions the check
-finds no context open on the generated and fixture sets of rooted runs and runs that count,
-and with `SPARKLES_COUNTING_LATE_UNIT=0` it finds the inferences that the late restrictions
-left out. A rooted run with `Limits::counting` applies an individual's at-most restrictions
-only in the context of its singleton, and the ground equalities that a merge there gives
-reach no other context, so such a run can still miss a merge of two values of an individual
-and report a complete answer. The F24 spec records the loss and the measured attempts at
-containing it, and roadmap item 1229 stays open for the proof of the replay, the
-containment and the repair.
+The opt-in rooted counting classifier now derives equalities between the values of a
+named individual or a successor term of an individual wherever the restriction, edges
+and qualifiers hold together. A query can use a merge that depends on its class without
+exporting that equality as an unconditional fact. This repairs missing subsumptions in
+the generated at-most and qualified at-most cases and preserves the consistent answers
+for compound qualifiers from item 897.
+
+### A closure check of the Pred replay
+
+Unit tests check after saturation that Pred, run again with every clause a successor
+sent and every restriction that reaches it, gives nothing that the context does not
+already hold. With item 1229's replay of late restrictions the check found no open
+context on the generated and fixture sets. Disabling the replay exposed inferences
+that the late restrictions left out. Item 1229 tracks the proof for all arrival orders
+and for ground counting under the rooted selection and delivery rules.
 
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 
