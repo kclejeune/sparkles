@@ -1,0 +1,27 @@
+{
+  "worker": "bx_7ghn4kdv",
+  "parent": "04e033715f180b644af3194e8e30021a45294020",
+  "date": "2026-11-28",
+  "checks": {
+    "fmt": "ok (cargo fmt --all --check)",
+    "clippy_core": "ok (-p sparkles-core --all-targets -- -D warnings)",
+    "clippy_server": "ok (-p sparkles-server --all-targets -- -D warnings)",
+    "service_enhancer": "ok (34 passed, 1 ignored)",
+    "service_cache_alloc": "ok (2 passed)",
+    "svccache_tests": "ok (13 passed)",
+    "cursor_service_tests": "ok (8 passed)",
+    "cursor_service_integration": "ok (27 passed)",
+    "enhancer_unit_tests": "ok (7 passed)"
+  },
+  "static_checks": {
+    "git_status": "ok (6 modified files)",
+    "git_diff_check": "ok (no whitespace errors)",
+    "check_doc_links": "ok",
+    "check_doc_paths": "ok",
+    "bench_docs_check": "ok",
+    "api_compat_check": "ok",
+    "client_types_check": "ok"
+  },
+  "advisor_consulted": true,
+  "findings_fixed": ["P2-lateral-leases", "P2-bulk-split", "P3-nested-term-budget", "P3-G10-wording", "P3-LIMIT-tests"]
+}

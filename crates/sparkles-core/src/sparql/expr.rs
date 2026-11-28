@@ -2545,12 +2545,30 @@ pub fn is_extension(iri: &str) -> bool {
         || iri.starts_with(AFN)
         || iri.starts_with(super::cdt::NS)
         || iri.starts_with(crate::vector::NS)
+        || iri == super::svcfn::CACHE_RM
         || (cfg!(feature = "geo")
             && (iri.starts_with(crate::geo::vocab::GEOF)
                 || iri.starts_with(crate::geo::vocab::SPATIALF)))
 }
 
 fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
+    if iri == super::svcfn::CACHE_RM {
+        // the planner refuses a query without the right; this never removes for one
+        if !ctx.service_cache_mgmt || args.len() > 1 {
+            return Err(TypeError);
+        }
+        let id = match args.len() {
+            0 => None,
+            _ => match Num::of(&*arg(args, 0, row, ctx)?)? {
+                Num::Integer(n) => Some(i64::from(n)),
+                _ => return Err(TypeError),
+            },
+        };
+        let n = super::svcfn::cache_rm(ctx, id);
+        return Ok(Val::V(Value::Integer(
+            i64::try_from(n).unwrap_or(i64::MAX).into(),
+        )));
+    }
     #[cfg(feature = "geo")]
     if let Some(r) = crate::geo::functions::call(iri, args, row, ctx) {
         return r;
@@ -2910,8 +2928,13 @@ fn dynamic_call(args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         return cast(&NamedNode::new_unchecked(&*iri), x, ctx);
     }
     // the dynamic functions themselves are not called this way, so that a call cannot
-    // nest without end
-    if !is_extension(&iri) || iri.ends_with("#apply") || iri.ends_with("#eval") {
+    // nest without end, and neither is se:cacheRm, whose right the planner checks on
+    // the calls it can see
+    if !is_extension(&iri)
+        || iri.ends_with("#apply")
+        || iri.ends_with("#eval")
+        || &*iri == super::svcfn::CACHE_RM
+    {
         return Err(TypeError);
     }
     extension(&iri, rest, row, ctx)

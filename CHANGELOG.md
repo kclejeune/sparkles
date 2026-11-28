@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### SERVICE enhancer cache slices, disk tier, management functions and parallel requests
+
+The cache of remote SERVICE results keys an entry without the outermost LIMIT and OFFSET
+of its request, so a request whose solutions all lie among an entry's rows is answered
+without a request. A short response is not taken as the end of the result, since an
+endpoint may cap its responses. Entries expire after `--service-cache-ttl` seconds
+(3,600), which changes the earlier behaviour of keeping them until eviction. The server
+keeps entries per credential with its OIDC scopes, endpoint, dataset branch and graph
+view, where it used to key them by principal and endpoint. A persistent dataset whose
+`service-cache.json` sets `disk` keeps its entries in `service-cache/` across restarts,
+under a cap and least recently used eviction, in files of the new kind `service-cache`
+(version 1) that hold neither the caller's scope nor credentials. A read-only server
+leaves the directory alone. Jena's `se:cacheLs` lists a caller's own entries, and
+`se:cacheRm` removes them for callers with `admin` on the dataset through the request's
+endpoint when the server runs with `--service-cache-mgmt`. `parallel+n` keeps up to `n`
+requests of a loop in flight, capped by `--service-parallel-max` (4), with the answer of
+one request at a time. The requests of a wave share the outbound time that is left, and
+admit their solutions as they arrive. A failure once the outbound time is spent now
+fails a remote loop under SILENT too, and the eager remote loop charges its answers until
+it joins them. This completes roadmap item 38.
+
+A response cut short by the request's own LIMIT is kept only when it ends at that limit,
+so an endpoint that sends more rows than it was asked for leaves no entry. Under graph
+guards the entries of a view are kept apart from those of every other view. A removal
+reaches the disk before the memory tier, a lookup between the two cannot bring the entry
+back, and a removal that the disk could not sync fails the query. SERVICE caching now
+applies in the WHERE clause of an UPDATE, which shares the store's cache, and
+`se:cacheRm` works there with the same right. A query that calls `se:cacheRm` inside
+EXISTS is refused at planning unless management is enabled, and neither function's
+results nor a LATERAL that calls them are kept in the query result cache. Listings show
+only http and https endpoints, without user information, query string and fragment, and
+every other endpoint as `urn:x-sparkles:unlisted-endpoint`. A wave of parallel requests
+that runs out of outbound time fails under SILENT as one request does, and the shares of
+a request's time keep one ledger. Entries read back from disk are admitted against the
+query's memory before they are decoded. The Fuseki converter reports a dataset that turns
+`enableMgmt` off under a server that turns it on, since Sparkles would allow it.
+
+- **Rust compatibility.** `QueryOptions`, `StoreOptions` and `OutboundPolicy` have new
+  public fields, so a literal that names every field needs them. `ServiceCache::get`
+  takes the request's `Slice`, and `ServiceCache::put` takes the key's `Parts` and the
+  `Slice` of the response. `ServiceCache::remove_in_scope` returns `Result<u64>`, and
+  `ServiceCache::clear`, `DiskTier::remove` and `DiskTier::clear` return
+  `std::io::Result<()>`. `DiskTier::remove_in_scope` is no longer public, and
+  `DiskTier::resize` and `DiskTier::retire` are new. `svccache` exports `CACHE_LS`,
+  `CACHE_RM` and `UNLISTED_ENDPOINT`, and `StoreOptions::service_cache_files` is a new
+  public field.
+
 ### Entity and axiom reads from the kept classification (item 588)
 
 `GET /$/ontology/{ds}/entity` and `GET /$/ontology/{ds}/axioms`, the library's wire `entity`

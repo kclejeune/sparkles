@@ -624,7 +624,7 @@ fn a_service_is_cached_only_when_drained() {
     let expected = eager(&snap, &q, &opts()).unwrap();
     assert_eq!(ep.calls(), 1);
     let service = &s.result_cache().service;
-    service.clear();
+    service.clear().unwrap();
     // stopped after one batch
     {
         let mut cursor = select_cursor(snap.clone(), &q, &cached, &strict(1)).unwrap();
@@ -1196,7 +1196,7 @@ fn malformed_late_head_responses_never_emit_partial_rows_or_cache() {
     for (label, body) in cases {
         let payload = body.to_vec();
         let ep = Endpoint::start(Arc::new(move || (200, vec![Part::Bytes(payload.clone())])));
-        s.result_cache().service.clear();
+        s.result_cache().service.clear().unwrap();
 
         let silent_q = format!(
             "SELECT ?s {{ SERVICE SILENT <cache:{}> {{ ?s ?p ?o }} }}",
@@ -1301,7 +1301,7 @@ fn silent_service_enforces_row_budgets_per_row_and_cache_semantics() {
     );
 
     // Mid-stream failure never populates the service cache.
-    s.result_cache().service.clear();
+    s.result_cache().service.clear().unwrap();
     let before = broken.calls();
     assert_eq!(
         streamed(&snap, &q_broken, &cached, &strict(1)).unwrap().0,
@@ -1320,7 +1320,7 @@ fn silent_service_enforces_row_budgets_per_row_and_cache_semantics() {
         "SELECT ?s ?o {{ SERVICE SILENT <cache:{}> {{ ?s ?p ?o }} }}",
         ok.url
     );
-    s.result_cache().service.clear();
+    s.result_cache().service.clear().unwrap();
     let (first_rows, _) = streamed(&snap, &q_ok, &cached, &strict(2)).unwrap();
     assert_eq!(first_rows.len(), 9);
     assert_eq!(ok.calls(), 1);

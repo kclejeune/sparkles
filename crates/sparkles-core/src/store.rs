@@ -40,6 +40,8 @@ mod aggregates;
 pub mod definitions;
 mod deltas;
 mod describe;
+mod service_cache;
+pub use service_cache::{SERVICE_CACHE_FILE, ServiceCacheSettings, ServiceCacheStatus};
 mod diff;
 mod diff_groups;
 mod embed;
@@ -2207,6 +2209,17 @@ pub struct StoreOptions {
     /// Budget for cached remote SERVICE results (`SERVICE <cache:…>`); 0 disables
     /// that cache.
     pub service_cache_bytes: u64,
+    /// How long a cached remote SERVICE result answers after it was stored, unless the
+    /// dataset's `service-cache.json` says otherwise (`Duration::ZERO`: until it is
+    /// evicted).
+    pub service_cache_ttl: std::time::Duration,
+    /// The disk a persistent dataset's SERVICE cache may take when its
+    /// `service-cache.json` sets `disk` without `diskMb` (0: no disk tier).
+    pub service_cache_disk_bytes: u64,
+    /// Persistent stores keep, read, evict and remove the files of the SERVICE cache's
+    /// disk tier; `false` leaves `service-cache/` as it is, reads none of it and refuses
+    /// a new setting (read-only servers).
+    pub service_cache_files: bool,
     pub union_default_graph: bool,
     /// How aggregates treat errors and values that are not strings in queries that do
     /// not choose, the server's default (see [`crate::sparql::AggregateErrors`]). A
@@ -2428,6 +2441,9 @@ impl Default for StoreOptions {
             result_cache_bytes: 256 << 20,
             result_cache_min_ms: 1.0,
             service_cache_bytes: 64 << 20,
+            service_cache_ttl: crate::sparql::svccache::DEFAULT_TTL,
+            service_cache_disk_bytes: 256 << 20,
+            service_cache_files: true,
             union_default_graph: false,
             aggregate_errors: Default::default(),
             build: BuildOptions::default(),
@@ -3823,6 +3839,7 @@ impl Store {
             opts,
         };
         *store.compaction.settings.lock() = compaction::read_settings(root)?;
+        store.apply_service_cache_settings(&service_cache::read_settings(root)?)?;
         // the merges this store made, and the holds branches place on it, before anything
         // is collected
         if let Some(set) = store.branching.set() {
@@ -6140,14 +6157,16 @@ impl Store {
     }
 
     fn result_cache_for(opts: &StoreOptions) -> Arc<crate::sparql::cache::ResultCache> {
-        match &opts.shared {
+        let c = match &opts.shared {
             Some(s) => s.result_cache(opts.result_cache_min_ms),
             None => Arc::new(crate::sparql::cache::ResultCache::with_service(
                 opts.result_cache_bytes,
                 opts.result_cache_min_ms,
                 opts.service_cache_bytes,
             )),
-        }
+        };
+        c.service.set_ttl(opts.service_cache_ttl);
+        c
     }
 
     pub fn cache(&self) -> &Arc<BlockCache> {
@@ -9020,11 +9039,14 @@ impl WriteTxn<'_> {
     /// Snapshot view including this transaction's uncommitted changes. It keeps the
     /// committed version number, but marks the view non-cacheable and disables its
     /// result cache. Its data differs from that committed identity, so result and
-    /// projection caches must neither be read nor populated through this view.
+    /// projection caches must neither be read nor populated through this view. The
+    /// cache of remote SERVICE results, which holds no local data, is the store's.
     pub fn view(&self) -> Snapshot {
         SnapshotBuilder::of_base(&self.base)
             .cacheable(false)
-            .results(Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)))
+            .results(Arc::new(
+                crate::sparql::cache::ResultCache::sharing_service(&self.base.results),
+            ))
             .delta(self.delta.clone())
             .text(match &self.base.text {
                 Some(t) if self.is_dirty() => Some(Arc::new(

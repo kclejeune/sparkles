@@ -103,6 +103,21 @@ fn settings_have_get_set_and_reset() {
     retention.reset().unwrap();
     assert_eq!(retention.get().retention.keep_commits, None);
 
+    let svc = ds.settings().service_cache();
+    assert!(svc.get().unwrap().is_default());
+    svc.set(sparkles::store::ServiceCacheSettings {
+        disk: true,
+        disk_mb: Some(2),
+        ttl_seconds: Some(30),
+    })
+    .unwrap();
+    let st = svc.status().unwrap();
+    assert!(st.disk);
+    assert_eq!((st.disk_capacity_bytes, st.ttl_seconds), (2 << 20, 30));
+    svc.reset().unwrap();
+    assert!(svc.get().unwrap().is_default());
+    assert!(!svc.status().unwrap().disk);
+
     let describe = ds.settings().describe();
     describe.set(describe.get()).unwrap();
     describe.reset().unwrap();

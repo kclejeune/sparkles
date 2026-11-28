@@ -213,6 +213,7 @@ fn impurity_with(
     match e {
         Expr::Exists(spec) => exists(spec),
         Expr::Call(Func::Registered(_), _) => Some("application function"),
+        Expr::Call(Func::Ext(iri), _) if iri == super::svcfn::CACHE_RM => Some("side effects"),
         Expr::Call(Func::Ext(iri), args) => {
             let afn = iri.strip_prefix(super::expr::AFN);
             match afn {

@@ -130,6 +130,9 @@ pub(super) struct Converter<'a> {
     pub(super) server_query_timeout: Option<f64>,
     pub(super) server_update_timeout: Option<f64>,
     pub(super) server_union: Option<bool>,
+    /// whether the server's context turns the service enhancer's management on, which
+    /// the server's contexts settle before any dataset's is read
+    pub(super) server_mgmt: bool,
     pub(super) server_aggregate_errors: Option<sparkles::sparql::AggregateErrors>,
     /// union-default-graph settings found in the contexts read since the last drain
     pub(super) local_union: Vec<(String, bool)>,
@@ -150,6 +153,7 @@ pub fn convert(inputs: &Inputs, mode: Mode) -> Result<Plan> {
         server_query_timeout: None,
         server_update_timeout: None,
         server_union: None,
+        server_mgmt: false,
         server_aggregate_errors: None,
         local_union: Vec::new(),
         local_aggregate_errors: Vec::new(),
@@ -496,6 +500,44 @@ impl Converter<'_> {
                         }
                     }
                 }
+                // Jena's service enhancer management switch (roadmap item 38). The
+                // converter never turns management on: the server flag does, for every
+                // dataset, so only a server-wide `true` has an equivalent, which the
+                // report names, and a dataset's `false` under it cannot be kept
+                "enableMgmt" => match (value.trim(), scope) {
+                    ("false" | "0", Scope::Local) if self.server_mgmt => self.report.unsupported(
+                        place,
+                        format!(
+                            "{name} false for one dataset under the server's true: \
+                             --service-cache-mgmt turns se:cacheRm on for every dataset, so \
+                             this dataset would allow it"
+                        ),
+                    ),
+                    ("false" | "0", _) => self.report.converted(
+                        place,
+                        format!("{name} false (se:cacheRm is refused, the default)"),
+                    ),
+                    ("true" | "1", Scope::Server) => {
+                        self.server_mgmt = true;
+                        self.report.approximated(
+                            place,
+                            format!(
+                                "{name} true: start the server with --service-cache-mgmt, \
+                                 which lets callers with admin on a dataset call se:cacheRm"
+                            ),
+                        )
+                    }
+                    ("true" | "1", Scope::Local) => self.report.unsupported(
+                        place,
+                        format!(
+                            "{name} true for one dataset: --service-cache-mgmt turns \
+                             se:cacheRm on for every dataset, so it is left off"
+                        ),
+                    ),
+                    _ => self
+                        .report
+                        .unsupported(place, format!("{name} \"{value}\" is not true or false")),
+                },
                 // the JVM binding's `Sparkles.AGGREGATE_ERRORS` symbol (roadmap item 1064)
                 "aggregateErrors" => {
                     match value.trim().parse::<sparkles::sparql::AggregateErrors>() {

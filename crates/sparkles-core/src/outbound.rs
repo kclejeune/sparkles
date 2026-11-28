@@ -58,6 +58,9 @@ pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 4 * DEFAULT_MAX_RESPONSE_BYTES;
 pub const DEFAULT_SERVICE_BULK_SIZE: usize = 10;
 /// The most inputs per request of a bulk SERVICE, as in Jena.
 pub const DEFAULT_SERVICE_BULK_MAX: usize = 100;
+/// The most requests of one `SERVICE <loop:parallel+n:…>` in flight at once; `parallel+n`
+/// is capped to it, and `parallel` alone takes it.
+pub const DEFAULT_SERVICE_PARALLEL_MAX: usize = 4;
 /// Default time all the outbound requests of one SPARQL request may take, summed.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(4 * 60);
 
@@ -263,6 +266,9 @@ pub struct OutboundPolicy {
     /// The most inputs per request of any bulk SERVICE; `bulk+n` is capped to it (Jena's
     /// `serviceBulkMaxBindingCount`).
     pub service_bulk_max: usize,
+    /// The most requests a `SERVICE <loop:parallel+n:…>` keeps in flight at once;
+    /// `parallel+n` is capped to it and `parallel` alone takes it.
+    pub service_parallel_max: usize,
     pub resolver: Arc<dyn Resolver>,
     /// How the requests check the certificates of `https` servers. The default trusts
     /// the system's roots and verifies every certificate.
@@ -321,6 +327,7 @@ impl Default for OutboundPolicy {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             service_bulk_size: DEFAULT_SERVICE_BULK_SIZE,
             service_bulk_max: DEFAULT_SERVICE_BULK_MAX,
+            service_parallel_max: DEFAULT_SERVICE_PARALLEL_MAX,
             resolver: Arc::new(SystemResolver),
             tls: TlsOptions::default(),
         }
@@ -340,6 +347,7 @@ impl fmt::Debug for OutboundPolicy {
             .field("request_timeout", &self.request_timeout)
             .field("service_bulk_size", &self.service_bulk_size)
             .field("service_bulk_max", &self.service_bulk_max)
+            .field("service_parallel_max", &self.service_parallel_max)
             .field("tls", &self.tls)
             .finish_non_exhaustive()
     }
@@ -478,12 +486,41 @@ impl Failure {
 ///
 /// [`max_request_bytes`]: OutboundPolicy::max_request_bytes
 /// [`request_timeout`]: OutboundPolicy::request_timeout
+///
+/// A request that runs beside others of the same SPARQL request can take a
+/// [`share`](Self::share) of the time left: a budget of its own whose time is reserved
+/// in this one until the share ends, so that the requests in flight together cannot take
+/// more time than this budget has, and whose bytes this budget counts. The time spent
+/// and the time reserved change together under one lock, so a reader never sees a
+/// share's reservation released before its time is spent, and two shares taken at once
+/// never reserve the same time. A single-request dispatch (one without a share) draws
+/// on the parent directly and snapshots the remaining time at dispatch: concurrent
+/// direct dispatches on the same parent can each see the full time left and together
+/// exceed it. Use shares for concurrent requests that must stay within a cumulative
+/// limit.
 #[derive(Debug)]
 pub struct RequestBudget {
     max_bytes: u64,
     max_time: Duration,
     bytes: AtomicU64,
-    nanos: AtomicU64,
+    time: Mutex<Ledger>,
+    /// for a share, the budget it was taken from, with the nanoseconds it reserved there
+    parent: Option<(Arc<RequestBudget>, u64)>,
+}
+
+/// The time of a [`RequestBudget`], in nanoseconds.
+#[derive(Debug, Default)]
+struct Ledger {
+    /// taken by requests that ended, and by shares that ended
+    spent: u64,
+    /// reserved by shares in flight
+    reserved: u64,
+}
+
+impl Ledger {
+    fn used(&self) -> u64 {
+        self.spent.saturating_add(self.reserved)
+    }
 }
 
 impl RequestBudget {
@@ -493,42 +530,80 @@ impl RequestBudget {
             max_bytes: policy.max_request_bytes,
             max_time: policy.request_timeout,
             bytes: AtomicU64::new(0),
-            nanos: AtomicU64::new(0),
+            time: Mutex::new(Ledger::default()),
+            parent: None,
         })
+    }
+
+    /// A share of at most `want` of the time this budget has left, reserved here until
+    /// the share is dropped, when the time it took is spent here instead. `None` when no
+    /// time is left. The share's bytes are this budget's.
+    pub(crate) fn share(self: &Arc<Self>, want: Duration) -> Option<Arc<RequestBudget>> {
+        let want = u64::try_from(want.as_nanos()).unwrap_or(u64::MAX);
+        let max = u64::try_from(self.max_time.as_nanos()).unwrap_or(u64::MAX);
+        let take = {
+            let mut time = self.time.lock();
+            let take = want.min(max.saturating_sub(time.used()));
+            time.reserved = time.reserved.saturating_add(take);
+            take
+        };
+        (take > 0).then(|| {
+            Arc::new(RequestBudget {
+                max_bytes: self.max_bytes,
+                max_time: Duration::from_nanos(take),
+                bytes: AtomicU64::new(0),
+                time: Mutex::new(Ledger::default()),
+                parent: Some((self.clone(), take)),
+            })
+        })
+    }
+
+    /// The budget that counts the bytes: this one, or the one a share was taken from.
+    fn root(&self) -> &RequestBudget {
+        match &self.parent {
+            Some((p, _)) => p.root(),
+            None => self,
+        }
+    }
+
+    /// The total time of the SPARQL request's outbound requests.
+    fn total_time(&self) -> Duration {
+        self.root().max_time
     }
 
     /// Bytes received so far.
     pub fn bytes(&self) -> u64 {
-        self.bytes.load(Ordering::Relaxed)
+        self.root().bytes.load(Ordering::Relaxed)
     }
 
     /// Time the requests took so far, summed.
     pub fn time(&self) -> Duration {
-        Duration::from_nanos(self.nanos.load(Ordering::Relaxed))
+        Duration::from_nanos(self.time.lock().spent)
     }
 
-    fn remaining_time(&self) -> Duration {
-        self.max_time.saturating_sub(self.time())
+    /// The time the budget has left, without what its shares in flight reserve.
+    pub fn remaining_time(&self) -> Duration {
+        let used = self.time.lock().used();
+        self.max_time.saturating_sub(Duration::from_nanos(used))
     }
 
     fn remaining_bytes(&self) -> u64 {
-        self.max_bytes.saturating_sub(self.bytes())
+        let root = self.root();
+        root.max_bytes.saturating_sub(root.bytes())
     }
 
     fn spend_time(&self, d: Duration) {
         let n = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-        let _ = self
-            .nanos
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
-                Some(t.saturating_add(n))
-            });
+        let mut time = self.time.lock();
+        time.spent = time.spent.saturating_add(n);
     }
 
     /// Count `n` more bytes; the exceeded budget once past the total.
     fn spend_bytes(&self, n: u64) -> Result<(), crate::error::Budget> {
-        let used = self.bytes.fetch_add(n, Ordering::Relaxed).saturating_add(n);
-        if used > self.max_bytes {
-            return Err(self.exceeded(used));
+        let root = self.root();
+        let used = root.bytes.fetch_add(n, Ordering::Relaxed).saturating_add(n);
+        if used > root.max_bytes {
+            return Err(root.exceeded(used));
         }
         Ok(())
     }
@@ -538,6 +613,18 @@ impl RequestBudget {
             kind: crate::error::BudgetKind::OutboundBytes,
             limit: self.max_bytes,
             requested,
+        }
+    }
+}
+
+impl Drop for RequestBudget {
+    /// A share gives its reservation back and spends the time it took, in one step.
+    fn drop(&mut self) {
+        if let Some((p, take)) = &self.parent {
+            let took = self.time.get_mut().spent;
+            let mut time = p.time.lock();
+            time.spent = time.spent.saturating_add(took);
+            time.reserved = time.reserved.saturating_sub(*take);
         }
     }
 }
@@ -742,7 +829,7 @@ impl OutboundPolicy {
         let left = budget.remaining_time();
         if left.is_zero() {
             return Err(InnerSendFailure::TimedOutBeforeSend(out_of_time(
-                budget.max_time,
+                budget.total_time(),
             )));
         }
         let failed = Arc::new(Mutex::new(None));
@@ -782,7 +869,7 @@ impl OutboundPolicy {
         let remaining_now = own_now.min(left_now);
         // the message of a timeout: this request's, or the whole SPARQL request's
         let late = if left_now < own_now {
-            out_of_time(budget.max_time)
+            out_of_time(budget.total_time())
         } else {
             timed_out(remaining_now)
         };
@@ -1489,6 +1576,90 @@ pub mod probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A share reserves its time in the budget it was taken from until it ends, so a
+    /// second user of the budget sees only what is left, and the time a share took is
+    /// spent there once it ends. Its bytes are the budget's.
+    #[test]
+    fn shares_reserve_their_time_and_count_their_bytes_in_the_budget() {
+        let b = RequestBudget::new(&OutboundPolicy {
+            request_timeout: Duration::from_secs(10),
+            max_request_bytes: 100,
+            ..Default::default()
+        });
+        let a = b.share(Duration::from_secs(4)).unwrap();
+        assert_eq!(a.remaining_time(), Duration::from_secs(4));
+        assert_eq!(b.remaining_time(), Duration::from_secs(6));
+        // a second user takes what is left, and no more
+        let c = b.share(Duration::from_secs(8)).unwrap();
+        assert_eq!(c.remaining_time(), Duration::from_secs(6));
+        assert!(b.remaining_time().is_zero());
+        assert!(b.share(Duration::from_secs(1)).is_none(), "nothing is left");
+        // bytes are the budget's, for every share
+        a.spend_bytes(60).unwrap();
+        assert_eq!((b.bytes(), c.bytes()), (60, 60));
+        assert!(c.spend_bytes(50).is_err(), "past the budget's bytes");
+        // a share that ends gives back what it did not take
+        a.spend_time(Duration::from_secs(1));
+        drop(a);
+        assert_eq!(b.remaining_time(), Duration::from_secs(3));
+        assert_eq!(b.time(), Duration::from_secs(1));
+        drop(c);
+        assert_eq!(b.remaining_time(), Duration::from_secs(9));
+        assert_eq!(b.total_time(), Duration::from_secs(10));
+    }
+
+    /// Shares that spend all the time they reserve leave the time used unchanged when
+    /// they end, so the time a budget has left never rises while they are taken and
+    /// ended by many threads at once. A reader that saw what a share spent and what it
+    /// reserved at different moments would see the time left rise for that moment.
+    #[test]
+    fn concurrent_shares_keep_one_ledger() {
+        use std::sync::atomic::AtomicBool;
+        let total = Duration::from_secs(1_000_000);
+        let b = RequestBudget::new(&OutboundPolicy {
+            request_timeout: total,
+            ..Default::default()
+        });
+        let each = Duration::from_millis(3);
+        let (writers, rounds) = (4u32, 20_000u32);
+        let done = AtomicBool::new(false);
+        let ended = std::sync::atomic::AtomicU32::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let (b, done) = (b.clone(), &done);
+                scope.spawn(move || {
+                    let mut last = b.remaining_time();
+                    while !done.load(Ordering::Acquire) {
+                        let left = b.remaining_time();
+                        assert!(left <= last, "the time left rose from {last:?} to {left:?}");
+                        last = left;
+                    }
+                });
+            }
+            let mut ws = Vec::new();
+            for _ in 0..writers {
+                let (b, ended) = (b.clone(), &ended);
+                ws.push(scope.spawn(move || {
+                    for _ in 0..rounds {
+                        let s = b.share(each).expect("time is left");
+                        assert!(s.remaining_time() <= each);
+                        s.spend_time(each);
+                        drop(s);
+                        ended.fetch_add(1, Ordering::Relaxed);
+                    }
+                }));
+            }
+            for w in ws {
+                w.join().unwrap();
+            }
+            done.store(true, Ordering::Release);
+        });
+        let n = ended.load(Ordering::Relaxed);
+        assert_eq!(n, writers * rounds);
+        assert_eq!(b.time(), each * n);
+        assert_eq!(b.remaining_time(), total - each * n);
+    }
     use std::collections::HashMap;
 
     #[test]

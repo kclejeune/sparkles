@@ -530,7 +530,11 @@ happens to materialized inferences, and the limits.
 | `--outbound-request-timeout S` | 4 × `--outbound-timeout` (`240`) | Time that all the SERVICE calls and LOADs of one query or update may take, summed. |
 | `--service-bulk-size N` | `10` | Inputs per request of `SERVICE <loop:bulk:…>` (see [Correlated and cached SERVICE](#correlated-bulk-and-cached-service)). |
 | `--service-bulk-max N` | `100` | The most inputs per request of any bulk SERVICE. `bulk+n` is capped to it. |
+| `--service-parallel-max N` | `4` | The most requests of one `SERVICE <loop:parallel+n:…>` in flight at once. `parallel+n` is capped to it. |
 | `--service-cache-mb N` | `64` (`small`: `16`) | The cache of remote results that `SERVICE <cache:…>` uses, for the whole server. `0` turns it off. A global flag. |
+| `--service-cache-ttl S` | `3600` | Seconds a cached remote result answers after it was stored, unless the dataset's `service-cache.json` sets another. `0` keeps entries until they are evicted. A global flag. |
+| `--service-cache-disk-mb N` | `256` | The disk a persistent dataset's SERVICE cache may take when its `service-cache.json` sets `disk` without `diskMb`. A global flag. |
+| `--service-cache-mgmt` | off | Let callers with `admin` on a dataset remove their entries of its SERVICE cache with `se:cacheRm`. A global flag. |
 | `--cache-mb N` | `1024` (`small`: `256`) | The block cache, for the whole server. A global flag. |
 | `--no-warm-up` | | Skip the query that `serve` runs before it reports ready. That query reads no data, runs on a scratch in-memory dataset and is neither logged nor counted, and it builds the state the query path builds once, so that the first request after a start does not wait for it. See [Memory and caches](#memory-and-caches). |
 | `--no-code-prefault` | | Do not map the executable's code into memory at start. Without the flag, a background thread maps it so that the first requests do not fault it in, which adds about 100 MB of shared file pages to the resident set. The kernel can reclaim those pages under memory pressure. |
@@ -2458,9 +2462,15 @@ every film gets the same label. With `loop:` and no `bulk`, it gets one request 
 With `bulk+50`, 1,000 films take 20 requests, and with `cache:` a second run takes none.
 The requests follow the outbound policy and its budgets like any SERVICE call.
 
+`parallel+4:` keeps four of those requests in flight at once, which cuts the wall time
+of a loop over a slow endpoint by about as much, with the same answer.
+
 The cache is shared by the datasets, holds `--service-cache-mb` (64) in all, and keeps each
-caller's entries apart. `cache+clear:` refreshes the entries a query reads, and
-`POST /$/cache/clear/{ds}` drops them all. `SERVICE <loop:> { … }` and
+caller's entries apart. An entry answers for an hour (`--service-cache-ttl`), and a
+request whose LIMIT and OFFSET lie inside an entry's solutions is answered from it.
+`cache+clear:` refreshes the entries a query reads, and `POST /$/cache/clear/{ds}` drops
+them all. A persistent dataset can keep its entries on disk across restarts, and
+`se:cacheLs` and `se:cacheRm` list and remove a caller's entries. `SERVICE <loop:> { … }` and
 `SERVICE <urn:x-arq:self> { … }` read the dataset itself without a request. The options
 and the request shapes are in [API.md](API.md#service-options-loop-bulk-and-cache).
 

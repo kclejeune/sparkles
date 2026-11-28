@@ -1996,7 +1996,8 @@ fn run_node<'ctx>(
             query,
             silent,
             cache,
-        } => match service(ctx, endpoint, query, &n.vars, *cache) {
+            key,
+        } => match service(ctx, endpoint, query, &n.vars, *cache, key.as_deref()) {
             Ok(t) => t,
             // SILENT hides failures of the remote service, not a refusal or a spent
             // budget
@@ -12791,6 +12792,7 @@ fn service(
     query: &str,
     vars: &[VarId],
     cache: super::enhancer::CacheMode,
+    cache_key: Option<&super::svccache::ServiceKey>,
 ) -> Result<Table> {
     use super::enhancer::CacheMode;
     super::enhancer::check_allowed(ctx)?;
@@ -12808,10 +12810,14 @@ fn service(
         && store.enabled()
         && !is_local(ctx, url.as_str())
     {
-        // the whole result under one key: a SERVICE without `loop` has one input
+        // the whole result under one key: a SERVICE without `loop` has one input, and
+        // the key leaves out the request's outermost slice, which bounds the entry
+        let (text, slice) = cache_key.map_or((query, super::svccache::Slice::ALL), |k| {
+            (k.text.as_str(), k.slice)
+        });
         let key_credit = ctx.charge(0)?;
         let mut key_reserved = 0usize;
-        let key = super::svccache::try_key(&ctx.service_scope, url.as_str(), query, &[], |need| {
+        let key = super::svccache::try_key(&ctx.service_scope, url.as_str(), text, &[], |need| {
             if need > key_reserved {
                 key_credit.add((need - key_reserved) as u64)?;
                 key_reserved = need;
@@ -12819,21 +12825,25 @@ fn service(
             Ok::<_, Error>(())
         })?;
         let hit = if cache == CacheMode::Default {
-            store.get(&key)
+            store.get_admitted(&key, slice, &|n| key_credit.add(n))?
         } else {
             store.remove(&key);
             None
         };
+        // what a lookup decoded or copied, and the rows a request fetched, stay charged
+        // until the table of them is made
+        let fetched = ctx.charge(0)?;
         let rows = match hit {
             Some(rows) => {
                 drop(key);
-                drop(key_credit);
                 rows
             }
             None => {
-                let rows = std::sync::Arc::new(super::enhancer::fetch_rows(ctx, &url, query)?);
-                store.put(key, rows.clone());
-                drop(key_credit);
+                let rows = std::sync::Arc::new(super::enhancer::fetch_rows_charged(
+                    ctx, &url, query, &fetched,
+                )?);
+                let parts = super::svccache::Parts::of(&ctx.service_scope, url.as_str(), text);
+                store.put(key, parts, slice, rows.clone());
                 rows
             }
         };
@@ -12857,6 +12867,7 @@ fn service(
             ctx.check()?;
             t.push_row(&row);
         }
+        drop((key_credit, fetched));
         return Ok(t);
     }
     let mut t = Table::new(vars.to_vec());
@@ -12966,6 +12977,11 @@ impl LocalCall {
         opts.work = Some(ctx.rows_produced.clone());
         opts.outbound_budget = Some(ctx.outbound_budget.clone());
         opts.service_depth = ctx.service_depth + 1;
+        if !ctx.use_cache {
+            opts.no_cache = true;
+        }
+        // the right to manage a cache is the caller's on its own dataset, not the target's
+        opts.service_cache_mgmt = false;
         // the call's plan is dropped below, so it names no patterns (item 180)
         opts.no_plan_patterns = true;
         Ok(Self {
@@ -13015,6 +13031,19 @@ pub(super) fn fetch(
     query: &str,
     on_solution: &mut dyn FnMut(ServiceSolution<'_>) -> Result<()>,
 ) -> Result<()> {
+    fetch_within(ctx, url, query, None, on_solution)
+}
+
+/// [`fetch`] drawing on `share` in place of the request's outbound budget: the share of
+/// its time that one of several requests in flight at once reserves
+/// ([`RequestBudget::share`](crate::outbound::RequestBudget::share)).
+pub(super) fn fetch_within(
+    ctx: &Ctx,
+    url: &oxrdf::NamedNode,
+    query: &str,
+    share: Option<&std::sync::Arc<crate::outbound::RequestBudget>>,
+    on_solution: &mut dyn FnMut(ServiceSolution<'_>) -> Result<()>,
+) -> Result<()> {
     if let Some(target) = ctx
         .local_endpoints
         .as_ref()
@@ -13022,7 +13051,7 @@ pub(super) fn fetch(
     {
         return fetch_local(ctx, target, query, on_solution);
     }
-    let mut answer = RemoteAnswer::open(ctx, url, query, None)?;
+    let mut answer = RemoteAnswer::open_within(ctx, url, query, None, share)?;
     let _entered = answer.span.clone().entered();
     while let Some(solution) = answer.next_solution() {
         on_solution(ServiceSolution::Remote(&solution?))?;
@@ -13062,6 +13091,18 @@ impl RemoteAnswer {
         query: &str,
         meter: Option<Meter<'_>>,
     ) -> Result<Self> {
+        Self::open_within(ctx, url, query, meter, None)
+    }
+
+    /// [`RemoteAnswer::open`] drawing on `share` in place of the request's outbound
+    /// budget.
+    pub(super) fn open_within(
+        ctx: &Ctx,
+        url: &oxrdf::NamedNode,
+        query: &str,
+        meter: Option<Meter<'_>>,
+        share: Option<&std::sync::Arc<crate::outbound::RequestBudget>>,
+    ) -> Result<Self> {
         // the host of the endpoint (no user info, no port)
         let host = oxiri::Iri::parse(url.as_str())
             .ok()
@@ -13088,9 +13129,10 @@ impl RemoteAnswer {
         let timeout = ctx.current_deadline().map_or(ctx.outbound.timeout, |d| {
             d.saturating_duration_since(Instant::now())
         });
+        let budget = share.unwrap_or(&ctx.outbound_budget);
         let resp = ctx
             .outbound
-            .send(&ctx.outbound_budget, url.as_str(), timeout, |client, u| {
+            .send(budget, url.as_str(), timeout, |client, u| {
                 client
                     .post(u)
                     .header(

@@ -874,6 +874,7 @@ fn enhancer_planner_subst_and_remote_run_propagate_memory_error() {
         silent: false,
         values: true,
         idx: "__idx".into(),
+        parallel: 1,
     };
 
     // 2. RemoteRun::new (outer constant decode)
@@ -955,6 +956,7 @@ fn remote_and_history_consumers_retain_decoded_output_credit_until_release() {
         silent: false,
         values: true,
         idx: "__idx".into(),
+        parallel: 1,
     };
 
     // 1. RemoteRun::new keeps outer decoded credit alive, and RemoteRun::add keeps input
@@ -2425,6 +2427,7 @@ fn remote_service_cursor_admission_does_not_double_charge_or_retain_discarded_in
         silent: false,
         values: true,
         idx: "__idx".into(),
+        parallel: 1,
     };
 
     for cursor in [false, true] {
@@ -2626,6 +2629,7 @@ fn remote_service_filtered_term_does_not_overlap_next_key_in_same_row() {
         silent: false,
         values: true,
         idx: "__idx".into(),
+        parallel: 1,
     };
 
     // 1. Direct RemoteRun::add on one multi-key row [delta_triple_2k, delta_iri_2k] with
@@ -2804,6 +2808,7 @@ fn remote_service_cache_key_refuses_before_allocating_key_string() {
         silent: false,
         values: true,
         idx: "__idx".into(),
+        parallel: 1,
     };
 
     for cursor in [false, true] {

@@ -610,6 +610,8 @@ pub enum Kind {
         silent: bool,
         /// the `cache` option of Jena's service enhancer
         cache: super::enhancer::CacheMode,
+        /// what a cached request keys its entry by (with the `cache` option)
+        key: Option<Box<super::svccache::ServiceKey>>,
     },
     /// full-text search (`text:query`)
     TextSearch(Box<TextSpec>),
@@ -1137,6 +1139,7 @@ impl<'a> Planner<'a> {
             )?))
         };
         let admit = |expr: &Expression| -> Result<()> {
+            super::svcfn::admit(ctx, expr)?;
             if let Some(held) = self.plan_charge {
                 ctx.check()?;
                 held.add(super::checked_layout::expression_compile_bytes(expr))?;
@@ -1309,6 +1312,12 @@ impl<'a> Planner<'a> {
             && scratch.is_some()
         {
             held.adopt_charge(&mut scratch)?;
+        } else if let Some(c) = scratch {
+            let bytes = c.bytes();
+            if bytes > 0 {
+                let lease = c.output_lease(bytes)?;
+                self.ctx.retain_plan_lease(lease);
+            }
         }
         Ok(())
     }
@@ -1328,6 +1337,7 @@ impl<'a> Planner<'a> {
 
     fn admit_expression(&self, expr: &Expression) -> Result<()> {
         use Expression as E;
+        super::svcfn::admit(self.ctx, expr)?;
         if let E::Literal(literal) = expr
             && let Some(credit) = self.branch_shared_payload.borrow_mut().as_mut()
         {
@@ -1558,6 +1568,9 @@ impl<'a> Planner<'a> {
                 right,
                 expression,
             } if super::enhancer::is_loop(right) => {
+                if let Some(e) = expression {
+                    super::svcfn::admit_tree(self.ctx, e)?;
+                }
                 let certain = certain_vars(left, self.ctx);
                 let (push, top, _push_list) =
                     self.split_filters(filters, |v| certain.contains(v))?;
@@ -2293,11 +2306,26 @@ impl<'a> Planner<'a> {
                 {
                     vars.push(v);
                 }
-                let query = if subst.map.is_empty() {
-                    super::enhancer::single_request(inner)
+                let sent = if subst.map.is_empty() {
+                    std::borrow::Cow::Borrowed(inner)
                 } else {
-                    super::enhancer::single_request(&super::enhancer::substitute(inner, &subst))
+                    std::borrow::Cow::Owned(super::enhancer::substitute(inner, &subst))
                 };
+                let query = super::enhancer::single_request(&sent);
+                // the cache keys the request without its outermost slice, which bounds
+                // the entry instead (roadmap item 38)
+                let key = matches!(
+                    cache,
+                    super::enhancer::CacheMode::Default | super::enhancer::CacheMode::Clear
+                )
+                .then(|| {
+                    let (base, slice) = super::enhancer::outer_slice(&sent);
+                    Box::new(super::svccache::ServiceKey {
+                        text: super::enhancer::single_request(base),
+                        slice,
+                    })
+                });
+                drop(sent);
                 drop(subst);
                 drop(subst_credit);
                 let mut n = Node::leaf(
@@ -2306,6 +2334,7 @@ impl<'a> Planner<'a> {
                         query: query.clone(),
                         silent,
                         cache,
+                        key,
                     },
                     vars,
                     1000.0,
@@ -2486,6 +2515,7 @@ impl<'a> Planner<'a> {
                     | super::textpf::TEXT_QUERY
                     | crate::vector::VECTOR_SEARCH
                     | super::hybrid::HYBRID_SEARCH
+                    | super::svcfn::CACHE_LS
                     | super::georewrite::SPATIAL_EQUALS
             ) || crate::geo::SpatialPfKind::from_iri(iri).is_some()
                 || rewrite && crate::geo::Relation::from_property(iri).is_some()
@@ -2545,6 +2575,24 @@ impl<'a> Planner<'a> {
                     )?))?;
                     return Ok(());
                 }
+                // `se:cacheLs`: the caller's entries in the cache of remote results
+                let listed;
+                let patterns = if patterns.iter().any(|t| {
+                    matches!(&t.predicate, NamedNodePattern::NamedNode(p)
+                        if p.as_str() == super::svcfn::CACHE_LS)
+                }) {
+                    let (calls, rest) =
+                        super::textpf::take_calls(patterns, super::svcfn::CACHE_LS, "se:cacheLs")?;
+                    for (subjects, args) in calls {
+                        items.push(Item::Node(super::svcfn::cache_ls_leaf(
+                            self, subjects, args,
+                        )?))?;
+                    }
+                    listed = rest;
+                    &listed
+                } else {
+                    patterns
+                };
                 // ARQ's property function library: the variables bound before a call
                 // are those of the group's earlier elements
                 let members;
@@ -7923,9 +7971,13 @@ fn limit_into(n: &mut Node, k: usize) {
         Kind::Service {
             endpoint: PathEnd::Const(_),
             query,
+            key,
             ..
         } if n.children.is_empty() => {
             query.push_str(&format!(" LIMIT {k}"));
+            if let Some(key) = key {
+                key.slice = key.slice.limited(k);
+            }
             n.desc.clone_from(query);
             n.est = n.est.min(k as f64);
         }

@@ -60,6 +60,8 @@ struct Endpoint {
     limit: Arc<AtomicUsize>,
     /// answer every request with an error
     failing: Arc<AtomicBool>,
+    /// the most requests answered at once
+    peak: Arc<AtomicUsize>,
 }
 
 impl Endpoint {
@@ -69,12 +71,21 @@ impl Endpoint {
         let queries = Arc::new(Mutex::new(Vec::new()));
         let limit = Arc::new(AtomicUsize::new(usize::MAX));
         let failing = Arc::new(AtomicBool::new(false));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
         let (q, lim, fail) = (queries.clone(), limit.clone(), failing.clone());
+        let (now, most) = (inflight.clone(), peak.clone());
         std::thread::spawn(move || {
             for c in l.incoming() {
                 let Ok(c) = c else { continue };
                 let (data, q, lim, fail) = (data.clone(), q.clone(), lim.clone(), fail.clone());
-                std::thread::spawn(move || answer(c, &data, &q, &lim, &fail, delay));
+                let (now, most) = (now.clone(), most.clone());
+                std::thread::spawn(move || {
+                    let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(n, Ordering::SeqCst);
+                    answer(c, &data, &q, &lim, &fail, delay);
+                    now.fetch_sub(1, Ordering::SeqCst);
+                });
             }
         });
         Endpoint {
@@ -82,6 +93,7 @@ impl Endpoint {
             queries,
             limit,
             failing,
+            peak,
         }
     }
 
@@ -91,6 +103,11 @@ impl Endpoint {
 
     fn take(&self) -> Vec<String> {
         std::mem::take(&mut *self.queries.lock().unwrap())
+    }
+
+    /// The most requests answered at once since the last call.
+    fn take_peak(&self) -> usize {
+        self.peak.swap(0, Ordering::SeqCst)
     }
 }
 
@@ -332,7 +349,7 @@ fn bulk_requests_cut_short_are_sent_again_per_input() {
             ("ASC", 10, 10),
         ] {
             data.result_cache().clear();
-            data.result_cache().service.clear();
+            data.result_cache().service.clear().unwrap();
             ep.limit.store(limit, Ordering::SeqCst);
             let q = format!(
                 "SELECT * {{ {{ SELECT ?d {{ ?d a <urn:Department> }} ORDER BY {dir}(?d) }} \
@@ -406,7 +423,7 @@ fn cache_per_input_and_per_caller() {
     assert!(ep.take().is_empty());
     let svc = &data.result_cache().service;
     assert!(svc.entries() > 0 && svc.bytes() > 0 && svc.hits() > 0);
-    data.result_cache().service.clear();
+    data.result_cache().service.clear().unwrap();
     assert_eq!(rows(&data, &q(three, "cache")), first);
     assert_eq!(ep.take().len(), 1);
     // without loop, the whole result is one entry
@@ -509,7 +526,7 @@ fn measure_bulk_and_cache() {
         let mut reqs = 0;
         for _ in 0..3 {
             if clear {
-                local.result_cache().service.clear();
+                local.result_cache().service.clear().unwrap();
             }
             ep.take();
             let t = Instant::now();
@@ -522,7 +539,13 @@ fn measure_bulk_and_cache() {
     };
     println!("{n} departments, {} ms per request", delay.as_millis());
     time("top label, loop, 1 per request", &q("loop:"), true);
+    time("top label, loop:parallel+4", &q("loop:parallel+4:"), true);
     time("top label, loop:bulk+10", &q("loop:bulk+10:"), true);
+    time(
+        "top label, loop:bulk+10:parallel+4",
+        &q("loop:bulk+10:parallel+4:"),
+        true,
+    );
     time("top label, loop:bulk+100", &q("loop:bulk+100:"), true);
     time(
         "top label, loop:bulk+100:cache, cold",
@@ -536,6 +559,11 @@ fn measure_bulk_and_cache() {
     );
     time("employees, plain SERVICE", &flat(""), true);
     time("employees, loop, 1 per request", &flat("loop:"), true);
+    time(
+        "employees, loop:parallel+4",
+        &flat("loop:parallel+4:"),
+        true,
+    );
     time(
         "employees, loop:bulk+10 (VALUES)",
         &flat("loop:bulk+10:"),
@@ -890,4 +918,1019 @@ fn a_streamed_loop_admits_each_retried_answer() {
     );
     let sent = ep.take().len();
     assert!(sent < 41, "the loop sent {sent} requests past its budget");
+}
+
+/// The cache keys a request without its outermost slice and bounds the entry by it, so a
+/// request whose slice lies inside what an entry holds is answered without a request,
+/// and a request for more is sent as written (roadmap item 38).
+#[test]
+fn slices_are_answered_from_the_entries_that_hold_them() {
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = |slice: &str| {
+        format!(
+            "SELECT ?p {{ SERVICE <cache:{}> {{ SELECT DISTINCT ?p {{ ?d <urn:hasEmployee> ?p }} ORDER BY ?p {slice} }} }}",
+            ep.url()
+        )
+    };
+    let all = rows(&data, &q(""));
+    assert_eq!(all.len(), 9);
+    ep.take();
+    data.result_cache().service.clear().unwrap();
+    let first5 = rows(&data, &q("LIMIT 5"));
+    assert_eq!(first5.len(), 5);
+    let sent = ep.take();
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0].contains("LIMIT 5"),
+        "the user's slice is sent: {}",
+        sent[0]
+    );
+    // inside the five rows held
+    for (slice, n) in [
+        ("LIMIT 3", 3),
+        ("OFFSET 1 LIMIT 3", 3),
+        ("OFFSET 4 LIMIT 1", 1),
+    ] {
+        assert_eq!(rows(&data, &q(slice)).len(), n, "{slice}");
+        assert!(ep.take().is_empty(), "{slice} was sent");
+    }
+    // OFFSET 4 LIMIT 1 is the fifth row
+    let fifth = rows(&data, &q("OFFSET 4 LIMIT 1"));
+    let sorted_all: Vec<String> = {
+        let mut v = all.clone();
+        v.sort_by_key(|p| p.trim_start_matches("person").parse::<u32>().unwrap_or(0));
+        v
+    };
+    assert_eq!(fifth, vec![sorted_all[4].clone()]);
+    ep.take();
+    // past the rows held, and the whole result, are sent
+    assert_eq!(rows(&data, &q("OFFSET 3 LIMIT 5")).len(), 5);
+    assert_eq!(ep.take().len(), 1);
+    assert_eq!(rows(&data, &q("LIMIT 20")), all);
+    assert_eq!(ep.take().len(), 1);
+    // the request itself, and the slices inside the 9 rows the LIMIT of 20 got, are
+    // answered from the entry
+    assert_eq!(rows(&data, &q("LIMIT 20")), all);
+    assert_eq!(rows(&data, &q("OFFSET 7 LIMIT 2")).len(), 2);
+    assert!(ep.take().is_empty());
+    // but 9 rows for a LIMIT of 20 is not taken as the whole result, so slices past them
+    // and the request without a slice are sent
+    assert_eq!(rows(&data, &q("OFFSET 7 LIMIT 100")).len(), 2);
+    assert_eq!(rows(&data, &q("")), all);
+    assert_eq!(rows(&data, &q("OFFSET 20")).len(), 0);
+    assert_eq!(ep.take().len(), 3);
+}
+
+/// An endpoint that caps its responses without saying so: a short response is not the
+/// end of the result, so a later slice past it gets what an uncached request gets.
+#[test]
+fn a_short_response_is_not_the_end_of_the_result() {
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = |cache: &str, slice: &str| {
+        format!(
+            "SELECT ?p {{ SERVICE <{cache}{}> {{ SELECT DISTINCT ?p {{ ?d <urn:hasEmployee> ?p }} ORDER BY ?p {slice} }} }}",
+            ep.url()
+        )
+    };
+    ep.limit.store(4, Ordering::SeqCst);
+    for first in ["LIMIT 20", ""] {
+        data.result_cache().service.clear().unwrap();
+        assert_eq!(rows(&data, &q("cache:", first)).len(), 4, "{first}: capped");
+        ep.take();
+        for later in ["OFFSET 4 LIMIT 3", "OFFSET 6", "OFFSET 2 LIMIT 4"] {
+            let uncached = rows(&data, &q("", later));
+            assert!(!uncached.is_empty(), "{later}");
+            assert_eq!(
+                rows(&data, &q("cache:", later)),
+                uncached,
+                "{first} then {later}"
+            );
+        }
+        // two uncached requests and the cached ones, which the entry could not answer
+        assert_eq!(ep.take().len(), 6, "{first}");
+        // inside the four rows held, nothing is sent
+        assert_eq!(rows(&data, &q("cache:", "OFFSET 1 LIMIT 3")).len(), 3);
+        assert!(ep.take().is_empty());
+    }
+}
+
+/// A LIMIT pushed into the request of a plain cached SERVICE bounds its entry in both
+/// execution modes, and a smaller one is answered from it.
+#[test]
+fn a_pushed_limit_bounds_the_entry() {
+    use sparkles_core::sparql::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let count = |q: &str, mode: ExecutionMode| -> usize {
+        match query_execution(data.snapshot(), q, &opts(), &CursorOptions::default(), mode)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+        {
+            QueryExecution::Select(mut c) => {
+                let mut n = 0;
+                while let Some(b) = c.next_batch().unwrap() {
+                    n += b.len();
+                }
+                n
+            }
+            QueryExecution::Eager(r) => r.into_result().len(),
+            _ => unreachable!("a SELECT"),
+        }
+    };
+    for mode in [ExecutionMode::Eager, ExecutionMode::Streaming] {
+        data.result_cache().service.clear().unwrap();
+        let q = |k: usize| {
+            format!(
+                "SELECT ?p ?n {{ SERVICE <cache:{url}> {{ ?d <urn:hasEmployee> ?p }} BIND(STR(?p) AS ?n) }} LIMIT {k}"
+            )
+        };
+        assert_eq!(count(&q(6), mode), 6, "{mode:?}");
+        let sent = ep.take();
+        assert_eq!(sent.len(), 1, "{mode:?}: first request dispatched");
+        assert!(sent[0].trim_end().ends_with("LIMIT 6"), "{}", sent[0]);
+        assert_eq!(count(&q(2), mode), 2, "{mode:?}");
+        let narrower = ep.take();
+        // An unordered outer LIMIT pulls through cursor operators even with
+        // ExecutionMode::Eager. The streamed path drops the copy, and the eager path
+        // gets only the LIMIT's rows, so a later narrower request dispatches its own.
+        assert_eq!(narrower.len(), 1, "{mode:?}: narrower LIMIT dispatches");
+        assert!(
+            narrower[0].trim_end().ends_with("LIMIT 2"),
+            "{mode:?}: {}",
+            narrower[0]
+        );
+        assert_eq!(count(&q(10), mode), 10, "{mode:?}");
+        let wider = ep.take();
+        assert_eq!(wider.len(), 1, "{mode:?}: wider LIMIT dispatches");
+        assert!(
+            wider[0].trim_end().ends_with("LIMIT 10"),
+            "{mode:?}: {}",
+            wider[0]
+        );
+    }
+}
+
+/// `se:cacheLs` lists the caller's own entries, and `se:cacheRm` removes them only for
+/// a query that its options let manage the cache. Any other query that calls it fails.
+#[test]
+fn cache_functions_list_and_remove_the_callers_entries() {
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let cached = format!(
+        "SELECT ?d ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} SERVICE <loop:cache:{url}> {{ ?d <urn:hasEmployee> ?p }} }}"
+    );
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let ls = format!("{se} SELECT ?id ?s ?q ?b ?n {{ ?id se:cacheLs (?s ?q ?b ?n) }}");
+    assert_eq!(rows(&data, &cached).len(), 9 + 8);
+    assert_eq!(ep.take().len(), 2);
+    let listed = query(data.snapshot(), &ls, &opts()).unwrap();
+    let listed = listed.rows().unwrap();
+    assert_eq!(listed.len(), 2);
+    for r in listed.iter() {
+        let v = r.values();
+        assert_eq!(
+            v[1].as_ref().map(ToString::to_string),
+            Some(format!("<{url}>"))
+        );
+        assert!(matches!(&v[2], Some(Term::Literal(l)) if l.value().contains("hasEmployee")));
+        assert!(matches!(&v[3], Some(Term::Literal(l)) if l.value().contains("urn:dept")));
+    }
+    let ns: Vec<String> = listed.iter().map(|r| short(&r.values()[4])).collect();
+    assert!(
+        ns.contains(&"9".to_string()) && ns.contains(&"8".to_string()),
+        "{ns:?}"
+    );
+    // a filter on the endpoint, and on another one
+    let by = |e: &str| format!("{se} SELECT ?id {{ ?id se:cacheLs (<{e}>) }}");
+    assert_eq!(rows(&data, &by(&url)).len(), 2);
+    assert_eq!(rows(&data, &by("http://elsewhere.example/sparql")).len(), 0);
+    // another caller sees none of them
+    let mut bob = opts();
+    bob.service_scope = Some("bob".into());
+    assert_eq!(run(&data, &ls, &bob).unwrap().len(), 0);
+    // removal needs the right
+    let rm_all = format!("{se} SELECT (se:cacheRm() AS ?n) {{}}");
+    assert!(matches!(
+        run(&data, &rm_all, &opts()),
+        Err(Error::NotPermitted(_))
+    ));
+    let mut admin_bob = bob.clone();
+    admin_bob.service_cache_mgmt = true;
+    assert_eq!(
+        run(&data, &rm_all, &admin_bob).unwrap(),
+        vec!["0".to_string()]
+    );
+    assert_eq!(
+        rows(&data, &ls).len(),
+        2,
+        "bob removed another caller's entries"
+    );
+    let mut admin = opts();
+    admin.service_cache_mgmt = true;
+    let rm_one =
+        format!("{se} SELECT (SUM(se:cacheRm(?id)) AS ?n) {{ ?id se:cacheLs (?s ?q ?b 8) }}");
+    assert_eq!(run(&data, &rm_one, &admin).unwrap(), vec!["1".to_string()]);
+    assert_eq!(rows(&data, &ls).len(), 1);
+    assert_eq!(rows(&data, &cached).len(), 17);
+    assert_eq!(ep.take().len(), 1, "only the removed input is sent again");
+    assert_eq!(run(&data, &rm_all, &admin).unwrap(), vec!["2".to_string()]);
+    assert_eq!(rows(&data, &ls).len(), 0);
+    // a call of se:cacheRm is never answered by a cache: each query removes again
+    assert_eq!(rows(&data, &cached).len(), 17);
+    assert_eq!(ep.take().len(), 2);
+    assert_eq!(run(&data, &rm_all, &admin).unwrap(), vec!["2".to_string()]);
+    assert_eq!(run(&data, &rm_all, &admin).unwrap(), vec!["0".to_string()]);
+}
+
+/// `parallel+n` keeps up to n requests in flight and gives the answer and the requests
+/// of a run one at a time (roadmap item 38).
+#[test]
+fn parallel_requests_give_the_answer_of_one_at_a_time() {
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::from_millis(60));
+    let q = |opts: &str| {
+        format!(
+            "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:{opts}{}> {{ SELECT ?p {{ ?d <urn:hasEmployee> ?p }} ORDER BY DESC(?p) LIMIT 1 }} }}",
+            ep.url()
+        )
+    };
+    let one = rows(&data, &q(""));
+    assert_eq!(one.len(), 9);
+    let mut sent_one = ep.take();
+    assert_eq!(sent_one.len(), 9);
+    assert_eq!(ep.take_peak(), 1);
+    for (opt, peak) in [
+        ("parallel+4:", 4),
+        ("parallel:", 4),
+        ("parallel+100:", 4),
+        ("parallel+3:bulk+2:", 3),
+    ] {
+        let started = Instant::now();
+        assert_eq!(rows(&data, &q(opt)), one, "{opt}");
+        let took = started.elapsed();
+        let mut sent = ep.take();
+        let most = ep.take_peak();
+        assert!(most > 1 && most <= peak, "{opt}: {most} requests at once");
+        if !opt.contains("bulk") {
+            sent.sort();
+            sent_one.sort();
+            assert_eq!(sent, sent_one, "{opt}");
+            // three waves of 60 ms against nine requests one at a time
+            assert!(took < Duration::from_millis(9 * 60), "{opt}: {took:?}");
+        } else {
+            assert_eq!(sent.len(), 5, "{opt}");
+        }
+    }
+    // a failing endpoint fails the query, and with SILENT keeps each input once
+    ep.failing.store(true, Ordering::SeqCst);
+    assert!(run(&data, &q("parallel+4:"), &opts()).is_err());
+    let silent = format!(
+        "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE SILENT <loop:parallel+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let kept = rows(&data, &silent);
+    assert_eq!(kept.len(), 9);
+    assert!(kept.iter().all(|r| r.ends_with(" -")), "{kept:?}");
+    ep.failing.store(false, Ordering::SeqCst);
+    ep.take();
+}
+
+/// A query that runs out of time stops sending: the waves after the deadline never go
+/// out, so the endpoint sees fewer requests than inputs.
+#[test]
+fn parallel_requests_stop_at_the_deadline() {
+    let data = store(&departments(30));
+    let ep = Endpoint::start(data.clone(), Duration::from_millis(150));
+    let q = format!(
+        "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:parallel+2:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let mut o = opts();
+    o.timeout = Some(Duration::from_millis(400));
+    let started = Instant::now();
+    let r = run(&data, &q, &o);
+    // the deadline ends the query, or the request it cuts short
+    assert!(
+        matches!(r, Err(Error::Timeout | Error::Service(_))),
+        "{r:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let sent = ep.take().len();
+    assert!((2..=8).contains(&sent), "{sent} of 30 requests were sent");
+}
+
+/// Parallel requests admit each solution as it arrives, so a loop over a small memory
+/// budget fails in both modes before it holds every answer of every wave.
+#[test]
+fn parallel_requests_admit_their_answers() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let data = store(&departments(40));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = format!(
+        "SELECT ?d ?p ?l {{ ?d a <urn:Department> SERVICE <loop:parallel+4:{}> {{ ?d <urn:hasEmployee> ?p . ?p <http://www.w3.org/2000/01/rdf-schema#label> ?l }} }}",
+        ep.url()
+    );
+    let o = |memory: Option<u64>| QueryOptions {
+        no_cache: true,
+        max_memory_bytes: memory,
+        ..opts()
+    };
+    let streamed = |memory: Option<u64>| -> Result<usize, Error> {
+        let c = CursorOptions {
+            batch_rows: 64,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(data.snapshot(), &q, &o(memory), &c)?;
+        let mut rows = 0;
+        while let Some(b) = c.next_batch()? {
+            rows += b.len();
+        }
+        Ok(rows)
+    };
+    assert_eq!(run(&data, &q, &o(None)).unwrap().len(), 820);
+    assert_eq!(streamed(None).unwrap(), 820);
+    assert_eq!(ep.take().len(), 80);
+    let eager = run(&data, &q, &o(Some(48 << 10)));
+    assert!(
+        matches!(&eager, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{eager:?}"
+    );
+    let sent = ep.take().len();
+    assert!(
+        sent < 40,
+        "the eager loop sent {sent} requests past its budget"
+    );
+    let r = streamed(Some(48 << 10));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
+    let sent = ep.take().len();
+    assert!(
+        sent < 40,
+        "the streamed loop sent {sent} requests past its budget"
+    );
+}
+
+/// The requests of a wave share the outbound time of the SPARQL request: with a total
+/// shorter than one response takes, every request of the wave is cut short within its
+/// share, the query fails with SILENT too, and no later wave goes out. Without shares
+/// each request would wait for the whole total of 2 s.
+#[test]
+fn parallel_requests_share_the_outbound_time() {
+    let data = store(&departments(12));
+    let ep = Endpoint::start(data.clone(), Duration::from_secs(4));
+    let q = |silent: &str| {
+        format!(
+            "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE {silent} <loop:parallel+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+            ep.url()
+        )
+    };
+    let mut o = opts();
+    o.outbound.request_timeout = Duration::from_secs(2);
+    for silent in ["", "SILENT"] {
+        let started = Instant::now();
+        let r = run(&data, &q(silent), &o);
+        assert!(r.is_err(), "{silent}: {r:?}");
+        // four shares of 500 ms, not four requests of 2 s each
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(1700), "{silent}: {took:?}");
+        let sent = ep.take().len();
+        assert!(sent <= 4, "{silent}: {sent} requests were sent");
+    }
+}
+
+/// A query cancelled while a wave is in flight sends no later wave. The test cancels
+/// once the endpoint holds the first wave's requests, so the wave is known to have
+/// started, and the requests in flight end when their responses arrive (roadmap item
+/// 1341). The query then waits for one wave and not for the three it would send.
+#[test]
+fn parallel_requests_stop_when_cancelled() {
+    let data = store(&departments(12));
+    let delay = Duration::from_millis(800);
+    let ep = Endpoint::start(data.clone(), delay);
+    let q = format!(
+        "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:parallel+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut o = opts();
+    o.cancel = Some(cancel.clone());
+    let (flag, seen) = (cancel.clone(), ep.queries.clone());
+    let t = std::thread::spawn(move || {
+        // the rendezvous: the first wave's requests have reached the endpoint
+        let started = Instant::now();
+        while seen.lock().unwrap().is_empty() && started.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        flag.store(true, Ordering::SeqCst);
+    });
+    let started = Instant::now();
+    let r = run(&data, &q, &o);
+    t.join().unwrap();
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    let sent = ep.take().len();
+    assert!((1..=4).contains(&sent), "{sent} requests were sent");
+    // one wave, with ample room for a loaded worker, against the three it would send
+    let took = started.elapsed();
+    assert!(took < delay * 3, "{took:?}");
+}
+
+/// `se:cacheRm` called through `fn:apply` or `afn:eval` removes nothing, with the right
+/// or without it, and the results of `se:cacheLs` are never kept in the query result
+/// cache: a second caller and a later listing each see the entries as they are.
+#[test]
+fn dynamic_removal_and_listings_in_the_result_cache() {
+    // a result cache that keeps every result, however fast
+    let data = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    data.load(&[Source::from_bytes(
+        departments(9).into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let data = Arc::new(data);
+    // the result cache does keep a plain query's result
+    let plain = "SELECT ?d { ?d a <urn:Department> }";
+    let caching0 = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    run(&data, plain, &caching0).unwrap();
+    let before = data.result_cache().hits();
+    run(&data, plain, &caching0).unwrap();
+    assert!(
+        data.result_cache().hits() > before,
+        "the result cache is on"
+    );
+    let listed_hits = || data.result_cache().hits();
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let cached = |d: &str| {
+        format!(
+            "SELECT ?p {{ VALUES ?d {{ <urn:{d}> }} SERVICE <loop:cache:{url}> {{ ?d <urn:hasEmployee> ?p }} }}"
+        )
+    };
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let ls = format!("{se} SELECT ?id {{ ?id se:cacheLs () }}");
+    let caching = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    rows(&data, &cached("dept1"));
+    let hits = listed_hits();
+    assert_eq!(run(&data, &ls, &caching).unwrap().len(), 1);
+    assert_eq!(run(&data, &ls, &caching).unwrap().len(), 1);
+    assert_eq!(
+        listed_hits(),
+        hits,
+        "a listing was answered from the result cache"
+    );
+    rows(&data, &cached("dept2"));
+    assert_eq!(
+        run(&data, &ls, &caching).unwrap().len(),
+        2,
+        "a stale listing"
+    );
+    let mut bob = caching.clone();
+    bob.service_scope = Some("bob".into());
+    assert_eq!(
+        run(&data, &ls, &bob).unwrap().len(),
+        0,
+        "another caller's listing"
+    );
+    let mut admin = caching.clone();
+    admin.service_cache_mgmt = true;
+    for q in [
+        format!(
+            "{se} PREFIX fn: <http://www.w3.org/2005/xpath-functions#> SELECT (fn:apply(se:cacheRm) AS ?n) {{}}"
+        ),
+        format!(
+            "{se} PREFIX afn: <http://jena.apache.org/ARQ/function#> SELECT (afn:eval(se:cacheRm) AS ?n) {{}}"
+        ),
+    ] {
+        for o in [&caching, &admin] {
+            // an error of the expression leaves ?n unbound
+            assert_eq!(run(&data, &q, o).unwrap(), vec!["-".to_string()], "{q}");
+            assert_eq!(run(&data, &ls, &caching).unwrap().len(), 2, "{q}");
+        }
+    }
+}
+
+/// A listing admits its entries as it makes them, so a query under a small memory
+/// budget fails on a long listing that it would run without one.
+#[test]
+fn a_listing_admits_its_entries() {
+    use sparkles_core::BudgetKind;
+    let data = store(&departments(200));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    rows(
+        &data,
+        &format!(
+            "SELECT ?p {{ ?d a <urn:Department> SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+            ep.url()
+        ),
+    );
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let ls = format!("{se} SELECT ?id ?s ?q ?b {{ ?id se:cacheLs (?s ?q ?b) }}");
+    assert_eq!(run(&data, &ls, &opts()).unwrap().len(), 200);
+    let small = QueryOptions {
+        max_memory_bytes: Some(16 << 10),
+        ..opts()
+    };
+    // the same shape without a listing runs under the budget
+    assert!(run(&data, "SELECT ?id { VALUES ?id { 1 } }", &small).is_ok());
+    let r = run(&data, &ls, &small);
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
+}
+
+/// A dataset that keeps its SERVICE cache on disk answers a cached query from it after
+/// it is opened again (roadmap item 38).
+#[test]
+fn a_disk_cache_outlives_the_store() {
+    use sparkles_core::store::ServiceCacheSettings;
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("db");
+    let q = format!(
+        "SELECT ?d ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept5> }} SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let first = {
+        let local = Store::open(&dir, StoreOptions::default()).unwrap();
+        local
+            .set_service_cache_settings(Some(ServiceCacheSettings {
+                disk: true,
+                ..Default::default()
+            }))
+            .unwrap();
+        let first = rows(&local, &q);
+        assert_eq!(first.len(), 9 + 5);
+        assert_eq!(ep.take().len(), 2);
+        first
+    };
+    let local = Store::open(&dir, StoreOptions::default()).unwrap();
+    assert_eq!(
+        local.result_cache().service.entries(),
+        0,
+        "the memory tier is new"
+    );
+    assert_eq!(rows(&local, &q), first);
+    assert!(ep.take().is_empty(), "the entries were not read from disk");
+    assert_eq!(local.result_cache().service.entries(), 2);
+}
+
+/// A store whose query result cache keeps every result, however fast, over Jena's
+/// departments.
+fn caching_store(n: usize) -> Arc<Store> {
+    let data = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    data.load(&[Source::from_bytes(
+        departments(n).into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    Arc::new(data)
+}
+
+/// `se:cacheLs` and `se:cacheRm` inside a correlated LATERAL or a loop over the dataset
+/// itself are never answered by the query result cache: another caller sees its own
+/// listing, and each removal removes (Sol and Neon round-1 P1).
+#[test]
+fn correlated_listings_and_removals_skip_the_result_cache() {
+    let data = caching_store(9);
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let cached = |ds: &[&str]| {
+        let vs: Vec<String> = ds.iter().map(|d| format!("<urn:{d}>")).collect();
+        format!(
+            "SELECT ?p {{ VALUES ?d {{ {} }} SERVICE <loop:cache:{url}> {{ ?d <urn:hasEmployee> ?p }} }}",
+            vs.join(" ")
+        )
+    };
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let caching = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    run(&data, &cached(&["dept1", "dept2"]), &caching).unwrap();
+    let mut bob = caching.clone();
+    bob.service_scope = Some("bob".into());
+    let count = format!("{se} SELECT (COUNT(?id) AS ?n) {{ ?id se:cacheLs () }}");
+    for ls in [
+        format!(
+            "{se} SELECT (COUNT(?id) AS ?n) {{ VALUES ?x {{ 1 }} LATERAL {{ ?id se:cacheLs () FILTER(?x = 1) }} }}"
+        ),
+        format!(
+            "{se} SELECT (COUNT(?id) AS ?n) {{ VALUES ?x {{ 1 }} SERVICE <loop:> {{ ?id se:cacheLs () FILTER(?x = 1) }} }}"
+        ),
+    ] {
+        assert_eq!(run(&data, &ls, &caching).unwrap(), vec!["2"], "{ls}");
+        assert_eq!(
+            run(&data, &ls, &bob).unwrap(),
+            vec!["0"],
+            "{ls}: another caller's listing"
+        );
+    }
+    let mut admin = caching.clone();
+    admin.service_cache_mgmt = true;
+    for rm in [
+        format!(
+            "{se} SELECT ?n {{ VALUES ?x {{ 1 }} LATERAL {{ BIND(se:cacheRm() + ?x - ?x AS ?n) }} }}"
+        ),
+        format!(
+            "{se} SELECT ?n {{ VALUES ?x {{ 1 }} SERVICE <loop:> {{ BIND(se:cacheRm() + ?x - ?x AS ?n) }} }}"
+        ),
+    ] {
+        run(&data, &cached(&["dept1", "dept2"]), &caching).unwrap();
+        assert_eq!(run(&data, &rm, &admin).unwrap(), vec!["2"], "{rm}");
+        run(&data, &cached(&["dept3"]), &caching).unwrap();
+        assert_eq!(
+            run(&data, &rm, &admin).unwrap(),
+            vec!["1"],
+            "{rm}: a removal answered from the result cache"
+        );
+        assert_eq!(run(&data, &count, &caching).unwrap(), vec!["0"], "{rm}");
+        assert!(
+            matches!(run(&data, &rm, &caching), Err(Error::NotPermitted(_))),
+            "{rm}: removal without the right"
+        );
+    }
+}
+
+/// A wave of `parallel+n` whose share of the outbound time rounds to nothing fails the
+/// query under SILENT too, as one request out of time does (Neon round-1 P1-3).
+#[test]
+fn parallel_requests_out_of_time_fail_with_silent() {
+    let data = store(&departments(6));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let mut o = opts();
+    o.outbound.request_timeout = Duration::from_nanos(2);
+    for p in ["parallel+3:", "parallel+4:bulk+2:"] {
+        let q = format!(
+            "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE SILENT <loop:{p}{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+            ep.url()
+        );
+        let r = run(&data, &q, &o);
+        assert!(r.is_err(), "{p}: {r:?}");
+    }
+    ep.take();
+}
+
+/// `se:cacheRm` in the WHERE clause of an update removes the caller's entries when the
+/// update's options grant it, and is refused otherwise (Neon round-1 P2-1).
+#[test]
+fn an_update_removes_with_the_right() {
+    let data = store(&departments(4));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let cached = format!(
+        "SELECT ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    rows(&data, &cached);
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let count = format!("{se} SELECT (COUNT(?id) AS ?n) {{ ?id se:cacheLs () }}");
+    assert_eq!(rows(&data, &count), vec!["2"]);
+    let u =
+        format!("{se} INSERT {{ <urn:removed> <urn:n> ?n }} WHERE {{ BIND(se:cacheRm() AS ?n) }}");
+    let r = sparkles_core::sparql::update::update(&data, &u, &opts());
+    assert!(matches!(r, Err(Error::NotPermitted(_))), "{r:?}");
+    assert_eq!(rows(&data, &count), vec!["2"]);
+    let admin = QueryOptions {
+        service_cache_mgmt: true,
+        ..opts()
+    };
+    sparkles_core::sparql::update::update(&data, &u, &admin).unwrap();
+    assert_eq!(rows(&data, &count), vec!["0"]);
+    assert_eq!(
+        rows(&data, "SELECT ?n { <urn:removed> <urn:n> ?n }"),
+        vec!["2"]
+    );
+}
+
+/// A removal refused for want of the right inside an EXISTS that no row reaches still
+/// fails the query when it is planned (Sol round-1 #9). A call inside a SERVICE to a
+/// remote endpoint is the endpoint's and is not refused here.
+#[test]
+fn a_removal_inside_exists_is_refused_at_planning() {
+    let data = store(&departments(2));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    for q in [
+        format!("{se} SELECT * {{ FILTER(false && EXISTS {{ BIND(se:cacheRm() AS ?n) }}) }}"),
+        format!(
+            "{se} SELECT * {{ ?d a <urn:Department> FILTER NOT EXISTS {{ FILTER EXISTS {{ BIND(se:cacheRm() AS ?n) }} }} }}"
+        ),
+        format!(
+            "{se} SELECT * {{ ?d a <urn:Department> FILTER EXISTS {{ SERVICE <loop:> {{ BIND(se:cacheRm() AS ?n) }} }} }}"
+        ),
+    ] {
+        let r = run(&data, &q, &opts());
+        assert!(matches!(r, Err(Error::NotPermitted(_))), "{q}: {r:?}");
+    }
+    // sent to the endpoint, which refuses it as an unknown function or answers it
+    let remote = format!(
+        "{se} SELECT * {{ ?d a <urn:Department> FILTER EXISTS {{ SERVICE SILENT <{}> {{ BIND(se:cacheRm() AS ?n) }} }} }}",
+        ep.url()
+    );
+    let r = run(&data, &remote, &opts());
+    assert!(!matches!(r, Err(Error::NotPermitted(_))), "{r:?}");
+}
+
+/// A guard whose exemptions change with the data gives the same caller a scope of its
+/// own for each set of graphs it lets through, so a listing in one view shows none of
+/// the entries cached in another (Sol round-1 #13).
+#[test]
+fn a_guarded_view_scopes_its_entries_by_its_exemptions() {
+    use sparkles_core::access::{Decider, GraphAccess, Graphs, GuardDecision};
+    use sparkles_core::store::Snapshot;
+    struct Flip(Arc<AtomicBool>);
+    impl GuardDecision for Flip {
+        fn exempt(&self, _snap: &Arc<Snapshot>) -> Vec<String> {
+            if self.0.load(Ordering::SeqCst) {
+                vec!["urn:g1".into()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+    let data = store(&departments(4));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let wide = Arc::new(AtomicBool::new(true));
+    let view = Graphs::All.guarded_by("urn:g*", Decider(Arc::new(Flip(wide.clone()))));
+    let o = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(view.clone(), view))),
+        ..opts()
+    };
+    let cached = format!(
+        "SELECT ?p {{ VALUES ?d {{ <urn:dept1> }} SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let count = format!("{se} SELECT (COUNT(?id) AS ?n) {{ ?id se:cacheLs () }}");
+    run(&data, &cached, &o).unwrap();
+    assert_eq!(run(&data, &count, &o).unwrap(), vec!["1"]);
+    wide.store(false, Ordering::SeqCst);
+    assert_eq!(
+        run(&data, &count, &o).unwrap(),
+        vec!["0"],
+        "the narrower view lists the broader one's entry"
+    );
+    wide.store(true, Ordering::SeqCst);
+    assert_eq!(run(&data, &count, &o).unwrap(), vec!["1"]);
+}
+
+/// A SERVICE call in an UPDATE WHERE clause does not read from or publish to the cache.
+/// Values inserted by one operation and readable by another operation's SERVICE are not
+/// published, and a rolled-back UPDATE leaves the cache as it was (Sol round-2 P1-1).
+#[test]
+fn an_update_does_not_cache_service_results() {
+    let data = store(&departments(4));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let count = format!("{se} SELECT (COUNT(?id) AS ?n) {{ ?id se:cacheLs () }}");
+    // a SELECT caches the result
+    let select = format!(
+        "SELECT ?p {{ VALUES ?d {{ <urn:dept1> }} SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    rows(&data, &select);
+    assert_eq!(rows(&data, &count), vec!["1"]);
+    // clear for the UPDATE test
+    let admin = QueryOptions {
+        service_cache_mgmt: true,
+        ..opts()
+    };
+    sparkles_core::sparql::query(
+        data.snapshot(),
+        &format!("{se} SELECT (se:cacheRm() AS ?r) {{ }}"),
+        &admin,
+    )
+    .unwrap();
+    assert_eq!(rows(&data, &count), vec!["0"]);
+    // the same loop in an UPDATE WHERE must not publish to the cache
+    let u = format!(
+        "INSERT {{ <urn:test> <urn:n> ?p }} WHERE {{ VALUES ?d {{ <urn:dept2> }} SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    sparkles_core::sparql::update::update(&data, &u, &admin).unwrap();
+    let sent = ep.take();
+    assert!(!sent.is_empty(), "the endpoint received requests");
+    assert_eq!(
+        rows(&data, &count),
+        vec!["0"],
+        "UPDATE must not publish SERVICE results to the cache"
+    );
+    // the inserted data proves the SERVICE ran
+    assert!(
+        !rows(&data, "SELECT ?n { <urn:test> <urn:n> ?n }").is_empty(),
+        "the UPDATE committed its WHERE results"
+    );
+}
+
+/// A deferred OPTIONAL condition that calls se:cacheRm inside EXISTS is refused at
+/// planning time, not deferred to execution (Sol round-2 P2-4).
+#[test]
+fn a_deferred_optional_refuses_cache_rm() {
+    let data = store(&departments(2));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let q = format!(
+        "{se} SELECT ?d ?p {{ ?d a <urn:Department> OPTIONAL {{ SERVICE <loop:{}> {{ ?d <urn:hasEmployee> ?p }} FILTER EXISTS {{ BIND(se:cacheRm() AS ?rm) }} }} }}",
+        ep.url()
+    );
+    let r = run(&data, &q, &opts());
+    assert!(
+        matches!(r, Err(Error::NotPermitted(_))),
+        "expected NotPermitted, got {r:?}"
+    );
+    assert!(ep.take().is_empty(), "no requests should have been sent");
+}
+
+/// Repeated empty non-OPTIONAL LATERAL groups release their plan leases even though the
+/// inner join produces no rows and `continue` skips the joined path (Sol round-4 P2-1).
+#[test]
+fn empty_lateral_groups_release_plan_leases() {
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    // five departments whose SERVICE returns no rows, plus four that do, under a tight
+    // memory budget so leaked leases would exhaust it
+    let q = format!(
+        "SELECT ?d ?p {{ \
+         VALUES ?d {{ <urn:dept1> <urn:dept2> <urn:dept3> <urn:dept4> <urn:dept5> <urn:dept6> <urn:dept7> <urn:dept8> <urn:dept9> }} \
+         LATERAL {{ SERVICE <cache:{url}> {{ ?d <urn:hasEmployee> ?p FILTER(?p = <urn:person1>) }} }} }}"
+    );
+    let o = QueryOptions {
+        max_memory_bytes: Some(2 << 20),
+        ..opts()
+    };
+    let r = run(&data, &q, &o).unwrap();
+    assert_eq!(r.len(), 9, "every department matches person1");
+    // confirm the joined path produced results too
+    let joined = format!(
+        "SELECT ?d ?p {{ \
+         VALUES ?d {{ <urn:dept1> <urn:dept5> }} \
+         LATERAL {{ SERVICE <cache:{url}> {{ ?d <urn:hasEmployee> ?p }} }} }}"
+    );
+    let r2 = run(&data, &joined, &o).unwrap();
+    assert_eq!(r2.len(), 9 + 5, "joined groups produce expected rows");
+}
+
+/// A bulk response without the end marker falls back to individual retries without
+/// first reserving the split, and a marker-only response splits into empty parts
+/// (Sol round-4 P2-2).
+#[test]
+fn bulk_missing_marker_and_marker_only_response() {
+    let data = store(&departments(4));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    // cut the endpoint after enough rows that the per-input retries succeed
+    // but the bulk response loses its end marker
+    ep.limit.store(usize::MAX, Ordering::SeqCst);
+    let q = format!(
+        "SELECT ?d ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} \
+         SERVICE <loop:bulk+5:{url}> {{ ?d <urn:hasEmployee> ?p }} }}"
+    );
+    // first run warms the individual responses to know the counts
+    let r = rows(&data, &q);
+    assert_eq!(r.len(), 4 + 3);
+    let warmup = ep.take();
+    assert_eq!(warmup.len(), 1, "one bulk request");
+
+    // now cut at a low limit so the UNION marker row is dropped
+    data.result_cache().service.clear().unwrap();
+    ep.limit.store(3, Ordering::SeqCst);
+    let r2 = rows(&data, &q);
+    // with limit 3, each individual retry returns at most 3 rows
+    assert!(r2.len() <= 3 + 3, "truncated retries: {}", r2.len());
+    let sent = ep.take();
+    // the first bulk is truncated (no marker), so individual retries follow
+    assert!(sent.len() >= 3, "bulk + retries: got {}", sent.len());
+
+    // now let the endpoint return only the marker (all departments are empty of rows)
+    ep.limit.store(usize::MAX, Ordering::SeqCst);
+    let empty = format!(
+        "SELECT ?d ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} \
+         SERVICE <loop:bulk+5:{url}> {{ ?d <urn:hasEmployee> ?p FILTER(false) }} }}"
+    );
+    let re = rows(&data, &empty);
+    assert!(re.is_empty(), "marker-only gives no rows");
+    let sent2 = ep.take();
+    assert_eq!(sent2.len(), 1, "marker-only: one bulk request, no retries");
+}
+
+/// A marker-only bulk response splits into empty parts whose Arc and tuple overhead is
+/// properly admitted, and a truncated bulk response retries within budget (Sol round-5
+/// P2). Both execution modes use the same admission code.
+#[test]
+fn bulk_arc_overhead_budget_in_both_modes() {
+    use sparkles_core::sparql::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let data = store(&departments(10));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let run_mode =
+        |q: &str, mode: ExecutionMode, o: &QueryOptions| -> sparkles_core::Result<usize> {
+            match query_execution(data.snapshot(), q, o, &CursorOptions::default(), mode)? {
+                QueryExecution::Select(mut c) => {
+                    let mut n = 0;
+                    while let Some(b) = c.next_batch()? {
+                        n += b.len();
+                    }
+                    Ok(n)
+                }
+                QueryExecution::Eager(r) => Ok(r.into_result().len()),
+                _ => unreachable!("a SELECT"),
+            }
+        };
+    for mode in [ExecutionMode::Eager, ExecutionMode::Streaming] {
+        data.result_cache().service.clear().unwrap();
+        // marker-only: 10 inputs, FILTER(false) → endpoint returns only the end marker
+        let marker_q = format!(
+            "SELECT ?d ?p {{ VALUES ?d {{ {} }} \
+             SERVICE <loop:bulk+12:{url}> {{ ?d <urn:hasEmployee> ?p FILTER(false) }} }}",
+            (1..=10)
+                .map(|d| format!("<urn:dept{d}>"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let o = QueryOptions {
+            max_memory_bytes: Some(512 << 10),
+            ..opts()
+        };
+        let n = run_mode(&marker_q, mode, &o).unwrap();
+        assert_eq!(n, 0, "{mode:?}: marker-only gives no rows");
+        let sent = ep.take();
+        assert_eq!(sent.len(), 1, "{mode:?}: one bulk request, no retries");
+
+        data.result_cache().service.clear().unwrap();
+        // truncated: 2 inputs, endpoint truncates at 3 rows → no end marker → retry
+        ep.limit.store(3, Ordering::SeqCst);
+        let trunc_q = format!(
+            "SELECT ?d ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} \
+             SERVICE <loop:bulk+5:{url}> {{ ?d <urn:hasEmployee> ?p }} }}"
+        );
+        let n = run_mode(&trunc_q, mode, &o).unwrap();
+        ep.limit.store(usize::MAX, Ordering::SeqCst);
+        let sent = ep.take();
+        // bulk (truncated, no marker) + 2 individual retries (each truncated at 3)
+        assert!(
+            sent.len() >= 3,
+            "{mode:?}: bulk + retries: got {}",
+            sent.len()
+        );
+        assert_eq!(n, 3 + 3, "{mode:?}: each retry truncated at 3");
+    }
+}
+
+/// Repeated empty non-OPTIONAL LATERAL groups that plan `se:cacheLs` release their
+/// plan scratch leases between groups, so a tight budget does not overflow even when
+/// most groups produce no rows (Sol round-5 P3-1).
+#[test]
+fn lateral_cache_ls_empty_groups_release_plan_leases() {
+    let data = caching_store(2);
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let caching = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    rows(
+        &data,
+        &format!(
+            "SELECT ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} \
+             SERVICE <loop:cache:{url}> {{ ?d <urn:hasEmployee> ?p }} }}"
+        ),
+    );
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    // 2 present groups (the endpoint URL) and 5 missing groups (urn: URIs that match
+    // nothing in the listing). The budget fits one listing plan at a time; leaked
+    // scratch leases across the 5 empty groups would exhaust it.
+    let q = format!(
+        "{se} SELECT ?target ?id ?ep {{ \
+         VALUES ?target {{ <{url}> <urn:gone1> <urn:gone2> <urn:gone3> <urn:gone4> <urn:gone5> <{url}> }} \
+         LATERAL {{ ?id se:cacheLs (?ep) FILTER(?ep = ?target) }} }}"
+    );
+    let o = QueryOptions {
+        max_memory_bytes: Some(256 << 10),
+        no_cache: false,
+        ..caching
+    };
+    let r = run(&data, &q, &o).unwrap();
+    assert_eq!(r.len(), 4, "2 present groups * 2 cached entries each");
 }

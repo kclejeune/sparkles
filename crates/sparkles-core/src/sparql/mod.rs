@@ -59,6 +59,8 @@ pub(crate) mod sortkey;
 pub(crate) mod stable;
 pub mod stats;
 pub mod svccache;
+pub mod svcdisk;
+mod svcfn;
 mod svcread;
 pub mod table;
 pub mod textpf;
@@ -210,6 +212,12 @@ pub struct QueryOptions {
     /// with different credentials or views never share results; `None` is one shared
     /// scope.
     pub service_scope: Option<Arc<str>>,
+    /// Whether the query may remove entries of its scope from the cache of remote
+    /// SERVICE results with `se:cacheRm` (see [`svcfn`]), as Jena's `enableMgmt`
+    /// context symbol allows it. The server sets it for a caller with `admin` on the
+    /// dataset when `serve --service-cache-mgmt` is on. A query that calls the function
+    /// without it fails with [`Error::NotPermitted`].
+    pub service_cache_mgmt: bool,
     /// Whether the default graph is the union of the named graphs for this request,
     /// overriding the store's [`StoreOptions::union_default_graph`](crate::store::StoreOptions)
     /// (`None`: the store's setting). Unlike a protocol dataset whose default graph is
@@ -840,6 +848,7 @@ fn make_ctx_input_policy(
     if let Some(s) = &opts.service_scope {
         ctx.service_scope = s.clone();
     }
+    ctx.service_cache_mgmt = opts.service_cache_mgmt;
     ctx.local_endpoints = opts.local_endpoints.clone();
     ctx.service_depth = opts.service_depth;
     if let Some(o) = opts.optimizations {
@@ -1200,6 +1209,7 @@ fn restrict_source_ctx(
         .clone();
     if access.reads_all() {
         ctx.graphs = Some(access.clone());
+        scope_to_view(ctx);
         return ctx.check();
     }
     let mut visible = Buffer::new(&preparation)?;
@@ -1307,6 +1317,7 @@ fn restrict_source_ctx(
         .merge(kept);
     ctx.dataset = dataset;
     ctx.graphs = Some(access.clone());
+    scope_to_view(ctx);
     ctx.check()
 }
 
@@ -1326,7 +1337,21 @@ pub(crate) fn restrict_ctx(
     ds.restrict_checked(&snap, a, &|id| ctx.term_checked(id))?;
     ctx.dataset = ds;
     ctx.graphs = Some(a.clone());
+    scope_to_view(ctx);
     Ok(())
+}
+
+/// Narrow the request's scope in the cache of remote SERVICE results to the graph view
+/// it reads, once its guards are decided against its snapshot. The caller's scope
+/// names the view as configured, and a guard's exemptions follow the data, so two
+/// requests of one caller whose guards let different graphs through never share an
+/// entry, and a listing in the narrower view shows none of the broader one's.
+fn scope_to_view(ctx: &mut Ctx) {
+    if let Some(view) = &ctx.graphs
+        && view.has_guards()
+    {
+        ctx.service_scope = svccache::view_scope(&ctx.service_scope, view).into();
+    }
 }
 
 fn split(

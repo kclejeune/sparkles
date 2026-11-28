@@ -51,6 +51,10 @@ pub struct OutboundArgs {
     /// serviceBulkMaxBindingCount)
     #[arg(long, value_name = "N", default_value_t = sparkles::outbound::DEFAULT_SERVICE_BULK_MAX)]
     pub service_bulk_max: usize,
+    /// The most requests of one `SERVICE <loop:parallel+n:…>` in flight at once;
+    /// parallel+n is capped to it and parallel alone takes it
+    #[arg(long, value_name = "N", default_value_t = sparkles::outbound::DEFAULT_SERVICE_PARALLEL_MAX)]
+    pub service_parallel_max: usize,
 }
 
 impl OutboundArgs {
@@ -96,6 +100,9 @@ impl OutboundArgs {
         if self.service_bulk_size == 0 || self.service_bulk_max == 0 {
             bail!("--service-bulk-size and --service-bulk-max must be at least 1");
         }
+        if self.service_parallel_max == 0 {
+            bail!("--service-parallel-max must be at least 1");
+        }
         let timeout = Duration::from_secs_f64(self.outbound_timeout);
         Ok(OutboundPolicy {
             allow_private: (allow_private || self.outbound_allow_private)
@@ -108,6 +115,7 @@ impl OutboundArgs {
             request_timeout: Duration::from_secs_f64(request_timeout),
             service_bulk_size: self.service_bulk_size.min(self.service_bulk_max),
             service_bulk_max: self.service_bulk_max,
+            service_parallel_max: self.service_parallel_max,
             ..Default::default()
         })
     }

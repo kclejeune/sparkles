@@ -62,7 +62,7 @@ pub use schema::{
 pub use settings::{
     AggregateErrorsSetting, AggregateErrorsStatus, ChangeLogSetting, CompactionSetting,
     DescribeSetting, HistorySettings, HistoryUpdate, IndexSetting, QuotaSetting, RetentionSetting,
-    Settings,
+    ServiceCacheSetting, Settings,
 };
 pub use settings::{
     CompactionReadings, CompactionState, CompactionStatus, DescribeStatus, SettingSource,

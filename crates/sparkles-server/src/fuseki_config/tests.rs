@@ -1024,3 +1024,88 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// Jena's `enableMgmt` context symbol: `false` is the default, a server-wide `true` names
+/// `--service-cache-mgmt`, and a dataset's own `true` is reported as unsupported, since
+/// the flag would turn management on for every dataset (roadmap item 38).
+#[test]
+fn service_enhancer_management_contexts() {
+    let dir = tempfile::tempdir().unwrap();
+    let cx = |v: &str| {
+        if v.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "ja:context [ ja:cxtName \"http://jena.apache.org/service-enhancer#enableMgmt\" ; \
+                 ja:cxtValue \"{v}\" ] ;"
+            )
+        }
+    };
+    let mut n = 0;
+    let mut plan_of = |server: &str, dataset: &str| {
+        n += 1;
+        let path = dir.path().join(format!("config-{n}.ttl"));
+        let config = format!(
+            r#"PREFIX :       <#>
+PREFIX fuseki: <http://jena.apache.org/fuseki#>
+PREFIX ja:     <http://jena.hpl.hp.com/2005/11/Assembler#>
+[] a fuseki:Server ; {} fuseki:services ( :a ) .
+:a a fuseki:Service ; fuseki:name "a" ;
+    fuseki:endpoint [ fuseki:operation fuseki:query ] ;
+    fuseki:dataset [ a ja:MemoryDataset ; {} ] .
+"#,
+            cx(server),
+            cx(dataset)
+        );
+        std::fs::write(&path, config).unwrap();
+        plan_for(&[path], &UserSource::default(), Mode::Files).unwrap()
+    };
+    let p = plan_of("true", "");
+    assert!(
+        has(&p, Kind::Approximated, "--service-cache-mgmt"),
+        "{}",
+        p.report.text()
+    );
+    assert!(!p.report.has_unsupported(), "{}", p.report.text());
+    for (s, d) in [("false", ""), ("", "false")] {
+        let p = plan_of(s, d);
+        assert!(
+            has(&p, Kind::Converted, "the default"),
+            "{}",
+            p.report.text()
+        );
+        assert!(
+            !has(&p, Kind::Approximated, "--service-cache-mgmt"),
+            "{}",
+            p.report.text()
+        );
+    }
+    let p = plan_of("", "true");
+    assert!(
+        has(&p, Kind::Unsupported, "every dataset"),
+        "{}",
+        p.report.text()
+    );
+    // a dataset's false under the server's true would not hold
+    let p = plan_of("true", "false");
+    assert!(
+        has(&p, Kind::Unsupported, "would allow it"),
+        "{}",
+        p.report.text()
+    );
+    assert!(
+        !has(&p, Kind::Converted, "the default"),
+        "{}",
+        p.report.text()
+    );
+    let p = plan_of("sometimes", "");
+    assert!(
+        has(&p, Kind::Unsupported, "not true or false"),
+        "{}",
+        p.report.text()
+    );
+    // the converter never writes the flag itself
+    for (s, d) in [("true", ""), ("", "true")] {
+        assert!(!args(&plan_of(s, d)).contains("--service-cache-mgmt"));
+    }
+}

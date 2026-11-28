@@ -1334,6 +1334,9 @@ pub struct Ctx {
     /// the caller's scope in the cache of remote SERVICE results (see
     /// [`QueryOptions::service_scope`](super::QueryOptions::service_scope))
     pub service_scope: Arc<str>,
+    /// whether the query may call `se:cacheRm` (see
+    /// [`QueryOptions::service_cache_mgmt`](super::QueryOptions::service_cache_mgmt))
+    pub service_cache_mgmt: bool,
     /// the process's own query endpoints (see [`super::LocalEndpoints`])
     pub local_endpoints: Option<Arc<dyn super::LocalEndpoints>>,
     /// how many in-process SERVICE calls this query runs inside
@@ -1399,6 +1402,7 @@ pub struct Ctx {
     strict_decode: AtomicU32,
     // Data and weak retained caches drop before final ledger ownership.
     fast: FastMemory,
+    plan_scratch_leases: parking_lot::Mutex<Vec<QueryMemoryLease>>,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
     // All ordinary payloads, including graphs and ledger callbacks, retire before
     // their actual sources. A new mask can share its original source's backing.
@@ -1564,6 +1568,9 @@ enum ResourceRefusal {
     ServiceRefused(String),
     UnconfiguredExtension,
     Corrupt(String),
+    /// A side effect of an expression that failed, such as a removal from the SERVICE
+    /// cache whose files could not be synced, which only its call site records.
+    Io(String),
 }
 
 impl ResourceRefusal {
@@ -1606,6 +1613,7 @@ impl ResourceRefusal {
             Self::ServiceRefused(message) => Error::Service(message),
             Self::UnconfiguredExtension => super::extensions::unconfigured(),
             Self::Corrupt(message) => Error::Corrupt(message),
+            Self::Io(message) => Error::Io(std::io::Error::other(message)),
             Self::Parent {
                 component,
                 code,
@@ -1910,6 +1918,7 @@ impl Ctx {
             streams: false,
             strict_decode: AtomicU32::new(0),
             fast: Default::default(),
+            plan_scratch_leases: Default::default(),
             memory: Default::default(),
             snap,
             read_source: None,
@@ -1951,6 +1960,7 @@ impl Ctx {
             use_cache: true,
             plan_patterns: true,
             service_scope: Arc::from(""),
+            service_cache_mgmt: false,
             local_endpoints: None,
             service_depth: 0,
             algo_projections: None,
@@ -2629,6 +2639,22 @@ impl Ctx {
         }
     }
 
+    /// Record that a side effect of an expression failed with `error`, such as a removal
+    /// from the SERVICE cache whose files could not be synced, so the query's next check
+    /// fails with it. The expression itself can only give a type error, and no other
+    /// error is recorded this way.
+    pub(crate) fn fail_side_effect(&self, error: &Error) {
+        if self.memory_failure.failed.load(Ordering::Acquire) {
+            return;
+        }
+        let failure = &self.memory_failure;
+        failure
+            .failure
+            .lock()
+            .get_or_insert(ResourceRefusal::Io(error.to_string()));
+        failure.failed.store(true, Ordering::Release);
+    }
+
     /// Run `f` as optional evaluation on this thread, such as the misses of an optional
     /// cache, and return its value with whether a refusal of memory met it. Inside `f`, a
     /// memory refusal that infallible code meets on this context sets that result and
@@ -3301,6 +3327,18 @@ impl Ctx {
             bytes,
             service: None,
         })
+    }
+
+    pub(super) fn retain_plan_lease(&self, lease: QueryMemoryLease) {
+        self.plan_scratch_leases.lock().push(lease);
+    }
+
+    pub(super) fn plan_lease_count(&self) -> usize {
+        self.plan_scratch_leases.lock().len()
+    }
+
+    pub(super) fn truncate_plan_leases(&self, len: usize) {
+        self.plan_scratch_leases.lock().truncate(len);
     }
 
     pub fn charge(&self, bytes: u64) -> Result<Charge<'_>> {

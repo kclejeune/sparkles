@@ -13,6 +13,7 @@ pub(crate) fn computed(iri: &str) -> bool {
         || iri == textpf::TEXT_QUERY
         || iri == sparkles_core::vector::VECTOR_SEARCH
         || iri == hybrid::HYBRID_SEARCH
+        || iri == sparkles_core::sparql::svccache::CACHE_LS
         || iri == georewrite::SPATIAL_EQUALS
         || SpatialPfKind::from_iri(iri).is_some()
         || Relation::from_property(iri).is_some()

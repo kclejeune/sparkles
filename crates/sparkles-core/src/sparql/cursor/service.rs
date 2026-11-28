@@ -45,7 +45,7 @@ use crate::sparql::ctx::{Ctx, OwnedCharge};
 use crate::sparql::enhancer::CacheMode;
 use crate::sparql::exec::{LocalCall, RemoteAnswer, ServiceSolution};
 use crate::sparql::plan::{Kind, Node, PathEnd};
-use crate::sparql::svccache::Rows;
+use crate::sparql::svccache::{Parts, Rows, ServiceKey, Slice};
 use crate::sparql::table::VarId;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -95,6 +95,8 @@ pub(super) struct Service {
     query: String,
     silent: bool,
     cache: CacheMode,
+    /// what the cached request keys its entry by (see [`ServiceKey`])
+    key: Option<ServiceKey>,
     vars: Vec<VarId>,
     /// the names of `vars`, as the endpoint's solutions name their variables
     names: Vec<String>,
@@ -118,6 +120,9 @@ enum Source {
         answer: Box<RemoteAnswer>,
         /// the copy of the answer read so far, for the cache once it has all of it
         tee: Option<Tee>,
+        /// what the answer gave after the solutions a LIMIT asks for, read ahead to
+        /// learn whether the response ended cleanly there: `Some(None)` for its end
+        peeked: Option<Option<Result<sparesults::QuerySolution>>>,
     },
     Local {
         /// Declared before `hold`, so that the call ends before its hold is released.
@@ -141,6 +146,9 @@ enum Source {
 /// A charged copy of a remote answer, kept while it is small enough to be cached.
 struct Tee {
     key: String,
+    /// the parts of `key`, and the slice of the request it copies
+    parts: Parts,
+    slice: Slice,
     rows: Rows,
     /// `rows.bytes()`, the cache's weight of the copy, kept as rows arrive
     bytes: u64,
@@ -161,12 +169,21 @@ impl Tee {
         let charge = OwnedCharge::new(ctx, retained.saturating_add(key.capacity() as u64))?;
         Ok(Self {
             key,
+            parts: Parts::default(),
+            slice: Slice::ALL,
             rows,
             bytes: 64,
             limit,
             retained,
             charge,
         })
+    }
+
+    /// The copy of the request whose key has `parts`, sent with `slice`.
+    fn of(mut self, parts: Parts, slice: Slice) -> Self {
+        self.parts = parts;
+        self.slice = slice;
+        self
     }
 
     /// Copy one solution, or give up the copy once it is larger than the cache keeps or
@@ -260,6 +277,7 @@ impl Service {
             query,
             silent,
             cache,
+            key,
         } = &node.kind
         else {
             unreachable!("a SERVICE node")
@@ -269,6 +287,7 @@ impl Service {
             query: query.clone(),
             silent: *silent,
             cache: *cache,
+            key: key.as_deref().cloned(),
             vars: node.vars.clone(),
             names: node.vars.iter().map(|v| ctx.var_name(*v)).collect(),
             fallback,
@@ -355,17 +374,26 @@ impl Service {
             && ctx.use_cache
             && store.enabled()
         {
-            // the whole result under one key: a SERVICE without `loop` has one input
-            let key =
-                crate::sparql::svccache::key(&ctx.service_scope, url.as_str(), &self.query, &[]);
+            // the whole result under one key: a SERVICE without `loop` has one input, and
+            // the key leaves out the request's outermost slice, which bounds the entry
+            let (text, slice) = self
+                .key
+                .as_ref()
+                .map_or((self.query.as_str(), Slice::ALL), |k| {
+                    (k.text.as_str(), k.slice)
+                });
+            let key = crate::sparql::svccache::key(&ctx.service_scope, url.as_str(), text, &[]);
+            let parts = Parts::of(&ctx.service_scope, url.as_str(), text);
+            let lookup = ctx.charge(0)?;
             let hit = if self.cache == CacheMode::Default {
-                store.get(&key)
+                store.get_admitted(&key, slice, &|n| lookup.add(n))?
             } else {
                 store.remove(&key);
                 None
             };
             if let Some(rows) = hit {
                 let charge = OwnedCharge::new(ctx, rows.retained_bytes())?;
+                drop(lookup);
                 let cols = self
                     .names
                     .iter()
@@ -380,7 +408,9 @@ impl Service {
                 return Ok(());
             }
             // a copy the budget cannot hold is not made
-            tee = Tee::new(ctx, key, store.max_entry_bytes()).ok();
+            tee = Tee::new(ctx, key, store.max_entry_bytes())
+                .ok()
+                .map(|t| t.of(parts, slice));
         }
         let meter = crate::sparql::exec::Meter {
             ctx,
@@ -392,6 +422,7 @@ impl Service {
         self.source = Some(Source::Remote {
             answer: Box::new(answer),
             tee,
+            peeked: None,
         });
         Ok(())
     }
@@ -523,17 +554,34 @@ impl Service {
                 b.table.push_row(&row);
             };
         let ended = match self.source.as_mut().expect("an open answer") {
-            Source::Remote { answer, tee } => {
+            Source::Remote {
+                answer,
+                tee,
+                peeked,
+            } => {
                 let _entered = answer.span.clone().entered();
                 loop {
                     if b.table.len >= cap {
                         break false;
                     }
                     ctx.check()?;
-                    let Some(solution) = answer.next_solution() else {
+                    let next = match peeked.take() {
+                        Some(next) => next,
+                        None => answer.next_solution(),
+                    };
+                    let Some(solution) = next else {
                         ctx.check()?;
-                        if let Some(tee) = tee.take() {
-                            ctx.snap.results.service.put(tee.key, Arc::new(tee.rows));
+                        // a response with more solutions than its LIMIT is not the
+                        // answer the request asked for
+                        if let Some(tee) = tee.take()
+                            && tee.slice.limit.is_none_or(|l| tee.rows.rows.len() <= l)
+                        {
+                            ctx.snap.results.service.put(
+                                tee.key,
+                                tee.parts,
+                                tee.slice,
+                                Arc::new(tee.rows),
+                            );
                         }
                         break true;
                     };
@@ -549,6 +597,19 @@ impl Service {
                     }
                     if let Some(copy) = tee.take() {
                         *tee = copy.push(&solution)?;
+                    }
+                    // A SILENT call reads its whole answer before returning any row and
+                    // caches it at the end. A non-SILENT call that reached the LIMIT
+                    // drops the copy without blocking on the response tail, so the
+                    // query returns promptly even when the endpoint stalls after the
+                    // last demanded row. The response is cached only when EOF has
+                    // already been observed (the loop breaks naturally).
+                    if silent_prior.is_none()
+                        && tee
+                            .as_ref()
+                            .is_some_and(|t| t.slice.limit == Some(t.rows.rows.len()))
+                    {
+                        *tee = None;
                     }
                     push(&mut b, bnodes, &ServiceSolution::Remote(&solution));
                     ctx.check()?;
@@ -711,6 +772,7 @@ mod tests {
             query: "SELECT ?s { ?s ?p ?o }".into(),
             silent: false,
             cache: CacheMode::Default,
+            key: None,
             vars: vec![var],
             names: vec![ctx.var_name(var)],
             fallback: FallbackPolicy::RejectMaterialization,
@@ -760,6 +822,7 @@ mod tests {
             Source::Remote {
                 answer: Box::new(answer),
                 tee: None,
+                peeked: None,
             },
         );
         let err = svc.fill(&ctx, 10, None).err();
@@ -816,6 +879,7 @@ mod tests {
             Source::Remote {
                 answer: Box::new(answer),
                 tee: Some(tee),
+                peeked: None,
             },
         );
         let err = svc.fill(&ctx, 4, None).err();
@@ -976,6 +1040,7 @@ mod tests {
             query: "SELECT ?s { ?s ?p ?o }".into(),
             silent: true,
             cache: CacheMode::Default,
+            key: None,
             vars: vec![var],
             names: vec![ctx.var_name(var)],
             fallback: FallbackPolicy::RejectMaterialization,
@@ -1002,5 +1067,157 @@ mod tests {
         assert!(svc.done());
         drop(hold);
         assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
+    }
+
+    /// The streamed answer to a request with a LIMIT is cached only once the response
+    /// is known to end at the limit: a response that fails after the rows it was asked
+    /// for, or sends more of them, leaves the cache as it was, with SILENT or without.
+    /// A read-ahead error (such as a timeout) also leaves the cache as it was.
+    #[test]
+    fn a_limited_answer_is_cached_only_when_it_ends_at_the_limit() {
+        use crate::sparql::svccache::{Parts, Slice};
+        let head = br#"{"head":{"vars":["s"]},"results":{"bindings":["#.to_vec();
+        let row = |v: &str| format!(r#"{{"s":{{"type":"literal","value":"{v}"}}}}"#);
+        for (tail, cached) in [
+            (format!("{},{}]}}}}", row("a"), row("b")), true),
+            (
+                format!("{},{},{}]}}}}", row("a"), row("b"), row("c")),
+                false,
+            ),
+            (format!("{},{},{{\"s\":", row("a"), row("b")), false),
+        ] {
+            for silent in [None, Some(0)] {
+                let ctx = ctx(1 << 20);
+                let var = ctx.var("s");
+                let mut chunks = std::collections::VecDeque::new();
+                chunks.push_back(head.clone());
+                chunks.push_back(tail.clone().into_bytes());
+                let reader = ChunkedReader {
+                    chunks,
+                    armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    cancel_on_first_armed_read: None,
+                    triggered: false,
+                    reads_after_first_armed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                };
+                let answer = RemoteAnswer::from_reader(
+                    Box::new(reader),
+                    sparesults::QueryResultsFormat::Json,
+                    "http://test.invalid/sparql",
+                )
+                .unwrap();
+                let key = "limited".to_string();
+                let slice = Slice::ALL.limited(2);
+                let tee = Tee::new(
+                    &ctx,
+                    key.clone(),
+                    ctx.snap.results.service.max_entry_bytes(),
+                )
+                .unwrap()
+                .of(Parts::default(), slice);
+                let mut svc = test_service(
+                    &ctx,
+                    var,
+                    Source::Remote {
+                        answer: Box::new(answer),
+                        tee: Some(tee),
+                        peeked: None,
+                    },
+                );
+                // the query reads the two rows it asked for, and no further
+                let first = svc.fill(&ctx, 2, silent);
+                if silent.is_some() {
+                    // a SILENT drain reads on to the end
+                    let mut r = first.map(|_| ());
+                    while r.is_ok() && svc.source.is_some() {
+                        r = svc.fill(&ctx, 2, silent).map(|_| ());
+                    }
+                }
+                let expect = if silent.is_some() { cached } else { false };
+                assert_eq!(
+                    ctx.snap.results.service.get(&key, slice).is_some(),
+                    expect,
+                    "{tail} silent {silent:?}"
+                );
+            }
+        }
+    }
+
+    /// A non-SILENT fill returns the demanded rows from the ready head without reading
+    /// the stalled tail, so a slow endpoint does not block the query past its rows.
+    #[test]
+    fn non_silent_fill_does_not_read_the_stalled_tail() {
+        use crate::sparql::svccache::{Parts, Slice};
+        let head = br#"{"head":{"vars":["s"]},"results":{"bindings":["#.to_vec();
+        let row = |v: &str| format!(r#"{{"s":{{"type":"literal","value":"{v}"}}}}"#);
+        let ctx = ctx(1 << 20);
+        let var = ctx.var("s");
+        let tail_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut chunks = std::collections::VecDeque::new();
+        chunks.push_back(head);
+        // include a comma after row b so the parser can emit it without reading ahead
+        chunks.push_back(format!("{},{},", row("a"), row("b")).into_bytes());
+        let reader = StalledTailReader {
+            chunks,
+            tail_reads: tail_reads.clone(),
+        };
+        let answer = RemoteAnswer::from_reader(
+            Box::new(reader),
+            sparesults::QueryResultsFormat::Json,
+            "http://test.invalid/sparql",
+        )
+        .unwrap();
+        let slice = Slice::ALL.limited(2);
+        let tee = Tee::new(
+            &ctx,
+            "stalled".to_string(),
+            ctx.snap.results.service.max_entry_bytes(),
+        )
+        .unwrap()
+        .of(Parts::default(), slice);
+        let mut svc = test_service(
+            &ctx,
+            var,
+            Source::Remote {
+                answer: Box::new(answer),
+                tee: Some(tee),
+                peeked: None,
+            },
+        );
+        let buf = svc.fill(&ctx, 2, None).unwrap();
+        let rows = buf.map(|b| b.table.len).unwrap_or(0);
+        assert_eq!(rows, 2, "both demanded rows returned");
+        assert_eq!(
+            tail_reads.load(Ordering::SeqCst),
+            0,
+            "no tail reads attempted"
+        );
+        assert!(
+            ctx.snap.results.service.get("stalled", slice).is_none(),
+            "stalled response is not cached"
+        );
+    }
+
+    struct StalledTailReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        tail_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::io::Read for StalledTailReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(mut chunk) = self.chunks.pop_front() {
+                let n = chunk.len().min(buf.len());
+                buf[..n].copy_from_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    self.chunks.push_front(chunk.split_off(n));
+                }
+                Ok(n)
+            } else {
+                self.tail_reads.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "stalled tail",
+                ))
+            }
+        }
     }
 }

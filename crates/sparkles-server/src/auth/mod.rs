@@ -46,7 +46,7 @@ mod tokens;
 
 pub use api::{
     PrincipalKeyer, cors_layer, flush, load, proxy_host_warning, public_url, render_metrics,
-    restrict, routes, server_json, spawn_reload_on_sighup, throttle,
+    restrict, routes, server_json, set_service_cache_mgmt, spawn_reload_on_sighup, throttle,
 };
 pub use proxy::Peer;
 #[cfg(test)]

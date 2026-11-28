@@ -287,6 +287,8 @@ pub(super) fn run(
     let mut solutions = 0;
     for key in &order {
         ctx.check()?;
+        let lease_mark = ctx.plan_lease_count();
+        let _lease_guard = LeaseGuard(ctx, lease_mark);
         let mut p = Planner::new(ctx);
         p.subst.extend(spec.outer.iter().copied());
         p.scoped.extend(spec.outer_scoped.iter().copied());
@@ -329,4 +331,12 @@ pub(super) fn run(
         out.append(joined.project(vars));
     }
     Ok((out, order.len(), solutions))
+}
+
+struct LeaseGuard<'a>(&'a Ctx, usize);
+
+impl Drop for LeaseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.truncate_plan_leases(self.1);
+    }
 }

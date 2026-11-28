@@ -3536,6 +3536,7 @@ one request, and a second run answers from the cache without a request.
 | `cache`, `cache+default` | Reads the dataset's cache of remote results, one entry per solution of the loop, and stores what it fetches. Without `loop`, the whole result is one entry. |
 | `cache+clear` | Drops the entries of this SERVICE's inputs, fetches them again and stores them. |
 | `cache+off` | Neither reads nor writes the cache. |
+| `parallel`, `parallel+n` | Keeps up to `n` requests of a loop to a remote endpoint in flight at once. `parallel` alone takes `--service-parallel-max` (4), and `n` is capped at it. The answer does not depend on the order in which responses arrive. |
 | `optimize` | Accepted for compatibility. It has no effect. |
 
 `SERVICE <urn:x-arq:self> { … }`, and options without an endpoint, read the dataset of
@@ -3564,20 +3565,73 @@ cached. Both shapes are plain SPARQL 1.1, which Fuseki, QLever and Wikidata answ
 
 Every request follows the outbound policy and counts against the request's outbound
 budget. A caller without `federate`, or a server with SERVICE turned off, is refused even
-when the cache holds the answer. Cache entries are kept per caller and per endpoint of
-the request, so callers with different credentials or graph views never read each
-other's entries. Library users choose the scope with `QueryOptions::service_scope`. The
-cache holds `--service-cache-mb` (64) for the whole server, skips any entry larger than an eighth
-of that, and keeps no entry for a response that was cut short. `POST /$/cache/clear/{ds}`
-empties it, the `no_cache` query option skips it, and the dataset's statistics report it
-as `serviceCache`.
+when the cache holds the answer. Cache entries are kept per credential, endpoint of the
+request, dataset branch and graph view, so callers with different credentials, OIDC scopes
+or graph views never read each other's entries. Library users choose the scope with
+`QueryOptions::service_scope`. The cache holds `--service-cache-mb` (64) for the whole
+server, skips any entry larger than an eighth of that, and keeps no entry for a response
+that was cut short. `POST /$/cache/clear/{ds}` empties it, the `no_cache` query option
+skips it, and the dataset's statistics report it as `serviceCache`.
 
 EXPLAIN shows a loop as a `Lateral` operator with the endpoint, the keys, the bulk size
 and shape, and the cache mode. Its counters give the inputs, the requests, the cache hits
 and the bulk requests sent again.
 
-Jena's slice-aware cache, which serves overlapping LIMIT and OFFSET ranges from stored
-pages, and its management functions `se:cacheRm` and `se:cacheLs` are not supported.
+A cache entry is keyed without the outermost LIMIT and OFFSET of its request and holds
+the solutions that request got. A later request for the same pattern and input is
+answered from the entry when it is the same request, or when it has a LIMIT and every
+solution it asks for is among the entry's rows. So `LIMIT 5` and `OFFSET 2 LIMIT 3` are
+answered from an entry that `LIMIT 10` stored. Any other request is sent as the query
+writes it. A response with fewer solutions than its LIMIT, or one without a LIMIT, is not
+taken as the end of the result, since an endpoint may cap its responses without saying
+so. Sparkles never rewrites a slice. A LIMIT that the planner passes into the request of
+a plain SERVICE bounds its entry in the same way.
+
+Entries answer for `--service-cache-ttl` seconds (3,600) after they are stored, since a
+remote endpoint's data changes without notice. A dataset's own setting comes first, and
+`0` keeps entries until they are evicted. A persistent dataset can keep its entries on
+disk too, so that they outlive a restart. Its `service-cache.json` sets `disk`, the MiB
+the files may take (`diskMb`, default `--service-cache-disk-mb`, 256) and the time to live
+(`ttlSeconds`). Library users call `Dataset::settings().service_cache()` or
+`Store::set_service_cache_settings`. Each entry is one file in `service-cache/` under the
+dataset's directory, named by the SHA-256 of its key, and the least recently used files
+are removed first. The files hold neither the caller's scope nor the user information,
+query string and fragment of the endpoint's URL. Backups and clones leave the directory
+out, `POST /$/cache/clear/{ds}` empties it, and turning `disk` off removes it. A file
+from a newer release is neither read nor overwritten. A read-only server leaves the
+directory as it is and does not read it.
+
+Jena's management functions list and remove the caller's own entries:
+
+```sparql
+PREFIX se: <http://jena.apache.org/service-enhancer#>
+SELECT ?id ?service ?rows { ?id se:cacheLs (?service ?query ?binding ?rows ?bytes ?age) }
+SELECT (se:cacheRm() AS ?removed) { }
+SELECT (SUM(se:cacheRm(?id)) AS ?removed) { ?id se:cacheLs (<https://dbpedia.org/sparql>) }
+```
+
+`se:cacheLs` binds the entry's id and up to six positions, each optional and each a
+variable or a term the entry must match. The first three are Jena's, the endpoint, the
+pattern and the values substituted into it. The last three are the entry's solutions,
+its bytes and its age in seconds. An http or https endpoint is listed without its user
+information, query string and fragment, and any other endpoint is listed as
+`urn:x-sparkles:unlisted-endpoint`. `se:cacheRm()` removes every entry of the caller and
+`se:cacheRm(?id)` one entry, and each returns the number removed once the removal is on
+disk. A removal that the disk could not sync fails the query. A query may call
+`se:cacheRm` only when the server runs with `--service-cache-mgmt` and the caller has
+`admin` on the dataset through the endpoint it uses, which is Jena's `enableMgmt`. Without
+both, a query that calls it fails with `403`, and a call inside EXISTS, including one
+within a SERVICE that runs against the dataset itself, is refused before the query runs.
+A call through `fn:apply` or `afn:eval` is an error of the expression and removes nothing.
+Both functions work in the WHERE clause of an UPDATE, which uses the store's SERVICE
+cache, under the same rules. A SERVICE call in an UPDATE WHERE clause does not read
+from or publish to the SERVICE cache, so an uncommitted or rolled-back value never
+reaches a cached entry. The management functions are independent of this: `se:cacheRm`
+removes entries as an external side effect and its removal survives an RDF rollback
+of the same UPDATE, since the cache is not part of the RDF transaction.
+Library users set `QueryOptions::service_cache_mgmt`. Neither function reaches another
+caller's entries, and the results of `se:cacheLs`, and of a LATERAL or EXISTS that calls
+either function, are never kept in the query result cache.
 
 ### Aggregate errors
 

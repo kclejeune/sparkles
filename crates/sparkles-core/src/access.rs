@@ -564,6 +564,11 @@ impl Graphs {
         Graphs::Only(r)
     }
 
+    /// Whether the set has a guard, decided or not.
+    pub(crate) fn has_guards(&self) -> bool {
+        matches!(self, Graphs::Only(r) if !r.guards.is_empty())
+    }
+
     /// Whether some guard of the set is undecided.
     pub fn undecided(&self) -> bool {
         matches!(self, Graphs::Only(r) if r.guards.iter().any(|g| g.decide.is_some()))
@@ -743,6 +748,24 @@ impl GraphAccess {
     /// different snapshot.
     pub fn validate_bound_snapshot(&self, snap: &Snapshot) -> Result<()> {
         self.check_bound_snapshot(snap)
+    }
+
+    /// Whether the view has a guard anywhere, in its graphs or in the graph rules of its
+    /// protections of triples, whose exemptions can differ between snapshots.
+    pub(crate) fn has_guards(&self) -> bool {
+        self.read.has_guards()
+            || self.write.has_guards()
+            || self.triples.as_ref().is_some_and(|rules| {
+                rules.rules.iter().any(|rule| {
+                    rule.read.has_guards()
+                        || rule.write.has_guards()
+                        || rule
+                            .protection
+                            .graphs
+                            .as_ref()
+                            .is_some_and(Graphs::has_guards)
+                })
+            })
     }
 
     /// Refuse applying a policy whose guards were bound against a different snapshot,
