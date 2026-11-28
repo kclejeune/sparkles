@@ -1146,6 +1146,24 @@ fn with_report(mut r: Response, report: AuthReport) -> Response {
 }
 
 /// A 403 (from the middleware, or a handler's own check).
+/// The view that a view management request names (`PUT` or `DELETE` of
+/// `/$/views/{ds}/{name}`, `POST /$/views/{ds}/{name}/rebuild`), when `route` is one.
+fn managed_view(route: &str, method: &Method, path: &str) -> Option<String> {
+    let mut segments = path.rsplit('/');
+    let name = match route {
+        "/$/views/{ds}/{name}" if !matches!(*method, Method::GET | Method::HEAD) => {
+            segments.next()?
+        }
+        "/$/views/{ds}/{name}/rebuild" => segments.nth(1)?,
+        _ => return None,
+    };
+    Some(
+        percent_encoding::percent_decode_str(name)
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
+}
+
 pub fn forbidden(p: &Principal, msg: &str) -> Response {
     forbidden_as(p, msg, Denied::Forbidden)
 }
@@ -1702,6 +1720,9 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                         }
                         _ => {
                             count(Denied::Forbidden);
+                            if let Some(view) = managed_view(&route, &method, req.uri().path()) {
+                                crate::http::views::manage_refused(&ds, &view, &p, "level");
+                            }
                             let msg =
                                 format!("{} access to branch main of /{ds} required", lvl.as_str());
                             return finish(forbidden(&p, &msg));
@@ -1715,6 +1736,11 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                     return finish(deny(Denied::Hidden, r, &p));
                 }
                 count(Denied::Forbidden);
+                // the caller sees the dataset, so the refusal of a view's management is
+                // recorded as a decision on the view
+                if let Some(view) = managed_view(&route, &method, req.uri().path()) {
+                    crate::http::views::manage_refused(&ds, &view, &p, "level");
+                }
                 let msg = match e {
                     Some(e) => denial_message(&ds, lvl, e, have),
                     None => format!("{} access to /{ds} required", lvl.as_str()),

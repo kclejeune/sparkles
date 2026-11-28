@@ -791,15 +791,23 @@ impl GraphAccess {
     }
 
     /// This view with every guard keeping all its graphs out, decided or not, and bound
-    /// to no snapshot. It reads no more than this view at any snapshot, and is the same
-    /// at every snapshot, so that decisions about it can be kept across commits.
+    /// to no snapshot. The guards of its graph sets and those of its protections' lifts
+    /// are closed, so it reads no more than this view at any snapshot and is the same at
+    /// every snapshot, and decisions about it can be kept across commits. The graphs a
+    /// protection applies in are left as they are, since closing a guard there would
+    /// make the protection hide less. Closing loses whether a guard is decided at the
+    /// snapshot a request reads, which [`binds_guards`](Self::binds_guards) keeps.
     pub fn guards_closed(self: &Arc<Self>) -> Arc<GraphAccess> {
         let has = |g: &Graphs| matches!(g, Graphs::Only(r) if !r.guards.is_empty());
-        if !has(&self.read) && !has(&self.write) {
+        let nested = self
+            .triples
+            .as_ref()
+            .is_some_and(|t| t.rules.iter().any(|r| has(&r.read) || has(&r.write)));
+        if !has(&self.read) && !has(&self.write) && !nested {
             return self.clone();
         }
         let close = |g: &Graphs| match g {
-            Graphs::Only(r) => {
+            Graphs::Only(r) if !r.guards.is_empty() => {
                 let mut r = r.clone();
                 for g in &mut r.guards {
                     g.decide = None;
@@ -809,26 +817,74 @@ impl GraphAccess {
                 r.normalize();
                 Graphs::Only(r)
             }
-            Graphs::All => Graphs::All,
+            g => g.clone(),
+        };
+        let triples = match &self.triples {
+            Some(t) if nested => Some(Arc::new(TripleRules {
+                rules: t
+                    .rules
+                    .iter()
+                    .map(|r| Rule {
+                        protection: r.protection.clone(),
+                        read: close(&r.read),
+                        write: close(&r.write),
+                    })
+                    .collect(),
+                caller: t.caller.clone(),
+                limits: t.limits,
+            })),
+            t => t.clone(),
         };
         Arc::new(GraphAccess {
             read: close(&self.read),
             write: close(&self.write),
-            triples: self.triples.clone(),
+            triples,
             views: self.views.clone(),
         })
     }
 
+    /// Whether a guard of this view's reads is decided at the snapshot a request reads,
+    /// or was bound to one, rather than fixed by its grants. Reads under such a guard
+    /// refuse some evidence that a view with the same guard fixed would accept (support
+    /// that a stored fact of an earlier commit proves while a pattern protection is in
+    /// force), so containment ([`read_contains`](Self::read_contains)) takes it into
+    /// account after [`guards_closed`](Self::guards_closed) or
+    /// [`settled`](Self::settled) has removed it.
+    pub fn binds_guards(&self) -> bool {
+        let binds = |g: &Graphs| {
+            matches!(g, Graphs::Only(r)
+                if r.guards.iter().any(|g| g.decide.is_some() || g.bound_to.is_some()))
+        };
+        binds(&self.read)
+            || self
+                .triples
+                .as_ref()
+                .is_some_and(|t| t.rules.iter().any(|r| binds(&r.read)))
+    }
+
     /// Whether every quad that `other` reads, this view reads as well, judged from the
-    /// grant sets alone (spec F13 §6.1). Both views are compared [`settled`](Self::settled),
-    /// so a guard exempts nothing. The answer is `Ok` only when the rules prove the
-    /// containment, and otherwise names the first [`Gap`] found: an inclusion that the
-    /// comparison cannot prove counts as a gap.
+    /// grant sets alone (spec F13 §6.1). Both views are compared
+    /// [`settled`](Self::settled), so an undecided guard exempts nothing, while a decided
+    /// guard keeps its exemptions. Use [`guards_closed`](Self::guards_closed) first to
+    /// ignore those too. The answer is `Ok` only when the rules prove the containment,
+    /// and otherwise names the first [`Gap`] found: an inclusion that the comparison
+    /// cannot prove counts as a gap.
     pub fn read_contains(
         self: &Arc<Self>,
         other: &Arc<GraphAccess>,
     ) -> std::result::Result<(), Gap> {
-        contain::read_contains(&self.settled(), &other.settled())
+        self.read_contains_binding(other, self.binds_guards())
+    }
+
+    /// [`read_contains`](Self::read_contains) for a view whose guards were closed,
+    /// with `binds` telling whether the view they were closed from
+    /// [`binds_guards`](Self::binds_guards).
+    pub(crate) fn read_contains_binding(
+        self: &Arc<Self>,
+        other: &Arc<GraphAccess>,
+        binds: bool,
+    ) -> std::result::Result<(), Gap> {
+        contain::read_contains(&self.settled(), &other.settled(), binds)
     }
 
     /// Whether some protection hides triples from reads.

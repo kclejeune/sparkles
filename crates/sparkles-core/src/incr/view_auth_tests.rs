@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+mod eval;
+
 const PREFIX: &str = "PREFIX : <http://ex/> PREFIX org: <http://www.w3.org/ns/org#> ";
 const DATA: &str = r#"
 @prefix : <http://ex/> .
@@ -732,4 +734,344 @@ _:g { :n :p "blank" . }
         "{proven} of {}",
         accesses.len()
     );
+}
+
+fn waiting_runtime(s: &Store, policy: &Arc<Policy>) -> Arc<Runtime> {
+    let rt = Runtime::open(
+        None,
+        s.dataset_id(),
+        RuntimeOptions {
+            view_wait: Duration::from_secs(20),
+            ..Default::default()
+        },
+    );
+    rt.set_host(policy.clone());
+    rt
+}
+
+/// A refused caller is refused before the read reports the view's state or waits for
+/// it: a suspended view does not tell it the size of its state, a view that failed to
+/// attach does not tell it why, and a view that is not attached is refused at once,
+/// each with a record of the refusal. A view that is not attached is decided as one
+/// that reads every quad, so it refuses a caller that its principal would admit, too.
+#[test]
+fn a_refusal_comes_before_the_view_state() {
+    let s = store();
+    let policy = Policy::with(&[("reports", Some(reads(&["default", SECRET])))]);
+    let rt = waiting_runtime(&s, &policy);
+    let narrow = granted(&["default"], &[], "frank");
+    let wider = granted(&["default", SECRET, "http://ex/g1"], &[], "erin");
+    let deadline = || Some(Instant::now() + Duration::from_secs(30));
+    let refused = |name: &str, caller: &Arc<GraphAccess>, hidden: &str| {
+        let start = Instant::now();
+        let e = read_at(&rt, &s, name, Some(caller), deadline()).unwrap_err();
+        assert_eq!(code(&e), "view-access", "{name}: {e}");
+        assert!(!e.to_string().contains(hidden), "{name}: {e}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{name}: {:?}",
+            start.elapsed()
+        );
+    };
+
+    // over its own budget while it builds: still attached, so a contained caller is
+    // told and a narrower one is refused without the reason
+    // a query of its own, so that no other view shares its circuit and its budget
+    let mut def = ViewDef::table(q("SELECT ?p ?team WHERE { ?p org:memberOf ?team }"));
+    def.principal = Some("reports".into());
+    def.memory_bytes = 1;
+    rt.put(&s, "small", def).unwrap();
+    rt.round(&s);
+    let info = rt.get(&s, "small").unwrap();
+    assert!(
+        matches!(&info.state, crate::incr::ViewState::Suspended { reason } if reason.starts_with("over-budget: ")),
+        "{:?}",
+        info.state
+    );
+    policy.events();
+    refused("small", &narrow, "over-budget");
+    assert_eq!(
+        policy.events(),
+        ["small read deny graphs cached=false frank"]
+    );
+    let e = read_at(&rt, &s, "small", Some(&wider), deadline()).unwrap_err();
+    assert_eq!(code(&e), "view-suspended", "{e}");
+
+    // suspended by the views' shared budget: detached, so decided as a view that reads
+    // every quad, which only an unrestricted reader reads
+    let pooled = Runtime::open(
+        None,
+        s.dataset_id(),
+        RuntimeOptions {
+            view_wait: Duration::from_secs(20),
+            views_memory: Some(1),
+            ..Default::default()
+        },
+    );
+    pooled.set_host(policy.clone());
+    define(&pooled, &s, "pooled", "reports");
+    let info = pooled.get(&s, "pooled").unwrap();
+    assert!(
+        matches!(&info.state, crate::incr::ViewState::Suspended { reason } if reason.contains("--views-memory")),
+        "{:?}",
+        info.state
+    );
+    policy.events();
+    for caller in [&narrow, &wider] {
+        let start = Instant::now();
+        let e = read_at(&pooled, &s, "pooled", Some(caller), deadline()).unwrap_err();
+        assert_eq!(code(&e), "view-access", "{e}");
+        assert!(!e.to_string().contains("views-memory"), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+    let events = policy.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(events.iter().all(|e| e.contains(" deny ")), "{events:?}");
+    let e = read_at(&pooled, &s, "pooled", None, deadline()).unwrap_err();
+    assert_eq!(code(&e), "view-suspended", "{e}");
+
+    // rebuilt and not yet attached again: no round runs
+    pooled.rebuild("pooled").unwrap();
+    policy.events();
+    for caller in [&narrow, &wider] {
+        let start = Instant::now();
+        let e = read_at(&pooled, &s, "pooled", Some(caller), deadline()).unwrap_err();
+        assert_eq!(code(&e), "view-access", "{e}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+    assert_eq!(policy.events().len(), 2);
+
+    // failed to attach: its principal is gone from the policy
+    define(&rt, &s, "team-sizes", "reports");
+    assert_eq!(read(&rt, &s, "team-sizes", &wider).unwrap(), 2);
+    policy.principals.lock().remove("reports");
+    policy.epoch.fetch_add(1, Ordering::SeqCst);
+    rt.round(&s);
+    assert!(
+        matches!(
+            rt.get(&s, "team-sizes").unwrap().state,
+            crate::incr::ViewState::Failed { .. }
+        ),
+        "{:?}",
+        rt.get(&s, "team-sizes").unwrap().state
+    );
+    policy.events();
+    refused("team-sizes", &narrow, "no principal");
+    refused("team-sizes", &wider, "no principal");
+    let events = policy.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(events.iter().all(|e| e.contains(" deny ")), "{events:?}");
+    let e = read_at(&rt, &s, "team-sizes", None, deadline()).unwrap_err();
+    assert_eq!(code(&e), "view-failed", "{e}");
+}
+
+/// A refused read asks for no memory: the eager reader resolves its fallback memory
+/// only after the decision, and a refused `SERVICE view:read` fits in a budget that
+/// does not hold the cursor's scratch.
+#[test]
+fn a_refusal_asks_for_no_memory() {
+    let s = store();
+    let policy = Policy::with(&[("reports", Some(reads(&["default", SECRET])))]);
+    let rt = runtime(&s, &policy);
+    define(&rt, &s, "team-sizes", "reports");
+    let narrow = granted(&["default"], &[], "frank");
+    let pool = crate::sparql::pool::QueryPool::new(1 << 20);
+    let parent = || -> crate::Result<sparkles_budget::ParentHandle> {
+        Err(crate::Error::invalid("the memory parent was asked for"))
+    };
+    let snap = s.snapshot();
+    let read_with = |caller: &Arc<GraphAccess>| {
+        rt.read(&ViewRead {
+            name: "team-sizes",
+            at: snap.commit,
+            snap: Some(&snap),
+            allow_stale: false,
+            caller: Some(caller),
+            deadline: None,
+            aggregate_errors: None,
+            memory_parent: Some(&parent),
+            memory_pool: Some(&pool),
+            max_memory_bytes: None,
+        })
+    };
+    let e = read_with(&narrow).err().expect("refused");
+    assert_eq!(code(&e), "view-access", "{e}");
+    // an admitted reader does ask for it
+    let wider = granted(&["default", SECRET, "http://ex/g1"], &[], "erin");
+    let e = read_with(&wider).err().expect("no memory parent");
+    assert!(e.to_string().contains("memory parent"), "{e}");
+
+    // The query's budget: a refusal needs no more of it than the refusal of a view
+    // that does not exist, which comes before the view is opened, so the cursor's
+    // scratch is not charged for either.
+    let outcome = |name: &str, budget: u64| {
+        let text = format!(
+            "PREFIX view: <urn:x-sparkles:view#> SELECT ?team ?n WHERE {{ SERVICE view:read {{ [] view:name \"{name}\" ; view:bind ?team, ?n }} }}"
+        );
+        let o = crate::sparql::QueryOptions {
+            views: Some(rt.clone()),
+            graphs: Some(narrow.clone()),
+            max_memory_bytes: Some(budget),
+            no_cache: true,
+            ..Default::default()
+        };
+        match crate::sparql::query(s.snapshot(), &text, &o) {
+            Ok(_) => "ok".to_string(),
+            Err(e) => code(&e),
+        }
+    };
+    let least = |name: &str, want: &str| {
+        let (mut lo, mut hi) = (1u64, 64u64 << 20);
+        assert_eq!(outcome(name, hi), want, "{name}");
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if outcome(name, mid) == want {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    };
+    let missing = least("missing-xx", "view-not-found");
+    assert_eq!(outcome("team-sizes", missing), "view-access");
+    assert_eq!(least("team-sizes", "view-access"), missing);
+}
+
+/// Another host resolves the views' principals again, even with the same epoch.
+#[test]
+fn a_new_host_is_decided_again() {
+    let s = store();
+    let first = Policy::with(&[("reports", Some(reads(&["default"])))]);
+    let rt = runtime(&s, &first);
+    define(&rt, &s, "team-sizes", "reports");
+    let caller = reads(&["default", "http://ex/g1"]);
+    assert_eq!(read(&rt, &s, "team-sizes", &caller).unwrap(), 2);
+    let second = Policy::with(&[("reports", Some(reads(&["default", SECRET])))]);
+    assert_eq!(first.epoch(), second.epoch());
+    rt.set_host(second.clone());
+    rt.round(&s);
+    let e = read(&rt, &s, "team-sizes", &caller).unwrap_err();
+    assert_eq!(code(&e), "view-access");
+    assert!(!rt.readable_by("team-sizes", Some(&caller)));
+    assert_eq!(read_at(&rt, &s, "team-sizes", None, None).unwrap(), 2);
+}
+
+/// A decision made for an entry read before the cache was emptied is not kept after
+/// it, so a definition that replaces the view with equal grants is decided, and
+/// recorded, afresh.
+#[test]
+fn a_decision_in_flight_is_not_kept_past_a_change() {
+    let s = Arc::new(store());
+    let policy = Policy::with(&[("reports", Some(reads(&["default"])))]);
+    let rt = runtime(&s, &policy);
+    define(&rt, &s, "team-sizes", "reports");
+    let wider = granted(&["default", "http://ex/g1"], &[], "erin");
+    let once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (rt2, s2, once2) = (Arc::downgrade(&rt), s.clone(), once.clone());
+    rt.set_auth_miss_hook(Some(Arc::new(move || {
+        if !once2.swap(true, Ordering::SeqCst)
+            && let Some(rt) = rt2.upgrade()
+        {
+            let mut def = ViewDef::table(q(TEAM_SIZES));
+            def.principal = Some("reports".into());
+            rt.put(&s2, "team-sizes", def).unwrap();
+        }
+    })));
+    policy.events();
+    assert!(rt.readable_by("team-sizes", Some(&wider)));
+    assert!(once.load(Ordering::SeqCst), "the miss ran");
+    rt.set_auth_miss_hook(None);
+    assert_eq!(
+        rt.view_auth_stats().entries,
+        0,
+        "nothing kept for the old entry"
+    );
+    rt.round(&s);
+    assert_eq!(read(&rt, &s, "team-sizes", &wider).unwrap(), 2);
+    assert_eq!(
+        policy.events(),
+        ["team-sizes read allow contained cached=false erin"],
+        "the first read of the new definition is recorded"
+    );
+}
+
+/// The metadata of a view and the decision on it come from one registry entry, so a
+/// replacement between the two never pairs the old state with the new decision.
+#[test]
+fn metadata_and_its_decision_come_from_one_entry() {
+    let s = Arc::new(store());
+    let policy = Policy::with(&[
+        ("secret", Some(reads(&["default", SECRET]))),
+        ("reports", Some(reads(&["default"]))),
+    ]);
+    let rt = runtime(&s, &policy);
+    define(&rt, &s, "team-sizes", "secret");
+    let caller = reads(&["default", "http://ex/g1"]);
+    let replace = |rt: &Arc<Runtime>| {
+        let (weak, s2) = (Arc::downgrade(rt), s.clone());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = done.clone();
+        rt.set_after_info_hook(Some(Arc::new(move || {
+            if !done2.swap(true, Ordering::SeqCst)
+                && let Some(rt) = weak.upgrade()
+            {
+                define(&rt, &s2, "team-sizes", "reports");
+            }
+        })));
+        done
+    };
+    let done = replace(&rt);
+    let (info, readable) = rt.get_readable(&s, "team-sizes", Some(&caller)).unwrap();
+    assert!(done.load(Ordering::SeqCst));
+    assert_eq!(info.definition.principal.as_deref(), Some("secret"));
+    assert!(!readable, "decided on the entry whose state it reports");
+    assert!(rt.readable_by("team-sizes", Some(&caller)), "the new entry");
+    define(&rt, &s, "team-sizes", "secret");
+    let done = replace(&rt);
+    let listed = rt.list_readable(&s, Some(&caller));
+    assert!(done.load(Ordering::SeqCst));
+    let (info, readable) = listed.iter().find(|(v, _)| v.name == "team-sizes").unwrap();
+    assert_eq!(info.definition.principal.as_deref(), Some("secret"));
+    assert!(!readable);
+    rt.set_after_info_hook(None);
+}
+
+/// The unnamed coverage test considers containment alone, whatever names a grant
+/// holds, the empty one included.
+#[test]
+fn coverage_without_a_name_ignores_named_grants() {
+    let view = reads(&["default", SECRET]);
+    let empty = Arc::new(GraphAccess {
+        views: ViewGrants::new([String::new()], Some("mallory")),
+        ..GraphAccess::graphs(rule(&["default"]), Graphs::none())
+    });
+    assert!(empty.views.grants(""));
+    assert!(!covers(Some(&empty), Some(&view)));
+    assert_eq!(
+        super::runtime::decide("", Some(&empty), Some(&view)),
+        ViewDecision::Allow(super::ViewAllow::Declassified),
+        "a decision for a view named so honors the grant"
+    );
+}
+
+/// Closing a caller's guards closes those of its protections' lifts too.
+#[test]
+fn guards_close_inside_the_lifts() {
+    let s = store();
+    let p = protection("age", None);
+    let lift = rule(&["default"]).guarded("http://ex/lift/*", &["http://ex/lift/1".to_string()]);
+    let caller = protected(&["default"], &p, lift, Caller::default());
+    let bound = caller.bound(&s.snapshot());
+    let closed = bound.guards_closed();
+    let rules = closed.triples.as_ref().unwrap();
+    let Graphs::Only(r) = &rules.rules[0].read else {
+        panic!("a lift by graph")
+    };
+    assert!(
+        r.guards
+            .iter()
+            .all(|g| g.exempt.is_empty() && g.decide.is_none())
+    );
+    assert_eq!(closed.guards_closed(), closed);
 }

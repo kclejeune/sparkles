@@ -1935,7 +1935,7 @@ impl Ctx {
             dataset: DatasetSpec::default(),
             selector_default_only: false,
             graphs: None,
-            now: std::sync::OnceLock::new(),
+            now: initial_now(),
             base_iri: None,
             var_names: RwLock::new(Vec::new()),
             prepared_var_names: Default::default(),
@@ -1986,6 +1986,7 @@ impl Ctx {
 
     /// The query's `NOW()`: the clock at its first call, the same value at every later
     /// call of this context.
+    /// The query's clock: `NOW()` at its first call, then the same for the query.
     pub fn now(&self) -> oxsdatatypes::DateTime {
         *self.now.get_or_init(oxsdatatypes::DateTime::now)
     }
@@ -8464,4 +8465,31 @@ mod charge_tests {
             assert_eq!(terms.bytes(), 0);
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The clock of the queries that start on this thread, for tests that evaluate one
+    /// snapshot at two times.
+    static TEST_NOW: std::cell::Cell<Option<oxsdatatypes::DateTime>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with the queries that start on this thread reading `now` as their clock.
+#[cfg(test)]
+pub(crate) fn at_test_clock<R>(now: oxsdatatypes::DateTime, f: impl FnOnce() -> R) -> R {
+    let before = TEST_NOW.with(|c| c.replace(Some(now)));
+    let out = f();
+    TEST_NOW.with(|c| c.set(before));
+    out
+}
+
+/// A query's clock before its first `NOW()`: unset, except under [`at_test_clock`].
+fn initial_now() -> std::sync::OnceLock<oxsdatatypes::DateTime> {
+    let now = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if let Some(t) = TEST_NOW.with(std::cell::Cell::get) {
+        let _ = now.set(t);
+    }
+    now
 }

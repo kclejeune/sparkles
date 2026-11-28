@@ -56,6 +56,7 @@ mod registeredagg;
 pub mod results;
 mod sample;
 pub(crate) mod sortkey;
+pub(crate) mod stable;
 pub mod stats;
 pub mod svccache;
 mod svcread;

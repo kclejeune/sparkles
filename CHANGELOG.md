@@ -11,13 +11,21 @@ sets alone and refuses whatever it cannot prove. A grant names a view in its `en
 as `view:{name}`, which declassifies it for the grantee without opening an endpoint or
 adding a graph. Decisions are cached per caller and view, and refusals, declassified
 reads and uncached decisions are written to the `sparkles::audit` log as `view_access`
-records without graph names. Rust callers ask `Views::authorize` before reading or
-watching a view for someone else. This completes roadmap item 222.
+records without graph names. A protection pattern that may answer differently on one
+snapshot, such as one that calls `NOW()`, and a caller whose guard is decided per request
+under a pattern protection are refused containment. The refusal comes before a read
+reports the view's state, waits for it or reserves memory, and a view that is not
+attached is decided as one that reads every quad. Listings decide on the same
+definition they report, and refused view management is audited with the operation
+`manage`. Rust callers ask `Views::authorize` before reading or watching a view for
+someone else, and `Views::get_readable` and `Views::list_readable` pair a view's state
+with the decision. This completes roadmap item 222.
 
 - **Rust compatibility.** `GraphAccess` has a new public field `views` of type
   `ViewGrants`. Struct literals add `views: Default::default()`, and the constructors
   set it to no views. `Host` has a new method `view_access` with a default that writes
-  the audit record.
+  the audit record. `access::Gap` has the variant `Evaluation`, and
+  `GraphAccess::guards_closed` closes the guards of protection lifts as well.
 
 ### Hierarchical memory budgets for reasoning and views
 

@@ -239,6 +239,33 @@ level = "read"
     }
 }
 
+/// A grant that names a view beside `datasets` access to its dataset declassifies the
+/// view over the protections `datasets` keeps in force, so it draws no warning that it
+/// has no effect, while a restricted grant that adds nothing still does.
+#[test]
+fn a_view_grant_beside_dataset_access_is_not_called_useless() {
+    let parse = |grant: &str| {
+        crate::auth::config::FileConfig::parse(&format!(
+            r#"version = 1
+[[users]]
+name = "u"
+password = "$argon2id$v=19$m=8,t=1,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo"
+datasets = {{ ds = "read" }}
+[[users.grants]]
+dataset = "ds"
+level = "read"
+{grant}
+"#
+        ))
+        .unwrap()
+    };
+    let useless = |cfg: &crate::auth::config::FileConfig| {
+        cfg.warnings().iter().any(|w| w.contains("has no effect"))
+    };
+    assert!(!useless(&parse("endpoints = [\"view:salary-summary\"]")));
+    assert!(useless(&parse("endpoints = [\"query\"]")));
+}
+
 /// The audit log names the dataset, the view, the decision and the caller, and never
 /// the graphs of either grant set.
 #[test]
@@ -269,6 +296,14 @@ fn view_decisions_are_audited_without_graph_names() {
                 )
                 .unwrap();
         }
+        let p = auth.user_principal("vnarrow").unwrap();
+        views
+            .authorize(
+                "secret-count",
+                p.view("graphs", Endpoint::Query).as_ref(),
+                sparkles::incr::ViewOp::Watch,
+            )
+            .unwrap();
     });
     let text = String::from_utf8(buf.0.lock().clone()).unwrap();
     let lines: Vec<serde_json::Value> = text
@@ -276,7 +311,7 @@ fn view_decisions_are_audited_without_graph_names() {
         .filter_map(|l| serde_json::from_str(l).ok())
         .filter(|j: &serde_json::Value| j["fields"]["event"] == "view_access")
         .collect();
-    let seen: Vec<(String, String, String)> = lines
+    let seen: Vec<(String, String, String, String)> = lines
         .iter()
         .map(|j| {
             let f = &j["fields"];
@@ -284,18 +319,23 @@ fn view_decisions_are_audited_without_graph_names() {
             assert_eq!(f["view"], "secret-count", "{j}");
             (
                 f["principal"].as_str().unwrap().to_string(),
+                f["op"].as_str().unwrap().to_string(),
                 f["decision"].as_str().unwrap().to_string(),
                 f["reason"].as_str().unwrap().to_string(),
             )
         })
         .collect();
-    let expect = |u: &str, d: &str, r: &str| {
+    let expect = |u: &str, op: &str, d: &str, r: &str| {
         seen.iter()
-            .any(|(p, dd, rr)| p.contains(u) && dd == d && rr == r)
+            .any(|(p, o, dd, rr)| p.contains(u) && o == op && dd == d && rr == r)
     };
-    assert!(expect("vnarrow", "deny", "graphs"), "{seen:?}");
-    assert!(expect("vnamed", "allow", "declassified"), "{seen:?}");
-    assert!(expect("vwide", "allow", "contained"), "{seen:?}");
+    assert!(expect("vnarrow", "read", "deny", "graphs"), "{seen:?}");
+    assert!(
+        expect("vnamed", "read", "allow", "declassified"),
+        "{seen:?}"
+    );
+    assert!(expect("vwide", "read", "allow", "contained"), "{seen:?}");
+    assert!(expect("vnarrow", "watch", "deny", "graphs"), "{seen:?}");
     assert!(!text.contains(SECRET), "{text}");
     assert!(!text.contains("http://ex/a/"), "{text}");
     assert!(!text.contains("vnarrow-pw"), "{text}");
@@ -375,4 +415,257 @@ async fn view_grants_follow_their_scope() {
             .audit_id()
             .is_some_and(|id| id.contains("alice"))
     );
+}
+
+/// The audit records the server writes to `sparkles::audit` while `f` runs on this
+/// thread, as JSON.
+fn audited(f: impl FnOnce()) -> Vec<serde_json::Value> {
+    let buf = Buf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(buf.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f();
+    });
+    let text = String::from_utf8(buf.0.lock().clone()).unwrap();
+    text.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|j: &serde_json::Value| j["target"] == "sparkles::audit")
+        .collect()
+}
+
+fn audit_fields(lines: &[serde_json::Value], event: &str) -> Vec<serde_json::Value> {
+    lines
+        .iter()
+        .filter(|j| j["fields"]["event"] == event)
+        .map(|j| j["fields"].clone())
+        .collect()
+}
+
+/// Defining, rebuilding and removing a view are recorded as allowed management, and a
+/// caller who sees the dataset but may not manage its views, or a read-only server,
+/// is recorded as refused management of the view.
+#[test]
+fn view_management_is_audited() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let s = rt.block_on(server());
+    let body =
+        serde_json::json!({ "query": "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }" }).to_string();
+    let send = |method: &str, path: &str, user: &str| {
+        rt.block_on(call(
+            &s.app,
+            method,
+            path,
+            &[
+                ("authorization", &b(user)),
+                ("content-type", "application/json"),
+            ],
+            if method == "PUT" { &body } else { "" },
+        ))
+    };
+    let lines = audited(|| {
+        let r = send("PUT", "/$/views/graphs/managed", "alice");
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        s.state
+            .get("graphs")
+            .unwrap()
+            .dataset
+            .views()
+            .wait_built("managed", Duration::from_secs(30))
+            .unwrap();
+        let r = send("POST", "/$/views/graphs/managed/rebuild", "alice");
+        assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+        for (method, path) in [
+            ("PUT", "/$/views/graphs/managed"),
+            ("POST", "/$/views/graphs/managed/rebuild"),
+            ("DELETE", "/$/views/graphs/managed"),
+        ] {
+            let r = send(method, path, "vwide");
+            assert_eq!(
+                r.status,
+                StatusCode::FORBIDDEN,
+                "{method} {path}: {}",
+                r.text()
+            );
+        }
+        // a caller who does not see the dataset is answered as if it did not exist,
+        // and nothing names the view for it
+        let r = send("DELETE", "/$/views/graphs/managed", "vonly");
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+        let r = send("DELETE", "/$/views/graphs/managed", "alice");
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    });
+    for event in ["view_defined", "view_rebuilt", "view_deleted"] {
+        let f = audit_fields(&lines, event);
+        assert_eq!(f.len(), 1, "{event}: {lines:?}");
+        assert_eq!(f[0]["op"], "manage", "{event}");
+        assert_eq!(f[0]["decision"], "allow", "{event}");
+        assert_eq!(f[0]["dataset"], "graphs", "{event}");
+        assert_eq!(f[0]["view"], "managed", "{event}");
+        assert!(
+            f[0]["principal"].as_str().unwrap().contains("alice"),
+            "{event}"
+        );
+    }
+    let denied: Vec<_> = audit_fields(&lines, "view_access")
+        .into_iter()
+        .filter(|f| f["op"] == "manage")
+        .collect();
+    assert_eq!(denied.len(), 3, "{denied:?}");
+    for f in &denied {
+        assert_eq!(f["decision"], "deny", "{f}");
+        assert_eq!(f["reason"], "level", "{f}");
+        assert_eq!(f["dataset"], "graphs", "{f}");
+        assert_eq!(f["view"], "managed", "{f}");
+        assert!(f["principal"].as_str().unwrap().contains("vwide"), "{f}");
+    }
+
+    // a read-only server refuses every change, and records each refusal
+    let ro = build(Fixture {
+        extra: users(),
+        read_only: true,
+        ..Default::default()
+    });
+    ro.state.attach("graphs", DbType::Memory, None).unwrap();
+    let lines = audited(|| {
+        for (method, path) in [
+            ("PUT", "/$/views/graphs/managed"),
+            ("POST", "/$/views/graphs/managed/rebuild"),
+            ("DELETE", "/$/views/graphs/managed"),
+        ] {
+            let r = rt.block_on(call(
+                &ro.app,
+                method,
+                path,
+                &[
+                    ("authorization", &b("alice")),
+                    ("content-type", "application/json"),
+                ],
+                if method == "PUT" { &body } else { "" },
+            ));
+            assert_eq!(
+                r.status,
+                StatusCode::FORBIDDEN,
+                "{method} {path}: {}",
+                r.text()
+            );
+        }
+    });
+    let denied = audit_fields(&lines, "view_access");
+    assert_eq!(denied.len(), 3, "{lines:?}");
+    for f in &denied {
+        assert_eq!(f["op"], "manage", "{f}");
+        assert_eq!(f["decision"], "deny", "{f}");
+        assert_eq!(f["reason"], "read-only", "{f}");
+        assert_eq!(f["view"], "managed", "{f}");
+    }
+}
+
+/// The metadata routes report a view's state with the decision on that same
+/// definition: a replacement between the two, by a definition the caller may read,
+/// leaves the old definition's numbers out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_metadata_decides_on_the_state_it_reports() {
+    let s = server().await;
+    let ds = s.state.get("graphs").unwrap();
+    let key = ds.dataset.store().dataset_id().to_string();
+    let dataset = ds.dataset.clone();
+    let replace = move || {
+        let dataset = dataset.clone();
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let hook: crate::http::views::hooks::Hook = Arc::new(move || {
+            if once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let mut def = sparkles::incr::ViewDef::table(
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }".to_string(),
+            );
+            def.principal = Some("vnarrow".into());
+            dataset.views().put("secret-count", def).unwrap();
+            dataset
+                .views()
+                .wait_built("secret-count", Duration::from_secs(30))
+                .unwrap();
+        });
+        hook
+    };
+    let restore = |s: &AuthServer| {
+        let body = serde_json::json!({
+            "query": format!("SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{SECRET}> {{ ?s ?p ?o }} }}"),
+            "principal": "vsec",
+        });
+        let views = s.state.get("graphs").unwrap().dataset.views();
+        let def: sparkles::incr::ViewDef = serde_json::from_value(body).unwrap();
+        views.put("secret-count", def).unwrap();
+        views
+            .wait_built("secret-count", Duration::from_secs(30))
+            .unwrap();
+    };
+
+    crate::http::views::hooks::set_after_capture(&key, Some(replace()));
+    let r = get_as(&s.app, "/$/views/graphs/secret-count", Some(&b("vnarrow"))).await;
+    crate::http::views::hooks::set_after_capture(&key, None);
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["definition"]["principal"], "vsec", "{j}");
+    assert!(j.get("rows").is_none(), "{j}");
+    assert!(j.get("stateBytes").is_none(), "{j}");
+    // the replacement itself is readable
+    let r = get_as(&s.app, "/$/views/graphs/secret-count", Some(&b("vnarrow"))).await;
+    assert!(r.json().get("rows").is_some(), "{}", r.text());
+
+    restore(&s);
+    crate::http::views::hooks::set_after_capture(&key, Some(replace()));
+    let r = get_as(&s.app, "/$/views/graphs", Some(&b("vnarrow"))).await;
+    crate::http::views::hooks::set_after_capture(&key, None);
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let v = j["views"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "secret-count")
+        .unwrap();
+    assert_eq!(v["definition"]["principal"], "vsec", "{j}");
+    assert!(v.get("rows").is_none(), "{j}");
+    assert!(v.get("stateBytes").is_none(), "{j}");
+}
+
+/// A suspended view's reason names the size of its state, so a caller who may not
+/// read the view sees the reason's code only.
+#[tokio::test]
+async fn a_suspended_view_hides_its_size_from_other_readers() {
+    let s = server().await;
+    let views = s.state.get("graphs").unwrap().dataset.views();
+    let body = serde_json::json!({
+        "query": format!("SELECT ?s WHERE {{ GRAPH <{SECRET}> {{ ?s ?p ?o }} }}"),
+        "principal": "vsec",
+        "memoryBytes": 1,
+    });
+    let def: sparkles::incr::ViewDef = serde_json::from_value(body).unwrap();
+    views.put("tiny", def).unwrap();
+    let info = views.wait_built("tiny", Duration::from_secs(30)).unwrap();
+    assert!(
+        matches!(&info.state, sparkles::incr::ViewState::Suspended { reason } if reason.starts_with("over-budget: ")),
+        "{:?}",
+        info.state
+    );
+    for (user, full) in [("vwide", true), ("vnarrow", false)] {
+        let r = get_as(&s.app, "/$/views/graphs/tiny", Some(&b(user))).await;
+        assert_eq!(r.status, StatusCode::OK, "{user}: {}", r.text());
+        let j = r.json();
+        assert_eq!(j["state"], "suspended", "{user}: {j}");
+        let reason = j["reason"].as_str().unwrap();
+        if full {
+            assert!(reason.starts_with("over-budget: "), "{user}: {j}");
+        } else {
+            assert_eq!(reason, "over-budget", "{user}: {j}");
+        }
+    }
 }

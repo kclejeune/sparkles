@@ -227,14 +227,16 @@ impl Runtime {
     /// It writes no audit record, so that listings may ask it for every view; a read
     /// asks [`authorize_view`](Self::authorize_view).
     pub fn readable_by(&self, name: &str, caller: Option<&Arc<GraphAccess>>) -> bool {
-        let view = {
+        let (view, generation) = {
             let reg = self.reg.lock();
             match reg.views.get(name) {
-                Some(e) => e.cell.as_ref().and(e.access.clone()),
+                Some(e) => self.view_grants(e),
                 None => return false,
             }
         };
-        self.decide_cached(name, caller, view.as_ref()).0.allowed()
+        self.decide_cached(name, caller, view.as_ref(), generation)
+            .0
+            .allowed()
     }
 
     /// View `name` with its state.
@@ -245,6 +247,69 @@ impl Runtime {
         let reg = self.reg.lock();
         let e = reg.view(name)?;
         Ok(self.info(name, e, head, &reg))
+    }
+
+    /// View `name` with its state, and whether a reader with `caller` may read its
+    /// rows and what they disclose, decided on the same registry entry as the state,
+    /// so that a concurrent replacement can never pair one definition's state with
+    /// another's decision. It writes no audit record, as
+    /// [`readable_by`](Self::readable_by).
+    pub fn get_readable(
+        &self,
+        store: &Store,
+        name: &str,
+        caller: Option<&Arc<GraphAccess>>,
+    ) -> Result<(ViewInfo, bool)> {
+        let _operation = Operation::enter();
+        let head = store.snapshot().commit;
+        self.sync_mode_nonblocking();
+        let (info, (view, generation)) = {
+            let reg = self.reg.lock();
+            let e = reg.view(name)?;
+            (self.info(name, e, head, &reg), self.view_grants(e))
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.after_info_hook.lock().clone() {
+            hook();
+        }
+        let readable = self
+            .decide_cached(name, caller, view.as_ref(), generation)
+            .0
+            .allowed();
+        Ok((info, readable))
+    }
+
+    /// Every view with its state, by name, each with whether a reader with `caller`
+    /// may read it, decided as [`get_readable`](Self::get_readable) decides.
+    pub fn list_readable(
+        &self,
+        store: &Store,
+        caller: Option<&Arc<GraphAccess>>,
+    ) -> Vec<(ViewInfo, bool)> {
+        let _operation = Operation::enter();
+        let head = store.snapshot().commit;
+        self.sync_mode_nonblocking();
+        let captured: Vec<_> = {
+            let reg = self.reg.lock();
+            reg.views
+                .iter()
+                .map(|(n, e)| (self.info(n, e, head, &reg), self.view_grants(e)))
+                .collect()
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.after_info_hook.lock().clone() {
+            hook();
+        }
+        captured
+            .into_iter()
+            .map(|(info, (view, generation))| {
+                let readable = self
+                    .decide_cached(&info.name, caller, view.as_ref(), generation)
+                    .0
+                    .allowed();
+                (info, readable)
+            })
+            .collect()
     }
 
     /// Every view with its state, by name.

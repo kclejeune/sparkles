@@ -57,7 +57,7 @@ pub fn access_fingerprint(access: Option<&Arc<GraphAccess>>) -> u64 {
 /// [`GraphAccess::read_contains`]). A grant that names a view is not considered here,
 /// since no view is named; [`Runtime::authorize_view`] considers it.
 pub fn covers(caller: Option<&Arc<GraphAccess>>, view: Option<&Arc<GraphAccess>>) -> bool {
-    super::auth::decide("", caller, view).allowed()
+    super::auth::decide_named(None, caller, view).allowed()
 }
 
 /// The query's text with the variables the parser names at random (aggregates' and

@@ -1016,6 +1016,18 @@ impl Principal {
         Some(Arc::new(v))
     }
 
+    /// The grants that decide this principal's reads of the views of `ds` (spec F13
+    /// §6.1), or `None` when it may not query `ds` at all and so reads no view of it.
+    /// `Some(None)` reads every quad. [`view`](Self::view) gives `None` both to a
+    /// principal that reads every quad and, for some endpoints, to one without access,
+    /// and the view runtime's decision takes `None` as every quad, so a surface that
+    /// decides a view read for a request, such as an MCP tool or the web UI, asks
+    /// this instead and refuses on `None`.
+    pub fn view_reader(&self, ds: &str) -> Option<Option<Arc<sparkles::access::GraphAccess>>> {
+        self.can_at(ds, Endpoint::Query, Level::Read)
+            .then(|| self.view(ds, Endpoint::Query))
+    }
+
     /// What a protection's pattern may know of this caller: its name (the owner's for
     /// a minted token, none when anonymous), its roles and its groups.
     pub fn caller(&self) -> sparkles::access::Caller {

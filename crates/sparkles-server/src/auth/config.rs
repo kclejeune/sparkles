@@ -363,8 +363,16 @@ fn restricted_warnings(
     out: &mut Vec<String>,
 ) {
     for g in grants {
+        // a grant that names a view declassifies it over protections that `datasets`
+        // keeps in force, so it has an effect
+        let names_views = g
+            .endpoints
+            .iter()
+            .flatten()
+            .any(|e| view_entry(e).is_some());
         if g.lifts.is_empty()
             && !g.server_models
+            && !names_views
             && datasets
                 .iter()
                 .any(|(p, l)| *l >= g.level && (p == "*" || p == &g.dataset))

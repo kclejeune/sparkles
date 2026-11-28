@@ -4149,8 +4149,16 @@ grants contain those of the view's principal, or when a grant names the view. It
 contain the principal's when it reads every graph the principal reads and lifts every
 protection wherever the principal lifts it. The comparison uses the grant sets alone,
 and a containment it cannot prove, such as one between IRI patterns with text between
-two `*`, counts as none. Otherwise the read fails with
-`403 view-access`, which names no graph. An administrator who publishes a view to callers
+two `*`, counts as none. A protection pattern in force for the caller must give the same
+answer every time it runs on one snapshot, so a pattern that calls `NOW()`, `RAND()` or
+an extension function refuses containment. Request principals of the server decide their
+GraphRAG guard at the snapshot they read, under which some evidence is read differently,
+so a caller under a pattern protection reads a view only with full access or a grant
+that names it. Otherwise the read fails with `403 view-access`, which names no graph.
+The decision comes before anything else the read reports, so a refused caller learns
+nothing of a view's state. A view that is suspended, failed to attach or waits to be
+attached again after a policy reload is decided as one that reads every quad, which
+refuses a contained caller until the view is attached. An administrator who publishes a view to callers
 who cannot read its inputs names it in a grant's `endpoints` as `view:{name}`, which
 declassifies the view for that grantee:
 
@@ -4167,8 +4175,11 @@ an endpoint that a grant opens, here `query`. A grant that names only views must
 `read` grant without `graphs`, `lifts` or `server_models`, and grants no level on the
 dataset by itself. Each refusal, each declassified read and
 each other decision not already cached is written to the audit log as a `view_access`
-record with the dataset, the view, the decision, its reason and the caller. Listings
-return a view's `rows` and `stateBytes` only to callers who may read it.
+record with the dataset, the view, the operation, the decision, its reason and the
+caller. A refused `PUT`, `DELETE` or `rebuild` of a view by a caller who sees the dataset
+is recorded the same way with the operation `manage`. Listings return a view's `rows` and
+`stateBytes` only to callers who may read it, decided on the same definition as the rest
+of the listing, and give other callers a suspended view's reason as its code alone.
 
 **Persistence.** A view's state is checkpointed to `views/{name}/main/state-{commit}.bin`
 every 60 seconds while it changes and when the dataset closes. On open the newest

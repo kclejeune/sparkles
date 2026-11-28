@@ -119,13 +119,22 @@ impl Runtime {
         retired: &mut Vec<MemoryLease>,
         persist: impl FnOnce(&ViewDef) -> Result<()>,
     ) -> Result<()> {
-        let host = self.host()?;
-        let Some(entry) = reg.views.get(name) else {
+        let (install, host) = self.current_install();
+        let host = host.ok_or_else(|| {
+            crate::incr::error(
+                "views-unavailable",
+                "the views of this dataset have not started",
+            )
+        })?;
+        let Some(entry) = reg.views.get_mut(name) else {
             return Ok(());
         };
         if entry.cell.is_some() || entry.suspended.is_some() {
             return Ok(());
         }
+        // the principal is resolved under this host below, whether or not it attaches
+        entry.resolved_under = install;
+        let entry = &*entry;
         // checked again on every attach, since a change of the host's epoch or a
         // rebuild clears the error
         if let Some(e) = unsupported(&entry.def) {
@@ -317,20 +326,42 @@ impl Runtime {
         let mut deferred = DeferredDrops::default();
         {
             let mut reg = self.reg.lock();
-            let (_, Some(host)) = self.current_host() else {
+            let (install, Some(host)) = self.current_install() else {
                 return;
             };
             let epoch = host.epoch();
-            if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
-                // grants may have changed: resolve every view's principal again
-                self.auth.clear();
-                for (name, e) in reg.views.iter_mut() {
-                    e.error = None;
-                    if let Some(c) = e.cell.take() {
-                        c.release_view(name, &mut deferred.retired);
-                        deferred.cells.push(c);
-                    }
+            let reloaded = self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch;
+            // Grants may have changed under a new policy, for every view, or with
+            // another host, whatever the epochs, for the views an older host resolved:
+            // those whose principal the new host resolves to other grants, or that
+            // failed to attach, attach again.
+            let mut cleared = false;
+            for (name, e) in reg.views.iter_mut() {
+                if e.cell.is_none() && e.error.is_none() {
+                    continue;
                 }
+                let stale = reloaded
+                    || (e.resolved_under != install
+                        && !(e.cell.is_some()
+                            && host
+                                .access(e.def.principal.as_deref())
+                                .is_ok_and(|a| a == e.access)));
+                if !stale {
+                    e.resolved_under = install;
+                    continue;
+                }
+                if !cleared {
+                    self.auth.clear();
+                    cleared = true;
+                }
+                e.error = None;
+                if let Some(c) = e.cell.take() {
+                    c.release_view(name, &mut deferred.retired);
+                    deferred.cells.push(c);
+                }
+            }
+            if reloaded && !cleared {
+                self.auth.clear();
             }
             let pending: Vec<String> = reg
                 .views

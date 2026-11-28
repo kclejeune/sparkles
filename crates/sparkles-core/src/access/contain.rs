@@ -18,6 +18,12 @@ pub enum Gap {
     Protections,
     /// a protection's pattern binds the caller, and the two callers differ
     CallerPattern,
+    /// a protection's pattern may let other triples through when the caller evaluates
+    /// it than when the view did: it calls a function such as `NOW()` or `RAND()`, or
+    /// does something else whose result the comparison cannot prove the same for one
+    /// snapshot, or the caller's reads decide a guard at each snapshot, under which
+    /// evidence that a stored fact of an earlier commit proves is refused
+    Evaluation,
 }
 
 impl Gap {
@@ -27,16 +33,19 @@ impl Gap {
             Gap::Graphs => "graphs",
             Gap::Protections => "protections",
             Gap::CallerPattern => "caller-pattern",
+            Gap::Evaluation => "evaluation",
         }
     }
 }
 
-/// Whether `c` reads every quad that `v` reads. Both are settled views.
-pub(super) fn read_contains(c: &GraphAccess, v: &GraphAccess) -> Result<(), Gap> {
+/// Whether `c` reads every quad that `v` reads. Both are settled views, and `binds`
+/// tells whether `c` came from a view that decides a guard at each snapshot
+/// ([`GraphAccess::binds_guards`]).
+pub(super) fn read_contains(c: &GraphAccess, v: &GraphAccess, binds: bool) -> Result<(), Gap> {
     if !graphs_contain(&c.read, &v.read) {
         return Err(Gap::Graphs);
     }
-    triples_contain(c.triples.as_deref(), v.triples.as_deref())
+    triples_contain(c.triples.as_deref(), v.triples.as_deref(), binds)
 }
 
 /// Whether every graph in `v` is in `c`.
@@ -136,7 +145,18 @@ pub(super) fn disjoint(p: &str, e: &str) -> bool {
 /// protection hides a quad depends on the protection, the quad and the store, and not
 /// on the reader, except for a pattern that binds the caller, which needs the same
 /// caller.
-fn triples_contain(c: Option<&TripleRules>, v: Option<&TripleRules>) -> Result<(), Gap> {
+///
+/// A pattern that `c` keeps in force must also let the same triples through whenever
+/// it is evaluated on one snapshot, which [`Protection::stable`](super::Protection::stable)
+/// proves, since the view evaluated it at another time than the caller reads. While such
+/// a pattern is in force, a reader whose guards are decided at each snapshot (`binds`)
+/// refuses support that a stored fact of an earlier commit proves, which a view with
+/// the same guards fixed accepts, so `binds` is a gap as well.
+fn triples_contain(
+    c: Option<&TripleRules>,
+    v: Option<&TripleRules>,
+    binds: bool,
+) -> Result<(), Gap> {
     let Some(c) = c else {
         return Ok(());
     };
@@ -152,8 +172,13 @@ fn triples_contain(c: Option<&TripleRules>, v: Option<&TripleRules>) -> Result<(
         if rv.read.is_all() || !graphs_contain(&rc.read, &rv.read) {
             return Err(Gap::Protections);
         }
-        if rc.protection.pattern.is_some() && c.caller != v.caller {
-            return Err(Gap::CallerPattern);
+        if rc.protection.pattern.is_some() {
+            if binds || !rc.protection.stable() {
+                return Err(Gap::Evaluation);
+            }
+            if c.caller != v.caller {
+                return Err(Gap::CallerPattern);
+            }
         }
     }
     Ok(())
