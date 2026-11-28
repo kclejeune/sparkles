@@ -5346,6 +5346,49 @@ fn merge_restart_honors_class_scaled_bound_and_hub_skip_switch() {
     assert_eq!(out_hub_on.consistent, out_hub_off.consistent);
 }
 
+/// Item 1061: a rooted run without counting takes the class-scaled bound by default, so
+/// that a signature of more than 16,384 named classes raises the run's cap above the fixed
+/// bound, and turning the scaling off keeps the fixed bound.
+#[test]
+fn a_rooted_run_takes_the_class_scaled_bound_by_default() {
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:C0 ObjectOneOf(:a1))\n\
+         ClassAssertion(:C0 :a0)\n",
+    );
+    for i in 0..16_400usize {
+        body.push_str(&format!("Declaration(Class(:Extra{i}))\n"));
+    }
+    let input = axioms(&body);
+    let run = |per_class: Option<bool>| {
+        let go = || {
+            let mut k = Classifier::of(&input);
+            let out = k
+                .classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    ..Limits::default()
+                })
+                .expect("classify");
+            assert!(out.complete);
+            LAST_ROOTED_WORK_LIMIT.get()
+        };
+        match per_class {
+            Some(on) => with_rooted_bound_per_class(on, go),
+            None => go(),
+        }
+    };
+    if std::env::var_os("SPARKLES_ROOTED_BOUND_PER_CLASS").is_none() {
+        let cap = run(None);
+        assert!(
+            cap > ROOTED_WORK_BOUND,
+            "default cap {cap} scales with the classes"
+        );
+        assert_eq!(cap, run(Some(true)));
+    }
+    assert_eq!(run(Some(false)), ROOTED_WORK_BOUND);
+}
+
 /// Sol P1 #1 / Neon B1: asserted anonymous individuals (`union_individual`) and harvested
 /// anonymous individuals (`union_named`) must hash and look up identically in `Merge`,
 /// producing a single component and a flat `CanonMap` even for labels beginning with `_:`.

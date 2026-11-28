@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### The rooted bound scales with the named classes (item 1061)
+
+The bound of a rooted run without counting is now 32 derived conclusions for each visible
+named class when that is more than 524,288, which is the case above 16,384 classes.
+ore_ont_15803, with 398,583 named classes, needs about 3.8 million conclusions and now
+finishes with HermiT's taxonomy on one and four threads, where it passed the fixed bound
+and gave its default answer. `SPARKLES_ROOTED_BOUND_PER_CLASS=0` keeps the fixed bound. An
+explicit `Limits::dl_work`, the adaptive bound of the stepped schedule and the counting
+bound keep their precedence, and rooted runs stay off by default. Item 1061 closes with
+shoi-022 finishing within the bound under shared facts and merging. Items 1405 and 1406
+follow the 33 generated ontologies that still pass the bound, and item 1337 follows
+ore_ont_14924, which now passes it because of the marker repair's charges.
+
 ### Combined SHACL and ShEx write-time validation
 
 A dataset can enforce both languages with independent modes, data graphs and baseline
