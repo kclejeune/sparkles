@@ -256,8 +256,8 @@ pub(super) fn result_options(opts: &QueryOptions, complete: bool) -> QueryOption
 }
 
 /// Whether a run acknowledged a stop of its caller: a partial answer, or a modules' pass
-/// that the deadline or a cancellation stopped. Its metadata and answer then finish
-/// without the stop controls ([`result_options`]).
+/// that the deadline, a cancellation or, in a partial run, the memory budget stopped. Its
+/// metadata and answer then finish without the stop controls ([`result_options`]).
 pub(super) fn acknowledged_stop(c: &Classification) -> bool {
     !c.complete_for_taken || c.stats.coverage_stopped
 }
@@ -784,8 +784,9 @@ impl Ontologies {
             let mut p = KeptClassification::capture(self, req, c, o, (out, excluded), opts, &work)?;
             let retained_bytes = classification_retained_bytes(e, &p);
             let keep = p.classification.complete_for_taken && retained_bytes <= retention_cap();
-            // A modules' pass that the deadline stopped answers by timing, so the next
-            // request takes the pass again over the kept saturation.
+            // A modules' pass that the deadline, a cancellation or the memory budget
+            // stopped answers by timing or by the request's budget, so the next request
+            // takes the pass again over the kept saturation.
             let publish = keep && !p.classification.stats.coverage_stopped;
             // Mutable saturation and immutable taxonomy must both have cache credit.
             // A refusal leaves the answer under its request credit.

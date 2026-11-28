@@ -924,7 +924,7 @@ pub(super) fn ce_retained_bytes(c: &ClassExpression) -> usize {
 /// anonymous blank-node labels, literals, `BTreeSet` nodes, `Box`ed subexpressions, `Vec`
 /// capacities, and repeated AST payloads without deduplication), excluding the inline
 /// `size_of::<AxiomKind>()` itself.
-pub(super) fn axiom_retained_heap_bytes(k: &AxiomKind) -> usize {
+pub(crate) fn axiom_retained_heap_bytes(k: &AxiomKind) -> usize {
     use AxiomKind as K;
     match k {
         K::Declaration(e) => e.iri().as_str().len(),
