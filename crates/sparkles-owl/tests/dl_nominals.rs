@@ -4582,7 +4582,8 @@ fn a_restart_after_the_counting_fallback_keeps_counting_off_and_its_bound() {
             counting: true,
             rooted: true,
             rooted_decline: false,
-            // the bound lies between the two runs without item 1231's repair
+            // the bound lies between the two runs without item 1231's repair, and the
+            // merge under the repair is item 1327
             rooted_marker_repair: false,
             rooted_merge: true,
             dl_work: Some(380),
