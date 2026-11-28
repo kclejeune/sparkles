@@ -517,6 +517,24 @@ before reads, counts past the end of a file, backups and clones without the tier
 refused setting, a read-only store, time shares, the `enableMgmt` values and the option
 parser.
 
+**Measurements.** The ignored test `measure_bulk_and_cache` ran at commit `de30fe83` in
+a release build on a Boat worker with 8 vCPUs and 16 GiB, at a load average of about 1,
+with 200 departments against the in-process endpoint. Boat timings are approximate and
+are not compared with the measurements above, which came from another host. The times
+are the best of three runs, and every arm returned the same 200 or 20,100 rows.
+
+| Query | Requests | 0 ms per request | 5 ms per request |
+|---|---|---|---|
+| Top label per department, `loop:` | 200 | 288.2 ms | 1,320.7 ms |
+| Same, `loop:parallel+4:` | 200 | 88.6 ms | 349.8 ms |
+| Same, `loop:bulk+10:` | 20 | 39.0 ms | 141.1 ms |
+| Same, `loop:bulk+10:parallel+4:` | 20 | 11.5 ms | 38.1 ms |
+| Employees per department, `loop:` | 200 | 266.5 ms | 1,316.2 ms |
+| Same, `loop:parallel+4:` | 200 | 96.2 ms | 345.9 ms |
+
+With 5 ms per request, `parallel+4` cuts the top-label loop 3.8 times, which meets the
+acceptance of at least 3 times in the sketch below.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Cache, parallel requests and metrics** (item 38, Tier 4, [ROADMAP](../ROADMAP.md)).
