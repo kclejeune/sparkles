@@ -4,21 +4,33 @@
  "scale": "33 generated DL corpus sets (18,916 input files, 18,870 usable HermiT 1.4.5 references, 36,360 usable rows across 1c and 4e) plus separate 4-worker --no-dl-steps correctness runs on 6 sets and Classifier runs on 9 sets",
  "host": {
   "name": "boat:bx_azx7qhs7",
-  "note": "Boat overflow worker; conclusion counts, HermiT agreement and estimated peak memory are deterministic accounting outputs, while wall-clock timing of the shared side-table mutex on 4 concurrent workers remains open for Intel host atlas"
+  "note": "Boat overflow worker; records HermiT agreement and conclusion/memory accounting results (with the single one-conclusion p3 variance noted below), while wall-clock timing of the shared side-table mutex on 4 concurrent workers remains open for Intel host atlas"
  },
  "manifest": {
   "arms": {
-   "flip-def": "new default (rooted_marker_repair=true mode 129, rooted_decline=false) on patched flip build",
-   "flip-prev": "previous default (rooted_marker_repair=false, rooted_decline=true) on patched flip build",
-   "flip-off": "both repair and decline off (SPARKLES_ROOTED_MARKER_REPAIR=0, SPARKLES_ROOTED_MARKER_DECLINE=0) on patched flip build",
-   "m1247-def": "new default with side-table MTab on patched m1247 build",
-   "m1247-prev": "previous default with side-table MTab on patched m1247 build",
-   "m1247-off": "both repair and decline off with side-table MTab on patched m1247 build"
+   "flip-def": "new default (rooted_marker_repair=true mode 129, rooted_decline=false) on patched flip build; retained output dir out/flip-def",
+   "flip-old": "previous default (rooted_marker_repair=false, rooted_decline=true) on patched flip build; retained output dir out/flip-old",
+   "flip-r0": "both repair and decline off (SPARKLES_ROOTED_MARKER_REPAIR=0, SPARKLES_ROOTED_MARKER_DECLINE=0) on patched flip build; retained output dir out/flip-r0",
+   "m1247-def": "new default with side-table MTab on patched m1247 build; retained output dir out/m1247-def",
+   "m1247-old": "previous default with side-table MTab on patched m1247 build; retained output dir out/m1247-old",
+   "m1247-r0": "both repair and decline off with side-table MTab on patched m1247 build; retained output dir out/m1247-r0"
+  },
+  "correctness_runs": {
+   "flip_four_worker_no_steps": ["out/flip-nds1", "out/flip-nds2", "out/flip-nds3"],
+   "m1247_four_worker_no_steps": ["out/m1247-nds1", "out/m1247-nds2"],
+   "classifier_handle_sets": ["out/flip-owned", "out/flip-owned-old", "out/flip-owned-r0", "out/ownf"]
   },
   "builds": {
    "flip": "patched checkout over tree edfabf58; subsequent flipfix.patch pinned tests after the corpus run and corresponds to committed revision 748a4a4f",
    "m1247": "patched checkout over tree 507cc20b (m1247.patch); subsequent formatting and test fixes (final.patch) correspond to committed revision 629fc9d7",
    "verified_followup": "4d50167b (tree 61796eb7) changes slot-admission locking, OnceLock::set race cleanup, post-saturation live_record_bytes recount, tests and docs; verified by targeted sparkles-owl (1,586 tests) and handles::ontology (214 tests) suites on boat:bx_azx7qhs7 with mbx 1.29.1 and rustc 1.99.1 without re-running the generated corpus"
+  },
+  "retained_evidence_sha256": {
+   "dl1231-logs.tgz": "fefc263eac3da7f4076dfe84a457ea67921f6cbaf18d14d9198f1b496eed4be1",
+   "m1247.patch": "8deea5b4461e6c61bba73673d11c3affc0c14c097fdbfe3de63f6bf6bbea99b0",
+   "final.patch": "bfe2acea8adac6c320089420e5991f2889646084796744c27bcf5bcc3e010b89",
+   "flipfix.patch": "e2ba639995ddf6f7e2f6080ec769798283d80b600d03aab8ce3a4ba41b910dc0",
+   "r1-fix-logs/boat-logs.tgz": "963f4718309fb740d03d2faa9e351f22f80d154be6cf24a47feb793c345da40d"
   },
   "commits": {
    "base": "f60157c0",
@@ -82,7 +94,7 @@
   },
   "item_1247_parity_and_memory": {
    "matching_rows": 36360,
-   "conclusion_count_variance": "1 p3 row differs by 1 conclusion between runs of the same build",
+   "conclusion_count_variance": "1 p3 row (p201109.ofn in 4e: 46 on flip vs 47 on m1247) differs by 1 conclusion between runs of the same build",
    "repair_off_peak_delta_bytes": "non-positive multiples of 8, down to -1488 bytes",
    "repair_on_peak_delta_median_pct": 0.03,
    "repair_on_peak_delta_max_bytes": 512,

@@ -2210,9 +2210,10 @@ files in `fz` and `gen` in both configurations across every arm (1,380 rows), le
   new default uses 1.0396 times the both-off peak and 0.9904 times the previous default's
   peak, and on `p3` (2,400 common claims) the ratios are 1.0349 and 0.9897.
 - **Side-table state parity and memory (item 1247).** Across all 36,360 usable rows in all
-  three arms (new default, previous default and both off), the side-table build matches
-  `748a4a4f` on claims, HermiT agreement and completeness, and matches derived conclusion
-  counts apart from one `p3` row that varies by 1 between runs of the same build. Peak
+  three arms (new default, previous default and both off), the patched `m1247` side-table
+  build matches the patched `flip` build on claims, HermiT agreement and completeness, and
+  matches derived conclusion counts apart from one `p3` row (`p201109.ofn` in `4e`, 46 vs
+  47) that varies by 1 between runs of the same build. Peak
   estimated memory with repair off drops by multiples of 8 bytes (at most 1,488 bytes) and
   with repair on rises by a median of 0.03% (at most 512 bytes for the table and its slots).
 - **Concurrent four-worker correctness and open Intel timing.** Separate repeated runs with
