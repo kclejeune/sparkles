@@ -61,6 +61,27 @@ run can therefore miss a merge of two values of an individual and report a compl
 answer. The F24 spec records the loss and the measured attempts at
 containing it, and roadmap item 1229 stays open for the proof of the replay, the
 containment and the repair.
+### One meter for the marker repair and the rooted premise lists (item 1280)
+
+Tier D's rooted rules and the marker repair of item 1231 read their premise lists through
+one meter, which checks the run's work bound, memory budget, deadline and cancellation once
+every 1,024 reads, with the count since the last check shared across an activation and a
+wide read split at each check. It reads the premise lists of a returned clause, the copies of
+their premises and their pruning on initial arrival and on a late premise's replay, the index
+of a returned clause and of a clause that the root offers, and Hyper's, Join's and the root
+fact offer's premise lists, partners and scans on the default path. A check that stops the
+meter ends the scan that made it at once. An initial return checks the bounds in full before
+it derives, as a late replay's batch does. The diagnostic's redundancy test reads through a
+meter of its own, which checks the deadline and cancellation and counts separate deficit
+work. The new reads charge nothing to the work bound, so the counts of derived conclusions do
+not change. A returned clause admits the buffer of its lists' sizes before it makes it and its
+premise lists exactly before it builds them, and its product that is not ground charges its
+own tables as they grow in place of the upfront bound, which could exceed them more than a
+thousand times. Scans and copies of a wide premise, side or head read in spans that meet the
+checks as they go, and the diagnostic's search of a head for an equality's inequality reads
+through its meter. A test harness grows each input dimension of the metered steps and asserts
+at most 1,024 reads counted and at most 1,024 reads made between two checks. Item 1323 follows the scans that the meter does not
+read.
 
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 

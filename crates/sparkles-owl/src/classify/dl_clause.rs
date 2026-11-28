@@ -729,6 +729,41 @@ impl Lits {
         })
     }
 
+    /// [`Lits::complementary`], telling `read` of each literal of `head` that it tests,
+    /// those of the inner search for an equality's inequality included, `None` once read
+    /// answers false.
+    pub(super) fn complementary_with(
+        &self,
+        head: &[Lit],
+        inv: impl Fn(Role) -> Option<Role> + Copy,
+        read: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<bool> {
+        for &l in head {
+            if !read(1) {
+                return None;
+            }
+            #[cfg(test)]
+            super::dl_rules::meter_probe::visit(1);
+            if !matches!(l.kind(), EQ | XL) {
+                continue;
+            }
+            let XLit::Eq(s, t) = self.view(l, inv) else {
+                continue;
+            };
+            for &m in head {
+                if !read(1) {
+                    return None;
+                }
+                #[cfg(test)]
+                super::dl_rules::meter_probe::visit(1);
+                if matches!(m.kind(), NE | XL) && self.view(m, inv) == XLit::Ne(s, t) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+
     /// The general form of any literal, canonical as [`XLit::canon`] makes it.
     pub fn view(&self, l: Lit, inv: impl Fn(Role) -> Option<Role>) -> XLit {
         use RTerm::Fx;
@@ -1236,6 +1271,37 @@ impl Rooted<'_> {
     }
 }
 
+/// [`subset`] of two sorted slices, telling `read` of each literal of `b`
+/// that it steps over, `None` once read answers false.
+#[inline]
+pub(super) fn subset_with<F: FnMut(usize) -> bool + ?Sized>(
+    a: &[Lit],
+    b: &[Lit],
+    read: &mut F,
+) -> Option<bool> {
+    if a.len() > b.len() {
+        return Some(false);
+    }
+    let mut j = 0;
+    for &x in a {
+        loop {
+            if !read(1) {
+                return None;
+            }
+            if j < b.len() && b[j] < x {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        if j == b.len() || b[j] != x {
+            return Some(false);
+        }
+        j += 1;
+    }
+    Some(true)
+}
+
 /// Whether sorted `a` is a subset of sorted `b`.
 /// Whether the sorted literals `a` without repeats are among the sorted literals `b`
 /// without repeats.
@@ -1656,6 +1722,48 @@ impl Store {
     /// `sig`: a clause that does has its last head literal in `c`'s head.
     pub(super) fn subsumed(&self, c: &Clause, sig: u64) -> bool {
         self.subsumed_parts(c.body(), c.head(), sig)
+    }
+
+    /// [`Store::subsumed_parts`] of a sorted body and head without repeats, telling `read`
+    /// of each candidate it reads and of each literal that a comparison steps over, for
+    /// item 1280's meter, and `None` once read answers false.
+    pub(super) fn subsumed_with(
+        &self,
+        body: &[Lit],
+        head: &[Lit],
+        sig: u64,
+        read: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<bool> {
+        let check = |ids: &[u32], read: &mut dyn FnMut(usize) -> bool| -> Option<bool> {
+            for &i in ids {
+                if !read(1) {
+                    return None;
+                }
+                let s = &self.clauses[i as usize];
+                if s.sig & !sig == 0
+                    && !s.dead
+                    && subset_with(s.c.body(), body, read)?
+                    && subset_with(s.c.head(), head, read)?
+                {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        };
+        if check(&self.empty, read)? {
+            return Some(true);
+        }
+        for l in head {
+            if !read(1) {
+                return None;
+            }
+            if let Some(ids) = self.by_last.get(l)
+                && check(ids, read)?
+            {
+                return Some(true);
+            }
+        }
+        Some(false)
     }
 
     /// Upper bound on peak index/container allocation (excluding the clause's own literal

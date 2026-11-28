@@ -3462,6 +3462,10 @@ impl Found {
     pub(super) fn products_len(&self) -> usize {
         self.prods.len()
     }
+    /// The rule that each product is traced under, for tests.
+    pub(super) fn product_rules(&self) -> Vec<&'static str> {
+        self.prods.iter().map(|p| p.3).collect()
+    }
     /// The direct (non-product) conclusions collected so far, for tests.
     pub(super) fn one_sides(&self) -> Vec<Side> {
         self.one.iter().map(|(s, _)| s.clone()).collect()
@@ -3545,6 +3549,27 @@ impl Found {
             return false;
         }
         let s = make();
+        debug_assert_eq!(side_cap_bytes(&s), side_bytes);
+        self.push(s);
+        guard.release_to(self.held_bytes());
+        true
+    }
+    /// [`Found::push_admitted`] with a `make` that reads through a meter and may stop:
+    /// `make` gets the guard to read through, and a `None` from it releases the admission
+    /// down to what the conclusions here hold and answers false.
+    pub(super) fn try_push_admitted<S: Sink>(
+        &mut self,
+        side_bytes: usize,
+        make: impl FnOnce(&Guard<'_, S>) -> Option<Side>,
+        guard: &mut Guard<'_, S>,
+    ) -> bool {
+        if !self.reserve_one_admitted(1, side_bytes, guard) {
+            return false;
+        }
+        let Some(s) = make(guard) else {
+            guard.release_to(self.held_bytes());
+            return false;
+        };
         debug_assert_eq!(side_cap_bytes(&s), side_bytes);
         self.push(s);
         guard.release_to(self.held_bytes());
@@ -3646,23 +3671,28 @@ impl Found {
     pub(super) fn products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
         self.products_of(lists, base, false);
     }
-    /// A bound on the bytes that [`fold`] holds without a charge while it derives the
-    /// products that are not ground, for a caller that reserves them before it drains:
-    /// the largest over the products, since fold drops a product's tables before the next.
-    /// fold charges each union it keeps, but not the slots of its `seen` table beyond the
-    /// union itself, nor its step list's spare capacity, each with the buffer it grew from.
-    /// The bound takes each step to make one union per choice, the product of the lengths
-    /// of the lists so far, which can far exceed the unions a step keeps. Any overflow of
-    /// a nonempty product's choice count or table model saturates cleanly to `usize::MAX`.
-    pub(super) fn fold_slack(&self) -> usize {
-        const SIDE: u128 = std::mem::size_of::<Side>() as u128;
-        const MAX: u128 = usize::MAX as u128;
-        self.prods
-            .iter()
-            .filter(|p| !p.2)
-            .map(|p| fold_slack_lens(p.0.iter().map(Vec::len), SIDE, MAX) as usize)
-            .max()
-            .unwrap_or(0)
+    /// [`Found::products`] for a product whose lists `guard` already holds admitted, with
+    /// their pruning read through `read` ([`prune_with`]). The caller admitted the push of
+    /// the product with [`Found::reserve_prod_admitted`], and pruning keeps each list's
+    /// capacity, so that what the product holds is what was admitted. False once read
+    /// answers false, with the product dropped.
+    pub(super) fn products_read<F: FnMut(usize) -> bool>(
+        &mut self,
+        mut lists: Vec<Vec<Side>>,
+        base: Side,
+        read: &mut F,
+    ) -> bool {
+        if lists.iter().any(|l| l.is_empty()) {
+            return true;
+        }
+        for l in &mut lists {
+            if !prune_with(l, read) {
+                return false;
+            }
+        }
+        self.prods_bytes += prod_inner_bytes(lists.capacity(), &lists, &base);
+        self.prods.push((lists, base, false, self.rule));
+        true
     }
     /// [`Found::products`] for a ground inference, whose choices the restriction filters.
     pub(super) fn ground_products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
@@ -3775,33 +3805,111 @@ pub(super) fn tr_ctx(st: &State, root: bool) -> String {
 /// both sides are sorted without repeats, as the sides of [`fold`] and of stored clauses
 /// are, and by a search of each literal otherwise.
 fn prune(l: &mut Vec<Side>) {
+    // the pruning that no meter reads, which item 1280's harness leaves out of its count
+    #[cfg(test)]
+    let _quiet = meter_probe::quiet();
+    let done = prune_with(l, &mut |_| true);
+    debug_assert!(done);
+}
+
+/// [`prune`], telling `read` of each comparison of two sides, of each literal that a
+/// comparison steps over, and of the literals of each side that its signature and its
+/// test of order read, false once read answers false, which leaves `l` with some of its
+/// sides dropped and others not, for a caller that drops the inference.
+pub(super) fn prune_with<F: FnMut(usize) -> bool>(l: &mut Vec<Side>, read: &mut F) -> bool {
     if l.len() < 2 {
-        return;
+        return true;
     }
-    let sig = |x: &[Lit]| x.iter().fold(0u64, |s, l| s | l.sig_bit());
-    let strict = |x: &[Lit]| x.windows(2).all(|w| w[0] < w[1]);
-    let within = |a: &(Side, u64, u64, bool), b: &(Side, u64, u64, bool)| {
-        if a.1 & !b.1 != 0 || a.2 & !b.2 != 0 {
-            return false;
+    // the signature of a side and whether its literals are sorted without repeats, which
+    // read each literal twice, once for its bit and once for its comparison with the
+    // literal before it, `None` once read answers false
+    let look = |x: &[Lit], read: &mut F| -> Option<(u64, bool)> {
+        let (mut sig, mut strict) = (0u64, true);
+        for (i, l) in x.iter().enumerate() {
+            if !read(1) {
+                return None;
+            }
+            #[cfg(test)]
+            meter_probe::visit(1);
+            sig |= l.sig_bit();
+            if !read(1) {
+                return None;
+            }
+            #[cfg(test)]
+            meter_probe::visit(1);
+            strict &= i == 0 || x[i - 1] < *l;
         }
-        let ((a0, a1), (b0, b1)) = (&a.0, &b.0);
-        if a.3 && b.3 {
-            super::dl_clause::subset(a0, b0) && super::dl_clause::subset(a1, b1)
-        } else {
-            a0.iter().all(|x| b0.contains(x)) && a1.iter().all(|x| b1.contains(x))
-        }
+        Some((sig, strict))
     };
+    // whether `a` is within `b`, `None` once read answers false
+    let within =
+        |a: &(Side, u64, u64, bool), b: &(Side, u64, u64, bool), read: &mut F| -> Option<bool> {
+            if !read(1) {
+                return None;
+            }
+            if a.1 & !b.1 != 0 || a.2 & !b.2 != 0 {
+                return Some(false);
+            }
+            let ((a0, a1), (b0, b1)) = (&a.0, &b.0);
+            if a.3 && b.3 {
+                Some(
+                    super::dl_clause::subset_with(a0, b0, read)?
+                        && super::dl_clause::subset_with(a1, b1, read)?,
+                )
+            } else {
+                Some(contained_with(a0, b0, read)? && contained_with(a1, b1, read)?)
+            }
+        };
     l.sort_by_key(|s| s.0.len() + s.1.len());
     let mut keep: Vec<(Side, u64, u64, bool)> = Vec::with_capacity(l.len());
     for s in l.drain(..) {
-        let (s0, s1) = (sig(&s.0), sig(&s.1));
-        let sorted = strict(&s.0) && strict(&s.1);
+        let Some((s0, sorted0)) = look(&s.0, read) else {
+            return false;
+        };
+        let Some((s1, sorted1)) = look(&s.1, read) else {
+            return false;
+        };
+        let sorted = sorted0 && sorted1;
         let s = (s, s0, s1, sorted);
-        if !keep.iter().any(|k| within(k, &s)) {
+        let mut inside = false;
+        for k in &keep {
+            match within(k, &s, read) {
+                None => return false,
+                Some(true) => {
+                    inside = true;
+                    break;
+                }
+                Some(false) => {}
+            }
+        }
+        if !inside {
             keep.push(s);
         }
     }
     l.extend(keep.into_iter().map(|k| k.0));
+    true
+}
+
+/// Whether every literal of `a` is in `b`, by a search of `b` for each, telling `read` of
+/// each literal of `b` that a search reads, `None` once read answers false.
+#[inline]
+fn contained_with<F: FnMut(usize) -> bool>(a: &[Lit], b: &[Lit], read: &mut F) -> Option<bool> {
+    for x in a {
+        let mut found = false;
+        for y in b {
+            if !read(1) {
+                return None;
+            }
+            if x == y {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// The choices of a product between two checks of the run's bounds.
@@ -3815,82 +3923,6 @@ pub(super) const RECORD_SLACK: usize = 64 * 1024;
 /// of the step has a subset of their literals, which costs a comparison of each side with
 /// the sides kept before it.
 const FOLD_PRUNE: usize = 4096;
-
-/// The [`step_slack`] model in `u128` for a `Side` of `side` bytes, clamped once at the
-/// end to `max`. Computing in `u128` avoids subtracting saturated `usize` values when
-/// `unions * side` and the table size both exceed `max`.
-fn step_slack_model(unions: u128, listed: u128, side: u128, max: u128) -> u128 {
-    debug_assert!(unions <= u64::MAX as u128 && listed <= u64::MAX as u128);
-    let table = |n: u128| -> u128 {
-        let buckets = match n {
-            0 => 0,
-            1..4 => 4,
-            4..8 => 8,
-            _ => (n * 8 / 7).next_power_of_two(),
-        };
-        buckets * (side + 1) + 16
-    };
-    let grown = table(unions)
-        + if unions >= 4 {
-            table(unions / 2 + 1)
-        } else {
-            0
-        };
-    let cap = if listed == 0 {
-        0
-    } else {
-        listed.next_power_of_two()
-    };
-    let list = (cap + cap / 2) * side;
-    let slack = (grown - unions * side) + (list - listed * side);
-    slack.min(max)
-}
-
-/// The [`Found::fold_slack`] bound for one product's list lengths, returning `max` when
-/// a nonempty product's choice count overflows `max`.
-fn fold_slack_lens(
-    lens: impl ExactSizeIterator<Item = usize> + Clone,
-    side: u128,
-    max: u128,
-) -> u128 {
-    if lens.clone().any(|n| n == 0) {
-        return 0;
-    }
-    let last = lens.len().saturating_sub(1);
-    let mut choices = 1u128;
-    let mut most = 0u128;
-    for (i, len) in lens.enumerate() {
-        let Some(next) = choices.checked_mul(len as u128).filter(|&c| c <= max) else {
-            return max;
-        };
-        choices = next;
-        // a last step past FOLD_PRUNE unions derives them as it makes them
-        let listed = if i < last {
-            choices
-        } else {
-            choices.min((FOLD_PRUNE + 1) as u128)
-        };
-        most = most.max(step_slack_model(choices, listed, side, max));
-    }
-    most
-}
-
-/// The bytes of one step of [`fold`] that its charge leaves out, for `unions` unions of
-/// which `listed` stay in the step's list: the `seen` table's slots and control bytes
-/// beyond the size of a union, which fold charges for each, together with the table of
-/// half the buckets it grew from, and the list's capacity beyond its length, together with
-/// the buffer of half that capacity it grew from. The buckets follow the hash table's
-/// growth, a power of two at least 8/7 of the entries. All arithmetic runs in `u128` and
-/// clamps once to `usize::MAX` at the end.
-#[cfg(test)]
-fn step_slack(unions: usize, listed: usize) -> usize {
-    step_slack_model(
-        unions as u128,
-        listed as u128,
-        std::mem::size_of::<Side>() as u128,
-        usize::MAX as u128,
-    ) as usize
-}
 
 /// Derives the conclusions of a product that is not ground (item 969): the union of one
 /// premise from every list with `base`, list after list. Each step keeps the unions it
@@ -3945,7 +3977,6 @@ fn fold<S: Sink, D: Deriver>(
     rule: &'static str,
     root: bool,
     trace: bool,
-    slack_covered: usize,
     out: &mut S,
     deriver: &D,
 ) -> bool {
@@ -4009,18 +4040,7 @@ fn fold<S: Sink, D: Deriver>(
                     mark_interrupted(st);
                     return false;
                 };
-                let cand_need = if slack_covered == 0 {
-                    cand_peak
-                } else {
-                    let union_cand = (acc.len() + seen.len() + next.len()) * SIDE
-                        + acc_lits
-                        + seen_lits
-                        + next_lits
-                        + cand_bytes;
-                    let slack_cand = cand_peak.saturating_sub(union_cand);
-                    union_cand.saturating_add(slack_cand.saturating_sub(slack_covered))
-                };
-                if !guard.ensure_admitted(cand_need) {
+                if !guard.ensure_admitted(cand_peak) {
                     mark_interrupted(st);
                     return false;
                 }
@@ -4062,8 +4082,6 @@ fn fold<S: Sink, D: Deriver>(
                     // (including rehash/doubling overlap) before cloning or inserting, even
                     // when `seen` and `next` have spare capacity. `seen` rehashes before
                     // `next` grows, so their temporary table/list buffers do not overlap.
-                    // When the caller already pre-reserved `fold_slack` (M-return), `slack_covered`
-                    // covers table/list spare-capacity slack only, never live union bytes.
                     let seen_after = if seen_rehash > 0 {
                         seen_rehash
                     } else {
@@ -4096,19 +4114,7 @@ fn fold<S: Sink, D: Deriver>(
                         mark_interrupted(st);
                         return false;
                     };
-                    let peak_total = during_seen.max(during_next);
-                    let peak_need = if slack_covered == 0 {
-                        peak_total
-                    } else {
-                        let union_total = (acc.len() + seen.len() + next.len()) * SIDE
-                            + acc_lits
-                            + seen_lits
-                            + next_lits
-                            + pair_lits;
-                        let peak_slack = peak_total.saturating_sub(union_total);
-                        union_total.saturating_add(peak_slack.saturating_sub(slack_covered))
-                    };
-                    if !guard.ensure_admitted(peak_need) {
+                    if !guard.ensure_admitted(during_seen.max(during_next)) {
                         mark_interrupted(st);
                         return false;
                     }
@@ -4159,15 +4165,7 @@ fn fold<S: Sink, D: Deriver>(
                         }
                         let live_after = (acc.capacity() * SIDE + acc_lits)
                             + (hash_table_bytes(seen.capacity(), SIDE) + seen_lits);
-                        let want = if slack_covered == 0 {
-                            live_after
-                        } else {
-                            let union_after =
-                                (acc.len() + seen.len()) * SIDE + acc_lits + seen_lits;
-                            let slack_after = live_after.saturating_sub(union_after);
-                            union_after.saturating_add(slack_after.saturating_sub(slack_covered))
-                        };
-                        guard.release_to(want);
+                        guard.release_to(live_after);
                     } else {
                         next.push(s);
                         next_lits += s_lits;
@@ -4179,17 +4177,7 @@ fn fold<S: Sink, D: Deriver>(
                     let live_now = (acc.capacity() * SIDE + acc_lits)
                         + (hash_table_bytes(seen.capacity(), SIDE) + seen_lits)
                         + (next.capacity() * SIDE + next_lits);
-                    let want = if slack_covered == 0 {
-                        live_now
-                    } else {
-                        let union_now = (acc.len() + seen.len() + next.len()) * SIDE
-                            + acc_lits
-                            + seen_lits
-                            + next_lits;
-                        let slack_now = live_now.saturating_sub(union_now);
-                        union_now.saturating_add(slack_now.saturating_sub(slack_covered))
-                    };
-                    let go = guard.ensure_admitted(want) && guard.go_on();
+                    let go = guard.ensure_admitted(live_now) && guard.go_on();
                     if !go {
                         mark_interrupted(st);
                         return false;
@@ -4207,16 +4195,7 @@ fn fold<S: Sink, D: Deriver>(
             let prune_scratch = sort_bytes.max(keep_bytes);
             let live_before_prune =
                 (acc.capacity() * SIDE + acc_lits) + (next.capacity() * SIDE + next_lits);
-            let need_prune = if slack_covered == 0 {
-                live_before_prune.saturating_add(prune_scratch)
-            } else {
-                let union_now = (acc.len() + next.len()) * SIDE + acc_lits + next_lits;
-                let extra = live_before_prune
-                    .saturating_sub(union_now)
-                    .saturating_add(prune_scratch);
-                union_now.saturating_add(extra.saturating_sub(slack_covered))
-            };
-            if !guard.ensure_admitted(need_prune) {
+            if !guard.ensure_admitted(live_before_prune.saturating_add(prune_scratch)) {
                 mark_interrupted(st);
                 return false;
             }
@@ -4224,14 +4203,7 @@ fn fold<S: Sink, D: Deriver>(
         }
         acc = next;
         acc_lits = acc.iter().map(lits_bytes).sum();
-        let live = acc.capacity() * SIDE + acc_lits;
-        let want = if slack_covered == 0 {
-            live
-        } else {
-            let union_now = acc.len() * SIDE + acc_lits;
-            let slack_now = live.saturating_sub(union_now);
-            union_now.saturating_add(slack_now.saturating_sub(slack_covered))
-        };
+        let want = acc.capacity() * SIDE + acc_lits;
         guard.release_to(want);
         if want.saturating_sub(guard.bytes()) >= RECORD_SLACK && !guard.ensure_admitted(want) {
             mark_interrupted(st);
@@ -4288,7 +4260,7 @@ fn emit<S: Sink, D: Deriver>(
 /// and marks the context's store interrupted, a store made for the mark if the context has
 /// none, so that the dependency record of a partial answer counts the context as open.
 pub(super) fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
-    drain_with_covered(ix, st, found, out, &ContextDerive, false, 0, 0);
+    drain_with_covered(ix, st, found, out, &ContextDerive, 0);
 }
 
 /// [`drain`], when `guard` already holds `guard.bytes()` of `found`'s `held_bytes()` (e.g.
@@ -4300,29 +4272,7 @@ pub(super) fn drain_admitted<S: Sink>(
     guard: &mut Guard<'_, S>,
 ) {
     let already = guard.bytes();
-    drain_with_covered(ix, st, found, guard, &ContextDerive, false, 0, already);
-}
-
-/// [`drain`], when the caller has already reserved `held` and/or `slack_covered` bytes
-/// (such as M-return's `m_flush` and `rret`).
-pub(super) fn drain_covered<S: Sink>(
-    ix: &Index,
-    st: &mut State,
-    found: Found,
-    out: &mut S,
-    held_covered: bool,
-    slack_covered: usize,
-) {
-    drain_with_covered(
-        ix,
-        st,
-        found,
-        out,
-        &ContextDerive,
-        held_covered,
-        slack_covered,
-        0,
-    );
+    drain_with_covered(ix, st, found, guard, &ContextDerive, already);
 }
 
 /// [`drain`], with `deriver` adding each conclusion, which the root of a rooted run gives
@@ -4335,7 +4285,7 @@ pub(super) fn drain_with<S: Sink, D: Deriver>(
     out: &mut S,
     deriver: &D,
 ) {
-    drain_with_covered(ix, st, found, out, deriver, false, 0, 0);
+    drain_with_covered(ix, st, found, out, deriver, 0);
 }
 
 /// [`drain_with`], when `guard` already holds `guard.bytes()` of `found`'s `held_bytes()`.
@@ -4348,10 +4298,9 @@ pub(super) fn drain_with_admitted<S: Sink, D: Deriver>(
     deriver: &D,
 ) {
     let already = guard.bytes();
-    drain_with_covered(ix, st, found, guard, deriver, false, 0, already);
+    drain_with_covered(ix, st, found, guard, deriver, already);
 }
 
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn drain_with_covered<S: Sink, D: Deriver>(
     ix: &Index,
@@ -4359,8 +4308,6 @@ fn drain_with_covered<S: Sink, D: Deriver>(
     found: Found,
     out: &mut S,
     deriver: &D,
-    held_covered: bool,
-    slack_covered: usize,
     held_admitted: usize,
 ) {
     debug_assert_eq!(found.extra_bytes, 0);
@@ -4369,11 +4316,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
         mark_interrupted(st);
         return;
     }
-    let h = if held_covered {
-        0
-    } else {
-        found.held_bytes().saturating_sub(held_admitted)
-    };
+    let h = found.held_bytes().saturating_sub(held_admitted);
     // Declare `held_guard` before moving `found`'s collections into locals so LIFO drop
     // always frees both `one` and `prods` before releasing their reservation, including on
     // early stop or callback panic unwind during single-conclusion delivery.
@@ -4386,7 +4329,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
             mark_interrupted(st);
             return;
         }
-    } else if !held_covered && held_guard.stopped() {
+    } else if held_guard.stopped() {
         mark_interrupted(st);
         return;
     }
@@ -4436,7 +4379,6 @@ fn drain_with_covered<S: Sink, D: Deriver>(
                 rule,
                 root,
                 trace,
-                slack_covered,
                 &mut held_guard,
                 deriver,
             ) {
@@ -5035,6 +4977,365 @@ fn again<S: Sink>(
 
 /// The clauses read that count as one derived conclusion for the work bound.
 pub(super) const WORK_READS: usize = 16;
+
+/// The reads that a [`Meter`] takes between two checks of the run's bounds, a multiple of
+/// [`WORK_READS`] so that a meter that charges its reads charges whole conclusions.
+pub(super) const METER_CHECK: usize = 1024;
+const _: () = assert!(METER_CHECK.is_multiple_of(WORK_READS));
+
+/// What a [`Meter`] charges to the work bound for the reads it counts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Bill {
+    /// nothing, so that the run's counts of derived conclusions stay as they were
+    Nothing,
+    /// a conclusion for every [`WORK_READS`] reads, through [`Sink::worked`]
+    Work,
+    /// as `Work`, and the same count in the repair's statistics, as the repair's scans
+    /// count
+    Repair,
+}
+
+/// Roadmap item 1280's meter of the reads of Tier D's rooted rules and of item 1231's
+/// marker repair. A read is one entry of an index, one literal of a clause, or one step of a
+/// comparison of two premises, and the meter checks the run's bounds once every
+/// [`METER_CHECK`] reads. A count of many reads at once is split at each check, and the
+/// reads past a check count toward the next one, so that the meter never counts more than
+/// `METER_CHECK` reads between two checks, however wide one step is. A step counts its
+/// reads before it makes them, so a check that stops the meter comes before the work it
+/// counts. A step that scans or copies many literals counts them one at a time or in spans
+/// that end short of the next check ([`Meter::span`], [`Meter::scan`], [`Meter::extend`]),
+/// so that it also makes no more than `METER_CHECK` reads between two checks. The count
+/// since the last check lives in the activation's sink when it has one
+/// ([`Sink::meter_reads`]), so that the meters of one activation share one cadence and
+/// many short scans cannot read without a check. A meter charges its own reads to the work
+/// bound only as its [`Bill`] says, and its charge is the same whatever the cadence, a
+/// conclusion for every [`WORK_READS`] of its reads. The memory that a metered step builds
+/// is admitted through the caller's [`Guard`] before it is built, as the rest of Tier D
+/// admits it.
+pub(super) struct Meter {
+    /// the reads since the last check, used when the sink keeps no count
+    own: std::cell::Cell<usize>,
+    /// the reads that the meter has not charged yet
+    unbilled: std::cell::Cell<usize>,
+    bill: Bill,
+    /// whether a check of the bounds stopped the meter, which answers false from then on
+    stopped: std::cell::Cell<bool>,
+}
+
+/// Takes the reads of `n` up to the next check on the count `at`, true when they reach
+/// it, which starts the count again with the rest of `n` still to take.
+#[inline]
+fn meter_upto(at: &std::cell::Cell<usize>, n: &mut usize) -> bool {
+    let k = at.get();
+    let room = METER_CHECK.saturating_sub(k);
+    if *n < room {
+        at.set(k + *n);
+        *n = 0;
+        return false;
+    }
+    *n -= room;
+    at.set(0);
+    #[cfg(test)]
+    meter_probe::check(k + room);
+    true
+}
+
+/// The reads of `want` that a step may count on the count `at` and then make before it
+/// counts again: those that stay short of the next check, or one when the next read reaches
+/// it. A step that reads in such spans meets the checks where a step that counts each read
+/// before it makes it meets them, so that no more than [`METER_CHECK`] reads are made
+/// between two checks.
+#[inline]
+fn span_at(at: &std::cell::Cell<usize>, want: usize) -> usize {
+    let room = METER_CHECK.saturating_sub(at.get());
+    if room > 1 {
+        want.min(room - 1)
+    } else {
+        want.min(1)
+    }
+}
+
+impl Meter {
+    /// A meter that charges its reads as `bill` says.
+    pub(super) fn new(bill: Bill) -> Self {
+        Meter {
+            own: Default::default(),
+            unbilled: Default::default(),
+            bill,
+            stopped: Default::default(),
+        }
+    }
+
+    /// A meter that checks the bounds and charges nothing.
+    pub(super) fn checks() -> Self {
+        Self::new(Bill::Nothing)
+    }
+
+    /// Whether the meter answers no further reads, which the harness counts.
+    #[inline]
+    fn refused(&self) -> bool {
+        let stopped = self.stopped.get();
+        #[cfg(test)]
+        if stopped {
+            meter_probe::refused();
+        }
+        stopped
+    }
+
+    /// The conclusions that the reads not charged yet make, which it takes.
+    fn take_bill(&self) -> usize {
+        let u = self.unbilled.get();
+        self.unbilled.set(u % WORK_READS);
+        u / WORK_READS
+    }
+
+    /// Counts `n` reads that the meter does not charge, which checks the bounds at each
+    /// [`METER_CHECK`] reads of the cadence that they reach, false once a check of the
+    /// bounds stopped it. A meter that charges takes the reads it charges through
+    /// [`Meter::read_mut`].
+    #[inline]
+    pub(super) fn read<S: Sink + ?Sized>(&self, n: usize, out: &S) -> bool {
+        if self.refused() {
+            return false;
+        }
+        #[cfg(test)]
+        meter_probe::read(n);
+        let mut n = n;
+        while meter_upto(out.meter_reads().unwrap_or(&self.own), &mut n) {
+            if !self.verdict(out.go_on()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Counts `n` reads and charges them as the meter's [`Bill`] says at each check, false
+    /// once a check of the bounds stopped it.
+    #[inline]
+    pub(super) fn read_mut<S: Sink>(&self, n: usize, out: &mut S) -> bool {
+        if self.refused() {
+            return false;
+        }
+        #[cfg(test)]
+        meter_probe::read(n);
+        let mut n = n;
+        loop {
+            let before = n;
+            let hit = meter_upto(out.meter_reads().unwrap_or(&self.own), &mut n);
+            self.unbill(before - n);
+            if !hit {
+                return true;
+            }
+            self.charge(out);
+            if !self.verdict(out.go_on()) {
+                return false;
+            }
+        }
+    }
+
+    /// Counts `n` reads of a check that a `poll` makes, which takes the conclusions to
+    /// charge and answers whether the run goes on, as the diagnostic polls.
+    pub(super) fn read_poll(&self, n: usize, poll: &mut dyn FnMut(usize) -> bool) -> bool {
+        if self.refused() {
+            return false;
+        }
+        #[cfg(test)]
+        meter_probe::read(n);
+        let mut n = n;
+        loop {
+            let before = n;
+            let hit = meter_upto(&self.own, &mut n);
+            self.unbill(before - n);
+            if !hit {
+                return true;
+            }
+            let w = self.take_bill();
+            if !self.verdict(poll(w)) {
+                return false;
+            }
+        }
+    }
+
+    /// Adds `n` reads made up to a check, or to the end of a count, to the reads not
+    /// charged yet, so that a check that stops the meter charges none of the reads after it.
+    #[inline]
+    fn unbill(&self, n: usize) {
+        if self.bill != Bill::Nothing {
+            self.unbilled.set(self.unbilled.get().saturating_add(n));
+        }
+    }
+
+    /// Counts the next span of a step of `want` reads ([`span_at`]) and gives its length,
+    /// `None` once a check of the bounds stopped the meter. The step makes the span's reads
+    /// before it asks for the next span.
+    #[inline]
+    pub(super) fn span<S: Sink + ?Sized>(&self, want: usize, out: &S) -> Option<usize> {
+        let n = span_at(out.meter_reads().unwrap_or(&self.own), want);
+        self.read(n, out).then_some(n)
+    }
+
+    /// Visits the elements of `src` in spans, a read each, until `f` answers false:
+    /// `Some(true)` when it visited them all, `Some(false)` when `f` ended the visit, and
+    /// `None` once a check of the bounds stopped the meter.
+    #[inline]
+    pub(super) fn scan<T, S: Sink + ?Sized>(
+        &self,
+        src: &[T],
+        out: &S,
+        mut f: impl FnMut(&T) -> bool,
+    ) -> Option<bool> {
+        let mut rest = src;
+        while !rest.is_empty() {
+            let n = self.span(rest.len(), out)?;
+            let (now, later) = rest.split_at(n);
+            for x in now {
+                #[cfg(test)]
+                meter_probe::visit(1);
+                if !f(x) {
+                    return Some(false);
+                }
+            }
+            rest = later;
+        }
+        Some(true)
+    }
+
+    /// Copies `src` onto the end of `dst` in spans, a read for each element, false once a
+    /// check of the bounds stopped the meter. The caller gave `dst` its capacity.
+    #[inline]
+    pub(super) fn extend<T: Copy, S: Sink + ?Sized>(
+        &self,
+        dst: &mut Vec<T>,
+        src: &[T],
+        out: &S,
+    ) -> bool {
+        let mut rest = src;
+        while !rest.is_empty() {
+            let Some(n) = self.span(rest.len(), out) else {
+                return false;
+            };
+            let (now, later) = rest.split_at(n);
+            #[cfg(test)]
+            let had = dst.len();
+            dst.extend_from_slice(now);
+            #[cfg(test)]
+            meter_probe::visit(dst.len() - had);
+            rest = later;
+        }
+        true
+    }
+
+    fn verdict(&self, go: bool) -> bool {
+        if !go {
+            self.stopped.set(true);
+        }
+        go
+    }
+
+    /// Charges the reads that make whole conclusions and keeps the rest.
+    fn charge<S: Sink>(&self, out: &mut S) {
+        let w = self.take_bill();
+        match self.bill {
+            Bill::Nothing => {}
+            Bill::Work => out.worked(w),
+            Bill::Repair => {
+                out.dl().count_mrepair(w);
+                out.worked(w);
+            }
+        }
+    }
+
+    /// Ends the meter: charges the reads since its last charge, dropping fewer than
+    /// [`WORK_READS`], as the repair's scans have always ended.
+    pub(super) fn end<S: Sink>(self, out: &mut S) {
+        self.charge(out);
+        self.unbilled.set(0);
+    }
+
+    /// Ends a meter of a `poll`: charges the reads since its last check and checks the
+    /// bounds, false when the check stopped it.
+    pub(super) fn end_poll(self, poll: &mut dyn FnMut(usize) -> bool) -> bool {
+        let w = self.take_bill();
+        !self.stopped.get() && poll(w)
+    }
+
+    /// Whether a check of the bounds stopped the meter.
+    pub(super) fn stopped(&self) -> bool {
+        self.stopped.get()
+    }
+}
+
+/// What the meters of the current thread counted, for item 1280's harness: the reads, the
+/// checks, the most reads between two checks, and the reads asked of a meter that a check
+/// had stopped.
+#[cfg(test)]
+pub(super) mod meter_probe {
+    use std::cell::Cell;
+    std::thread_local! {
+        static READS: Cell<usize> = const { Cell::new(0) };
+        static CHECKS: Cell<usize> = const { Cell::new(0) };
+        static MOST: Cell<usize> = const { Cell::new(0) };
+        static REFUSED: Cell<usize> = const { Cell::new(0) };
+        static SINCE: Cell<usize> = const { Cell::new(0) };
+        static GAP: Cell<usize> = const { Cell::new(0) };
+        static QUIET: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Leaves the reads that a step makes without a meter out of [`visit`]'s count until the
+    /// answer drops.
+    pub(in crate::classify) fn quiet() -> impl Drop {
+        struct Quiet(bool);
+        impl Drop for Quiet {
+            fn drop(&mut self) {
+                QUIET.with(|c| c.set(self.0));
+            }
+        }
+        Quiet(QUIET.with(|c| c.replace(true)))
+    }
+    pub(in crate::classify) fn read(n: usize) {
+        READS.with(|c| c.set(c.get() + n));
+    }
+    pub(in crate::classify) fn check(k: usize) {
+        CHECKS.with(|c| c.set(c.get() + 1));
+        MOST.with(|c| c.set(c.get().max(k)));
+        SINCE.with(|c| c.set(0));
+    }
+    /// Counts `n` reads that a metered step made at the point where it made them, the
+    /// literals it visited or the elements it copied.
+    pub(in crate::classify) fn visit(n: usize) {
+        if QUIET.with(|c| c.get()) {
+            return;
+        }
+        let k = SINCE.with(|c| {
+            let k = c.get() + n;
+            c.set(k);
+            k
+        });
+        GAP.with(|c| c.set(c.get().max(k)));
+    }
+    /// Clears and gives back the most reads that metered steps made between two checks,
+    /// as [`visit`] counted them at the point of use.
+    pub(in crate::classify) fn take_gap() -> usize {
+        SINCE.with(|c| c.set(0));
+        GAP.with(|c| c.replace(0))
+    }
+    pub(in crate::classify) fn refused() {
+        REFUSED.with(|c| c.set(c.get() + 1));
+    }
+    /// Clears the counts and gives back what they held: reads, checks and the most reads
+    /// between two checks.
+    pub(in crate::classify) fn take() -> (usize, usize, usize) {
+        REFUSED.with(|c| c.set(0));
+        (
+            READS.with(|c| c.replace(0)),
+            CHECKS.with(|c| c.replace(0)),
+            MOST.with(|c| c.replace(0)),
+        )
+    }
+    /// Clears and gives back the reads asked of stopped meters since the last take.
+    pub(in crate::classify) fn take_refused() -> usize {
+        REFUSED.with(|c| c.replace(0))
+    }
+}
 
 /// A class of `a` and one of `b` in a disjointness set, with the clauses that give them.
 fn disjoint(ix: &Index, a: &[(Ex, u32)], b: &[(Ex, u32)]) -> Option<(u32, u32)> {
@@ -8177,7 +8478,6 @@ mod tests {
             "test",
             false,
             false,
-            0,
             out,
             &derive
         ));
@@ -8245,7 +8545,6 @@ mod tests {
             "test",
             false,
             false,
-            0,
             &mut out,
             &derive
         ));
@@ -8276,7 +8575,6 @@ mod tests {
                 "test",
                 false,
                 false,
-                0,
                 out,
                 &NoopDerive,
             )
@@ -8326,7 +8624,6 @@ mod tests {
             "test",
             false,
             false,
-            0,
             &mut out,
             &NoopDerive
         ));
@@ -8451,111 +8748,6 @@ mod tests {
         let mut run = run;
         run.begin_run();
         assert!(!run.too_wide(&lists));
-    }
-
-    #[test]
-    fn step_slack_saturates_cleanly_and_matches_the_u128_model() {
-        let side_bytes = std::mem::size_of::<Side>() as u128;
-        let expected = |unions: usize, listed: usize| -> usize {
-            let u = unions as u128;
-            let l = listed as u128;
-            let table = |n: u128| -> u128 {
-                let buckets = match n {
-                    0 => 0,
-                    1..4 => 4,
-                    4..8 => 8,
-                    _ => (n * 8 / 7).next_power_of_two(),
-                };
-                buckets * (side_bytes + 1) + 16
-            };
-            let grown = table(u) + if u >= 4 { table(u / 2 + 1) } else { 0 };
-            let cap = if l == 0 { 0 } else { l.next_power_of_two() };
-            let list = (cap + cap / 2) * side_bytes;
-            ((grown - u * side_bytes) + (list - l * side_bytes)).min(usize::MAX as u128) as usize
-        };
-        for (u, l) in [
-            (0, 0),
-            (1, 1),
-            (3, 3),
-            (4, 4),
-            (7, 7),
-            (8, 8),
-            (16, 16),
-            (100, 100),
-            (FOLD_PRUNE, FOLD_PRUNE),
-            (FOLD_PRUNE + 1, FOLD_PRUNE + 1),
-            (50_000, 50_000),
-            (200_000_000, FOLD_PRUNE + 1),
-            (usize::MAX / std::mem::size_of::<Side>() + 1, FOLD_PRUNE + 1),
-            (usize::MAX, FOLD_PRUNE + 1),
-            (usize::MAX, usize::MAX),
-        ] {
-            assert_eq!(step_slack(u, l), expected(u, l), "u={u}, l={l}");
-        }
-        assert_eq!(step_slack(usize::MAX, usize::MAX), usize::MAX);
-        assert_eq!(step_slack(usize::MAX, FOLD_PRUNE + 1), usize::MAX);
-    }
-
-    #[test]
-    fn fold_slack_saturates_on_choice_overflow_and_handles_empty_and_ground() {
-        assert_eq!(Found::default().fold_slack(), 0);
-        // Ground products are ignored by fold_slack.
-        let mut ground = Found::default();
-        ground.ground_products(
-            vec![vec![side(&[1]), side(&[2])], vec![side(&[3]), side(&[4])]],
-            side(&[]),
-        );
-        assert_eq!(ground.fold_slack(), 0);
-        // Empty-list products produce no choices.
-        let mut empty = Found::default();
-        empty.products(vec![vec![side(&[1])], Vec::new()], side(&[]));
-        assert_eq!(empty.fold_slack(), 0);
-        // Choice multiplication overflowing usize must return usize::MAX.
-        let mut overflow = Found::default();
-        let lists: Vec<Vec<Side>> = (0..usize::BITS)
-            .map(|i| vec![side(&[2 * i + 2]), side(&[2 * i + 3])])
-            .collect();
-        overflow.products(lists, side(&[]));
-        assert_eq!(overflow.fold_slack(), usize::MAX);
-        // Multiple sequential products take the maximum, not the sum.
-        let mut multi = Found::default();
-        multi.products(
-            vec![
-                vec![side(&[1]), side(&[2]), side(&[3]), side(&[4])],
-                vec![side(&[5]), side(&[6]), side(&[7]), side(&[8])],
-            ],
-            side(&[]),
-        );
-        let one = multi.fold_slack();
-        assert_eq!(one, step_slack(4, 4).max(step_slack(16, 16)));
-        multi.products(
-            vec![
-                vec![side(&[11]), side(&[12]), side(&[13]), side(&[14])],
-                vec![side(&[15]), side(&[16]), side(&[17]), side(&[18])],
-            ],
-            side(&[]),
-        );
-        assert_eq!(multi.fold_slack(), one);
-        // 32-bit 50,000 x 4,000 example (Side = 24 B, max = u32::MAX): step 0 is 2,416,928 B
-        // and step 1 (200,000,000 choices, FOLD_PRUNE + 1 listed) must saturate to u32::MAX
-        // instead of collapsing to 196,584 B and letting fold_slack return 2,416,928 B.
-        assert_eq!(
-            step_slack_model(50_000, 50_000, 24, u32::MAX as u128),
-            2_416_928
-        );
-        assert_eq!(
-            step_slack_model(200_000_000, (FOLD_PRUNE + 1) as u128, 24, u32::MAX as u128),
-            u32::MAX as u128
-        );
-        assert_eq!(
-            fold_slack_lens([50_000, 4_000].into_iter(), 24, u32::MAX as u128),
-            u32::MAX as u128
-        );
-        // Empty list after an overflowing prefix still represents an empty product (0).
-        assert_eq!(
-            fold_slack_lens([usize::MAX, 2, 0].into_iter(), 48, usize::MAX as u128),
-            0
-        );
     }
 
     #[test]

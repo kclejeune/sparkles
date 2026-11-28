@@ -1006,11 +1006,13 @@ fn store_add_parts_and_rooted_next_refuse_copy_and_maxima_scratch() {
     let _ = exact_needed;
 }
 
-/// Non-ground `fold` with `slack_covered > 0`, `FOLD_PRUNE` streaming transition, and wide
+/// Non-ground `fold` with wide unions, the `FOLD_PRUNE` streaming transition, and wide
 /// unions under spare capacity (on both non-ground and ground paths) must keep every live
-/// buffer charged through its last use and stop immediately on refusal.
+/// buffer charged through its last use and stop immediately on refusal. Since item 1280 no
+/// caller reserves a bound on fold's tables before it drains, so fold's own charge covers
+/// them.
 #[test]
-fn fold_covered_slack_prune_streaming_and_wide_spare_capacity() {
+fn fold_charges_wide_unions_prune_streaming_and_wide_spare_capacity() {
     struct TrackSink<'a> {
         run: &'a DlRun,
         cap: usize,
@@ -1057,8 +1059,8 @@ fn fold_covered_slack_prune_streaming_and_wide_spare_capacity() {
     );
     let run = DlRun::new(false, Default::default());
 
-    // A. `slack_covered > 0` with large wide unions (`union_now` >> `slack_covered`):
-    // reservation must include `union_now` on both growth and prune paths and cover heap.
+    // A. Large wide unions: fold's own reservation covers the heap on both growth and
+    // prune paths, with nothing reserved before the drain.
     {
         let mut st = State::default();
         let _ = super::dl_rules::ds(&mut st);
@@ -1067,34 +1069,31 @@ fn fold_covered_slack_prune_streaming_and_wide_spare_capacity() {
         let list_b: Vec<_> = (0..8u32).map(|i| wide(10_000 + i * 300)).collect();
         let mut found = Found::default();
         found.products(vec![list_a, list_b], (Vec::new(), Vec::new()));
-        let slack = found.fold_slack();
-        assert!(slack > 0);
         let mut sink = TrackSink {
             run: &run,
             cap: usize::MAX,
-            live: slack, // caller pre-reserved `slack`
-            peak: slack,
+            live: 0,
+            peak: 0,
             stopped: false,
         };
         let (_, sample) = measure(|| {
-            super::dl_rules::drain_covered(&ix, &mut st, found, &mut sink, false, slack);
+            super::dl_rules::drain(&ix, &mut st, found, &mut sink);
         });
         assert!(
             sink.peak >= sample.peak,
-            "covered fold peak ({}) undercounted heap ({})",
+            "fold peak ({}) undercounted heap ({})",
             sink.peak,
             sample.peak
         );
-        // After drain, only `slack` plus retained Store growth remains in `sink.live`.
+        // After drain, only retained Store growth remains in `sink.live`.
         let store_bytes = super::dl_rules::dl(&st).map_or(0, |d| d.store.bytes());
         assert_eq!(
-            sink.live,
-            slack + store_bytes,
+            sink.live, store_bytes,
             "fold must release all temporary reservations"
         );
 
-        // Tight cap covering `slack` + `held` + 64 KiB (not enough for 128 wide unions) must
-        // refuse before allocating all unions even with `slack_covered > 0`.
+        // A tight cap covering `held` + 64 KiB (not enough for 128 wide unions) must refuse
+        // before allocating all unions.
         let mut st2 = State::default();
         let _ = super::dl_rules::ds(&mut st2);
         let list_a2: Vec<_> = (0..16u32).map(|i| wide(100 + i * 300)).collect();
@@ -1104,15 +1103,15 @@ fn fold_covered_slack_prune_streaming_and_wide_spare_capacity() {
         let held2 = found2.held_bytes();
         let mut tight = TrackSink {
             run: &run,
-            cap: slack + held2 + (64 << 10),
-            live: slack,
-            peak: slack,
+            cap: held2 + (64 << 10),
+            live: 0,
+            peak: 0,
             stopped: false,
         };
-        super::dl_rules::drain_covered(&ix, &mut st2, found2, &mut tight, false, slack);
-        assert!(tight.stopped, "tight cap must refuse wide covered fold");
+        super::dl_rules::drain(&ix, &mut st2, found2, &mut tight);
+        assert!(tight.stopped, "tight cap must refuse wide fold");
         assert!(st2.interrupted);
-        assert_eq!(tight.live, slack);
+        assert_eq!(tight.live, 0);
     }
 
     // B. `FOLD_PRUNE` (4,096) streaming transition:
