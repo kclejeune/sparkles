@@ -12,9 +12,16 @@
 use super::*;
 use std::cell::RefCell;
 
+/// What the check saw on the current thread: its findings, one list per saturation that
+/// finished, and the saturations that stopped before they finished, which it skips.
+#[derive(Default)]
+struct Observed {
+    runs: Vec<Vec<dl_rules::PredAudit>>,
+    unfinished: usize,
+}
+
 thread_local! {
-    /// the findings of the check on the current thread, one list per saturation
-    static AUDIT: RefCell<Option<Vec<Vec<dl_rules::PredAudit>>>> = const { RefCell::new(None) };
+    static AUDIT: RefCell<Option<Observed>> = const { RefCell::new(None) };
 }
 
 /// Whether a test on this thread observes the check.
@@ -25,11 +32,11 @@ pub(super) fn observing() -> bool {
 /// The check's finding for one context of the saturation that is ending.
 pub(super) fn record(f: dl_rules::PredAudit) {
     AUDIT.with(|a| {
-        if let Some(runs) = a.borrow_mut().as_mut() {
-            if runs.is_empty() {
-                runs.push(Vec::new());
+        if let Some(o) = a.borrow_mut().as_mut() {
+            if o.runs.is_empty() {
+                o.runs.push(Vec::new());
             }
-            runs.last_mut().expect("a saturation").push(f);
+            o.runs.last_mut().expect("a saturation").push(f);
         }
     });
 }
@@ -37,22 +44,67 @@ pub(super) fn record(f: dl_rules::PredAudit) {
 /// The end of a saturation that the check read.
 pub(super) fn saturated() {
     AUDIT.with(|a| {
-        if let Some(runs) = a.borrow_mut().as_mut() {
-            runs.push(Vec::new());
+        if let Some(o) = a.borrow_mut().as_mut() {
+            o.runs.push(Vec::new());
         }
     });
 }
 
+/// The end of a saturation that stopped before it finished, which the check does not read.
+pub(super) fn unfinished() {
+    AUDIT.with(|a| {
+        if let Some(o) = a.borrow_mut().as_mut() {
+            o.unfinished += 1;
+        }
+    });
+}
+
+/// What the check found in one saturation that finished.
+struct Run {
+    /// the clauses, units and promoted facts that Pred gave again
+    found: usize,
+    /// the replays of received clauses that the check made
+    replayed: usize,
+    /// whether a replay stopped, which leaves the counts without meaning
+    interrupted: bool,
+    /// whether every context checked was in a run with the root, and in one that counts
+    rooted: bool,
+    counting: bool,
+    first: Option<String>,
+}
+
 /// What the check found in each saturation of one run.
 struct Seen {
-    /// per saturation, the clauses and units that Pred gave again and the first one's
-    /// description
-    runs: Vec<(usize, Option<String>)>,
-    /// whether the run answered in full
+    runs: Vec<Run>,
+    /// the saturations that stopped before they finished
+    unfinished: usize,
+    /// whether the run answered in full, with nothing excluded or open, within its budget
+    /// and without classifying again on another route
     complete: bool,
     out: Classification,
 }
 
+/// Clears the observation however the classification leaves the thread, panics included.
+struct Observe;
+
+impl Observe {
+    fn start() -> Observe {
+        AUDIT.with(|a| *a.borrow_mut() = Some(Observed::default()));
+        Observe
+    }
+    fn take(self) -> Observed {
+        AUDIT.with(|a| a.borrow_mut().take()).expect("observed")
+    }
+}
+
+impl Drop for Observe {
+    fn drop(&mut self) {
+        AUDIT.with(|a| *a.borrow_mut() = None);
+    }
+}
+
+/// Classifies `body` with the check observing. `threads` is the requested thread count,
+/// and the scheduler may run a saturation on fewer workers.
 fn audited(body: &str, counting: bool, rooted: bool, threads: usize, eager: bool) -> Seen {
     let ax = crate::ofn_read::parse(&format!(
         "Prefix(:=<http://example.org/s#>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n{body}\n)"
@@ -60,7 +112,7 @@ fn audited(body: &str, counting: bool, rooted: bool, threads: usize, eager: bool
     .expect("test ontology")
     .axioms;
     let mut k = Classifier::of(&ax);
-    AUDIT.with(|a| *a.borrow_mut() = Some(Vec::new()));
+    let observe = Observe::start();
     let out = k.classify(&Limits {
         threads,
         counting,
@@ -72,19 +124,32 @@ fn audited(body: &str, counting: bool, rooted: bool, threads: usize, eager: bool
         },
         ..Limits::default()
     });
-    let found = AUDIT.with(|a| a.borrow_mut().take()).expect("observed");
+    let found = observe.take();
     let out = out.expect("a classification");
     let runs = found
+        .runs
         .into_iter()
         .filter(|r| !r.is_empty())
-        .map(|r| {
-            let n = r.iter().map(|f| f.clauses + f.units).sum();
-            (n, r.into_iter().find_map(|f| f.first))
+        .map(|r| Run {
+            found: r.iter().map(|f| f.found()).sum(),
+            replayed: r.iter().map(|f| f.replayed).sum(),
+            interrupted: r.iter().any(|f| f.interrupted),
+            rooted: r.iter().all(|f| f.rooted),
+            counting: r.iter().all(|f| f.counting),
+            first: r.into_iter().find_map(|f| f.first),
         })
         .collect();
-    let complete = out.complete && k.excluded().is_empty() && !out.stats.dl_over_budget;
+    let st = &out.stats;
+    let complete = out.complete
+        && out.incomplete.is_empty()
+        && k.excluded().is_empty()
+        && !st.dl_over_budget
+        && !st.dl_counting_over
+        && !st.dl_rooted_over
+        && !st.dl_rooted_declined;
     Seen {
         runs,
+        unfinished: found.unfinished,
         complete,
         out,
     }
@@ -260,40 +325,66 @@ const CASES: &[Case] = &[
     },
 ];
 
-/// Every context of every run of the cases is closed under Pred with the late rules on,
-/// on one thread and on four with both strategies, and the run that answers in full holds
-/// the case's subsumption.
+/// The configurations of the matrix, as requested thread counts and strategies. One and
+/// four are the threads the run asks for, and the scheduler may still saturate a rooted or
+/// eager bounded Tier D run on one worker.
+const MATRIX: [(usize, bool); 4] = [(1, false), (1, true), (4, false), (4, true)];
+
+/// Every context of every run of the cases is closed under Pred with the replay of item
+/// 1229 pinned on, for each requested thread count and strategy of [`MATRIX`]. Each run
+/// finishes a saturation on the case's route whose check replays received clauses and
+/// stops nowhere, and it answers in full and consistently with the case's subsumption and
+/// a satisfiable antecedent.
 #[test]
 fn every_order_of_arrival_leaves_the_contexts_closed_under_pred() {
     for case in CASES {
-        for (threads, eager) in [(1, false), (1, true), (4, false), (4, true)] {
-            let seen = audited(case.body, case.counting, case.rooted, threads, eager);
-            assert!(
-                !seen.runs.is_empty(),
-                "{}: no saturation checked",
+        for (threads, eager) in MATRIX {
+            let at = format!(
+                "{} on {threads} requested threads, eager {eager}",
                 case.name
             );
-            for (n, first) in &seen.runs {
-                assert_eq!(
-                    *n, 0,
-                    "{} on {threads} threads, eager {eager}: Pred gives again {first:?}",
-                    case.name
-                );
+            let seen = dl_rules::with_late_unit_mode_override(2, || {
+                audited(case.body, case.counting, case.rooted, threads, eager)
+            });
+            assert_eq!(seen.unfinished, 0, "{at}: a saturation stopped");
+            assert!(!seen.runs.is_empty(), "{at}: no saturation checked");
+            assert!(
+                seen.runs
+                    .iter()
+                    .all(|r| r.rooted == case.rooted && r.counting == case.counting),
+                "{at}: a saturation ran off the case's route"
+            );
+            assert!(
+                seen.runs.iter().any(|r| r.replayed > 0),
+                "{at}: no saturation replayed a received clause"
+            );
+            for r in &seen.runs {
+                assert!(!r.interrupted, "{at}: the check's replay stopped");
+                assert_eq!(r.found, 0, "{at}: Pred gives again {:?}", r.first);
             }
-            if seen.complete {
-                let (a, b) = case.want;
-                assert!(
-                    sub(&seen.out, a, b),
-                    "{}: {a} ⊑ {b} is missing on {threads} threads, eager {eager}",
-                    case.name
-                );
-            }
+            assert!(seen.complete, "{at}: the run did not answer in full");
+            assert_eq!(
+                seen.out.consistency,
+                Consistency::Consistent,
+                "{at}: the run is not consistent"
+            );
+            let (a, b) = case.want;
+            assert!(
+                !seen
+                    .out
+                    .taxonomy
+                    .is_unsatisfiable(&Class::new(format!("http://example.org/s#{a}"))),
+                "{at}: {a} is unsatisfiable"
+            );
+            assert!(sub(&seen.out, a, b), "{at}: {a} ⊑ {b} is missing");
         }
     }
 }
 
 /// The check sees the losses: with the replay off, which `SPARKLES_COUNTING_LATE_UNIT=0`
-/// gives, the contexts of each case are not closed under Pred on one thread.
+/// gives, the contexts of the cases that name configurations in [`Case::lost_without`]
+/// are not closed under Pred on one requested thread. The cases with no such
+/// configuration serve only the positive check.
 #[test]
 fn without_the_replay_the_check_finds_the_inferences_left_out() {
     let mut missed = Vec::new();
@@ -302,8 +393,14 @@ fn without_the_replay_the_check_finds_the_inferences_left_out() {
             let seen = dl_rules::with_late_unit_mode_override(0, || {
                 audited(case.body, case.counting, case.rooted, 1, eager)
             });
-            if !seen.runs.iter().any(|(n, _)| *n > 0) {
-                missed.push(format!("{}, eager {eager}", case.name));
+            let at = format!("{}, eager {eager}", case.name);
+            assert_eq!(seen.unfinished, 0, "{at}: a saturation stopped");
+            assert!(
+                seen.runs.iter().all(|r| !r.interrupted),
+                "{at}: the check's replay stopped"
+            );
+            if !seen.runs.iter().any(|r| r.found > 0) {
+                missed.push(at);
             }
         }
     }

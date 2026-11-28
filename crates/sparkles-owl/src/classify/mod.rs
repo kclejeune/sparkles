@@ -13355,9 +13355,13 @@ impl Saturation {
                 }
             }
             stats.dl_work = d.work();
-            // the closure check of item 1229's lemma, for the tests that observe it
+            // the closure check of item 1229's lemma, for the tests that observe it, after
+            // a saturation that finished, replayed in a copy of the run so that the check
+            // leaves the run's work, memory and tables as the saturation left them
             #[cfg(test)]
-            if pred_audit_tests::observing() {
+            if pred_audit_tests::observing() && open.is_none() {
+                let kept = (d.work(), d.bytes(), d.table.len());
+                let iso = d.audit_copy();
                 let made = dynamic.iter().flat_map(|dy| {
                     (0..dy.len() as Ex)
                         .filter_map(move |i| dy.get_ctx(base + i).map(|c| (base + i, c)))
@@ -13369,9 +13373,18 @@ impl Saturation {
                     .filter_map(|(e, c)| c.get().map(|c| (e as Ex, &**c)))
                     .chain(made)
                 {
-                    pred_audit_tests::record(dl_rules::pred_audit(&ix, e, &c.st.lock(), d));
+                    pred_audit_tests::record(dl_rules::pred_audit(&ix, e, &c.st.lock(), &iso));
                 }
+                assert_eq!(
+                    (d.work(), d.bytes(), d.table.len()),
+                    kept,
+                    "the closure check changed the run it read"
+                );
                 pred_audit_tests::saturated();
+            }
+            #[cfg(test)]
+            if pred_audit_tests::observing() && open.is_some() {
+                pred_audit_tests::unfinished();
             }
             let decline = dl_root::marker_decline(limits.rooted_decline);
             if self.dl_rooted && open.is_none() && (dl_root::marker_diag() || decline.is_some()) {

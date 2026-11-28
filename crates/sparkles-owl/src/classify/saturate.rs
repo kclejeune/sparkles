@@ -3822,6 +3822,8 @@ impl<'a> Run<'a> {
             WORKER.with(|w| w.set(0));
             return;
         }
+        #[cfg(test)]
+        let late = super::dl_rules::late_unit_mode_test();
         std::thread::scope(|s| {
             let start = || {
                 // counted while the first worker is busy, so that the count cannot reach 0
@@ -3834,6 +3836,7 @@ impl<'a> Run<'a> {
                         {
                             self.helper_ran.store(true, Ordering::Relaxed);
                             WORKER.with(|w| w.set(HELPER));
+                            super::dl_rules::set_late_unit_mode_test(late);
                         }
                         self.worker::<R>(None)
                     });
@@ -4096,6 +4099,8 @@ impl<'a> Run<'a> {
             seeds.into()
         };
         let mut root = 0;
+        #[cfg(test)]
+        let late = super::dl_rules::late_unit_mode_test();
         std::thread::scope(|s| {
             // dropped last, so that the helpers end however this thread leaves
             let _helpers = Helpers::new(self, &sh);
@@ -4137,6 +4142,8 @@ impl<'a> Run<'a> {
                     for w in 1..threads {
                         let sh = &sh;
                         s.spawn(move || {
+                            #[cfg(test)]
+                            super::dl_rules::set_late_unit_mode_test(late);
                             let mut seen = 0;
                             loop {
                                 let phase = {
