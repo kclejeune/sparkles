@@ -28057,6 +28057,9 @@ mod tests {
             threads: 1,
             rooted,
             partial: false,
+            // Measure each tier through taxonomy construction. Coverage scratch
+            // can put the EL peak above the caps that refuse the Horn build.
+            cover_later: true,
             max_memory: cap,
             ..Limits::default()
         };

@@ -384,12 +384,12 @@ fn a_partial_rooted_run_keeps_the_horn_share() {
 
 /// Under memory budgets stepped from an eighth of the default run's high-water mark to
 /// more than it, a rooted run of the four fixtures stops where the default run stops, falls
-/// back to the EL rules where it does, and otherwise gives its answer with the same flags,
-/// since the refusal comes before the normalization interns anything and the rooted run's
-/// high-water mark is at most the default run's. The refused run never tries Tier D, so it
-/// reports no Tier D overrun, while the default run of `mixed-031`, whose individuals are
-/// all outside OWL 2 EL, tries Tier D without the root and reports one where its Horn rules
-/// pass the budget. A cancelled run stops before it answers.
+/// back to the EL rules where it does, and otherwise gives its answer with the same flags.
+/// These caps exercise tier selection and taxonomy construction. The later coverage pass
+/// can stop independently because it charges scratch beside the selected tier's retained
+/// state. The Horn handoff leaves the rooted run's Tier D overrun flag clear. The default
+/// run of `mixed-031` can report a Tier D overrun since all its individuals occur outside
+/// OWL 2 EL. A cancelled run stops before it answers.
 #[test]
 fn a_refused_rooted_run_stops_and_answers_as_the_default_run() {
     let (mut stopped, mut el, mut full) = (0, 0, 0);
@@ -397,6 +397,7 @@ fn a_refused_rooted_run_stops_and_answers_as_the_default_run() {
         let c = named(name);
         let one = Limits {
             threads: 1,
+            cover_later: true,
             ..Limits::default()
         };
         let mut plain = Classifier::of(&c.axioms);
@@ -408,10 +409,9 @@ fn a_refused_rooted_run_stops_and_answers_as_the_default_run() {
             for partial in [false, true] {
                 let budget = peak * step / 32;
                 let limits = Limits {
-                    threads: 1,
                     partial,
                     max_memory: Some(budget),
-                    ..Limits::default()
+                    ..one.clone()
                 };
                 let at = format!("{name}, budget {budget} of {peak}, partial {partial}");
                 let mut k = Classifier::of(&c.axioms);
