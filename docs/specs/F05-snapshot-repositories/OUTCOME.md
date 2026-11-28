@@ -197,6 +197,16 @@ until its storage retention or legal hold allows deletion. Garbage collection ke
 deletes specific unreferenced object versions, without governance bypass. It reports
 retained blobs and records partial deletion failures so a later run can retry them.
 
+Held leases renew every five minutes. Object stores with conditional writes update
+the held version and check the lease again if the version changed. Filesystem
+repositories update the original open inode, so renewal after unlink leaves the
+lease path absent. Single-writer object stores check that the key exists, then
+overwrite it. That check and overwrite can race with a manual lock break.
+Restore and verification check the lease between batches of blob requests. They
+return `repository-locked` if the lease disappears or expires, as do create and
+copy at publication and GC during a sweep. Time spent suspended counts toward the
+30-minute expiry.
+
 Repository zstd remains reserved. Raw and LZ4 cover existing repositories and transfers,
 and there is no measured transfer-size, CPU and restore-time evidence to justify a
 third codec. Readers report the reserved zstd tag as an incompatible format and

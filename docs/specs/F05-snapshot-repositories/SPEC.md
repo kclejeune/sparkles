@@ -1068,10 +1068,14 @@ A lock object `locks/<uuid>.json` holds
 * **Acquire shared.** `PUT` its own lock (`PutMode::Create`), then `LIST locks/`. If a
   non-stale exclusive lock exists, delete its own lock and retry with jittered backoff
   (1 s → 30 s), up to `lockWait`. Then fail with `409 repository-locked`.
+  If LIST omits the new lease, delete it and fail with the same code.
 * **Acquire exclusive.** The same, except that any other non-stale lock conflicts. Two
   exclusive acquirers see each other and both back off with jitter, so progress is
   probabilistic, as with restic's lock retry.
-* **Refresh.** Every 5 minutes the holder re-PUTs its own key (`PutMode::Overwrite`).
+* **Refresh.** Every 5 minutes the holder updates its own lease using the current
+  object version, or updates the mtime of the open lease file on a filesystem.
+  A single-writer object store checks the lease exists and overwrites it.
+  See the [implementation outcome](OUTCOME.md#roadmap-follow-ups-2026-10-12).
 * **Stale.** A lock is stale when its `last_modified` is older than 30 minutes, measured
   by the storage server's clock as LIST reports it. Acquirers ignore stale locks, and GC
   and `repo locks --break` delete them. For `fs` repositories, `last_modified` is the

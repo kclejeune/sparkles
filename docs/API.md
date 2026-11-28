@@ -6630,7 +6630,7 @@ Errors are `{error, code, requestId}`. Some codes add `task`, `holder`, `policie
 | 400 | `invalid-name`. `invalid-config`: a bad repository or policy setting, a repository body that is JSON but not a repository configuration, or a refused destination. `field` names the setting. `invalid-request`: a body that is not JSON (on every route), a backup, restore, verification, GC or policy body of the wrong shape, a malformed query parameter, a repository verification at level `restore`, or a negative `graceHours`. `invalid-schedule`: a bad schedule or an unknown time zone. |
 | 403 | `server-read-only` |
 | 404 | `no-such-repository`, `no-such-backup` (also for a backup of another dataset), `no-such-policy`, `no-such-dataset`, `no-such-lock` |
-| 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (with `policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (with `task`), `backup-busy` (with `task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the 10 min wait, with `holder`), `dataset-exists`, `dataset-busy` (with `task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (with `task`), `object-retained` (S3 Object Lock prevents deletion), `archive-restore-required` (S3 must thaw a requested blob) |
+| 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (with `policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (with `task`), `backup-busy` (with `task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the wait, a new lease was absent from the listing, or a held lease was lost), `dataset-exists`, `dataset-busy` (with `task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (with `task`), `object-retained` (S3 Object Lock prevents deletion), `archive-restore-required` (S3 must thaw a requested blob) |
 | 422 | `incompatible-repository` (an unsupported repository format or encryption configuration), `incompatible-format` (an index format, blob codec or chunker this build cannot read), `invalid-backup` (a manifest that fails validation, with `field`) |
 | 500 | `restore-mismatch`, `internal` |
 | 501 | `not-implemented` (backup repositories are not enabled on this server) |
@@ -6645,12 +6645,21 @@ component. Storage requests are retried with exponential backoff, up to 10 retri
 ### Locks and garbage collection
 
 Operations take a lease object `locks/<uuid>.json` in the repository. Create, delete,
-restore and verify take a **shared** lock, and GC's sweep takes an **exclusive** one. A
-held lock is rewritten every 5 minutes. A lock not rewritten for 30 minutes is **stale**:
-other operations ignore it and GC removes it. Staleness is judged by the storage server's
-clock, never this host's. An operation that meets a conflicting lock retries with backoff
-for up to 10 minutes, then fails with `409 repository-locked`. These leases let several
-servers, and the CLI, share a repository. Read-only repositories take no locks.
+restore and verify take a **shared** lock, and GC's sweep takes an **exclusive** one.
+A held lease renews every 5 minutes. Object stores with conditional writes update
+the held version. On a filesystem the holder updates the mtime of the open inode.
+Single-writer object stores check that the lease exists and then overwrite it, so
+a concurrent manual lock break can race with renewal.
+
+A lease without renewal for 30 minutes becomes **stale**. Acquirers use the
+storage server's clock to ignore stale leases and GC removes them. Time spent
+suspended counts toward the holder's expiry. Restore and verify check their lease
+between batches of blob requests. A lost or expired lease returns
+`409 repository-locked` on those checks, when create or copy tries to publish, or
+during a GC sweep. An operation that meets a conflicting lock retries with backoff
+for up to 10 minutes and then returns the same code with `holder` when known.
+These leases let several servers and the CLI share a repository. Read-only
+repositories take no locks.
 
 GC first marks the blobs that every manifest references, under a shared lock, so backups
 continue. It then takes the exclusive lock, lists the manifests again and deletes the

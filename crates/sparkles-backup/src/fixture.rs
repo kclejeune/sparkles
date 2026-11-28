@@ -338,6 +338,9 @@ impl ObjectStore for Flaky {
         location: &Key,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if options.head {
+            return self.inner.get_opts(location, options).await;
+        }
         self.gets.fetch_add(1, SeqCst);
         let r = self.inner.get_opts(location, options).await?;
         let hit = self.target.lock().unwrap().as_ref() == Some(location);

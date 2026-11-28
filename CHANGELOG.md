@@ -10,6 +10,10 @@ FastCDC for vocabulary files. S3 repositories can select a blob storage class an
 enforce Object Lock on manifests and their referenced blobs. Garbage collection
 reports retention and partial deletion failures.
 
+Held backup leases renew with conditional updates, open-file mtime updates on
+local filesystems, or overwrites on single-writer object stores. Restore and
+verify stop with `repository-locked` when a lease is lost or expires.
+
 **Format.** Repositories using these layout options write format 2 markers. A
 chunked backup requires the `fastcdc-2016/1` manifest feature. Readers continue to
 accept format 1 repositories and raw and LZ4 blobs.

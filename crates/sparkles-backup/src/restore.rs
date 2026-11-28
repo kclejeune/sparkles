@@ -10,7 +10,7 @@
 use crate::blob::Hasher;
 use crate::error::Result;
 use crate::layout::blob_key;
-use crate::lock::{self};
+use crate::lock::{self, LockGuard};
 use crate::manifest;
 use crate::{
     BackupError, BackupVerify, Code, Ctl, Identity, LockKind, LockOperation, Manifest, Repository,
@@ -170,7 +170,7 @@ impl Repository {
         })?;
         let r = match lock::acquire(self, LockKind::Shared, op, &o.ctl).await {
             Ok(lock) => {
-                let r = self.restore_locked(name, tmp, o, t0).await;
+                let r = self.restore_locked(name, tmp, o, t0, &lock).await;
                 let _ = lock.release().await;
                 r
             }
@@ -189,6 +189,7 @@ impl Repository {
         tmp: &Path,
         o: &RestoreOptions,
         t0: Instant,
+        lock: &LockGuard,
     ) -> std::result::Result<RestoreReport, Failure> {
         let security = self.security().await?;
         let (m, _, _) = manifest::fetch_with_security(self, name, None, &security).await?;
@@ -208,7 +209,7 @@ impl Repository {
             &format!("restoring {name}"),
         )?;
         o.ctl.report(0.02, "downloading");
-        self.download(&m, tmp, &o.ctl, &security).await?;
+        self.download(&m, tmp, &o.ctl, &security, lock).await?;
         o.ctl.check()?;
 
         let source = ForkedFrom {
@@ -333,6 +334,7 @@ impl Repository {
             )
             .into());
         }
+        lock.check_live().await?;
         o.ctl.report(1.0, "restored");
         Ok(RestoreReport {
             backup: m.summary(&self.config.name),
@@ -354,6 +356,7 @@ impl Repository {
         dir: &Path,
         ctl: &Ctl,
         security: &crate::security::Security,
+        lock: &LockGuard,
     ) -> std::result::Result<(), Failure> {
         // Every path was validated against its closed root, generation, history
         // or definition grammar before this unpublished directory is populated.
@@ -396,8 +399,11 @@ impl Repository {
                 off += b.size;
             }
         }
-        futures::stream::iter(jobs)
-            .map(|(i, id, size, off, path)| {
+        let concurrency = self.config.concurrency();
+        let downloaded = lock
+            .read_batches(jobs, concurrency, ctl)
+            .err_into::<Failure>()
+            .map_ok(|(i, id, size, off, path)| {
                 let (files, done) = (files.clone(), done.clone());
                 async move {
                     let plain = self.fetch_blob(&id, size, &path, ctl, security).await?;
@@ -412,9 +418,12 @@ impl Repository {
                     Ok::<(), Failure>(())
                 }
             })
-            .buffer_unordered(self.config.concurrency())
+            .try_buffer_unordered(concurrency)
             .try_collect::<()>()
-            .await?;
+            .await;
+        ctl.check()?;
+        lock.check_live().await?;
+        downloaded?;
 
         let (m, dir) = (m.clone(), dir.to_path_buf());
         blocking(move || {

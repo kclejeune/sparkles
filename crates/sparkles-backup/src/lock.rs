@@ -5,7 +5,8 @@
 //!   the own lock, back off with jitter (1 s → 30 s), retry up to `lockWait`, then
 //!   `409 repository-locked` naming the holder.
 //! * **exclusive** (GC's sweep): the same, conflicting with any other non-stale lock.
-//! * **refresh** every [`REFRESH`] with a conditional update while held.
+//! * **refresh** every [`REFRESH`] with a conditional update, an open-inode touch
+//!   on the filesystem, or an overwrite in single-writer object stores.
 //! * **stale**: `last_modified` (the storage server's clock, from LIST; the file mtime
 //!   for `fs`) older than [`STALE`]: ignored by acquirers, removed by GC and
 //!   `break_lock`.
@@ -19,10 +20,11 @@
 use crate::error::Result;
 use crate::layout::{LOCKS, lock_id_of, lock_key};
 use crate::{
-    BackupError, Code, Ctl, LockHolder, LockInfo, LockKind, LockObject, LockOperation, Repository,
+    BackupError, Code, Ctl, LockHolder, LockInfo, LockKind, LockObject, LockOperation, RepoType,
+    Repository,
 };
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
 use object_store::path::Path as Key;
 use object_store::{
     GetOptions, GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutPayload,
@@ -114,10 +116,28 @@ impl LockGuard {
         self.server_time?.checked_add_signed(elapsed)
     }
 
-    /// A writer may publish only while its current lease still exists and is fresh.
+    /// Operations may use the protected objects only while their lease is live.
     pub(crate) async fn check_live(&self) -> Result<()> {
         self.live_head(GetOptions::default()).await?;
         Ok(())
+    }
+
+    /// Check the lease before admitting each batch of reader requests.
+    pub(crate) fn read_batches<I: IntoIterator>(
+        &self,
+        requests: I,
+        batch_size: usize,
+        ctl: &Ctl,
+    ) -> impl Stream<Item = Result<I::Item>> {
+        futures::stream::iter(requests.into_iter().enumerate()).then(
+            move |(index, request)| async move {
+                if index.is_multiple_of(batch_size) {
+                    ctl.check()?;
+                    self.check_live().await?;
+                }
+                Ok(request)
+            },
+        )
     }
 
     async fn live_head(&self, mut options: GetOptions) -> Result<Option<GetResult>> {
@@ -130,7 +150,7 @@ impl LockGuard {
                 Ok(())
             } else {
                 *renewed = None;
-                Err(locked(id, None))
+                Err(lost_lease(id))
             }
         };
         check()?;
@@ -147,7 +167,7 @@ impl LockGuard {
             }
             Ok(_) | Err(object_store::Error::NotFound { .. }) => {
                 *self.renewed.lock().unwrap() = None;
-                Err(locked(id, None))
+                Err(lost_lease(id))
             }
             Err(error) => Err(error.into()),
         }
@@ -168,7 +188,7 @@ impl LockGuard {
             .transpose()?;
         if now.is_some_and(|now| is_stale(head.meta.last_modified, now)) {
             *self.renewed.lock().unwrap() = None;
-            return Err(locked(self.id().expect("lease HEAD has an id"), None));
+            return Err(lost_lease(self.id().expect("lease HEAD has an id")));
         }
         Ok(now)
     }
@@ -295,6 +315,16 @@ pub async fn acquire(
     op: LockOperation,
     ctl: &Ctl,
 ) -> Result<LockGuard> {
+    acquire_with_refresh(repo, kind, op, ctl, REFRESH).await
+}
+
+async fn acquire_with_refresh(
+    repo: &Repository,
+    kind: LockKind,
+    op: LockOperation,
+    ctl: &Ctl,
+    refresh_delay: Duration,
+) -> Result<LockGuard> {
     ctl.check()?;
     if repo.readonly() {
         return Ok(LockGuard::none());
@@ -346,7 +376,11 @@ pub async fn acquire(
             .find(|m| m.location == key)
             .map(|m| m.last_modified)
         else {
-            return Err(locked(&id, None));
+            delete_quietly(store.as_ref(), &id).await;
+            return Err(BackupError::new(
+                Code::RepositoryLocked,
+                "the new repository lease was not visible in the lock listing",
+            ));
         };
         let mut conflict = None;
         for m in &listed {
@@ -380,14 +414,16 @@ pub async fn acquire(
         }
         let Some((other, obj)) = conflict else {
             let renewed = Arc::new(Mutex::new(Some(acquired_at)));
+            let overwrite = repo.config.kind != RepoType::Fs && repo.single_writer();
             let refresh = tokio::runtime::Handle::try_current().ok().map(|h| {
                 h.spawn(refresh_lock(
                     store.clone(),
                     key.clone(),
                     PutPayload::from(body.clone()),
                     version,
+                    overwrite,
                     renewed.clone(),
-                    REFRESH,
+                    refresh_delay,
                 ))
             });
             return Ok(LockGuard {
@@ -421,6 +457,7 @@ async fn refresh_lock(
     key: Key,
     body: PutPayload,
     mut version: UpdateVersion,
+    overwrite: bool,
     renewed: Renewal,
     delay: Duration,
 ) {
@@ -443,10 +480,28 @@ async fn refresh_lock(
             if let Some(file) = &file {
                 return touch_lease(file).await.map(|()| None);
             }
-            match store
+            if overwrite {
+                // Single-writer stores cannot make this check atomic with the PUT.
+                store.head(&key).await?;
+                store.put(&key, body.clone()).await?;
+                return Ok(None);
+            }
+            let mut result = store
                 .put_opts(&key, body.clone(), PutMode::Update(version.clone()).into())
-                .await
-            {
+                .await;
+            if matches!(result, Err(object_store::Error::Precondition { .. })) {
+                // This UUID is written only by its holder. A previous renewal
+                // may have committed even though its response was lost.
+                let head = store.head(&key).await?;
+                version = UpdateVersion {
+                    e_tag: head.e_tag,
+                    version: head.version,
+                };
+                result = store
+                    .put_opts(&key, body.clone(), PutMode::Update(version.clone()).into())
+                    .await;
+            }
+            match result {
                 Ok(result) => Ok(Some(result.into())),
                 #[cfg(feature = "fs")]
                 Err(error @ object_store::Error::NotImplemented { .. }) => {
@@ -485,14 +540,8 @@ async fn refresh_lock(
                 }
             }
             Ok(Err(error)) => {
-                let (lost, unsupported) = (
-                    matches!(
-                        error,
-                        object_store::Error::NotFound { .. }
-                            | object_store::Error::Precondition { .. }
-                    ),
-                    matches!(error, object_store::Error::NotImplemented { .. }),
-                );
+                let lost = matches!(error, object_store::Error::NotFound { .. });
+                let unsupported = matches!(error, object_store::Error::NotImplemented { .. });
                 tracing::warn!(
                     target: "sparkles::backup",
                     error = %BackupError::from(error),
@@ -547,6 +596,14 @@ fn locked(id: &str, obj: Option<&LockObject>) -> BackupError {
         )
         .with("lock", id),
     }
+}
+
+fn lost_lease(id: &str) -> BackupError {
+    BackupError::new(
+        Code::RepositoryLocked,
+        format!("the repository lease {id} was lost or expired"),
+    )
+    .with("lock", id)
 }
 
 fn kind_name(k: LockKind) -> &'static str {
@@ -635,6 +692,192 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::fixture;
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, ListResult, MultipartUpload, PutMultipartOptions, PutOptions, PutResult,
+    };
+
+    #[derive(Debug)]
+    struct LeaseStore {
+        inner: Arc<dyn ObjectStore>,
+        hide_locks: bool,
+        disable_conditionals: bool,
+    }
+
+    impl std::fmt::Display for LeaseStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LeaseStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for LeaseStore {
+        async fn put_opts(
+            &self,
+            key: &Key,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            if self.disable_conditionals && !matches!(opts.mode, PutMode::Overwrite) {
+                return Err(object_store::Error::NotImplemented {
+                    operation: "conditional put".into(),
+                    implementer: "LeaseStore".into(),
+                });
+            }
+            self.inner.put_opts(key, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            key: &Key,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(key, opts).await
+        }
+
+        async fn get_opts(&self, key: &Key, opts: GetOptions) -> object_store::Result<GetResult> {
+            self.inner.get_opts(key, opts).await
+        }
+
+        fn delete_stream(
+            &self,
+            keys: BoxStream<'static, object_store::Result<Key>>,
+        ) -> BoxStream<'static, object_store::Result<Key>> {
+            self.inner.delete_stream(keys)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Key>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            if self.hide_locks && prefix.is_some_and(|key| key.as_ref() == LOCKS) {
+                return Box::pin(futures::stream::empty());
+            }
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Key>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Key,
+            to: &Key,
+            opts: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    async fn wait_for_renewal(guard: &LockGuard, previous: LeaseClock) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = guard.renewed.lock().unwrap().expect("lease was lost");
+                if current.monotonic > previous.monotonic {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("lease was not renewed");
+    }
+
+    #[tokio::test]
+    async fn single_writer_s3_lease_renews_without_conditional_put() {
+        let store = Arc::new(LeaseStore {
+            inner: fixture::memory_store(),
+            hide_locks: false,
+            disable_conditionals: true,
+        });
+        let repo = fixture::repo_with(store, |config| {
+            config.kind = RepoType::S3;
+            config.conditional_writes = false;
+        })
+        .await;
+        let guard = acquire_with_refresh(
+            &repo,
+            LockKind::Exclusive,
+            LockOperation::Gc,
+            &Ctl::default(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        wait_for_renewal(&guard, guard.acquired_at).await;
+        let head = repo
+            .store
+            .head(&lock_key(guard.id().unwrap()))
+            .await
+            .unwrap();
+        assert!(head.last_modified > guard.server_time().unwrap());
+        guard.check_live().await.unwrap();
+        guard.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acquisition_deletes_a_lease_missing_from_the_listing() {
+        let inner = fixture::memory_store();
+        let repo = fixture::repo_with(
+            Arc::new(LeaseStore {
+                inner: inner.clone(),
+                hide_locks: true,
+                disable_conditionals: false,
+            }),
+            |_| {},
+        )
+        .await;
+        let error = acquire(
+            &repo,
+            LockKind::Exclusive,
+            LockOperation::Gc,
+            &Ctl::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::RepositoryLocked);
+        assert!(error.message().contains("not visible in the lock listing"));
+        assert!(error.body().get("lock").is_none());
+        assert!(list_locks(inner.as_ref()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn conditional_renewal_recovers_after_an_unacknowledged_write() {
+        let repo = fixture::memory_repo().await;
+        let guard = acquire_with_refresh(
+            &repo,
+            LockKind::Shared,
+            LockOperation::Create,
+            &Ctl::default(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        // Advance the ETag without advancing the version known to the refresh task.
+        let key = lock_key(guard.id().unwrap());
+        let first = repo.store.get(&key).await.unwrap();
+        let original = first.meta.e_tag.clone();
+        let unacknowledged = repo
+            .store
+            .put(&key, first.bytes().await.unwrap().into())
+            .await
+            .unwrap();
+        assert_ne!(unacknowledged.e_tag, original);
+        wait_for_renewal(&guard, guard.acquired_at).await;
+        assert_ne!(
+            repo.store.head(&key).await.unwrap().e_tag,
+            unacknowledged.e_tag
+        );
+        guard.check_live().await.unwrap();
+        guard.release().await.unwrap();
+    }
+
     #[tokio::test]
     async fn removed_lease_refuses_to_publish() {
         let repo = crate::fixture::memory_repo().await;
@@ -673,6 +916,7 @@ mod tests {
                 key.clone(),
                 body,
                 version,
+                false,
                 renewed.clone(),
                 Duration::ZERO,
             ),
@@ -719,20 +963,114 @@ mod tests {
     #[tokio::test]
     async fn filesystem_renewal_touches_only_the_original_inode() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("lease");
-        std::fs::write(&path, "lease").unwrap();
-        let file = Arc::new(std::fs::File::open(&path).unwrap());
-        let initial = SystemTime::now() - REFRESH;
-        file.set_modified(initial).unwrap();
-        touch_lease(&file).await.unwrap();
+        let repo = Repository::open(
+            &crate::RepoConfig {
+                name: "local".into(),
+                kind: RepoType::Fs,
+                path: Some(temp.path().display().to_string()),
+                conditional_writes: true,
+                ..Default::default()
+            },
+            &crate::OpenEnv::default(),
+        )
+        .await
+        .unwrap();
+        let guard = acquire_with_refresh(
+            &repo,
+            LockKind::Shared,
+            LockOperation::Restore,
+            &Ctl::default(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let key = lock_key(guard.id().unwrap());
+        let path = temp.path().join(key.as_ref());
+        let file = std::fs::File::open(&path).unwrap();
+        let initial = file.metadata().unwrap().modified().unwrap();
+        wait_for_renewal(&guard, guard.acquired_at).await;
         assert!(file.metadata().unwrap().modified().unwrap() > initial);
+        guard.check_live().await.unwrap();
         std::fs::remove_file(&path).unwrap();
-        touch_lease(&file).await.unwrap();
+        let unlinked = file.metadata().unwrap().modified().unwrap();
+        wait_for_renewal(&guard, LeaseClock::now()).await;
+        assert!(file.metadata().unwrap().modified().unwrap() > unlinked);
         assert!(!path.exists());
+        assert_eq!(
+            guard.check_live().await.unwrap_err().code(),
+            Code::RepositoryLocked
+        );
+        guard.release().await.unwrap();
     }
 
-    use super::*;
-    use crate::fixture;
+    #[cfg(feature = "fs")]
+    #[tokio::test]
+    async fn restore_and_verify_stop_reading_after_their_lease_is_broken() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let source = temp.path().join("source");
+        let restored = temp.path().join("restored");
+        let mut repo = fixture::fs_repo(&root).await;
+        repo.config.max_concurrency = Some(1);
+        fixture::make_db(&source);
+        let manifest = fixture::put_backup(&repo, &source, "backup").await;
+        assert!(
+            manifest
+                .files
+                .iter()
+                .filter(|file| !file.blobs.is_empty())
+                .count()
+                > 1
+        );
+        let progress = Arc::new(AtomicUsize::new(0));
+        let break_on_first_read = |prefix: &'static str| Ctl {
+            progress: Some(Arc::new({
+                let lock_dir = root.join(LOCKS);
+                let progress = progress.clone();
+                move |_, message: &str| {
+                    if message.starts_with(prefix) && progress.fetch_add(1, Ordering::Relaxed) == 0
+                    {
+                        let mut entries = std::fs::read_dir(&lock_dir).unwrap();
+                        let lease = entries.next().unwrap().unwrap();
+                        assert!(entries.next().is_none());
+                        std::fs::remove_file(lease.path()).unwrap();
+                    }
+                }
+            })),
+            ..Default::default()
+        };
+        let error = repo
+            .restore(
+                "backup",
+                &restored,
+                &crate::RestoreOptions {
+                    ctl: break_on_first_read("downloading "),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::RepositoryLocked);
+        assert_eq!(progress.swap(0, Ordering::Relaxed), 1);
+        assert!(!restored.exists());
+
+        let error = repo
+            .verify(
+                &["backup".into()],
+                &crate::VerifyOptions {
+                    level: crate::VerifyLevel::Data,
+                    ctl: break_on_first_read("checked "),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::RepositoryLocked);
+        assert_eq!(progress.load(Ordering::Relaxed), 1);
+        assert_eq!(lock_count(&repo).await, 0);
+    }
 
     fn plant(kind: LockKind) -> Vec<u8> {
         serde_json::to_vec(&LockObject {

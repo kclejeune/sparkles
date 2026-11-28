@@ -347,6 +347,7 @@ async fn nested_history_download_stages_plain_parents_and_syncs() {
         &target,
         &Ctl::default(),
         &crate::security::Security::default(),
+        &LockGuard::none(),
     )
     .await
     .unwrap();
@@ -399,6 +400,7 @@ async fn nested_history_download_refuses_parent_aliases_and_existing_leaves() {
                     &target,
                     &Ctl::default(),
                     &crate::security::Security::default(),
+                    &LockGuard::none(),
                 )
                 .await
                 .unwrap_err()
@@ -418,6 +420,7 @@ async fn nested_history_download_refuses_parent_aliases_and_existing_leaves() {
             &target,
             &Ctl::default(),
             &crate::security::Security::default(),
+            &LockGuard::none(),
         )
         .await
         .is_err()
