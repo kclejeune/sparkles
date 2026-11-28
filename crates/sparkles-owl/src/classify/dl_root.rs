@@ -2570,15 +2570,16 @@ pub fn rpred_c<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bo
     let mut found = Found::default();
     found.rule = "rpred";
     found.push((Vec::new(), c.head().to_vec()));
-    ds(st).taking_fact = true;
+    // with forwarding the stored copy takes the root's id as it is stored or marked, so
+    // the context forwards the unit under the root's id with no later scan of its store
+    let root_id = out.dl().forwards_facts().then_some(cid);
+    let x = ds(st);
+    x.taking_fact = true;
+    x.taking_root_id = root_id;
     drain(ix, st, found, out);
-    ds(st).taking_fact = false;
-    if out.dl().forwards_facts() {
-        let c = out.dl().table.get(cid);
-        if let [l] = c.head() {
-            ds(st).store.adopt_root_id(*l, cid);
-        }
-    }
+    let x = ds(st);
+    x.taking_fact = false;
+    x.taking_root_id = None;
     true
 }
 
@@ -9591,6 +9592,147 @@ pub(super) mod tests {
             );
             let _ = inv;
         }
+
+        // 3. A unit that the context derived and sent by Pred before the root delivered it.
+        //    The root's delivery gives the stored copy the root's table id, so the late
+        //    replays by `dedge` and `back` forward it under that id, and a predecessor takes
+        //    it once from the root and the forwarders together in either order (item 1061).
+        //    Forwarding off is the Pred control, which keeps the local id.
+        {
+            let mut s = Sig::new();
+            let na = s.ind("a");
+            let [a, p, q, t, z] = ["A", "P", "Q", "T", "Z"].map(|n| s.class(n));
+            let r = s.role("r");
+            let e = s.some_h(r, a);
+            let (ix, _) = probe_ix(s);
+            let RTerm::C(u) = c(na, &ix) else {
+                unreachable!()
+            };
+            for forward in [false, true] {
+                let run = DlRun::new(false, Default::default())
+                    .with_shared_facts(true)
+                    .with_forward_facts(forward);
+                let mut out = Probe {
+                    run: &run,
+                    sent: Vec::new(),
+                    mine: Vec::new(),
+                };
+                let la = atom(&ix, &out, a, u);
+                let mut st = State {
+                    init: true,
+                    ..State::default()
+                };
+                // the early predecessor p makes the context send its local unit by Pred
+                assert!(super::super::dl_rules::dedge(
+                    &ix, z, &mut st, p, e, &mut out
+                ));
+                assert!(
+                    ds(&mut st)
+                        .store
+                        .add_parts_admitted(vec![], vec![la], &mut out)
+                );
+                super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+                let local_cid = out
+                    .sent
+                    .iter()
+                    .find_map(|&(to, m)| match m {
+                        Concl::PredC(from, cid)
+                            if to == p && from == z && run.table.get(cid).head() == [la] =>
+                        {
+                            Some(cid)
+                        }
+                        _ => None,
+                    })
+                    .expect("the local unit goes to p by Pred");
+                let unit = |st: &State| {
+                    let x = dl(st).unwrap();
+                    let live: Vec<_> = x
+                        .store
+                        .clauses
+                        .iter()
+                        .filter(|cl| !cl.dead && cl.c.body().is_empty() && cl.c.head() == [la])
+                        .map(|cl| (cl.fact, cl.sent))
+                        .collect();
+                    assert_eq!(live.len(), 1, "one live copy of → A(a)");
+                    live[0]
+                };
+                assert_eq!(unit(&st), (false, Some(local_cid)));
+                let root_cid = run.table.push(Clause::new(Vec::new(), vec![la]));
+                assert_ne!(root_cid, local_cid);
+                assert!(rpred_c(&ix, &mut st, root_cid, &mut out));
+                super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+                assert_eq!(
+                    unit(&st),
+                    (true, Some(if forward { root_cid } else { local_cid })),
+                    "forward={forward}: the root's delivery sets the id the unit goes up by"
+                );
+                // late predecessors through both replay paths
+                out.sent.clear();
+                assert!(super::super::dl_rules::dedge(
+                    &ix, z, &mut st, q, e, &mut out
+                ));
+                super::super::dl_rules::back(&ix, z, &mut st, t, r, &mut out);
+                let mut forwarded = Vec::new();
+                for late in [q, t] {
+                    let copies: Vec<Concl> = out
+                        .sent
+                        .iter()
+                        .filter(|&&(to, m)| {
+                            to == late
+                                && match m {
+                                    Concl::RPred(cid) | Concl::PredC(_, cid) => {
+                                        run.table.get(cid).head() == [la]
+                                    }
+                                    _ => false,
+                                }
+                        })
+                        .map(|&(_, m)| m)
+                        .collect();
+                    assert!(
+                        !copies.is_empty(),
+                        "forward={forward}: the late predecessor {late} takes → A(a)"
+                    );
+                    for m in copies {
+                        if forward {
+                            assert!(
+                                matches!(m, Concl::RPred(cid) if cid == root_cid),
+                                "forward={forward}: {late} takes the root's id, not {m:?}"
+                            );
+                            forwarded.push(root_cid);
+                        } else {
+                            assert!(
+                                matches!(m, Concl::PredC(from, cid) if from == z && cid == local_cid),
+                                "forward={forward}: {late} takes Pred, not {m:?}"
+                            );
+                        }
+                    }
+                }
+                if !forward {
+                    continue;
+                }
+                // a recipient takes the root's direct delivery and a forwarded copy once, in
+                // either order
+                for direct_first in [true, false] {
+                    let mut rc = State {
+                        init: true,
+                        ..State::default()
+                    };
+                    let order = if direct_first {
+                        [root_cid, forwarded[0]]
+                    } else {
+                        [forwarded[0], root_cid]
+                    };
+                    let mut taken = 0;
+                    for cid in order {
+                        if rpred_c(&ix, &mut rc, cid, &mut out) {
+                            taken += 1;
+                        }
+                    }
+                    assert_eq!(taken, 1, "direct first {direct_first}: one root delivery");
+                    assert!(unit(&rc).0, "direct first {direct_first}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -10337,7 +10479,8 @@ pub(super) mod tests {
         //   (via multi-hop DL disjunction -> `x.dpreds`/`dedge`) both hold private conditional
         //   ground fact `G(c)` and neither mentions `:b`.
         // - Child `:V` reaches `:b`, receives root unit `E(b) = (∃r.A)(b)` via `RPred`, and
-        //   must preserve `PredC` (live + late replay) to `:Z` and `:Z2`.
+        //   must still deliver it (live + late replay) to `:Z` and `:Z2`, by `PredC` with
+        //   forwarding off and as the root's own `RPred` with item 1061's forwarding on.
         // - Successor of `E = ∃r.A` requires BOTH `A(x)` and `s(y, x)` (via `r ⊑ s`) to derive
         //   `:Step1`, which feeds `:Hit` through anonymous successor `:M` combining with private
         //   `G(c)` (keeping the root free of any empty-body fact linking `b` and `c`), returning
@@ -10430,76 +10573,63 @@ Ontology(<http://example.org/g6>
                     (k.classify(&limits).unwrap(), k.excluded().len())
                 })
             });
-            let (on, on_excl) = with_marker_diag_override(repair, || {
-                super::super::dl_rules::with_shared_facts_override(true, || {
-                    let mut k = super::super::Classifier::of(&ax);
-                    (k.classify(&limits).unwrap(), k.excluded().len())
+            // sharing on with forwarding explicitly off and on, so that the forwarding arm
+            // differs from its control in forwarding alone
+            let shared = |forward: bool| {
+                with_marker_diag_override(repair, || {
+                    super::super::dl_rules::with_shared_facts_override(true, || {
+                        super::super::dl_rules::with_forward_facts_override(forward, || {
+                            let mut k = super::super::Classifier::of(&ax);
+                            (k.classify(&limits).unwrap(), k.excluded().len())
+                        })
+                    })
                 })
-            });
+            };
+            let (nofwd, nofwd_excl) = shared(false);
+            let (on, on_excl) = shared(true);
             let cfg =
                 format!("threads={threads}, exp={expansion:?}, steps={dl_steps}, repair={repair}");
-            assert_eq!(
-                off.stats.tier,
-                super::super::Tier::Disjunctive,
-                "{cfg}: OFF tier"
-            );
-            assert_eq!(
-                on.stats.tier,
-                super::super::Tier::Disjunctive,
-                "{cfg}: ON tier"
-            );
-            assert!(
-                off.stats.dl_work > 0 && on.stats.dl_work > 0,
-                "{cfg}: must do Tier D work"
-            );
-            assert!(
-                off.complete && on.complete,
-                "{cfg}: both arms must complete"
-            );
-            assert_eq!(off_excl, 0, "{cfg}: OFF exclusions");
-            assert_eq!(on_excl, 0, "{cfg}: ON exclusions");
-            assert!(
-                !off.stats.dl_over_budget
-                    && !on.stats.dl_over_budget
-                    && !off.stats.dl_rooted_over
-                    && !on.stats.dl_rooted_over
-                    && !off.stats.dl_rooted_declined
-                    && !on.stats.dl_rooted_declined,
-                "{cfg}: no budget/decline fallback permitted"
-            );
-            assert_eq!(off.consistency, on.consistency, "{cfg}");
-            // Full named-class taxonomy equality against sharing OFF and exact OWL/HermiT set.
-            let mut got_off = std::collections::BTreeSet::new();
-            let mut got_on = std::collections::BTreeSet::new();
-            for &a_name in &named {
-                let ca = cls(a_name);
-                for &b_name in &named {
-                    if a_name == b_name {
-                        continue;
-                    }
-                    let cb = cls(b_name);
-                    if off.taxonomy.is_subclass(&ca, &cb) {
-                        got_off.insert((a_name, b_name));
-                    }
-                    if on.taxonomy.is_subclass(&ca, &cb) {
-                        got_on.insert((a_name, b_name));
+            for (arm, res, excl) in [
+                ("OFF", &off, off_excl),
+                ("ON forward=false", &nofwd, nofwd_excl),
+                ("ON forward=true", &on, on_excl),
+            ] {
+                assert_eq!(
+                    res.stats.tier,
+                    super::super::Tier::Disjunctive,
+                    "{cfg}: {arm} tier"
+                );
+                assert!(res.stats.dl_work > 0, "{cfg}: {arm} must do Tier D work");
+                assert!(res.complete, "{cfg}: {arm} must complete");
+                assert_eq!(excl, 0, "{cfg}: {arm} exclusions");
+                assert!(
+                    !res.stats.dl_over_budget
+                        && !res.stats.dl_rooted_over
+                        && !res.stats.dl_rooted_declined,
+                    "{cfg}: {arm} no budget/decline fallback permitted"
+                );
+                assert_eq!(off.consistency, res.consistency, "{cfg}: {arm}");
+                // Full named-class taxonomy equality against the exact OWL/HermiT set.
+                let mut got = std::collections::BTreeSet::new();
+                for &a_name in &named {
+                    let ca = cls(a_name);
+                    for &b_name in &named {
+                        if a_name != b_name && res.taxonomy.is_subclass(&ca, &cls(b_name)) {
+                            got.insert((a_name, b_name));
+                        }
                     }
                 }
-            }
-            assert_eq!(
-                got_off, expected_pairs,
-                "{cfg}: OFF taxonomy must match HermiT/OWL"
-            );
-            assert_eq!(
-                got_on, expected_pairs,
-                "{cfg}: ON taxonomy must match HermiT/OWL"
-            );
-            if repair {
                 assert_eq!(
-                    on.stats.dl_marker_deficits,
-                    [0, 0, 0],
-                    "{cfg}: real marker deficits must be zero with marker_diag enabled"
+                    got, expected_pairs,
+                    "{cfg}: {arm} taxonomy must match HermiT/OWL"
                 );
+                if repair && arm != "OFF" {
+                    assert_eq!(
+                        res.stats.dl_marker_deficits,
+                        [0, 0, 0],
+                        "{cfg}: {arm} real marker deficits must be zero with marker_diag enabled"
+                    );
+                }
             }
         }
 
@@ -10539,9 +10669,10 @@ Ontology(<http://example.org/g6>
                 }
             };
 
-        // Control 1 (unguarded D2): omitting live + late non-root unit PredC with repair=false
-        // MUST break both `:Z ⊑ :Ans` and `:Z2 ⊑ :Ans`, proving the fixture genuinely depends on
-        // G6 PredC preservation rather than a root shortcut.
+        // Control 1 (unguarded D2): omitting the live + late non-root unit delivery (`PredC`,
+        // or the forwarded `RPred`) with repair=false MUST break both `:Z ⊑ :Ans` and
+        // `:Z2 ⊑ :Ans`, proving the fixture genuinely depends on G6's delivery to non-root
+        // predecessors rather than a root shortcut.
         let ctrl_limits = super::super::Limits {
             threads: 1,
             expansion: super::super::Expansion::Cautious,
@@ -10561,11 +10692,11 @@ Ontology(<http://example.org/g6>
         assert_complete_control(&ctrl_no_predc, ctrl_no_predc_excl, "control 1");
         assert!(
             !ctrl_no_predc.taxonomy.is_subclass(&z, &ans),
-            "control 1: omitting non-root unit PredC must break Z ⊑ Ans"
+            "control 1: omitting the non-root unit delivery must break Z ⊑ Ans"
         );
         assert!(
             !ctrl_no_predc.taxonomy.is_subclass(&z2, &ans),
-            "control 1: omitting non-root unit PredC must break Z2 ⊑ Ans"
+            "control 1: omitting the non-root unit delivery must break Z2 ⊑ Ans"
         );
 
         // Control 2 (late replay): omitting ONLY late non-root unit replay (`dedge`/`back`)
@@ -10580,7 +10711,7 @@ Ontology(<http://example.org/g6>
         assert_complete_control(&ctrl_no_late, ctrl_no_late_excl, "control 2");
         assert!(
             ctrl_no_late.taxonomy.is_subclass(&z, &ans),
-            "control 2: early predecessor Z ⊑ Ans must still succeed via live PredC"
+            "control 2: early predecessor Z ⊑ Ans must still succeed via the live delivery"
         );
         assert!(
             !ctrl_no_late.taxonomy.is_subclass(&z2, &ans),
@@ -10602,11 +10733,17 @@ Ontology(<http://example.org/g6>
             "control 3: removing r ⊑ s must break Z ⊑ Ans and Z2 ⊑ Ans"
         );
 
-        // Rule-level sender -> destination probe (Sol r2 P2): drive BOTH early live delivery
-        // (`st_v.back` during `flush` of `V`) and late replay (`dedge` into `V` after `V`
-        // processed `-> E(b)`), starting from `V` receiving `-> E(b)` via `rpred_c` with
-        // `Stored::fact = true`, and feeding the emitted `Concl::PredC` messages into `:Z` and
-        // `:Z2` via `dl_rules::pred_c` without any direct injection.
+        // Rule-level sender -> destination probe (Sol r2 P2). A root state takes `-> E(b)`
+        // and derives the witnesses `r(b, f_E(b))` and `A(f_E(b))` itself, and every message
+        // between the root, the sender `V` and the destinations is one that a rule emitted.
+        // `Z` takes `-> E(b)` by `V`'s live delivery over `st_v.back` during `V`'s flush, and
+        // `Z2` by the late replay of `dedge` after `V` processed it. Forwarding off is the
+        // Pred control, in which each destination derives the witnesses locally. With
+        // forwarding on, `V` forwards `-> E(b)` under the root's id, and each destination
+        // leaves out the local witnesses, registers with the root for b, takes the
+        // witnesses from the root and derives the return. This holds when the root saturates
+        // before the contexts register and when they register after the root sent
+        // `-> E(b)` and before it processes the witnesses.
         {
             let mut s = Sig::new();
             let nb = s.ind("b");
@@ -10629,10 +10766,16 @@ Ontology(<http://example.org/g6>
             let RTerm::C(uc) = c(nc, &ix) else {
                 unreachable!()
             };
-            // Forwarding off is the control: the sender sends Pred. With forwarding on it
-            // sends the root's own delivery under the root's table id, and the destination
-            // must still open the edge, forward its marker and derive the return.
-            for forward in [false, true] {
+            fn rpreds(sent: &[(Ex, Concl)], to: Ex) -> Vec<u32> {
+                sent.iter()
+                    .filter_map(|&(t, m)| match m {
+                        Concl::RPred(cid) if t == to => Some(cid),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            for (forward, root_first) in [(false, true), (true, true), (true, false)] {
+                let cfg = format!("forward={forward} root_first={root_first}");
                 let run = DlRun::new(false, Default::default())
                     .with_shared_facts(true)
                     .with_forward_facts(forward);
@@ -10644,28 +10787,82 @@ Ontology(<http://example.org/g6>
                 let le = atom(&ix, &out, e, ub);
                 let lg = atom(&ix, &out, g, uc);
                 let lbhit = atom(&ix, &out, bhit, ub);
-                let cid_eb = run.table.push(Clause::new(Vec::new(), vec![le]));
-                let ret_clause =
-                    Clause::new(vec![Lit::x(a), Lit::ry(s_role), lg], vec![Lit::y(bhit)]);
-                let cid_ret = run.table.push(ret_clause);
-                // the root's units over b that it derives from its own -> E(b), which it
-                // delivers to every context registered for b
                 let inv = inv_of(&ix, dix(&ix));
                 let lit_of = |v: XLit| match run.lits.lit(v, inv) {
                     Made::Lit(l) => l,
                     _ => panic!("literal"),
                 };
-                let cid_af = run.table.push(Clause::new(
-                    Vec::new(),
-                    vec![lit_of(XLit::Atom(a, RTerm::Fc(e, ub)))],
-                ));
-                let cid_rf = run.table.push(Clause::new(
-                    Vec::new(),
-                    vec![lit_of(XLit::Role(r, RTerm::C(ub), RTerm::Fc(e, ub)))],
-                ));
+                let laf = lit_of(XLit::Atom(a, RTerm::Fc(e, ub)));
+                let lrf = lit_of(XLit::Role(r, RTerm::C(ub), RTerm::Fc(e, ub)));
+                let ret_clause =
+                    Clause::new(vec![Lit::x(a), Lit::ry(s_role), lg], vec![Lit::y(bhit)]);
+                let cid_ret = run.table.push(ret_clause);
+                let is_witness = |cid: u32| {
+                    let h = run.table.get(cid).head();
+                    h == [laf] || h == [lrf]
+                };
+                // the live unit `-> l` of a context, with its root provenance
+                let unit = |st: &State, l: Lit| {
+                    dl(st).and_then(|x| {
+                        x.store
+                            .clauses
+                            .iter()
+                            .find(|cl| !cl.dead && cl.c.body().is_empty() && cl.c.head() == [l])
+                            .map(|cl| cl.fact)
+                    })
+                };
+                let root_fix =
+                    |st: &mut State, out: &mut Probe| while flush(&ix, st, out, 64) > 0 {};
 
-                // Sender `V`: has `root` in `dpreds` (must be skipped by D2) and early predecessor
-                // `Z` pre-registered in `st_v.back` over `p` BEFORE `V` processes `-> E(b)`.
+                // The root takes `-> E(b)` as its own conclusion, as from an assertion.
+                let mut st_root = State::default();
+                init(&ix, &mut st_root, &mut out);
+                derive(&ix, &mut st_root, (Vec::new(), vec![le]), &mut out);
+                out.sent.clear();
+                let to_v = if root_first {
+                    root_fix(&mut st_root, &mut out);
+                    assert!(
+                        unit(&st_root, laf).is_some() && unit(&st_root, lrf).is_some(),
+                        "{cfg}: the root derives both witnesses"
+                    );
+                    out.sent.clear();
+                    assert!(redge(&mut st_root, v_c, ub, &mut out));
+                    let to_v = rpreds(&out.sent, v_c);
+                    assert!(
+                        to_v.iter().any(|&cid| is_witness(cid)),
+                        "{cfg}: the saturated root replays the witnesses to V"
+                    );
+                    to_v
+                } else {
+                    // V registers first, and the root runs until it sends `-> E(b)`
+                    assert!(redge(&mut st_root, v_c, ub, &mut out));
+                    let mut steps = 0;
+                    while !rpreds(&out.sent, v_c)
+                        .iter()
+                        .any(|&cid| run.table.get(cid).head() == [le])
+                    {
+                        assert!(
+                            flush(&ix, &mut st_root, &mut out, 1) > 0 && steps < 10_000,
+                            "{cfg}: the root sends -> E(b) to V"
+                        );
+                        steps += 1;
+                    }
+                    let to_v = rpreds(&out.sent, v_c);
+                    assert!(
+                        !to_v.iter().any(|&cid| is_witness(cid)),
+                        "{cfg}: the root has not offered the witnesses yet"
+                    );
+                    to_v
+                };
+                let cid_eb = to_v
+                    .iter()
+                    .copied()
+                    .find(|&cid| run.table.get(cid).head() == [le])
+                    .expect("the root sends -> E(b) to V");
+
+                // Sender `V`: has `root` in `dpreds` (must be skipped by D2) and early
+                // predecessor `Z` pre-registered in `st_v.back` over `p` BEFORE `V` processes
+                // `-> E(b)`.
                 let mut st_v = State {
                     init: true,
                     ..State::default()
@@ -10677,48 +10874,50 @@ Ontology(<http://example.org/g6>
                     &ix, v_c, &mut st_v, root, e_p, &mut out
                 ));
                 out.sent.clear();
-                // Deliver root unit `-> E(b)` to `V` via `rpred_c` so `Stored::fact == true`.
-                assert!(rpred_c(&ix, &mut st_v, cid_eb, &mut out));
-                assert!(
-                    dl(&st_v).unwrap().store.clauses.iter().any(|cl| !cl.dead
-                        && cl.fact
-                        && cl.c.body().is_empty()
-                        && cl.c.head() == [le]),
-                    "sender V must store -> E(b) with Stored::fact == true"
+                // V takes the root's messages, among them `-> E(b)` with `Stored::fact == true`.
+                for cid in to_v {
+                    rpred_c(&ix, &mut st_v, cid, &mut out);
+                }
+                assert_eq!(
+                    unit(&st_v, le),
+                    Some(true),
+                    "{cfg}: sender V must store -> E(b) with Stored::fact == true"
                 );
                 super::super::dl_rules::flush(&ix, v_c, &mut st_v, &mut out, 64);
-                let cid_early = out
-                    .sent
-                    .iter()
-                    .find_map(|&(to, msg)| match msg {
+                let from_v = |out: &Probe, to: Ex| {
+                    out.sent.iter().find_map(|&(t, msg)| match msg {
                         Concl::PredC(from, cid)
                             if !forward
-                                && to == z_c
+                                && t == to
                                 && from == v_c
                                 && run.table.get(cid).body().is_empty()
                                 && run.table.get(cid).head() == [le] =>
                         {
                             Some(cid)
                         }
-                        Concl::RPred(cid) if forward && to == z_c && cid == cid_eb => Some(cid),
+                        Concl::RPred(cid) if forward && t == to && cid == cid_eb => Some(cid),
                         _ => None,
                     })
-                    .expect("early Z must receive -> E(b) from V when V flushes");
+                };
+                let cid_early =
+                    from_v(&out, z_c).expect("early Z must receive -> E(b) from V when V flushes");
                 assert!(
                     !out.sent.iter().any(|&(to, msg)| to == z_c
                         && forward
                         && matches!(msg, Concl::PredC(from, _) if from == v_c)),
-                    "forwarding sends the root unit as the root's delivery, not Pred"
+                    "{cfg}: forwarding sends the root unit as the root's delivery, not Pred"
                 );
                 assert!(
                     !out.sent.iter().any(|&(to, msg)| {
-                        to == root && matches!(msg, Concl::PredC(from, _) if from == v_c)
+                        to == root
+                            && (matches!(msg, Concl::PredC(from, _) if from == v_c)
+                                || matches!(msg, Concl::RPred(_)))
                     }),
-                    "D2 must still skip live unit PredC back to root"
+                    "{cfg}: D2 must still skip the live unit back to root"
                 );
                 assert!(
                     !out.sent.iter().any(|&(to, _)| to == z2_c),
-                    "unregistered late Z2 must not receive PredC before dedge"
+                    "{cfg}: unregistered late Z2 must not receive -> E(b) before dedge"
                 );
 
                 // Late predecessor `Z2` registers with `V` AFTER `V` already processed `-> E(b)`.
@@ -10726,31 +10925,15 @@ Ontology(<http://example.org/g6>
                 assert!(super::super::dl_rules::dedge(
                     &ix, v_c, &mut st_v, z2_c, e_p, &mut out
                 ));
-                let cid_late = out
-                    .sent
-                    .iter()
-                    .find_map(|&(to, msg)| match msg {
-                        Concl::PredC(from, cid)
-                            if !forward
-                                && to == z2_c
-                                && from == v_c
-                                && run.table.get(cid).body().is_empty()
-                                && run.table.get(cid).head() == [le] =>
-                        {
-                            Some(cid)
-                        }
-                        Concl::RPred(cid) if forward && to == z2_c && cid == cid_eb => Some(cid),
-                        _ => None,
-                    })
-                    .expect("late Z2 must receive -> E(b) replayed via dedge");
+                let cid_late =
+                    from_v(&out, z2_c).expect("late Z2 must receive -> E(b) replayed via dedge");
 
-                // Drive BOTH destinations through actual `dl_rules::pred_c` delivery from `V`.
+                // Each destination holds private `-> G(c)` and takes `-> E(b)` from `V`.
+                let mut dests = Vec::new();
                 for (label, dest, cid_delivered, use_unit_edge) in [
-                    ("early Z (live PredC)", z_c, cid_early, true),
+                    ("early Z (live delivery)", z_c, cid_early, true),
                     ("late Z2 (dedge replay)", z2_c, cid_late, false),
                 ] {
-                    out.sent.clear();
-                    out.mine.clear();
                     let mut st = State {
                         init: true,
                         ..State::default()
@@ -10760,22 +10943,36 @@ Ontology(<http://example.org/g6>
                     } else {
                         ds(&mut st).insert_edge(e_p, v_c);
                     }
-                    // Destination holds private `-> G(c)`, then ingests `PredC(V, -> E(b))`.
                     super::super::dl_rules::derive(&ix, &mut st, (Vec::new(), vec![lg]), &mut out);
+                    out.sent.clear();
+                    let mut msgs = Vec::new();
+                    // the destination's messages before the root's delivery
+                    let mut pre = Vec::new();
                     if forward {
-                        // The destination takes -> E(b) as the root's unit, so the rule for
-                        // root units leaves out its local A(f_E(b)) and r(b, f_E(b)), which
-                        // the root derives too. Taking -> E(b) registers the destination for
-                        // b, and the root then delivers those units, as it does in a run.
                         assert!(rpred_c(&ix, &mut st, cid_delivered, &mut out));
                         super::super::dl_rules::flush(&ix, dest, &mut st, &mut out, 64);
                         assert!(
-                            out.sent.iter().any(|&(to, c)| to == root
-                                && matches!(c, Concl::REdge(from, u) if from == dest && u == ub)),
-                            "{label}: destination must register with the root for b"
+                            unit(&st, laf).is_none() && unit(&st, lrf).is_none(),
+                            "{cfg} {label}: the destination leaves out the local witnesses"
                         );
-                        assert!(rpred_c(&ix, &mut st, cid_rf, &mut out));
-                        assert!(rpred_c(&ix, &mut st, cid_af, &mut out));
+                        // the destination's registrations reach the root
+                        let regs: Vec<u32> = out
+                            .sent
+                            .iter()
+                            .filter_map(|&(to, c)| match c {
+                                Concl::REdge(from, u) if to == root && from == dest => Some(u),
+                                _ => None,
+                            })
+                            .collect();
+                        assert!(
+                            regs.contains(&ub),
+                            "{cfg} {label}: destination must register with the root for b"
+                        );
+                        out.sent.clear();
+                        for u in regs {
+                            redge(&mut st_root, dest, u, &mut out);
+                        }
+                        msgs = rpreds(&out.sent, dest);
                     } else {
                         assert!(super::super::dl_rules::pred_c(
                             &ix,
@@ -10785,27 +10982,70 @@ Ontology(<http://example.org/g6>
                             cid_delivered,
                             &mut out
                         ));
+                        super::super::dl_rules::flush(&ix, dest, &mut st, &mut out, 64);
+                        assert!(
+                            unit(&st, laf) == Some(false) && unit(&st, lrf) == Some(false),
+                            "{cfg} {label}: the Pred control derives the witnesses locally"
+                        );
+                        pre = std::mem::take(&mut out.sent);
                     }
-                    super::super::dl_rules::flush(&ix, dest, &mut st, &mut out, 64);
+                    dests.push((label, dest, st, msgs, pre));
+                }
+                if forward && !root_first {
+                    // the root processes the witnesses only now and offers them to the
+                    // contexts registered for b
+                    for (label, _, _, msgs, _) in &dests {
+                        assert!(
+                            !msgs.iter().any(|&cid| is_witness(cid)),
+                            "{cfg} {label}: no witness before the root processes it"
+                        );
+                    }
+                    out.sent.clear();
+                    root_fix(&mut st_root, &mut out);
+                    for (_, dest, _, msgs, _) in &mut dests {
+                        msgs.extend(rpreds(&out.sent, *dest));
+                    }
+                }
+
+                for (label, dest, mut st, msgs, pre) in dests {
+                    out.sent = pre;
+                    out.mine.clear();
+                    if forward {
+                        assert!(
+                            msgs.iter().filter(|&&cid| is_witness(cid)).count() == 2,
+                            "{cfg} {label}: the root delivers both witnesses"
+                        );
+                        for cid in msgs {
+                            let took = rpred_c(&ix, &mut st, cid, &mut out);
+                            if cid == cid_eb {
+                                assert!(!took, "{cfg} {label}: -> E(b) is taken once");
+                            }
+                        }
+                        super::super::dl_rules::flush(&ix, dest, &mut st, &mut out, 64);
+                        assert!(
+                            unit(&st, laf) == Some(true) && unit(&st, lrf) == Some(true),
+                            "{cfg} {label}: the witnesses are the root's units"
+                        );
+                    }
 
                     let r_st = dl(&st)
                         .and_then(|x| x.root.as_deref())
                         .expect("destination must have RootSt");
                     assert!(
                         r_st.succ_set.contains(&(e, ub)),
-                        "{label}: destination must open rooted existential edge (E, b)"
+                        "{cfg} {label}: destination must open rooted existential edge (E, b)"
                     );
                     assert!(
                         out.sent.iter().any(|&(to, c)| to == w
                             && matches!(c, Concl::DEdge(from, f) if from == dest && f == e)),
-                        "{label}: destination must send DEdge(dest, E) to successor w"
+                        "{cfg} {label}: destination must send DEdge(dest, E) to successor w"
                     );
                     assert!(
                         r_st.gsent.contains(&(w, lg))
                             && out.sent.iter().any(|&(to, c)| {
                                 to == w && matches!(c, Concl::HypL(xid) if xid == lg.xid())
                             }),
-                        "{label}: destination must forward private ground marker G(c) to successor w"
+                        "{cfg} {label}: destination must forward private ground marker G(c) to successor w"
                     );
 
                     // Successor `w` returns `A(x) ∧ s(y, x) ∧ G(c) -> BHit(y)` to destination.
@@ -10813,15 +11053,9 @@ Ontology(<http://example.org/g6>
                         &ix, dest, &mut st, w, cid_ret, &mut out
                     ));
                     super::super::dl_rules::flush(&ix, dest, &mut st, &mut out, 64);
-                    let has_bhit = dl(&st)
-                        .unwrap()
-                        .store
-                        .clauses
-                        .iter()
-                        .any(|s| !s.dead && s.c.body().is_empty() && s.c.head() == [lbhit]);
                     assert!(
-                        has_bhit,
-                        "{label} forward={forward}: destination must derive -> BHit(b) from w's return and private G(c)"
+                        unit(&st, lbhit).is_some(),
+                        "{cfg} {label}: destination must derive -> BHit(b) from w's return and private G(c)"
                     );
                 }
             }

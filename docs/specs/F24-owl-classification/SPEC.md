@@ -5371,18 +5371,25 @@ delivers it. The context also takes a successor's clause over constants alone on
 each successor instead of once for each edge to it. `Limits::rooted_merge`, or
 `SPARKLES_ROOTED_MERGE=1`, merges two individuals when the ontology asserts their equality
 or the root derives it as a unit, and starts the run again on the merged ontology within
-the same work bound. It takes shoi-022 within the bound with 455,548 derived conclusions
-on one thread and 479,366 on four eager threads. `SPARKLES_ROOTED_BOUND_PER_CLASS=1` raises
+the same work bound. Merging alone, with shared facts off, takes shoi-022 within the bound
+with 455,548 derived conclusions on one thread and 479,366 on four eager threads, in one
+run each of the build before forwarding. `SPARKLES_ROOTED_BOUND_PER_CLASS=1` raises
 the bound of a rooted run without counting to 32 conclusions for each named class when
 that is more than 524,288.
 
 With shared facts on, a context that holds a root unit and would send it to a predecessor
 other than the root by Pred sends it as the root's own delivery instead, under the root's
-identifier for the clause. Pred moves such a unit unchanged, because only a unit over
-constants with an empty body goes to a predecessor, so the predecessor receives the same
-clause by either message and runs the same rules on it. Only the channel and the
-provenance change. The predecessor takes the unit once, however many successors send it,
-and holds it as the root's, so the rule for root units applies there too. The predecessor
+identifier for the clause. Pred moves such a unit unchanged, because a root unit goes to a
+predecessor only when its body is empty and its literals hold constants alone, so the
+predecessor receives the same clause by either message and runs the same rules on it.
+Only the channel and the provenance change. The root's delivery skips the test by which
+Pred admits a clause over the edge it arrives by. The received unit holds in every model
+because the root derived it, whatever edge links the predecessor to the sender. The
+context's copy takes the root's identifier when the root's delivery arrives, also when the
+context derived the unit itself and already sent it by Pred under its own identifier, so
+every forwarded copy carries the root's identifier whatever the order of arrival. The
+predecessor therefore takes the unit once, however many successors send it, and holds it
+as the root's, so the rule for root units applies there too. The predecessor
 still makes every inference it made before, except those that the rule for root units
 leaves out, so forwarding is complete if that rule is. That rule's completeness is not
 proved, as for the rest of the rooted run. `SPARKLES_ROOTED_FACT_FORWARD=0` turns
@@ -5396,15 +5403,19 @@ and on four threads, forwarding derives fewer conclusions in 220 of the 357 runs
 thread that finish with and without it and more in 7. It finishes the same runs apart
 from one four-thread run of s2-g2-115, whose outcome varies between schedules in both
 builds, and it changes no answer.
-The dl1061 regression family derives 0.55 times the conclusions, and the 50 `shoi`
-fixtures all finish with HermiT's taxonomies with merging and item 1075's splitting, as
-before. With shared facts, merging and forwarding together, shoi-022 needs at most 506,938
-conclusions in 20 runs on four eager threads, against 474,314 without forwarding.
+The dl1061 regression family derives 0.55 times the conclusions on one thread, and the 50
+`shoi` fixtures all finish with HermiT's taxonomies with merging and item 1075's
+splitting, as before. With shared facts and merging, one run of shoi-022 needs 424,376
+conclusions on one thread and 430,041 on four eager threads with forwarding, against
+425,497 and 470,299 without it. The largest of 20 runs on four eager threads needs 506,938
+conclusions with forwarding and 474,314 without it, both within the bound.
 
 Two parts of the item remain. 36 of the generated ontologies still pass the bound in 71
 runs, all on one thread and all but s2-g2-266 on four. With a bound of 30 million on one
-thread, 11 of them finish, ten after 529,652 to 29.8 million conclusions, 18 pass that
-bound, 4 run past 120 s and 3 end without finishing or passing it. In the first 600,000
+thread, 11 of them finish, 18 pass that bound, 4 run past 120 s and 3 end without
+finishing or passing it. Ten of the 11 report 529,652 to 29.8 million conclusions. The
+eleventh, s2-g2-266, reports 4,982 under that bound, although its single-thread run passes
+the default bound. In the first 600,000
 conclusions of each, the commonest rule is Pred over the edges `f_e(u)` to successors in
 18 files and Eq on equalities `f_e(u) ≈ v` in 7, both in the contexts other than the root.
 Forwarding does not reach that work, since those clauses are not root units. ore_ont_15803 needs 3,778,620 conclusions with or

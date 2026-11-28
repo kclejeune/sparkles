@@ -1743,6 +1743,9 @@ pub struct DlSt {
     pub empty_core: bool,
     /// in a rooted run, whether the context is taking a fact of the root, which it keeps
     pub taking_fact: bool,
+    /// in a rooted run that forwards root units, the root's table id of the fact the
+    /// context is taking, which its stored copy goes to predecessors by (item 1061)
+    pub taking_root_id: Option<u32>,
     /// in a rooted run, whether the clause currently being processed by [`process`] is an
     /// exact empty-body unit delivered from the root (`Stored::fact == true`), cleared on
     /// every exit from `process`
@@ -4934,9 +4937,13 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
     }
     if let Some(x) = ds_admit(st, out) {
         let unit_fact = incoming_unit_fact && body.is_empty() && head.len() == 1;
+        // the root's id goes with the unit only when the stored clause is the root's own
+        let root_id = x
+            .taking_root_id
+            .filter(|&id| unit_fact && out.dl().table.get(id).head() == head.as_slice());
         let _ = x
             .store
-            .add_parts_admitted_with_fact(body, head, unit_fact, out);
+            .add_parts_admitted_with_fact(body, head, unit_fact, root_id, out);
     }
 }
 

@@ -21711,10 +21711,13 @@ mod tests {
 
     /// Item 1061's forwarding of root units keeps the run's resource controls. With shared
     /// facts and forwarding on, the reported peak memory covers the counting allocator's
-    /// peak with and without the marker repair, a cancellation at any poll ends the run
-    /// with the cancellation or a partial answer and never with a passed bound, a tight
-    /// memory cap ends it cleanly and the same classifier then gives the full answer, and a
-    /// rooted run with counting gives the same answer with and without forwarding.
+    /// peak with and without the marker repair. A cancellation reported at a poll inside a
+    /// clean run ends that run with the cancellation or a partial answer and never with a
+    /// complete one or a passed bound, and the same classifier then gives the full answer. A
+    /// memory cap below the clean run's peak refuses the run, and the same classifier then
+    /// gives the full answer. A rooted run that counts, on the same ontologies with a
+    /// minimum cardinality that the rooted counting rules take, gives HermiT's answer with
+    /// and without forwarding.
     #[test]
     fn forwarded_root_units_keep_memory_accounting_cancellation_and_counting() {
         use super::numeric::tests::measure;
@@ -21728,7 +21731,7 @@ mod tests {
                 dl_rules::with_forward_facts_override(forward, f)
             })
         }
-        for name in ["s1-g1-002", "s2-g2-298"] {
+        let read = |name: &str| {
             let ax = crate::ofn_read::parse(
                 &std::fs::read_to_string(dir.join(format!("{name}.ofn"))).unwrap(),
             )
@@ -21736,12 +21739,17 @@ mod tests {
             .axioms;
             let hermit = std::fs::read_to_string(dir.join(format!("{name}.hermit.txt"))).unwrap();
             let (classes, want) = hermit_pairs(&ax, &hermit);
+            (ax, classes, want)
+        };
+        for name in ["s1-g1-002", "s2-g2-298"] {
+            let (ax, classes, want) = read(name);
             let base = Limits {
                 threads: 1,
                 rooted: true,
                 rooted_merge: true,
                 ..Limits::default()
             };
+            let mut peak = 0;
             for repair in [false, true] {
                 let limits = Limits {
                     rooted_marker_repair: repair,
@@ -21760,11 +21768,29 @@ mod tests {
                     out.stats.peak_memory,
                     sample.peak
                 );
+                if !repair {
+                    peak = out.stats.peak_memory;
+                }
             }
-            // a cancellation from the n-th poll on, for growing n, until a run ends first
-            let mut cancelled = 0usize;
-            let mut finished = false;
-            for n in (0..20).map(|k| (1usize << k) - 1) {
+            // the polls of a clean run, which never cancels
+            let polls = Arc::new(AtomicUsize::new(0));
+            let p = polls.clone();
+            let counted = Limits {
+                cancelled: Some(Arc::new(move || {
+                    p.fetch_add(1, Ordering::Relaxed);
+                    false
+                })),
+                ..base.clone()
+            };
+            let clean = with(true, &mut || Classifier::of(&ax).classify(&counted)).unwrap();
+            assert!(clean.complete, "{name}: the clean run finishes");
+            assert_eq!(run_pairs(&clean, &classes), want, "{name}: the clean run");
+            let total = polls.load(Ordering::Relaxed);
+            assert!(total >= 8, "{name}: the clean run polls {total} times");
+            // a cancellation from the n-th poll on, at polls inside the clean run
+            let mut at = vec![0, total / 8, total / 4, total / 2, total * 3 / 4, total - 1];
+            at.dedup();
+            for n in at {
                 let polls = Arc::new(AtomicUsize::new(0));
                 let p = polls.clone();
                 let limits = Limits {
@@ -21772,58 +21798,97 @@ mod tests {
                     cancelled: Some(Arc::new(move || p.fetch_add(1, Ordering::Relaxed) >= n)),
                     ..base.clone()
                 };
-                match with(true, &mut || Classifier::of(&ax).classify(&limits)) {
-                    Err(Error::Cancelled) => cancelled += 1,
+                let mut k = Classifier::of(&ax);
+                match with(true, &mut || k.classify(&limits)) {
+                    Err(Error::Cancelled) => {}
+                    Ok(out) => assert!(
+                        !out.complete && !out.stats.dl_rooted_over && !out.stats.dl_over_budget,
+                        "{name} poll {n} of {total}: a cancellation ends the run with a partial \
+                         answer and no passed bound: {:?}",
+                        out.stats
+                    ),
                     Err(e) => panic!("{name} poll {n}: {e:?}"),
-                    Ok(out) => {
-                        assert!(
-                            !out.stats.dl_rooted_over && !out.stats.dl_over_budget,
-                            "{name} poll {n}: a cancellation is no passed bound"
-                        );
-                        if polls.load(Ordering::Relaxed) <= n {
-                            assert!(out.complete, "{name} poll {n}: {:?}", out.stats);
-                            assert_eq!(run_pairs(&out, &classes), want, "{name} poll {n}");
-                            finished = true;
-                            break;
-                        }
-                    }
                 }
+                assert!(
+                    polls.load(Ordering::Relaxed) > n,
+                    "{name} poll {n}: the callback reported the cancellation"
+                );
+                let again = with(true, &mut || k.classify(&base)).unwrap();
+                assert!(again.complete, "{name} poll {n}: after the cancellation");
+                assert_eq!(
+                    run_pairs(&again, &classes),
+                    want,
+                    "{name} poll {n}: after the cancellation"
+                );
             }
-            assert!(
-                cancelled > 0 && finished,
-                "{name}: cancelled {cancelled}, finished {finished}"
-            );
-            // a tight memory cap, then the full answer from the same classifier
+            // a memory cap below the clean run's peak, then the full answer from the same
+            // classifier
             let mut k = Classifier::of(&ax);
             let tight = Limits {
-                max_memory: Some(1 << 16),
+                max_memory: Some(peak / 2),
                 ..base.clone()
             };
             match with(true, &mut || k.classify(&tight)) {
-                Ok(out) => assert!(!out.stats.dl_rooted_over, "{name}: {:?}", out.stats),
+                Ok(out) => assert!(
+                    (!out.complete || out.stats.dl_over_budget) && !out.stats.dl_rooted_over,
+                    "{name}: a cap of {} below the peak {peak} refuses the run: {:?}",
+                    peak / 2,
+                    out.stats
+                ),
                 Err(Error::Memory { .. }) => {}
                 Err(e) => panic!("{name} tight cap: {e:?}"),
             }
             let again = with(true, &mut || k.classify(&base)).unwrap();
             assert!(again.complete, "{name}: after the cap {:?}", again.stats);
             assert_eq!(run_pairs(&again, &classes), want, "{name}: after the cap");
-            // counting with the rooted rules, with and without forwarding
+        }
+        // counting with the rooted rules, with and without forwarding, on the ontologies
+        // with `SubClassOf(:C1 ObjectMinCardinality(2 :r1))`, which HermiT answers as it
+        // answers them without it
+        for name in ["s1-g1-002-count", "s2-g2-298-count"] {
+            let (ax, classes, want) = read(name);
             let counting = Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
                 counting: true,
-                ..base.clone()
+                ..Limits::default()
             };
-            let off = with(false, &mut || Classifier::of(&ax).classify(&counting)).unwrap();
-            let on = with(true, &mut || Classifier::of(&ax).classify(&counting)).unwrap();
-            assert_eq!(off.complete, on.complete, "{name} counting");
-            assert_eq!(off.consistency, on.consistency, "{name} counting");
-            assert_eq!(
-                run_pairs(&off, &classes),
-                run_pairs(&on, &classes),
-                "{name} counting"
-            );
-            if on.complete {
-                assert_eq!(run_pairs(&on, &classes), want, "{name} counting");
+            let mut work = Vec::new();
+            for forward in [false, true] {
+                let at = format!("{name} forward={forward}");
+                let (out, excluded, counted, rooted) =
+                    dl_rules::with_shared_facts_override(true, || {
+                        dl_rules::with_forward_facts_override(forward, || {
+                            let mut k = Classifier::of(&ax);
+                            let out = k.classify(&counting).unwrap();
+                            (out, k.excluded().len(), k.sat.dl_counted, k.sat.dl_rooted)
+                        })
+                    });
+                assert!(
+                    counted && rooted,
+                    "{at}: the run counts with the rooted rules"
+                );
+                assert_eq!(out.stats.tier, Tier::Disjunctive, "{at}");
+                assert!(out.complete && excluded == 0, "{at}: {:?}", out.stats);
+                assert!(
+                    !out.stats.dl_over_budget
+                        && !out.stats.dl_rooted_over
+                        && !out.stats.dl_rooted_declined
+                        && !out.stats.dl_counting_over,
+                    "{at}: no fallback {:?}",
+                    out.stats
+                );
+                assert_eq!(out.consistency, Consistency::Consistent, "{at}");
+                assert_eq!(run_pairs(&out, &classes), want, "{at}");
+                work.push(out.stats.dl_work + out.stats.dl_rooted_spent);
             }
+            assert!(
+                work[1] < work[0],
+                "{name}: forwarding takes part in the counted run, {} against {}",
+                work[1],
+                work[0]
+            );
         }
     }
 
