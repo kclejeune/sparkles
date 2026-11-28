@@ -753,10 +753,10 @@ the side of the head is not cut, and the Join exemption keeps its conclusion, si
 producer has no ground body literal. The conclusion has one ground body literal fewer, and
 its head is the clause's head with the false rest of the producer's head. Otherwise a live
 clause subsumes the conclusion with no more ground body literals and a head that is still
-false. With the producers delivered and the saturation quiescent, processing the clause
-first finds the producer through the index of maximal literals, and processing the producer
-first finds the clause through the index of ground body literals, so the order of arrival
-does not matter. After at most as many Joins as the body has literals, the query context
+false. With the producers delivered and the saturation quiescent, a newly processed body clause
+looks up an already processed producer through the index of maximal literals, and a newly
+processed producer looks up an already processed body clause through the index of ground
+body literals, so the order of arrival does not matter. After at most as many Joins as the body has literals, the query context
 reaches a contradiction or a false clause that the stage of facts covers, and this endpoint
 includes the exits of derivation by a unit and by bottom. The discharge promises no maximal
 literal for a later inference, since a false residue can dominate an equality of the head
