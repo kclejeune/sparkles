@@ -95,7 +95,44 @@ pub fn restrict(
     opts.graphs = p.view(ds, e);
     opts.write.graphs = opts.graphs.clone();
     // remote results cached for one caller and endpoint are never read by another
-    opts.service_scope = Some(format!("{}\u{1f}{e:?}", p.id()).into());
+    opts.service_scope = Some(service_scope(p, ds, e, opts.graphs.as_deref()).into());
+    // se:cacheRm, for an admin of the dataset through this endpoint when the server
+    // turns it on
+    opts.service_cache_mgmt = service_cache_mgmt() && p.can_at(ds, e, Level::Admin);
+}
+
+/// The scope of the SERVICE cache entries a request reads, lists and removes. It names
+/// the credential with the bound of its OIDC scopes ([`Principal::access_id`]), the
+/// endpoint, the dataset with its branch, and a digest of the graphs and triples the
+/// request may read, so that two credentials of one account, a narrowed grant and
+/// another branch each see entries of their own. The digest is of the view's debug
+/// form, which is the same in every process of one release, so entries on disk stay in
+/// their scope across a restart.
+fn service_scope(
+    p: &Principal,
+    ds: &str,
+    e: super::Endpoint,
+    view: Option<&sparkles::access::GraphAccess>,
+) -> String {
+    use sha2::Digest;
+    let view = view.map(|v| {
+        let d = sha2::Sha256::digest(format!("{v:?}").as_bytes());
+        d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    });
+    json!([p.access_id(), format!("{e:?}"), p.qualified(ds), view]).to_string()
+}
+
+static SERVICE_CACHE_MGMT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `--service-cache-mgmt`: whether callers with `admin` on a dataset may call
+/// `se:cacheRm` on its SERVICE cache.
+pub fn set_service_cache_mgmt(on: bool) {
+    SERVICE_CACHE_MGMT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn service_cache_mgmt() -> bool {
+    SERVICE_CACHE_MGMT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The external base URL the auth configuration sets (`server.public_url`), if any.
@@ -390,5 +427,91 @@ impl crate::ratelimit::ClientKeyer for PrincipalKeyer {
             }
             _ => crate::ratelimit::PeerKeyer.key(class, req, trusted),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Access, Endpoint, Grants, Kind, PrincipalInfo, Restricted, Scheme};
+    use super::*;
+
+    fn bob(grants: Grants) -> Principal {
+        Principal::new(Kind::User, "bob", Scheme::Basic, Access::of(grants))
+    }
+
+    fn admin_of(ds: &str) -> Grants {
+        Grants {
+            datasets: vec![(ds.into(), Level::Admin)],
+            ..Default::default()
+        }
+    }
+
+    /// Two credentials of one account with different OIDC scopes, a narrowed view and
+    /// another branch each get a scope of their own, and the same request gets the same
+    /// scope every time, so that entries on disk stay in it after a restart.
+    #[test]
+    fn service_scopes_separate_credentials_views_and_branches() {
+        let p = bob(admin_of("ds"));
+        let mut scoped = p.clone();
+        scoped.info = Arc::new(PrincipalInfo {
+            oauth_scopes: Some(vec!["sparkles:read".into()]),
+            ..Default::default()
+        });
+        let all = service_scope(&p, "ds", Endpoint::Query, None);
+        assert_eq!(all, service_scope(&p, "ds", Endpoint::Query, None));
+        let narrow = sparkles::access::GraphAccess {
+            read: sparkles::access::Graphs::none(),
+            ..sparkles::access::GraphAccess::all()
+        };
+        let others = [
+            service_scope(&scoped, "ds", Endpoint::Query, None),
+            service_scope(&p, "ds", Endpoint::Update, None),
+            service_scope(&p, "ds", Endpoint::Query, Some(&narrow)),
+            service_scope(
+                &p,
+                "ds",
+                Endpoint::Query,
+                Some(&sparkles::access::GraphAccess::all()),
+            ),
+            service_scope(&p.clone().on_branch(Some("b")), "ds", Endpoint::Query, None),
+            service_scope(&p, "ds@b", Endpoint::Query, None),
+            service_scope(&p, "other", Endpoint::Query, None),
+        ];
+        for (i, s) in others.iter().enumerate() {
+            assert_ne!(*s, all, "{i}");
+        }
+        // the branch chosen by the request and the one named in the dataset are one
+        assert_eq!(others[4], others[5]);
+    }
+
+    /// `se:cacheRm` needs `admin` through the endpoint the request uses, not through
+    /// some other endpoint of the dataset, and management turned on.
+    #[test]
+    fn cache_removal_needs_admin_through_the_endpoint() {
+        let p = bob(Grants {
+            datasets: vec![("ds".into(), Level::Read)],
+            restricted: vec![Restricted {
+                dataset: "ds".into(),
+                level: Level::Admin,
+                graphs: None,
+                endpoints: Some(vec![Endpoint::Update]),
+                lifts: vec![],
+                branches: None,
+                server_models: false,
+            }],
+            ..Default::default()
+        });
+        assert!(p.can("ds", Level::Admin), "the grant over any endpoint");
+        let mgmt = |p: &Principal, e: Endpoint| {
+            let mut opts = sparkles::sparql::QueryOptions::default();
+            restrict(&mut opts, p, "ds", e);
+            opts.service_cache_mgmt
+        };
+        set_service_cache_mgmt(true);
+        assert!(!mgmt(&p, Endpoint::Query));
+        assert!(mgmt(&p, Endpoint::Update));
+        assert!(mgmt(&bob(admin_of("ds")), Endpoint::Query));
+        set_service_cache_mgmt(false);
+        assert!(!mgmt(&bob(admin_of("ds")), Endpoint::Query));
     }
 }

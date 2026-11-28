@@ -58,6 +58,8 @@ mod sample;
 pub(crate) mod sortkey;
 pub mod stats;
 pub mod svccache;
+pub mod svcdisk;
+mod svcfn;
 mod svcread;
 pub mod table;
 pub mod textpf;
@@ -209,6 +211,12 @@ pub struct QueryOptions {
     /// with different credentials or views never share results; `None` is one shared
     /// scope.
     pub service_scope: Option<Arc<str>>,
+    /// Whether the query may remove entries of its scope from the cache of remote
+    /// SERVICE results with `se:cacheRm` (see [`svcfn`]), as Jena's `enableMgmt`
+    /// context symbol allows it. The server sets it for a caller with `admin` on the
+    /// dataset when `serve --service-cache-mgmt` is on. A query that calls the function
+    /// without it fails with [`Error::NotPermitted`].
+    pub service_cache_mgmt: bool,
     /// Whether the default graph is the union of the named graphs for this request,
     /// overriding the store's [`StoreOptions::union_default_graph`](crate::store::StoreOptions)
     /// (`None`: the store's setting). Unlike a protocol dataset whose default graph is
@@ -839,6 +847,7 @@ fn make_ctx_input_policy(
     if let Some(s) = &opts.service_scope {
         ctx.service_scope = s.clone();
     }
+    ctx.service_cache_mgmt = opts.service_cache_mgmt;
     ctx.local_endpoints = opts.local_endpoints.clone();
     ctx.service_depth = opts.service_depth;
     if let Some(o) = opts.optimizations {

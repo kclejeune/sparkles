@@ -45,7 +45,7 @@ use crate::sparql::ctx::{Ctx, OwnedCharge};
 use crate::sparql::enhancer::CacheMode;
 use crate::sparql::exec::{LocalCall, RemoteAnswer, ServiceSolution};
 use crate::sparql::plan::{Kind, Node, PathEnd};
-use crate::sparql::svccache::Rows;
+use crate::sparql::svccache::{Parts, Rows, ServiceKey, Slice};
 use crate::sparql::table::VarId;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -95,6 +95,8 @@ pub(super) struct Service {
     query: String,
     silent: bool,
     cache: CacheMode,
+    /// what the cached request keys its entry by (see [`ServiceKey`])
+    key: Option<ServiceKey>,
     vars: Vec<VarId>,
     /// the names of `vars`, as the endpoint's solutions name their variables
     names: Vec<String>,
@@ -141,6 +143,9 @@ enum Source {
 /// A charged copy of a remote answer, kept while it is small enough to be cached.
 struct Tee {
     key: String,
+    /// the parts of `key`, and the slice of the request it copies
+    parts: Parts,
+    slice: Slice,
     rows: Rows,
     /// `rows.bytes()`, the cache's weight of the copy, kept as rows arrive
     bytes: u64,
@@ -161,12 +166,21 @@ impl Tee {
         let charge = OwnedCharge::new(ctx, retained.saturating_add(key.capacity() as u64))?;
         Ok(Self {
             key,
+            parts: Parts::default(),
+            slice: Slice::ALL,
             rows,
             bytes: 64,
             limit,
             retained,
             charge,
         })
+    }
+
+    /// The copy of the request whose key has `parts`, sent with `slice`.
+    fn of(mut self, parts: Parts, slice: Slice) -> Self {
+        self.parts = parts;
+        self.slice = slice;
+        self
     }
 
     /// Copy one solution, or give up the copy once it is larger than the cache keeps or
@@ -260,6 +274,7 @@ impl Service {
             query,
             silent,
             cache,
+            key,
         } = &node.kind
         else {
             unreachable!("a SERVICE node")
@@ -269,6 +284,7 @@ impl Service {
             query: query.clone(),
             silent: *silent,
             cache: *cache,
+            key: key.as_deref().cloned(),
             vars: node.vars.clone(),
             names: node.vars.iter().map(|v| ctx.var_name(*v)).collect(),
             fallback,
@@ -355,17 +371,26 @@ impl Service {
             && ctx.use_cache
             && store.enabled()
         {
-            // the whole result under one key: a SERVICE without `loop` has one input
-            let key =
-                crate::sparql::svccache::key(&ctx.service_scope, url.as_str(), &self.query, &[]);
+            // the whole result under one key: a SERVICE without `loop` has one input, and
+            // the key leaves out the request's outermost slice, which bounds the entry
+            let (text, slice) = self
+                .key
+                .as_ref()
+                .map_or((self.query.as_str(), Slice::ALL), |k| {
+                    (k.text.as_str(), k.slice)
+                });
+            let key = crate::sparql::svccache::key(&ctx.service_scope, url.as_str(), text, &[]);
+            let parts = Parts::of(&ctx.service_scope, url.as_str(), text);
+            let lookup = ctx.charge(0)?;
             let hit = if self.cache == CacheMode::Default {
-                store.get(&key)
+                store.get_admitted(&key, slice, &|n| lookup.add(n))?
             } else {
                 store.remove(&key);
                 None
             };
             if let Some(rows) = hit {
                 let charge = OwnedCharge::new(ctx, rows.retained_bytes())?;
+                drop(lookup);
                 let cols = self
                     .names
                     .iter()
@@ -380,7 +405,9 @@ impl Service {
                 return Ok(());
             }
             // a copy the budget cannot hold is not made
-            tee = Tee::new(ctx, key, store.max_entry_bytes()).ok();
+            tee = Tee::new(ctx, key, store.max_entry_bytes())
+                .ok()
+                .map(|t| t.of(parts, slice));
         }
         let meter = crate::sparql::exec::Meter {
             ctx,
@@ -533,7 +560,12 @@ impl Service {
                     let Some(solution) = answer.next_solution() else {
                         ctx.check()?;
                         if let Some(tee) = tee.take() {
-                            ctx.snap.results.service.put(tee.key, Arc::new(tee.rows));
+                            ctx.snap.results.service.put(
+                                tee.key,
+                                tee.parts,
+                                tee.slice,
+                                Arc::new(tee.rows),
+                            );
                         }
                         break true;
                     };
@@ -549,6 +581,19 @@ impl Service {
                     }
                     if let Some(copy) = tee.take() {
                         *tee = copy.push(&solution)?;
+                    }
+                    // a response to a request with a LIMIT holds no more solutions than
+                    // it, so the copy is whole once it has them, even when the query
+                    // reads no further
+                    if tee
+                        .as_ref()
+                        .is_some_and(|t| t.slice.limit == Some(t.rows.rows.len()))
+                        && let Some(t) = tee.take()
+                    {
+                        ctx.snap
+                            .results
+                            .service
+                            .put(t.key, t.parts, t.slice, Arc::new(t.rows));
                     }
                     push(&mut b, bnodes, &ServiceSolution::Remote(&solution));
                     ctx.check()?;
@@ -711,6 +756,7 @@ mod tests {
             query: "SELECT ?s { ?s ?p ?o }".into(),
             silent: false,
             cache: CacheMode::Default,
+            key: None,
             vars: vec![var],
             names: vec![ctx.var_name(var)],
             fallback: FallbackPolicy::RejectMaterialization,
@@ -976,6 +1022,7 @@ mod tests {
             query: "SELECT ?s { ?s ?p ?o }".into(),
             silent: true,
             cache: CacheMode::Default,
+            key: None,
             vars: vec![var],
             names: vec![ctx.var_name(var)],
             fallback: FallbackPolicy::RejectMaterialization,

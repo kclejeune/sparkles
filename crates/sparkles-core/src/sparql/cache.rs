@@ -592,6 +592,9 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
         | Kind::HybridSearch(_)
         | Kind::GraphNames(_)
         | Kind::GraphBranches(_) => false,
+        // the caller's own SERVICE cache entries, which change without a commit and
+        // belong to one caller
+        Kind::Values(_) if n.desc.starts_with(super::svcfn::LS_DESC) => false,
         Kind::Values(t) => {
             // include the actual rows (local ids make it uncacheable)
             if t.cols.iter().flatten().any(|id| id.tag() == Tag::Local) {

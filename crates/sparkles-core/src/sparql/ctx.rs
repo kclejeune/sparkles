@@ -1334,6 +1334,9 @@ pub struct Ctx {
     /// the caller's scope in the cache of remote SERVICE results (see
     /// [`QueryOptions::service_scope`](super::QueryOptions::service_scope))
     pub service_scope: Arc<str>,
+    /// whether the query may call `se:cacheRm` (see
+    /// [`QueryOptions::service_cache_mgmt`](super::QueryOptions::service_cache_mgmt))
+    pub service_cache_mgmt: bool,
     /// the process's own query endpoints (see [`super::LocalEndpoints`])
     pub local_endpoints: Option<Arc<dyn super::LocalEndpoints>>,
     /// how many in-process SERVICE calls this query runs inside
@@ -1951,6 +1954,7 @@ impl Ctx {
             use_cache: true,
             plan_patterns: true,
             service_scope: Arc::from(""),
+            service_cache_mgmt: false,
             local_endpoints: None,
             service_depth: 0,
             algo_projections: None,

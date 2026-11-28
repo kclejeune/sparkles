@@ -644,7 +644,14 @@ impl<'a> Layout<'a> {
                 self.optional_vector(spec.preds.as_ref())?;
                 self.graph(&spec.graph)
             }
-            Kind::Service { query, .. } => self.string(query),
+            Kind::Service { query, key, .. } => {
+                self.string(query)?;
+                if let Some(key) = key {
+                    self.slots::<super::svccache::ServiceKey>(1)?;
+                    self.string(&key.text)?;
+                }
+                Ok(())
+            }
             Kind::TextSearch(spec) => self.text(spec),
             Kind::VectorSearch(spec) => self.vector_search(spec),
             Kind::HybridSearch(spec) => {

@@ -60,6 +60,8 @@ struct Endpoint {
     limit: Arc<AtomicUsize>,
     /// answer every request with an error
     failing: Arc<AtomicBool>,
+    /// the most requests answered at once
+    peak: Arc<AtomicUsize>,
 }
 
 impl Endpoint {
@@ -69,12 +71,21 @@ impl Endpoint {
         let queries = Arc::new(Mutex::new(Vec::new()));
         let limit = Arc::new(AtomicUsize::new(usize::MAX));
         let failing = Arc::new(AtomicBool::new(false));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
         let (q, lim, fail) = (queries.clone(), limit.clone(), failing.clone());
+        let (now, most) = (inflight.clone(), peak.clone());
         std::thread::spawn(move || {
             for c in l.incoming() {
                 let Ok(c) = c else { continue };
                 let (data, q, lim, fail) = (data.clone(), q.clone(), lim.clone(), fail.clone());
-                std::thread::spawn(move || answer(c, &data, &q, &lim, &fail, delay));
+                let (now, most) = (now.clone(), most.clone());
+                std::thread::spawn(move || {
+                    let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(n, Ordering::SeqCst);
+                    answer(c, &data, &q, &lim, &fail, delay);
+                    now.fetch_sub(1, Ordering::SeqCst);
+                });
             }
         });
         Endpoint {
@@ -82,6 +93,7 @@ impl Endpoint {
             queries,
             limit,
             failing,
+            peak,
         }
     }
 
@@ -91,6 +103,11 @@ impl Endpoint {
 
     fn take(&self) -> Vec<String> {
         std::mem::take(&mut *self.queries.lock().unwrap())
+    }
+
+    /// The most requests answered at once since the last call.
+    fn take_peak(&self) -> usize {
+        self.peak.swap(0, Ordering::SeqCst)
     }
 }
 
@@ -522,7 +539,13 @@ fn measure_bulk_and_cache() {
     };
     println!("{n} departments, {} ms per request", delay.as_millis());
     time("top label, loop, 1 per request", &q("loop:"), true);
+    time("top label, loop:parallel+4", &q("loop:parallel+4:"), true);
     time("top label, loop:bulk+10", &q("loop:bulk+10:"), true);
+    time(
+        "top label, loop:bulk+10:parallel+4",
+        &q("loop:bulk+10:parallel+4:"),
+        true,
+    );
     time("top label, loop:bulk+100", &q("loop:bulk+100:"), true);
     time(
         "top label, loop:bulk+100:cache, cold",
@@ -536,6 +559,11 @@ fn measure_bulk_and_cache() {
     );
     time("employees, plain SERVICE", &flat(""), true);
     time("employees, loop, 1 per request", &flat("loop:"), true);
+    time(
+        "employees, loop:parallel+4",
+        &flat("loop:parallel+4:"),
+        true,
+    );
     time(
         "employees, loop:bulk+10 (VALUES)",
         &flat("loop:bulk+10:"),
@@ -890,4 +918,413 @@ fn a_streamed_loop_admits_each_retried_answer() {
     );
     let sent = ep.take().len();
     assert!(sent < 41, "the loop sent {sent} requests past its budget");
+}
+
+/// The cache keys a request without its outermost slice and bounds the entry by it, so a
+/// request whose slice lies inside what an entry holds is answered without a request,
+/// and a request for more is sent as written (roadmap item 38).
+#[test]
+fn slices_are_answered_from_the_entries_that_hold_them() {
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = |slice: &str| {
+        format!(
+            "SELECT ?p {{ SERVICE <cache:{}> {{ SELECT DISTINCT ?p {{ ?d <urn:hasEmployee> ?p }} ORDER BY ?p {slice} }} }}",
+            ep.url()
+        )
+    };
+    let all = rows(&data, &q(""));
+    assert_eq!(all.len(), 9);
+    ep.take();
+    data.result_cache().service.clear();
+    let first5 = rows(&data, &q("LIMIT 5"));
+    assert_eq!(first5.len(), 5);
+    let sent = ep.take();
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0].contains("LIMIT 5"),
+        "the user's slice is sent: {}",
+        sent[0]
+    );
+    // inside the five rows held
+    for (slice, n) in [
+        ("LIMIT 3", 3),
+        ("OFFSET 1 LIMIT 3", 3),
+        ("OFFSET 4 LIMIT 1", 1),
+    ] {
+        assert_eq!(rows(&data, &q(slice)).len(), n, "{slice}");
+        assert!(ep.take().is_empty(), "{slice} was sent");
+    }
+    // OFFSET 4 LIMIT 1 is the fifth row
+    let fifth = rows(&data, &q("OFFSET 4 LIMIT 1"));
+    let sorted_all: Vec<String> = {
+        let mut v = all.clone();
+        v.sort_by_key(|p| p.trim_start_matches("person").parse::<u32>().unwrap_or(0));
+        v
+    };
+    assert_eq!(fifth, vec![sorted_all[4].clone()]);
+    ep.take();
+    // past the rows held, and the whole result, are sent
+    assert_eq!(rows(&data, &q("OFFSET 3 LIMIT 5")).len(), 5);
+    assert_eq!(ep.take().len(), 1);
+    assert_eq!(rows(&data, &q("LIMIT 20")), all);
+    assert_eq!(ep.take().len(), 1);
+    // the request itself, and the slices inside the 9 rows the LIMIT of 20 got, are
+    // answered from the entry
+    assert_eq!(rows(&data, &q("LIMIT 20")), all);
+    assert_eq!(rows(&data, &q("OFFSET 7 LIMIT 2")).len(), 2);
+    assert!(ep.take().is_empty());
+    // but 9 rows for a LIMIT of 20 is not taken as the whole result, so slices past them
+    // and the request without a slice are sent
+    assert_eq!(rows(&data, &q("OFFSET 7 LIMIT 100")).len(), 2);
+    assert_eq!(rows(&data, &q("")), all);
+    assert_eq!(rows(&data, &q("OFFSET 20")).len(), 0);
+    assert_eq!(ep.take().len(), 3);
+}
+
+/// An endpoint that caps its responses without saying so: a short response is not the
+/// end of the result, so a later slice past it gets what an uncached request gets.
+#[test]
+fn a_short_response_is_not_the_end_of_the_result() {
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = |cache: &str, slice: &str| {
+        format!(
+            "SELECT ?p {{ SERVICE <{cache}{}> {{ SELECT DISTINCT ?p {{ ?d <urn:hasEmployee> ?p }} ORDER BY ?p {slice} }} }}",
+            ep.url()
+        )
+    };
+    ep.limit.store(4, Ordering::SeqCst);
+    for first in ["LIMIT 20", ""] {
+        data.result_cache().service.clear();
+        assert_eq!(rows(&data, &q("cache:", first)).len(), 4, "{first}: capped");
+        ep.take();
+        for later in ["OFFSET 4 LIMIT 3", "OFFSET 6", "OFFSET 2 LIMIT 4"] {
+            let uncached = rows(&data, &q("", later));
+            assert!(!uncached.is_empty(), "{later}");
+            assert_eq!(
+                rows(&data, &q("cache:", later)),
+                uncached,
+                "{first} then {later}"
+            );
+        }
+        // two uncached requests and the cached ones, which the entry could not answer
+        assert_eq!(ep.take().len(), 6, "{first}");
+        // inside the four rows held, nothing is sent
+        assert_eq!(rows(&data, &q("cache:", "OFFSET 1 LIMIT 3")).len(), 3);
+        assert!(ep.take().is_empty());
+    }
+}
+
+/// A LIMIT pushed into the request of a plain cached SERVICE bounds its entry in both
+/// execution modes, and a smaller one is answered from it.
+#[test]
+fn a_pushed_limit_bounds_the_entry() {
+    use sparkles_core::sparql::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let count = |q: &str, mode: ExecutionMode| -> usize {
+        match query_execution(data.snapshot(), q, &opts(), &CursorOptions::default(), mode)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+        {
+            QueryExecution::Select(mut c) => {
+                let mut n = 0;
+                while let Some(b) = c.next_batch().unwrap() {
+                    n += b.len();
+                }
+                n
+            }
+            QueryExecution::Eager(r) => r.into_result().len(),
+            _ => unreachable!("a SELECT"),
+        }
+    };
+    for mode in [ExecutionMode::Eager, ExecutionMode::Streaming] {
+        data.result_cache().service.clear();
+        let q = |k: usize| {
+            format!(
+                "SELECT ?p ?n {{ SERVICE <cache:{url}> {{ ?d <urn:hasEmployee> ?p }} BIND(STR(?p) AS ?n) }} LIMIT {k}"
+            )
+        };
+        assert_eq!(count(&q(6), mode), 6, "{mode:?}");
+        let sent = ep.take();
+        assert_eq!(sent.len(), 1, "{mode:?}");
+        assert!(sent[0].trim_end().ends_with("LIMIT 6"), "{}", sent[0]);
+        assert_eq!(count(&q(2), mode), 2, "{mode:?}");
+        assert!(ep.take().is_empty(), "{mode:?}: LIMIT 2 was sent");
+        assert_eq!(count(&q(10), mode), 10, "{mode:?}");
+        assert_eq!(ep.take().len(), 1, "{mode:?}");
+    }
+}
+
+/// `se:cacheLs` lists the caller's own entries, and `se:cacheRm` removes them only for
+/// a query that its options let manage the cache. Any other query that calls it fails.
+#[test]
+fn cache_functions_list_and_remove_the_callers_entries() {
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let cached = format!(
+        "SELECT ?d ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} SERVICE <loop:cache:{url}> {{ ?d <urn:hasEmployee> ?p }} }}"
+    );
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let ls = format!("{se} SELECT ?id ?s ?q ?b ?n {{ ?id se:cacheLs (?s ?q ?b ?n) }}");
+    assert_eq!(rows(&data, &cached).len(), 9 + 8);
+    assert_eq!(ep.take().len(), 2);
+    let listed = query(data.snapshot(), &ls, &opts()).unwrap();
+    let listed = listed.rows().unwrap();
+    assert_eq!(listed.len(), 2);
+    for r in listed.iter() {
+        let v = r.values();
+        assert_eq!(
+            v[1].as_ref().map(ToString::to_string),
+            Some(format!("<{url}>"))
+        );
+        assert!(matches!(&v[2], Some(Term::Literal(l)) if l.value().contains("hasEmployee")));
+        assert!(matches!(&v[3], Some(Term::Literal(l)) if l.value().contains("urn:dept")));
+    }
+    let ns: Vec<String> = listed.iter().map(|r| short(&r.values()[4])).collect();
+    assert!(
+        ns.contains(&"9".to_string()) && ns.contains(&"8".to_string()),
+        "{ns:?}"
+    );
+    // a filter on the endpoint, and on another one
+    let by = |e: &str| format!("{se} SELECT ?id {{ ?id se:cacheLs (<{e}>) }}");
+    assert_eq!(rows(&data, &by(&url)).len(), 2);
+    assert_eq!(rows(&data, &by("http://elsewhere.example/sparql")).len(), 0);
+    // another caller sees none of them
+    let mut bob = opts();
+    bob.service_scope = Some("bob".into());
+    assert_eq!(run(&data, &ls, &bob).unwrap().len(), 0);
+    // removal needs the right
+    let rm_all = format!("{se} SELECT (se:cacheRm() AS ?n) {{}}");
+    assert!(matches!(
+        run(&data, &rm_all, &opts()),
+        Err(Error::NotPermitted(_))
+    ));
+    let mut admin_bob = bob.clone();
+    admin_bob.service_cache_mgmt = true;
+    assert_eq!(
+        run(&data, &rm_all, &admin_bob).unwrap(),
+        vec!["0".to_string()]
+    );
+    assert_eq!(
+        rows(&data, &ls).len(),
+        2,
+        "bob removed another caller's entries"
+    );
+    let mut admin = opts();
+    admin.service_cache_mgmt = true;
+    let rm_one =
+        format!("{se} SELECT (SUM(se:cacheRm(?id)) AS ?n) {{ ?id se:cacheLs (?s ?q ?b 8) }}");
+    assert_eq!(run(&data, &rm_one, &admin).unwrap(), vec!["1".to_string()]);
+    assert_eq!(rows(&data, &ls).len(), 1);
+    assert_eq!(rows(&data, &cached).len(), 17);
+    assert_eq!(ep.take().len(), 1, "only the removed input is sent again");
+    assert_eq!(run(&data, &rm_all, &admin).unwrap(), vec!["2".to_string()]);
+    assert_eq!(rows(&data, &ls).len(), 0);
+    // a call of se:cacheRm is never answered by a cache: each query removes again
+    assert_eq!(rows(&data, &cached).len(), 17);
+    assert_eq!(ep.take().len(), 2);
+    assert_eq!(run(&data, &rm_all, &admin).unwrap(), vec!["2".to_string()]);
+    assert_eq!(run(&data, &rm_all, &admin).unwrap(), vec!["0".to_string()]);
+}
+
+/// `parallel+n` keeps up to n requests in flight and gives the answer and the requests
+/// of a run one at a time (roadmap item 38).
+#[test]
+fn parallel_requests_give_the_answer_of_one_at_a_time() {
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::from_millis(60));
+    let q = |opts: &str| {
+        format!(
+            "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:{opts}{}> {{ SELECT ?p {{ ?d <urn:hasEmployee> ?p }} ORDER BY DESC(?p) LIMIT 1 }} }}",
+            ep.url()
+        )
+    };
+    let one = rows(&data, &q(""));
+    assert_eq!(one.len(), 9);
+    let mut sent_one = ep.take();
+    assert_eq!(sent_one.len(), 9);
+    assert_eq!(ep.take_peak(), 1);
+    for (opt, peak) in [
+        ("parallel+4:", 4),
+        ("parallel:", 4),
+        ("parallel+100:", 4),
+        ("parallel+3:bulk+2:", 3),
+    ] {
+        let started = Instant::now();
+        assert_eq!(rows(&data, &q(opt)), one, "{opt}");
+        let took = started.elapsed();
+        let mut sent = ep.take();
+        let most = ep.take_peak();
+        assert!(most > 1 && most <= peak, "{opt}: {most} requests at once");
+        if !opt.contains("bulk") {
+            sent.sort();
+            sent_one.sort();
+            assert_eq!(sent, sent_one, "{opt}");
+            // three waves of 60 ms against nine requests one at a time
+            assert!(took < Duration::from_millis(9 * 60), "{opt}: {took:?}");
+        } else {
+            assert_eq!(sent.len(), 5, "{opt}");
+        }
+    }
+    // a failing endpoint fails the query, and with SILENT keeps each input once
+    ep.failing.store(true, Ordering::SeqCst);
+    assert!(run(&data, &q("parallel+4:"), &opts()).is_err());
+    let silent = format!(
+        "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE SILENT <loop:parallel+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let kept = rows(&data, &silent);
+    assert_eq!(kept.len(), 9);
+    assert!(kept.iter().all(|r| r.ends_with(" -")), "{kept:?}");
+    ep.failing.store(false, Ordering::SeqCst);
+    ep.take();
+}
+
+/// A query that runs out of time stops sending: the waves after the deadline never go
+/// out, so the endpoint sees fewer requests than inputs.
+#[test]
+fn parallel_requests_stop_at_the_deadline() {
+    let data = store(&departments(30));
+    let ep = Endpoint::start(data.clone(), Duration::from_millis(150));
+    let q = format!(
+        "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:parallel+2:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let mut o = opts();
+    o.timeout = Some(Duration::from_millis(400));
+    let started = Instant::now();
+    let r = run(&data, &q, &o);
+    // the deadline ends the query, or the request it cuts short
+    assert!(
+        matches!(r, Err(Error::Timeout | Error::Service(_))),
+        "{r:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let sent = ep.take().len();
+    assert!((2..=8).contains(&sent), "{sent} of 30 requests were sent");
+}
+
+/// Parallel requests admit each solution as it arrives, so a loop over a small memory
+/// budget fails in both modes before it holds every answer of every wave.
+#[test]
+fn parallel_requests_admit_their_answers() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let data = store(&departments(40));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = format!(
+        "SELECT ?d ?p ?l {{ ?d a <urn:Department> SERVICE <loop:parallel+4:{}> {{ ?d <urn:hasEmployee> ?p . ?p <http://www.w3.org/2000/01/rdf-schema#label> ?l }} }}",
+        ep.url()
+    );
+    let o = |memory: Option<u64>| QueryOptions {
+        no_cache: true,
+        max_memory_bytes: memory,
+        ..opts()
+    };
+    let streamed = |memory: Option<u64>| -> Result<usize, Error> {
+        let c = CursorOptions {
+            batch_rows: 64,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(data.snapshot(), &q, &o(memory), &c)?;
+        let mut rows = 0;
+        while let Some(b) = c.next_batch()? {
+            rows += b.len();
+        }
+        Ok(rows)
+    };
+    assert_eq!(run(&data, &q, &o(None)).unwrap().len(), 820);
+    assert_eq!(streamed(None).unwrap(), 820);
+    assert_eq!(ep.take().len(), 80);
+    let eager = run(&data, &q, &o(Some(48 << 10)));
+    assert!(
+        matches!(&eager, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{eager:?}"
+    );
+    let sent = ep.take().len();
+    assert!(
+        sent < 40,
+        "the eager loop sent {sent} requests past its budget"
+    );
+    let r = streamed(Some(48 << 10));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
+    let sent = ep.take().len();
+    assert!(
+        sent < 40,
+        "the streamed loop sent {sent} requests past its budget"
+    );
+}
+
+/// The requests of a wave share the outbound time of the SPARQL request: with a total
+/// shorter than one response takes, every request of the wave is cut short within its
+/// share, the query fails with SILENT too, and no later wave goes out.
+#[test]
+fn parallel_requests_share_the_outbound_time() {
+    let data = store(&departments(12));
+    let ep = Endpoint::start(data.clone(), Duration::from_millis(400));
+    let q = |silent: &str| {
+        format!(
+            "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE {silent} <loop:parallel+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+            ep.url()
+        )
+    };
+    let mut o = opts();
+    o.outbound.request_timeout = Duration::from_millis(600);
+    for silent in ["", "SILENT"] {
+        let started = Instant::now();
+        let r = run(&data, &q(silent), &o);
+        assert!(r.is_err(), "{silent}: {r:?}");
+        // four shares of 150 ms, not four requests of 400 ms each
+        assert!(
+            started.elapsed() < Duration::from_millis(390),
+            "{silent}: {:?}",
+            started.elapsed()
+        );
+        let sent = ep.take().len();
+        assert!(sent <= 4, "{silent}: {sent} requests were sent");
+    }
+}
+
+/// A dataset that keeps its SERVICE cache on disk answers a cached query from it after
+/// it is opened again (roadmap item 38).
+#[test]
+fn a_disk_cache_outlives_the_store() {
+    use sparkles_core::store::ServiceCacheSettings;
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("db");
+    let q = format!(
+        "SELECT ?d ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept5> }} SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let first = {
+        let local = Store::open(&dir, StoreOptions::default()).unwrap();
+        local
+            .set_service_cache_settings(Some(ServiceCacheSettings {
+                disk: true,
+                ..Default::default()
+            }))
+            .unwrap();
+        let first = rows(&local, &q);
+        assert_eq!(first.len(), 9 + 5);
+        assert_eq!(ep.take().len(), 2);
+        first
+    };
+    let local = Store::open(&dir, StoreOptions::default()).unwrap();
+    assert_eq!(
+        local.result_cache().service.entries(),
+        0,
+        "the memory tier is new"
+    );
+    assert_eq!(rows(&local, &q), first);
+    assert!(ep.take().is_empty(), "the entries were not read from disk");
+    assert_eq!(local.result_cache().service.entries(), 2);
 }

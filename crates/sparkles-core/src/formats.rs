@@ -491,6 +491,19 @@ pub const PREWARM: FileKind = FileKind {
     reads: &[1],
 };
 
+/// The disk tier of the cache of remote SERVICE results (spec G10, roadmap item 38):
+/// one file per entry under a dataset's `service-cache/`, named by the SHA-256 of the
+/// entry's key. A file of another version is not read and is evicted like any other, so
+/// the entries of a newer release are a miss here.
+pub const SERVICE_CACHE: FileKind = FileKind {
+    id: "service-cache",
+    files: "service-cache/*.svc",
+    marker: "the u32 after the `SPKSVC` magic; another version is a cache miss",
+    class: Class::Derived,
+    writes: 1,
+    reads: &[1],
+};
+
 /// The spill files of cursor operators that outgrow their memory budget. Only the
 /// process that wrote a file reads it, and a start removes what dead processes left.
 pub const SPILL: FileKind = FileKind {
@@ -733,6 +746,7 @@ pub const KINDS: &[&FileKind] = &[
     &VIEW_STATE,
     &INTERNAL_CIRCUIT_STATE,
     &PREWARM,
+    &SERVICE_CACHE,
     &SPILL,
     &BACKUP_LAYOUT,
     &BACKUP_BLOB,
@@ -808,6 +822,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     // a dataset's directory
     ds("describe.json", 1),
     ds("aggregate-errors.json", 1),
+    ds("service-cache.json", 1),
     ds("compaction.json", 1),
     ds("quota.json", 1),
     ds("changelog.json", 1),

@@ -9,6 +9,7 @@ use crate::sparql::AggregateErrors;
 use crate::sparql::describe::{DescribeMode, DescribeOptions};
 use crate::store::{
     ChangeLogSettings, ChangeLogStatus, CompactionMeasures, CompactionSettings, QuotaStatus,
+    ServiceCacheSettings, ServiceCacheStatus,
 };
 use crate::store::{CompactionPolicy, Trigger};
 use serde::Serialize;
@@ -38,6 +39,14 @@ impl Settings {
     /// (`aggregate-errors.json`).
     pub fn aggregate_errors(&self) -> AggregateErrorsSetting {
         AggregateErrorsSetting {
+            ds: self.ds.clone(),
+        }
+    }
+
+    /// The cache of remote SERVICE results: its disk tier and time to live
+    /// (`service-cache.json`).
+    pub fn service_cache(&self) -> ServiceCacheSetting {
+        ServiceCacheSetting {
             ds: self.ds.clone(),
         }
     }
@@ -216,6 +225,35 @@ impl DescribeSetting {
     /// The setting as `GET /$/describe/{ds}` reports it.
     pub fn status(&self) -> DescribeStatus {
         DescribeStatus::of(&self.get())
+    }
+}
+
+/// The dataset's setting for its cache of remote SERVICE results (see
+/// [`ServiceCacheSettings`]). Unset members follow the store's options, which are the
+/// server's `--service-cache-disk-mb` and `--service-cache-ttl`.
+#[derive(Clone)]
+pub struct ServiceCacheSetting {
+    ds: Dataset,
+}
+
+impl ServiceCacheSetting {
+    pub fn get(&self) -> Result<ServiceCacheSettings> {
+        self.ds.store().service_cache_settings()
+    }
+
+    /// Replace the setting. It applies at once, and turning `disk` off removes the
+    /// files.
+    pub fn set(&self, s: ServiceCacheSettings) -> Result<()> {
+        self.ds.store().set_service_cache_settings(Some(s))
+    }
+
+    pub fn reset(&self) -> Result<()> {
+        self.ds.store().set_service_cache_settings(None)
+    }
+
+    /// The setting with the defaults applied, and what the disk tier holds.
+    pub fn status(&self) -> Result<ServiceCacheStatus> {
+        self.ds.store().service_cache_status()
     }
 }
 

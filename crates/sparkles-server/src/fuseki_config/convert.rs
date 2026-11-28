@@ -496,6 +496,33 @@ impl Converter<'_> {
                         }
                     }
                 }
+                // Jena's service enhancer management switch (roadmap item 38). The
+                // converter never turns management on: the server flag does, for every
+                // dataset, so only a server-wide `true` has an equivalent, which the
+                // report names
+                "enableMgmt" => match (value.trim(), scope) {
+                    ("false" | "0", _) => self.report.converted(
+                        place,
+                        format!("{name} false (se:cacheRm is refused, the default)"),
+                    ),
+                    ("true" | "1", Scope::Server) => self.report.approximated(
+                        place,
+                        format!(
+                            "{name} true: start the server with --service-cache-mgmt, which \
+                             lets callers with admin on a dataset call se:cacheRm"
+                        ),
+                    ),
+                    ("true" | "1", Scope::Local) => self.report.unsupported(
+                        place,
+                        format!(
+                            "{name} true for one dataset: --service-cache-mgmt turns \
+                             se:cacheRm on for every dataset, so it is left off"
+                        ),
+                    ),
+                    _ => self
+                        .report
+                        .unsupported(place, format!("{name} \"{value}\" is not true or false")),
+                },
                 // the JVM binding's `Sparkles.AGGREGATE_ERRORS` symbol (roadmap item 1064)
                 "aggregateErrors" => {
                     match value.trim().parse::<sparkles::sparql::AggregateErrors>() {

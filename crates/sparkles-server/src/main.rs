@@ -147,6 +147,19 @@ struct Cli {
     /// (0 disables it; default 64, `small`: 16)
     #[arg(long, global = true)]
     service_cache_mb: Option<u64>,
+    /// Seconds a cached remote SERVICE result answers after it was stored, unless the
+    /// dataset's service-cache.json says otherwise (0: until it is evicted)
+    #[arg(long, global = true, value_name = "SECS", default_value_t = sparkles::sparql::svccache::DEFAULT_TTL.as_secs())]
+    service_cache_ttl: u64,
+    /// The disk a persistent dataset's SERVICE cache may take, in MiB, when its
+    /// service-cache.json sets disk without diskMb (0: no disk tier)
+    #[arg(long, global = true, value_name = "N", default_value_t = 256,
+        value_parser = clap::value_parser!(u64).range(..=(u64::MAX >> 20)))]
+    service_cache_disk_mb: u64,
+    /// Let callers with admin on a dataset remove their entries of its SERVICE cache
+    /// with se:cacheRm (Jena's enableMgmt)
+    #[arg(long, global = true)]
+    service_cache_mgmt: bool,
     /// Treat the default graph as the union of all named graphs
     #[arg(long, global = true)]
     union_default_graph: bool,
@@ -2296,10 +2309,13 @@ fn store_opts(cli: &Cli) -> StoreOptions {
     sparkles::algo::pool::configure(cli.algo_threads, cli.algo_max_threads_per_call);
     sparkles::algo::cache::set_limit(cli.algo_cache_mb << 20);
     sparkles::algo::pool::set_exact_betweenness_max(cli.algo_exact_betweenness_max);
+    auth::set_service_cache_mgmt(cli.service_cache_mgmt);
     StoreOptions {
         cache_bytes: sizes.blocks,
         result_cache_bytes: sizes.results,
         service_cache_bytes: sizes.service,
+        service_cache_ttl: std::time::Duration::from_secs(cli.service_cache_ttl),
+        service_cache_disk_bytes: cli.service_cache_disk_mb << 20,
         union_default_graph: cli.union_default_graph,
         aggregate_errors: cli
             .aggregate_errors
@@ -3028,6 +3044,7 @@ fn run() -> Result<()> {
             opts.geo_query_rewrite = !no_geo_rewrite;
             // a read-only server writes no index files (it still reads good ones)
             opts.geo_files = !read_only;
+            opts.service_cache_files = !read_only;
             if let Some(url) = &map_style_url {
                 ui::map_style_origin(url)?;
             }

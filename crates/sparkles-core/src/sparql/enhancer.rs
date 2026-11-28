@@ -27,6 +27,7 @@ use super::svccache::{self, Rows};
 use super::table::{Table, VarId};
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::outbound::RequestBudget;
 use oxrdf::{Literal, NamedNode, Term, Variable};
 use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
@@ -72,6 +73,9 @@ pub struct Options {
     /// `None` without `bulk`, `Some(None)` for `bulk` and `Some(Some(n))` for `bulk+n`
     pub bulk: Option<Option<usize>>,
     pub cache: CacheMode,
+    /// `None` without `parallel`, `Some(None)` for `parallel` and `Some(Some(n))` for
+    /// `parallel+n`: the requests of a remote loop in flight at once
+    pub parallel: Option<Option<usize>>,
 }
 
 /// Where a SERVICE with options runs.
@@ -90,7 +94,7 @@ pub struct Effective<'a> {
     pub silent: bool,
 }
 
-const KNOWN: [&str; 4] = ["loop", "bulk", "cache", "optimize"];
+const KNOWN: [&str; 5] = ["loop", "bulk", "cache", "optimize", "parallel"];
 
 /// The options at the front of `iri` and the rest of it.
 pub fn parse_options(iri: &str) -> (Vec<(&str, Option<&str>)>, &str) {
@@ -146,6 +150,18 @@ fn apply(
                         Some(n.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
                             Error::invalid(format!(
                                 "SERVICE option bulk+{n}: not a positive number"
+                            ))
+                        })?)
+                    }
+                })
+            }
+            "parallel" => {
+                o.parallel = Some(match v {
+                    None => None,
+                    Some(n) => {
+                        Some(n.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                            Error::invalid(format!(
+                                "SERVICE option parallel+{n}: not a positive number"
                             ))
                         })?)
                     }
@@ -813,6 +829,25 @@ fn sub_gp(gp: &GraphPattern, m: &FxHashMap<String, Term>, h: &FxHashSet<String>)
 
 // ------------------------------------------------------------- requests ------
 
+/// `gp` without its outermost slice, and that slice, which the cache of remote results
+/// keeps as the bound of an entry rather than in its key (roadmap item 38).
+pub(super) fn outer_slice(gp: &GraphPattern) -> (&GraphPattern, svccache::Slice) {
+    match gp {
+        GraphPattern::Slice {
+            inner,
+            start,
+            length,
+        } => (
+            inner,
+            svccache::Slice {
+                offset: *start,
+                limit: *length,
+            },
+        ),
+        _ => (gp, svccache::Slice::ALL),
+    }
+}
+
 /// The query sent for one input: `SELECT * WHERE { R }`, with the input's values in `R`.
 pub(super) fn single_request(inner: &GraphPattern) -> String {
     format!("SELECT * WHERE {{ {inner} }}")
@@ -922,6 +957,8 @@ pub struct RemoteLoop {
     pub values: bool,
     /// the name of the input index in bulk requests
     pub idx: String,
+    /// the requests in flight at once (`parallel+n`)
+    pub parallel: usize,
 }
 
 /// The plan of `left` joined (or, with `optional`, left-joined) with the SERVICE
@@ -970,10 +1007,16 @@ pub(super) fn plan_loop(
         Some(Some(n)) => n,
     }
     .clamp(1, policy.service_bulk_max.max(1));
+    let parallel = match e.opts.parallel {
+        None => 1,
+        Some(None) => policy.service_parallel_max,
+        Some(Some(n)) => n,
+    }
+    .clamp(1, policy.service_parallel_max.max(1));
     let values = values_form(ctx, e.inner, &keys);
     let idx = fresh_var(e.inner, "__idx__");
     let est = left.est.max(1.0);
-    let requests = (est / bulk as f64).ceil().max(1.0);
+    let requests = (est / bulk as f64).ceil().max(1.0) / parallel as f64;
     let cost = left.cost + requests * 100_000.0 + est;
     let dist = vars
         .iter()
@@ -999,7 +1042,11 @@ pub(super) fn plan_loop(
             CacheMode::Clear => ", cache cleared",
             _ => "",
         }
-    );
+    ) + &if parallel > 1 {
+        format!(", {parallel} requests at a time")
+    } else {
+        String::new()
+    };
     let mut outer: Vec<(VarId, Id)> = p.subst.iter().map(|(v, id)| (*v, *id)).collect();
     outer.sort_unstable_by_key(|(v, _)| *v);
     let mut outer_scoped: Vec<VarId> = p.scoped.iter().copied().collect();
@@ -1020,6 +1067,7 @@ pub(super) fn plan_loop(
             cache: e.opts.cache,
             values,
             idx,
+            parallel,
         })),
     };
     Ok(Node {
@@ -1117,20 +1165,94 @@ pub(super) fn check_allowed(ctx: &Ctx) -> Result<()> {
 
 /// The solutions of one response, as terms by variable name.
 pub(super) fn fetch_rows(ctx: &Ctx, url: &NamedNode, query: &str) -> Result<Rows> {
+    fetch_rows_within(ctx, url, query, None, None)
+}
+
+/// [`fetch_rows`] drawing on `share` in place of the request's outbound budget, with
+/// each solution admitted on `charge` before it is kept.
+fn fetch_rows_within(
+    ctx: &Ctx,
+    url: &NamedNode,
+    query: &str,
+    share: Option<&Arc<RequestBudget>>,
+    charge: Option<&Charge<'_>>,
+) -> Result<Rows> {
     let mut vars: Vec<String> = Vec::new();
     let mut rows = Vec::new();
-    super::exec::fetch(ctx, url, query, &mut |sol| {
+    super::exec::fetch_within(ctx, url, query, share, &mut |sol| {
         if vars.is_empty() && sol.variables().len() != 0 {
             vars = sol.variables().map(str::to_owned).collect();
         }
-        rows.push(
-            vars.iter()
-                .map(|v| sol.get(v.as_str()).cloned())
-                .collect::<Vec<_>>(),
-        );
+        let row = vars
+            .iter()
+            .map(|v| sol.get(v.as_str()).cloned())
+            .collect::<Vec<_>>();
+        if let Some(c) = charge {
+            c.add(Rows::retained_row_bytes(&row))?;
+        }
+        rows.push(row);
         ctx.check()
     })?;
     Ok(Rows { vars, rows })
+}
+
+/// One answer of [`fetch_all`]: the rows, with the charge that admitted them, which the
+/// caller holds until it has admitted them itself.
+type Fetched<'c> = Result<(Rows, Charge<'c>)>;
+
+/// The answers to `queries`, sent to `url` at once, in the order of `queries`. Each
+/// request reserves an equal share of the time the request's outbound budget has left
+/// before any is sent ([`RequestBudget::share`]), so the requests in flight together,
+/// and any other request of the query that draws on the budget meanwhile, cannot take
+/// more than the budget, which counts every request's own time. A request whose share
+/// cannot be reserved is not sent and fails. The budget's bytes are counted as
+/// responses arrive, so they bound the requests in flight together as they bound one.
+/// Each solution is admitted on its request's charge before it is kept, and every
+/// solution checks for cancellation and the deadline, as does every dispatch. Each
+/// request runs in the caller's span.
+fn fetch_all<'c>(ctx: &'c Ctx, url: &NamedNode, queries: &[String]) -> Result<Vec<Fetched<'c>>> {
+    let one = |q: &str, share: Option<&Arc<RequestBudget>>| -> Fetched<'c> {
+        let charge = ctx.charge(0)?;
+        let rows = fetch_rows_within(ctx, url, q, share, Some(&charge))?;
+        Ok((rows, charge))
+    };
+    if queries.len() <= 1 {
+        return Ok(queries.iter().map(|q| one(q, None)).collect());
+    }
+    let n = u32::try_from(queries.len()).unwrap_or(u32::MAX);
+    let each = ctx.outbound_budget.remaining_time() / n;
+    let mut shares = Vec::with_capacity(queries.len());
+    for _ in queries {
+        ctx.check()?;
+        shares.push(ctx.outbound_budget.share(each));
+    }
+    let span = tracing::Span::current();
+    let answers = std::thread::scope(|scope| {
+        let handles: Vec<_> = queries
+            .iter()
+            .zip(shares)
+            .map(|(q, share)| {
+                let span = span.clone();
+                let one = &one;
+                scope.spawn(move || -> Fetched<'c> {
+                    let _entered = span.enter();
+                    ctx.check()?;
+                    let Some(share) = share else {
+                        return Err(Error::Service(format!(
+                            "<{}>: the outbound requests of this request have no time left",
+                            url.as_str()
+                        )));
+                    };
+                    one(q, Some(&share))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
+    Ok(answers)
 }
 
 /// The rows of one input, as a table of `vars`, leaving out the variables in `skip`
@@ -1177,10 +1299,12 @@ pub(super) fn run_remote(
 ) -> Result<(Table, LoopStats)> {
     let mut run = RemoteRun::new(ctx, spec, rl)?;
     run.add(ctx, spec, rl, l)?;
-    // The eager loop keeps its answers outside the memory charge until it joins them,
-    // and admits the joined rows.
-    run.send(ctx, spec, rl, true, &mut |_| Ok(()))?;
+    // The eager loop admits its answers as they arrive and holds them on one charge
+    // until it has joined them.
+    let held = ctx.charge(0)?;
+    run.send(ctx, spec, rl, true, &mut |bytes| held.resize(bytes))?;
     let t = run.join(ctx, spec, l, vars)?;
+    drop(held);
     Ok((t, run.stats))
 }
 
@@ -1193,7 +1317,12 @@ pub(super) struct RemoteRun {
     /// the constants in force where the loop was planned
     outer: Subst,
     pattern: GraphPattern,
+    /// the pattern without its outermost slice, which the cache keys
     text: String,
+    /// the outermost slice of the pattern, which bounds the cache's entries
+    slice: svccache::Slice,
+    /// the parts of every input's cache key before its values
+    parts: svccache::Parts,
     caching: bool,
     inputs: Vec<Input>,
     by_values: FxHashMap<Vec<Option<Term>>, usize>,
@@ -1259,7 +1388,9 @@ impl RemoteRun {
         } else {
             None
         };
-        let text = spec.pattern.to_string();
+        let (base, slice) = outer_slice(&spec.pattern);
+        let text = base.to_string();
+        let parts = svccache::Parts::of(&ctx.service_scope, rl.endpoint.as_str(), &text);
         let cache = &ctx.snap.results.service;
         let caching = rl.cache != CacheMode::None
             && rl.cache != CacheMode::Off
@@ -1271,6 +1402,8 @@ impl RemoteRun {
             outer,
             pattern,
             text,
+            slice,
+            parts,
             caching,
             inputs: Vec::new(),
             by_values: FxHashMap::default(),
@@ -1388,7 +1521,9 @@ impl RemoteRun {
             }
             if let Some(k) = &input.key {
                 if rl.cache.reads() {
-                    input.rows = cache.get(k);
+                    // what the lookup allocates is admitted before it is, on the
+                    // charge that settles into the kept lease below
+                    input.rows = cache.get_admitted(k, self.slice, &|n| row_decode.add(n))?;
                     if let Some(rows) = &input.rows {
                         self.stats.cache_hits += 1;
                         self.held = self.held.saturating_add(rows.bytes());
@@ -1438,6 +1573,7 @@ impl RemoteRun {
         let missing: Vec<usize> = self.missing.drain(..ready).collect();
         let mut held = self.held;
         let (names, outer, pattern) = (&self.names, &self.outer, &self.pattern);
+        let (key_parts, slice) = (self.parts, self.slice);
         let (inputs, stats) = (&mut self.inputs, &mut self.stats);
         let unit = || {
             Arc::new(Rows {
@@ -1445,7 +1581,8 @@ impl RemoteRun {
                 rows: vec![Vec::new()],
             })
         };
-        let one = |ctx: &Ctx, input: &Input, stats: &mut LoopStats| -> Result<Rows> {
+        // the request of one input alone
+        let single = |input: &Input| -> String {
             let mut s = Subst {
                 hidden: outer.hidden.clone(),
                 ..Subst::default()
@@ -1457,102 +1594,139 @@ impl RemoteRun {
             }
             s.map
                 .extend(outer.map.iter().map(|(k, v)| (k.clone(), v.clone())));
+            single_request(&substitute(&spec.pattern, &s))
+        };
+        // one input's request, its solutions admitted as they arrive on a charge that
+        // the caller drops once it has admitted them itself
+        let one = |input: &Input, stats: &mut LoopStats| {
             stats.requests += 1;
-            fetch_rows(
-                ctx,
-                &rl.endpoint,
-                &single_request(&substitute(&spec.pattern, &s)),
-            )
+            let charge = ctx.charge(0)?;
+            let rows = fetch_rows_within(ctx, &rl.endpoint, &single(input), None, Some(&charge))?;
+            Ok::<_, Error>((rows, charge))
+        };
+        // the request of a chunk of inputs: one input's alone, or a bulk request
+        let request = |chunk: &[usize], inputs: &[Input]| -> String {
+            if chunk.len() == 1 {
+                return single(&inputs[chunk[0]]);
+            }
+            if rl.values {
+                let tuples: Vec<&[Option<Term>]> =
+                    chunk.iter().map(|i| &inputs[*i].values[..]).collect();
+                values_request(pattern, names, &tuples, &rl.idx)
+            } else {
+                let members: Vec<GraphPattern> = chunk
+                    .iter()
+                    .map(|i| {
+                        let mut s = Subst::default();
+                        for (n, t) in names.iter().zip(&inputs[*i].values) {
+                            if let Some(t) = t {
+                                s.add(n, t.clone());
+                            }
+                        }
+                        substitute(pattern, &s)
+                    })
+                    .collect();
+                union_request(&members, &rl.idx)
+            }
         };
         let cache = &ctx.snap.results.service;
-        for chunk in missing.chunks(bulk) {
+        let chunks: Vec<&[usize]> = missing.chunks(bulk).collect();
+        // an in-process endpoint answers one request at a time
+        let width = if super::exec::is_local(ctx, rl.endpoint.as_str()) {
+            1
+        } else {
+            rl.parallel.max(1)
+        };
+        // Up to `width` requests go out at once. Their answers are taken in the order of
+        // the inputs, so neither the answer nor the requests that follow depend on
+        // which response came first, and no wave starts after a failure.
+        for wave in chunks.chunks(width) {
             ctx.check()?;
-            let fetched: Result<Vec<(usize, Rows, bool)>> = if chunk.len() == 1 {
-                one(ctx, &inputs[chunk[0]], stats).map(|r| vec![(chunk[0], r, true)])
-            } else {
-                let query = if rl.values {
-                    let tuples: Vec<&[Option<Term>]> =
-                        chunk.iter().map(|i| &inputs[*i].values[..]).collect();
-                    values_request(pattern, names, &tuples, &rl.idx)
+            let queries: Vec<String> = wave.iter().map(|c| request(c, inputs)).collect();
+            stats.requests += queries.len();
+            let answers = fetch_all(ctx, &rl.endpoint, &queries)?;
+            for (chunk, answer) in wave.iter().copied().zip(answers) {
+                // the charges that admitted the answers, held until `admit` has them
+                let mut charges = Vec::new();
+                let fetched: Result<Vec<(usize, Rows, bool)>> = if chunk.len() == 1 {
+                    answer.map(|(r, c)| {
+                        charges.push(c);
+                        vec![(chunk[0], r, true)]
+                    })
                 } else {
-                    let members: Vec<GraphPattern> = chunk
-                        .iter()
-                        .map(|i| {
-                            let mut s = Subst::default();
-                            for (n, t) in names.iter().zip(&inputs[*i].values) {
-                                if let Some(t) = t {
-                                    s.add(n, t.clone());
-                                }
-                            }
-                            substitute(pattern, &s)
-                        })
-                        .collect();
-                    union_request(&members, &rl.idx)
-                };
-                stats.requests += 1;
-                match fetch_rows(ctx, &rl.endpoint, &query) {
-                    Ok(r) => match split(&r, &rl.idx, chunk.len()) {
-                        Some(parts) => Ok(chunk
-                            .iter()
-                            .copied()
-                            .zip(parts)
-                            .map(|(i, p)| (i, p, true))
-                            .collect()),
-                        None => {
-                            // cut short: one request per input
-                            stats.retried += 1;
-                            let mut out = Vec::new();
-                            let mut err = None;
-                            // Each answer is held before the next request goes out.
-                            let mut retried = held;
-                            for i in chunk {
-                                match ctx
-                                    .check()
-                                    .and_then(|()| one(ctx, &inputs[*i], stats))
-                                    .and_then(|r| {
-                                        retried = retried.saturating_add(r.bytes());
-                                        admit(retried).map(|()| r)
-                                    }) {
-                                    Ok(r) => out.push((*i, r, true)),
-                                    Err(e) => {
-                                        err = Some(e);
-                                        break;
+                    match answer {
+                        // the parts copy the response, so they are admitted before
+                        Ok((r, c)) => match c.add(r.retained_bytes()).map(|()| {
+                            charges.push(c);
+                            split(&r, &rl.idx, chunk.len())
+                        }) {
+                            Err(e) => Err(e),
+                            Ok(Some(parts)) => Ok(chunk
+                                .iter()
+                                .copied()
+                                .zip(parts)
+                                .map(|(i, p)| (i, p, true))
+                                .collect()),
+                            Ok(None) => {
+                                // cut short: one request per input
+                                stats.retried += 1;
+                                let mut out = Vec::new();
+                                let mut err = None;
+                                // Each answer is held before the next request goes out.
+                                let mut retried = held;
+                                for i in chunk {
+                                    match ctx
+                                        .check()
+                                        .and_then(|()| one(&inputs[*i], stats))
+                                        .and_then(|(r, c)| {
+                                            retried = retried.saturating_add(r.bytes());
+                                            admit(retried).map(|()| {
+                                                drop(c);
+                                                r
+                                            })
+                                        }) {
+                                        Ok(r) => out.push((*i, r, true)),
+                                        Err(e) => {
+                                            err = Some(e);
+                                            break;
+                                        }
                                     }
                                 }
+                                match err {
+                                    Some(e) => Err(e),
+                                    None => Ok(out),
+                                }
                             }
-                            match err {
-                                Some(e) => Err(e),
-                                None => Ok(out),
-                            }
-                        }
-                    },
-                    Err(e) => Err(e),
-                }
-            };
-            match fetched {
-                Ok(parts) => {
-                    for (i, rows, complete) in parts {
-                        let rows = Arc::new(rows);
-                        if self.caching
-                            && complete
-                            && rl.cache.writes()
-                            && let Some(k) = &inputs[i].key
-                        {
-                            cache.put(k.clone(), rows.clone());
-                        }
-                        inputs[i].rows = Some(rows);
+                        },
+                        Err(e) => Err(e),
                     }
+                };
+                match fetched {
+                    Ok(answered) => {
+                        for (i, rows, complete) in answered {
+                            let rows = Arc::new(rows);
+                            if self.caching
+                                && complete
+                                && rl.cache.writes()
+                                && let Some(k) = &inputs[i].key
+                            {
+                                cache.put(k.clone(), key_parts, slice, rows.clone());
+                            }
+                            inputs[i].rows = Some(rows);
+                        }
+                    }
+                    Err(e) => failed(ctx, e, rl, chunk, inputs, unit)?,
                 }
-                Err(e) => failed(e, rl, chunk, inputs, unit)?,
+                let answered: u64 = chunk
+                    .iter()
+                    .filter_map(|&i| inputs[i].rows.as_ref())
+                    .map(|rows| rows.bytes())
+                    .sum();
+                held = held.saturating_add(answered);
+                self.held = held;
+                admit(held)?;
+                drop(charges);
             }
-            let answered: u64 = chunk
-                .iter()
-                .filter_map(|&i| inputs[i].rows.as_ref())
-                .map(|rows| rows.bytes())
-                .sum();
-            held = held.saturating_add(answered);
-            self.held = held;
-            admit(held)?;
         }
         Ok(())
     }
@@ -1642,9 +1816,11 @@ impl RemoteRun {
     }
 }
 
-/// A failed request: a refusal and a spent budget always fail the query; with SILENT,
-/// any other failure gives each of the chunk's inputs one empty solution.
+/// A failed request: a refusal and a spent budget always fail the query, and so does a
+/// failure once the request's outbound time is spent; with SILENT, any other failure
+/// gives each of the chunk's inputs one empty solution.
 fn failed(
+    ctx: &Ctx,
     e: Error,
     rl: &RemoteLoop,
     chunk: &[usize],
@@ -1656,6 +1832,7 @@ fn failed(
         | Error::BudgetExceeded(_)
         | Error::Timeout
         | Error::Cancelled) => Err(e),
+        e if ctx.outbound_budget.remaining_time().is_zero() => Err(e),
         _ if rl.silent => {
             for i in chunk {
                 inputs[*i].rows = Some(unit());
@@ -1804,6 +1981,52 @@ mod tests {
         );
         assert!(eff("SELECT * { SERVICE <bulk+x:http://e/s> { ?s ?p ?o } }").is_err());
         assert!(eff("SELECT * { SERVICE <cache+maybe:http://e/s> { ?s ?p ?o } }").is_err());
+        // parallel, with and without a count
+        let (o, _) = eff("SELECT * { SERVICE <loop:parallel+3:http://e/s> { ?s ?p ?o } }")
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.parallel, Some(Some(3)));
+        let (o, _) = eff("SELECT * { SERVICE <parallel:loop:http://e/s> { ?s ?p ?o } }")
+            .unwrap()
+            .unwrap();
+        assert_eq!((o.parallel, o.looped), (Some(None), true));
+        assert!(eff("SELECT * { SERVICE <parallel+0:http://e/s> { ?s ?p ?o } }").is_err());
+    }
+
+    /// The outermost slice of a pattern is split off for the cache's key, and a pattern
+    /// without one has every solution.
+    #[test]
+    fn outer_slices() {
+        let q = |s: &str| pattern(&format!("SELECT * {{ SERVICE <http://e/s> {{ {s} }} }}"));
+        let inner = |gp: &GraphPattern| -> GraphPattern {
+            let mut found = None;
+            let _ = super::super::walk::visit_graph_patterns(gp, |p| {
+                if let GraphPattern::Service { inner, .. } = p {
+                    found.get_or_insert_with(|| (**inner).clone());
+                }
+                Ok::<(), ()>(())
+            });
+            found.expect("a SERVICE")
+        };
+        let gp = inner(&q("SELECT ?p { ?s ?p ?o } ORDER BY ?p OFFSET 2 LIMIT 3"));
+        let (base, slice) = outer_slice(&gp);
+        assert_eq!(
+            slice,
+            svccache::Slice {
+                offset: 2,
+                limit: Some(3)
+            }
+        );
+        assert!(!matches!(base, GraphPattern::Slice { .. }));
+        let gp = inner(&q("?s ?p ?o"));
+        assert_eq!(outer_slice(&gp).1, svccache::Slice::ALL);
+        assert_eq!(
+            svccache::Slice::ALL.limited(4).limited(9),
+            svccache::Slice {
+                offset: 0,
+                limit: Some(4)
+            }
+        );
     }
 
     fn pattern(q: &str) -> GraphPattern {
