@@ -1,4 +1,4 @@
-//! Linked-data publishing front end (spec C32, phase 1).
+//! Server-local linked-data publishing (spec C32).
 //!
 //! Serves resolvable IRIs under hosted namespaces registered in the C30 resource catalog
 //! (`resources.json`):
@@ -15,9 +15,13 @@
 //!   triple ACLs and server query budgets.
 //! * PURL and w3id recipe export for hosted vocabulary namespaces ([`recipes`]).
 
+mod docs;
 pub mod html;
 pub mod http;
+mod ols;
+mod publication;
 pub mod recipes;
+mod search;
 #[cfg(test)]
 mod tests;
 
@@ -1055,6 +1059,10 @@ pub fn not_found() -> ApiError {
     )
 }
 
+fn bad(message: impl Into<String>) -> ApiError {
+    err_code(StatusCode::BAD_REQUEST, "bad-publication-request", message)
+}
+
 fn history_gone() -> ApiError {
     err_code(
         StatusCode::GONE,
@@ -2033,6 +2041,13 @@ impl<'a> ChargedLimitedWriter<'a> {
             charge,
             charged: 0,
             budget_err: None,
+        }
+    }
+
+    fn into_result(self) -> sparkles::Result<Vec<u8>> {
+        match self.budget_err {
+            Some(error) => Err(error),
+            None => Ok(self.buf),
         }
     }
 

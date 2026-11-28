@@ -125,6 +125,9 @@ pub fn classify(
     if r == "/$/algo/{ds}/run" && *method == Method::POST {
         return None;
     }
+    if r.starts_with("/ols4/api/") {
+        return Some(Class::Query);
+    }
     if let Some(admin) = r.strip_prefix("/$/") {
         // MCP charges each message by its tool and dataset (`mcp::http`)
         if admin == "ping" || admin == "metrics" || admin.starts_with("ready") || admin == "mcp" {
@@ -153,6 +156,7 @@ pub fn classify(
             // linked-data publishing runs bounded DESCRIBE queries over readable graphs
             || admin == "ld"
             || admin.starts_with("ld/")
+            || admin == "ontology/{ds}/doc"
         {
             return Some(Class::Query);
         }

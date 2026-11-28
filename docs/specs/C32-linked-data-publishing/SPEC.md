@@ -1,10 +1,8 @@
 # C32: Linked-data publishing
 
-> **Status:** implemented in part (Phase 1).
+> **Status:** implemented for server-local publishing.
 >
-> **Roadmap:** [item 461](../../ROADMAP.md) holds this work. Each candidate phase below gets
-> its own numbered roadmap item when it is ready to start, and the items already numbered
-> are named in their phase.
+> **Roadmap:** [item 461](../../ROADMAP.md#completed) delivered server-local publishing.
 
 The design covers content negotiation for hosted namespaces, term and ontology pages with generated documentation, catalog-wide term search and an OLS API subset.
 
@@ -71,9 +69,8 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Phase 1 (the linked-data front end) has shipped. [Item 461](../../ROADMAP.md) keeps the
-remaining phases: term and ontology pages with a documentation generator, catalog-wide
-term search, the OLS4 API subset and the deferred public-hub phases.
+The linked-data front end, documentation, catalog term search and OLS4 REST subset
+complete item 461. The public-hub phases remain deferred under the design constraints.
 
 The implementation lives in `crates/sparkles-server/src/linked_data/` and extends
 `resources.json` to format 2 (keeping format 1 on disk when no version uses the new
@@ -87,6 +84,19 @@ recipe export (`w3id`, `htaccess` and `purl`) at `/$/resources/{id}/recipes`.
 Every linked-data request enforces dataset, graph and triple read permissions through
 `CallerContext::read_options`, classifies as a query for rate limiting and query memory
 admission, bounds `DESCRIBE` output by default and answers `404 Not Found` before any
-redirect when the caller cannot read the backing data. The first acceptance gate and the
-page half of the second acceptance gate are met; catalog-wide search remains with its
-phase.
+redirect when the caller cannot read the backing data.
+
+The documentation generator at `/$/ontology/{ds}/doc` and
+`/$/ld/resources/{id}/doc` shows the asserted hierarchy, definitions, usage, examples
+and annotation coverage. Its HTML export includes an internal term index and requires
+no external assets. Hosted HTML descriptions display sections using the same RDF
+predicates within their existing DESCRIBE bounds.
+
+The catalog term index is built from authorized RDF rows for each request. It ranks
+normalized lexical matches and sparse character trigram vectors over labels, synonyms,
+definitions and identifiers. Ontology facets and autocomplete use that same data.
+The OLS4 subset under `/ols4/api` serves search, suggestions, ontology metadata, term
+details and direct or transitive asserted hierarchy. Dataset query grants, graph and
+triple protections are applied before the index, counts and documents are derived.
+The new routes prohibit response caching and enforce query and response budgets.
+Both acceptance gates are met by the linked-data router and authorization tests.

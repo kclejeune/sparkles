@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Ontology documentation and catalog term search
+
+Sparkles generates ontology and term documentation from readable dataset and catalog
+graphs, with definitions, hierarchy, usage, examples and a standalone HTML export.
+Catalog search adds lexical and character trigram vector ranking, ontology facets and
+autocomplete. An OLS4 REST subset serves search, ontology metadata and asserted hierarchy
+under the caller's query grants. This completes roadmap item 461.
+
 ### View access by grant containment
 
 A caller reads an incremental view when its grants cover every quad of the dataset, when

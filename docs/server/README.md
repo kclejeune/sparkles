@@ -54,6 +54,9 @@ The linked-data front end resolves IRIs under hosted vocabulary namespaces and c
 * **Versioned snapshots and recipes.** Catalog versions that set `versionIri` and `snapshot` resolve versioned IRIs to their pinned snapshots or commits with Memento headers. Administrators can export Apache `.htaccess`, w3id and PURL redirection recipes at `/$/resources/{id}/recipes`.
 * **Authorization and safety.** Every lookup, redirect target, HTML page and bounded `DESCRIBE` response runs through the caller's dataset, graph and triple read permissions and server query budgets. Unauthorized or missing IRIs answer `404 Not Found` without leaking private terms, and HTML pages escape all dynamic values under a script-free Content Security Policy.
 
+* **Ontology documentation.** Open `/$/ontology/{ds}/doc` for a dataset or `/$/ld/resources/{id}/doc` for a catalog resource. The generated HTML groups asserted hierarchy, definitions, usage and examples and exports as one offline file.
+* **Catalog search and OLS4.** Search readable resources by label, synonym, definition or identifier with lexical or character trigram vector ranking, ontology facets and autocomplete. The OLS4 REST subset shares the same caller-visible data and serves ontology and term browsing under `/ols4/api`.
+
 ## Access control and security
 
 Authentication is disabled by default. When enabled via `serve --auth-config`, access is denied unless explicitly granted ([API.md](../API.md#authentication-and-access-control), [C09](../specs/C09-dataset-access-control.md)).
