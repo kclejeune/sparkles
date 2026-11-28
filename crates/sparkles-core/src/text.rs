@@ -142,6 +142,24 @@ pub struct TextConfig {
     pub dictionaries: std::collections::BTreeMap<String, String>,
 }
 
+/// Durable intent of an online configuration. Bind it to the last active settings
+/// so an intervening change by another program cannot be silently undone.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingTextConfig {
+    pub base: Option<String>,
+    pub config: TextConfig,
+}
+
+pub(crate) fn read_pending_config(root: &std::path::Path) -> Result<Option<PendingTextConfig>> {
+    const NAME: &str = "text.pending.json";
+    match std::fs::read(root.join(NAME)) {
+        Ok(bytes) => crate::formats::settings_from_slice(NAME, &bytes).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl TextConfig {
     /// The configuration with `dictionaries` naming the installed dictionary of each
     /// dictionary analyzer its languages use. Fails when one is missing or this build
@@ -671,6 +689,9 @@ pub struct TextStatus {
     pub disk_bytes: u64,
     pub segments: usize,
     pub config: TextConfig,
+    /// Configuration being built alongside the active index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_config: Option<TextConfig>,
     pub format_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_rebuild: Option<RebuildInfo>,
@@ -865,6 +886,9 @@ pub(crate) struct TextProbe {
     pub configured: bool,
     /// `text.json` does not parse
     pub config_error: Option<String>,
+    /// an online configuration is pending
+    pub pending: bool,
+    pub pending_error: Option<String>,
     /// this build has no full-text support: only the configuration was read
     pub unsupported: bool,
     /// `<root>/text/` exists
@@ -885,6 +909,17 @@ pub(crate) struct TextProbe {
     pub damaged: Vec<(String, String)>,
 }
 
+impl TextProbe {
+    fn check_pending(&mut self, root: &std::path::Path) {
+        match read_pending_config(root) {
+            Ok(Some(_)) => self.pending = true,
+            Ok(None) => {}
+            Err(error) => self.pending_error = Some(error.to_string()),
+        }
+        self.configured |= self.pending || self.pending_error.is_some();
+    }
+}
+
 /// The commit payload of the index's `meta.json`.
 #[derive(Debug)]
 pub(crate) struct ProbePayload {
@@ -900,6 +935,8 @@ pub(crate) use imp::probe;
 #[cfg(not(feature = "text"))]
 pub(crate) fn probe(root: &std::path::Path, _checksums: bool) -> TextProbe {
     let mut p = TextProbe::default();
+    p.check_pending(root);
+    p.unsupported = p.configured;
     match std::fs::read(root.join("text.json")) {
         Ok(b) => {
             p.configured = true;
@@ -969,7 +1006,7 @@ impl StandardAnalyzer {
 }
 
 #[cfg(feature = "text")]
-pub(crate) use imp::read_config as imp_read_config;
+pub(crate) use imp::{FORMAT as TEXT_INDEX_FORMAT, config_hash, read_config as imp_read_config};
 #[cfg(feature = "text")]
 pub use imp::{Staged, TextIndex};
 #[cfg(feature = "text")]
@@ -1034,7 +1071,7 @@ mod imp {
     /// The index format. Format 2 keeps each document's terms in columns (fast fields),
     /// where format 1 kept them in the doc store. An index of another format is rebuilt
     /// on open.
-    const FORMAT: u32 = 2;
+    pub(crate) const FORMAT: u32 = 2;
     const TOKENIZER: &str = "sparkles_standard";
 
     #[derive(Clone)]
@@ -1671,7 +1708,7 @@ mod imp {
         h.finish()
     }
 
-    fn config_hash(c: &TextConfig) -> String {
+    pub(crate) fn config_hash(c: &TextConfig) -> String {
         let bytes = serde_json::to_vec(c).unwrap();
         let d = sha2::Sha256::digest(&bytes);
         d.iter().map(|b| format!("{b:02x}")).collect()
@@ -1822,6 +1859,7 @@ mod imp {
         mut after_snapshot: impl FnMut(&tantivy::IndexMeta),
     ) -> super::TextProbe {
         let mut p = super::TextProbe::default();
+        p.check_pending(root);
         let config = match read_config(root) {
             Ok(Some(c)) => c,
             Ok(None) => return p,
@@ -2920,7 +2958,7 @@ mod imp {
     }
 
     pub(crate) fn cleanup_staging(root: &Path) -> Result<()> {
-        for name in ["text.new", "text.old"] {
+        for name in ["text.new", "text.old", "text.configure"] {
             match std::fs::remove_dir_all(root.join(name)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
                 _ => {}
@@ -2949,8 +2987,20 @@ mod imp {
         memory_budget: usize,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Built> {
-        let t0 = std::time::Instant::now();
         let new_dir = root.map(|r| r.join("text.new"));
+        build_in(new_dir, config, epoch, snap, threads, memory_budget, check)
+    }
+
+    fn build_in(
+        new_dir: Option<PathBuf>,
+        config: &TextConfig,
+        epoch: u64,
+        snap: &Snapshot,
+        threads: usize,
+        memory_budget: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Built> {
+        let t0 = std::time::Instant::now();
         let (index, fields) = new_index(new_dir.as_deref(), config)?;
         let mut docs = 0u64;
         {
@@ -2994,19 +3044,19 @@ mod imp {
 
     impl TextIndex {
         pub(crate) fn recovery_build(
-            root: &Path,
+            staging: Option<PathBuf>,
             config: &TextConfig,
+            epoch: u64,
             snap: &Snapshot,
             check: &dyn Fn() -> Result<()>,
         ) -> Result<Built> {
             check()?;
-            cleanup_staging(root)?;
             // Bound automatic recovery to two writer threads within the existing
             // 64 MiB total arena budget. Single-CPU hosts keep one writer.
             let threads = std::thread::available_parallelism()
                 .map_or(1, |n| n.get())
                 .min(2);
-            build_index(Some(root), config, 1, snap, threads, 64 << 20, check)
+            build_in(staging, config, epoch, snap, threads, 64 << 20, check)
         }
 
         /// Build the index of `snap` into `root/text` for a store that is not open yet,
@@ -3065,7 +3115,7 @@ mod imp {
         /// Caller owns final writer admission and completes this durability fence even
         /// if cancellation arrives after admission. No detached worker publishes.
         pub(crate) fn recovery_install(
-            root: &Path,
+            root: Option<&Path>,
             config: TextConfig,
             built: Built,
             head: &Snapshot,
@@ -3078,9 +3128,9 @@ mod imp {
                 docs,
                 started,
             } = built;
-            let (index, fields, dir) = publish_built(Some(root), &config, index, fields, dir)?;
+            let (index, fields, dir) = publish_built(root, &config, index, fields, dir)?;
             let live = live_of(index, fields, &config, dir, head.commit)?;
-            let inner = inner_of(Some(root), config, live, epoch);
+            let inner = inner_of(root, config, live, epoch);
             *inner.last_rebuild.lock() = Some(RebuildInfo {
                 at: crate::commit::rfc3339_ms(crate::commit::now_ms()),
                 ms: started.elapsed().as_secs_f64() * 1000.,
@@ -3811,6 +3861,7 @@ mod imp {
                     .map_or(0, |r| crate::store::dir_size(&r.join("text"))),
                 segments: searcher.segment_readers().len(),
                 config: self.config.clone(),
+                pending_config: None,
                 format_version: FORMAT,
                 last_rebuild: self.last_rebuild.lock().clone(),
                 message: stale,

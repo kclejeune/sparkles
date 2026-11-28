@@ -2,7 +2,7 @@
 //!
 //! The vector and spatial index builds run in the store's background threads, so their
 //! `put`, `enable` and `rebuild` return once the build starts, and `wait` blocks until it
-//! ends. The full-text index builds in the call.
+//! ends. Full-text configuration waits for the online build to publish.
 
 use crate::Dataset;
 use crate::error::Result;
@@ -96,7 +96,7 @@ impl TextIndex {
         Err(no_text())
     }
 
-    /// Rebuild the index from the current state (writes wait meanwhile).
+    /// Rebuild the index from the current state while writes continue.
     pub fn rebuild(&self) -> Result<TextStatus> {
         #[cfg(feature = "text")]
         return self.ds.store().rebuild_text();

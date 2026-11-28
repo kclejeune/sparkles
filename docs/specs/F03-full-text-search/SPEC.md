@@ -110,7 +110,7 @@ Semantics:
 |---|---|---|---|
 | GET | `/$/text/{ds}` | 1 | Returns `TextStatus` (below), or `{ "enabled": false }` when text search is off. An unknown dataset gives `404`. |
 | POST | `/$/text/{ds}/rebuild` | 1 | Rebuilds the index in full from the current snapshot and returns a `Task` (`kind: "text-rebuild"`). Gives `409` if a rebuild is running, `403` on `--read-only` and `400` if text search is not enabled. |
-| PUT | `/$/text/{ds}` | 2 | Takes a `TextConfig` body, enables or reconfigures text search, then starts a rebuild task. An invalid config gives `400`. |
+| PUT | `/$/text/{ds}` | 2 | Takes a `TextConfig` body and starts an online configuration task. An active index serves requests until the replacement publishes. An invalid configuration gives `400`. |
 | DELETE | `/$/text/{ds}` | 2 | Disables text search and removes `text.json` and the index directory. |
 | POST | `/$/datasets` | 2 | Accepts an optional `text: true \| TextConfig` in the JSON body. |
 | GET/POST | `/{ds}/text?q=&predicate=&lang=&graph=&limit=&highlight=` | 2 | A convenience search for the UI. It returns JSON hits with snippets (§2.5). |
@@ -129,7 +129,7 @@ type TextStatus = {
   docs: number; seq: number; storeSeq: number;   // ready ⇔ seq == storeSeq
   epoch: number;                                  // +1 per rebuild / reconfiguration
   diskBytes: number; segments: number;
-  config: TextConfig; formatVersion: 1;
+  config: TextConfig; pendingConfig?: TextConfig; formatVersion: 2;
   lastRebuild?: { at: string; ms: number; docs: number };
   message?: string;                               // reason for stale / failed
 };
@@ -330,6 +330,10 @@ graph_var: Option<VarId>, dedup: bool }`. `dedup` is true when the active graph 
 
 ### 5.2 Persistence (format version 1)
 
+The delivered online configuration path stages persistent settings in `text.pending.json`
+and the derived index in `text.configure`. The active settings remain in `text.json`
+until the replacement installs. See the [delivery record](OUTCOME.md#roadmap-follow-ups-2026-10-12).
+
 ```
 <root>/text.json        TextConfig + "formatVersion": 1 — authoritative, written with write_atomic
 <root>/text/            Tantivy index (derived; deleting it only forces a rebuild)
@@ -429,6 +433,10 @@ releases the lock during the build. The commit path appends the keys of touched 
 journal, and a short catch-up under the lock replays the journal before the swap.
 
 ### 5.6 Open and recovery (`Store::open`, before WAL replay)
+
+Startup compares the installed payload with the pending and active configurations.
+It promotes a ready replacement or resumes the pending build alongside a usable active
+index. An intervening change to the active settings can supersede pending intent.
 
 1. Without `text.json`, text search is off. If `text.json` exists but Sparkles was built
    without the feature, it warns once and ignores the file. The text index then falls

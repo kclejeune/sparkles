@@ -413,7 +413,7 @@ pub const CATALOG: FileKind = FileKind {
 /// The full-text index.
 pub const TEXT: FileKind = FileKind {
     id: "text",
-    files: "text/ (Tantivy) and text.json",
+    files: "text/ (Tantivy), text.json and text.pending.json",
     marker: "`FORMAT` of the index metadata; another format is rebuilt on open",
     class: Class::Derived,
     writes: 2,
@@ -820,6 +820,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("validation.json", 3),
     ds("validation-status.json", 1),
     ds("text.json", 1),
+    ds("text.pending.json", 1),
     ds("reasoning-imports.json", 2),
     named(ds("reasoning.json", 2), "reasoningFormat"),
     named(ds("query-reasoning.json", 1), "queryReasoningFormat"),
