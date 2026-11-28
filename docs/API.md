@@ -1981,10 +1981,11 @@ first of its group appears only in its group's equivalence. The answer has the k
 `commit`, `status`, `reason`, `result`, `outcome`, `activity` and `staleCommit`, with
 `source: "keptClassification"`, `axioms`, `total`, `offset`, `limit` and `next`. `axioms`
 and `total` are null unless the status is `available`, so a miss never reads as an empty
-listing. `limit` is from 1 to 1,000, and a nonzero `offset` needs `resultId` and
+listing, and with `about` the `entity` member reports whether the class is present. `limit` is from 1 to 1,000, and a nonzero `offset` needs `resultId` and
 `at=commit:N`. The page walks the retained taxonomy and builds only its own rows, whose
-estimated bytes count against the request's memory limit and the server pool, so a page
-past them is `507`. `elOnly` reads the kept EL-only classification. The selector refuses
+estimated bytes count against the request's memory limit and the server pool. A page past
+the request's limit or the whole pool is `507`, and one that the busy pool cannot take is
+`503`. `elOnly` reads the kept EL-only classification. The selector refuses
 `inferences=true`, `assertions=true` and `format=ofn`, and its answers are
 `Cache-Control: no-store`.
 

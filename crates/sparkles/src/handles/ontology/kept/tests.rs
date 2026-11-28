@@ -2093,6 +2093,28 @@ fn kept_axioms_page_the_taxonomy_axioms_in_order_with_exact_filters() {
             .collect();
         assert_eq!(got, want, "{local}");
     }
+    // an absent class is reported as absent, not as an empty listing
+    let missing = ds
+        .ontology()
+        .kept_axioms(
+            &req(),
+            &KeptAxiomQuery {
+                about: Some(iri("Missing")),
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    assert_eq!(missing.total, Some(0));
+    assert!(!missing.read.entity.as_ref().unwrap().present);
+    let w = super::super::wire::call(
+        &ds,
+        "axioms",
+        &json!({"classification": "kept", "about": iri("B")}),
+        &opts(),
+    )
+    .unwrap();
+    assert_eq!(w["entity"]["present"], true, "{w}");
     // E is not its group's representative, so only the group's equivalence names it
     let e = kept_axioms_all(
         &ds,

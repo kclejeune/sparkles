@@ -4,9 +4,9 @@
 
 ### Entity and axiom reads from the kept classification (item 588)
 
-`GET /$/ontology/{ds}/entity` and `GET /$/ontology/{ds}/axioms`, the `entity` and `axioms`
-operations of every binding's generic ontology call, and the new `Ontologies::kept_entity`
-and `Ontologies::kept_axioms` take `classification=kept`. The entity report gains a
+`GET /$/ontology/{ds}/entity` and `GET /$/ontology/{ds}/axioms`, the library's wire `entity`
+and `axioms` operations, and the new `Ontologies::kept_entity` and `Ontologies::kept_axioms`
+take `classification=kept`. The entity report gains a
 `classification` member with the kept read's status, result and outcome and the first
 pages of the class's direct parents, children and equivalents. The axiom listing pages
 the `SubClassOf` and `EquivalentClasses` axioms that the kept taxonomy infers, in the order
@@ -20,7 +20,7 @@ read transaction or a historical view holds. On the JVM, `keptClassification`, t
 individual and term reads now answer a dataset returned by `at()` and an active read
 transaction at their own commit, where they threw `JenaTransactionException` before. They
 still throw it in a write transaction, before anything is flushed. Python and Node.js
-selectors are roadmap item 1319.
+selectors are roadmap item 1325.
 
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 

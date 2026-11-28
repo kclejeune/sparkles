@@ -930,6 +930,10 @@ impl Ontologies {
         let Some(p) = selected else {
             return Ok(answer);
         };
+        // an absent class reads as `present: false`, not as an empty inference
+        if let Some(iri) = &query.about {
+            answer.read.entity = Some(entity_status(&p, iri));
+        }
         let t = &p.classification.taxonomy;
         let wants =
             |ty: sparkles_owl::AxiomType| query.types.as_ref().is_none_or(|s| s.contains(&ty));
@@ -1277,7 +1281,8 @@ impl KeptAxiomQuery {
     }
 }
 /// What [`Ontologies::kept_axioms`] answers. `axioms` and `total` are `None` unless
-/// `read.status` is available, so a miss never reads as an empty inference.
+/// `read.status` is available, so a miss never reads as an empty inference, and
+/// `read.entity` gives the status of an `about` class in an available result.
 #[derive(Debug)]
 pub struct KeptAxioms {
     pub read: KeptRead,

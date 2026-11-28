@@ -444,8 +444,9 @@ class OntologyTest {
                     { pinned.ontology().individuals(read.copy(inferences = true)) },
                     { pinned.ontology().term("http://ex.org/Professor", read.copy(inferences = true)) },
                 )) {
-                    val e = assertThrows(Exception::class.java) { call() }
-                    assertTrue(e is SparklesError, "the native read answers: $e")
+                    // not the refusal of a read without an exact commit, which the pin names
+                    val e = assertThrows(SparklesNotFoundException::class.java) { call() }
+                    assertTrue(e.engineMessage.contains("materialization"), "the native read answers: $e")
                 }
                 // the head's live reads are unchanged
                 assertEquals("unavailable", ds.ontology().keptAxioms(read.copy(graphs = listOf("http://ex.org/other"))).getString("status"))

@@ -1004,7 +1004,7 @@ walks the retained taxonomy without copying it and builds only its page's rows. 
 their estimated bytes to the request's memory limit and the server pool's grant before it
 builds each one, and holds the charge while the answer lives. `about` keeps the axioms that
 mention a class, so a class that is not the first of its group appears only in its group's
-equivalence. A miss classifies, maps and warms nothing and answers its status with null
+equivalence, and its `entity` status says whether the class is present. A miss classifies, maps and warms nothing and answers its status with null
 axioms, totals and pages, and a restricted view or synthetic snapshot reports
 `unsupportedScope` without observing the shared slot. The selector refuses `inferences`,
 the listing also refuses `assertions` and `format=ofn`, kept pages take limits from 1 to
@@ -1032,7 +1032,7 @@ restricted scopes, mismatches and a pinned snapshot after its commit was pruned.
 tests cover both selectors, their refusals and `no-store`, and the JVM's `OntologyTest`
 covers pinned views and read transactions after a later commit and the refusal in a write
 transaction without a flush. The Python and Node.js bindings do not take the selector
-and are item 1319.
+and are item 1325.
 
 ### The OWL 2 EL classifier
 

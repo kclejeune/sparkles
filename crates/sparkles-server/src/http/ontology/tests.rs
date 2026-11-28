@@ -4622,6 +4622,15 @@ async fn kept_entity_and_axioms_routes_read_the_kept_classification_without_clas
     .await
     .json();
     assert!(about["total"].as_u64().unwrap() >= 1);
+    assert_eq!(about["entity"]["present"], true);
+    let missing = get(
+        &s.app,
+        &format!("{axioms}&about={}", enc("http://ex.org/Missing")),
+    )
+    .await
+    .json();
+    assert_eq!(missing["total"], 0);
+    assert_eq!(missing["entity"]["present"], false);
     assert!(
         about["axioms"]
             .as_array()

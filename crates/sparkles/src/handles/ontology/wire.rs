@@ -2335,13 +2335,12 @@ pub fn kept_entity_json(e: &super::kept::KeptEntityRead) -> Result<J> {
     Ok(v)
 }
 /// The JSON of a kept-classification axiom listing. `axioms` and `total` are null
-/// unless the status is available.
+/// unless the status is available, and `entity` is the status of an `about` class.
 pub fn kept_axioms_body(name: &str, k: &super::kept::KeptAxioms, r: &Renderer) -> Result<J> {
     let mut v =
         serde_json::to_value(&k.read).map_err(|e| bad(format!("kept classification: {e}")))?;
     if let J::Object(m) = &mut v {
         m.remove("page");
-        m.remove("entity");
     }
     v["dataset"] = json!(name);
     v["source"] = json!("keptClassification");
