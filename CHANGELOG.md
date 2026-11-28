@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Growing ground conditions with the selection off (item 1250)
+
+The F24 specification now records a conditional completeness argument for the cut of
+ground-bodied clauses in rooted runs with the selection of ground body literals off, and
+names the obligations it leaves open, which stay with item 1220. On 104 generated
+ontologies around g1-051_p0012, every file except C4 finishes within 4 million
+conclusions with item 1231's repair off, and every complete answer agrees with HermiT in
+every mode of the repair. The containment test adds the generated files H1 and U2, which
+pass that bound without the cut. Item 1324 follows the cut's cost on part022 p01 and the
+bound on C4. This completes roadmap item 1250.
+
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 
 Term and value decoding in SPARQL UPDATE, ARQ property functions, registered property and aggregate extensions, custom aggregates, hybrid search, history service, path search, vector top-k, remote SERVICE and LATERAL enhancers, GeoSPARQL planner rewrites and aggregates, planner range and lexical probes and RDFS schema and explanation decoding now uses checked decode helpers that enforce live cancellation, deadline and memory controls while keeping decoded-output credit alive across multi-term operations. Plan and error diagnostic rendering decodes terms through `plan_term` so describing a plan never latches a decode refusal, and RDFS explanation keeps its answer memory limit separate from its decode workspace accounting. This lands the first wave of roadmap item 1308.

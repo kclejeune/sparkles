@@ -174,6 +174,80 @@ DifferentIndividuals(:a0 :a2)
 DifferentIndividuals(:a0 :a3)
 )";
 
+/// Generated neighbour `H1.ofn` of `g1-051_p0012`, which held the largest store of the
+/// growth without the cut and passes 4 million conclusions uncut with the marker repair off,
+/// filtered or unfiltered. HermiT 1.4.5 oracle: consistent, `C1 ⊑ Nothing`, `Thing ⊑ C0`.
+const H1: &str = "Prefix(:=<http://example.org/d#>)
+Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+Ontology(
+Declaration(Class(:C0))
+Declaration(Class(:C1))
+Declaration(Class(:C2))
+Declaration(Class(:C3))
+Declaration(Class(:C4))
+Declaration(ObjectProperty(:r0))
+Declaration(ObjectProperty(:r1))
+Declaration(NamedIndividual(:a0))
+Declaration(NamedIndividual(:a2))
+Declaration(NamedIndividual(:b0))
+SubClassOf(ObjectHasValue(ObjectInverseOf(:r1) :a0) :C2)
+SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:r1) ObjectAllValuesFrom(:r1 :C4)) :C3)
+SubClassOf(:C0 ObjectUnionOf(:C2 ObjectSomeValuesFrom(:r0 :C3)))
+SubClassOf(ObjectSomeValuesFrom(:r1 :C0) ObjectHasValue(owl:topObjectProperty :a2))
+SubClassOf(:C0 ObjectComplementOf(:C1))
+SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty ObjectComplementOf(:C0)) ObjectOneOf(:a0))
+SubClassOf(ObjectSomeValuesFrom(:r1 ObjectIntersectionOf(:C4 :C1)) ObjectSomeValuesFrom(:r1 ObjectHasValue(owl:topObjectProperty :a2)))
+SubClassOf(:C0 ObjectUnionOf(:C3 :C4))
+HasKey(:C3 (:r0 :r1) ())
+ClassAssertion(ObjectUnionOf(:C0 :C4) :a0)
+ClassAssertion(:C2 :a2)
+ObjectPropertyAssertion(:r1 :a2 :a2)
+ObjectPropertyAssertion(:r0 :a2 :a0)
+ObjectPropertyAssertion(:r0 :a0 :a0)
+ObjectPropertyAssertion(:r1 :a0 :a0)
+DifferentIndividuals(:a0 :a2)
+ClassAssertion(:C2 :b0)
+ObjectPropertyAssertion(:r0 :b0 :a0)
+DifferentIndividuals(:a0 :b0)
+)";
+
+/// Generated neighbour `U2.ofn` with a three-way union, which also passes 4 million
+/// conclusions uncut in every marker-repair mode. HermiT 1.4.5 oracle: consistent,
+/// `C1 ⊑ Nothing`, `Thing ⊑ C0`.
+const U2: &str = "Prefix(:=<http://example.org/d#>)
+Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+Ontology(
+Declaration(Class(:C0))
+Declaration(Class(:C1))
+Declaration(Class(:C2))
+Declaration(Class(:C3))
+Declaration(Class(:C4))
+Declaration(ObjectProperty(:r0))
+Declaration(ObjectProperty(:r1))
+Declaration(NamedIndividual(:a0))
+Declaration(NamedIndividual(:a2))
+Declaration(Class(:C4_1))
+SubClassOf(ObjectHasValue(ObjectInverseOf(:r1) :a0) :C2)
+SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:r1) ObjectAllValuesFrom(:r1 :C4)) :C3)
+SubClassOf(:C0 ObjectUnionOf(:C2 ObjectSomeValuesFrom(:r0 :C3)))
+SubClassOf(ObjectSomeValuesFrom(:r1 :C0) ObjectHasValue(owl:topObjectProperty :a2))
+SubClassOf(:C0 ObjectComplementOf(:C1))
+SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty ObjectComplementOf(:C0)) ObjectOneOf(:a0))
+SubClassOf(ObjectSomeValuesFrom(:r1 ObjectIntersectionOf(:C4 :C1)) ObjectSomeValuesFrom(:r1 ObjectHasValue(owl:topObjectProperty :a2)))
+SubClassOf(:C0 ObjectUnionOf(:C3 :C4 :C4_1))
+HasKey(:C3 (:r0 :r1) ())
+ClassAssertion(ObjectUnionOf(:C0 :C4) :a0)
+ClassAssertion(:C2 :a2)
+ObjectPropertyAssertion(:r1 :a2 :a2)
+ObjectPropertyAssertion(:r0 :a2 :a0)
+ObjectPropertyAssertion(:r0 :a0 :a0)
+ObjectPropertyAssertion(:r1 :a0 :a0)
+DifferentIndividuals(:a0 :a2)
+SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:r1) ObjectAllValuesFrom(:r1 :C4_1)) :C3)
+SubClassOf(ObjectSomeValuesFrom(:r1 ObjectIntersectionOf(:C4_1 :C1)) ObjectSomeValuesFrom(:r1 ObjectHasValue(owl:topObjectProperty :a2)))
+ClassAssertion(ObjectUnionOf(:C0 :C4_1) :a0)
+)";
+
 /// Genuine two-selected-premise R1 fixture (`MEET`, item 1220): at K's successor D, both
 /// premises `B(v) -> F(x)` and `B2(w) -> F2(x)` carry ground bodies (`gbody=true, sel=false`)
 /// and must meet in Hyper over `x` (`partners_x`) to derive `K ⊑ Ans`. HermiT 1.4.5 oracle:
@@ -435,6 +509,22 @@ fn ground_body_cut_and_m_return_cf_contain_growth_without_losing_answers() {
             unsat: &["C1"],
             top: &["C0"],
             subs: &[("C2", "C0"), ("C3", "C0"), ("C4", "C0")],
+        },
+        Fixture {
+            name: "h1",
+            prefix: "http://example.org/d#",
+            src: H1,
+            unsat: &["C1"],
+            top: &["C0"],
+            subs: &[("C2", "C0"), ("C3", "C0"), ("C4", "C0")],
+        },
+        Fixture {
+            name: "u2",
+            prefix: "http://example.org/d#",
+            src: U2,
+            unsat: &["C1"],
+            top: &["C0"],
+            subs: &[("C2", "C0"), ("C3", "C0"), ("C4", "C0"), ("C4_1", "C0")],
         },
         Fixture {
             name: "r1_meet",
