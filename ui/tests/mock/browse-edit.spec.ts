@@ -252,7 +252,7 @@ test('an edit invalidates inferences until explicit classification reads the new
       axioms.locator('[data-section="sub"]').getByRole('link', { name: 'Teacher' }),
     ).toBeVisible();
     // An edit may reread availability, but must not compute implicitly or retain old clauses.
-    await expect(axioms).toContainText('The kept classification does not match this source');
+    await expect(axioms).toContainText('The kept classification is stale');
     await expect(inferredSub.getByRole('link', { name: 'Teacher' })).toHaveCount(0);
     expect(classifications).toHaveLength(1);
     await axioms.getByRole('button', { name: 'Classify', exact: true }).click();

@@ -51,6 +51,16 @@ and Factor query case stay open. A set of 1,500 generated ontologies built aroun
 8,889 complete answers in 9,000 runs and none that differs from HermiT 1.4.5. The selection
 without its repair, which is known to lose, also agrees there, so the set is regression
 coverage only. The rules are unchanged.
+### Inferred ontology views use the displayed reasoning source
+
+Browse and Workbench named-class frames read their initial clauses from the kept
+entity report. A separate disclosure pages through the taxonomy axioms that mention
+the selected IRI using the same result and commit. When the kept result is missing
+or stale, Browse and Workbench offer an explicit classification or a read of a
+fresh materialization at the frame's scope. Property and individual trees and frames report kept
+classification availability and read matching fresh RDFS or OWL RL materializations.
+Kept property and individual entailments and explanation links remain in items 1380
+and 1381.
 
 ### SERVICE enhancer cache slices, disk tier, management functions and parallel requests
 

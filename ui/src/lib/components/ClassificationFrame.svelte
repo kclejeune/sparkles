@@ -3,6 +3,7 @@
   import { ClassificationFrame } from '$lib/classification-frame.svelte';
   import {
     CLASSIFICATION_DISPLAY_CAP,
+    keptAvailability,
     type ClassificationName,
     type ClassificationFramePart as ClassificationPart,
     type ClassificationExcluded,
@@ -13,6 +14,7 @@
   import { consistencyInfo, OWL_THING, type AxiomItem, type ClassifyOptions } from '$lib/ontology';
   import { ClassifyOptionsState } from '$lib/explicit-classification.svelte';
   import type { InferredPins } from '$lib/inferred-read';
+  import MaterializedFrame from './MaterializedFrame.svelte';
 
   let {
     target,
@@ -43,6 +45,7 @@
     () => pins?.classificationId,
     (result) => pins?.acceptClassification(result.resultId) ?? true,
   );
+  let materialized = $state(false);
   const opts = new ClassifyOptionsState(
     untrack(() => target),
     untrack(() => graph),
@@ -53,6 +56,7 @@
   });
   function runClassify() {
     if (opts.parsedDeadline.error) return;
+    materialized = false;
     void model.classify(opts.requestOptions);
   }
   // The read has pinned labels but no proven historical prefix map. Rendering
@@ -71,6 +75,7 @@
             commit,
             languages: [...iriForm.languages],
           };
+    materialized = false;
     untrack(() => void model.reset(view));
   });
   $effect(() => () => model.drop());
@@ -107,6 +112,7 @@
     { part: 'parents' as const, title: 'SubClassOf', rows: parents },
     { part: 'equivalents' as const, title: 'EquivalentTo', rows: equivalents },
   ]);
+  const axiomPage = $derived(model.parts.axioms);
   const result = $derived(model.reply?.result);
   const outcome = $derived(model.reply?.outcome);
   const consistency = $derived(
@@ -166,7 +172,10 @@
     <button
       class="btn sm ghost"
       disabled={commit == null || model.loading || model.computing}
-      onclick={() => void model.refresh()}>Read again</button
+      onclick={() => {
+        materialized = false;
+        void model.refresh();
+      }}>Read again</button
     >
   </div>
   {#if commit == null}
@@ -184,13 +193,28 @@
     <p class="note">Classification is running for this source. Read again when it finishes.</p>
   {:else if model.reply?.status === 'unavailable' || model.reply?.status === 'mismatch'}
     <p class="note">
-      {model.reply.status === 'mismatch'
-        ? 'The kept classification does not match this source or result pin.'
-        : model.reply.reason === 'unsupportedScope'
-          ? 'This view does not share a kept classification.'
-          : 'No kept classification is available for this source.'}
+      {keptAvailability(model.reply)}
     </p>
     {@render classifyForm('Classify')}
+    {#if materialized}
+      <MaterializedFrame
+        {target}
+        {graph}
+        {imports}
+        {mode}
+        {iri}
+        {commit}
+        {items}
+        {pins}
+        {onopen}
+        {href}
+        kind="Class"
+      />
+    {:else}
+      <button class="btn sm ghost" onclick={() => (materialized = true)}>
+        Read fresh materialized axioms
+      </button>
+    {/if}
   {:else if result && outcome}
     <div class="status-row" role="status">
       <span class="status-badge">{outcome.tier.toUpperCase()}</span>
@@ -212,7 +236,8 @@
       {/if}
     </div>
     <p class="provenance">
-      Classified commit {result.classifiedCommit} · {outcome.tier.toUpperCase()} · {outcome.consistency}
+      {model.isolated ? 'Scoped classification' : 'Kept classification'} · Classified commit {result.classifiedCommit}
+      · {outcome.tier.toUpperCase()} · {outcome.consistency}
     </p>
     {#if model.reply?.activity}<p class="note">
         A reasoning run is active for this commit. These clauses come from the completed pinned
@@ -290,6 +315,46 @@
       {#if model.reply?.entity?.present && outcome.complete && !outcome.partial && outcome.consistency === 'consistent' && finished && !parents.length && !equivalents.length}
         <p class="note">No additional direct named-class clauses beyond the asserted frame.</p>
       {/if}
+    {/if}
+    {#if !model.isolated && model.reply?.entity?.present && outcome.consistency !== 'inconsistent'}
+      <details>
+        <summary>Kept taxonomy axioms</summary>
+        <p class="note">
+          These axioms mention the selected IRI. Subclass edges name the representatives of their
+          equivalence groups.
+        </p>
+        {#each ['SubClassOf', 'EquivalentClasses'] as type}
+          {@const rows = (axiomPage.items as AxiomItem[]).filter((item) => item.type === type)}
+          {#if rows.length}
+            <h4>{type}</h4>
+            <ul>
+              {#each rows as row (row.ofn)}
+                <li><code>{row.ofn}</code> <span class="badge">Inferred</span></li>
+              {/each}
+            </ul>
+          {/if}
+        {/each}
+        {#if axiomPage.error}
+          <p class="note error" role="alert">Could not read taxonomy axioms. {axiomPage.error}</p>
+        {/if}
+        {#if axiomPage.loaded}
+          <p class="note">
+            Read {axiomPage.items.length} of {axiomPage.total} taxonomy axioms.
+            {#if axiomPage.next != null && axiomPage.items.length >= CLASSIFICATION_DISPLAY_CAP}
+              The display limit is {CLASSIFICATION_DISPLAY_CAP} rows.
+            {/if}
+          </p>
+        {/if}
+        {#if (!axiomPage.loaded || axiomPage.next != null || axiomPage.error) && axiomPage.items.length < CLASSIFICATION_DISPLAY_CAP}
+          <button
+            class="btn sm ghost"
+            disabled={axiomPage.loading}
+            onclick={() => void model.more('axioms')}
+          >
+            {axiomPage.error ? 'Retry' : axiomPage.loaded ? 'Show more' : 'Read'} taxonomy axioms
+          </button>
+        {/if}
+      </details>
     {/if}
     {#if outcome.partial}<p class="note warn" role="status">
         This is a partial classification ({outcome.tier.toUpperCase()}). It leaves

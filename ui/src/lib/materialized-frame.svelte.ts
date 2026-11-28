@@ -8,11 +8,13 @@ import {
   type InferredPins,
 } from './inferred-read';
 
+type FrameView = InferredView & { iri: string; mode?: 'lenient' | 'strict' };
+
 export class MaterializedFrame {
   page = $state<TermPage | null>(null);
   loading = $state(false);
   error = $state<string | null>(null);
-  #view: (InferredView & { iri: string }) | null = null;
+  #view: FrameView | null = null;
   #pins: InferredPins | undefined;
   #abort = new AbortController();
   #epoch = 0;
@@ -25,19 +27,20 @@ export class MaterializedFrame {
     this.loading = false;
     this.error = null;
   }
-  reset(view: (InferredView & { iri: string }) | null, pins?: InferredPins) {
+  reset(view: FrameView | null, pins?: InferredPins) {
     if (
       view &&
       this.#view &&
       sameView(view, this.#view) &&
       view.iri === this.#view.iri &&
+      view.mode === this.#view.mode &&
       pins === this.#pins
     )
       return;
     this.drop();
     this.#pins = pins;
     if (!view) return;
-    this.#view = { ...captureView(view), iri: view.iri };
+    this.#view = { ...view, ...captureView(view) };
     void this.refresh();
   }
   async refresh() {
@@ -55,7 +58,7 @@ export class MaterializedFrame {
         view.target,
         { ...view.selection, at: `commit:${view.commit}`, inferences: true },
         view.iri,
-        { lang: view.languages, mentions: 0, incoming: 0, sourceId: pin },
+        { lang: view.languages, mode: view.mode, mentions: 0, incoming: 0, sourceId: pin },
         this.#abort.signal,
       );
       if (epoch !== this.#epoch) return;

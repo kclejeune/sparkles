@@ -8,6 +8,7 @@
   import { consistencyInfo } from '$lib/ontology';
   import OntoTree from './OntoTree.svelte';
   import MaterializationNotice from './MaterializationNotice.svelte';
+  import KeptCoverageNotice from './KeptCoverageNotice.svelte';
   let {
     target,
     graph,
@@ -39,6 +40,7 @@
   );
   let open = $state(new Set<string>());
   let lastRefresh = -1;
+  let revision = $state(0);
   $effect(() => {
     const view =
       commit == null
@@ -125,11 +127,26 @@
           ? 'Materialized individual types'
           : 'Materialized property hierarchy'}
     </svelte:element>
-    <button class="btn sm ghost" disabled={commit == null} onclick={() => model.refresh()}
-      >Read again</button
+    <button
+      class="btn sm ghost"
+      disabled={commit == null}
+      onclick={() => {
+        revision++;
+        model.refresh();
+      }}>Read again</button
     >
   </div>
   <div class="frame-body" class:panel-body={card}>
+    {#if kind !== 'Class'}
+      <KeptCoverageNotice
+        {target}
+        {graph}
+        {imports}
+        {commit}
+        {pins}
+        revision={revision + refresh}
+      />
+    {/if}
     {#if commit == null}<p>Waiting for the displayed source commit.</p>{/if}
     {#if model.error}<p class="error-box" role="alert">{model.error}</p>{/if}
     {#if kind === 'Class' && model.reply?.result}

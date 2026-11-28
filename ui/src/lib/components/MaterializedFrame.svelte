@@ -8,10 +8,12 @@
   import { materializedClauses } from '$lib/materialized-clauses';
   import type { PrefixMap } from '$lib/rdf';
   import MaterializationNotice from './MaterializationNotice.svelte';
+  import KeptCoverageNotice from './KeptCoverageNotice.svelte';
   let {
     target,
     graph,
     imports = true,
+    mode = 'lenient',
     kind,
     iri,
     commit,
@@ -24,6 +26,7 @@
     target: string;
     graph: string | null;
     imports?: boolean;
+    mode?: 'lenient' | 'strict';
     kind: EntityKind;
     iri: string;
     commit: number | null;
@@ -35,11 +38,19 @@
     onopen?: (iri: string) => void;
   } = $props();
   const model = new MaterializedFrame();
+  let revision = $state(0);
   $effect(() => {
     const view =
       commit == null
         ? null
-        : { target, selection: { graph, imports }, iri, commit, languages: [...iriForm.languages] };
+        : {
+            target,
+            selection: { graph, imports },
+            mode,
+            iri,
+            commit,
+            languages: [...iriForm.languages],
+          };
     const capturedPins = pins;
     untrack(() => model.reset(view, capturedPins));
   });
@@ -77,9 +88,15 @@
     <button
       class="btn sm ghost"
       disabled={commit == null || model.loading}
-      onclick={() => void model.refresh()}>Read again</button
+      onclick={() => {
+        revision++;
+        void model.refresh();
+      }}>Read again</button
     >
   </div>
+  {#if kind !== 'Class'}
+    <KeptCoverageNotice {target} {graph} {imports} {mode} {commit} {pins} {revision} />
+  {/if}
   {#if commit == null}<p>Waiting for the displayed source commit.</p>
   {:else if model.loading}<p>Reading materialized facts…</p>{/if}
   {#if model.error}<p class="error-box" role="alert">

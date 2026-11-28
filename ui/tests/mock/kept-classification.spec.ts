@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 
 const UNI = 'http://example.org/uni#';
 function kept(url: URL, page: unknown = null) {
@@ -37,7 +37,11 @@ function kept(url: URL, page: unknown = null) {
       excludedCount: 0,
       incompleteCount: 0,
     },
-    entity: { iri: url.searchParams.get('about'), present: true, unsatisfiable: false },
+    entity: {
+      iri: url.searchParams.get('about') ?? url.searchParams.get('iri'),
+      present: true,
+      unsatisfiable: false,
+    },
     activity: null,
     staleCommit: null,
     page,
@@ -53,6 +57,40 @@ function relationPage(url: URL, items: unknown[] = []) {
     items,
     nextOffset: null,
   };
+}
+
+function keptEntity(url: URL, parents: unknown[] = []) {
+  const reply = kept(url);
+  const iri = url.searchParams.get('iri');
+  const part = (name: string, items: unknown[] = []) => ({
+    part: name,
+    about: iri,
+    offset: 0,
+    limit: 100,
+    items,
+    total: items.length,
+    nextOffset: null,
+  });
+  return {
+    commit: reply.commit,
+    iri,
+    classification: {
+      ...reply,
+      source: 'keptClassification',
+      covers: ['namedClass'],
+      parents: part('parents', parents),
+      equivalents: part('equivalents'),
+      children: part('children'),
+    },
+  };
+}
+
+async function stubKeptStatus(page: Page) {
+  await page.route('**/$/ontology/uni/classification?*', (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('part') !== 'status') return route.fallback();
+    return route.fulfill({ json: kept(url) });
+  });
 }
 
 test('an inferred URL and tree toggle never classify implicitly', async ({ page }) => {
@@ -75,6 +113,48 @@ test('an inferred URL and tree toggle never classify implicitly', async ({ page 
   expect(new URL(posts[0]).searchParams.get('at')).toMatch(/^commit:\d+$/);
 });
 
+test('property and individual trees report classifier coverage beside materialized reads', async ({
+  page,
+}) => {
+  const reads: URL[] = [];
+  page.on('request', (r) => {
+    const url = new URL(r.url());
+    if (url.pathname.startsWith('/$/ontology/uni/') && r.method() === 'GET') reads.push(url);
+  });
+  await page.route('**/$/ontology/uni/classification?*', (route) => {
+    const url = new URL(route.request().url());
+    return route.fulfill({ json: { ...kept(url), entity: null } });
+  });
+  for (const [kind, name, path] of [
+    ['ObjectProperty', 'Object properties (materialized inferred)', 'hierarchy'],
+    ['DataProperty', 'Data properties (materialized inferred)', 'hierarchy'],
+    ['NamedIndividual', 'Individuals (materialized inferred types)', 'individuals'],
+  ]) {
+    reads.length = 0;
+    await page.goto(`/ui/workbench/ontology?ds=uni&kind=${kind}&inferred=1`);
+    const tree = page.getByRole('region', { name, exact: true });
+    await expect(tree).toContainText('The kept classification covers named classes only.');
+    await expect(tree).toContainText('matching fresh RDFS or OWL RL materialization');
+    await expect
+      .poll(() =>
+        reads.some(
+          (r) => r.pathname.endsWith('/' + path) && r.searchParams.get('inferences') === 'true',
+        ),
+      )
+      .toBe(true);
+    const status = reads.find((r) => r.pathname.endsWith('/classification'));
+    const materialized = reads.find(
+      (r) => r.pathname.endsWith('/' + path) && r.searchParams.get('inferences') === 'true',
+    );
+    for (const key of ['at', 'graph'])
+      expect(status?.searchParams.get(key)).toBe(materialized?.searchParams.get(key));
+    expect(status?.searchParams.get('imports')).toBe(
+      materialized?.searchParams.get('imports') ?? 'true',
+    );
+    expect(status?.searchParams.has('about')).toBe(false);
+  }
+});
+
 test('a fresh empty class frame reads kept state without a session gate or POST', async ({
   page,
 }) => {
@@ -83,25 +163,218 @@ test('a fresh empty class frame reads kept state without a session gate or POST'
   page.on('request', (r) => {
     if (r.method() === 'POST' && /\/classify(?:\?|$)/.test(r.url())) posts.push(r.url());
   });
-  await page.route('**/$/ontology/uni/classification?*', async (route) => {
+  await stubKeptStatus(page);
+  await page.route('**/$/ontology/uni/entity?*', async (route) => {
     const url = new URL(route.request().url());
+    if (!url.searchParams.has('classification')) return route.fallback();
     reads.push(url);
-    await route.fulfill({
-      json: kept(url, url.searchParams.get('part') === 'status' ? null : relationPage(url)),
-    });
+    await route.fulfill({ json: keptEntity(url) });
   });
   await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Agent')}`);
   const card = page.getByRole('region', { name: 'Axioms', exact: true });
   await expect(card).toBeVisible();
   const region = page.getByRole('region', { name: 'Inferred class axioms', exact: true });
   await expect(region).toContainText('No additional direct named-class clauses');
-  expect(reads.map((r) => r.searchParams.get('part')).sort()).toEqual([
-    'equivalents',
-    'parents',
-    'status',
-  ]);
-  for (const url of reads.slice(1)) expect(url.searchParams.get('resultId')).toBe('immutable-a');
+  expect(reads).toHaveLength(1);
+  expect(reads[0].searchParams.get('classification')).toBe('kept');
+  expect(reads[0].searchParams.get('iri')).toBe(UNI + 'Agent');
   expect(posts).toEqual([]);
+});
+
+test('the class frame reads emitted taxonomy axioms at the kept pin on demand', async ({
+  page,
+}) => {
+  const reads: URL[] = [];
+  await stubKeptStatus(page);
+  await page.route('**/$/ontology/uni/entity?*', (route) => {
+    const url = new URL(route.request().url());
+    if (!url.searchParams.has('classification')) return route.fallback();
+    return route.fulfill({ json: keptEntity(url) });
+  });
+  await page.route('**/$/ontology/uni/axioms?*', (route) => {
+    const url = new URL(route.request().url());
+    if (!url.searchParams.has('classification')) return route.fallback();
+    reads.push(url);
+    return route.fulfill({
+      json: {
+        ...kept(url),
+        source: 'keptClassification',
+        offset: 0,
+        limit: 100,
+        total: 1,
+        next: null,
+        axioms: [
+          {
+            type: 'SubClassOf',
+            ofn: `SubClassOf(<${UNI}Professor> <${UNI}Agent>)`,
+            axiom: { type: 'SubClassOf', subClass: UNI + 'Professor', superClass: UNI + 'Agent' },
+          },
+        ],
+      },
+    });
+  });
+  await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Agent')}`);
+  const region = page.getByRole('region', { name: 'Inferred class axioms', exact: true });
+  await region.getByText('Kept taxonomy axioms', { exact: true }).click();
+  expect(reads).toHaveLength(0);
+  await region.getByRole('button', { name: 'Read taxonomy axioms', exact: true }).click();
+  await expect(region).toContainText('Read 1 of 1 taxonomy axioms.');
+  await expect(region).toContainText(`SubClassOf(<${UNI}Professor> <${UNI}Agent>)`);
+  expect(reads).toHaveLength(1);
+  expect(reads[0].searchParams.get('resultId')).toBe('immutable-a');
+  expect(reads[0].searchParams.get('at')).toMatch(/^commit:\d+$/);
+});
+
+test('the class frame requests a scoped materialization only after the fallback click', async ({
+  page,
+}) => {
+  const reads: URL[] = [];
+  await page.route('**/$/ontology/uni/classification?*', (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('part') !== 'status') return route.fallback();
+    return route.fulfill({
+      json: {
+        ...kept(url),
+        status: 'mismatch',
+        reason: 'commitMismatch',
+        staleCommit: 0,
+        result: null,
+        outcome: null,
+        entity: null,
+      },
+    });
+  });
+  await page.route('**/$/ontology/uni/term?*', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('inferences') !== 'true') return route.fallback();
+    reads.push(url);
+    await route.fulfill({ status: 409, json: { error: 'The materialization is stale.' } });
+  });
+  await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Agent')}`);
+  const region = page.getByRole('region', { name: 'Inferred class axioms', exact: true });
+  await expect(region).toContainText('The kept classification is stale. It covers commit 0.');
+  expect(reads).toHaveLength(0);
+  await region.getByRole('button', { name: 'Read fresh materialized axioms' }).click();
+  await expect(region).toContainText('The materialization is stale.');
+  expect(reads).toHaveLength(1);
+  expect(reads[0].searchParams.get('iri')).toBe(UNI + 'Agent');
+  expect(reads[0].searchParams.get('at')).toMatch(/^commit:\d+$/);
+});
+
+test('classifying clears fallback permission even if the kept result is replaced', async ({
+  page,
+}) => {
+  const iri = UNI + 'Professor';
+  const parent = UNI + 'Agent';
+  const reads: URL[] = [];
+  const unavailable = (url: URL) => ({
+    ...kept(url),
+    status: 'unavailable',
+    reason: 'notKept',
+    result: null,
+    outcome: null,
+    entity: null,
+  });
+  await page.route('**/$/ontology/uni/classification?*', (route) => {
+    const url = new URL(route.request().url());
+    return route.fulfill({ json: unavailable(url) });
+  });
+  await page.route('**/$/ontology/uni/term?*', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('inferences') !== 'true') return route.fallback();
+    reads.push(url);
+    const { commit } = kept(url);
+    const axioms = [parent, 'http://www.w3.org/2002/07/owl#Thing'].map((superClass) => ({
+      type: 'SubClassOf',
+      ofn: `SubClassOf(<${iri}> <${superClass}>)`,
+      axiom: { type: 'SubClassOf', subClass: iri, superClass },
+      graph: 'urn:x-sparkles:inferred',
+    }));
+    await route.fulfill({
+      json: {
+        iri,
+        commit,
+        axioms,
+        names: { [parent]: { label: 'Materialized agent', labelLang: 'en' } },
+        inferenceSource: {
+          kind: 'materialization',
+          sourceId: `sha256:${'a'.repeat(64)}`,
+          profile: 'rdfs',
+          producerCommit: commit,
+          commit,
+          boundStoreId: 'branch-a',
+          familyId: 'family',
+          inputGraphs: ['default'],
+          inputGraphCount: 1,
+          inputGraphsTruncated: false,
+          warnings: [],
+          warningCount: 0,
+          warningsTruncated: false,
+          complete: null,
+          consistency: 'unknown',
+          justifications: 'unavailable',
+        },
+      },
+    });
+  });
+  await page.route('**/$/ontology/uni/classify?*', (route) => {
+    const { commit, result, outcome } = kept(new URL(route.request().url()));
+    const empty = { items: [], total: 0, limit: 100, truncated: false };
+    return route.fulfill({
+      json: {
+        commit,
+        frame: {
+          iri,
+          result,
+          outcome,
+          unsatisfiable: false,
+          parents: empty,
+          equivalents: empty,
+          excluded: empty,
+          sources: empty,
+          retention: { kept: true, resultId: result.resultId },
+        },
+      },
+    });
+  });
+  await page.route('**/$/ontology/uni/axioms?*', (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('classification') !== 'kept') return route.fallback();
+    expect(url.searchParams.get('resultId')).toBe('immutable-a');
+    return route.fulfill({
+      json: {
+        ...unavailable(url),
+        status: 'mismatch',
+        reason: 'resultChanged',
+        source: 'keptClassification',
+      },
+    });
+  });
+
+  await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(iri)}`);
+  const region = page.getByRole('region', { name: 'Inferred class axioms', exact: true });
+  const openFallback = region.getByRole('button', { name: 'Read fresh materialized axioms' });
+  const fallback = region.getByRole('region', { name: 'Materialized inferred axioms' });
+  await expect(openFallback).toBeVisible();
+  expect(reads).toHaveLength(0);
+  await openFallback.click();
+  await expect(fallback).toContainText('Materialized RDFS facts at commit');
+  await expect(fallback).toContainText('SubClassOf:');
+  const row = fallback.getByRole('listitem').filter({ hasText: 'Materialized agent' });
+  await expect(row.getByText('Inferred', { exact: true })).toBeVisible();
+  await expect(fallback).toContainText('One trivial entailment');
+  expect(reads).toHaveLength(1);
+  expect(reads[0].searchParams.get('iri')).toBe(iri);
+  expect(reads[0].searchParams.get('at')).toMatch(/^commit:\d+$/);
+  expect(reads[0].searchParams.get('mode')).toBe('lenient');
+
+  await region.getByRole('button', { name: 'Classify', exact: true }).click();
+  await region.getByText('Kept taxonomy axioms', { exact: true }).click();
+  await region.getByRole('button', { name: 'Read taxonomy axioms', exact: true }).click();
+  await expect(region).toContainText('does not match this source or result pin');
+  await expect(openFallback).toBeVisible();
+  await expect(fallback).toHaveCount(0);
+  expect(reads).toHaveLength(1);
 });
 
 test('full-IRI rendering uses the pinned IRI rather than a label or mutable prefix', async ({
@@ -113,21 +386,19 @@ test('full-IRI rendering uses the pinned IRI rather than a label or mutable pref
       JSON.stringify({ version: 1, mode: 'iri', languages: ['en'] }),
     ),
   );
-  await page.route('**/$/ontology/uni/classification?*', async (route) => {
+  await stubKeptStatus(page);
+  await page.route('**/$/ontology/uni/entity?*', async (route) => {
     const url = new URL(route.request().url());
-    const part = url.searchParams.get('part');
-    const items =
-      part === 'parents'
-        ? [
-            {
-              iri: UNI + 'Teacher',
-              label: 'Do not render this label',
-              labelLang: 'en',
-              equivalenceCount: 1,
-            },
-          ]
-        : [];
-    await route.fulfill({ json: kept(url, part === 'status' ? null : relationPage(url, items)) });
+    if (!url.searchParams.has('classification')) return route.fallback();
+    const items = [
+      {
+        iri: UNI + 'Teacher',
+        label: 'Do not render this label',
+        labelLang: 'en',
+        equivalenceCount: 1,
+      },
+    ];
+    await route.fulfill({ json: keptEntity(url, items) });
   });
   await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Professor')}`);
   const region = page.getByRole('region', { name: 'Inferred class axioms', exact: true });
@@ -143,23 +414,21 @@ test('a language change keeps all new reads pinned to the completed result', asy
     ),
   );
   const reads: URL[] = [];
-  await page.route('**/$/ontology/uni/classification?*', async (route) => {
+  await stubKeptStatus(page);
+  await page.route('**/$/ontology/uni/entity?*', async (route) => {
     const url = new URL(route.request().url());
+    if (!url.searchParams.has('classification')) return route.fallback();
     reads.push(url);
-    const part = url.searchParams.get('part');
     const french = url.searchParams.get('lang')?.startsWith('fr');
-    const items =
-      part === 'parents'
-        ? [
-            {
-              iri: UNI + 'Teacher',
-              label: french ? 'Enseignant historique' : 'Historical teacher',
-              labelLang: french ? 'fr' : 'en',
-              equivalenceCount: 1,
-            },
-          ]
-        : [];
-    await route.fulfill({ json: kept(url, part === 'status' ? null : relationPage(url, items)) });
+    const items = [
+      {
+        iri: UNI + 'Teacher',
+        label: french ? 'Enseignant historique' : 'Historical teacher',
+        labelLang: french ? 'fr' : 'en',
+        equivalenceCount: 1,
+      },
+    ];
+    await route.fulfill({ json: keptEntity(url, items) });
   });
   await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(UNI + 'Professor')}`);
   const region = page.getByRole('region', { name: 'Inferred class axioms', exact: true });
@@ -172,7 +441,7 @@ test('a language change keeps all new reads pinned to the completed result', asy
     region.getByRole('link', { name: 'Enseignant historique', exact: true }),
   ).toBeVisible();
   const changed = reads.filter((r) => r.searchParams.get('lang')?.startsWith('fr'));
-  expect(changed).toHaveLength(3);
+  expect(changed).toHaveLength(1);
   for (const url of changed) expect(url.searchParams.get('resultId')).toBe('immutable-a');
 });
 
@@ -184,6 +453,10 @@ test('a failed inference page preserves valid pinned rows and retries only the r
   const posts: string[] = [];
   page.on('request', (r) => {
     if (r.method() === 'POST' && /\/classify(?:\?|$)/.test(r.url())) posts.push(r.url());
+  });
+  await page.route('**/$/ontology/uni/entity?*', (route) => {
+    if (!new URL(route.request().url()).searchParams.has('classification')) return route.fallback();
+    return route.fulfill({ status: 404, json: { error: 'Entity report unavailable' } });
   });
   await page.route('**/$/ontology/uni/classification?*', async (route) => {
     const url = new URL(route.request().url());
@@ -213,8 +486,9 @@ test('a failed inference page preserves valid pinned rows and retries only the r
   await region.getByRole('button', { name: 'Retry equivalents', exact: true }).click();
   await expect(region).not.toContainText('Pinned page failed');
   await expect(region.getByRole('link', { name: 'Historical teacher', exact: true })).toBeVisible();
-  expect(reads.filter((r) => r.searchParams.get('part') === 'equivalents')).toHaveLength(2);
-  for (const url of reads.slice(1)) expect(url.searchParams.get('resultId')).toBe('immutable-a');
+  const equivalents = reads.filter((r) => r.searchParams.get('part') === 'equivalents');
+  expect(equivalents).toHaveLength(2);
+  for (const url of equivalents) expect(url.searchParams.get('resultId')).toBe('immutable-a');
   expect(posts).toEqual([]);
 });
 
@@ -224,6 +498,10 @@ test('replacement between actual clause reads discards the whole assembled resul
   let release!: () => void;
   const held = new Promise<void>((resolve) => {
     release = resolve;
+  });
+  await page.route('**/$/ontology/uni/entity?*', (route) => {
+    if (!new URL(route.request().url()).searchParams.has('classification')) return route.fallback();
+    return route.fulfill({ status: 404, json: { error: 'Entity report unavailable' } });
   });
   await page.route('**/$/ontology/uni/classification?*', async (route) => {
     const url = new URL(route.request().url());
@@ -267,8 +545,11 @@ test('a deliberate scoped projection keeps clauses and reports its unavailable c
   const posts: string[] = [];
   let reads = 0;
   await page.route('**/$/ontology/uni/classification?*', async (route) => {
-    reads++;
     const url = new URL(route.request().url());
+    // The sibling hierarchy can ask for parents when it already has a kept result.
+    if (!['status', 'equivalents'].includes(url.searchParams.get('part') ?? ''))
+      return route.fallback();
+    reads++;
     await route.fulfill({
       json: {
         ...kept(url),

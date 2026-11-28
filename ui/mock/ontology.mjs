@@ -1755,33 +1755,27 @@ export async function handleOntology(req, res, url, seg, ctx) {
   });
   const terminology = (o) => o.axioms.filter((a) => !ASSERTION_TYPES.has(a.json.type));
 
-  if (req.method === 'GET' && sub === 'classification') {
-    res.setHeader('Cache-Control', 'no-store');
-    const kept = keptClassifications.get(ds);
-    const selected = /^commit:\d+$/.test(p.get('at') ?? '') ? Number(p.get('at').slice(7)) : head();
+  const kept = keptClassifications.get(ds);
+  const selected = /^commit:\d+$/.test(p.get('at') ?? '') ? Number(p.get('at').slice(7)) : head();
+  function keptStatus(about) {
     const matches = kept?.input === classificationKey(graph, p.get('imports'), p.get('mode'));
-    const available =
-      matches &&
-      kept.result.classifiedCommit === selected &&
-      (!p.has('resultId') || p.get('resultId') === kept.result.resultId);
-    const status = available ? 'available' : matches ? 'mismatch' : 'unavailable';
-    const about = p.get('about');
+    const sameCommit = matches && kept.result.classifiedCommit === selected;
+    const sameResult = !p.has('resultId') || p.get('resultId') === kept?.result.resultId;
+    const available = sameCommit && sameResult;
     const entityNode = available
       ? kept.taxonomy.nodes.find((n) => n.classes.includes(about))
       : null;
     const present = !!entityNode;
-    const part = p.get('part') ?? 'status';
-    const offset = Number(p.get('offset') ?? 0);
-    const limit = Number(p.get('limit') ?? 100);
-    const rows =
-      available && part !== 'status'
-        ? mockClassificationRows(kept, part, about, p.get('lang'))
-        : null;
-    send(res, 200, {
-      dataset: ds.name,
+    return {
       commit: selected,
-      status,
-      reason: available ? null : matches ? 'resultMismatch' : 'notKept',
+      status: available ? 'available' : matches ? 'mismatch' : 'unavailable',
+      reason: available
+        ? null
+        : !matches
+          ? 'notKept'
+          : sameResult
+            ? 'commitMismatch'
+            : 'resultChanged',
       result: available ? kept.result : null,
       outcome: available ? kept.outcome : null,
       entity:
@@ -1798,18 +1792,33 @@ export async function handleOntology(req, res, url, seg, ctx) {
             }
           : null,
       activity: null,
-      staleCommit: matches && !available ? kept.result.classifiedCommit : null,
-      page: rows
-        ? {
-            part,
-            about,
-            offset,
-            limit,
-            total: rows.length,
-            items: rows.slice(offset, offset + limit),
-            nextOffset: offset + limit < rows.length ? offset + limit : null,
-          }
-        : null,
+      staleCommit:
+        matches && !sameCommit && !p.has('resultId') ? kept.result.classifiedCommit : null,
+    };
+  }
+  function keptPage(part, about) {
+    const rows = mockClassificationRows(kept, part, about, p.get('lang'));
+    const offset = Number(p.get('offset') ?? 0);
+    const limit = Number(p.get('limit') ?? 100);
+    return {
+      part,
+      about,
+      offset,
+      limit,
+      total: rows.length,
+      items: rows.slice(offset, offset + limit),
+      nextOffset: offset + limit < rows.length ? offset + limit : null,
+    };
+  }
+  if (req.method === 'GET' && sub === 'classification') {
+    res.setHeader('Cache-Control', 'no-store');
+    const about = p.get('about');
+    const status = keptStatus(about);
+    const part = p.get('part') ?? 'status';
+    send(res, 200, {
+      dataset: ds.name,
+      ...status,
+      page: status.result && part !== 'status' ? keptPage(part, about) : null,
     });
     return true;
   }
@@ -2128,6 +2137,47 @@ export async function handleOntology(req, res, url, seg, ctx) {
     return true;
   }
   if (req.method === 'GET' && sub === 'axioms') {
+    if (p.get('classification') === 'kept') {
+      res.setHeader('Cache-Control', 'no-store');
+      const about = p.get('about');
+      const status = keptStatus(about);
+      const limit = Number(p.get('limit') ?? 100);
+      const offset = Number(p.get('offset') ?? 0);
+      const types = p.get('type')?.split(',');
+      const rows = status.result
+        ? kept.taxonomy.nodes
+            .flatMap((node) => [
+              ...(node.classes.length > 1
+                ? [{ type: 'EquivalentClasses', classes: node.classes }]
+                : []),
+              ...node.parents.map((parent) => ({
+                type: 'SubClassOf',
+                subClass: node.classes[0],
+                superClass: kept.taxonomy.nodes[parent].classes[0],
+              })),
+            ])
+            .filter(
+              (axiom) =>
+                (!about || mentions(axiom, about)) && (!types || types.includes(axiom.type)),
+            )
+        : null;
+      send(res, 200, {
+        dataset: ds.name,
+        ...status,
+        source: 'keptClassification',
+        axioms:
+          rows?.slice(offset, offset + limit).map((axiom) => ({
+            type: axiom.type,
+            ofn: r.axiom(axiom),
+            axiom,
+          })) ?? null,
+        total: rows?.length ?? null,
+        offset,
+        limit,
+        next: rows && offset + limit < rows.length ? offset + limit : null,
+      });
+      return true;
+    }
     const o = readOntology(ds, graph);
     const types = p.get('type')?.split(',');
     const about = p.get('about');
@@ -2198,13 +2248,23 @@ export async function handleOntology(req, res, url, seg, ctx) {
     return true;
   }
   if (req.method === 'GET' && sub === 'entity') {
-    const o = readOntology(ds, graph);
+    const classified = p.get('classification') === 'kept';
+    if (classified) res.setHeader('Cache-Control', 'no-store');
+    const store = classified && selected !== head() ? storeAt(ds, selected) : ds.store;
+    if (!store)
+      return (
+        fail(res, 410, `commit ${selected} is not reconstructable`, { code: 'history-gone' }), true
+      );
+    const o = readOntology(store === ds.store ? ds : pastView(ds, store), graph);
     const iri = p.get('iri');
-    if (!iri || !o.kinds.has(iri))
+    const kinds = o.kinds.get(iri);
+    const kind = p.get('kind');
+    if (!iri || !kinds || (kind && !kinds.has(kind)))
       return (
         fail(res, 404, `the ontology neither declares nor uses <${iri}>`, { code: 'not-found' }),
         true
       );
+    const status = classified ? keptStatus(iri) : null;
     const labels = o.axioms
       .filter(
         (a) =>
@@ -2216,7 +2276,20 @@ export async function handleOntology(req, res, url, seg, ctx) {
     send(res, 200, {
       ...opened(o),
       iri,
-      kinds: [...o.kinds.get(iri)],
+      commit: classified ? selected : head(),
+      kinds: kind ? [kind] : [...kinds],
+      ...(status
+        ? {
+            classification: {
+              ...status,
+              source: 'keptClassification',
+              covers: ['namedClass'],
+              parents: status.entity?.present ? keptPage('parents', iri) : null,
+              children: status.entity?.present ? keptPage('children', iri) : null,
+              equivalents: status.entity?.present ? keptPage('equivalents', iri) : null,
+            },
+          }
+        : {}),
       labels,
       annotations: [],
       assertions: false,

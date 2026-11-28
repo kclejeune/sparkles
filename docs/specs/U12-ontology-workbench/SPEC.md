@@ -657,8 +657,8 @@ levels beside the asserted tree without computing. Equivalent classes share a no
 and unsatisfiable classes sit under `owl:Nothing`. A deliberate **Classify tree** action
 retains the full-taxonomy POST flow with the actual EL, Horn or disjunctive result of
 [F24](../F24-owl-classification/README.md). Matching fresh RDFS or OWL RL materializations
-also supply bounded property hierarchies and named individual types. General
-classifier-backed property and individual entailments remain under item 609.
+supply bounded property hierarchies and named individual types. These views report the
+availability and named-class coverage of the kept classification at the same scope.
 
 **Frame.** Selecting an entity opens its frame. The frame lists the entity's annotations,
 its characteristics as checkboxes for properties, and its axioms in sections such as
@@ -743,7 +743,8 @@ through a form remains for later. Rename covers the one graph the page
 reads and does not reach IRIs inside triple terms. Real-time co-editing stays with the
 U05 §1 open question. The page decides whether the caller can write from its level on
 the dataset, so write grants on a branch alone leave the page read-only, roadmap item
-611. Roadmap item 609 adds inferred property and individual trees, and 610 adds an IRI
+611. Roadmap item 1380 adds kept property and individual entailments to the trees of
+item 609, and item 610 adds an IRI
 policy kept on the server with
 the resource catalog of [C30](../C30-resource-catalog/README.md).
 
@@ -1058,15 +1059,19 @@ counts as one row of chips and a More menu for buttons that do not fit are share
 of the UI. The Hierarchy card draws the graph in its own body. The Workbench editors' trees
 show labels before short forms and keep their ancestors in view, and the two columns of
 cards balance their heights. Item 726 adds the bounded read-only kept-classification
-route used by Browse and editor named-class frames. A page reads availability and then
-direct-parent/equivalence pages at its displayed branch/commit, with one immutable result
-pin and labels from that source. Automatic loading, retry, paging and toggles never POST
-to classify. Empty frames keep their outcome region visible, and partial page errors,
+route used by Browse and editor named-class frames. A page checks availability at its
+displayed branch and commit before reading the first direct-parent and equivalence pages
+through the entity report. Standalone taxonomy pages also cover built-in classes without
+an asserted entity report. Continuations use one immutable result pin and labels from
+that source. The **Kept taxonomy axioms** disclosure reads the emitted subclass and
+equivalence axioms that mention the selected IRI. Subclass edges name the representatives
+of their groups. Automatic loading, retry, paging and toggles use only reads. Empty frames keep their outcome region visible, and partial page errors,
 replacement, exclusions, unsatisfiability and inconsistency have distinct notices.
 
-A deliberate **Classify** click asks for one bounded frame projection when no matching
-result is available. Restricted views retain useful authorized clauses from that explicit
-computation, with actual producer/source/outcome and bounded diagnostic samples. They do
+When no matching result is available, **Read fresh materialized axioms** reads a
+matching materialization at the frame's displayed scope. A deliberate **Classify**
+click asks for one bounded frame projection at that scope. Restricted views retain
+useful authorized clauses from that explicit computation, with actual producer/source/outcome and bounded diagnostic samples. They do
 not advertise a shared continuation or silently recompute for more rows. An eligible
 publication supports bounded GET continuation. The separate explicit full-tree action
 retains its legacy multi-POST transfer, pins every page and name batch to its original
@@ -1091,8 +1096,7 @@ Characteristics clause. Self-subsumptions, types and superclasses of `owl:Thing`
 `rdfs:Resource` and subproperty relations to the top property of the same kind are counted
 instead of listed. Annotations, declarations and other rows that no clause takes keep their
 functional-style form. Profile completeness, consistency and
-arbitrary-axiom explanations remain unknown or unavailable. General classifier-backed
-entailments and matching F24 justifications remain in items 622 and 609. The existing
+arbitrary-axiom explanations remain unknown or unavailable. The existing
 mapper and exact-total scans can cost more than a page's output size, and this phase
 establishes no new cold or warm latency claim.
 
@@ -1113,13 +1117,11 @@ kind in place of a table, with hidden labels behind their toggle. Identifiers sa
 page already has for them, and keep the exact value as their title. Typed literals show their exact value with a datatype chip,
 and copied Manchester text keeps its syntax. A phone puts Metadata and Hierarchy before Axioms.
 
-**Remaining work.** Item 622 still covers general classifier-backed inferred axiom
-frames and explanation links dependent on matching F24 justifications. Classifier-backed
-property and individual entailments remain in item 609, search at a past state in item
-658 and other servers' term pages in item 461. Item 588's kept entity and axiom reads are
-available to the frames, which do not show them yet. The kept named-class and strict materialization-backed slices
-do not complete these parent items, compute on a read miss or use RL witnesses as
-classification explanations.
+**Remaining work.** Items 609 and 622 depend on item 1380 for kept property and
+individual entailments. Individual reads need retained classification with assertions
+from item 590. Explanation links depend on item 1381 and F24 justifications for the
+selected axiom and result. Search at a past state remains in item 658 and other servers'
+term pages in item 461.
 
 ### Ontology summary head
 

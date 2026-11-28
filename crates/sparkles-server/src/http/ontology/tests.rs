@@ -1063,6 +1063,30 @@ async fn kept_classification_http_branch_and_retained_history_are_exact() {
     assert_eq!(pinned.status, StatusCode::OK, "{}", pinned.text());
     assert_eq!(pinned.json()["status"], "available");
     assert_eq!(pinned.json()["result"], j["result"]);
+    let selection = format!(
+        "classification=kept&branch=kept-dev&at=commit:{}&resultId={}",
+        j["commit"],
+        j["result"]["resultId"].as_str().unwrap()
+    );
+    let iri = enc("http://ex.org/Professor");
+    let entity = get(
+        &s.app,
+        &format!("/$/ontology/h/entity?kind=Class&iri={iri}&{selection}"),
+    )
+    .await;
+    let axioms = get(
+        &s.app,
+        &format!("/$/ontology/h/axioms?about={iri}&{selection}"),
+    )
+    .await;
+    for r in [&entity, &axioms] {
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(r.json()["commit"], j["commit"]);
+        assert!(!r.text().contains("Lecturer"), "{}", r.text());
+    }
+    assert_eq!(entity.json()["classification"]["result"], j["result"]);
+    assert_eq!(axioms.json()["result"], j["result"]);
 }
 
 /// Item 603's cases in Turtle, as the `sparkles` crate's tests write them: a classification
@@ -2566,6 +2590,82 @@ async fn inferred_browse_materialization_sources_are_read_only_pinned_and_never_
     let missing = get(&s.app, &uri).await;
     assert_ne!(missing.status, StatusCode::OK);
     assert_eq!(missing.headers[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn workbench_reads_keep_taxonomy_and_materialization_sources_distinct() {
+    let s = server_of(&format!(
+        "{DATA}
+        :teaches a owl:Class ; rdfs:subClassOf :Person .
+        :language a owl:DatatypeProperty .
+        :courseLanguage a owl:DatatypeProperty ; rdfs:subPropertyOf :language .
+        :teaches rdfs:subPropertyOf :worksWith .
+        :worksWith a owl:ObjectProperty ."
+    ));
+    let ds = s._state.get("t").unwrap();
+    ds.dataset
+        .reasoning()
+        .run(&sparkles::reasoning::ReasonRequest {
+            profile: sparkles_reasoner::Profile::Rdfs,
+            ..Default::default()
+        })
+        .unwrap();
+    let commit = ds.store.head_commit().seq;
+    let classify = post(&s.app, "/$/ontology/t/classify", json!({})).await;
+    assert_eq!(classify.status, StatusCode::OK, "{}", classify.text());
+    let report = get(
+        &s.app,
+        &format!(
+            "/$/ontology/t/entity?classification=kept&kind=Class&iri={}&at=commit:{commit}",
+            enc("http://ex.org/teaches")
+        ),
+    )
+    .await;
+    assert_eq!(report.status, StatusCode::OK, "{}", report.text());
+    let report = report.json();
+    let kept = &report["classification"];
+    assert_eq!(kept["covers"], json!(["namedClass"]));
+    assert_eq!(kept["entity"]["present"], true);
+    let id = kept["result"]["resultId"].as_str().unwrap();
+    let axioms = get(
+        &s.app,
+        &format!(
+            "/$/ontology/t/axioms?classification=kept&about={}&at=commit:{commit}&resultId={id}",
+            enc("http://ex.org/teaches")
+        ),
+    )
+    .await;
+    assert_eq!(axioms.status, StatusCode::OK, "{}", axioms.text());
+    let axioms = axioms.json();
+    assert_eq!(axioms["result"], kept["result"]);
+    assert_eq!(axioms["outcome"], kept["outcome"]);
+    assert!(axioms["axioms"].as_array().unwrap().iter().any(|axiom| {
+        axiom["type"] == "SubClassOf" && axiom["axiom"]["superClass"] == "http://ex.org/Person"
+    }));
+
+    let mut source = None;
+    for path in [
+        "hierarchy?kind=objectProperty",
+        "hierarchy?kind=dataProperty",
+        "individuals?iri=http%3A%2F%2Fex.org%2Fada",
+        "term?iri=http%3A%2F%2Fex.org%2Fteaches",
+    ] {
+        let r = get(
+            &s.app,
+            &format!("/$/ontology/t/{path}&inferences=true&at=commit:{commit}"),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{path}: {}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store");
+        let page = r.json();
+        assert_eq!(page["commit"], commit);
+        assert_eq!(page["inferenceSource"]["kind"], "materialization");
+        assert_eq!(page["inferenceSource"]["profile"], "rdfs");
+        assert_eq!(page["inferenceSource"]["justifications"], "unavailable");
+        let selected = source.get_or_insert_with(|| page["inferenceSource"].clone());
+        assert_eq!(*selected, page["inferenceSource"]);
+    }
+    assert_eq!(ds.store.head_commit().seq, commit);
 }
 
 #[tokio::test]

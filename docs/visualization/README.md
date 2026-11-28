@@ -593,14 +593,18 @@ in linked Manchester syntax with **Copy**, **See also**, **Mappings**, **What li
 here**, **In other datasets** (checking up to 20 readable datasets on the server),
 **Similar terms** (from the first ready vector index), and **All other statements**.
 
-Named-class inference regions read kept classifications at the displayed branch and commit
-without triggering computation, reporting unavailable, running, mismatch, unsatisfiable,
-inconsistent, excluded, and partial states clearly; **Classify** explicitly requests one
-bounded frame projection. Property and individual pages read materialized frames and
-hierarchies from fresh RDFS or OWL RL producers with exact revision pins and inferred
-badges, counting universal entailments (such as `owl:Thing`) instead of listing them
-([materialized property view](../images/ontology-materialized-properties.png),
-[individual page](../images/browse-materialized-individual.png)). Disabled change logs or
+Named-class frames read direct parents and equivalences from the kept entity report at
+the displayed branch and commit. **Kept taxonomy axioms** pages through the emitted
+axioms that mention the selected IRI under the same result pin. The frame reports
+unavailability, staleness and the outcome of a matching result. **Classify** requests one
+bounded frame projection, and **Read fresh materialized axioms** reads an existing
+materialization at the displayed scope. Property and individual pages report the kept
+classification's coverage and read their frames and hierarchies from matching fresh
+RDFS or OWL RL producers. They use exact revision pins and inferred badges, and count
+universal entailments such as `owl:Thing`.
+The [materialized property view](../images/ontology-materialized-properties.png) and
+[individual page](../images/browse-materialized-individual.png) show these sources.
+Disabled change logs or
 reverted inputs refuse stale reads conservatively.
 
 The **Hierarchy** card toggles between a scrollable **Tree** view (lineage, direct
@@ -698,17 +702,15 @@ are tracked in the [central roadmap](../ROADMAP.md).
   under an incremental guard with other dataset violations (item 121), and is unavailable
   to callers with partial-graph grants (item 75).
 * **Ontology editor and DL Query.** Classifier-backed property and individual entailments
-  remain planned under F24 (roadmap item 609). IRI policy lives in browser storage per
+  depend on F24 and roadmap item 1380. IRI policy lives in browser storage per
   dataset (item 610), and rename does not cover IRIs inside triple terms; triple-term
   rename and an editable schema diagram are tracked in roadmap item 457. DL Query instance
   answers reclassify assertions per query, and queries outside OWL 2 EL copy the ontology
   into memory for RL rules, where class answers may be incomplete (roadmap item 662).
 * **Kept and materialized inference frames.** Named-class frames display up to 1,000 rows
-  per part from kept classifications, while property and individual frames read fresh
-  RDFS/OWL RL materializations without completeness, consistency, or explanation links.
-  The frames do not yet show the kept inferred axiom listing that the axioms route answers,
-  and explanations remain planned under F24 (roadmap items 622 and 609). The full **Classify tree** action remains
-  explicit via legacy POST pages.
+  per part, including emitted taxonomy axioms. Materialized sources report unknown
+  completeness and consistency. Explanation links wait for F24 justifications under
+  roadmap item 1381. The full **Classify tree** action uses explicit POST pages.
 * **Thesaurus editor.** The editor reads up to 2,000 narrower concepts per concept and
   5,000 roots per scheme, and label search returns the first 100 substring matches
   (roadmap item 638). Cross-dataset mappings display target IRIs and list only locally
