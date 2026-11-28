@@ -3416,6 +3416,10 @@ impl Found {
     pub(super) fn products_len(&self) -> usize {
         self.prods.len()
     }
+    /// The rule that each product is traced under, for tests.
+    pub(super) fn product_rules(&self) -> Vec<&'static str> {
+        self.prods.iter().map(|p| p.3).collect()
+    }
     /// The direct (non-product) conclusions collected so far, for tests.
     pub(super) fn one_sides(&self) -> Vec<Side> {
         self.one.iter().map(|(s, _)| s.clone()).collect()
@@ -3738,8 +3742,9 @@ fn prune(l: &mut Vec<Side>) {
     debug_assert!(done);
 }
 
-/// [`prune`], telling `read` of each comparison of two sides and of each literal that a
-/// comparison steps over, false once read answers false, which leaves `l` with some of its
+/// [`prune`], telling `read` of each comparison of two sides, of each literal that a
+/// comparison steps over, and of the literals of each side that its signature and its
+/// test of order read, false once read answers false, which leaves `l` with some of its
 /// sides dropped and others not, for a caller that drops the inference.
 pub(super) fn prune_with<F: FnMut(usize) -> bool>(l: &mut Vec<Side>, read: &mut F) -> bool {
     if l.len() < 2 {
@@ -3769,6 +3774,10 @@ pub(super) fn prune_with<F: FnMut(usize) -> bool>(l: &mut Vec<Side>, read: &mut 
     l.sort_by_key(|s| s.0.len() + s.1.len());
     let mut keep: Vec<(Side, u64, u64, bool)> = Vec::with_capacity(l.len());
     for s in l.drain(..) {
+        // the signature and the test of order read each literal of the side twice
+        if !read(2 * (s.0.len() + s.1.len())) {
+            return false;
+        }
         let (s0, s1) = (sig(&s.0), sig(&s.1));
         let sorted = strict(&s.0) && strict(&s.1);
         let s = (s, s0, s1, sorted);
@@ -4899,15 +4908,17 @@ pub(super) enum Bill {
 /// Roadmap item 1280's meter of the reads of Tier D's rooted rules and of item 1231's
 /// marker repair. A read is one entry of an index, one literal of a clause, or one step of a
 /// comparison of two premises, and the meter checks the run's bounds once every
-/// [`METER_CHECK`] reads. Between two checks it therefore counts at most `METER_CHECK - 1`
-/// reads and then the reads of one step, which is one read everywhere except a choice of the
-/// diagnostic, which reads [`WORK_READS`]. The count since the last check lives in the
-/// activation's sink when it has one ([`Sink::meter_reads`]), so that the meters of one
-/// activation share one cadence and many short scans cannot read without a check. A meter
-/// charges its own reads to the work bound only as its [`Bill`] says, and its charge is
-/// the same whatever the cadence, a conclusion for every [`WORK_READS`] of its reads. The
-/// memory that a metered step builds is admitted through the caller's [`Guard`] before it
-/// is built, as the rest of Tier D admits it.
+/// [`METER_CHECK`] reads. A count of many reads at once is split at each check, and the
+/// reads past a check count toward the next one, so that the meter never counts more than
+/// `METER_CHECK` reads between two checks, however wide one step is. A step counts its
+/// reads before it makes them, so a check that stops the meter comes before the work it
+/// counts. The count since the last check lives in the activation's sink when it has one
+/// ([`Sink::meter_reads`]), so that the meters of one activation share one cadence and
+/// many short scans cannot read without a check. A meter charges its own reads to the work
+/// bound only as its [`Bill`] says, and its charge is the same whatever the cadence, a
+/// conclusion for every [`WORK_READS`] of its reads. The memory that a metered step builds
+/// is admitted through the caller's [`Guard`] before it is built, as the rest of Tier D
+/// admits it.
 pub(super) struct Meter {
     /// the reads since the last check, used when the sink keeps no count
     own: std::cell::Cell<usize>,
@@ -4916,6 +4927,24 @@ pub(super) struct Meter {
     bill: Bill,
     /// whether a check of the bounds stopped the meter, which answers false from then on
     stopped: std::cell::Cell<bool>,
+}
+
+/// Takes the reads of `n` up to the next check on the count `at`, true when they reach
+/// it, which starts the count again with the rest of `n` still to take.
+#[inline]
+fn meter_upto(at: &std::cell::Cell<usize>, n: &mut usize) -> bool {
+    let k = at.get();
+    let room = METER_CHECK.saturating_sub(k);
+    if *n < room {
+        at.set(k + *n);
+        *n = 0;
+        return false;
+    }
+    *n -= room;
+    at.set(0);
+    #[cfg(test)]
+    meter_probe::check(k + room);
+    true
 }
 
 impl Meter {
@@ -4934,25 +4963,15 @@ impl Meter {
         Self::new(Bill::Nothing)
     }
 
-    /// Counts `n` reads and tells whether a check is due, with the reads since the last
-    /// check when it is.
+    /// Whether the meter answers no further reads, which the harness counts.
     #[inline]
-    fn tick<S: Sink + ?Sized>(&self, n: usize, billed: bool, out: &S) -> Option<usize> {
-        if billed && self.bill != Bill::Nothing {
-            self.unbilled.set(self.unbilled.get().saturating_add(n));
-        }
-        let at = out.meter_reads().unwrap_or(&self.own);
-        let k = at.get().saturating_add(n);
+    fn refused(&self) -> bool {
+        let stopped = self.stopped.get();
         #[cfg(test)]
-        meter_probe::read(n);
-        if k < METER_CHECK {
-            at.set(k);
-            return None;
+        if stopped {
+            meter_probe::refused();
         }
-        at.set(0);
-        #[cfg(test)]
-        meter_probe::check(k);
-        Some(k)
+        stopped
     }
 
     /// The conclusions that the reads not charged yet make, which it takes.
@@ -4962,55 +4981,67 @@ impl Meter {
         u / WORK_READS
     }
 
-    /// Counts `n` reads that the meter does not charge, which checks the bounds on the
-    /// meter's cadence, false once a check of the bounds stopped it. A meter that charges
-    /// takes the reads it charges through [`Meter::read_mut`].
+    /// Counts `n` reads that the meter does not charge, which checks the bounds at each
+    /// [`METER_CHECK`] reads of the cadence that they reach, false once a check of the
+    /// bounds stopped it. A meter that charges takes the reads it charges through
+    /// [`Meter::read_mut`].
     #[inline]
     pub(super) fn read<S: Sink + ?Sized>(&self, n: usize, out: &S) -> bool {
-        if self.stopped.get() {
+        if self.refused() {
             return false;
         }
-        if self.tick(n, false, out).is_none() {
-            return true;
+        #[cfg(test)]
+        meter_probe::read(n);
+        let mut n = n;
+        while meter_upto(out.meter_reads().unwrap_or(&self.own), &mut n) {
+            if !self.verdict(out.go_on()) {
+                return false;
+            }
         }
-        self.verdict(out.go_on())
+        true
     }
 
     /// Counts `n` reads and charges them as the meter's [`Bill`] says at each check, false
     /// once a check of the bounds stopped it.
     #[inline]
     pub(super) fn read_mut<S: Sink>(&self, n: usize, out: &mut S) -> bool {
-        if self.stopped.get() {
+        if self.refused() {
             return false;
         }
-        if self.tick(n, true, &*out).is_none() {
-            return true;
+        #[cfg(test)]
+        meter_probe::read(n);
+        if self.bill != Bill::Nothing {
+            self.unbilled.set(self.unbilled.get().saturating_add(n));
         }
-        self.charge(out);
-        self.verdict(out.go_on())
+        let mut n = n;
+        while meter_upto(out.meter_reads().unwrap_or(&self.own), &mut n) {
+            self.charge(out);
+            if !self.verdict(out.go_on()) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Counts `n` reads of a check that a `poll` makes, which takes the conclusions to
     /// charge and answers whether the run goes on, as the diagnostic polls.
     pub(super) fn read_poll(&self, n: usize, poll: &mut dyn FnMut(usize) -> bool) -> bool {
-        if self.stopped.get() {
+        if self.refused() {
             return false;
         }
+        #[cfg(test)]
+        meter_probe::read(n);
         if self.bill != Bill::Nothing {
             self.unbilled.set(self.unbilled.get().saturating_add(n));
         }
-        let k = self.own.get().saturating_add(n);
-        #[cfg(test)]
-        meter_probe::read(n);
-        if k < METER_CHECK {
-            self.own.set(k);
-            return true;
+        let mut n = n;
+        while meter_upto(&self.own, &mut n) {
+            let w = self.take_bill();
+            if !self.verdict(poll(w)) {
+                return false;
+            }
         }
-        self.own.set(0);
-        #[cfg(test)]
-        meter_probe::check(k);
-        let w = self.take_bill();
-        self.verdict(poll(w))
+        true
     }
 
     fn verdict(&self, go: bool) -> bool {
@@ -5054,7 +5085,8 @@ impl Meter {
 }
 
 /// What the meters of the current thread counted, for item 1280's harness: the reads, the
-/// checks, and the most reads between two checks.
+/// checks, the most reads between two checks, and the reads asked of a meter that a check
+/// had stopped.
 #[cfg(test)]
 pub(super) mod meter_probe {
     use std::cell::Cell;
@@ -5062,6 +5094,7 @@ pub(super) mod meter_probe {
         static READS: Cell<usize> = const { Cell::new(0) };
         static CHECKS: Cell<usize> = const { Cell::new(0) };
         static MOST: Cell<usize> = const { Cell::new(0) };
+        static REFUSED: Cell<usize> = const { Cell::new(0) };
     }
     pub(in crate::classify) fn read(n: usize) {
         READS.with(|c| c.set(c.get() + n));
@@ -5070,14 +5103,22 @@ pub(super) mod meter_probe {
         CHECKS.with(|c| c.set(c.get() + 1));
         MOST.with(|c| c.set(c.get().max(k)));
     }
+    pub(in crate::classify) fn refused() {
+        REFUSED.with(|c| c.set(c.get() + 1));
+    }
     /// Clears the counts and gives back what they held: reads, checks and the most reads
     /// between two checks.
     pub(in crate::classify) fn take() -> (usize, usize, usize) {
+        REFUSED.with(|c| c.set(0));
         (
             READS.with(|c| c.replace(0)),
             CHECKS.with(|c| c.replace(0)),
             MOST.with(|c| c.replace(0)),
         )
+    }
+    /// Clears and gives back the reads asked of stopped meters since the last take.
+    pub(in crate::classify) fn take_refused() -> usize {
+        REFUSED.with(|c| c.replace(0))
     }
 }
 

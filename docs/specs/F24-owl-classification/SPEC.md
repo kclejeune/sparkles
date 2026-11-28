@@ -540,55 +540,94 @@ duplicated a charge that the product already made.
 
 Item 1280 gives the repair and the rooted rules' premise lists one meter,
 `dl_rules::Meter`. A read is one entry of the store's index, one literal of a clause, or one
-step of a comparison of two premises. A meter checks the run's work bound, memory budget,
-deadline and cancellation once every 1,024 reads, so between two checks it counts at most
-1,024 reads of one read each, or 1,039 in the diagnostic, whose choice of a product counts as
-16 reads. The count since the last check lives in the activation's sink, which all meters of
-an activation share, so that many short scans in a row still meet a check. The meter's checks
-are new, and its reads charge nothing to the work bound except where a scan of the repair
-charged one conclusion for every 16 entries before. Those scans keep that charge, so runs
-with the repair off and the repair's own counts of derived conclusions are unchanged. The
-meter reads these steps.
+step of a comparison of two premises. During saturation a meter checks the run's work bound,
+memory budget, deadline and cancellation once every 1,024 reads. A step counts its reads
+before it makes them, and a count of many reads at once is split at each check with the rest
+carried to the next, so a meter never counts more than 1,024 reads between two checks however
+wide one premise or clause is. The count since the last check lives in the activation's
+sink, which all meters of an activation share, so that many short scans in a row still meet
+a check. The meter's checks are new, and its reads charge nothing to the work bound except
+where a scan of the repair charged one conclusion for every 16 entries before. Those scans
+keep that charge, so runs with the repair off and the repair's own counts of derived
+conclusions are unchanged. A check that stops a meter ends the scan that made it at once.
+The meter reads these steps.
 
 - The premise lists of a returned clause are read twice, once to size them and once to build
-  them, including M-return-cf's test of each premise's body. The lists, the product's slot
-  and the pruning's scratch are admitted before the lists are built, and the pruning of each
-  list reads through the meter, a read for each comparison of two sides and for each literal
-  that a comparison steps over. This holds on initial arrival and for every return that a
-  late premise replays, with one meter across the replay, and a replay batch checks the
-  bounds before it drains.
+  them, with a read for each body literal looked up, each index entry, each literal that
+  M-return-cf tests and each literal of a premise that a pass sizes or copies. The buffer of
+  the lists' sizes is admitted before it is made, and the lists, the product's slot and the
+  pruning's scratch are admitted before the lists are built. The pruning of each list reads
+  each side's literals for its signature and its test of order, and a read for each
+  comparison of two sides and for each literal that a comparison steps over. This holds on
+  initial arrival, where the clause's index under its body literals reads through the same
+  meter and the bounds are checked in full before the product is drained, and for every
+  return that a late premise replays, with one meter across the replay, its search for the
+  late premise's literal included, and a check of the bounds before each batch drains.
 - The root's offer of a clause whose body is ground triggers reads through the meter for
-  each body literal it tests, looks up in the index or compares to choose the holders it
-  scans.
-- The diagnostic's redundancy test of each product reads the stored candidates and the
-  literals of their comparisons through its meter, as do the copies of the chosen premises.
-- On the default path, Hyper's partner lists, its test of root facts over a constant, Join's
-  premises over a ground body literal and the destinations of the root's offer of a fact read
-  through a meter, and the offer admits its list of destinations before it builds it.
+  each body literal it tests, looks up in the index, adds to the index or compares to choose
+  the holders it scans. A stop while the clause is indexed leaves the rest of its body
+  unindexed in a store that the stop interrupts.
+- On the default path, Hyper reads each body position of an ontology clause, each partner
+  in the index and each literal of a partner it visits, and its test of root facts over a
+  constant ends at the first refused read. Join reads each body literal of the given clause,
+  each premise over a ground body literal and the literals that its restriction and copy
+  read. The root's offer of a fact reads each literal of its head, each lookup of the
+  registrations of a constant and each destination, and admits its list of destinations
+  before it builds it.
+
+The marker pass that the decline check and the diagnostic run after a rooted run saturates
+is outside the saturation. Its redundancy test of each product reads the stored candidates,
+the literals of their comparisons, the copies of the chosen premises and of the base's head,
+and the normalization of each assembled clause through a meter of its own. That meter
+checks only the deadline and cancellation through the diagnostic's callback, and it counts
+its reads as separate deficit work, `dwork`, which neither the saturation's work bound nor
+the admission of the deficit pass's scratch takes.
 
 The upfront bound is gone. A return's premise lists are admitted exactly before they are
 built, and the product charges its own tables as they grow. On a return of 64 × 64 premises
 whose conclusions a stored unit subsumes, a counting allocator measures a heap that the
 charged peak covers together with the return's retained record of the clause and its copy of
-it, and the charge stays within four times the heap. A return of 2^57 choices now runs until
-the work bound or its tables' charge against the memory budget stops it, where before it
-stopped at once on an unrepresentable bound. Under a budget of 4 MiB the test fixture stops
-within the product's second step, before the product derives anything. A test refuses each
-check of the bounds in turn during a return's premise lists, an offered clause's index and
-holders, and Join's premises, and finds nothing held, no product of a return pushed, and the
-offer cut short with its store interrupted. A test harness grows the
-premises per literal, the length of a premise, the returned body, the returns of a late
-premise, the holders and body of an offered clause, the stored clauses of the diagnostic's
-test and Join's premises eight times over, and asserts each time that no more than the
-cadence of reads passes between two checks, that every read the fixture needs is counted
-and that the sink sees a check for every 1,024 reads.
+it, and the charge stays within four times the heap. A return over a wide body whose first
+literal has no premise admits its buffer of the lists' sizes before it makes it, so that a
+grant below the buffer refuses the return before the heap grows by it. A return of 2^57
+choices now runs until the work bound or its tables' charge against the memory budget stops
+it, where before it stopped at once on an unrepresentable bound. Under a budget of 4 MiB the
+test fixture stops within the product's second step, before the product derives anything.
 
-Item 1319 follows the premise lists that the meter does not read. These are Pred's lists in
-the root, the pruning of the products of the other rules on the default path, and the scans
-of the equality split and merge, which keep a counter of their own. The marker pass that the
-decline check and the diagnostic run after a rooted run saturates checks no bound, and the
-last step of a wide product derives up to 4,097 unions between two checks. Item 1260 follows
-both.
+The tests of the meter cover these cases. They refuse each check of the bounds in turn
+during a return's premise lists and their pruning, the index of a returned clause and of an
+offered clause, an offered clause's holders, Hyper's lists and partners, the root's offer of
+a fact, Join's premises and the search for a root fact. Each time they find no read asked
+of the stopped meter and nothing held once the step returns. For a return's lists, Hyper,
+its partners and Join they find the caller's guard holding only what the step kept while
+the guard is still live, and for a return's lists no product pushed. For the indexes and
+the offers they find the store interrupted and nothing sent, and for a wide index the rest
+of the body unlisted. A pruning of two wide sides reads every literal of both, and a
+refusal of its first read ends it. A return of one premise under a sink that
+grants memory without the full check derives nothing after a stop that was already asked
+for. A test reads through guarded views of one sink that keeps the activation's count, with
+a check-only meter and a repair's meter that charges, and finds the check at the 1,024th
+read of the two together and the repair charged one conclusion for every 16 of its own
+reads. A late replay's batches keep M-return's rule across a flush. A test harness grows the
+premises per literal, the length of a premise, the width of a single premise, the returned
+body, the body that a late premise's literal is searched for in, the returns of a late
+premise, the holders and body of an offered clause, the stored clauses of the diagnostic's
+test, Hyper's premises and partners, the root fact offer's registrations and head, and
+Join's premises and given body eight times over. It asserts each time that no more than 1,024 reads pass
+between two checks, that every read the fixture needs is counted and that the sink sees a
+check for every 1,024 reads. The fixtures are unit fixtures over one context's store, and
+the harness does not run a whole saturation.
+
+Item 1319 follows the scans that the meter does not read. These are Pred's lists in the
+root, the pruning of the products of the other rules on the default path and of the unions
+of one step of a product, the scans of the equality split and merge, which keep a counter of
+their own, Join's head lookups, the universals over role atoms, the moves of universals to
+and from constants, the registration of a context with the root, Hyper's comparisons of the
+fixed premise with each partner, the root fact offer's list of constants, and the copy of a
+returned clause that M-return takes before it admits its lists. Outside the diagnostic's
+counts and redundancy test, which check the deadline and cancellation, the marker pass that
+the decline check and the diagnostic run after a rooted run saturates checks no bound, and
+item 1260 follows it.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position

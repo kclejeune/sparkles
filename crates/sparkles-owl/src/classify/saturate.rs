@@ -7709,10 +7709,14 @@ mod horn_accounting_tests {
             out2.keep_data(500);
             assert_eq!(out2.kept, 500);
             // rret commits its small retained seen/MRep/rets growth into `run.memory`
-            // (single ledger) and then admits its premise lists and its product's tables,
-            // which pass the remaining headroom (`room`), so the admission overflows
-            // `run.memory` before debit; its cleanup must leave out1's debit, the committed
-            // retained growth, and out2's kept untouched.
+            // (single ledger), admits the buffer of its lists' sizes, and then admits its
+            // premise lists and its product's tables, which pass the remaining headroom
+            // (`room`), so that admission overflows `run.memory` before debit; its cleanup
+            // must leave out1's debit and the committed retained growth untouched. The
+            // release of the sizes' buffer nets against out2's kept bytes first, as every
+            // release of an activation does, so those bytes move from kept to the run's
+            // count and their sum is unchanged.
+            let sizes = dl.table.get(cid).body().len() * std::mem::size_of::<usize>();
             assert!(super::dl_root::rret(&ix, &mut st, cid, &mut out2));
             retained = st.bytes() - before_st;
             assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
@@ -7724,17 +7728,21 @@ mod horn_accounting_tests {
             );
             assert_eq!(
                 run.memory.load(Ordering::Relaxed),
-                base + first + retained,
+                base + first + retained + sizes,
                 "overflow refusal in rret must not subtract from worker 1's debit"
             );
             assert_eq!(
-                out2.kept, 500,
-                "overflow refusal in rret must not consume worker 2's pending kept bytes"
+                out2.kept,
+                500 - sizes,
+                "overflow refusal in rret must not lose worker 2's pending kept bytes"
             );
             // Also verify direct unrepresentable request leaves both untouched.
             assert!(!out2.reserve_data(isize::MAX as usize + 1));
-            assert_eq!(run.memory.load(Ordering::Relaxed), base + first + retained);
-            assert_eq!(out2.kept, 500);
+            assert_eq!(
+                run.memory.load(Ordering::Relaxed),
+                base + first + retained + sizes
+            );
+            assert_eq!(out2.kept, 500 - sizes);
         }
         // Dropping out2 flushes its 500 kept bytes cleanly onto base + first + retained.
         assert_eq!(
