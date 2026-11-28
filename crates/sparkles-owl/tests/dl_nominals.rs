@@ -332,26 +332,17 @@ fn a_minimum_of_two_into_one_nominal_needs_counting() {
     let out = rooted(body, true, &[("A", "Nothing")]);
     assert_eq!(out.consistency, Consistency::Consistent);
     assert!(out.taxonomy.is_unsatisfiable(&c("A")));
-    // without it the minimum alone is left out and reported, and not read as an
-    // existential, while Tier D takes the rest
-    let mut k = Classifier::of(&axioms(body));
-    let out = k
-        .classify(&Limits {
-            rooted: true,
-            ..Limits::default()
-        })
-        .unwrap();
-    let left: Vec<String> = k
-        .excluded()
-        .iter()
-        .map(|e| format!("{:?}", e.axiom))
-        .collect();
+    // without it the rooted rules would leave the minimum out, which the Horn rules take,
+    // so the Horn rules take the axioms outside OWL 2 EL as in the run without the option
+    // and leave the disjunction out (roadmap item 1286)
+    let left = declined(body, true);
     assert_eq!(left.len(), 1, "{left:?}");
-    assert!(left[0].contains("MinCardinality"), "{left:?}");
-    assert!(out.stats.clauses > 0, "Tier D took no clause");
-    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(left[0].contains("ObjectUnionOf"), "{left:?}");
+    let mut k = Classifier::of(&axioms(body));
+    let out = k.classify(&rooted_limits()).unwrap();
+    assert_eq!(out.stats.clauses, 0, "Tier D took a clause");
     assert!(
-        !out.taxonomy.is_subclass(&c("A"), &c("C")),
+        out.taxonomy.is_unsatisfiable(&c("A")) || !out.taxonomy.is_subclass(&c("A"), &c("C")),
         "the minimum was weakened"
     );
 }
@@ -374,7 +365,8 @@ fn minimum_fillers_are_not_coloured_across_individuals() {
 }
 
 /// An irreflexive property beside a nominal is left out and reported, and the rooted run
-/// takes the rest, as it does with a minimum above one when counting is off.
+/// takes the rest. The Horn rules take the property too, but an irreflexive property does
+/// not give the axioms to them (roadmap item 1323).
 #[test]
 fn an_irreflexive_property_beside_a_nominal_is_left_out() {
     // r(a, a) closes a loop that the rules check only on simple properties without loops
@@ -784,37 +776,19 @@ fn a_disjoint_union_of_two_members_with_one_image_is_empty() {
     assert!(out.taxonomy.is_subclass(&c("D"), &c("C")));
 }
 
-/// A rewritten axiom can equal an axiom the ontology states as it is. Here both members of
-/// the disjointness rewrite to `≥2 r.⊤`, so the rewriting adds `≥2 r.⊤ ⊑ ⊥`, which the
-/// first axiom states too. Without counting the run leaves that axiom out, and the report
-/// names both original axioms (row 1304).
+/// `≥2 r.⊤ ⊑ ⊥` states the empty class of two members whose images are one, and two
+/// replaced axioms can rewrite to one axiom, here `≥2 r.∃U.A ⊑ ⊥` (row 1304). Without
+/// counting the rooted rules would leave that Horn axiom out, so the run gives the
+/// original axioms to the Horn rules, which take them as the run without the option does
+/// (roadmap item 1286). The crate's tests check the report of such an axiom in the run
+/// without counting after the counting bound, which leaves it out.
 #[test]
-fn the_report_names_every_original_axiom_of_a_rewritten_one_left_out() {
-    let ax = axioms(
+fn a_rewritten_horn_axiom_that_needs_counting_goes_to_the_horn_rules() {
+    for body in [
         "SubClassOf(ObjectMinCardinality(2 :r owl:Thing) owl:Nothing)
          DisjointClasses(ObjectMinCardinality(2 :r owl:Thing)
              ObjectMinCardinality(2 :r ObjectMinCardinality(0 owl:topObjectProperty :X)))
          ClassAssertion(:B :b)",
-    );
-    let find = |f: fn(&AxiomKind) -> bool| ax.iter().map(|a| a.kind.clone()).find(f).unwrap();
-    let stated = find(|k| matches!(k, AxiomKind::SubClassOf(_, ClassExpression::Class(_))));
-    let disjoint = find(|k| matches!(k, AxiomKind::DisjointClasses(_)));
-    let mut k = Classifier::of(&ax);
-    let out = k.classify(&rooted_limits()).unwrap();
-    assert_eq!(out.stats.tier, Tier::Disjunctive);
-    let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
-    assert!(left.contains(&stated), "{left:#?}");
-    assert!(left.contains(&disjoint), "{left:#?}");
-    assert_eq!(left.len(), 2, "{left:#?}");
-    // the disjunction is the only axiom outside OWL 2 EL that the run takes
-    assert_eq!(out.stats.outside_el.taken, 1);
-}
-
-/// Two replaced axioms can rewrite to one axiom, here `≥2 r.∃U.A ⊑ ⊥`, and the report
-/// names both when the run leaves it out (row 1304).
-#[test]
-fn the_report_names_both_replaced_axioms_of_one_rewritten_axiom() {
-    let ax = axioms(
         "DisjointClasses(
              ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
              ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A)))
@@ -822,21 +796,26 @@ fn the_report_names_both_replaced_axioms_of_one_rewritten_axiom() {
              ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
              owl:Nothing)
          ClassAssertion(:B :b)",
-    );
-    let mut k = Classifier::of(&ax);
-    let out = k.classify(&rooted_limits()).unwrap();
-    assert_eq!(out.stats.tier, Tier::Disjunctive);
-    let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
-    assert_eq!(left.len(), 2, "{left:#?}");
-    assert!(
-        left.iter()
-            .any(|k| matches!(k, AxiomKind::DisjointClasses(_)))
-    );
-    assert!(left.iter().any(|k| matches!(k, AxiomKind::SubClassOf(..))));
-    assert_eq!(out.stats.outside_el.taken, 1);
+    ] {
+        let left = declined(body, true);
+        assert_eq!(left.len(), 1, "{left:#?}");
+        assert!(left[0].contains("ObjectUnionOf"), "{left:#?}");
+        // the run over the rewriting refuses, and its fallback to the original axioms, in
+        // which the rooted rules leave out the universal property, gives them to the Horn
+        // rules too
+        let mut k = Classifier::of(&axioms(body));
+        let out = k.classify(&rooted_limits()).unwrap();
+        assert_eq!(out.stats.clauses, 0, "Tier D took a clause");
+        assert_eq!(out.stats.dl_contexts, 0, "Tier D ran");
+    }
 }
 
 /// A disjoint union whose rewritten axioms are left out for two rules is reported once.
+/// Its two minimums rewrite to one Horn axiom that needs counting, `≥2 r.∃U.A ⊑ ⊥`, which
+/// does not give the axioms to the Horn rules, since the disjoint union it stands for
+/// needs case analysis (roadmap item 1286). The run keeps the rewriting, whose universal
+/// restriction over the universal property only the rewriting lets the rooted rules take,
+/// so that `D ⊑ H` follows through the union.
 #[test]
 fn a_disjoint_union_left_out_for_two_rules_is_reported_once() {
     let ax = axioms(
@@ -844,13 +823,23 @@ fn a_disjoint_union_left_out_for_two_rules_is_reported_once() {
              ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
              ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A))
              :D)
-         ClassAssertion(:B :b)",
+         ClassAssertion(:B :b)
+         SubClassOf(:B ObjectAllValuesFrom(owl:topObjectProperty :E))
+         SubClassOf(:E ObjectUnionOf(:F :G))
+         SubClassOf(:F :H)
+         SubClassOf(:G :H)",
     );
     let mut k = Classifier::of(&ax);
-    k.classify(&rooted_limits()).unwrap();
+    let out = k.classify(&rooted_limits()).unwrap();
     let left = k.excluded();
     assert_eq!(left.len(), 1, "{left:#?}");
     assert!(matches!(left[0].axiom, AxiomKind::DisjointUnion(..)));
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert!(out.stats.clauses > 0, "Tier D took no clause");
+    assert!(
+        out.taxonomy.is_subclass(&c("D"), &c("H")),
+        "the run did not keep the rewriting"
+    );
 }
 
 const INTERNAL: &str = "urn:sparkles:internal:";
@@ -1015,18 +1004,19 @@ fn a_minimum_of_one_over_the_universal_property_is_an_existential() {
 }
 
 #[test]
-fn a_functional_property_above_the_universal_property_is_left_out() {
+fn a_functional_property_above_the_universal_property_goes_to_the_horn_rules() {
     // p is above the transitive property that stands for the universal one, so p is not
-    // simple, and the rooted run leaves its functionality out and reports it, while it
-    // takes the equivalence and the union
+    // simple, and the rooted rules without counting would leave its functionality out,
+    // which the Horn rules take, so the run answers as the run without the option and
+    // leaves the union out (roadmap item 1286)
     let left = declined(
         "EquivalentObjectProperties(owl:topObjectProperty :p)
          FunctionalObjectProperty(:p)
          ClassAssertion(:A :a)",
-        false,
+        true,
     );
     assert_eq!(left.len(), 1, "{left:?}");
-    assert!(left[0].contains("FunctionalObjectProperty"), "{left:?}");
+    assert!(left[0].contains("ObjectUnionOf"), "{left:?}");
 }
 
 #[test]

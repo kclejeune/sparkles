@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Rooted classification keeps the Horn share (item 1286)
+
+A classification with `Limits::rooted` and without `Limits::counting` no longer trades the
+axioms that the Horn rules take for the disjunctive axioms that the rooted rules take.
+Before Tier D normalizes anything, a rooted run checks whether its rules would leave out a
+Horn axiom only for lack of counting, such as a functional or inverse-functional property
+or a minimum above one, that the Horn rules take. When one would, every axiom outside
+OWL 2 EL goes to the Horn rules, as in a run without the option, and the disjunctive axioms
+are left out and reported instead. An axiom that both rules leave out, such as a minimum
+above 64, or that the rooted rules leave out for another reason, such as a self
+restriction, keeps the rooted run's disjunctive axioms. The check changes nothing in the
+classifier's interner and polls for cancellation, so a refused run interns what the default
+run interns. On the item's fixtures and the new regression ontologies it answers, falls
+back or stops as the default run does under memory budgets, with partial answers or not.
+Over item 805's rewriting the Horn rules are asked about the original axioms, so a Horn
+piece of a rewritten disjunctive axiom keeps the rewriting. The four `dl603` fixtures
+`mixed-031`, `sroiq-017`, `sroiq-030` and `sroiq-032` now give the default run's answer,
+and `sroiq-030` and `sroiq-032` are inconsistent as HermiT finds them. Across the 640
+`dl603` fixtures a rooted run misses 1,225 of HermiT's subsumptions against 1,349 before. A
+run asked to count that passes its bound still starts again without counting and leaves
+those axioms out. Rooted runs remain off by default, and item 1326 follows the irreflexive
+properties that the rooted rules still leave out.
+
 ### Shared ground reasoning in rooted runs (item 1061)
 
 A rooted run with `SPARKLES_ROOTED_SHARED_FACTS=1` now forwards a unit the root delivered

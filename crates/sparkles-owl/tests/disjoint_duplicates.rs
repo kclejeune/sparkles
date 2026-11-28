@@ -438,13 +438,22 @@ fn original_axiom_diagnostics_and_counts_preserve_repeated_operands() {
     // Rooted dl_reduce diagnostic restoration: a repeated-operand axiom over
     // owl:topObjectProperty whose rewritten form is excluded (counting=false refuses
     // ObjectMaxCardinality(2 ...)) must be restored with all original repeated operands.
+    // The complemented member makes the axiom need case analysis, so that the rooted run
+    // keeps it rather than giving the axioms to the Horn rules (roadmap item 1286). The
+    // universal restriction over the universal property, which only the rewriting lets the
+    // rooted rules take, gives `C ⊑ S` through the union of `Q` and `R`, so that the run
+    // shows it kept the rewriting.
     let rooted_ax = parse_axioms(
         "SubClassOf(:B ObjectUnionOf(:C :D))\n\
          ClassAssertion(:B :b)\n\
+         SubClassOf(:B ObjectAllValuesFrom(owl:topObjectProperty :P))\n\
+         SubClassOf(:P ObjectUnionOf(:Q :R))\n\
+         SubClassOf(:Q :S)\n\
+         SubClassOf(:R :S)\n\
          DisjointClasses(ObjectSomeValuesFrom(owl:topObjectProperty :A) \
                          ObjectSomeValuesFrom(owl:topObjectProperty :A) \
                          ObjectMaxCardinality(2 :r :E) \
-                         :F)",
+                         ObjectComplementOf(:F))",
     );
     let expected_orig = rooted_ax
         .iter()
@@ -465,10 +474,20 @@ fn original_axiom_diagnostics_and_counts_preserve_repeated_operands() {
         })
         .unwrap();
     assert!(!out.complete);
+    // the rooted run took the union, which the Horn rules leave out, and reports only the
+    // restored original axiom
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert!(out.stats.clauses > 0, "the rooted run took no clause");
     let left = k.excluded();
+    assert_eq!(left.len(), 1, "{left:?}");
     assert!(
-        left.iter().any(|e| e.axiom == expected_orig),
+        left[0].axiom == expected_orig,
         "expected restored original repeated axiom {expected_orig:?}, got {left:?}"
+    );
+    let ex = |n: &str| Class::new(format!("http://ex.org/{n}"));
+    assert!(
+        out.taxonomy.is_subclass(&ex("C"), &ex("S")),
+        "the run did not keep the rewriting"
     );
 }
 
