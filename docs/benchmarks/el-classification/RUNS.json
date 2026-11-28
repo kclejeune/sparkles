@@ -1603,9 +1603,9 @@
    "metadata_note": "Manual record of roadmap item 1269 on forge: nine rounds of the base, the allocation-free profile check and the tip on ore_ont_13482, GO and ChEBI lite on one and four threads, the separate atlas rounds with the layout probe, the laptop's instruction counts and stage probe, and the taxonomy and exclusion sweep."
   },
   {
-   "run_id": "sha256-16a7543fe49bfc74c67c2d6028bb73029038b93f9f52a3d77bf731d3162e3afb",
+   "run_id": "sha256-e45f4ef57d4d12b0aec5e3cb2e85b090f19660905bcd4e3bbead6b3eb2fc20b6",
    "path": "runs/2026-11-28-dl-marker-default-boat-4d50167b/record.json",
-   "sha256": "16a7543fe49bfc74c67c2d6028bb73029038b93f9f52a3d77bf731d3162e3afb",
+   "sha256": "e45f4ef57d4d12b0aec5e3cb2e85b090f19660905bcd4e3bbead6b3eb2fc20b6",
    "format": "legacy-assessment",
    "context": {
     "suite": "el-classification",
@@ -1642,7 +1642,12 @@
       "verified_followup": "4d50167b (tree 61796eb7) changes slot-admission locking, OnceLock::set race cleanup, post-saturation live_record_bytes recount, tests and docs; verified by targeted sparkles-owl (1,586 tests) and handles::ontology (214 tests) suites on boat:bx_azx7qhs7 with mbx 1.29.1 and rustc 1.99.1 without re-running the generated corpus"
      },
      "retained_evidence_sha256": {
+      "corpora.tgz": "eafedef559d03f1d9f7f99a38a4510f7276107b2d279b20b9a87a311f7e2cfdf",
       "dl1231-logs.tgz": "fefc263eac3da7f4076dfe84a457ea67921f6cbaf18d14d9198f1b496eed4be1",
+      "out-base.tgz": "64e97aa1c48edf57a69009207ec42fede3d9770deb37b100f6db7f3882c9139e",
+      "out-flip.tgz": "17feb35128adff3514a7ea894eff8d00a7d2038fa349644473ea586e5bc72850",
+      "out-m1247.tgz": "c479f0060e572d72d0e2fcc942395e0758aa897a7348ff2ccde1c4b7579ad841",
+      "out-own.tgz": "69ab81802436118e5fbb9896b2973b6f2e3ae43f3a702defde2000c79c3482dd",
       "m1247.patch": "8deea5b4461e6c61bba73673d11c3affc0c14c097fdbfe3de63f6bf6bbea99b0",
       "final.patch": "bfe2acea8adac6c320089420e5991f2889646084796744c27bcf5bcc3e010b89",
       "flipfix.patch": "e2ba639995ddf6f7e2f6080ec769798283d80b600d03aab8ce3a4ba41b910dc0",
