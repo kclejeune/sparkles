@@ -1,7 +1,8 @@
 # OWL 2 EL classification results
 
-This report is a manual import of the retained run records. Read the
-[methodology](README.md) with each result.
+This report is a manual import of the retained run records and includes
+working measurements where noted. Read the [methodology](README.md) with
+each result.
 
 ## Rooted at-most agreement
 
@@ -35,13 +36,17 @@ Item 1232 tracks the cost of repeated products.
 
 ## Rooted equality pruning on ORE 2015 DL development files
 
-Boat worker `bx_z8s55a5v` ran the release example at `ac994f489` with Rust
-1.99.1 and Boxington 1.29.1. Each pair used the same ontology and the same
-524,288-conclusion cap, once with `SPARKLES_ROOTED_EQ_KNOWN=0` and once with
-`SPARKLES_ROOTED_EQ_KNOWN=1`. One-thread cautious runs used both the stock
-settings and shared facts with constant merging. The 12 historical bound
-cases also ran with shared facts and merging and four threads requested in
-eager mode. Item 1061 measures `ore_ont_14924` and `ore_ont_15803` separately.
+This Boat census is a working measurement of derived work and taxonomy
+agreement. Published benchmark-host results have their own run records.
+On worker `bx_z8s55a5v`, the original-input arm ran the unpatched release
+example `el_classify` at `ac994f489` with Rust 1.99.1 and Boxington 1.29.1.
+Each pair used the same ontology and the same 524,288-conclusion cap,
+once with `SPARKLES_ROOTED_EQ_KNOWN=0` and once with `SPARKLES_ROOTED_EQ_KNOWN=1`.
+One-thread cautious runs used both the stock settings and shared facts with
+constant merging. The historical bound cases are the 12 development files
+that exceeded the cap at `b47b582b`. These files also ran with shared facts
+and merging and four threads requested in eager mode. Item 1061 measures
+`ore_ont_14924` and `ore_ont_15803` separately.
 
 | Original input cohort | Files | Switch pairs | Pairs with identical taxonomies |
 |---|---:|---:|---:|
@@ -59,10 +64,11 @@ HermiT's. The equality switch changes neither control's work.
 The [F24 rationale](../../specs/F24-owl-classification/SPEC.md#equality-rewrites-to-known-query-atoms-item-1284)
 describes which products the cut can omit.
 
-The diagnostic build bypassed item 1286's two Horn-share routing decisions.
-The same build applied the data and anonymous-individual ablation to the
-top-property files. The diagnostic runs requested one cautious thread
-with and without shared facts and merging.
+The diagnostic binary `el_classify_ablated` was built from `ac994f489`
+with the `dl_eq.rs` scan-polling patch from `42fdb775b`. It also bypassed
+item 1286's two Horn-share routing decisions and applied the data and
+anonymous-individual ablation to the top-property files. The diagnostic
+runs requested one cautious thread with and without shared facts and merging.
 
 | Cohort with the routing bypass | Files | Switch pairs | Work-bound pairs | DL memory pairs | Pairs with partial DL work |
 |---|---:|---:|---:|---:|---:|

@@ -6001,11 +6001,21 @@ discrepancy remains part of the evidence for item 823.
 
 #### The rooted work bound on development files
 
-The development census at `ac994f489` includes 12 prior bound cases, six
-top-property files and three controls. Item 1061 tracks `ore_ont_14924`
-and `ore_ont_15803` separately. Each pair keeps the input, bound, schedule,
-and all other switches fixed. All 54 pairs on the original files give
-byte-identical taxonomies with the equality cut on and off.
+At `b47b582b`, 25 ORE 2015 DL files from the development and final sets
+exceeded the rooted cap of 524,288 conclusions. Their default answers
+reported 974 left-out axioms and 7,722 classes whose modules contained a
+left-out axiom. On 21 files the bound was the only reason for fallback.
+Item 1061 tracks `ore_ont_14924` and `ore_ont_15803` separately. The roughly
+11 remaining final-set cases still need measurement.
+
+The census at `ac994f489` rechecks the 12 development files that exceeded
+the bound at `b47b582b`. They are `ore_ont_10006`, `ore_ont_1199`,
+`ore_ont_12698`, `ore_ont_13928`, `ore_ont_16462`, `ore_ont_16535`,
+`ore_ont_1673`, `ore_ont_5184`, `ore_ont_5359`, `ore_ont_7914`,
+`ore_ont_8480` and `ore_ont_9540`. It also covers six top-property files from item 1282 and
+three controls. Each pair keeps the input, bound, schedule and all other
+switches fixed. All 54 pairs on the original files give byte-identical
+taxonomies with the equality cut on and off.
 
 The original bound cases and top-property files report zero DL work on
 the ordinary route. The bound therefore cannot explain those answers.
@@ -6013,7 +6023,7 @@ Item 1286 retains Horn coverage when rooted saturation would give up
 Horn axioms that need counting. A separate diagnostic bypasses its two
 routing checks to expose the rooted work on those inputs.
 
-All 12 historical inputs exhaust the diagnostic work bound with either equality
+All 12 prior bound cases exhaust the diagnostic work bound with either equality
 setting and with or without shared facts and merging. On the six top-property
 inputs with data and anonymous-individual axioms removed, four still exhaust
 the work bound in every diagnostic configuration and `ore_ont_15993` hits the
