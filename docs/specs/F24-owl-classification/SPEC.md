@@ -490,9 +490,9 @@ premise of Hyper over `x`, of Pred and Succ, of Join on the side of the body, of
 Factor with a literal over `x` or `f(x)`, and of the inferences local to the context. The
 root's clauses are never cut.
 
-The argument has four parts. The first is the stage of facts. The journal's model
-construction starts from the clauses with an empty body of the query context and of the
-root, none of which is ground-bodied, so the cut leaves every inference among them in
+The argument has four parts. The first is the stage of facts. The model construction of
+item 1220's proof work starts from the clauses with an empty body of the query context and
+of the root, none of which is ground-bodied, so the cut leaves every inference among them in
 place. The second is the discharge of a ground body in the query context. Take a clause
 there whose ground body literals all hold in that model and whose head is false in it.
 Each body literal has a producer, a processed clause with an empty body and the literal
@@ -505,12 +505,12 @@ still false. Processing the clause first finds the producer through the index of
 literals, and processing the producer first finds the clause through the index of ground
 body literals, so the order of arrival does not matter. After at most as many Joins as
 the body has ground literals, the clause has no ground body and takes every inference.
-The third part is the elements outside the stage of facts. Each inference that the
-journal's construction needs at such an element has a pivot of its own, an atom over `x`,
-a literal over `f(x)` or a role atom between `x` and a constant, and the cut keeps all of
-them. A ground-bodied clause whose head holds a literal over a constant either has that
-literal true in the model, where its consequences follow from the clause with an empty
-body that produces it, or reaches the query context or the root by Pred with its ground
+The third part is the elements outside the stage of facts. Each inference that the same
+construction needs at such an element has a pivot of its own, an atom over `x`, a literal
+over `f(x)` or a role atom between `x` and a constant, and the cut keeps all of them. A
+ground-bodied clause whose head holds a literal over a constant either has that literal
+true in the model, where its consequences follow from the clause with an empty body that
+produces it, or is assumed to reach the query context or the root by Pred with its ground
 body intact, where the second part discharges the body. The fourth part is item 1231's
 return in mode `129`. The argument resolves a returned root clause against producers with
 an empty body in the query context, or against live clauses that subsume them, and the
@@ -529,14 +529,17 @@ ground-bodied partners, since a candidate that left them out broke the return of
 over `f(u)` that hold under a marker. The growth is cut where those partners are made and
 not in Pred.
 
-Three obligations stay open. A clause with a ground body and a literal over `f(u)` in its
-head can be held by a context other than the query context, and the argument does not
-show that such a context can discharge its body or that another context holds a
-replacement with the residual head and the maximality that a later inference needs, so
-the second part covers the query context only. The lifting of clauses with `f(u)` to
-every context is the obligation of item 804's departures. Counting is not covered, and the
-filter of the return is checked only against the uses of the return that the argument
-names. No measured run loses an entailment to any of them, and all three stay with item
+Four obligations stay open. The first is the assumption of the third part, that a
+ground-bodied clause outside the query context whose literal is false in the model reaches
+the query context or the root by Pred. The second is the holder of such a clause. A clause
+with a ground body and a literal over `f(u)` in its head can be held by a context other
+than the query context, and the argument does not show that such a context can discharge
+its body or that another context holds a replacement with the residual head and the
+maximality that a later inference needs, so the second part covers the query context
+only. The third is the lifting of clauses with `f(u)` to every context, which is the
+obligation of item 804's departures. The fourth is that counting is not covered and that
+the filter of the return is checked only against the uses of the return that the argument
+names. No measured run loses an entailment to any of them, and all four stay with item
 1220's proof, which item 823 waits for. An earlier design also proposed selecting one
 ground body literal for Join and pruning a product early against the store. The consult
 on the design found that the first needs the holder argument above, which is open, and
@@ -547,24 +550,31 @@ The cut finishes the ontologies of the item. The measured set holds 104 generate
 ontologies around g1-051_p0012, which are g1-051_p0011, g1-051_p0012, g1-051_p0121, 17
 one-axiom deletions, 22 further reductions, 25 ablations, 24 files of item 1251's family
 with ground conditions nested one and two deep, the two files of part022 and 11 fixtures
-and reductions from the tests of the cut. Each ran on one thread under the cautious strategy and on four
-under the eager one, with the selection off, the partners of item 1220's repair off, the
-check off, a bound of 4 million conclusions and HermiT 1.4.5's taxonomy as the reference.
-Without the cut, 25 files pass the bound with the repair off and 36 with it in mode `129`
-or `1`, and g1-051_p0012 finishes only with the repair off, at 455,969 conclusions. With
-the cut, every file finishes with the repair off except C4, which passes the bound with
-the selection on as well. With the repair on, three files of item 1251's family with
-conditions two deep pass it too. Every complete answer agrees with HermiT, in
-204 runs with the repair off and 198 in each of modes `129` and `1`. g1-051_p0012 takes
-141,886 conclusions with the repair off, 143,778 in mode `129` and 145,794 in mode `1` on
-one thread, H1 takes 135,615, 138,457 and 140,992, and g1-051_p0121 takes 95,081, 101,181
-and 135,892. On the 154 runs that finish both with the cut and the selection off and with
-the selection on, the cut derives 1.002 times the conclusions of the selection with the
-repair off and 1.006 times in mode `129`, and on the runs that finish without the cut it
-derives 0.32 times their conclusions with the repair off. One file costs more. part022 p01 takes 568,223
-conclusions on one thread with the cut, against 390,545 without it and 507,837 with the
-selection, so it passes the default bound of 524,288 with the selection off, as it does on
-four threads under the eager strategy with the selection on. Item 1324 follows it and C4.
+and reductions from the tests of the cut. Each ran on one thread under the cautious
+strategy and on four under the eager one, with the selection off, the partners of item
+1220's repair off, the check off, a bound of 4 million conclusions and HermiT 1.4.5's
+taxonomy as the reference. These runs use `Saturation::classify` over the logical axioms,
+as the `el_classify` example does, which derives fewer conclusions than `Classifier` on
+the same file, so g1-051_p0012 takes 143,778 conclusions in mode `129` on one thread here
+against the 251,217 above. Without the cut, 25 files pass the bound with the repair off
+and 36 with it in mode `129` or `1`, and g1-051_p0012 finishes only with the repair off,
+at 455,969 conclusions. With the cut, every file finishes with the repair off except C4,
+which passes the bound with the selection on as well. With the repair on, three files of
+item 1251's family with conditions two deep pass it too. Every complete answer agrees with
+HermiT, in 204 runs with the repair off and 198 in each of modes `129` and `1`.
+g1-051_p0012 takes 141,886 conclusions with the repair off, 143,778 in mode `129` and
+145,794 in mode `1` on one thread, H1 takes 135,615, 138,457 and 140,992, and g1-051_p0121
+takes 95,081, 101,181 and 135,892. The runs with the selection on keep the check on. On
+the 154 runs that finish both with the cut and the selection off and with the selection
+on, the cut derives 1.002 times the conclusions of the selection with the repair off and
+1.006 times in mode `129`, and on the runs that finish without the cut it derives 0.32
+times their conclusions with the repair off. C2, C3, min-C2 and min-C3 finish between
+602,198 and 2,590,900 conclusions with the repair off, above the default bound of 524,288,
+with the cut as with the selection, and U4 does so in mode `129`. One file costs more.
+part022 p01 takes 568,223 conclusions on one thread with the cut, against 390,545 without
+it and 507,837 with the selection, so it passes the default bound of 524,288 with the
+selection off, as it does on four threads under the eager strategy with the selection on.
+Item 1324 follows it and C4.
 
 The repair keeps the resource contract of the rest of Tier D, and the contract is
 cooperative. A run charges each conclusion that it derives to the work bound, and several
