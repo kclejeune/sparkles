@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### A persistent ordered map in place of `imbl` (item 1152)
+
+The predicate statistics of a delta and the control keyspace are kept in a persistent B+ tree
+map that copies one path from the root to a leaf for each write, and the rows that commits add
+to the spatial index after its overlay are kept in a persistent append-only vector. Snapshots
+still share every unchanged node. The `imbl` crate is no longer a dependency, and the
+`THIRD_PARTY_LICENSES.md` files no longer list it or the crates that only it used. The JVM library's
+notices take the MPL-2.0 text that UniFFI needs from the crates of the server binary, since no
+crate that the library links ships it any longer.
+
 ### Hierarchical memory budgets for reasoning and views
 
 Reasoning, ontology reads and maintained views share the dataset's query memory pool.

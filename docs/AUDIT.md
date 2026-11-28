@@ -15,7 +15,7 @@
 
 | Module | Java LOC (main/test) | Role | Sparkles status |
 |---|---|---|---|
-| jena-base | 19K / 8K | Utilities and persistent maps (PMap/PSet) for TIM | Replaced by the Rust standard library and `imbl`. |
+| jena-base | 19K / 8K | Utilities and persistent maps (PMap/PSet) for TIM | Replaced by the Rust standard library and the store's own persistent B+ trees. |
 | jena-iri3986, jena-langtag | 7K + 2K | RFC 3986 IRIs and BCP47 language tags | Uses `oxiri` and `oxilangtag`, plus scheme and tag checks. |
 | jena-core | 141K / 84K | Node/Triple/Graph, Model API, datatypes, rule reasoners (forward RETE, backward LP), ARP RDF/XML parser and legacy OntModel | Term model from `oxrdf`; forward reasoners in `sparkles-reasoner`. |
 | jena-arq | 309K / 82K | RIOT I/O and SPARQL (JavaCC parser, algebra, 21 optimizer passes, iterator engine), functions, update and SERVICE | Implemented in `sparkles-core` (`io` and `sparql`) and re-exported by `sparkles`. |
@@ -67,7 +67,7 @@ tests in `jena-arq/testing/ARQ`. The formatter's tests read the Turtle and TriG 
 | Vocabulary | Ids are assigned in sort order, so range and prefix filters work on ids. FSST²-compressed, with a sparse sample in RAM. | Adopted. Sorted, front-coded and memory-mapped, with prefix ranges on IDs and optional FSST suffixes. |
 | Index build | Parallel parse → per-batch partial vocabularies → k-way merge → id remap → external sort per permutation | Adopted on Rayon. |
 | Permutations | 6 permutations (SPO, SOP, PSO, POS, OSP, OPS) plus a graph column. Blocks of ~31k rows with per-column zstd. The first and last triple of each block stay in RAM. | Adopted. Six triple permutations plus GSPO, in 32k-row blocks with per-column delta, varint and LZ4; block metadata stays in RAM for skipping. |
-| Updates | An immutable base plus DeltaTriples located per block, a snapshot per version, and a rebuild when the delta grows | Adopted. Persistent (`imbl`) delta sets per permutation, checksummed WAL, MVCC snapshots and online compaction. |
+| Updates | An immutable base plus DeltaTriples located per block, a snapshot per version, and a rebuild when the delta grows | Adopted. Persistent B+ tree delta sets per permutation, checksummed WAL, MVCC snapshots and online compaction. |
 | Planner | DP over connected components with interesting sort orders, and a greedy fallback past a budget. Filters are applied as soon as their variables are bound. The cost is row counts, and join estimates use multiplicities. | Adopted. |
 | Execution | A column-major `IdTable`. Operators materialize their results, though some are lazy. A LocalVocab per result. | Adopted. Column-major tables, snapshot-owning cursors and a local vocabulary per query. |
 | Joins | Zipper merge join with UNDEF, galloping join for skewed sizes, MultiColumnJoin, OptionalJoin, Minus, and TransitivePath with a bound side | Adopted. Merge, galloping, hash and batched index joins; transitive paths use BFS from the bound side. |
@@ -121,7 +121,7 @@ as a benchmark engine, downloaded at benchmark time, and in
 | XSD datatypes | `oxsdatatypes`: decimal, dateTime and durations, with arithmetic and comparison per XPath | None |
 | Reasoning/OWL | `horned-owl`, `reasonable` (OWL 2 RL) and `rudof` (SHACL/ShEx) are available as references | None |
 | Performance of QLever-style columnar engine | No GC. `u64` columns, a predictable layout, LLVM autovectorization, `rayon` parallel sort and mmap through `memmap2`. | A GC, which is fine for pointer-free slices but adds tail latency on big materializations. A weaker optimizer and bounds-check elimination, and little SIMD autovectorization. |
-| Concurrency | `rayon`, `tokio`/`axum`, `arc-swap`, and persistent collections (`imbl`) for MVCC | Goroutines are excellent, but concurrency is not the bottleneck here. |
+| Concurrency | `rayon`, `tokio`/`axum`, `arc-swap`, and persistent B+ trees for MVCC | Goroutines are excellent, but concurrency is not the bottleneck here. |
 | Build/dev ergonomics | Slower compile times | Faster compiles and simpler code |
 
 Rust wins on its ecosystem, since the SPARQL/RDF stack alone saves months, and on the

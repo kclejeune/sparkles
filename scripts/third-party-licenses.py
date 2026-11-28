@@ -338,9 +338,17 @@ def apache_text(by_text):
     raise SystemExit("no crate ships the Apache License 2.0 text")
 
 
+# the license texts that the crates of the documents rendered so far ship, by hash
+SHIPPED = {}
+
+
 def mpl_text(by_text):
-    """The Mozilla Public License 2.0 as some crate ships it."""
-    for text, _, _ in sorted(by_text.values(), key=lambda t: (t[2][0], t[1])):
+    """The Mozilla Public License 2.0 as some crate ships it. UniFFI declares MPL-2.0
+    without a license file, and when no crate the JVM library links ships the text, it is
+    taken from the crates of a document rendered before."""
+    shipped = [t for t, _, _ in sorted(by_text.values(), key=lambda t: (t[2][0], t[1]))]
+    shipped += [SHIPPED[h] for h in sorted(SHIPPED)]
+    for text in shipped:
         if "Mozilla Public License Version 2.0" in text[:200]:
             return text
     raise SystemExit("no crate ships the Mozilla Public License 2.0 text")
@@ -406,6 +414,7 @@ def render(pkgs, intro=BINARY_INTRO, lock="Cargo.lock"):
         for n, text in files:
             h = key(text)
             by_text.setdefault(h, (text, n, []))[2].append(f"{p['name']} {p['version']}")
+            SHIPPED.setdefault(h, text)
     # crates without a file: the standard text of their license
     for p in bare:
         id, text = standard_text(p, by_text)

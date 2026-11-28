@@ -896,9 +896,9 @@ pub struct GeoView {
     /// set when ready
     pub(crate) base: Option<Arc<GeoBase>>,
     pub(crate) overlay: Arc<Overlay>,
-    pub(crate) tail: imbl::Vector<TailRow>,
+    pub(crate) tail: crate::store::append_vec::AppendVec<TailRow>,
     /// skipped rows inserted since the overlay was built (as the tail)
-    pub(crate) skipped: imbl::Vector<Row>,
+    pub(crate) skipped: crate::store::append_vec::AppendVec<Row>,
 }
 
 impl GeoView {
@@ -919,8 +919,8 @@ impl GeoView {
             lookup,
             base: None,
             overlay: Arc::new(Overlay::empty()),
-            tail: imbl::Vector::new(),
-            skipped: imbl::Vector::new(),
+            tail: crate::store::append_vec::AppendVec::new(),
+            skipped: crate::store::append_vec::AppendVec::new(),
         }
     }
 
@@ -942,8 +942,8 @@ impl GeoView {
             lookup,
             base: Some(base),
             overlay: Arc::new(overlay),
-            tail: imbl::Vector::new(),
-            skipped: imbl::Vector::new(),
+            tail: crate::store::append_vec::AppendVec::new(),
+            skipped: crate::store::append_vec::AppendVec::new(),
         }
     }
 
@@ -953,8 +953,8 @@ impl GeoView {
             state: s,
             base: None,
             overlay: Arc::new(Overlay::empty()),
-            tail: imbl::Vector::new(),
-            skipped: imbl::Vector::new(),
+            tail: crate::store::append_vec::AppendVec::new(),
+            skipped: crate::store::append_vec::AppendVec::new(),
             ..self.clone()
         }
     }

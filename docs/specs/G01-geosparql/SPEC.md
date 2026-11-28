@@ -955,7 +955,7 @@ pub struct GeoView {                                // on Snapshot (Arc), immuta
     generation: u64,                                // Generation.uid
     epoch: u64,                                     // +1 per enable/reconfigure/rebuild (cache keys)
     overlay: Arc<Overlay>,                          // packed tree over overlay rows (as of some earlier commit)
-    tail: imbl::Vector<(Row, [f32; 4])>,            // rows inserted since the overlay tree was built
+    tail: AppendVec<TailRow>,                       // rows inserted since the overlay tree was built
 }
 ```
 
@@ -965,8 +965,8 @@ pub struct GeoView {                                // on Snapshot (Arc), immuta
   static packed R-tree in the Flatbush layout, from `geo-index`. It builds in O(n log n),
   has 16-entry nodes, and takes about `n · 1.07 · (16 + 4)` bytes plus `rows`.
 * **Overlay** rows come only from transactions (§5.4). A row in `overlay` or `tail` is
-  valid for snapshot S iff its quad is in `S.delta.ins`, which is an O(log n) `imbl` lookup
-  on the PSO set. A base row is valid iff its quad is not in `S.delta.del`. `store::apply`
+  valid for snapshot S iff its quad is in `S.delta.ins`, which is an O(log n) lookup on
+  the PSO set. A base row is valid iff its quad is not in `S.delta.del`. `store::apply`
   keeps `ins` disjoint from the base and `del ⊆ base`, so
   `rows(S) = (base − del) ∪ (overlay ∪ tail) ∩ ins` exactly.
 * A search queries `base.tree` and `overlay.tree`, and scans `tail` linearly. Tails stay

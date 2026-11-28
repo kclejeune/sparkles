@@ -1,10 +1,10 @@
 # X16: Storage consolidation
 
-> Phases 1 through 4, most of Phase 5, the unified WAL commit path of Phase 6, and
-> items 846 and 1062 have shipped.
+> Phases 1 through 5, the unified WAL commit path of Phase 6, and items 846, 1062 and
+> 1152 have shipped.
 >
 > [Roadmap item 455](../../ROADMAP.md) tracks the remaining work. Item 833 tracks Phase 6's
-> Intel writes benchmark, and item 1152 tracks the remaining `imbl` maps from Phase 5.
+> Intel writes benchmark.
 > The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
@@ -910,13 +910,8 @@ functions outside tests in place of their `cfg` blocks. `parse_source` and
 `parse_source_into` choose their first rung, Jena's syntaxes, the functional-style syntax
 or a buffered document, through one `Rung`, and a buffered document of either is parsed by
 one whole-slice parser, with a test that both entry points agree for every parse mode,
-codec and kind of data. The `imbl` maps stay. A `BTreeMap` behind an `Arc` would copy the
-whole map at the first change after a snapshot, which measured 38 µs a commit at 10,000
-predicates and 8.4 ms at a million, against about a microsecond for `imbl`, and 30 ms a
-frame for a control state of a million entries, as
-[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md#writes) records. Item 1152
-takes a persistent ordered map shared with the B+ tree of `KeySet`, after which the
-dependency can leave. No on-disk format changed.
+codec and kind of data. Item 1152 replaced the `imbl` maps and vectors that Phase 5 left,
+as the [outcome of item 1152](#item-1152-outcome) describes. No on-disk format changed.
 
 The query matrix on `atlas` compared Phase 5, d05e6b9d, with its base, 5f3f69c2, at 1.05M and
 10.5M triples with one and twelve Rayon threads, in eager and streamed execution. No query of 0.3 ms or
@@ -942,6 +937,74 @@ addition for overflow. Unit tests cover every overflowing tenth byte from `0x02`
 `0x7f`, non-terminating tenth bytes, padded tenth-byte zero encodings and round-trips of the
 largest valid 64-bit varint across index column frames, bounded reads, builder run blocks and
 temporary pattern runs.
+
+### Item 1152 outcome
+
+The `imbl` crate has left the workspace, the three binding workspaces and every lock file.
+A `BTreeMap` behind an `Arc` would copy the whole map at the first change after a snapshot,
+which measured 38 µs a commit at 10,000 predicates, 8.4 ms at a million and 30 ms a frame
+for a control state of a million entries, as
+[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md#writes) records. The predicate
+statistics of `Delta` and the entries of `ControlState` are therefore a `store::pmap::PMap`,
+the persistent B+ tree of `KeySet` with a value beside each key and without the range
+counts. It shares the node-copy helpers of `KeySet`, whose own code did not change. A clone
+shares every node, and a write copies the nodes on one path from the root to a leaf.
+
+Maps whose keys or values own heap memory, such as the byte strings of the control keyspace,
+use nodes of 16 entries in place of 32, so a path copy clones fewer keys. Their binary
+searches stop at an equal key, because the branchless search of the standard library made
+each step wait for the previous comparison through a key's pointer. With that search and
+32-entry nodes, control lookups measured 1.3 to 2.7 times as slow as `imbl` and writes up to
+1.7 times as slow. `get_mut`, `remove` and an update through `get_or_insert_with` find an
+entry's path in one descent that compares keys, and copy that path in a second descent that
+compares none, so a missing key copies no node. A const assertion checks that a node of the
+predicate statistics stays within the 8 KiB that `Delta::predicate_bytes_bound` charges for
+each node.
+
+The rows that commits add to the spatial index after its overlay was built are kept in a
+`store::append_vec::AppendVec`. It is a radix tree of full 32-row chunks with the last,
+partly filled chunk beside it, so an append to a clone copies at most that last chunk and the
+branches above a new chunk. Iteration walks the chunks in order, and the memory that a view
+charges for its tail is unchanged. Unit tests compare `PMap` with `BTreeMap` under random
+inserts, removals, updates and ranges with integer and heap keys, and check after each phase
+that every snapshot kept its entries, that a write to a clone of a million entries leaves
+at most one path and its splits unshared, and that a missing key copies nothing. The tests
+of `AppendVec` cover sizes past three levels of branches and two clones of one version that
+append different rows.
+
+A harness timed both crates in one process on one pinned core of the Boat worker
+`bx_4xarzecx`, an AMD Ryzen 9 9950X, against `imbl` 7.0.2, in eight rounds that alternate
+the order of the two. Each commit case clones a map and changes one entry, as a single-quad
+commit and a control frame do. The table gives the ratio of the medians, `PMap` or
+`AppendVec` over `imbl`, at 100, 10,000 and 1,000,000 entries, and at 4,096, 100,000 and
+1,000,000 rows for the tails. Boat timings are approximate. Two later runs of the final
+code, after a long test run on the worker, read the random inserts into one map of a million
+predicates at 1.89 and 1.98 and the control removal at a million entries at 1.17 and 1.44,
+and item 1246 holds the costs that an Intel host should confirm.
+
+| Case | Small | Medium | Large |
+|---|---|---|---|
+| Predicate commit, existing predicate | 0.77 | 1.14 | 1.08 |
+| Predicate commit, new predicate | 0.90 | 1.16 | 1.02 |
+| Predicate lookup | 0.46 | 0.53 | 0.82 |
+| Predicate iteration | 0.62 | 0.47 | 0.56 |
+| Predicate inserts into one unshared map | 1.02 | 1.13 | 1.60 |
+| Control frame, existing key | 0.93 | 0.95 | 0.96 |
+| Control frame, new key | 0.98 | 0.95 | 0.95 |
+| Control frame, removal | 1.00 | 1.03 | 1.24 |
+| Control lookup | 0.84 | 1.02 | 1.12 |
+| Control prefix of 16 entries | 0.79 | 0.85 | 1.14 |
+| Spatial tail commit of one row | 0.53 | 0.52 | 0.53 |
+| Spatial tail commit of 16 rows | 0.47 | 0.47 | 0.47 |
+| Spatial tail iteration | 0.47 | 0.48 | 0.44 |
+| Spatial tail lookup by position | 0.50 | 0.52 | 0.49 |
+
+A commit that changes one predicate of a million took 1.44 µs against 1.34 µs, and a control
+frame that sets one of a million keys 2.41 µs against 2.51 µs. A commit that appends one row
+to a spatial tail took 0.19 to 0.21 µs against 0.37 to 0.39 µs. Building a map of a million
+predicates by random inserts took 322 ns an insert against 202 ns. Integer maps with 16-entry
+nodes were measured as well and were not kept, as
+[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md#writes) records.
 
 ### Phase 6 outcome
 

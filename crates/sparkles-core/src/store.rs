@@ -57,6 +57,8 @@ mod history_probe;
 #[doc(hidden)]
 pub mod import_journal;
 pub(crate) use history_limited::SnapshotCharge;
+#[cfg_attr(not(feature = "geo"), allow(dead_code))]
+pub(crate) mod append_vec;
 mod history_query;
 mod holds;
 #[cfg(test)]
@@ -70,6 +72,7 @@ mod lock;
 mod lock_tests;
 mod managed;
 pub(crate) mod managed_history;
+pub(crate) mod pmap;
 pub use holds::{Acquired, HoldPublication, PublishedWriter};
 pub use managed::ManagedSnapshot;
 #[cfg(test)]
@@ -621,7 +624,7 @@ pub struct Delta {
     pub reifiers_ins: KeySet,
     /// the planner's statistics of the inserted quads, by predicate, kept up to date by
     /// each write ([`Delta::insert_quad`], [`Delta::remove_inserted`])
-    predicates: imbl::OrdMap<u64, DeltaPredicate>,
+    predicates: pmap::PMap<u64, DeltaPredicate>,
 }
 
 /// Statistics of the quads a delta inserted with one predicate: their number and the
@@ -675,7 +678,7 @@ impl Delta {
             }
         }
         if added {
-            let e = self.predicates.entry(q[1].0).or_default();
+            let e = self.predicates.get_or_insert_with(q[1].0, Default::default);
             e.count += 1;
             e.distinct_subjects += new_s as u64;
             e.distinct_objects += new_o as u64;
@@ -707,6 +710,7 @@ impl Delta {
     /// An upper bound on the bytes of every node of the predicate statistics: each
     /// node holds at least one entry, and a node takes at most 8 KiB.
     pub(crate) fn predicate_bytes_bound(&self) -> u64 {
+        const _: () = assert!(pmap::node_bound::<u64, DeltaPredicate>() <= 8 << 10);
         (self.predicates.len() as u64)
             .saturating_mul(2)
             .saturating_add(2)
