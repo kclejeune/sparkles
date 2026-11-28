@@ -492,8 +492,12 @@ on 1,456 answers, the repair leaves those two and loses 9 claims to the work bou
 them in item 1251's family. The ratios below compare the default run with that run with
 both off, since the previous default claims no answer of the fixtures built for orders of
 arrival or of item 1251's family. On the larger generated sets the previous default claims
-the same answers as the run with both off, or a subset of them, with the same ratios. Over
-the answers that both runs claim, the repair derives 3 to 13% more conclusions on the
+the same answers as the run with both off, or a subset of them, while peak estimated memory
+differs between the two baselines because the previous default runs the decline check. On
+`g6`, where all three arms claim all 4,000 rows, the new default uses 1.0396 times the peak
+estimated memory of the both-off arm and 0.9904 times that of the previous default, and on
+`p3`, with all 2,400 claims in common, the ratios are 1.0349 and 0.9897. Over
+the answers that the default run and the both-off run both claim, the repair derives 3 to 13% more conclusions on the
 larger generated sets and 6.9% more over all sets, with 1.61 times on `av`, 1.96 times on
 the fixtures built for orders of arrival and 34.6 times on item 1251's family. The peak
 estimated memory of the same answers rises by 2.1 to 4.8% on the larger sets and 4.9% over
