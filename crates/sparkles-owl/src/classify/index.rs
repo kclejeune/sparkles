@@ -1183,6 +1183,25 @@ impl Interner {
         self.scope = None;
     }
 
+    /// Whether a run over this interner opened the scope.
+    pub fn has_scope(&self, scope: &Scope) -> bool {
+        self.scopes.contains_key(scope)
+    }
+
+    /// Drops a scope that made no fresh classes, as a refused trial of an axiom that opened
+    /// it for the first time leaves it, so that the trial holds no memory beyond what the
+    /// rules that take the axiom instead intern (roadmap item 1286).
+    pub fn forget_scope(&mut self, scope: &Scope) {
+        if self
+            .scopes
+            .get(scope)
+            .is_some_and(|(made, _)| made.is_empty())
+        {
+            self.scopes.remove(scope);
+            self.scope_bytes = self.scope_bytes.saturating_sub(SCOPE_BYTES);
+        }
+    }
+
     /// The number of an axiom outside OWL 2 EL in the scopes of its fresh classes, the
     /// same in every run over this interner that normalizes the axiom.
     pub fn scope_axiom(&mut self, k: &AxiomKind) -> u32 {

@@ -447,6 +447,56 @@ million and finishes only at 63.2 million conclusions under a bound of 400 milli
 growth is in Pred over successor terms of constants and in Join, and g1-051_p0121 derives
 1.42 million conclusions against 1.17 million with unfiltered repair alone.
 
+Item 1286 keeps the Horn share in rooted runs. A rooted run without counting left out the
+functional, inverse-functional, asymmetric and disjoint properties and the number
+restrictions that need counting, as the rules without the root do, and still took the
+ontology for its disjunctive axioms, while a run without the option gave the same ontology
+to the Horn rules, which take those axioms. The normalization of a rooted run that was not
+asked to count now refuses the axioms outside OWL 2 EL when it leaves out a Horn axiom that
+needs counting. It tries the axioms that need counting first and refuses before it
+normalizes the rest. It drops the scope of the axiom it leaves out when that scope made no
+fresh classes. The Horn rules then take the axioms in the same run, so the run's memory
+budget, deadline, cancellation and partial answers apply as before. A check after the whole
+normalization, as the Nom refusal makes, left 583 to 3,272 bytes more on the four fixtures
+of the item. Under budgets near the default run's need, that stopped partial runs that the
+default run answered. With the check first, the rooted run's high-water mark equals the
+default run's on sroiq-017, sroiq-030 and sroiq-032 and is 422 bytes below it on mixed-031.
+Under memory budgets stepped by a thirty-second of the default run's high-water mark, the
+rooted run of the four fixtures stops, falls back to the EL rules or answers as the default
+run does, with the same flags. A refused run sets neither `Stats::dl_rooted_over` nor
+`Stats::dl_rooted_declined`. A run asked to count that passes its bound starts again without
+counting and leaves those axioms out, as before counting was built, which item 1324
+follows. An irreflexive property,
+a self restriction and a data axiom do not refuse the axioms, since the rooted rules leave
+them out for other reasons, which items 1323, 1285 and 768 follow.
+
+At b47b582b, `mixed-031`, `sroiq-017`, `sroiq-030` and `sroiq-032` left out 1, 1, 1 and 4
+more axioms in a rooted run than by default, and `sroiq-032` was consistent where the
+default run and HermiT find it inconsistent. At 17674a34 they left out 2, 1, 2 and 5 more,
+and the consistency of `sroiq-030` and `sroiq-032` was unknown. All four now give the
+default run's answer on one and four threads under both strategies, and `sroiq-030` and
+`sroiq-032` are inconsistent with HermiT's taxonomy. With counting, the three `sroiq`
+fixtures meet the refusal for the Nom rule and give the same answer.
+
+Across the 640 fixtures of item 603, a rooted run at 17674a34 left out an axiom that the
+default run takes on 27 fixtures and missed 1,349 of HermiT's subsumptions, against the
+default run's 1,254. A rooted run now misses 1,225, and no run of either kind answers a
+subsumption that HermiT does not. It recovers 127 subsumptions on `mixed-032`, `sroiq-013`,
+`sroiq-030` and `sroiq-032` and loses 3 on `sroiq-029` and `sroiq-040`, whose disjunctive
+axioms the rooted rules took beside the Horn axioms they left out. Those come back as the
+rooted rules take the axioms that need counting, which items 896 and 1283 follow, and so
+does the consistency of `sroiq-038` below. `mixed-032`,
+`sroiq-030` and `sroiq-032` become inconsistent as HermiT finds them, three fixtures go
+from unknown to consistent, and `sroiq-038` goes from consistent to unknown. A rooted run
+still leaves out an axiom that the default run takes on five fixtures. `data-015`,
+`mixed-001` and `mixed-010` leave out data axioms, which the disjunctive rules leave out in
+every run, and `sroiq-004` and `sroiq-040` have a default run that takes the disjunctive
+rules without the root, against which the rooted run leaves out fewer axioms. The
+regression of [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) that
+left out a minimum above one while the rooted run took the rest now checks that the Horn
+rules take the ontology. The crate's test of item 805's report of a rewritten axiom left
+out now builds the run without counting that follows the counting bound.
+
 Item 1250 decouples the non-root ground-body cut from full ground-body selection and makes
 mode `129` the default when `Limits::rooted_marker_repair` is enabled. Each stored clause
 in a non-root context carries `Stored::gbody` alongside `Stored::sel`, while root clauses
@@ -4836,10 +4886,17 @@ to the calculus once the root exists, since a nominal in a class axiom already g
 root ground clauses, such as `⊤ → B(o)` for `{o} ⊑ B`. The run also takes keys over object
 properties and the universal property, as below. Data properties wait on item 768, and self
 restrictions and reflexive properties stay refused. An irreflexive property is left out and
-reported, and the run takes the other axioms, as it does with a minimum above one when
-counting is off. The property is left out because a nominal or an equality of constants can
-close a loop, as `r(a, a)` does, and the rules above check irreflexivity only on simple
-properties without loops. The Nom rule with its generated nominals is not built. Nom fires only when a nominal,
+reported, and the run takes the other axioms. The property is left out because a nominal or
+an equality of constants can close a loop, as `r(a, a)` does, and the rules above check
+irreflexivity only on simple properties without loops. Item 1323 follows the Horn rules'
+share of it. Without counting, the run leaves out the functional, inverse-functional,
+asymmetric and disjoint properties and the number restrictions that need counting, as the
+rules above do. When one of them is Horn, the Horn rules take it in a run without the
+option, so a rooted run does not trade that share for its disjunctive axioms. Every axiom
+outside OWL 2 EL then goes to the Horn rules, and the disjunctive axioms are left out and
+reported instead (roadmap item 1286). A run asked to count that passes its bound starts
+again without counting and keeps its disjunctive axioms, as before counting was built. The
+Nom rule with its generated nominals is not built. Nom fires only when a nominal,
 an inverse property and an at-most restriction meet, so the run refuses that interaction. A
 symmetric or inverse functional property counts as an inverse for this test, and so does
 the symmetric property that replaces the universal property.
@@ -4903,7 +4960,8 @@ Sequoia holds back asserted ground facts from a context in a similar way.
 
 A minimum restriction above one in a positive position is not weakened to an existential
 restriction in a rooted run with counting off, since `A ⊑ ≥2 r.{o}` makes `A`
-unsatisfiable. Such an axiom is reported as left out instead. With counting on, a minimum
+unsatisfiable. Such an axiom is left out instead, and a run that was not asked to count
+gives the ontology to the Horn rules, as above. With counting on, a minimum
 restriction gets inequalities between its successor terms, `M(x) → f_i(x) ≉ f_j(x)`, in
 place of the globally disjoint fresh fillers of the rules above, which a nominal can make
 unsound. Three individuals with `M ⊑ ≥2 r.⊤` and `∀r` over two of three shared constants
@@ -4993,8 +5051,9 @@ The hand cases `nominal-inverse-max`, `nominal-bounded-count` and
 `nominal-predecessor-cases` need the Nom rule. Every case in the gate runs with counting
 off, on one and four threads, under both strategies, and must equal HermiT's taxonomy and
 consistency. Regressions with one disjunctive axiom added check that an irreflexive
-property beside a nominal is left out while the run takes the rest, and that a stopped rooted run reports its consistency
-as unknown.
+property beside a nominal is left out while the run takes the rest, that a minimum above
+one without counting sends the ontology to the Horn rules, and that a stopped rooted run
+reports its consistency as unknown.
 
 With the journal's rules as first built, the rooted run finishes 132 of the 200 runs of the 50 `shoi` fixtures,
 on one and four threads under both strategies, within 5 s each in a debug build, and each

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Rooted classification keeps the Horn share (item 1286)
+
+A classification with `Limits::rooted` and without `Limits::counting` no longer trades the
+axioms that the Horn rules take for the disjunctive axioms that the rooted rules take. When
+the rooted rules would leave out a Horn axiom that needs counting, such as a functional or
+inverse-functional property or a minimum above one, every axiom outside OWL 2 EL goes to the
+Horn rules, as in a run without the option, and the disjunctive axioms are left out and
+reported instead. The normalization tries the axioms that need counting before the rest, so on
+the four fixtures below a refused run's high-water mark is at most the default run's. Under
+memory budgets stepped across that mark, with partial answers or not, the run answers, falls
+back or stops as the default run does. The `dl603` fixtures `mixed-031`, `sroiq-017`, `sroiq-030` and `sroiq-032`
+now give the default run's answer, and `sroiq-030` and `sroiq-032` are inconsistent as
+HermiT finds them. Across the 640 `dl603` fixtures a rooted run misses 1,225 of HermiT's
+subsumptions against 1,349 before. A run asked to count that passes its bound still starts
+again without counting and leaves those axioms out. Rooted runs remain off by default, and
+item 1323 follows the irreflexive properties that the rooted rules still leave out.
+
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 
 Term and value decoding in SPARQL UPDATE, ARQ property functions, registered property and aggregate extensions, custom aggregates, hybrid search, history service, path search, vector top-k, remote SERVICE and LATERAL enhancers, GeoSPARQL planner rewrites and aggregates, planner range and lexical probes and RDFS schema and explanation decoding now uses checked decode helpers that enforce live cancellation, deadline and memory controls while keeping decoded-output credit alive across multi-term operations. Plan and error diagnostic rendering decodes terms through `plan_term` so describing a plan never latches a decode refusal, and RDFS explanation keeps its answer memory limit separate from its decode workspace accounting. This lands the first wave of roadmap item 1308.

@@ -438,13 +438,15 @@ fn original_axiom_diagnostics_and_counts_preserve_repeated_operands() {
     // Rooted dl_reduce diagnostic restoration: a repeated-operand axiom over
     // owl:topObjectProperty whose rewritten form is excluded (counting=false refuses
     // ObjectMaxCardinality(2 ...)) must be restored with all original repeated operands.
+    // The complemented member makes the axiom need case analysis, so that the rooted run
+    // keeps it rather than giving the axioms to the Horn rules (roadmap item 1286).
     let rooted_ax = parse_axioms(
         "SubClassOf(:B ObjectUnionOf(:C :D))\n\
          ClassAssertion(:B :b)\n\
          DisjointClasses(ObjectSomeValuesFrom(owl:topObjectProperty :A) \
                          ObjectSomeValuesFrom(owl:topObjectProperty :A) \
                          ObjectMaxCardinality(2 :r :E) \
-                         :F)",
+                         ObjectComplementOf(:F))",
     );
     let expected_orig = rooted_ax
         .iter()

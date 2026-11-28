@@ -8372,6 +8372,11 @@ impl Saturation {
                     rooted,
                     order: limits.number_order,
                     automata: limits.dl_automata_level(),
+                    // a rooted run that was not asked to count keeps the Horn share, while
+                    // one that starts again without counting past its bound leaves the
+                    // axioms that need counting out, as before counting was built (roadmap
+                    // item 1286)
+                    horn_share: rooted && !limits.counting,
                 },
             )
             .map_err(halt)?

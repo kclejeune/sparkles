@@ -10145,6 +10145,45 @@ fn split_round6_reduced_merge_does_not_copy_unchanged_exclusions() {
     );
 }
 
+/// A rewritten axiom can equal an axiom the ontology states as it is (row 1304). Both
+/// members of the disjointness rewrite to `≥2 r.⊤`, so the rewriting adds `≥2 r.⊤ ⊑ ⊥`,
+/// which the first axiom states too. The run without counting after the counting bound
+/// leaves that axiom out, and the report names both original axioms, while a run that was
+/// not asked to count gives the axioms to the Horn rules (roadmap item 1286).
+#[test]
+fn the_run_after_the_counting_bound_names_every_original_axiom_of_a_rewritten_one() {
+    let input = axioms(
+        "SubClassOf(:D ObjectUnionOf(:E :F))
+         SubClassOf(ObjectMinCardinality(2 :r owl:Thing) owl:Nothing)
+         DisjointClasses(ObjectMinCardinality(2 :r owl:Thing)
+             ObjectMinCardinality(2 :r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+         ClassAssertion(:B :b)",
+    );
+    let refs: Vec<&AxiomKind> = input.iter().map(|a| &a.kind).collect();
+    let mut sat = Saturation::new();
+    sat.no_counting = true;
+    let out = sat
+        .classify(
+            &refs,
+            None,
+            &Limits {
+                threads: 1,
+                rooted: true,
+                counting: true,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert!(out.stats.clauses > 0, "Tier D took no clause");
+    let left: Vec<&AxiomKind> = sat.excluded().iter().map(|e| &e.axiom).collect();
+    assert_eq!(left.len(), 2, "{left:#?}");
+    assert!(
+        left.contains(&refs[1]) && left.contains(&refs[2]),
+        "{left:#?}"
+    );
+}
+
 #[test]
 fn reduced_exclusion_restore_accounts_for_taken_profile_diagnostics() {
     let input = axioms(
@@ -10181,10 +10220,14 @@ fn reduced_exclusion_restore_accounts_for_taken_profile_diagnostics() {
     let held_bytes = excluded_copy_bytes(&old_report)
         + red.retained_bytes()
         + reduced.capacity() * std::mem::size_of::<&AxiomKind>();
+    // the run without counting after the counting bound, which leaves the rewritten
+    // maximum out where a run not asked to count gives the axioms to the Horn rules
+    // (roadmap item 1286)
     let build = |outside: &Vec<_>, cap| {
         let mut sat = Saturation::new();
         sat.active_hub = hub.clone();
         sat.hide_internal = true;
+        sat.no_counting = true;
         sat.excluded = old_report.clone();
         let result = sat.build(
             &reduced,
@@ -10196,6 +10239,7 @@ fn reduced_exclusion_restore_accounts_for_taken_profile_diagnostics() {
             &Limits {
                 max_memory: cap,
                 rooted: true,
+                counting: true,
                 threads: 1,
                 ..Limits::default()
             },
