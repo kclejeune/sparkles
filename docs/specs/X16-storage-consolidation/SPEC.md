@@ -949,7 +949,12 @@ for a control state of a million entries, as
 statistics of `Delta` and the entries of `ControlState` are therefore a `store::pmap::PMap`,
 the persistent B+ tree of `KeySet` with a value beside each key and without the range
 counts. It shares the node-copy helpers of `KeySet`, whose own code did not change. A clone
-shares every node, and a write copies the nodes on one path from the root to a leaf.
+shares every node, and a write of one entry copies the nodes on its path from the root to a
+leaf, so a commit or a control frame that changes several entries copies a path for each.
+A removal also copies the neighbouring child at each level where the child on its path holds
+the fewest entries a node may hold, since it prepares that neighbour for a merge before the
+leaf changes. That copy happens even when the child keeps enough entries and no merge
+follows.
 
 Maps whose keys or values own heap memory, such as the byte strings of the control keyspace,
 use nodes of 16 entries in place of 32, so a path copy clones fewer keys. Their binary
@@ -988,8 +993,8 @@ inconsistent. The maps of the store hold integer and byte-string keys, whose clo
 only when an allocation fails, and that aborts the process. Unit tests compare `PMap` with `BTreeMap` under random
 inserts, removals, updates and ranges with integer and heap keys, and check after each phase
 that every snapshot kept its entries, that a write to a clone of a million entries leaves
-at most one path and its splits unshared, and that a missing key copies nothing. The tests
-of `AppendVec` cover sizes past three levels of branches and two clones of one version that
+at most one path with a split or a neighbour at each level unshared, and that a missing
+key copies nothing. The tests of `AppendVec` cover sizes past three levels of branches and two clones of one version that
 append different rows.
 
 A [collection harness](../../benchmarks/writes/RESULTS.md#persistent-collections-of-the-commit-path)
@@ -998,12 +1003,19 @@ timed both crates in one process on one pinned core of the Boat worker
 the order of the two. Each commit case clones a map and changes one entry, as a single-quad
 commit and a control frame do. The table gives the ratio of the medians, `PMap` or
 `AppendVec` over `imbl`, at 100, 10,000 and 1,000,000 entries, and at 4,096, 100,000 and
-1,000,000 rows for the tails. Boat timings are approximate. Two later runs of the final
-code, after a long test run on the worker, read the random inserts into one map of a million
-predicates at 1.89 and 1.98 and the control removal at a million entries at 1.17 and 1.44.
-Item 1246 holds the cases that ran slower, the commits at 10,000 predicates, the inserts into
-one map of 10,000 and of a million predicates and the control removal at a million entries,
-for an Intel host to confirm. The harness times collection operations alone and no
+1,000,000 rows for the tails. Boat timings are approximate. The table is the run of an
+unhashed working tree of the change before its formatting, which the
+[run record](../../benchmarks/writes/runs/2026-11-27-persistent-collections-boat/README.md)
+identifies with the others. Two later runs of the sources of d2c524f6, which predate the
+repair of removal and tail appends in 6e6405bf, read the random inserts into one map of a
+million predicates at 1.89 and 1.98 and the control removal at a million entries at 1.17 and
+1.44, after a long test run on the worker. A run of the repaired code of 6e6405bf read the
+commits at 10,000 predicates at 1.09 and 1.18, the inserts into one map of 10,000 and of a
+million predicates at 1.12 and 1.24, the control removal at a million entries at 1.09 and the
+control lookup at 10,000 entries at 1.04, with the spatial tails again at about half of
+`imbl`'s time. Item 1246 holds the cases that ran slower, the commits at 10,000 predicates,
+the inserts into one map of 10,000 and of a million predicates, the control removal at a
+million entries and the control lookup at 10,000 entries, for an Intel host to confirm. The harness times collection operations alone and no
 whole-store commit or spatial query.
 
 | Case | Small | Medium | Large |

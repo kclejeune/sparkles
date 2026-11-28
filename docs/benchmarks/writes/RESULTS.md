@@ -641,15 +641,22 @@ the index and 3.546 ms without it, medians of 20.
 
 ### Persistent collections of the commit path
 
-A commit clones the delta's predicate statistics, the control keyspace and the spatial
-index's tail from the last snapshot and changes them. Collection microbenchmarks on the Boat
+The delta's predicate statistics, the control keyspace and the spatial index's tail are
+persistent collections that a write clones from the last snapshot. A commit changes the
+statistics of the predicates it touches, a control frame changes the keys it sets or removes,
+and a commit that adds spatial rows appends them to the tail, so each write changes only the
+collections its own operations reach. A write copies the path to each entry it changes, and
+a removal can also copy a neighbouring node at each level. Collection microbenchmarks on the Boat
 worker `bx_4xarzecx` compare the persistent map and vector that hold them with `imbl` 7.0.2,
 on one pinned core in eight alternating rounds. They time the collection operations alone,
 with no whole-store commit or spatial query, and Boat timings are approximate. The harness
 was built with Rust 1.99.1 and mbx 1.29.1 in a release profile with thin LTO, and its
 correctness evidence is the unit tests of the same sources, which compare the map with
 `BTreeMap`, together with the `sparkles-core` test suite. Each figure is the median per
-operation over the rounds.
+operation over the rounds. The table comes from a run of an unhashed working tree of
+the change, before its formatting and before the repair of removal and tail appends in 6e6405bf. A run of the
+repaired code read the update at 10,000 predicates at 454 against 417 ns and the control
+removal at a million entries at 1.68 against 1.54 µs.
 
 | Case at 10,000 and at 1,000,000 entries | `imbl` | `PMap` or `AppendVec` |
 |---|---:|---:|
