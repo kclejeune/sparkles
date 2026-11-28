@@ -11135,6 +11135,150 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn known_query_equality_pruning_preserves_both_orders_and_late_units() {
+        use super::super::dl_eq::Eqs;
+
+        let mut sig = Sig::new();
+        let [query, b, p, q, r, s] = ["Query", "B", "P", "Q", "R", "S"].map(|n| sig.class(n));
+        let nominal = sig.ind("u");
+        let (ix, _) = probe_ix(sig);
+        let dx = dix(&ix);
+        let inv = inv_of(&ix, dx);
+        let u = c(nominal, &ix);
+        let eqs = Eqs {
+            ix: &ix,
+            dx,
+            root: false,
+            query: Some(query),
+        };
+        for skip in [false, true] {
+            let mut run = DlRun::new(false, Default::default());
+            run.skip_known_eq_atoms = skip;
+            let Made::Lit(eq) = run.lits.lit(XLit::Eq(RTerm::X, u), inv) else {
+                panic!("x ≈ u must be a literal");
+            };
+            let atom = glit(&run, &ix, b, nominal);
+            let eq_clause = Clause::new(vec![Lit::x(p)], vec![eq, Lit::y(r)]);
+            let atom_clause = Clause::new(vec![Lit::x(q)], vec![atom, Lit::y(s)]);
+            let order = Rooted {
+                ix: &ix,
+                lits: &run.lits,
+                inv: &inv,
+                ground_total: true,
+            };
+            for (old, old_max, given, given_max) in [
+                (&eq_clause, eq, &atom_clause, atom),
+                (&atom_clause, atom, &eq_clause, eq),
+            ] {
+                let mut st = State::default();
+                let store = &mut ds(&mut st).store;
+                assert!(store.add(old.clone()).is_some());
+                let mut maxima = Vec::new();
+                assert!(store.next(&ix, Some(&order), &mut maxima).is_some());
+                assert_eq!(maxima, [old_max]);
+                given.maximal_rooted(&order, &mut maxima);
+                assert_eq!(maxima, [given_max]);
+                let retained = |st: &State| {
+                    let mut out = Stops::new(&run);
+                    let mut guard = Guard::new(&mut out);
+                    let mut found = Found::default();
+                    assert!(eqs.on_max(
+                        st,
+                        given_max,
+                        &side(given, given_max),
+                        &mut found,
+                        &mut guard,
+                        false,
+                        false,
+                    ));
+                    let mut sides = found.one_sides();
+                    for (body, head) in &mut sides {
+                        body.sort_unstable();
+                        head.sort_unstable();
+                    }
+                    sides
+                };
+                let mut body = vec![Lit::x(p), Lit::x(q)];
+                let mut head = vec![Lit::x(b), Lit::y(r), Lit::y(s)];
+                body.sort_unstable();
+                head.sort_unstable();
+                let expected = vec![(body, head)];
+                assert_eq!(retained(&st), expected, "before the unit arrives");
+
+                st.subs.insert(b);
+                let after = retained(&st);
+                if skip {
+                    assert!(after.is_empty(), "the unit subsumes the whole product");
+                } else {
+                    assert_eq!(after, expected, "the control still constructs the product");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn known_query_equality_scans_poll_without_admitting_products() {
+        use super::super::dl_eq::Eqs;
+
+        let mut sig = Sig::new();
+        let [query, b] = ["Query", "B"].map(|n| sig.class(n));
+        let bodies: Vec<_> = (0..2 * METER_CHECK)
+            .map(|i| Lit::x(sig.class(&format!("P{i}"))))
+            .collect();
+        let nominal = sig.ind("u");
+        let (ix, _) = probe_ix(sig);
+        let dx = dix(&ix);
+        let inv = inv_of(&ix, dx);
+        let mut run = DlRun::new(false, Default::default());
+        run.skip_known_eq_atoms = true;
+        let Made::Lit(eq) = run.lits.lit(XLit::Eq(RTerm::X, c(nominal, &ix)), inv) else {
+            panic!("x ≈ u must be a literal");
+        };
+        let atom = glit(&run, &ix, b, nominal);
+        let order = Rooted {
+            ix: &ix,
+            lits: &run.lits,
+            inv: &inv,
+            ground_total: true,
+        };
+        let eqs = Eqs {
+            ix: &ix,
+            dx,
+            root: false,
+            query: Some(query),
+        };
+        for (old, given) in [(eq, atom), (atom, eq)] {
+            let mut st = State::default();
+            st.subs.insert(b);
+            let store = &mut ds(&mut st).store;
+            for &body in &bodies {
+                assert!(store.add(Clause::new(vec![body], vec![old])).is_some());
+            }
+            let mut maxima = Vec::new();
+            while store.next(&ix, Some(&order), &mut maxima).is_some() {
+                assert_eq!(maxima, [old]);
+            }
+            for refuse in [false, true] {
+                let mut out = Stops::new(&run);
+                out.refuse = refuse;
+                out.after = 1;
+                let mut found = Found::default();
+                let mut guard = Guard::new(&mut out);
+                assert_eq!(
+                    eqs.on_max(&st, given, &unit(), &mut found, &mut guard, false, false),
+                    !refuse,
+                    "stored {old:?}, given {given:?}"
+                );
+                drop(guard);
+                assert!(found.one_sides().is_empty());
+                assert_eq!(out.asked, 0, "no product reached admission");
+                assert_eq!(out.stop.get(), refuse);
+                assert_eq!(out.polls.get(), if refuse { 2 } else { 4 });
+            }
+        }
+    }
+
+    #[test]
     fn a_root_fact_of_a_named_class_is_rewritten_back_over_x_in_a_query_context() {
         // A ⊑ {o}, and the root holds B(o) and F(o) for a fresh F: A's context takes both
         // and rewrites B(o) to the unit B(x) with o ↦ x. With the blocking, the fresh atom

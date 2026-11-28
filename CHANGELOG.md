@@ -186,6 +186,9 @@ has full-text search disabled until it is enabled on the copy.
 
 With `SPARKLES_ROOTED_EQ_KNOWN=1`, rooted classification skips an equality rewrite
 when the query context already holds the class assertion the rewrite would produce.
+The partner scans check the run's bounds even when every candidate pair is skipped.
+The development census still reaches the fixed cap on the historical bound cases
+when they take the rooted route.
 
 ### The marker repair on by default in rooted runs (items 1231 and 1247)
 

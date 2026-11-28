@@ -85,6 +85,11 @@ describe, and to ALCHI ontologies without individuals that need case analysis, a
 as the ROBOT-compatible commands of items 634, 635 and 637, and the existential
 superclasses as `materialize`, item 636. The other phases remain under [item 457](../../ROADMAP.md).
 
+Item 1284 checks the [rooted work bound on development files](#the-rooted-work-bound-on-development-files).
+The equality cut preserves the conclusions of the implemented calculus and polls
+for stops while scanning redundant partners. It remains opt-in while routing
+and work-bound failures leave development taxonomies incomplete.
+
 Item 719 adds partial-classification controls and display to the Ontology Workbench. Both the explicit inferred-tree run and the class frame accept a partial-answer toggle, a microsecond-precision bounded deadline in seconds sent as the `timeout` query parameter (blank omits the override and uses the server default) and the `cautious` or `eager` expansion strategy on `POST /$/ontology/{ds}/classify`. When a partial answer returns, the Workbench displays the partial status with its tier, open-class count and any excluded-axiom or unmapped-triple gaps, marks classes in the `incomplete` set as open in the inferred class tree (including accessible row names) and marks the selected class from `entity.incomplete` or `frame.incomplete` in the class frame, while rendering `unknown` consistency distinctly from `consistent` and `inconsistent` verdicts. Partial tree responses keep only their first page with a single-page partial truncation notice distinct from the 50,000-node browser cap, and open-class list sample caps are reported on both partial and finished incomplete runs. Both the explicit tree and the class frame reject unrequested partial answers, and the class frame also rejects any partial projection that advertises shared retention.
 
 Integer, decimal and rational literals use exact arbitrary-precision canonical values,
@@ -6375,12 +6380,28 @@ and the proof for all orders of late Pred replay, remain part of item 1229.
 #### Equality rewrites to known query atoms (item 1284)
 
 A rooted query can obtain the same conclusion many times when a primitive class
-is placed below an enumeration. If rewriting `B(u)` with an equality between the
-individual `u` and the query variable `x` would yield a known unit `B(x)`, ordinary
-clause simplification discards the conclusion. The switch `SPARKLES_ROOTED_EQ_KNOWN=1`
-skips that product whichever premise arrives last. Bottom and locally denied atoms
-still take the ordinary path because the simplifier handles them first. The switch
-is off by default.
+is placed below an enumeration. The switch `SPARKLES_ROOTED_EQ_KNOWN=1` skips
+products that rewrite `B(u)` to a known `B(x)` using the equality between the
+individual `u` and the query variable `x`. The switch is off by default.
+
+In either arrival order, Eq combines the two premise bodies and retains each
+unresolved head literal beside the atom `B(x)`. The cut requires that the
+same query context already hold `B(x)` as an unconditional unit. It excludes
+`owl:Nothing` and any atom denied by that context, since simplification removes
+those atoms before testing for known units. The resulting clause is subsumed by
+the unit whatever other literals it contains. The unit is already available to
+the rules that can use it. If it arrives later, Eq constructs the product as
+usual and the ordinary simplifier can discard it. Each context makes the test
+against its own units while it processes the premises, so another context's
+state and the order of delivery supply no additional assumptions.
+
+This preserves the conclusions of a completed saturation under the implemented
+rules. A bounded run can produce a different answer when the reduction in work
+changes a fallback or the point at which equality splitting starts. The two
+partner scans poll the run's bounds even when every pair is skipped. The
+guarded rewrite has one result. An extension to other literal shapes would
+have to establish redundancy for each result, including any result in which a
+rewrite makes a literal false and removes it from the disjunction.
 
 On the six-axiom enumeration fixture with its 18 primitive subclasses, this cut
 the one-thread work count from 3,388,100 to 969,033. That still exceeds the
@@ -6392,6 +6413,52 @@ subsumptions that HermiT 1.4.5.519 omits. Two explicit assertions of the univers
 object property suffice for HermiT to entail all four as well. Those assertions
 already hold in every interpretation of the original ontology. The original
 discrepancy remains part of the evidence for item 823.
+
+#### The rooted work bound on development files
+
+At `b47b582b`, 25 ORE 2015 DL files from the development and final sets
+exceeded the rooted cap of 524,288 conclusions. Their default answers
+reported 974 left-out axioms and 7,722 classes whose modules contained a
+left-out axiom. On 21 files the bound was the only reason for fallback.
+Item 1061 tracks `ore_ont_14924` and `ore_ont_15803` separately. The roughly
+11 remaining final-set cases still need measurement.
+
+The census at `ac994f489` rechecks the 12 development files that exceeded
+the bound at `b47b582b`. They are `ore_ont_10006`, `ore_ont_1199`,
+`ore_ont_12698`, `ore_ont_13928`, `ore_ont_16462`, `ore_ont_16535`,
+`ore_ont_1673`, `ore_ont_5184`, `ore_ont_5359`, `ore_ont_7914`,
+`ore_ont_8480` and `ore_ont_9540`. It also covers six top-property files from item 1282 and
+three controls. Each pair keeps the input, bound, schedule and all other
+switches fixed. All 54 pairs on the original files give byte-identical
+taxonomies with the equality cut on and off.
+
+The original bound cases and top-property files report zero DL work on
+the ordinary route. The bound therefore cannot explain those answers.
+Item 1286 retains Horn coverage when rooted saturation would give up
+Horn axioms that need counting. A separate diagnostic bypasses its two
+routing checks to expose the rooted work on those inputs.
+
+All 12 prior bound cases exhaust the diagnostic work bound with either equality
+setting and with or without shared facts and merging. On the six top-property
+inputs with data and anonymous-individual axioms removed, four still exhaust
+the work bound in every diagnostic configuration and `ore_ont_15993` hits the
+DL memory budget. Sharing and merging take the ablated `ore_ont_15516` within
+the bound at 60,715 conclusions, with HermiT's exact taxonomy and 17 axioms
+left out. Both equality settings produce that result. At the wider bound of
+8,388,608 the cut saves 20,119 conclusions on `ore_ont_10006` and
+2,495,621 on `ore_ont_16462`, both of which still need more than the
+fixed cap. The [development results](../../benchmarks/el-classification/RESULTS.md#rooted-equality-pruning-on-ore-2015-dl-development-files)
+give the paired measurements and HermiT comparisons.
+
+The fixed-bound traces with sharing, merging and the cut on show where
+other work accumulates. On `ore_ont_1199` and `ore_ont_8480` the root
+spends the prefix on individual seeds and Hyper at constants. Deliveries
+from the root account for 163,607 trace events on `ore_ont_12698` and
+218,775 on `ore_ont_16535`. On `ore_ont_9540` the two most frequent
+events are Hyper at constants outside the root and deliveries from the
+root. The ablated `ore_ont_13545` spends much of its trace on disjointness
+and rewrites from successor terms to constants, outside the shape covered
+by the cut. Item 1410 follows the repeated use of root units across contexts.
 
 #### Item 1061: shared ground reasoning across contexts
 
