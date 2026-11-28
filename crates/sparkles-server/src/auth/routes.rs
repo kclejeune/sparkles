@@ -1145,7 +1145,6 @@ fn with_report(mut r: Response, report: AuthReport) -> Response {
     r
 }
 
-/// A 403 (from the middleware, or a handler's own check).
 /// The view that a view management request names (`PUT` or `DELETE` of
 /// `/$/views/{ds}/{name}`, `POST /$/views/{ds}/{name}/rebuild`), when `route` is one.
 fn managed_view(route: &str, method: &Method, path: &str) -> Option<String> {
@@ -1164,6 +1163,7 @@ fn managed_view(route: &str, method: &Method, path: &str) -> Option<String> {
     )
 }
 
+/// A 403 (from the middleware, or a handler's own check).
 pub fn forbidden(p: &Principal, msg: &str) -> Response {
     forbidden_as(p, msg, Denied::Forbidden)
 }

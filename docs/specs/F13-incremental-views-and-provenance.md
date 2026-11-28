@@ -1845,7 +1845,8 @@ not attached, because it is suspended, failed to attach or waits for the next ro
 no principal resolved under the current policy, so it is decided as a view that reads
 every quad. Only an unrestricted caller or a `view:{name}` grant reads it then, and a
 contained caller is refused until the view is attached again, including the moment after
-a policy reload or a new host while the next round attaches it. Decisions are cached per
+a policy reload or a new host while the next round attaches it. Item 1325 tracks deciding
+such a view on its principal under the current policy. Decisions are cached per
 view name, caller grant set and principal grant set, and whether the caller's guards are
 decided at each snapshot. An entry is found by a hash of all four and used only when all
 four are equal to the request's, so a change of the caller's grants, of the view's
