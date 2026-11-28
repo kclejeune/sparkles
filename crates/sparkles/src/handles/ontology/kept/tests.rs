@@ -2653,6 +2653,41 @@ fn a_warm_copy_opens_no_state_of_another_copy_from_its_cache() {
                 .map(drop),
         );
     }
+    // swapping only the mapped ontology with another copy's is also refused, since the
+    // source, view and snapshot are still this copy's
+    let own = pinned.open_at(&mine, &req(), &opts()).unwrap();
+    let mut ont_swapped = own.clone();
+    ont_swapped.ontology = theirs_open.ontology.clone();
+    refused(
+        pinned
+            .dl_query_opened(ont_swapped.clone(), &req(), &q, &opts())
+            .map(drop),
+    );
+    refused(
+        a.ontology()
+            .dl_query_opened(ont_swapped.clone(), &req(), &q, &opts())
+            .map(drop),
+    );
+    refused(
+        pinned
+            .kept_entity_at_opened(
+                &req(),
+                &ont_swapped,
+                &KeptEntityQuery::new(iri("B")),
+                &opts(),
+            )
+            .map(drop),
+    );
+    refused(
+        a.ontology()
+            .kept_entity_at_opened(
+                &req(),
+                &ont_swapped,
+                &KeptEntityQuery::new(iri("B")),
+                &opts(),
+            )
+            .map(drop),
+    );
     // an ontology this copy opened at its own pinned state answers there, through the
     // caller's grants too
     for (o, masked) in [(&opts(), false), (&restricted, true)] {
@@ -2728,6 +2763,47 @@ fn a_branch_opens_the_commits_it_inherits_and_its_own_history() {
             "A"
         ));
     }
+}
+
+#[test]
+fn a_sibling_branch_snapshot_with_replaced_branch_id_is_refused() {
+    let (_dir, family) = persistent(TAXONOMY);
+    family
+        .create_branch("left", &crate::branch::BranchOptions::default())
+        .unwrap();
+    family
+        .create_branch("right", &crate::branch::BranchOptions::default())
+        .unwrap();
+    let left = family.branch("left").unwrap();
+    let right = family.branch("right").unwrap();
+    left.update(&format!(
+        "{BASE} INSERT DATA {{ :L a owl:Class ; rdfs:subClassOf :A }}"
+    ))
+    .unwrap();
+    right
+        .update(&format!(
+            "{BASE} INSERT DATA {{ :R a owl:Class ; rdfs:subClassOf :B }}"
+        ))
+        .unwrap();
+    let left_snap = left.store().snapshot();
+    let mut spoofed = (*left_snap).clone();
+    spoofed.branch_id = right.store().snapshot().branch_id;
+    let spoofed = Arc::new(spoofed);
+    let refused = |r: Result<()>| assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    let warm = right.state().ontology_cache.lock().len();
+    refused(
+        right
+            .ontology()
+            .open_at(&spoofed, &req(), &opts())
+            .map(drop),
+    );
+    refused(
+        right
+            .ontology()
+            .head_at(&spoofed, &req(), &opts())
+            .map(drop),
+    );
+    assert_eq!(right.state().ontology_cache.lock().len(), warm);
 }
 
 #[test]
@@ -3362,7 +3438,7 @@ fn controlled_json_stops_inside_one_long_escape_free_ofn_string() {
         assert_eq!(calls, n);
     }
     // a run that is not stopped checks at most every chunk of the string and writes the
-    // plain serialization
+    // plain serialization; every adjacent gap from 0 through offsets to the end is bounded
     let mut offsets = Vec::new();
     let out = json_bytes_checked(&body, &mut |written| {
         offsets.push(written);
@@ -3370,17 +3446,13 @@ fn controlled_json_stops_inside_one_long_escape_free_ofn_string() {
     })
     .unwrap();
     assert_eq!(out, whole);
-    // the entry check, then one after each full piece of the string
     assert!(offsets.len() > 16, "{offsets:?}");
+    assert!(offsets[0] <= JSON_CHUNK, "first poll: {offsets:?}");
     assert!(
-        offsets[1] > start && offsets[1] - start <= JSON_CHUNK,
+        offsets.windows(2).all(|w| w[1] - w[0] <= JSON_CHUNK),
         "{offsets:?}"
     );
-    assert!(
-        offsets[1..].windows(2).all(|w| w[1] - w[0] <= JSON_CHUNK),
-        "{offsets:?}"
-    );
-    assert!(end - offsets.last().unwrap() <= JSON_CHUNK);
+    assert!(out.len() - offsets.last().unwrap() <= JSON_CHUNK);
     // a long string of multi-byte characters, whose pieces end short of a full chunk,
     // is checked between every two pieces too
     let wide = json!({"ofn": "\u{6f22}".repeat(16 * JSON_CHUNK / 3)});
@@ -3392,10 +3464,36 @@ fn controlled_json_stops_inside_one_long_escape_free_ofn_string() {
     .unwrap();
     assert_eq!(out, serde_json::to_vec(&wide).unwrap());
     assert!(offsets.len() > 16, "{offsets:?}");
+    assert!(offsets[0] <= JSON_CHUNK, "first poll (wide): {offsets:?}");
     assert!(
-        offsets[1..].windows(2).all(|w| w[1] - w[0] <= JSON_CHUNK),
+        offsets.windows(2).all(|w| w[1] - w[0] <= JSON_CHUNK),
         "{offsets:?}"
     );
+}
+
+#[test]
+fn controlled_json_poll_interval_bounded_across_adjacent_strings() {
+    use super::super::wire::{JSON_CHUNK, json_bytes_checked};
+    // a short first string followed by a long one: the gap from the last poll before
+    // the long string's first piece to the first poll inside it must stay <= JSON_CHUNK
+    let short = "a".repeat(JSON_CHUNK - 6);
+    let long = "b".repeat(JSON_CHUNK + 1);
+    let body = json!([short, long]);
+    let whole = serde_json::to_vec(&body).unwrap();
+    let mut offsets = Vec::new();
+    let out = json_bytes_checked(&body, &mut |written| {
+        offsets.push(written);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(out, whole);
+    assert!(!offsets.is_empty(), "no polls");
+    assert!(offsets[0] <= JSON_CHUNK, "first: {offsets:?}");
+    assert!(
+        offsets.windows(2).all(|w| w[1] - w[0] <= JSON_CHUNK),
+        "gap: {offsets:?}"
+    );
+    assert!(out.len() - offsets.last().unwrap() <= JSON_CHUNK);
 }
 
 #[test]

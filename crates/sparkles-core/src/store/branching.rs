@@ -1493,6 +1493,7 @@ impl Store {
     pub fn holds_state(&self, snap: &Snapshot) -> bool {
         snap.dataset_id == self.owner_dataset_id()
             && snap.branch_id == self.branch_id()
+            && snap.origin_branch_id == self.branch_id()
             && snap
                 .managed
                 .as_ref()

@@ -2432,10 +2432,10 @@ pub fn kept_axioms_body(
     Ok(v)
 }
 /// `j` serialized as JSON, byte for byte as [`serde_json::to_vec`] writes it, checking
-/// `opts` after every 64 KiB of output. Each string is scanned, escaped and written in
-/// pieces of at most [`JSON_CHUNK`] bytes with a check between two pieces, so that a stop
-/// ends the serialization of a large answer such as a kept axiom page within a bounded
-/// amount of work, even inside one long string.
+/// `opts` after every [`JSON_CHUNK`] bytes of output. The writer splits every incoming
+/// fragment at the remaining byte budget, and each string is escaped in pieces of at
+/// most `JSON_CHUNK` bytes, so the interval between two checks never exceeds
+/// `JSON_CHUNK` bytes.
 pub fn json_bytes_controlled(j: &J, opts: &QueryOptions) -> Result<Vec<u8>> {
     json_bytes_checked(j, &mut |_| super::check(opts))
 }
@@ -2468,10 +2468,16 @@ pub(crate) fn json_bytes_checked(
     }
     impl std::io::Write for Controlled<'_> {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.out.extend_from_slice(b);
-            self.since += b.len();
-            if self.since >= 64 << 10 {
-                self.poll()?;
+            let mut rest = b;
+            while !rest.is_empty() {
+                let budget = JSON_CHUNK - self.since;
+                let n = rest.len().min(budget);
+                self.out.extend_from_slice(&rest[..n]);
+                self.since += n;
+                if self.since >= JSON_CHUNK {
+                    self.poll()?;
+                }
+                rest = &rest[n..];
             }
             Ok(b.len())
         }

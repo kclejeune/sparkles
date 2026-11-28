@@ -185,6 +185,9 @@ pub struct Opened {
     /// them and the dataset has them; `None` reads the asserted axioms only
     pub inferences: Option<Inferences>,
     inner: Arc<Inner>,
+    /// the mapped ontology this open supplied, for provenance: a read that takes an
+    /// opened ontology checks that the caller has not replaced its public `ontology`
+    origin_ontology: Arc<read::Ontology>,
     /// the snapshot the ontology was opened at, before the caller's grants masked it
     source: Arc<Snapshot>,
     /// the view [`snapshot`](Self::snapshot) was set to when the ontology was opened
@@ -1031,6 +1034,11 @@ impl Ontologies {
                 "an ontology read takes an ontology opened from its own open dataset and branch",
             ));
         }
+        if !Arc::ptr_eq(&o.ontology, &o.origin_ontology) {
+            return Err(Error::invalid(
+                "an ontology read takes the mapped ontology its open supplied",
+            ));
+        }
         if self.pinned.is_none() {
             return Ok(());
         }
@@ -1425,6 +1433,7 @@ impl Ontologies {
                     cached: true,
                     inferences: None,
                     inner: e.inner.clone(),
+                    origin_ontology: e.ontology.clone(),
                     source: snap.clone(),
                     view,
                 };
@@ -1467,6 +1476,7 @@ impl Ontologies {
                 inner: inner.clone(),
             });
         }
+        let origin_ontology = ontology.clone();
         let mut opened = Opened {
             ontology,
             snapshot: view.clone(),
@@ -1478,6 +1488,7 @@ impl Ontologies {
             cached: false,
             inferences: None,
             inner,
+            origin_ontology,
             source: snap.clone(),
             view,
         };

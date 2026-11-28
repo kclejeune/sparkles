@@ -392,6 +392,7 @@ async fn select_branch(
 ) -> Response {
     let path = req.uri().path().to_string();
     let mut chosen: Vec<String> = Vec::new();
+    let mut rewrite_kept = false;
     let admin = path.starts_with("/$/");
     // the path form
     if !admin && !path.starts_with("/ui") {
@@ -418,7 +419,10 @@ async fn select_branch(
                 Err(_) => return bad_branch("invalid path"),
             }
             match Uri::from_parts(parts) {
-                Ok(u) => *req.uri_mut() = u,
+                Ok(u) => {
+                    *req.uri_mut() = u;
+                    rewrite_kept = super::kept_request(req.method(), req.uri());
+                }
                 Err(_) => return bad_branch("invalid path"),
             }
         }
@@ -458,16 +462,30 @@ async fn select_branch(
     distinct.sort();
     distinct.dedup();
     if distinct.len() > 1 {
-        return bad_branch(format!(
+        let mut r = bad_branch(format!(
             "the request names more than one branch: {}",
             distinct.join(", ")
         ));
+        if rewrite_kept {
+            r.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+        }
+        return r;
     }
     let Some(branch) = distinct.pop() else {
         return next.run(req).await;
     };
     if branch != MAIN && !sparkles::branch::valid_name(&branch) {
-        return bad_branch(format!("invalid branch name '{branch}'"));
+        let mut r = bad_branch(format!("invalid branch name '{branch}'"));
+        if rewrite_kept {
+            r.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+        }
+        return r;
     }
     if admin {
         let seg = path.split('/').nth(2).unwrap_or("");
