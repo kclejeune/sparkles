@@ -4629,8 +4629,8 @@ through the marker `G_1 → G_1` of the hypothesis that a predecessor sent, sinc
 in the body of a context clause comes from such a marker, and the marker subsumes the
 conclusion. The paper's elimination rule deletes a clause only when another clause of the
 context contains it, so the marker, or `D`, is either kept or replaced by a clause that
-also subsumes the conclusion, which is the unit `G_1`, a stronger blocker clause or the
-empty clause. A context of the run is therefore saturated for `O'` up to redundancy, and
+also subsumes the conclusion, which is the unit `G_1`, the clause `G_1 → ⊥`, a stronger
+blocker clause or the empty clause. A context of the run is therefore saturated for `O'` up to redundancy, and
 Theorem 9 applies to `O'` as before. A blocker that arrives after `W_2` was derived leaves
 sound clauses behind, as with units. The scan reads every literal of `C`, every blocker
 and every stored clause it inspects, dead or alive, charges this work to the run in chunks
@@ -4748,9 +4748,12 @@ which all hold `N` in their heads. The cases `U_1` and `U_2` then refute the wit
 `A` and give the unit `B`, which deletes the clauses of `A`'s witness and gives the unit
 `∃r.F`. The unit `N` would block that restriction, and no witness would be left to
 refute. The name was derived from the restriction's own witnesses and then blocked the
-restriction. This is a schedule of the clause-level rules and not a measured run, since
-the ontology needs no counting and so turns no order on. A regression of the form would
-need a trigger of counting and a schedule that the test controls.
+restriction. This is a schedule of the clause-level rules and not a measured run. The
+ontology needs no counting and so turns no order on by itself, and the regression
+`section_4_1_counterexample_with_counting_trigger_entails_x_unsatisfiable` adds
+`Z ⊑ ≤1 u.⊤` to turn counting on and checks that `X` is unsatisfiable, which the present
+rules give since they block nothing on `N`. A regression of the unit form itself would
+need a schedule that the test controls.
 
 The forms that block where `N` is in the body or in the core read `N` from the predecessor,
 so the cycle above cannot occur. Their completeness needs a lemma that the model of
@@ -4774,7 +4777,17 @@ either expansion strategy. The root and a test context have no predecessor, so n
 instance of such a body applies there and nothing is blocked in them. This form is a
 candidate if a measurement shows a need for it. ore_ont_6485's attempt after the first
 four parts finishes within the bound, as the measurements below state, so item 896 builds
-none of the three forms.
+none of the three forms. Whether the unqualified form is worth building is open.
+
+The regressions of the four changes are in `tests/dl_number_order.rs`, the cases of
+blocking under clauses with the return between equivalent representatives, the names of
+negative existential restrictions over symmetric, nested and transitive roles with
+ranges, the guarded cardinalities of the shape of ore_ont_6485 with their arrival orders,
+fillers and compound heads, a predecessor merge that only a lazy equality makes, and the
+memory budget and cancellation over all four. The unit tests of `dl_norm.rs` cover the
+pairs of `skip_weaken` and their removal on any truncation, the pass over refused axioms,
+and the depth and size limits of the guarded walk, and those of `dl_rules.rs` and
+`dl_clause.rs` cover the scan's charges and polls.
 
 **Measurements and the default.** The measurements are of commit 95ed2961 on a Boat worker
 with 8 vCPUs and 16 GiB, with one process at a time in a 12 GiB scope. A Boat measurement
@@ -4786,28 +4799,47 @@ attempt and the run without counting when `Limits::number_order` is false. Its t
 equals Konclude 0.7.0's, and the run without counting differs from it by 18 missing and
 12 extra direct edges. ore_ont_6952 and ore_ont_10140 finish with counting in 0.97 to
 1.03 s and 0.89 to 0.92 s, against 2.15 to 2.29 s and 3.28 to 3.40 s without counting,
-and their taxonomies equal Konclude's.
+and their taxonomies equal Konclude's. The run without counting on these two files spends
+1.39 and 2.53 s of its time in the coverage of the axioms it leaves out, which a run that
+leaves nothing out does not need, and its saturation takes 0.80 and 0.66 s against 0.88
+and 0.74 s with counting. Item 894's measurements on `atlas` came before that step.
 
 The 207 development files of the ORE 2015 DL sample were classified on four threads, once
 without counting and once with it, with 300 s and 12 GiB for each run. The reader refuses
 ore_ont_9881. The other 206 give a taxonomy in both runs, the same bytes on 203 of them.
 The other three are ore_ont_6485, ore_ont_6952 and ore_ont_10140, which finish only with
-counting. Three files pass the bound with counting and classify again without it.
+counting. The order and the four changes act only in a run that counts, and of the
+development files only these three and the three below have axioms that only counting
+takes, so the identical taxonomies of the others say nothing of the
+changes. The other files differ between the two runs only in the number of conclusions
+on four threads, which varies from run to run. Three files pass the bound with counting and classify again without it.
 ore_ont_541 has no number restriction and counts because of one functional property, and
 its classification with counting requested takes 5.7 to 6.0 s against 1.6 to 1.8 s
 without counting, with the order or without it. ore_ont_14817 takes 10.7 to 11.9 s
 against 3.1 to 3.5 s, and 7.0 s when `number_order` is false, whose attempt passes the
 memory budget before the bound of conclusions. ore_ont_9663 takes 10.6 to 11.1 s against
-8.4 to 8.8 s. The single runs on four threads put three more files above twice their time
+8.4 to 8.8 s. In each of these runs the time with counting requested is the failed
+attempt, then the run without counting under its own bound of 4 million conclusions, and
+then the Horn rules, since the run without counting also passes its bound on ore_ont_541
+and ore_ont_14817. The single runs on four threads put three more files above twice their time
 without counting, and on one thread ore_ont_8273, ore_ont_11110 and ore_ont_12141 derive
 the same conclusions in both runs and take the same time within the rounds' spread.
+
+The parent of the merge of these changes, commit fbe62c12 with the order, and the merge
+itself, commit 3ba8f6d6, were measured in the same way in one more pair of rounds.
+Before the changes, ore_ont_6485's attempt passes the bound and its classification with
+counting requested takes 230 to 244 ms, and after them the file finishes in 26 to 28 ms,
+so the four changes and not the order make it finish. Before them, ore_ont_14817's
+attempt passes the memory budget first and takes 7.0 to 8.0 s, and after them it runs to
+the bound of conclusions and takes 11.5 s in the round that the host's load did not
+disturb. ore_ont_541 takes 6.0 to 6.5 s in both builds, and ore_ont_6952 finishes in both.
 
 Counting stays off by default. The condition of item 896 that no development file costs
 more than twice its run without counting fails on ore_ont_541 and ore_ont_14817 at 3.4
 to 3.5 times, and on ore_ont_6485 at 3.8 to 3.9 times, where only the run with counting
 gives the complete taxonomy. A run that counts also rests on item 1229's repair, which is
 not proved, as the section on the disjunctive rules states. ore_ont_541's attempt is item
-1395, and the cost that the order adds to ore_ont_14817's attempt is item 1396.
+1395, and the cost that the four changes add to ore_ont_14817's attempt is item 1396.
 
 #### Compound qualifiers of number restrictions
 
