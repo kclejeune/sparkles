@@ -1993,8 +1993,8 @@ request's limit or the whole pool is `507`, and one that the busy pool cannot ta
 once, apart from `graph`, and `inferences` and `assertions` only as `true` or `false`. It
 refuses `inferences=true`, `assertions=true` and `format=ofn`. Every answer to a `GET`
 that names `classification` is `Cache-Control: no-store`. This includes the route's own
-refusals and those of authentication, the rate limiter and the pool admission, which
-answer before the route. A stop or a deadline ends the page while it is scanned, rendered
+refusals and those of branch selection, authentication, the rate limiter and the pool
+admission, which answer before the route. A stop or a deadline ends the page while it is scanned, rendered
 or serialized, even when one equivalence of an inconsistent ontology names every class.
 
 `GET /$/ontology/{ds}/entities` lists the entities the ontology declares or, in a lenient
@@ -2390,7 +2390,9 @@ that a read transaction or a historical view holds, so that its reads answer at 
 commit without resolving history again. A pinned read refuses a snapshot of another
 dataset or branch before it reads a cache, and `Ontologies::open_at` and
 `Ontologies::kept_entity_at_opened` refuse a snapshot or an opened ontology of another
-state. A pinned handle refuses diffs and entity searches, which read
+state. Pinned or not, `open_at` and `head_at` refuse a state of another dataset, branch or
+separately opened copy before they read a cache, and `kept_entity_at_opened` and
+`dl_query_opened` refuse an ontology opened from one. A pinned handle refuses diffs and entity searches, which read
 other states. A classification through a handle pinned to a commit older than the head
 reuses that commit's kept result while the dataset holds it, and otherwise classifies
 without replacing the head's kept result. The FFI's `FfiReadTxn::ontology_call` answers

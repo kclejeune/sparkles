@@ -368,6 +368,24 @@ fn bad_branch(msg: impl Into<String>) -> Response {
 /// body, check that they agree, and run the request with that branch. Responses from a
 /// branch other than `main` name it in `Sparkles-Branch` and `Sparkles-Branch-Id`.
 pub(crate) async fn select(
+    st: St,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // a kept read's refusal here is not cached, as `security_headers` marks the
+    // responses of the routes this layer runs
+    let kept = super::kept_request(req.method(), req.uri());
+    let mut resp = select_branch(st, req, next).await;
+    if kept {
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+    }
+    resp
+}
+
+async fn select_branch(
     State(st): St,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,

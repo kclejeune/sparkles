@@ -122,6 +122,39 @@ async fn authentication_refusals_of_kept_reads_are_never_cached() {
     }
 }
 
+#[tokio::test]
+async fn branch_selection_refusals_of_kept_reads_are_never_cached() {
+    let (_dir, app) = server();
+    // branch selection refuses a conflicting or invalid branch before routing
+    for branch in ["branch=one&branch=two", "branch=a%20b"] {
+        for uri in [
+            format!("/$/ontology/ont/axioms?classification=kept&{branch}"),
+            format!("/$/ontology/ont/entity?iri=http%3A%2F%2Fex%2FA&classification=kept&{branch}"),
+            format!("/$/ontology/ont/classification?{branch}"),
+        ] {
+            let r = as_user(&app, "oread", "GET", &uri, &json!(null)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.text());
+            assert_eq!(r.json()["code"], "invalid-branch", "{uri}");
+            assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{uri}");
+        }
+        // the asserted reads keep their own caching
+        for uri in [
+            format!("/$/ontology/ont/axioms?{branch}"),
+            format!("/$/ontology/ont/entity?iri=http%3A%2F%2Fex%2FA&{branch}"),
+        ] {
+            let r = as_user(&app, "oread", "GET", &uri, &json!(null)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.text());
+            assert_eq!(r.json()["code"], "invalid-branch", "{uri}");
+            assert!(
+                r.headers
+                    .get(header::CACHE_CONTROL)
+                    .is_none_or(|v| v.as_bytes() != b"no-store"),
+                "{uri}"
+            );
+        }
+    }
+}
+
 const DATA: &str = r#"@prefix : <http://ex/> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .

@@ -1031,8 +1031,10 @@ or a materialized read names. A read refuses a pinned snapshot of another datase
 of a separately opened copy of the dataset with the same persisted UUIDs, before it reads
 a cache. The methods that take a state, `open_at`, `head_at`, `kept_entity_at_opened` and
 `dl_query_opened`, refuse every snapshot other than the pinned one, even a view of the
-same commit with other data, and an ontology opened from another. A request whose `at`
-names another state is refused at every entry, and so are edits, entity removals,
+same commit with other data, and an ontology opened from another. Through an unpinned
+handle, `open_at` and `head_at` refuse a state of another dataset, branch or copy before
+they read a cache, and the opened entries refuse an ontology opened from one. A request
+whose `at` names another state is refused at every entry, and so are edits, entity removals,
 classifications that write, diffs and entity searches. A classification or DL class query
 pinned to a commit older than the head reuses that commit's kept result while the slot
 holds it, and otherwise runs without replacing the head's. A pinned run checks again once

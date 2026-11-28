@@ -2576,6 +2576,161 @@ fn a_pin_refuses_an_independently_opened_copy_at_the_same_commit() {
 }
 
 #[test]
+fn a_warm_copy_opens_no_state_of_another_copy_from_its_cache() {
+    // two copies of one closed dataset, each with one different ontology commit, share
+    // the persisted dataset and branch ids and the commit number but not their data
+    let dir = tempfile::tempdir().unwrap();
+    let (a_root, b_root) = (dir.path().join("a"), dir.path().join("b"));
+    {
+        let ds = Dataset::open(&a_root).unwrap();
+        ds.update(&format!(
+            "{BASE} INSERT DATA {{ {TAXONOMY} :B :secret true . }}"
+        ))
+        .unwrap();
+    }
+    copy_dir(&a_root, &b_root);
+    let a = Dataset::open(&a_root).unwrap();
+    let b = Dataset::open(&b_root).unwrap();
+    a.update(&format!(
+        "{BASE} INSERT DATA {{ :X a owl:Class ; rdfs:subClassOf :A }}"
+    ))
+    .unwrap();
+    b.update(&format!(
+        "{BASE} INSERT DATA {{ :Y a owl:Class ; rdfs:subClassOf :B }}"
+    ))
+    .unwrap();
+    let (mine, theirs) = (a.store().snapshot(), b.store().snapshot());
+    assert_eq!(
+        (mine.dataset_id, mine.branch_id, mine.commit),
+        (theirs.dataset_id, theirs.branch_id, theirs.commit)
+    );
+    let has = |o: &Opened, local: &str| {
+        o.ontology
+            .classes()
+            .iter()
+            .any(|c| c.as_str() == iri(local))
+    };
+    // the other copy's ontology cache is warm at the same commit
+    let theirs_open = b.ontology().open(&req(), &opts()).unwrap();
+    assert!(has(&theirs_open, "Y") && !has(&theirs_open, "X"));
+    let warm = b.state().ontology_cache.lock().len();
+    assert!(warm > 0);
+    let refused = |r: Result<()>| assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    let restricted = crate::handles::ontology::tests::hiding("http://ex.org/secret");
+    // it opens no state of this copy, from its cache or otherwise
+    refused(b.ontology().open_at(&mine, &req(), &opts()).map(drop));
+    refused(b.ontology().open_at(&mine, &req(), &restricted).map(drop));
+    refused(b.ontology().head_at(&mine, &req(), &opts()).map(drop));
+    assert_eq!(b.state().ontology_cache.lock().len(), warm);
+    // and an ontology one copy opened is refused by the other's entries that take one,
+    // pinned or not, also with its snapshot replaced by the receiver's
+    let mut q = super::super::dl_query::DlQueryRequest::new(sparkles_owl::ClassExpression::Class(
+        sparkles_owl::Class::new(iri("B")),
+    ));
+    q.answers.instances = false;
+    let pinned = a.ontology().at_snapshot(mine.clone());
+    let mut swapped = theirs_open.clone();
+    swapped.snapshot = mine.clone();
+    for o in [&theirs_open, &swapped] {
+        refused(
+            pinned
+                .dl_query_opened(o.clone(), &req(), &q, &opts())
+                .map(drop),
+        );
+        refused(
+            a.ontology()
+                .dl_query_opened(o.clone(), &req(), &q, &opts())
+                .map(drop),
+        );
+        refused(
+            pinned
+                .kept_entity_at_opened(&req(), o, &KeptEntityQuery::new(iri("B")), &opts())
+                .map(drop),
+        );
+        refused(
+            a.ontology()
+                .kept_entity_at_opened(&req(), o, &KeptEntityQuery::new(iri("B")), &opts())
+                .map(drop),
+        );
+    }
+    // an ontology this copy opened at its own pinned state answers there, through the
+    // caller's grants too
+    for (o, masked) in [(&opts(), false), (&restricted, true)] {
+        let own = pinned.open_at(&mine, &req(), o).unwrap();
+        assert_eq!(!Arc::ptr_eq(&own.snapshot, &mine), masked);
+        assert!(has(&own, "X") && !has(&own, "Y"));
+        assert!(
+            pinned
+                .kept_entity_at_opened(&req(), &own, &KeptEntityQuery::new(iri("B")), o)
+                .is_ok()
+        );
+        let answer = pinned.dl_query_opened(own, &req(), &q, o).unwrap();
+        let subclasses = answer.subclasses.expect("subclasses");
+        assert!(
+            subclasses.iter().any(|c| c.as_str() == iri("D")),
+            "{subclasses:?}"
+        );
+        assert!(
+            subclasses.iter().all(|c| c.as_str() != iri("Y")),
+            "{subclasses:?}"
+        );
+    }
+    // and the other copy still answers its own state
+    assert!(has(
+        &b.ontology().open_at(&theirs, &req(), &opts()).unwrap(),
+        "Y"
+    ));
+}
+
+#[test]
+fn a_branch_opens_the_commits_it_inherits_and_its_own_history() {
+    let (_dir, family) = persistent(TAXONOMY);
+    let inherited = family.store().snapshot().commit;
+    family
+        .create_branch("left", &crate::branch::BranchOptions::default())
+        .unwrap();
+    let left = family.branch("left").unwrap();
+    left.update(&format!(
+        "{BASE} INSERT DATA {{ :L a owl:Class ; rdfs:subClassOf :A }}"
+    ))
+    .unwrap();
+    let own = left.store().snapshot().commit;
+    left.update(&format!("{BASE} INSERT DATA {{ :M a owl:Class }}"))
+        .unwrap();
+    family
+        .update(&format!("{BASE} INSERT DATA {{ :R a owl:Class }}"))
+        .unwrap();
+    let has = |o: &Opened, local: &str| {
+        o.ontology
+            .classes()
+            .iter()
+            .any(|c| c.as_str() == iri(local))
+    };
+    let at = |n: u64| OntologyRequest {
+        at: Some(At::Commit(n)),
+        ..req()
+    };
+    let restricted = crate::handles::ontology::tests::hiding("http://ex.org/secret");
+    for o in [opts(), restricted] {
+        // a commit before the fork, which the branch inherits
+        let before = left.ontology().open(&at(inherited), &o).unwrap();
+        assert!(has(&before, "A") && !has(&before, "L") && !has(&before, "R"));
+        assert!(left.ontology().head(&at(inherited), &o).is_ok());
+        // a commit of the branch's own history, and its head
+        let mid = left.ontology().open(&at(own), &o).unwrap();
+        assert!(has(&mid, "L") && !has(&mid, "M"));
+        let head = left.ontology().open(&req(), &o).unwrap();
+        assert!(has(&head, "M") && !has(&head, "R"));
+        assert!(left.ontology().head(&req(), &o).is_ok());
+        // and the main branch's history
+        assert!(has(
+            &family.ontology().open(&at(inherited), &o).unwrap(),
+            "A"
+        ));
+    }
+}
+
+#[test]
 fn a_pinned_handle_refuses_diffs_searches_and_reads_at_other_states() {
     let ds = ds(TAXONOMY);
     let held = ds.store().snapshot();
@@ -3154,6 +3309,138 @@ fn rendering_a_large_kept_equivalence_stops_with_the_request() {
         super::super::wire::json_bytes_controlled(&body, &stopping),
         Err(Error::Cancelled)
     ));
+}
+
+#[test]
+fn controlled_json_stops_inside_one_long_escape_free_ofn_string() {
+    use super::super::wire::{JSON_CHUNK, json_bytes_checked};
+    // a kept row whose OFN names many classes and has no character that JSON escapes
+    let mut ofn = String::from("EquivalentClasses(");
+    let mut i = 0;
+    while ofn.len() < 16 * JSON_CHUNK {
+        ofn.push_str(&format!(" <http://ex.org/C{i}>"));
+        i += 1;
+    }
+    ofn.push(')');
+    assert!(!ofn.contains(['"', '\\']) && ofn.bytes().all(|b| (0x20..0x7f).contains(&b)));
+    let body = json!({
+        "dataset": "ds",
+        "axioms": [{"type": "EquivalentClasses", "ofn": ofn, "axiom": {"type": "EquivalentClasses"}}],
+        "total": 1,
+    });
+    let whole = serde_json::to_vec(&body).unwrap();
+    let key = b"\"ofn\":\"";
+    let start = whole.windows(key.len()).position(|w| w == key).unwrap() + key.len();
+    let end = start + ofn.len();
+    // a cancellation raised by the n-th check, after the entry check, stops the
+    // serialization inside the string
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = QueryOptions {
+        cancel: Some(cancel.clone()),
+        ..opts()
+    };
+    for n in [2usize, 3, 9] {
+        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        let (mut calls, mut stopped_at) = (0usize, None);
+        let r = json_bytes_checked(&body, &mut |written| {
+            calls += 1;
+            if calls == n {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let r = crate::handles::ontology::check(&stopping);
+            if r.is_err() {
+                stopped_at = Some(written);
+            }
+            r
+        });
+        assert!(matches!(r, Err(Error::Cancelled)), "{n}: {r:?}");
+        let at = stopped_at.expect("stopped");
+        assert!(
+            at > start && at < end,
+            "{n}: stopped at {at}, string at {start}..{end}"
+        );
+        assert_eq!(calls, n);
+    }
+    // a run that is not stopped checks at most every chunk of the string and writes the
+    // plain serialization
+    let mut offsets = Vec::new();
+    let out = json_bytes_checked(&body, &mut |written| {
+        offsets.push(written);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(out, whole);
+    // the entry check, then one after each full piece of the string
+    assert!(offsets.len() > 16, "{offsets:?}");
+    assert!(
+        offsets[1] > start && offsets[1] - start <= JSON_CHUNK,
+        "{offsets:?}"
+    );
+    assert!(
+        offsets[1..].windows(2).all(|w| w[1] - w[0] <= JSON_CHUNK),
+        "{offsets:?}"
+    );
+    assert!(end - offsets.last().unwrap() <= JSON_CHUNK);
+    // a long string of multi-byte characters, whose pieces end short of a full chunk,
+    // is checked between every two pieces too
+    let wide = json!({"ofn": "\u{6f22}".repeat(16 * JSON_CHUNK / 3)});
+    let mut offsets = Vec::new();
+    let out = json_bytes_checked(&wide, &mut |written| {
+        offsets.push(written);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(out, serde_json::to_vec(&wide).unwrap());
+    assert!(offsets.len() > 16, "{offsets:?}");
+    assert!(
+        offsets[1..].windows(2).all(|w| w[1] - w[0] <= JSON_CHUNK),
+        "{offsets:?}"
+    );
+}
+
+#[test]
+fn controlled_json_writes_the_bytes_serde_json_writes() {
+    use super::super::wire::{JSON_CHUNK, json_bytes_controlled};
+    // escapes and multi-byte characters straddle every chunk boundary
+    let pieces = [
+        "a",
+        "\u{e9}",
+        "\u{6f22}",
+        "\u{1f389}",
+        "\"",
+        "\\",
+        "\n",
+        "\t",
+        "\r",
+        "\u{8}",
+        "\u{c}",
+        "\u{1}",
+        "\u{1f}",
+        "\u{7f}",
+        "/",
+        "\u{2028}",
+        "</script>",
+    ];
+    let mut mixed = String::new();
+    let mut k = 0;
+    while mixed.len() < 3 * JSON_CHUNK + 17 {
+        mixed.push_str(pieces[k % pieces.len()]);
+        k += 1;
+    }
+    let mut wide = "x".repeat(JSON_CHUNK - 1);
+    wide.push_str(&"\u{6f22}".repeat(10));
+    wide.push_str(&"\u{1f389}".repeat(JSON_CHUNK / 4 + 3));
+    let mut escapes = "y".repeat(JSON_CHUNK - 2);
+    escapes.push_str(&"\"\\\u{0}".repeat(JSON_CHUNK));
+    let body = json!({
+        "a\"key\\with\nescapes\u{e9}": [mixed, wide, escapes, "", "plain", null, true, false],
+        "numbers": [0, -1, 1.5, -0.25, 1e300, u64::MAX, i64::MIN],
+        "nested": {"\u{e9}": [[], {}, [{"k": [null]}]]},
+        "ofn": "EquivalentClasses(<http://ex.org/A> <http://ex.org/B>)",
+    });
+    let bytes = json_bytes_controlled(&body, &opts()).unwrap();
+    assert_eq!(bytes, serde_json::to_vec(&body).unwrap());
+    assert_eq!(serde_json::from_slice::<J>(&bytes).unwrap(), body);
 }
 
 #[test]

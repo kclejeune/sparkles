@@ -1021,9 +1021,16 @@ impl Ontologies {
     }
 
     /// [`check_pinned_at`](Self::check_pinned_at) for an ontology the caller opened: it
-    /// must have been opened from the pinned snapshot and still read the view it was
-    /// opened with.
+    /// must have been opened from a state of this handle's own open dataset and branch,
+    /// pinned or not, and through a pinned handle from the pinned snapshot, still
+    /// reading the view it was opened with.
     pub(crate) fn check_pinned_opened(&self, o: &Opened, req: &OntologyRequest) -> Result<()> {
+        let store = self.ds.store();
+        if !store.holds_state(&o.source) || !store.holds_state(&o.snapshot) {
+            return Err(Error::invalid(
+                "an ontology read takes an ontology opened from its own open dataset and branch",
+            ));
+        }
         if self.pinned.is_none() {
             return Ok(());
         }
@@ -1357,7 +1364,9 @@ impl Ontologies {
         self.open_at(&snap, req, &opts)
     }
 
-    /// [`open`](Self::open) at a state the caller has.
+    /// [`open`](Self::open) at a state the caller has. The state must belong to this
+    /// handle's own open dataset and branch: a snapshot of another dataset, branch or
+    /// separately opened copy is refused, pinned or not, before any cache is read.
     pub fn open_at(
         &self,
         snap: &Arc<Snapshot>,
@@ -1379,6 +1388,14 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<Opened> {
         req.validate()?;
+        // the dataset's caches key an open ontology by commit alone, so a state of
+        // another dataset, branch or separately opened copy, which can have the same
+        // commit number, is refused before they are read
+        if !self.ds.store().holds_state(snap) {
+            return Err(Error::invalid(
+                "an ontology opens only at a state of its own open dataset and branch",
+            ));
+        }
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let view = match &access {
             Some(a) => a.masked(snap)?,

@@ -735,16 +735,7 @@ async fn security_headers(req: axum::extract::Request, next: axum::middleware::N
     let kept_read = req
         .extensions()
         .get::<axum::extract::MatchedPath>()
-        .is_some_and(|p| match p.as_str() {
-            "/$/ontology/{ds}/classification" => true,
-            "/$/ontology/{ds}/axioms" | "/$/ontology/{ds}/entity" => {
-                matches!(*req.method(), Method::GET | Method::HEAD)
-                    && Params::from_query(req.uri())
-                        .get("classification")
-                        .is_some()
-            }
-            _ => false,
-        });
+        .is_some_and(|p| kept_route(p.as_str(), req.method(), req.uri()));
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     if kept_read {
@@ -761,6 +752,38 @@ async fn security_headers(req: axum::extract::Request, next: axum::middleware::N
             "default-src 'none'; frame-ancestors 'none'",
         ));
     resp
+}
+
+/// Whether a request to `route`, a route such as `/$/ontology/{ds}/axioms`, reads the
+/// kept classification, whose answers and refusals are never cached.
+fn kept_route(route: &str, method: &Method, uri: &Uri) -> bool {
+    match route {
+        "/$/ontology/{ds}/classification" => true,
+        "/$/ontology/{ds}/axioms" | "/$/ontology/{ds}/entity" => {
+            matches!(*method, Method::GET | Method::HEAD)
+                && Params::from_query(uri).get("classification").is_some()
+        }
+        _ => false,
+    }
+}
+
+/// [`kept_route`] for a request that has not been routed, from its path, for the
+/// refusals of the branch selection that runs before routing.
+pub(crate) fn kept_request(method: &Method, uri: &Uri) -> bool {
+    let Some((ds, tail)) = uri
+        .path()
+        .strip_prefix("/$/ontology/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    let route = match tail {
+        "classification" => "/$/ontology/{ds}/classification",
+        "axioms" => "/$/ontology/{ds}/axioms",
+        "entity" => "/$/ontology/{ds}/entity",
+        _ => return false,
+    };
+    !ds.is_empty() && kept_route(route, method, uri)
 }
 
 /// Add the request's id to JSON error bodies (`requestId`), so an error shown by a

@@ -14,13 +14,17 @@ of a classification's `format=ofn`, walking the retained taxonomy and charging e
 rows to the memory budget and the server's query memory pool, which admits the HTTP
 listing. A miss classifies nothing and answers null pages, and every answer to a `GET`
 that names the selector is `Cache-Control: no-store`, including the refusals of
-authentication, the rate limiter and the pool that come before the route. A stop or a
+branch selection, authentication, the rate limiter and the pool that come before the
+route. A stop or a
 deadline ends a listing while it scans, renders or serializes the page.
 
 `Ontologies::at_snapshot` and `FfiReadTxn::ontology_call` answer reads at a snapshot that a
 read transaction or a historical view holds. They refuse a snapshot of another dataset or
 branch or of a separately opened copy of the dataset. The methods that take a state accept
-only the pinned snapshot, and the request's `at` only at its commit. A pinned
+only the pinned snapshot, and the request's `at` only at its commit. An unpinned handle's
+`open_at` and `head_at` also refuse a state of another dataset, branch or copy before they
+read a cache, and `kept_entity_at_opened` and `dl_query_opened` refuse an ontology opened
+from one. A pinned
 classification or DL query of an older commit never replaces the head's kept result,
 including a head that was classified while the pinned run waited for the flight. On the JVM, `keptClassification`, the new
 `keptAxioms` and `keptEntity`, the frame projection and the materialized hierarchy,

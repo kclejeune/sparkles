@@ -24,7 +24,7 @@ use super::{
     GraphRef, INFERRED_GRAPH, Import, ImportEdge, Inferences, Ontologies, OntologyRequest,
     ReadView, check, triple_of,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::index::Perm;
 use crate::sparql::QueryOptions;
@@ -109,6 +109,12 @@ impl Ontologies {
     ) -> Result<Head> {
         req.validate()?;
         self.check_pinned_at(snap, req)?;
+        // the reasoning record read below belongs to this dataset
+        if !self.ds.store().holds_state(snap) {
+            return Err(Error::invalid(
+                "an ontology opens only at a state of its own open dataset and branch",
+            ));
+        }
         // the view, the graphs and the inferences as `open_at` reads them
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let view = match &access {

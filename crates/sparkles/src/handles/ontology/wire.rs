@@ -2413,11 +2413,13 @@ pub fn kept_axioms_body(
                 // the form of `axiom_json` without a graph
                 let ofn = r.axiom_controlled(ax, &mut tick)?;
                 let axiom = sparkles_owl::json::axiom_controlled(ax, &mut tick)?;
-                rows.push(json!({
-                    "type": ax.axiom_type().name(),
-                    "ofn": ofn,
-                    "axiom": axiom,
-                }));
+                // the rendered values move into the row: `json!` would copy them again
+                // without polling
+                let mut row = Map::with_capacity(3);
+                row.insert("type".into(), J::String(ax.axiom_type().name().into()));
+                row.insert("ofn".into(), J::String(ofn));
+                row.insert("axiom".into(), axiom);
+                rows.push(J::Object(row));
             }
             J::Array(rows)
         }
@@ -2429,40 +2431,128 @@ pub fn kept_axioms_body(
     v["next"] = json!(k.next_offset);
     Ok(v)
 }
-/// `j` serialized as JSON, checking `opts` every 64 KiB of output, so that a stop ends
-/// the serialization of a large answer such as a kept axiom page.
+/// `j` serialized as JSON, byte for byte as [`serde_json::to_vec`] writes it, checking
+/// `opts` after every 64 KiB of output. Each string is scanned, escaped and written in
+/// pieces of at most [`JSON_CHUNK`] bytes with a check between two pieces, so that a stop
+/// ends the serialization of a large answer such as a kept axiom page within a bounded
+/// amount of work, even inside one long string.
 pub fn json_bytes_controlled(j: &J, opts: &QueryOptions) -> Result<Vec<u8>> {
+    json_bytes_checked(j, &mut |_| super::check(opts))
+}
+
+/// The most bytes of one string that [`json_bytes_controlled`] scans, escapes and writes
+/// at once.
+pub(crate) const JSON_CHUNK: usize = 64 << 10;
+
+/// [`json_bytes_controlled`] with `check`, which is passed the bytes written so far.
+pub(crate) fn json_bytes_checked(
+    j: &J,
+    check: &mut dyn FnMut(usize) -> Result<()>,
+) -> Result<Vec<u8>> {
+    use std::io::Write;
     struct Controlled<'a> {
         out: Vec<u8>,
-        opts: &'a QueryOptions,
+        check: &'a mut dyn FnMut(usize) -> Result<()>,
         since: usize,
         stopped: Option<Error>,
     }
+    impl Controlled<'_> {
+        fn poll(&mut self) -> std::io::Result<()> {
+            self.since = 0;
+            if let Err(e) = (self.check)(self.out.len()) {
+                self.stopped = Some(e);
+                return Err(std::io::Error::other("stopped"));
+            }
+            Ok(())
+        }
+    }
     impl std::io::Write for Controlled<'_> {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.out.extend_from_slice(b);
             self.since += b.len();
             if self.since >= 64 << 10 {
-                self.since = 0;
-                if let Err(e) = super::check(self.opts) {
-                    self.stopped = Some(e);
-                    return Err(std::io::Error::other("stopped"));
-                }
+                self.poll()?;
             }
-            self.out.extend_from_slice(b);
             Ok(b.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    super::check(opts)?;
+    /// The compact formatter without the quotes around a string, so that a string's
+    /// contents are escaped in chunks between one pair of quotes.
+    struct Contents;
+    impl serde_json::ser::Formatter for Contents {
+        fn begin_string<W: ?Sized + std::io::Write>(&mut self, _: &mut W) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn end_string<W: ?Sized + std::io::Write>(&mut self, _: &mut W) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // a string is escaped one character at a time, so escaping it in pieces split at
+    // character boundaries writes the bytes that escaping it whole does
+    fn string(s: &str, w: &mut Controlled<'_>) -> std::io::Result<()> {
+        w.write_all(b"\"")?;
+        let mut rest = s;
+        while !rest.is_empty() {
+            let mut end = rest.len().min(JSON_CHUNK);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (piece, tail) = rest.split_at(end);
+            serde::Serialize::serialize(
+                piece,
+                &mut serde_json::Serializer::with_formatter(&mut *w, Contents),
+            )
+            .map_err(std::io::Error::other)?;
+            rest = tail;
+            // a piece that ends before a multi-byte character, or holds escapes, can
+            // leave the output count short of a check
+            if !rest.is_empty() && w.since != 0 {
+                w.poll()?;
+            }
+        }
+        w.write_all(b"\"")
+    }
+    fn value(j: &J, w: &mut Controlled<'_>) -> std::io::Result<()> {
+        match j {
+            J::Null | J::Bool(_) | J::Number(_) => {
+                serde_json::to_writer(&mut *w, j).map_err(std::io::Error::other)
+            }
+            J::String(s) => string(s, w),
+            J::Array(a) => {
+                w.write_all(b"[")?;
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        w.write_all(b",")?;
+                    }
+                    value(x, w)?;
+                }
+                w.write_all(b"]")
+            }
+            J::Object(m) => {
+                w.write_all(b"{")?;
+                for (i, (k, x)) in m.iter().enumerate() {
+                    if i > 0 {
+                        w.write_all(b",")?;
+                    }
+                    string(k, w)?;
+                    w.write_all(b":")?;
+                    value(x, w)?;
+                }
+                w.write_all(b"}")
+            }
+        }
+    }
+    check(0)?;
     let mut w = Controlled {
         out: Vec::new(),
-        opts,
+        check,
         since: 0,
         stopped: None,
     };
-    match serde_json::to_writer(&mut w, j) {
+    match value(j, &mut w) {
         Ok(()) => Ok(w.out),
         Err(e) => Err(w
             .stopped
