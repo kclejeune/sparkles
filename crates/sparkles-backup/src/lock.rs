@@ -5,7 +5,7 @@
 //!   the own lock, back off with jitter (1 s → 30 s), retry up to `lockWait`, then
 //!   `409 repository-locked` naming the holder.
 //! * **exclusive** (GC's sweep): the same, conflicting with any other non-stale lock.
-//! * **refresh** every [`REFRESH`] (re-`PUT` with `PutMode::Overwrite`) while held.
+//! * **refresh** every [`REFRESH`] with a conditional update while held.
 //! * **stale**: `last_modified` (the storage server's clock, from LIST; the file mtime
 //!   for `fs`) older than [`STALE`]: ignored by acquirers, removed by GC and
 //!   `break_lock`.
@@ -24,10 +24,13 @@ use crate::{
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use object_store::path::Path as Key;
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutPayload};
+use object_store::{
+    GetOptions, GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutPayload,
+    UpdateVersion,
+};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 /// How often a held lock is re-written.
@@ -39,6 +42,30 @@ pub const DEFAULT_WAIT: Duration = Duration::from_secs(10 * 60);
 /// First and largest back-off between acquisition attempts (jittered).
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug)]
+struct LeaseClock {
+    monotonic: Instant,
+    wall: SystemTime,
+}
+
+impl LeaseClock {
+    fn now() -> Self {
+        Self {
+            monotonic: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+
+    fn elapsed(self) -> Duration {
+        // The wall clock also advances when the host is suspended.
+        self.monotonic
+            .elapsed()
+            .max(self.wall.elapsed().unwrap_or(STALE))
+    }
+}
+
+type Renewal = Arc<Mutex<Option<LeaseClock>>>;
 
 /// A held lock (or none, for read-only repositories). Release it with
 /// [`release`](LockGuard::release); dropping it stops the refresh and deletes the lock
@@ -52,8 +79,8 @@ pub struct LockGuard {
     /// the lock object's `last_modified` when it was acquired: the storage server's
     /// clock, the reference for other objects' ages (GC's grace period)
     server_time: Option<DateTime<Utc>>,
-    acquired_at: Instant,
-    refreshed_at: Arc<std::sync::Mutex<Instant>>,
+    acquired_at: LeaseClock,
+    renewed: Renewal,
     /// the task re-writing the lock every [`REFRESH`]
     refresh: Option<tokio::task::JoinHandle<()>>,
 }
@@ -65,8 +92,8 @@ impl LockGuard {
             id: None,
             store: None,
             server_time: None,
-            acquired_at: Instant::now(),
-            refreshed_at: Arc::new(std::sync::Mutex::new(Instant::now())),
+            acquired_at: LeaseClock::now(),
+            renewed: Arc::new(Mutex::new(None)),
             refresh: None,
         }
     }
@@ -89,22 +116,61 @@ impl LockGuard {
 
     /// A writer may publish only while its current lease still exists and is fresh.
     pub(crate) async fn check_live(&self) -> Result<()> {
+        self.live_head(GetOptions::default()).await?;
+        Ok(())
+    }
+
+    async fn live_head(&self, mut options: GetOptions) -> Result<Option<GetResult>> {
         let (Some(id), Some(store)) = (self.id(), &self.store) else {
-            return Ok(());
+            return Ok(None);
         };
-        let expired = || locked(id, None);
-        match store.head(&lock_key(id)).await {
-            Ok(meta)
-                if self.refreshed_at.lock().unwrap().elapsed() < STALE
-                    && self
-                        .estimated_server_time()
-                        .is_none_or(|now| !is_stale(meta.last_modified, now)) =>
-            {
+        let check = || {
+            let mut renewed = self.renewed.lock().unwrap();
+            if renewed.is_some_and(|clock| clock.elapsed() < STALE) {
                 Ok(())
+            } else {
+                *renewed = None;
+                Err(locked(id, None))
             }
-            Ok(_) | Err(object_store::Error::NotFound { .. }) => Err(expired()),
+        };
+        check()?;
+        options.head = true;
+        let found = store.get_opts(&lock_key(id), options).await;
+        check()?;
+        match found {
+            Ok(head)
+                if self
+                    .estimated_server_time()
+                    .is_none_or(|now| !is_stale(head.meta.last_modified, now)) =>
+            {
+                Ok(Some(head))
+            }
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => {
+                *self.renewed.lock().unwrap() = None;
+                Err(locked(id, None))
+            }
             Err(error) => Err(error.into()),
         }
+    }
+
+    #[cfg(feature = "s3")]
+    pub(crate) async fn fresh_server_time(&self) -> Result<Option<DateTime<Utc>>> {
+        let Some(head) = self
+            .live_head(crate::storage::RetentionHead::options())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let now = head
+            .extensions
+            .get::<crate::storage::RetentionHead>()
+            .map(crate::storage::RetentionHead::server_time)
+            .transpose()?;
+        if now.is_some_and(|now| is_stale(head.meta.last_modified, now)) {
+            *self.renewed.lock().unwrap() = None;
+            return Err(locked(self.id().expect("lease HEAD has an id"), None));
+        }
+        Ok(now)
     }
 
     /// Delete the lock object (best effort: a failure is logged, the lock goes stale).
@@ -256,19 +322,18 @@ pub async fn acquire(
         } else {
             PutMode::Create
         };
-        let acquired_at = Instant::now();
-        match store
+        let acquired_at = LeaseClock::now();
+        let version = match store
             .put_opts(&key, PutPayload::from(body.clone()), mode.into())
             .await
         {
             Err(object_store::Error::NotImplemented { .. }) => {
                 repo.no_conditional_writes();
-                store.put(&key, PutPayload::from(body.clone())).await?;
+                store.put(&key, PutPayload::from(body.clone())).await?
             }
-            r => {
-                r?;
-            }
+            result => result?,
         }
+        .into();
         let listed = match list_locks(store.as_ref()).await {
             Ok(l) => l,
             Err(e) => {
@@ -276,17 +341,19 @@ pub async fn acquire(
                 return Err(e);
             }
         };
-        let now = listed
+        let Some(now) = listed
             .iter()
             .find(|m| m.location == key)
-            .map(|m| m.last_modified);
-        let reference = now.unwrap_or_else(Utc::now);
+            .map(|m| m.last_modified)
+        else {
+            return Err(locked(&id, None));
+        };
         let mut conflict = None;
         for m in &listed {
             let Some(other) = lock_id_of(&m.location) else {
                 continue;
             };
-            if other == id || is_stale(m.last_modified, reference) {
+            if other == id || is_stale(m.last_modified, now) {
                 continue;
             }
             if !kinds.contains_key(other) {
@@ -312,42 +379,23 @@ pub async fn acquire(
             }
         }
         let Some((other, obj)) = conflict else {
-            let refreshed_at = Arc::new(std::sync::Mutex::new(acquired_at));
+            let renewed = Arc::new(Mutex::new(Some(acquired_at)));
             let refresh = tokio::runtime::Handle::try_current().ok().map(|h| {
-                let renewed = refreshed_at.clone();
-                let (store, key, body) = (store.clone(), key.clone(), body.clone());
-                h.spawn(async move {
-                    loop {
-                        tokio::time::sleep(REFRESH).await;
-                        if renewed.lock().unwrap().elapsed() >= STALE {
-                            break;
-                        }
-                        let refresh_started = Instant::now();
-                        if let Err(e) = store
-                            .put_opts(
-                                &key,
-                                PutPayload::from(body.clone()),
-                                PutMode::Overwrite.into(),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                target: "sparkles::backup",
-                                error = %BackupError::from(e),
-                                "could not refresh a repository lock"
-                            );
-                        } else {
-                            *renewed.lock().unwrap() = refresh_started;
-                        }
-                    }
-                })
+                h.spawn(refresh_lock(
+                    store.clone(),
+                    key.clone(),
+                    PutPayload::from(body.clone()),
+                    version,
+                    renewed.clone(),
+                    REFRESH,
+                ))
             });
             return Ok(LockGuard {
                 id: Some(id),
                 store: Some(store),
-                server_time: now,
+                server_time: Some(now),
                 acquired_at,
-                refreshed_at,
+                renewed,
                 refresh,
             });
         };
@@ -366,6 +414,112 @@ pub async fn acquire(
         sleep_cancellable(pause, ctl).await?;
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
+}
+
+async fn refresh_lock(
+    store: Arc<dyn ObjectStore>,
+    key: Key,
+    body: PutPayload,
+    mut version: UpdateVersion,
+    renewed: Renewal,
+    delay: Duration,
+) {
+    #[cfg(feature = "fs")]
+    let mut file = None;
+    loop {
+        tokio::time::sleep(delay).await;
+        let Some(previous) = *renewed.lock().unwrap() else {
+            return;
+        };
+        let started = LeaseClock::now();
+        // Leave room for storage's second-resolution timestamps and stop an
+        // in-flight retry before the preceding lease can go stale.
+        let budget = (STALE - Duration::from_secs(1)).saturating_sub(previous.elapsed());
+        if budget.is_zero() {
+            break;
+        }
+        let update = async {
+            #[cfg(feature = "fs")]
+            if let Some(file) = &file {
+                return touch_lease(file).await.map(|()| None);
+            }
+            match store
+                .put_opts(&key, body.clone(), PutMode::Update(version.clone()).into())
+                .await
+            {
+                Ok(result) => Ok(Some(result.into())),
+                #[cfg(feature = "fs")]
+                Err(error @ object_store::Error::NotImplemented { .. }) => {
+                    // LocalFileSystem has no conditional PUT. Touch the open
+                    // inode so a concurrent unlink cannot recreate the key.
+                    let get = store
+                        .get_opts(
+                            &key,
+                            GetOptions {
+                                if_match: version.e_tag.clone(),
+                                head: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    let object_store::GetResultPayload::File(handle, _) = get.payload else {
+                        return Err(error);
+                    };
+                    let handle = Arc::new(handle);
+                    touch_lease(&handle).await?;
+                    file = Some(handle);
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match tokio::time::timeout(budget, update).await {
+            Ok(Ok(next)) if previous.elapsed() < STALE => {
+                let mut lease = renewed.lock().unwrap();
+                if lease.is_none() {
+                    return;
+                }
+                *lease = Some(started);
+                if let Some(next) = next {
+                    version = next;
+                }
+            }
+            Ok(Err(error)) => {
+                let (lost, unsupported) = (
+                    matches!(
+                        error,
+                        object_store::Error::NotFound { .. }
+                            | object_store::Error::Precondition { .. }
+                    ),
+                    matches!(error, object_store::Error::NotImplemented { .. }),
+                );
+                tracing::warn!(
+                    target: "sparkles::backup",
+                    error = %BackupError::from(error),
+                    "could not refresh a repository lock"
+                );
+                if lost {
+                    break;
+                }
+                if unsupported {
+                    // Keep the original lease until it expires. There is no safe overwrite.
+                    return;
+                }
+            }
+            _ => break,
+        }
+    }
+    *renewed.lock().unwrap() = None;
+}
+
+#[cfg(feature = "fs")]
+async fn touch_lease(file: &Arc<std::fs::File>) -> object_store::Result<()> {
+    let file = file.clone();
+    let result = tokio::task::spawn_blocking(move || file.set_modified(SystemTime::now())).await?;
+    result.map_err(|source| object_store::Error::Generic {
+        store: "filesystem",
+        source: Box::new(source),
+    })
 }
 
 /// `409 repository-locked` naming the lock `id` and its holder.
@@ -502,6 +656,79 @@ mod tests {
             Code::RepositoryLocked
         );
         guard.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_cannot_recreate_a_broken_lease() {
+        let store = fixture::memory_store();
+        let key = lock_key(&Uuid::new_v4().to_string());
+        let body = PutPayload::from(plant(LockKind::Shared));
+        let version = store.put(&key, body.clone()).await.unwrap().into();
+        store.delete(&key).await.unwrap();
+        let renewed = Arc::new(Mutex::new(Some(LeaseClock::now())));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            refresh_lock(
+                store.clone(),
+                key.clone(),
+                body,
+                version,
+                renewed.clone(),
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("a failed precondition stops renewal");
+        assert!(renewed.lock().unwrap().is_none());
+        assert!(matches!(
+            store.head(&key).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_lease_stays_lost_even_if_the_key_still_exists() {
+        let repo = fixture::memory_repo().await;
+        let guard = acquire(
+            &repo,
+            LockKind::Exclusive,
+            LockOperation::Gc,
+            &Ctl::default(),
+        )
+        .await
+        .unwrap();
+        guard.check_live().await.unwrap();
+        let mut clock = LeaseClock::now();
+        clock.wall -= STALE;
+        *guard.renewed.lock().unwrap() = Some(clock);
+        assert_eq!(
+            guard.check_live().await.unwrap_err().code(),
+            Code::RepositoryLocked
+        );
+        assert!(guard.renewed.lock().unwrap().is_none());
+        assert!(
+            repo.store
+                .head(&lock_key(guard.id().unwrap()))
+                .await
+                .is_ok()
+        );
+        guard.release().await.unwrap();
+    }
+
+    #[cfg(feature = "fs")]
+    #[tokio::test]
+    async fn filesystem_renewal_touches_only_the_original_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("lease");
+        std::fs::write(&path, "lease").unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        let initial = SystemTime::now() - REFRESH;
+        file.set_modified(initial).unwrap();
+        touch_lease(&file).await.unwrap();
+        assert!(file.metadata().unwrap().modified().unwrap() > initial);
+        std::fs::remove_file(&path).unwrap();
+        touch_lease(&file).await.unwrap();
+        assert!(!path.exists());
     }
 
     use super::*;

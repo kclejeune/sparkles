@@ -7,6 +7,7 @@ use crate::{BackupError, Code, Result};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use object_store::aws::{
     AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsAuthorizer, AwsCredential,
 };
@@ -26,10 +27,20 @@ struct Signing {
     credentials: OnceLock<Weak<Credentials>>,
     region: String,
     request_payer: bool,
+    skip_signature: bool,
 }
 
 impl Signing {
     async fn authorize(&self, request: &mut HttpRequest, digest: Option<&[u8]>) -> Result<()> {
+        if self.request_payer {
+            request.headers_mut().insert(
+                "x-amz-request-payer",
+                "requester".parse().expect("static header"),
+            );
+        }
+        if self.skip_signature {
+            return Ok(());
+        }
         let credentials = self
             .credentials
             .get()
@@ -128,12 +139,20 @@ impl RetentionHead {
     }
 
     pub(crate) fn retained(&self) -> Result<bool> {
-        let now = self
-            .date
+        let held = self.legal_hold()?;
+        let retained = match self.until()? {
+            Some(until) => until >= self.server_time()?,
+            None => false,
+        };
+        Ok(held || retained)
+    }
+
+    pub(crate) fn server_time(&self) -> Result<DateTime<Utc>> {
+        self.date
             .as_deref()
             .and_then(|date| DateTime::parse_from_rfc2822(date).ok())
-            .map_or_else(Utc::now, |date| date.with_timezone(&Utc));
-        Ok(self.legal_hold()? || self.until()?.is_some_and(|until| until > now))
+            .map(|date| date.with_timezone(&Utc))
+            .ok_or_else(|| unavailable("HEAD did not include a valid Date header"))
     }
 
     pub(crate) fn legal_hold(&self) -> Result<bool> {
@@ -231,6 +250,12 @@ pub(crate) struct Controls {
 
 impl Controls {
     pub(crate) fn build(builder: AmazonS3Builder, concurrency: usize) -> Result<(AmazonS3, Self)> {
+        let enabled = |value: &str| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "true" | "1" | "on" | "yes" | "y"
+            )
+        };
         let signing = Arc::new(Signing {
             credentials: OnceLock::new(),
             region: builder
@@ -238,7 +263,10 @@ impl Controls {
                 .unwrap_or_else(|| "us-east-1".into()),
             request_payer: builder
                 .get_config_value(&AmazonS3ConfigKey::RequestPayer)
-                .is_some_and(|value| value == "true"),
+                .is_some_and(|value| enabled(&value) || value.eq_ignore_ascii_case("requester")),
+            skip_signature: builder
+                .get_config_value(&AmazonS3ConfigKey::SkipSignature)
+                .is_some_and(|value| enabled(&value)),
         });
         let connector = Connector {
             signing: signing.clone(),
@@ -259,17 +287,16 @@ impl Controls {
         head: &RetentionHead,
         version: &str,
         requests: &RequestStats,
+        guard: Option<&crate::lock::LockGuard>,
     ) -> Result<bool> {
         // An unqualified DELETE can hide even a locked version behind a delete marker.
         let status = self
-            .version_request(head, version, RequestOp::Delete, None, requests)
+            .version_request(head, version, RequestOp::Delete, None, requests, guard)
             .await?;
-        match status {
+        match status.code {
             200 | 204 => Ok(true),
             404 => Ok(false),
-            _ => Err(unavailable(format!(
-                "versioned DELETE returned HTTP {status}"
-            ))),
+            _ => Err(status.error("versioned DELETE")),
         }
     }
 
@@ -287,12 +314,10 @@ impl Controls {
             timestamp(until)
         );
         let status = self
-            .version_request(head, version, RequestOp::Put, Some(body), requests)
+            .version_request(head, version, RequestOp::Put, Some(body), requests, None)
             .await?;
-        if status != 200 {
-            return Err(unavailable(format!(
-                "PutObjectRetention returned HTTP {status}"
-            )));
+        if status.code != 200 {
+            return Err(status.error("PutObjectRetention"));
         }
         Ok(())
     }
@@ -304,9 +329,14 @@ impl Controls {
         op: RequestOp,
         body: Option<String>,
         requests: &RequestStats,
-    ) -> Result<u16> {
-        let version =
-            percent_encoding::utf8_percent_encode(version, percent_encoding::NON_ALPHANUMERIC);
+        guard: Option<&crate::lock::LockGuard>,
+    ) -> Result<VersionStatus> {
+        const ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+            .remove(b'-')
+            .remove(b'_')
+            .remove(b'.')
+            .remove(b'~');
+        let version = percent_encoding::utf8_percent_encode(version, ENCODE);
         let uri = format!(
             "{}?{}versionId={version}",
             head.uri,
@@ -339,6 +369,9 @@ impl Controls {
             self.signing
                 .authorize(&mut request, digest.as_ref().map(<[u8; 32]>::as_slice))
                 .await?;
+            if let Some(guard) = guard {
+                guard.check_live().await?;
+            }
             let response = head.network.execute(request).await;
             let status = response.as_ref().ok().map(|response| response.status());
             requests.record(
@@ -347,8 +380,18 @@ impl Controls {
                     s.is_success() || (op == RequestOp::Delete && s.as_u16() == 404)
                 }),
             );
-            match status.map(|s| s.as_u16()) {
-                Some(408 | 429 | 500..=599) | None if attempt < 2 => {
+            let response = match response {
+                Ok(response) => Some(VersionStatus::read(response).await),
+                Err(_) => None,
+            };
+            match response {
+                Some(VersionStatus {
+                    code: 408 | 429 | 500..=599,
+                    ..
+                })
+                | None
+                    if attempt < 2 =>
+                {
                     tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
                 }
                 Some(status) => return Ok(status),
@@ -356,6 +399,44 @@ impl Controls {
             }
         }
         unreachable!("the last attempt returns a result")
+    }
+}
+
+struct VersionStatus {
+    code: u16,
+    error_body: Vec<u8>,
+}
+
+impl VersionStatus {
+    async fn read(response: HttpResponse) -> Self {
+        const MAX_BODY: usize = 8 * 1024;
+        let status = response.status();
+        let mut body = response.into_body().bytes_stream();
+        let mut error_body = Vec::new();
+        let mut drained = 0;
+        while let Some(Ok(chunk)) = body.next().await {
+            let take = chunk.len().min(MAX_BODY - drained);
+            if !status.is_success() {
+                error_body.extend_from_slice(&chunk[..take]);
+            }
+            drained += take;
+            if drained == MAX_BODY {
+                break;
+            }
+        }
+        Self {
+            code: status.as_u16(),
+            error_body,
+        }
+    }
+
+    fn error(&self, operation: &str) -> BackupError {
+        let message = format!(
+            "{operation}: Server returned non-2xx status code: {}: {}",
+            self.code,
+            String::from_utf8_lossy(&self.error_body)
+        );
+        unavailable(crate::error::redact_bodies(&message))
     }
 }
 
@@ -387,4 +468,60 @@ pub(crate) fn unavailable(message: impl std::fmt::Display) -> BackupError {
         Code::RepositoryUnavailable,
         format!("S3 storage controls: {message}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn builder() -> AmazonS3Builder {
+        AmazonS3Builder::new()
+            .with_bucket_name("test-s3")
+            .with_access_key_id("test-access")
+            .with_secret_access_key("test-secret")
+    }
+
+    #[tokio::test]
+    async fn controls_respect_requester_pays_and_skip_signature() {
+        for value in ["Requester", "true", "1"] {
+            let (_store, controls) = Controls::build(
+                builder().with_config(AmazonS3ConfigKey::RequestPayer, value),
+                1,
+            )
+            .unwrap();
+            let mut request = HttpRequest::new(HttpRequestBody::empty());
+            *request.uri_mut() = "https://test-s3.example.test/key?versionId=v1"
+                .parse()
+                .unwrap();
+            controls
+                .signing
+                .authorize(&mut request, None)
+                .await
+                .unwrap();
+            assert_eq!(request.headers()["x-amz-request-payer"], "requester");
+            assert!(
+                request.headers()["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .contains("x-amz-request-payer")
+            );
+        }
+        let (store, controls) = Controls::build(
+            AmazonS3Builder::new()
+                .with_bucket_name("public-s3")
+                .with_config(AmazonS3ConfigKey::SkipSignature, "true"),
+            1,
+        )
+        .unwrap();
+        drop(store);
+        let mut request = HttpRequest::new(HttpRequestBody::empty());
+        // Removing the provider makes falling through to credential lookup fail immediately.
+        controls
+            .signing
+            .authorize(&mut request, None)
+            .await
+            .unwrap();
+        assert!(request.headers().get("authorization").is_none());
+        assert!(request.headers().get("x-amz-date").is_none());
+    }
 }

@@ -5,9 +5,10 @@
 > **Phases:** Part of Phase 1 is built: an optional local-key/passphrase encrypted
 > repository engine in `sparkles-backup`, local provider lookup and offline key/backup
 > CLI commands, and trusted operator TOML server support. Authorized API/UI/Nix
-> integration and further operator recovery workflows remain. Phase 2 content-defined chunking and write-only
-> repositories, Phase 3 database-directory encryption, and Phase 4 full-text/vector/spatial
-> file encryption remain unbuilt.
+> integration and further operator recovery workflows remain. Phase 2 offers opt-in
+> FastCDC vocabulary chunking. Default enablement awaits the measurement in §6.4.
+> Write-only repositories, database-directory encryption and encryption of
+> full-text, vector and spatial files remain unbuilt.
 >
 > **User docs:** [Encrypted repositories](../USAGE.md#encrypted-repositories).
 > The engine uses `sparkles-backup/encryption`; the facade and CLI/server use

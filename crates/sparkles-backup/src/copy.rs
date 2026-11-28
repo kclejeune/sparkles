@@ -12,6 +12,7 @@ use crate::{
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectStoreExt, PutPayload};
 use sparkles_core::formats::READABLE_INDEX_FORMATS;
 use std::collections::HashSet;
@@ -20,7 +21,8 @@ use std::sync::Arc;
 /// Selects backups to copy. All supplied conditions must match.
 #[derive(Clone, Debug, Default)]
 pub struct CopyOptions {
-    /// An empty selection takes every manifest in the source.
+    /// An empty name list scans every source manifest. An unreadable manifest
+    /// cannot be classified by dataset or completion time, so that scan fails.
     pub names: Vec<String>,
     pub dataset: Option<String>,
     /// Include backups completed at or after this RFC 3339 time.
@@ -40,7 +42,8 @@ pub struct CopyReport {
 
 impl Repository {
     /// Copy selected backups to `destination`. Publish each manifest only after all its
-    /// contents verify. A retry can reuse completed manifests and unreferenced blobs.
+    /// source contents verify. A retry checks completed manifests and blob metadata.
+    /// Reuse of archived destination blobs checks presence and stored size with HEAD.
     /// A read-only source must stay readable for the duration of the copy, as for restore.
     pub async fn copy_to(
         &self,
@@ -237,7 +240,7 @@ impl Repository {
             }
             let body = transfer.target_security.seal_manifest(&copied.name, json)?;
             if destination
-                .publish_manifest(&copied, body.into(), ctl, guards.1, transfer.until)
+                .publish_manifest(&copied, body.into(), ctl, guards.1)
                 .await?
                 .is_some()
             {
@@ -272,8 +275,8 @@ impl Repository {
         until: Option<DateTime<Utc>>,
     ) -> Result<Option<u64>> {
         let key = blob_key(&blob.id);
-        match self.store.head(&key).await {
-            Ok(_) => {}
+        let existing = match self.store.head(&key).await {
+            Ok(meta) => meta,
             Err(error) if is_not_found(&error) => {
                 let payload: PutPayload = security.encode(Bytes::from(plain))?;
                 let stored = payload.content_length() as u64;
@@ -287,11 +290,33 @@ impl Repository {
                 {
                     return Ok(Some(stored));
                 }
+                self.store.head(&key).await?
             }
             Err(error) => return Err(error.into()),
+        };
+        check_blob_size(&blob.id, blob.size, existing.size, security)?;
+        let may_archive = self.marker.s3_policy.as_ref().is_some_and(|policy| {
+            matches!(
+                policy.storage_class,
+                Some(
+                    crate::StorageClass::Glacier
+                        | crate::StorageClass::DeepArchive
+                        | crate::StorageClass::IntelligentTiering
+                )
+            )
+        });
+        if !may_archive {
+            match self
+                .fetch_blob(&blob.id, blob.size, path, ctl, security)
+                .await
+            {
+                Ok(_) => {}
+                // The bucket's lifecycle may have archived a previously readable blob.
+                Err(crate::restore::Failure::Other(error))
+                    if error.code() == Code::ArchiveRestoreRequired => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        self.fetch_blob(&blob.id, blob.size, path, ctl, security)
-            .await?;
         Ok(None)
     }
 }
@@ -446,17 +471,41 @@ async fn verify_existing(
             ),
         ));
     }
-    for file in &existing.files {
-        let mut hash = Hasher::new();
-        for blob in &file.blobs {
-            let plain = repo
-                .fetch_blob(&blob.id, blob.size, &file.path, ctl, security)
-                .await?;
-            hash.update(&plain);
-        }
-        check_file_hash(file, hash)?;
+    let blobs = existing
+        .files
+        .iter()
+        .flat_map(|file| &file.blobs)
+        .map(|blob| (&blob.id, blob.size))
+        .collect::<HashSet<_>>();
+    futures::stream::iter(blobs)
+        .map(|(id, size)| async move {
+            ctl.check()?;
+            let stored = match repo.store.head(&blob_key(id)).await {
+                Ok(meta) => meta.size,
+                Err(error) if is_not_found(&error) => {
+                    return Err(BackupError::invalid_backup(
+                        "blobs",
+                        format!("missing blob {id}"),
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            check_blob_size(id, size, stored, security)
+        })
+        .buffer_unordered(repo.config.concurrency())
+        .try_for_each(|()| async { Ok(()) })
+        .await
+}
+
+fn check_blob_size(id: &str, plain: u64, stored: u64, security: &Security) -> Result<()> {
+    if stored <= security.blob_limit(plain)? && security.plausible_size(plain, stored) {
+        Ok(())
+    } else {
+        Err(BackupError::invalid_backup(
+            "blobs",
+            format!("blob {id} has an invalid stored size"),
+        ))
     }
-    Ok(())
 }
 
 fn check_file_hash(file: &crate::FileEntry, hash: Hasher) -> Result<()> {

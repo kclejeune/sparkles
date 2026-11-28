@@ -92,10 +92,17 @@ impl crate::Repository {
         &self,
         guard: &crate::lock::LockGuard,
     ) -> crate::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        self.retention_deadline_from(guard.estimated_server_time())
+    }
+
+    fn retention_deadline_from(
+        &self,
+        now: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> crate::Result<Option<chrono::DateTime<chrono::Utc>>> {
         let Some(lock) = self.object_lock() else {
             return Ok(None);
         };
-        let now = guard.estimated_server_time().ok_or_else(|| {
+        let now = now.ok_or_else(|| {
             crate::BackupError::new(
                 crate::Code::RepositoryUnavailable,
                 "cannot assign Object Lock retention without a storage server clock",
@@ -108,6 +115,16 @@ impl crate::Repository {
 
 #[cfg(feature = "s3")]
 impl crate::Repository {
+    pub(crate) async fn publish_retention_deadline(
+        &self,
+        guard: &crate::lock::LockGuard,
+    ) -> crate::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        if !self.has_object_lock() {
+            return Ok(None);
+        }
+        self.retention_deadline_from(guard.fresh_server_time().await?)
+    }
+
     pub(crate) async fn retain_manifest_blobs(
         &self,
         manifest: &crate::Manifest,
@@ -155,6 +172,10 @@ impl crate::Repository {
                     // S3 refuses a shorter date if a concurrent writer already extended it.
                     let (current, current_version) = retention(inspect().await?)?;
                     if version != current_version
+                        || current.mode()?.is_none_or(|mode| {
+                            mode != lock.mode && mode != ObjectLockMode::Compliance
+                        })
+                        || (lock.legal_hold && !current.legal_hold()?)
                         || current.until()?.is_none_or(|date| date < until)
                     {
                         return Err(error);
@@ -173,6 +194,7 @@ impl crate::Repository {
         key: &object_store::path::Path,
         dry_run: bool,
         requests: &mut crate::GcRequests,
+        guard: Option<&crate::lock::LockGuard>,
     ) -> crate::Result<DeleteOutcome> {
         use crate::repo::is_not_found;
 
@@ -196,11 +218,12 @@ impl crate::Repository {
             .ok_or_else(|| s3::unavailable("no version-aware S3 transport"))?;
         requests.delete += 1;
         match controls
-            .delete_version(&head, &version, &self.requests)
+            .delete_version(&head, &version, &self.requests, guard)
             .await
         {
             Ok(true) => Ok(DeleteOutcome::Deleted),
             Ok(false) => Ok(DeleteOutcome::Missing),
+            Err(error) if error.code() == crate::Code::RepositoryLocked => Err(error),
             Err(error) => {
                 // Retention or a legal hold can be changed after HEAD. The conditional
                 // version delete cannot hide the protected version behind a marker.

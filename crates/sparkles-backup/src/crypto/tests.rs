@@ -934,3 +934,139 @@ async fn repository_copy_rekeys_blobs_and_restores_after_destination_rotation() 
         .unwrap();
     assert!(restored.join("CURRENT").exists());
 }
+
+#[tokio::test]
+async fn encrypted_fastcdc_uses_epoch_keys_for_capture_copy_and_restore() {
+    use crate::{CopyOptions, RepositoryOptions, chunking};
+
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("db");
+    fixture::make_db(&db);
+    {
+        let store = Store::open(&db, StoreOptions::default()).unwrap();
+        let mut seed = 541_987_u64;
+        for index in 0..26 {
+            let literal: String = (0..1 << 20)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    char::from(b'a' + (seed % 26) as u8)
+                })
+                .collect();
+            fixture::upd(
+                &store,
+                &format!("INSERT DATA {{ <urn:s{index}> <urn:p> \"{literal}\" }}"),
+            );
+        }
+        store.compact().unwrap();
+    }
+    let generation = std::fs::read_to_string(db.join("CURRENT")).unwrap();
+    let path = format!("{}/vocab.dat", generation.trim());
+    let vocabulary = std::fs::read(db.join(&path)).unwrap();
+    assert!(vocabulary.len() >= 24 << 20);
+    let cfg = RepoConfig {
+        name: "encrypted-cdc".into(),
+        kind: RepoType::Memory,
+        conditional_writes: true,
+        ..Default::default()
+    };
+    let env = OpenEnv {
+        store: Some(Arc::new(InMemory::new())),
+        ..Default::default()
+    };
+    let open_options = RepositoryOptions {
+        content_defined_chunking: true,
+        ..Default::default()
+    };
+    let source_keys = options(71);
+    let first = Repository::open_encrypted_with_options(&cfg, &env, &source_keys, &open_options)
+        .await
+        .unwrap();
+    assert_eq!(first.marker().format, 2);
+    assert_eq!(first.marker().chunking, Some(chunking::V1));
+    assert!(first.marker().encryption.is_some());
+    let source = Repository::open_encrypted(&cfg, &env, &source_keys)
+        .await
+        .unwrap();
+    assert_eq!(source.marker().format, 2);
+    assert_eq!(source.id(), first.id());
+    drop(first);
+
+    let target = Repository::open_encrypted_with_options(
+        &cfg,
+        &OpenEnv::default(),
+        &options(90),
+        &open_options,
+    )
+    .await
+    .unwrap();
+    let target_security = target.security().await.unwrap();
+    let before_security = source.security().await.unwrap();
+    let cut_points = |security: &crate::security::Security| {
+        // Hold the HKDF salt fixed to isolate the contribution of the epoch key.
+        let gear = chunking::gear(source.id(), security).unwrap();
+        let mut boundaries = chunking::Boundaries::default();
+        let mut remaining = vocabulary.as_slice();
+        let mut lengths = Vec::new();
+        while !remaining.is_empty() {
+            let (length, _) = boundaries.take(remaining, &gear);
+            lengths.push(length as u64);
+            remaining = &remaining[length..];
+        }
+        lengths
+    };
+    let sizes = |manifest: &crate::Manifest| {
+        assert!(
+            manifest
+                .requires
+                .iter()
+                .any(|feature| feature == chunking::FEATURE)
+        );
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap();
+        assert_eq!(file.chunker, Some(chunking::Chunker::FastCdc2016));
+        assert!(file.blobs.len() > 1);
+        file.blobs.iter().map(|blob| blob.size).collect::<Vec<_>>()
+    };
+
+    backup(&source, &db, "before").await;
+    let before = source.manifest("before").await.unwrap();
+    assert_eq!(before.encryption.as_ref().unwrap()["epoch"], 1);
+    assert_eq!(sizes(&before), cut_points(&before_security));
+    assert_ne!(sizes(&before), cut_points(&target_security));
+    assert_ne!(
+        sizes(&before),
+        cut_points(&crate::security::Security::default())
+    );
+
+    source.key_rotate(&Ctl::default()).await.unwrap();
+    backup(&source, &db, "after").await;
+    let after = source.manifest("after").await.unwrap();
+    assert_eq!(after.encryption.as_ref().unwrap()["epoch"], 2);
+    assert_eq!(sizes(&after), cut_points(&source.security().await.unwrap()));
+    assert_ne!(sizes(&before), sizes(&after));
+
+    backup(&target, &db, "native").await;
+    let native_sizes = sizes(&target.manifest("native").await.unwrap());
+    let report = source
+        .copy_to(&target, &CopyOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report.copied, ["after", "before"]);
+    for name in ["before", "after"] {
+        let copied = target.manifest(name).await.unwrap();
+        assert_eq!(sizes(&copied), native_sizes);
+        assert_eq!(copied.encryption.as_ref().unwrap()["epoch"], 1);
+        for (prefix, repo) in [("source", &source), ("target", &target)] {
+            let restored = temp.path().join(format!("{prefix}-{name}"));
+            repo.restore(name, &restored, &RestoreOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(restored.join(&path)).unwrap(), vocabulary);
+        }
+    }
+}

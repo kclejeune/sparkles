@@ -162,7 +162,7 @@ impl Repository {
         self.relist(mark, req).await?;
         #[cfg(feature = "s3")]
         if self.has_object_lock() {
-            let (deleted, bytes, failure) = self.sweep_object_lock(o, mark, req).await?;
+            let (deleted, bytes, failure) = self.sweep_object_lock(o, mark, req, None).await?;
             if let Some(failure) = failure {
                 return Err(failure);
             }
@@ -178,23 +178,34 @@ impl Repository {
         o: &GcOptions,
         mark: &mut Mark,
         req: &mut GcRequests,
+        guard: Option<&LockGuard>,
     ) -> Result<(u64, u64, Option<BackupError>)> {
         use crate::storage::DeleteOutcome;
 
-        let mut keys: Vec<_> = mark.candidates.iter().collect();
-        keys.sort_unstable_by_key(|(key, _)| *key);
+        let mut results = futures::stream::iter(&mark.candidates)
+            .map(|(key, size)| async move {
+                o.ctl.check()?;
+                let mut requests = GcRequests::default();
+                let result = self
+                    .delete_locked_object(key, o.dry_run, &mut requests, guard)
+                    .await;
+                Ok::<_, BackupError>((key, size, requests, result))
+            })
+            .buffer_unordered(self.config.concurrency());
         let mut deleted = 0;
         let mut bytes = 0;
         let mut failure = None;
-        for (key, size) in keys {
-            o.ctl.check()?;
-            match self.delete_locked_object(key, o.dry_run, req).await {
+        while let Some((key, size, requests, result)) = results.try_next().await? {
+            req.head += requests.head;
+            req.delete += requests.delete;
+            match result {
                 Ok(DeleteOutcome::Eligible | DeleteOutcome::Deleted) => {
                     deleted += 1;
                     bytes += size;
                 }
                 Ok(DeleteOutcome::Retained) => mark.kept_locked += 1,
                 Ok(DeleteOutcome::Missing) => {}
+                Err(e) if e.code() == Code::RepositoryLocked => return Err(e),
                 Err(e) => {
                     mark.delete_failures += 1;
                     failure.get_or_insert_with(|| e.with("object", key.as_ref()));
@@ -316,17 +327,18 @@ impl Repository {
         let (deleted, deleted_bytes, failure) = if versioned {
             #[cfg(feature = "s3")]
             {
-                self.sweep_object_lock(o, mark, req).await?
+                self.sweep_object_lock(o, mark, req, Some(lock)).await?
             }
             #[cfg(not(feature = "s3"))]
             unreachable!("the build has no S3 support")
         } else {
-            let (deleted, bytes) = self.sweep_unversioned(o, mark, req).await?;
+            let (deleted, bytes) = self.sweep_unversioned(o, mark, req, lock).await?;
             (deleted, bytes, None::<BackupError>)
         };
 
         // leftovers of other operations: stale locks and connection-test probes
         let now = lock.server_time().unwrap_or_else(Utc::now);
+        lock.check_live().await?;
         let locks = lock::list_locks(self.store.as_ref()).await?;
         req.list += 1;
         let probes = list_all(self.store.as_ref(), PROBE).await?;
@@ -343,6 +355,7 @@ impl Repository {
                     .filter(|m| older_than(m.last_modified, now, STALE)),
             );
         for m in stale {
+            lock.check_live().await?;
             req.delete += 1;
             match self.store.delete(&m.location).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
@@ -350,6 +363,7 @@ impl Repository {
             }
         }
 
+        lock.check_live().await?;
         let rep = report(o, mark, req, deleted_bytes, deleted, t0, wait);
         let last = LastGc {
             report: rep.clone(),
@@ -385,6 +399,7 @@ impl Repository {
         o: &GcOptions,
         mark: &Mark,
         req: &mut GcRequests,
+        lock: &LockGuard,
     ) -> Result<(u64, u64)> {
         let mut keys: Vec<Key> = mark.candidates.keys().cloned().collect();
         keys.sort();
@@ -392,6 +407,7 @@ impl Repository {
         let (mut deleted, mut deleted_bytes) = (0u64, 0u64);
         for (i, batch) in keys.chunks(DELETE_BATCH).enumerate() {
             o.ctl.check()?;
+            lock.check_live().await?;
             req.delete += 1;
             let input = futures::stream::iter(batch.to_vec()).map(Ok).boxed();
             let mut out = self.store.delete_stream(input);

@@ -57,17 +57,22 @@ The Rust repository library supports verified copy with `Repository::copy_to`.
 chunking, an S3 blob storage class or S3 Object Lock. Encrypted repositories use
 `Repository::open_encrypted_with_options` for the same settings. The repository marker
 preserves the settings on reopen. Existing repositories keep their original layout.
+When a copy selects backups by dataset or completion time without explicit names, an
+unreadable source manifest stops the scan because its selection fields are unknown.
+Supply explicit backup names to copy around a damaged manifest.
 
 S3 Object Lock requires a versioned bucket with Object Lock enabled. Writers need
 permission to set and inspect retention and legal holds, and garbage collectors need
 permission to delete object versions as they expire. Deny unversioned deletes for the
 protected blob and manifest prefixes to prevent delete markers. Enforce conditional
 creates on those keys to prevent newer versions from shadowing protected objects.
-Keep the repository's
-control and lease keys outside bucket-wide default retention and use lifecycle rules
-for their expired noncurrent versions. If S3 archives a blob, restore its readable
-copy in S3 before retrying a Sparkles restore. Archive selection leaves manifests and
-control files in the backend's default storage class.
+Keep the repository's control and lease keys outside bucket-wide default retention
+and use lifecycle rules for their expired noncurrent versions. Protected backups use
+the S3 clock at publication to set retention on the manifest and extend its blobs.
+Archive selection leaves manifests and control files in the backend's default storage
+class. Copy retries compare published manifests and check blob presence and stored size
+with HEAD. Reuse of archived destination blobs also uses HEAD. Thaw blobs in S3 before
+restoring them, copying their data out of an archive, or running full data verification.
 
 ### Upgrades and on-disk formats
 

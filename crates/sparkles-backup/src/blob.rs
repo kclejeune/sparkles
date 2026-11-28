@@ -14,8 +14,8 @@
 //! | 8..16 | plaintext length |
 //! | 16.. | payload |
 //!
-//! Readers refuse unknown formats, codecs and encryption values, then check the decoded
-//! length and the SHA-256 against the id.
+//! Readers validate the header, then check the decoded length and the SHA-256 against
+//! the id. The reserved zstd codec is incompatible with this reader.
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -171,10 +171,6 @@ pub fn parse_header(stored: &[u8], id: &str) -> Result<Header, BlobError> {
         id: id.to_string(),
         reason: reason.to_string(),
     };
-    let unsupported = |reason: String| BlobError::Unsupported {
-        id: id.to_string(),
-        reason,
-    };
     if stored.len() < HEADER_LEN {
         return Err(malformed("shorter than its header"));
     }
@@ -182,19 +178,25 @@ pub fn parse_header(stored: &[u8], id: &str) -> Result<Header, BlobError> {
         return Err(malformed("bad magic"));
     }
     if stored[4] != FORMAT {
-        return Err(unsupported(format!("format {}", stored[4])));
+        return Err(malformed("invalid format byte"));
     }
-    let codec = match Codec::from_byte(stored[5]) {
-        Some(c @ (Codec::Raw | Codec::Lz4)) => c,
-        _ => return Err(unsupported(format!("codec {}", stored[5]))),
-    };
     if stored[6] != 0 {
-        return Err(unsupported(format!("encryption {}", stored[6])));
+        return Err(malformed("invalid encryption byte"));
     }
     if stored[7] != 0 {
         return Err(malformed("reserved header byte is not zero"));
     }
     let plain_len = u64::from_le_bytes(stored[8..16].try_into().unwrap());
+    let codec = match Codec::from_byte(stored[5]) {
+        Some(c @ (Codec::Raw | Codec::Lz4)) => c,
+        Some(Codec::Zstd) => {
+            return Err(BlobError::Unsupported {
+                id: id.to_string(),
+                reason: "zstd codec".into(),
+            });
+        }
+        None => return Err(malformed("invalid codec byte")),
+    };
     Ok(Header { codec, plain_len })
 }
 
@@ -326,14 +328,20 @@ mod tests {
             decode(&b, &e.id, 5),
             Err(BlobError::Malformed { .. })
         ));
-        for (i, v) in [(4, 2u8), (5, 2), (5, 9), (6, 1)] {
+        for (i, v) in [(4, 2u8), (5, 9), (6, 1), (7, 1)] {
             let mut b = e.bytes.to_vec();
             b[i] = v;
             assert!(
-                matches!(decode(&b, &e.id, 5), Err(BlobError::Unsupported { .. })),
+                matches!(decode(&b, &e.id, 5), Err(BlobError::Malformed { .. })),
                 "byte {i} = {v}"
             );
         }
+        let mut reserved = e.bytes.to_vec();
+        reserved[5] = Codec::Zstd as u8;
+        assert!(matches!(
+            decode(&reserved, &e.id, 5),
+            Err(BlobError::Unsupported { .. })
+        ));
         assert!(decode(&e.bytes[..10], &e.id, 5).is_err());
     }
 

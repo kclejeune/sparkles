@@ -561,6 +561,9 @@ impl Repository {
             };
             match result {
                 Ok(plain) => return Ok(plain),
+                Err(error) if error.code() == Code::IncompatibleFormat => {
+                    return Err(error.with("blob", id).with("path", path).into());
+                }
                 Err(why) if attempt < BLOB_RETRIES => {
                     attempt += 1;
                     tracing::warn!(
@@ -570,9 +573,6 @@ impl Repository {
                         attempt,
                         "blob did not verify ({why}); fetching it again"
                     );
-                }
-                Err(error) if error.code() == Code::IncompatibleFormat => {
-                    return Err(error.with("blob", id).with("path", path).into());
                 }
                 Err(_) => {
                     return Err(Failure::Corrupt {

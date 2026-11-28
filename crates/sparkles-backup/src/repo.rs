@@ -1040,8 +1040,11 @@ impl Repository {
         payload: PutPayload,
         ctl: &Ctl,
         guard: &crate::lock::LockGuard,
-        until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Option<PutResult>> {
+        #[cfg(feature = "s3")]
+        let until = self.publish_retention_deadline(guard).await?;
+        #[cfg(not(feature = "s3"))]
+        let until = None;
         #[cfg(feature = "s3")]
         if let Some(until) = until {
             self.retain_manifest_blobs(manifest, ctl, until).await?;
@@ -1439,7 +1442,7 @@ impl Repository {
             #[cfg(feature = "s3")]
             if self.has_object_lock() {
                 return match self
-                    .delete_locked_object(&key, false, &mut Default::default())
+                    .delete_locked_object(&key, false, &mut Default::default(), Some(&guard))
                     .await?
                 {
                     crate::storage::DeleteOutcome::Deleted => {

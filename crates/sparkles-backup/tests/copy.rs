@@ -102,13 +102,22 @@ async fn corruption_and_name_conflicts_do_not_publish_or_replace_a_manifest() {
         target.manifest("copy").await.unwrap_err().code(),
         Code::NoSuchBackup
     );
+    let mut damaged = stored.to_vec();
+    damaged[6] = 8;
+    source_store.put(&key, damaged.into()).await.unwrap();
+    let before = source.requests().get.ok;
+    let error = source.copy_to(&target, &select).await.unwrap_err();
+    assert!(error.message().contains("checksum mismatch"));
+    assert_eq!(source.requests().get.ok - before, 4); // manifest and three blob reads
     let mut unsupported = stored.to_vec();
     unsupported[5] = 2;
     source_store.put(&key, unsupported.into()).await.unwrap();
+    let before = source.requests().get.ok;
     assert_eq!(
         source.copy_to(&target, &select).await.unwrap_err().code(),
         Code::IncompatibleFormat
     );
+    assert_eq!(source.requests().get.ok - before, 2); // manifest and one blob read
     assert_eq!(
         target.manifest("copy").await.unwrap_err().code(),
         Code::NoSuchBackup
@@ -195,4 +204,108 @@ async fn manifest_put_failure_leaves_reusable_blobs_and_releases_locks() {
         .unwrap();
     assert_eq!(retry.copied, ["copy"]);
     assert_eq!(retry.uploaded_blobs, 0);
+}
+
+#[tokio::test]
+async fn copies_across_fixed_piece_sizes_and_across_source_piece_boundaries() {
+    use sparkles_backup::{FileKind, OpenEnv, Repository};
+    use std::sync::Arc;
+
+    async fn with_piece_size(name: &str, size: u64) -> Repository {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let mut marker = layout::Marker::new(uuid::Uuid::new_v4(), sparkles_backup::now_rfc3339());
+        marker.piece_bytes = size;
+        store
+            .put(&layout::marker_key(), marker.to_bytes().into())
+            .await
+            .unwrap();
+        open_on(store, &memory_config(name)).await
+    }
+
+    let source = with_piece_size("source", 7).await;
+    let smaller = with_piece_size("smaller", 5).await;
+    let larger = Repository::open(&memory_config("larger"), &OpenEnv::default())
+        .await
+        .unwrap();
+    let path = "gen-0001/spo.dat";
+    let data = noise(17, 5);
+    let snapshot = || {
+        synthetic(vec![
+            ("CURRENT", FileKind::Meta, b"gen-0001\n".to_vec()),
+            (path, FileKind::Immutable, data.clone()),
+        ])
+    };
+    source
+        .create(snapshot(), &opts("copy", "ds"))
+        .await
+        .unwrap();
+    smaller
+        .create(snapshot(), &opts("native", "ds"))
+        .await
+        .unwrap();
+    for target in [&smaller, &larger] {
+        source
+            .copy_to(target, &CopyOptions::default())
+            .await
+            .unwrap();
+    }
+    let copied = smaller.manifest("copy").await.unwrap();
+    let smaller_file = copied.files.iter().find(|file| file.path == path).unwrap();
+    assert_eq!(
+        smaller_file
+            .blobs
+            .iter()
+            .map(|blob| blob.size)
+            .collect::<Vec<_>>(),
+        [5, 5, 5, 2]
+    );
+    let native = smaller.manifest("native").await.unwrap();
+    assert_eq!(
+        smaller_file,
+        native.files.iter().find(|file| file.path == path).unwrap()
+    );
+    assert_eq!(
+        larger.manifest("copy").await.unwrap().files,
+        source.manifest("copy").await.unwrap().files
+    );
+}
+
+#[tokio::test]
+async fn filtering_requires_readable_manifests_unless_names_are_explicit() {
+    let (source, store) = memory_repo().await;
+    let (target, _) = memory_repo().await;
+    source
+        .create(
+            synthetic(vec![(
+                "CURRENT",
+                sparkles_backup::FileKind::Meta,
+                b"gen-0001\n".to_vec(),
+            )]),
+            &opts("selected", "ds"),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            &layout::manifest_key("corrupt"),
+            PutPayload::from_static(b"corrupt"),
+        )
+        .await
+        .unwrap();
+    let options = CopyOptions {
+        dataset: Some("ds".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        source.copy_to(&target, &options).await.unwrap_err().code(),
+        Code::InvalidBackup
+    );
+    let named = CopyOptions {
+        names: vec!["selected".into()],
+        ..options
+    };
+    assert_eq!(
+        source.copy_to(&target, &named).await.unwrap().copied,
+        ["selected"]
+    );
 }

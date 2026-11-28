@@ -165,15 +165,18 @@ multi-dataset backups, and retained dataset history.
 
 `Repository::copy_to` copies backups selected by name, dataset and completion time.
 The copy verifies source blobs by their content IDs and checks each complete file digest
-before publishing its destination manifest. Existing destination blobs are verified
-before reuse. Encrypted copies derive destination blob IDs from the active destination
-key and seal the blobs and manifests with that key. A retry can reuse uploaded blobs and
-published backups. A different backup using the same destination name fails. Copy
+before publishing its destination manifest. Retries compare published manifests and
+check the referenced objects' presence and stored size. Copy also checks archived
+destination blobs by presence and size when it reuses them for a new manifest.
+Encrypted copies derive destination blob IDs from the active destination key and seal
+the blobs and manifests with that key. A retry can reuse uploaded blobs and published
+backups. A different backup using the same destination name fails. Copy
 replans vocabulary boundaries using the destination settings. Copying from an
 encrypted source to a plaintext destination requires explicit opt-in. The copy keeps
 the source policy and run names. A policy with the same name in the destination can
 select the copied backup for expiry. Each manifest becomes visible independently
-after its own transfer completes.
+after its own transfer completes. When the selection omits names, an unreadable
+source manifest stops the scan because its dataset and completion time are unknown.
 
 New repositories can opt in to [F11 FastCDC](../F11-encryption-at-rest.md#6-content-defined-chunking-and-write-only-repositories-phase-2)
 for immutable `vocab.dat` files. The format 2 repository marker records the 1 MiB
@@ -185,19 +188,20 @@ chunker. Default repositories keep 32 MiB fixed pieces. Enabling FastCDC by defa
 requires the measured 30% upload reduction in F11 §6.4.
 
 The format 2 marker can select an S3 storage class for blobs and configure Object Lock
-for blobs and manifests. Before publishing a protected manifest, the repository
-extends the retention of any referenced blob that expires sooner. Metadata remains in
-the backend's default storage class. Restore and copy report `archive-restore-required`
-when S3 requires the operator to thaw an archived blob. Logical policy expiry identifies
-backups to delete. A protected manifest remains visible until its storage retention
-or legal hold allows deletion. Garbage collection keeps referenced blobs and only
+for blobs and manifests. Before publishing a protected manifest, the repository uses
+the current S3 clock to set the deadline and extends the retention of any referenced
+blob that expires sooner. Metadata remains in the backend's default storage class.
+Restore and copy report `archive-restore-required` when reading a blob requires a thaw.
+Logical policy expiry identifies backups to delete. A protected manifest remains visible
+until its storage retention or legal hold allows deletion. Garbage collection keeps referenced blobs and only
 deletes specific unreferenced object versions, without governance bypass. It reports
 retained blobs and records partial deletion failures so a later run can retry them.
 
 Repository zstd remains reserved. Raw and LZ4 cover existing repositories and transfers,
 and there is no measured transfer-size, CPU and restore-time evidence to justify a
-third codec. The reader still refuses the zstd tag and other unknown codecs. Retiring
-the reserved feature requires the maintainer decision described in
+third codec. Readers report the reserved zstd tag as an incompatible format and
+treat invalid plaintext header bytes as corruption. Retiring the reserved feature
+requires the maintainer decision described in
 [X01](../X01-compression-codecs.md#remaining-codec-decisions).
 
 The remaining server and capture work includes the following operations.
@@ -225,7 +229,11 @@ The remaining server and capture work includes the following operations.
 * **Repository management.** Expose repository copy in `sparkles repo copy SRC DST`
   and the task route `POST /$/repositories/{repo}/copy`. Pin requested storage policy
   in registered repository configuration and expose initialization options to operators.
-  Report storage-protected expiry as deferred in lifecycle policy results.
+  The encrypted descriptor MAC authenticates the descriptor and repository ID. The
+  marker's storage policy, chunking settings and piece size remain outside that MAC.
+  A marker rewrite can disable version-aware deletion and hide protected objects behind
+  delete markers. Report storage-protected expiry as deferred in lifecycle policy
+  results.
 
 ### Object Lock version visibility
 

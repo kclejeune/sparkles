@@ -627,7 +627,7 @@ impl Repository {
             sparkles.backup.name = %o.name);
         let e_tag = async {
             match self
-                .publish_manifest(&manifest, PutPayload::from(body.clone()), ctl, guard, until)
+                .publish_manifest(&manifest, PutPayload::from(body.clone()), ctl, guard)
                 .await?
             {
                 Some(put) => Ok(put.e_tag),

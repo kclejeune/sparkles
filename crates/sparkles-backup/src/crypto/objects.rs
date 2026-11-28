@@ -318,6 +318,12 @@ mod tests {
             bad[offset] ^= 1;
             assert!(keys.open_blob(&seal_inner(&bad), &valid.id, 100).is_err());
         }
+        let mut reserved = inner.clone();
+        reserved[0] = blob::Codec::Zstd as u8;
+        let error = keys
+            .open_blob(&seal_inner(&reserved), &valid.id, 100)
+            .unwrap_err();
+        assert_eq!(error.code(), crate::Code::IncompatibleFormat);
         let encoded = blob::encode(&plain, true);
         let mut two_frames = vec![1];
         two_frames.extend_from_slice(&100u64.to_le_bytes());

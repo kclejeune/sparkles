@@ -85,7 +85,8 @@ Non-goals:
 * Deduplication across compactions. A compaction renumbers ids and rewrites every index
   file (§5.4).
 * Archive storage classes (Glacier restores), S3 Object Lock/WORM, and
-  repository-to-repository copy (Phase 3).
+  repository-to-repository copy (Phase 3). The [Outcome](OUTCOME.md#roadmap-follow-ups-2026-10-12)
+  records the repository-library support delivered for these features.
 
 ## 2. User-visible behavior
 
