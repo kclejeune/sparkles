@@ -316,7 +316,9 @@ impl View {
         let scratch = (self.node.vars.len()
             * (std::mem::size_of::<Option<usize>>() + std::mem::size_of::<Id>()))
             as u64;
-        let mut charge = OwnedCharge::new(ctx, scratch)?;
+        // The scratch is charged once the view admits the caller, so that a refusal
+        // comes before the query's memory budget is asked for anything.
+        let mut admitted: Option<OwnedCharge> = None;
         let get_parent = || ctx.memory_parent();
         let memory_pool = ctx.grant().map(|g| g.pool());
         let max_memory_bytes = (ctx.mem_limit != u64::MAX).then_some(ctx.mem_limit);
@@ -334,9 +336,18 @@ impl View {
                 max_memory_bytes,
             },
         };
-        let opened = source.open_view(&open, &|| ctx.check(), &mut |bytes| {
-            charge.resize(scratch.saturating_add(bytes))
-        })?;
+        let opened =
+            source.open_view(&open, &|| ctx.check(), &mut |bytes| match &mut admitted {
+                Some(charge) => charge.resize(scratch.saturating_add(bytes)),
+                None => {
+                    admitted = Some(OwnedCharge::new(ctx, scratch.saturating_add(bytes))?);
+                    Ok(())
+                }
+            })?;
+        let mut charge = match admitted {
+            Some(charge) => charge,
+            None => OwnedCharge::new(ctx, scratch)?,
+        };
         ctx.check()?;
         self.scratch_bytes = scratch;
         self.commit_var = spec.commit;

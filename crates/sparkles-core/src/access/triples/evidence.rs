@@ -2100,6 +2100,7 @@ fn clone_access_unbound(
             read,
             write,
             triples: access.triples.clone(),
+            views: access.views.clone(),
         },
         held,
     ))

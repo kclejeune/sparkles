@@ -234,6 +234,7 @@ fn graph_views_limit_the_draft() {
         read: only_default.clone(),
         write: only_default,
         triples: None,
+        views: Default::default(),
     }));
     let view = draft_shapes(&s.snapshot(), &o).unwrap();
     assert!(!view.shacl.contains("secret"), "{}", view.shacl);

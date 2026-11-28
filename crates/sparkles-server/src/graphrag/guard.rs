@@ -772,6 +772,7 @@ pub fn apply(view: GraphAccess, guard: Option<&Arc<Guard>>) -> GraphAccess {
         read,
         write: view.write.guarded(&pattern, &[]),
         triples: view.triples,
+        views: view.views,
     }
 }
 

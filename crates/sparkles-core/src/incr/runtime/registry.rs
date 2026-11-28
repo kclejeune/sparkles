@@ -11,6 +11,9 @@ pub(super) struct ViewEntry {
     pub(super) suspended: Option<String>,
     /// why the view could not be attached (its query, its principal)
     pub(super) error: Option<String>,
+    /// the host installation its principal was last resolved under, attached or not
+    /// (0: none), so that another host resolves it again whatever the hosts' epochs
+    pub(super) resolved_under: u64,
     pub(super) checkpointed: u64,
     /// evidence visibility key active when `checkpointed` was written
     pub(super) checkpointed_ev_key: Option<String>,
@@ -100,6 +103,7 @@ impl ViewEntry {
             // a restored or cloned view waits until it is resumed
             suspended: paused.map(paused_reason),
             error,
+            resolved_under: 0,
             checkpointed: 0,
             checkpointed_ev_key: None,
             paused: paused.is_some(),

@@ -885,8 +885,11 @@ records it. The fixed-point operator of item 417 was delivered on 2026-11-01, an
 correlated `EXISTS` of item 418 were delivered on 2026-11-10, and
 [Aggregates and correlated EXISTS](#aggregates-and-correlated-exists) records them. The
 ordered windows of item 419 were delivered on 2026-11-21, and
-[Ordered windows](#ordered-windows) records them. The rest of Phases 2 and 3 is not
-built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as items 416 and 420 to 429.
+[Ordered windows](#ordered-windows) records them. The view access of item 222 was
+delivered on 2026-11-27, and
+[View access by grant containment](#view-access-by-grant-containment) records it. The rest
+of Phases 2 and 3 is not built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as items
+416 and 420 to 429.
 
 - `crates/sparkles-core/src/incr/` holds the core. `zset.rs` keeps rows of ids with
   `i64` weights. `compile.rs` compiles the spargebra algebra into a circuit of the
@@ -962,10 +965,11 @@ built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as items 416 and 420 to 42
   decides a guard at its own snapshot, and a circuit cannot decide it again at each
   commit, so every circuit and every access fingerprint treat a guard as exempting
   nothing. Item 227 tracks proving guards in circuits.
-- A caller reads a view when it reads every quad of the dataset or has the same access
-  fingerprint as the view's principal. A caller who cannot read a view still sees its
-  definition and state through `GET /$/views/{ds}`, without `rows` and `stateBytes`. Comparing grant sets for containment and the
-  `view:{name}` grant that declassifies a view are left to item 222.
+- A caller reads a view when it reads every quad of the dataset, when its grants contain
+  those of the view's principal, or when a grant names the view, as
+  [View access by grant containment](#view-access-by-grant-containment) describes. A
+  caller who cannot read a view still sees its definition and state through
+  `GET /$/views/{ds}`, without `rows` and `stateBytes`.
 - A view's principal is a configured user, resolved through the server's policy when
   the view is attached and again after each policy reload. A definer whose grants cover
   every graph defines a view without a principal by default, which reads every quad.
@@ -1778,6 +1782,167 @@ output preparation and retained window accounting. Other tests synchronize GC ow
 release before checkpointing, change mode after the reader's first generation check,
 advance the epoch at expiration, and cancel eager and streaming queries after an
 incomplete view read has waited.
+
+### View access by grant containment
+
+Item 222 decides who reads a view from the grant sets of the caller and of the view's
+principal, as §6.1 specifies. One decision function in `incr::runtime::auth` serves
+`SERVICE view:read`, the library's reads, the redaction of `GET /$/views/{ds}` and the
+`Runtime::authorize_view` entry point, which the MCP tools of item 424 and the web UI of
+item 426 call before they read or watch a view on a caller's behalf.
+
+A caller who reads every quad of the dataset reads every view. Otherwise
+`GraphAccess::read_contains` compares the two grant sets with every disclosure guard
+exempting nothing on either side, as circuits read them. The caller's guards are closed
+with `GraphAccess::guards_closed`, so a guard decided against the request's snapshot
+gives the same decision at every commit. The caller's read graphs must contain the
+principal's. The default graph, blank-node graph names, each exact graph and each IRI
+pattern are compared one by one. A pattern counts as contained only when a pattern of the
+caller proves to match everything it matches, and the caller's excluded patterns, guards
+and protected graphs such as the graph of inferences cannot reach into it. Every
+protection that the caller keeps in force for reads must be in force for the principal
+too, and the caller must lift it wherever the principal lifts it. Masks evaluate subject
+classes and patterns on the unmasked snapshot, so such a protection hides the same quads
+from both readers, and a protection whose pattern binds the caller also needs the same
+caller attributes. A pattern that the caller keeps in force must also give the same
+answer whenever it is evaluated on one snapshot, since the view evaluated it at another
+time than the caller reads. `Protection::stable` accepts a pattern only when every
+construct in it is on a list of those whose results depend on the snapshot and the caller
+alone, so a call of `NOW()`, `RAND()`, `UUID()`, `STRUUID()`, `BNODE()` or an extension
+function other than a cast, a `SERVICE`, a property function, a `LIMIT` or `OFFSET`, and
+an aggregate other than `COUNT` refuse containment, since `MIN` and `MAX` keep the
+first-seen lexical spelling on value ties and their result can change when the input
+order changes at an unchanged commit. The projection of
+review-policy output hides only quads without supports the reader can read, so a caller
+whose graphs and lifts contain the principal's hides no more of it, with one exception.
+A reader whose guard is decided at the snapshot it reads refuses support that a stored
+fact of an earlier commit proves while a pattern protection is in force, and a principal
+with the same guard fixed by its grants accepts it. Closing the guards removes that
+difference, so `GraphAccess::binds_guards` records it before they are closed, and such a
+caller is refused containment while a pattern protection is in force for it. Every
+restricted request principal of the server carries the GraphRAG guard, so over HTTP a
+caller under a pattern protection reads a view only with unrestricted access or a
+`view:{name}` grant. Every test is sound and
+incomplete, so a containment that the comparison cannot prove refuses the read with
+`403 view-access`. When containment fails, a `view:{name}` grant on the dataset declassifies
+the view for its grantee alone, and a caller with the same graphs and no such grant is
+still refused. A grant names views in its `endpoints` list. Naming a view opens no
+endpoint and adds no graph, protection lift or write. A grant that names only views must
+be a `read` grant without graphs, lifts or `server_models`, and grants no level on the
+dataset at all, so its grantee reaches the dataset, and reads the view through an
+endpoint such as `query`, only by another grant. A token scope that no
+longer reaches the dataset, or a principal whose reads hide graphs whatever its grants
+say, carries no view grants. A view's definition refuses `SERVICE view:read` with
+`400 not-incremental`, so a principal's own view grants never widen what a view reads.
+
+A read decides on the registry entry it has just read, with no lock held, and in this
+order. It decides and records the decision first. Only an admitted read then learns
+that the view is suspended, with the size of its state, or that it failed to attach,
+with the reason, and only an admitted read waits for the view, evaluates a fallback or
+reserves memory. The view cursor of `SERVICE view:read` charges its scratch to the
+query's budget once the view admits the read, and the eager reader resolves its fallback
+memory parent at the same point, so a refused caller is answered at once with
+`403 view-access`, not after `viewWaitMs` and not with a budget refusal. A view that is
+not attached, because it is suspended, failed to attach or waits for the next round, has
+no principal resolved under the current policy, so it is decided as a view that reads
+every quad. Only an unrestricted caller or a `view:{name}` grant reads it then, and a
+contained caller is refused until the view is attached again, including the moment after
+a policy reload or a new host while the next round attaches it. Item 1348 tracks deciding
+such a view on its principal under the current policy. Decisions are cached per
+view name, caller grant set and principal grant set, and whether the caller's guards are
+decided at each snapshot. An entry is found by a hash of all four and used only when all
+four are equal to the request's, so a change of the caller's grants, of the view's
+principal or of the policy that resolves it misses the cache whatever the hash. The
+runtime also empties the cache when a view is attached under a new definition, policy
+epoch or host, and when one is removed. Each emptying starts a new generation, which a
+read takes from the registry together with the entry it decides on. A decision is kept,
+and the cache answers, only for an entry read in the current generation, so a decision
+that was in flight when the cache was emptied cannot restore it for a definition that
+replaced the view with equal grants. The cache holds at most 1,024 decisions and is
+emptied when it would grow past that, which bounds its memory to that many shared grant
+sets and view names. Unrestricted callers never reach it.
+
+The audit log receives a `view_access` record on the `sparkles::audit` target for every
+refusal, including one the cache answered, for every declassified read, and for each
+other decision the cache did not hold. A read that waits for its view is recorded once
+for each (decision, generation) pair, so that a replacement with equal grants while the
+read waits emits a fresh uncached record for the new generation. The record names the dataset, the view, the operation (`read` or
+`watch`), the decision, its reason and whether the cache answered, and the caller's
+`Principal::id`. Its reason is `contained`, `declassified` or the category of the first
+gap, which is `graphs`, `protections`, `caller-pattern` or `evaluation`, the last for a
+pattern that may not give the same answer twice or a caller whose guards bind under one.
+Neither the record nor the `403` body names a graph, a protection or a row. Listings ask
+without writing records, and reads by unrestricted callers are not recorded. Defining,
+rebuilding and removing a view need `admin` on the dataset, which the policy checks
+before the handler runs, and their records `view_defined`, `view_rebuilt` and
+`view_deleted` carry the operation `manage` and the decision `allow` in the same
+vocabulary. A caller who sees the dataset and is refused one of these routes, by its
+grants or because the server is read-only, gets a `view_access` record with the
+operation `manage`, the decision `deny` and the reason `level` or `read-only`, including
+an anonymous caller whose grants make the dataset visible. A caller who does not see
+the dataset gets the same `404` as for a dataset that does not exist, and an anonymous
+caller without visibility gets the authentication challenge with no record.
+
+`GET /$/views/{ds}` and `GET /$/views/{ds}/{name}` read each view's state and the grants
+of its principal under one registry lock and decide on that pair, so a definition that
+replaces a view between the two never pairs the old state with the decision on the new
+one. A caller who may not read a view gets its listing without `rows` and `stateBytes`,
+and a suspended view's reason reduced to its code, such as `over-budget`, since the full
+reason names the size of the view's state. `Principal::view_reader` gives a surface the
+grants that decide a request's view reads, or nothing when the request may not query
+the dataset, since `Runtime::authorize_view` takes an absent grant set as a reader of
+every quad.
+
+A policy reload takes effect for a view's principal when the next round attaches the view
+again, and so does a new host, whatever its epoch, for each view whose principal an
+older host resolved. Until then the view's rows and the decision both reflect the
+principal's previous grants, so a caller is never decided against grants that differ
+from those its rows were computed under. The caller's own grants are resolved on each
+request.
+
+Tests in `incr/view_auth_tests.rs` cover each dimension with a near miss and a cover:
+the default graph, exact graphs, patterns, blank-node graph names, the graph of
+inferences, excluded patterns, guards, a protection lifted on a narrower or wider set, a
+protection the principal does not have and a pattern that binds the caller. They check
+cache hits and misses, misses after narrowed grants, a new definition, a policy epoch
+and a deletion, the cache bound, the audit records of each decision without graph names,
+an immediate refusal of a view that is behind, the deadline of a permitted read, the
+refusal of a view that reads a view, and a differential test over a store with named,
+blank and protected data that checks, for every pair of 99 grant sets the comparison
+proves contained, that the caller reads every row the principal reads. Its `eval` module
+evaluates a pattern that reads the clock on one snapshot at two times with a test clock,
+refuses it, and still admits a lift of the caller's own, an unrestricted reader and a
+`view:{name}` grant. It admits a stable pattern that binds the caller, whose direct read
+returns every row of the view, and refuses callers whose guards are decided at each
+snapshot under a pattern protection in three cache orders. Further tests refuse callers
+of suspended, failed, rebuilt and unattached views without their sizes or errors and
+with a record of each refusal, refuse a read without asking for its fallback memory
+parent and within the least query budget that reaches the view cursor, decide again
+under a new host with the same epoch, keep no decision that was in flight when a new
+definition emptied the cache, pair metadata with its decision across a replacement, and
+emit a fresh uncached audit record when a waiting read crosses a replacement with equal
+grants.
+`evidence_visibility.rs` in the library builds two commits whose second accepts a claim
+on a stored fact of the first, shows that a principal with a fixed guard reads the claim
+and a caller whose guard binds does not, maintains a view of it for the principal, and
+checks the decisions for both callers in both cache orders. The server tests in
+`router_tests/auth/views.rs` read a view through `SERVICE view:read` as contained,
+declassified, narrower and view-only callers, also below a join so that the result cache
+cannot answer a narrower caller, check the redaction of listings, the validation of
+`view:{name}` entries, that view grants follow their dataset, branch and token scope and
+drop under hidden graphs, the dataset, operation, principal and absence of graph names in
+the JSON audit lines, the records of allowed and refused management including anonymous
+callers with dataset visibility, metadata decided on the state it reports across a
+replacement, and the reduced reason of a suspended view.
+
+The comparison of IRI patterns is incomplete. A caller pattern with literal text between
+two `*`, such as `http://*/data/*`, proves no containment of another pattern, and an
+excluded pattern or guard of the caller that may overlap a principal's pattern refuses
+unless the principal excludes it too. Such reads are refused rather than allowed, and
+[ROADMAP](../ROADMAP.md) item 1346 tracks a complete pattern comparison. Callers whose
+guards bind under a pattern protection, patterns that `Protection::stable` cannot
+prove stable, and protections whose patterns use `MIN` or `MAX` are refused containment
+too, and item 1347 tracks deciding them without that refusal.
 
 ### Scope changes
 

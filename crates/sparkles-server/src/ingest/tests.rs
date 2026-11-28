@@ -4444,6 +4444,7 @@ async fn claims_upload_respects_query_policy_on_c18_predecessor() {
                     lifts: Vec::new(),
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
                 Restricted {
                     dataset: "org".into(),
@@ -4457,6 +4458,7 @@ async fn claims_upload_respects_query_policy_on_c18_predecessor() {
                     lifts: Vec::new(),
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -4522,6 +4524,7 @@ async fn claims_upload_respects_query_policy_on_c18_predecessor() {
                     lifts: vec!["hide_rend".into()],
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
                 Restricted {
                     dataset: "org".into(),
@@ -4531,6 +4534,7 @@ async fn claims_upload_respects_query_policy_on_c18_predecessor() {
                     lifts: Vec::new(),
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -4894,6 +4898,7 @@ async fn claims_multi_profile_reingestion_preserves_same_graph_cross_graph_and_m
                     lifts: vec!["hide_was_rev".into()],
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
                 Restricted {
                     dataset: "org".into(),
@@ -4903,6 +4908,7 @@ async fn claims_multi_profile_reingestion_preserves_same_graph_cross_graph_and_m
                     lifts: Vec::new(),
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -5351,6 +5357,7 @@ async fn claims_lineage_treats_unattributable_shared_c18_transition_as_ambiguous
                     lifts: vec!["hide_a".into()],
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
                 Restricted {
                     dataset: "org".into(),
@@ -5360,6 +5367,7 @@ async fn claims_lineage_treats_unattributable_shared_c18_transition_as_ambiguous
                     lifts: Vec::new(),
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -5488,6 +5496,7 @@ async fn claims_lineage_treats_unattributable_shared_c18_transition_as_ambiguous
                     lifts: vec!["hide_a".into(), "hide_s2_on_x".into()],
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
                 Restricted {
                     dataset: "org".into(),
@@ -5497,6 +5506,7 @@ async fn claims_lineage_treats_unattributable_shared_c18_transition_as_ambiguous
                     lifts: Vec::new(),
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -6034,6 +6044,7 @@ async fn claims_predecessor_lookup_ignores_rows_in_query_denied_graph() {
                         lifts: Vec::new(),
                         branches: None,
                         server_models: false,
+                        views: Vec::new(),
                     },
                     Restricted {
                         dataset: "org".into(),
@@ -6043,6 +6054,7 @@ async fn claims_predecessor_lookup_ignores_rows_in_query_denied_graph() {
                         lifts: Vec::new(),
                         branches: None,
                         server_models: false,
+                        views: Vec::new(),
                     },
                 ],
                 ..Default::default()
@@ -6941,6 +6953,7 @@ async fn claims_source_retry_refuses_masked_byte_update_digest() {
                     lifts: vec!["hide_crlf_digest".into()],
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
                 Restricted {
                     dataset: "org".into(),
@@ -6950,6 +6963,7 @@ async fn claims_source_retry_refuses_masked_byte_update_digest() {
                     lifts: Vec::new(),
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -7068,6 +7082,7 @@ async fn claims_before_publish_head_move_masking_predecessor_retries_cleanly() {
                         lifts: vec!["hide_pred".into()],
                         branches: None,
                         server_models: false,
+                        views: Vec::new(),
                     },
                     Restricted {
                         dataset: "org".into(),
@@ -7077,6 +7092,7 @@ async fn claims_before_publish_head_move_masking_predecessor_retries_cleanly() {
                         lifts: Vec::new(),
                         branches: None,
                         server_models: false,
+                        views: Vec::new(),
                     },
                 ],
                 ..Default::default()

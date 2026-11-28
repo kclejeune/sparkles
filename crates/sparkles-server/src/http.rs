@@ -109,7 +109,7 @@ mod ontology {
 }
 mod patch;
 mod queries;
-mod views;
+pub(crate) mod views;
 pub(crate) use views::start as start_views;
 pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;

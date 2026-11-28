@@ -4146,10 +4146,42 @@ that commit, and `503 view-ahead` answers when neither is possible. `view:allowS
 instead. A suspended view answers `503 view-suspended`, and an unknown one
 `404 view-not-found`.
 
-A caller may read a view when its own grants cover every graph, or when its grants equal
-those of the view's principal. Otherwise the read fails with `403 view-access`. Phase 1
-does not compare grant sets for containment and has no grant that declassifies a view by
-name.
+A caller may read a view when its grants cover every quad of the dataset, when its
+grants contain those of the view's principal, or when a grant names the view. Its grants
+contain the principal's when it reads every graph the principal reads and lifts every
+protection wherever the principal lifts it. The comparison uses the grant sets alone,
+and a containment it cannot prove, such as one between IRI patterns with text between
+two `*`, counts as none. A protection pattern in force for the caller must give the same
+answer every time it runs on one snapshot, so a pattern that calls `NOW()`, `RAND()` or
+an extension function refuses containment. Request principals of the server decide their
+GraphRAG guard at the snapshot they read, under which some evidence is read differently,
+so a caller under a pattern protection reads a view only with full access or a grant
+that names it. Otherwise the read fails with `403 view-access`, which names no graph.
+The decision comes before anything else the read reports, so a refused caller learns
+nothing of a view's state. A view that is suspended, failed to attach or waits to be
+attached again after a policy reload is decided as one that reads every quad, which
+refuses a contained caller until the view is attached. An administrator who publishes a view to callers
+who cannot read its inputs names it in a grant's `endpoints` as `view:{name}`, which
+declassifies the view for that grantee:
+
+```toml
+[[users.grants]]
+dataset = "org"
+level = "read"
+graphs = ["http://example.org/public/*"]
+endpoints = ["query", "view:team-sizes"]
+```
+
+Naming a view opens no endpoint and adds no graph, so the grantee reads the view through
+an endpoint that a grant opens, here `query`. A grant that names only views must be a
+`read` grant without `graphs`, `lifts` or `server_models`, and grants no level on the
+dataset by itself. Each refusal, each declassified read and
+each other decision not already cached is written to the audit log as a `view_access`
+record with the dataset, the view, the operation, the decision, its reason and the
+caller. A refused `PUT`, `DELETE` or `rebuild` of a view by a caller who sees the dataset
+is recorded the same way with the operation `manage`. Listings return a view's `rows` and
+`stateBytes` only to callers who may read it, decided on the same definition as the rest
+of the listing, and give other callers a suspended view's reason as its code alone.
 
 **Persistence.** A view's state is checkpointed to `views/{name}/main/state-{commit}.bin`
 every 60 seconds while it changes and when the dataset closes. On open the newest
@@ -11440,6 +11472,7 @@ server_models = true
 | `shacl`, `shex` | `/{ds}/shacl`, `/{ds}/shex`, and the MCP validation tools |
 | `diff` | `/{ds}/diff` and the change feed `/{ds}/changes` |
 | `graphql` | `/{ds}/graphql` and `/{ds}/graphql/schema`. A grant for `query` covers them too. |
+| `view:{name}` | No endpoint. It declassifies the incremental view `name` for the grantee, who reads it through an endpoint another grant opens ([incremental views](#incremental-views)). |
 | `info` | The dataset's other routes that need `read` or `write`: its description, schema, prefixes, commits, index and reasoning status, snapshots, history and validation settings, and backups. MCP's `list_commits`, `describe_schema`, `draft_shapes` and resources count as `info`, and so do the stored-query definitions under `/$/queries/{ds}`. |
 
 A request through an endpoint that no grant names gets

@@ -53,12 +53,11 @@ pub fn access_fingerprint(access: Option<&Arc<GraphAccess>>) -> u64 {
 }
 
 /// Whether a reader with `caller` may read a view whose principal reads `view`: the
-/// caller reads everything, or reads exactly what the principal reads (spec F13 §6.1).
-/// Comparing grant sets for containment is left to Phase 2; equal grants and
-/// unrestricted callers cover every case Phase 1 needs.
+/// caller reads everything, or its grants contain the principal's (spec F13 §6.1,
+/// [`GraphAccess::read_contains`]). A grant that names a view is not considered here,
+/// since no view is named; [`Runtime::authorize_view`] considers it.
 pub fn covers(caller: Option<&Arc<GraphAccess>>, view: Option<&Arc<GraphAccess>>) -> bool {
-    let c = access_fingerprint(caller);
-    c == 0 || c == access_fingerprint(view)
+    super::auth::decide_named(None, caller, view).allowed()
 }
 
 /// The query's text with the variables the parser names at random (aggregates' and

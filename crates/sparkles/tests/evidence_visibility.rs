@@ -3925,3 +3925,197 @@ fn in_memory_configuration_activation_advances_managed_generation_and_invalidate
         other => panic!("expected access-changed after activation, got {other:?}"),
     }
 }
+
+/// A view's grants contain a caller's only when the caller reads every row the view
+/// holds. Support that a stored fact of an earlier commit proves is refused to a caller
+/// whose guard is decided at the snapshot it reads while a pattern protection is in
+/// force, and accepted for a view whose principal has the same guard fixed by its
+/// grants. Closed, the two guards are equal, so containment refuses the caller whose
+/// guard binds, whichever of the two the decision cache meets first (spec F13 §6.1).
+#[test]
+fn view_containment_follows_earlier_stored_fact_support_under_bound_guards() {
+    use sparkles::access::{Decider, Exemptions, GraphGuard, GuardDecision, GuardSnapshot};
+
+    struct NoExemption;
+    impl GuardDecision for NoExemption {
+        fn exempt(&self, _: &Arc<sparkles::store::Snapshot>) -> Vec<String> {
+            Vec::new()
+        }
+        fn exempt_controlled(
+            &self,
+            _: &GuardSnapshot<'_>,
+            preparation: &Preparation,
+        ) -> sparkles::Result<Exemptions> {
+            Exemptions::new(preparation)
+        }
+    }
+    struct Principal(Arc<GraphAccess>);
+    impl sparkles::incr::Host for Principal {
+        fn access(&self, p: Option<&str>) -> sparkles::Result<Option<Arc<GraphAccess>>> {
+            Ok(p.map(|_| self.0.clone()))
+        }
+        fn stored_query(&self, name: &str) -> sparkles::Result<String> {
+            Err(Error::NotFound(name.into()))
+        }
+    }
+
+    const DECISIONS_2: &str = "urn:ev:decisions-2";
+    const SUPPORTS_2: &str = "urn:ev:supports-2";
+    const OUTPUT_2: &str = "urn:ev:accepted-2";
+    let ds = configured(true);
+    let mut settings = two_boundary_settings();
+    settings.decisions.push(DECISIONS_2.into());
+    settings.supports.push(SUPPORTS_2.into());
+    settings.projections.push(OUTPUT_2.into());
+    settings.policies.insert(
+        "secondary".into(),
+        Policy {
+            version: 1,
+            admitted_kinds: vec![ClaimKind::Reported, ClaimKind::Observation],
+            required_scope: Vec::new(),
+            conflicts: ConflictMode::AdmitLabelled,
+            boundary: vec![CLAIMS_B.into(), SOURCES_B.into()],
+            decisions: DECISIONS_2.into(),
+            supports: SUPPORTS_2.into(),
+            output: OUTPUT_2.into(),
+        },
+    );
+    evidence::configure(&ds, &settings, &Control::none()).unwrap();
+
+    // C1 accepts cve-1 into OUTPUT, and C2 accepts cve-2 into OUTPUT_2 on a stored fact
+    // that cites cve-1 in OUTPUT at C1
+    let c1_claim = propose_in(&ds, SOURCES_A, CLAIMS_A, "src-a", "a1", affected());
+    decide(&ds, &c1_claim, Disposition::Accepted, None);
+    let c1 = ds.store().head_commit().seq;
+    let (c2_iri, c2_digest, _) = propose_fact_in(
+        &ds,
+        &ds,
+        SOURCES_B,
+        CLAIMS_B,
+        "occ-c2",
+        affected_two(),
+        StoredFactRef {
+            dataset: ds.store().dataset_id(),
+            branch: ds.store().branch_id(),
+            commit: c1,
+            graph: GraphIdentity::Named(iri(OUTPUT)),
+            expected: affected(),
+            anchor: None,
+        },
+    );
+    decide_policy(
+        &ds,
+        &ds,
+        "secondary",
+        &(c2_iri, c2_digest),
+        Disposition::Accepted,
+    );
+    assert!(ds.store().head_commit().seq > c1);
+
+    // every evidence graph, a guard over graphs the data does not use, and a pattern
+    // protection in force on a predicate the data does not use
+    let protection = Arc::new(Protection {
+        name: "own".into(),
+        predicates: Some(vec!["urn:unused".into()]),
+        classes: None,
+        subclasses: false,
+        graphs: None,
+        pattern: Some("?s <urn:owner> ?user".into()),
+        prefixes: Default::default(),
+        hide_inferences: false,
+    });
+    let graphs = GraphRule::new(
+        [
+            OUTPUT,
+            OUTPUT_2,
+            DECISIONS,
+            SUPPORTS,
+            DECISIONS_2,
+            SUPPORTS_2,
+            CLAIMS_A,
+            CLAIMS_B,
+            SOURCES_A,
+            SOURCES_B,
+        ],
+        &[],
+    );
+    let with = |guard: GraphGuard| {
+        let mut read = graphs.clone();
+        read.guards.push(guard);
+        Arc::new(GraphAccess::with_triples(
+            Graphs::Only(read),
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: protection.clone(),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller {
+                    user: Some("alice".into()),
+                    ..Default::default()
+                },
+                limits: Limits::default(),
+            },
+        ))
+    };
+    let fixed = with(GraphGuard::new("urn:guarded:*", Vec::new()));
+    let deciding = with(GraphGuard::with_decider(
+        "urn:guarded:*",
+        Decider(Arc::new(NoExemption)),
+    ));
+    let bound = deciding.bound(&ds.store().snapshot());
+    assert_eq!(fixed.guards_closed(), deciding.guards_closed());
+    let reads_cve2 = |a: &Arc<GraphAccess>| {
+        sparkles::sparql::query(
+            ds.store().snapshot(),
+            &format!(
+                "ASK {{ GRAPH <{OUTPUT_2}> {{ <urn:release> <urn:affectedBy> <urn:cve-2> }} }}"
+            ),
+            &QueryOptions {
+                graphs: Some(a.clone()),
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .boolean
+    };
+    assert!(
+        reads_cve2(&fixed),
+        "the earlier commit's fact proves the support"
+    );
+    assert!(!reads_cve2(&deciding), "refused under a guard that binds");
+
+    ds.start_views(Arc::new(Principal(fixed.clone())));
+    let views = ds.views();
+    let view_query =
+        format!("SELECT ?o WHERE {{ GRAPH <{OUTPUT_2}> {{ <urn:release> <urn:affectedBy> ?o }} }}");
+    for name in ["first-fixed", "first-deciding"] {
+        let mut def = sparkles::incr::ViewDef::table(view_query.clone());
+        def.principal = Some("fixed".into());
+        views.put(name, def).unwrap();
+        views
+            .wait_built(name, std::time::Duration::from_secs(30))
+            .unwrap();
+        let rows = views.read(name).unwrap();
+        assert_eq!(rows.rows.len(), 1, "the view holds cve-2");
+    }
+    let orders: [(&str, [&Arc<GraphAccess>; 3]); 2] = [
+        ("first-fixed", [&fixed, &deciding, &bound]),
+        ("first-deciding", [&deciding, &bound, &fixed]),
+    ];
+    for (name, callers) in orders {
+        for c in callers {
+            let d = views
+                .authorize(name, Some(c), sparkles::incr::ViewOp::Read)
+                .unwrap();
+            assert_eq!(d.allowed(), Arc::ptr_eq(c, &fixed), "{name}: {d:?}");
+            // contained only when the caller's own read holds the view's row
+            if d.allowed() {
+                assert!(reads_cve2(c), "{name}");
+            }
+            assert_eq!(views.readable_by(name, Some(c)), d.allowed(), "{name}");
+        }
+    }
+}

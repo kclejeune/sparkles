@@ -283,6 +283,7 @@ fn restricted_principal(
             lifts: Vec::new(),
             branches,
             server_models,
+            views: Vec::new(),
         }],
         ..Default::default()
     });
@@ -1484,6 +1485,7 @@ GRAPH <http://example.org/g/secret> { <http://example.org/r/s> a ex:SecretThing 
                 lifts: Vec::new(),
                 branches: None,
                 server_models: false,
+                views: Vec::new(),
             },
             Restricted {
                 dataset: "org".into(),
@@ -1497,6 +1499,7 @@ GRAPH <http://example.org/g/secret> { <http://example.org/r/s> a ex:SecretThing 
                 lifts: Vec::new(),
                 branches: None,
                 server_models: false,
+                views: Vec::new(),
             },
         ],
         ..Default::default()
@@ -1555,6 +1558,7 @@ GRAPH <http://example.org/g/secret> { <http://example.org/r/s> a ex:SecretThing 
                 lifts: Vec::new(),
                 branches: None,
                 server_models: false,
+                views: Vec::new(),
             },
             Restricted {
                 dataset: "org".into(),
@@ -1564,6 +1568,7 @@ GRAPH <http://example.org/g/secret> { <http://example.org/r/s> a ex:SecretThing 
                 lifts: Vec::new(),
                 branches: None,
                 server_models: false,
+                views: Vec::new(),
             },
         ],
         ..Default::default()
@@ -1720,6 +1725,7 @@ GRAPH <http://example.org/g/secret> { <http://example.org/r/s> a ex:SecretThing 
                 lifts: Vec::new(),
                 branches: None,
                 server_models: false,
+                views: Vec::new(),
             },
             Restricted {
                 dataset: "org".into(),
@@ -1729,6 +1735,7 @@ GRAPH <http://example.org/g/secret> { <http://example.org/r/s> a ex:SecretThing 
                 lifts: Vec::new(),
                 branches: None,
                 server_models: false,
+                views: Vec::new(),
             },
         ],
         ..Default::default()
@@ -1788,6 +1795,7 @@ GRAPH <http://example.org/g/secret> { <http://example.org/r/s> a ex:SecretThing 
                     lifts: Vec::new(),
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
                 Restricted {
                     dataset: "org".into(),
@@ -1797,6 +1805,7 @@ GRAPH <http://example.org/g/secret> { <http://example.org/r/s> a ex:SecretThing 
                     lifts: Vec::new(),
                     branches: None,
                     server_models: false,
+                    views: Vec::new(),
                 },
             ],
             ..Default::default()

@@ -247,13 +247,54 @@ impl Views {
         self.rt().list(&self.ds.inner.store)
     }
 
-    /// View `name` with its state, or `None`.
     /// Whether a reader with `access` may read view `name`'s rows and what they
-    /// disclose, such as their count (`None`: every graph).
+    /// disclose, such as their count (`None`: every graph). It writes no audit
+    /// record.
     pub fn readable_by(&self, name: &str, access: Option<&Arc<GraphAccess>>) -> bool {
         self.rt().readable_by(name, access)
     }
 
+    /// Whether a reader with `access` may `op` view `name` (spec F13 §6.1), recorded
+    /// in the audit log as [`ViewAccessEvent`](crate::incr::ViewAccessEvent)
+    /// describes. Surfaces that read or watch a view for a caller ask this first.
+    ///
+    /// `access: None` is a reader of every quad, which is always allowed. A surface
+    /// that decides for a request checks first that the request may read the dataset,
+    /// and only then passes the request's view of it.
+    pub fn authorize(
+        &self,
+        name: &str,
+        access: Option<&Arc<GraphAccess>>,
+        op: crate::incr::ViewOp,
+    ) -> Result<crate::incr::ViewDecision> {
+        self.rt().authorize_view(name, access, op)
+    }
+
+    /// The counters of the cache of decisions on who reads which view.
+    pub fn auth_stats(&self) -> crate::incr::ViewAuthStats {
+        self.rt().view_auth_stats()
+    }
+
+    /// View `name` with its state and whether a reader with `access` may read its rows
+    /// and what they disclose, decided on the same definition as the state (`None`:
+    /// no such view). It writes no audit record.
+    pub fn get_readable(
+        &self,
+        name: &str,
+        access: Option<&Arc<GraphAccess>>,
+    ) -> Option<(ViewInfo, bool)> {
+        self.rt()
+            .get_readable(&self.ds.inner.store, name, access)
+            .ok()
+    }
+
+    /// Every view with its state and whether a reader with `access` may read it, as
+    /// [`get_readable`](Self::get_readable) decides. It writes no audit record.
+    pub fn list_readable(&self, access: Option<&Arc<GraphAccess>>) -> Vec<(ViewInfo, bool)> {
+        self.rt().list_readable(&self.ds.inner.store, access)
+    }
+
+    /// View `name` with its state, or `None`.
     pub fn get(&self, name: &str) -> Option<ViewInfo> {
         self.rt().get(&self.ds.inner.store, name).ok()
     }

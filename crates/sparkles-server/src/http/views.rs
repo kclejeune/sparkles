@@ -102,6 +102,14 @@ impl Host for ServerHost {
         }
         0
     }
+
+    fn view_access(&self, event: &sparkles::incr::ViewAccessEvent<'_>) {
+        #[cfg(feature = "auth")]
+        let dataset = Some(self.dataset.as_str());
+        #[cfg(not(feature = "auth"))]
+        let dataset = None;
+        event.log(dataset);
+    }
 }
 
 /// Start the views of a dataset the server opens, with the server's principals.
@@ -124,15 +132,41 @@ fn info_json(ds: &str, v: &sparkles::incr::ViewInfo) -> J {
     j
 }
 
-/// Leave out what a view's data discloses for a caller who may not read the view.
-fn redact(j: &mut J, ds: &crate::state::Dataset, name: &str, p: &Principal) {
-    let access = p.view(&ds.name, Endpoint::Query);
-    if !ds.dataset.views().readable_by(name, access.as_ref())
-        && let Some(o) = j.as_object_mut()
-    {
-        o.remove("rows");
-        o.remove("stateBytes");
+/// Leave out what a view's data discloses for a caller who may not read the view: its
+/// row count, the size of its state, and the details of why it is suspended, which can
+/// name the size of its state. `readable` is decided on the same registry entry as `j`.
+fn redact(j: &mut J, readable: bool) {
+    if readable {
+        return;
     }
+    let Some(o) = j.as_object_mut() else {
+        return;
+    };
+    o.remove("rows");
+    o.remove("stateBytes");
+    if o.get("state").and_then(J::as_str) == Some("suspended")
+        && let Some(reason) = o.get_mut("reason")
+    {
+        // keep the code that names the cause, such as `over-budget`, and drop the rest
+        let code = reason
+            .as_str()
+            .and_then(|r| r.split_once(':'))
+            .map(|(code, _)| code.trim())
+            .filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'))
+            .unwrap_or("suspended")
+            .to_string();
+        *reason = J::String(code);
+    }
+}
+
+/// The grants a metadata route decides a caller's views by.
+fn metadata_reader(ds: &crate::state::Dataset, p: &Principal) -> Option<Option<Arc<GraphAccess>>> {
+    p.view_reader(&ds.name)
+}
+
+/// Whether `j` is readable for `reader` as [`metadata_reader`] gives it.
+fn readable_for(reader: &Option<Option<Arc<GraphAccess>>>, readable: bool) -> bool {
+    reader.is_some() && readable
 }
 
 /// `GET /$/views/{ds}`
@@ -142,18 +176,22 @@ pub(super) async fn list(
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &ds_name)?;
-    let views: Vec<J> = ds
+    let reader = metadata_reader(&ds, &p);
+    let captured = ds
         .dataset
         .views()
-        .list()
+        .list_readable(reader.as_ref().and_then(|r| r.as_ref()));
+    #[cfg(test)]
+    hooks::after_capture(&ds.dataset.store().dataset_id().to_string());
+    let views: Vec<J> = captured
         .iter()
-        .map(|v| {
+        .map(|(v, readable)| {
             let mut j = info_json(&ds.name, v);
             if let Some(o) = j.as_object_mut() {
                 o.remove("plan");
                 o.remove("dataset");
             }
-            redact(&mut j, &ds, &v.name, &p);
+            redact(&mut j, readable_for(&reader, *readable));
             j
         })
         .collect();
@@ -167,15 +205,46 @@ pub(super) async fn get_view(
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &ds_name)?;
-    let v = ds.dataset.views().get(&name).ok_or_else(|| {
-        ApiError::from(sparkles::incr::error(
-            "view-not-found",
-            format!("no view '{name}' in /{}", ds.name),
-        ))
-    })?;
+    let reader = metadata_reader(&ds, &p);
+    let (v, readable) = ds
+        .dataset
+        .views()
+        .get_readable(&name, reader.as_ref().and_then(|r| r.as_ref()))
+        .ok_or_else(|| {
+            ApiError::from(sparkles::incr::error(
+                "view-not-found",
+                format!("no view '{name}' in /{}", ds.name),
+            ))
+        })?;
+    #[cfg(test)]
+    hooks::after_capture(&ds.dataset.store().dataset_id().to_string());
     let mut j = info_json(&ds.name, &v);
-    redact(&mut j, &ds, &name, &p);
+    redact(&mut j, readable_for(&reader, readable));
     Ok(Json(j))
+}
+
+/// Record a refused view management request (`PUT`, `DELETE` or `POST .../rebuild`) of
+/// a caller who sees dataset `ds`, as `view_access` with `op = "manage"` in the audit
+/// log. `reason` is `level` when the caller's grants do not reach the route's level
+/// and `read-only` when the server refuses every change.
+pub(crate) fn manage_refused(ds: &str, view: &str, p: &Principal, reason: &str) {
+    tracing::info!(
+        target: "sparkles::audit",
+        event = "view_access",
+        dataset = ds,
+        view = view,
+        op = "manage",
+        decision = "deny",
+        reason = reason,
+        cached = false,
+        principal = p.id().as_str(),
+    );
+}
+
+/// The read-only refusal of a view management request, recorded in the audit log.
+fn read_only(ds: &str, view: &str, p: &Principal) -> ApiError {
+    manage_refused(ds, view, p, "read-only");
+    err(StatusCode::FORBIDDEN, "server is read-only")
 }
 
 /// `PUT /$/views/{ds}/{name}`: the view's definition. Without `principal`, the view
@@ -188,7 +257,7 @@ pub(super) async fn put_view(
     AdminBody(body): AdminBody,
 ) -> ApiResult<Response> {
     if st.read_only {
-        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+        return Err(read_only(&ds_name, &name, &p));
     }
     let ds = dataset(&st, &ds_name)?;
     let mut j: J = serde_json::from_slice(&body)
@@ -236,6 +305,8 @@ pub(super) async fn put_view(
     tracing::info!(
         target: "sparkles::audit",
         event = "view_defined",
+        op = "manage",
+        decision = "allow",
         dataset = ds.name.as_str(),
         view = name.as_str(),
         principal = who.as_str()
@@ -274,7 +345,7 @@ pub(super) async fn delete_view(
     Extension(p): Extension<Principal>,
 ) -> ApiResult<StatusCode> {
     if st.read_only {
-        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+        return Err(read_only(&ds_name, &name, &p));
     }
     let ds = dataset(&st, &ds_name)?;
     let ds2 = ds.clone();
@@ -290,6 +361,8 @@ pub(super) async fn delete_view(
     tracing::info!(
         target: "sparkles::audit",
         event = "view_deleted",
+        op = "manage",
+        decision = "allow",
         dataset = ds.name.as_str(),
         view = name.as_str(),
         principal = p.id().as_str()
@@ -305,13 +378,15 @@ pub(super) async fn rebuild(
 ) -> ApiResult<Response> {
     // a rebuild resumes a restored or cloned view, which rewrites its definition
     if st.read_only {
-        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+        return Err(read_only(&ds_name, &name, &p));
     }
     let ds = dataset(&st, &ds_name)?;
     ds.dataset.views().rebuild(&name)?;
     tracing::info!(
         target: "sparkles::audit",
         event = "view_rebuilt",
+        op = "manage",
+        decision = "allow",
         dataset = ds.name.as_str(),
         view = name.as_str(),
         principal = p.id().as_str()
@@ -333,4 +408,36 @@ pub(super) async fn rebuild(
         Json(json!({ "dataset": ds.name, "name": name, "task": task.id })),
     )
         .into_response())
+}
+
+#[cfg(test)]
+pub(crate) mod hooks {
+    //! Test hooks of the metadata routes, by dataset so that tests running together
+    //! in one process do not see each other's.
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    pub(crate) type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    fn hooks() -> &'static Mutex<HashMap<String, Hook>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Hook>>> = OnceLock::new();
+        HOOKS.get_or_init(Default::default)
+    }
+
+    /// Run `hook` in the metadata routes of dataset `ds` between capturing the views
+    /// and answering.
+    pub(crate) fn set_after_capture(ds: &str, hook: Option<Hook>) {
+        let mut h = hooks().lock().unwrap();
+        match hook {
+            Some(hook) => h.insert(ds.to_string(), hook),
+            None => h.remove(ds),
+        };
+    }
+
+    pub(super) fn after_capture(ds: &str) {
+        let hook = hooks().lock().unwrap().get(ds).cloned();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }

@@ -46,6 +46,7 @@ mod startup;
 mod tasks;
 mod tokens;
 pub(super) mod triples;
+mod views;
 
 pub(super) fn tok(c: char) -> String {
     format!("spk_{}", c.to_string().repeat(43))

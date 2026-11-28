@@ -71,6 +71,27 @@ impl Protection {
     pub fn covers_graph(&self, g: Option<&Term>) -> bool {
         self.graphs.as_ref().is_none_or(|gs| gs.allows(g))
     }
+
+    /// Whether the pattern lets the same triples through every time it is evaluated on
+    /// one snapshot for one caller (spec F13 §6.1). It is `true` without a pattern, and
+    /// otherwise only when every construct of the pattern is on a list of those whose
+    /// results depend on the snapshot and the caller alone. A call of `NOW()`, `RAND()`,
+    /// `UUID()`, `STRUUID()`, `BNODE()` or an extension function, a SERVICE, a property
+    /// function, a LIMIT or OFFSET, and an aggregate other than `COUNT`
+    /// make it `false`, as does a pattern that does not parse.
+    pub fn stable(&self) -> bool {
+        let Some(pattern) = &self.pattern else {
+            return true;
+        };
+        // every attribute bound, so that the query has the shape any caller's has
+        let caller = Caller {
+            user: Some("u".into()),
+            roles: vec!["r".into()],
+            groups: vec!["g".into()],
+        };
+        pattern_query(self, pattern, &caller)
+            .is_some_and(|(q, _)| crate::sparql::stable::query_is_stable(&q))
+    }
 }
 
 /// The attributes of a caller that patterns may use.

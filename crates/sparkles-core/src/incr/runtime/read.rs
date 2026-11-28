@@ -249,12 +249,15 @@ impl Runtime {
             control.check()?;
             check()
         };
-        let (pool, parent) = self.resolve_fallback_budget(r)?;
-        let budget = crate::incr::budget::ViewBudget::new(r.max_memory_bytes, parent.clone());
-        let mut scratch = budget.scratch_lease();
+        // The memory of the read is set up once the view admits the caller, so that a
+        // refusal comes before any memory parent is resolved or reserved.
+        let mut memory = None;
         let opened = self.open_view(&open, &combined, &mut |bytes| {
+            let (_, _, _, scratch) = self.fallback_memory(r, &mut memory)?;
             scratch.try_reserve(bytes.saturating_sub(scratch.bytes()))
         })?;
+        self.fallback_memory(r, &mut memory)?;
+        let (pool, parent, budget, mut scratch) = memory.expect("set up above");
         match opened {
             OpenedView::Shared(version) | OpenedView::Owned(version) => {
                 decode_rows(&budget, &version, version.commit, None, &combined)
@@ -352,6 +355,9 @@ impl Runtime {
         let wait = Instant::now() + self.opts.read().view_wait;
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         let mut final_check = false;
+        // a read is audited once for each (decision, generation) pair so that a
+        // view replacement with equal grants across a wait emits a fresh record
+        let mut last: Option<(ViewDecision, u64)> = None;
         loop {
             let round_start = self.round_epoch();
             check()?;
@@ -382,9 +388,11 @@ impl Runtime {
                     ));
                 }
                 let e = reg.view(r.name)?;
+                let (grants, generation) = self.view_grants(e);
                 Some((
                     e.cell.clone(),
-                    e.access.clone(),
+                    grants,
+                    generation,
                     e.suspended.clone(),
                     e.error.clone(),
                     reg.aggregate_errors,
@@ -394,7 +402,21 @@ impl Runtime {
             } else {
                 None
             };
-            if let Some((cell, access, suspended, error, errors, mode_gen, host_seq)) = entry {
+            if let Some((cell, grants, generation, suspended, error, errors, mode_gen, host_seq)) =
+                entry
+            {
+                // Decided on the entry just read, before its state is reported and
+                // before any wait, evaluation or allocation for the read. An entry
+                // without a circuit, which is not attached, suspended or failed to
+                // attach, is decided as a view that reads every quad.
+                let decided = self.decide_cached(r.name, r.caller, grants.as_ref(), generation);
+                if last != Some((decided.0, generation)) {
+                    self.audit(r.name, r.caller, ViewOp::Read, decided);
+                }
+                last = Some((decided.0, generation));
+                if !decided.0.allowed() {
+                    return Err(super::auth::refused(r.name));
+                }
                 if let Some(why) = suspended {
                     return Err(crate::incr::error(
                         "view-suspended",
@@ -408,12 +430,6 @@ impl Runtime {
                     ));
                 }
                 if let Some(cell) = cell {
-                    if !covers(r.caller, access.as_ref()) {
-                        return Err(crate::incr::error(
-                            "view-access",
-                            format!("the view {:?} reads data your grants do not cover", r.name),
-                        ));
-                    }
                     // The mode generation, reading and status are checked against the
                     // current runtime mode generation under the state lock so a delayed
                     // reader never accepts an old-generation version published after a
@@ -625,6 +641,34 @@ impl Runtime {
     /// Resolve a coherent `(pool, parent)` pair for fallback evaluation (`read_back` /
     /// `evaluate_under`) so `parent.domain()` always matches `pool`, unpooled callers
     /// never bypass `self.pool`, and `Ctx::memory_parent()` is invoked lazily.
+    /// The fallback pool and memory parent of read `r`, its view budget and its scratch
+    /// lease, set up in `memory` on first use.
+    #[allow(clippy::type_complexity)]
+    fn fallback_memory<'m>(
+        &self,
+        r: &ViewRead<'_>,
+        memory: &'m mut Option<(
+            Option<Arc<QueryPool>>,
+            Option<ParentHandle>,
+            crate::incr::budget::ViewBudget,
+            crate::incr::budget::ScratchLease,
+        )>,
+    ) -> Result<(
+        &'m mut Option<Arc<QueryPool>>,
+        &'m mut Option<ParentHandle>,
+        &'m mut crate::incr::budget::ViewBudget,
+        &'m mut crate::incr::budget::ScratchLease,
+    )> {
+        if memory.is_none() {
+            let (pool, parent) = self.resolve_fallback_budget(r)?;
+            let budget = crate::incr::budget::ViewBudget::new(r.max_memory_bytes, parent.clone());
+            let scratch = budget.scratch_lease();
+            *memory = Some((pool, parent, budget, scratch));
+        }
+        let (pool, parent, budget, scratch) = memory.as_mut().expect("set up above");
+        Ok((pool, parent, budget, scratch))
+    }
+
     fn resolve_fallback_budget(
         &self,
         r: &ViewRead<'_>,

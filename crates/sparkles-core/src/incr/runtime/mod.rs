@@ -45,6 +45,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 mod attach;
+mod auth;
 mod catalog;
 mod cell;
 mod internal;
@@ -71,6 +72,9 @@ use key::*;
 use registry::*;
 use worker::*;
 
+pub use auth::{
+    AUTH_CACHE_ENTRIES, ViewAccessEvent, ViewAllow, ViewAuthStats, ViewDecision, ViewOp, decide,
+};
 pub(crate) use cell::{Cell, Slot};
 use internal::InternalCell;
 pub use internal::InternalCircuit;
@@ -198,7 +202,8 @@ pub trait Host: Send + Sync {
     /// The text of the current version of stored query `name` (C16).
     fn stored_query(&self, name: &str) -> Result<String>;
     /// A number that changes when principals' access may have changed (a policy
-    /// reload): the views then resolve their principals again.
+    /// reload): the views then resolve their principals again. They also resolve them
+    /// again when another host is installed, whatever its epoch.
     fn epoch(&self) -> u64 {
         0
     }
@@ -216,6 +221,12 @@ pub trait Host: Send + Sync {
     /// itself instead of reading the view's state.
     fn aggregate_errors(&self) -> crate::sparql::AggregateErrors {
         crate::sparql::AggregateErrors::default()
+    }
+    /// Record a decision on reading a view (spec F13 §6.1) in the audit log. The
+    /// default writes it to the `sparkles::audit` target without naming the dataset.
+    /// The runtime calls it without holding its locks.
+    fn view_access(&self, event: &ViewAccessEvent<'_>) {
+        event.log(None)
     }
 }
 
@@ -272,6 +283,11 @@ pub struct Runtime {
     closed: AtomicBool,
     /// the host's epoch the attached views resolved their principals under
     host_epoch: AtomicU64,
+    /// how many hosts were installed, counted while `host` is locked for writing, so
+    /// that a replacement host is told from the one it replaced whatever its epoch
+    host_installs: AtomicU64,
+    /// who may read which view (spec F13 §6.1), by caller and view
+    auth: auth::AuthCache,
     /// Serializes worker store acquisition and rounds with shutdown. Reentrancy
     /// allows a worker store wrapper to close the runtime from its destructor.
     worker: ReentrantMutex<()>,
@@ -288,6 +304,10 @@ pub struct Runtime {
     /// Test hook invoked in `open_view` between releasing `reg` and acquiring `cell.state`.
     #[cfg(test)]
     before_read_state_hook: Mutex<Option<TestHook>>,
+    /// Test hook invoked in `get_readable` and `list_readable` between capturing the
+    /// entries and deciding on them.
+    #[cfg(test)]
+    after_info_hook: Mutex<Option<TestHook>>,
     #[cfg(test)]
     observer_wait_hook: Mutex<Option<WaitHook>>,
     #[cfg(test)]
@@ -351,6 +371,8 @@ impl Runtime {
             last_checkpoint: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
             host_epoch: AtomicU64::new(0),
+            host_installs: AtomicU64::new(0),
+            auth: Default::default(),
             worker: ReentrantMutex::new(()),
             worker_round: AtomicBool::new(false),
             deferred_close: AtomicBool::new(false),
@@ -358,6 +380,8 @@ impl Runtime {
             switched: AtomicU64::new(0),
             #[cfg(test)]
             before_read_state_hook: Mutex::new(None),
+            #[cfg(test)]
+            after_info_hook: Mutex::new(None),
             #[cfg(test)]
             busy_waits: AtomicUsize::new(0),
             #[cfg(test)]
@@ -396,10 +420,17 @@ impl Runtime {
             let mut slot = self.host.write();
             let old = slot.replace(host);
             self.host_seq.fetch_add(1, Ordering::AcqRel);
+            self.host_installs.fetch_add(1, Ordering::AcqRel);
             old
         };
         drop(old);
         self.kick();
+    }
+
+    /// The installed host and which installation it is, read together.
+    pub(super) fn current_install(&self) -> (u64, Option<Arc<dyn Host>>) {
+        let slot = self.host.read();
+        (self.host_installs.load(Ordering::Acquire), slot.clone())
     }
 
     pub(super) fn current_host(&self) -> (u64, Option<Arc<dyn Host>>) {
