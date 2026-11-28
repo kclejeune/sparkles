@@ -103,7 +103,7 @@ fn unopened_parent_preserves_exact_commit_origin_and_durable_bytes() {
         Err(Error::BudgetExceeded(_))
     ));
     assert_eq!(durable_bytes(dir.path()), before);
-    // Ordinary origin-aware reads are an independent sufficient-cap oracle.
+    // Ordinary origin-aware reads must agree with bounded reads.
     let (legacy, legacy_resolved, legacy_origin) = main
         .snapshot_at_with_branch(&child, &At::Commit(target.seq), &HistoryOptions::default())
         .unwrap();
@@ -400,7 +400,7 @@ fn cold_historical_providers_match_ordinary_configuration_without_rebuilding() {
         ..Default::default()
     };
     std::fs::write(root.join("geo.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
-    // Past snapshots omit the configured live full-text provider.
+    // Text settings alone cannot provide an index for a cold origin.
     std::fs::write(
         root.join("text.json"),
         serde_json::to_vec(&sparkles_core::text::TextConfig::default()).unwrap(),
@@ -437,6 +437,7 @@ fn cold_historical_providers_match_ordinary_configuration_without_rebuilding() {
         snapshot.geo.as_ref().map(|g| &*g.config)
     );
     assert_eq!(rows(legacy), rows(snapshot));
+    assert_eq!(durable_bytes(family.dir.path()), before);
 }
 
 #[cfg(feature = "failpoints")]

@@ -993,7 +993,7 @@ impl Store {
             set.opts.geo_op_vertices,
             set.opts.history_cache_bytes,
         ));
-        // Ordinary past snapshots deliberately have no live full-text index.
+        // Cold history leaves the live full-text index unopened.
         let snapshot = Arc::new(
             SnapshotBuilder::of_generation(
                 Shared {

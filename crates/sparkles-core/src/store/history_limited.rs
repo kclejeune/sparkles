@@ -266,6 +266,27 @@ impl Store {
         Ok(snap)
     }
 
+    pub(super) fn snapshot_pinned(
+        &self,
+        store: &Store,
+        at: &At,
+        options: &HistoryOptions,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+        let (snapshot, resolved, origin, _) =
+            self.snapshot_pinned_mode(store, at, options, None, false)?;
+        // The requested branch and selector can carry a different semantic
+        // configuration from the branch that served the inherited RDF commit.
+        let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
+            let prep = options.temporary(crate::evidence::resolve::MEMORY_BYTES)?;
+            let (pinned, _held) =
+                self.pin_historical_evidence(store, at, resolved.commit.seq, snapshot, &prep)?;
+            pinned
+        } else {
+            snapshot
+        };
+        Ok((snapshot, resolved, origin))
+    }
+
     /// Origin-aware bounded counterpart of snapshot_at_with_branch.
     pub fn snapshot_at_with_branch_limited(
         &self,
@@ -337,7 +358,7 @@ impl Store {
                 "the pinned branch belongs to a different dataset family",
             ));
         }
-        self.snapshot_pinned_limited_mode(store, at, options, max_memory_bytes, committed_only)
+        self.snapshot_pinned_mode(store, at, options, Some(max_memory_bytes), committed_only)
     }
 
     pub(super) fn snapshot_at_prepared(
@@ -355,7 +376,7 @@ impl Store {
                 "physical selection requires the actual owning main Store",
             ));
         }
-        self.snapshot_pinned_limited(logical, at, preparation, memory)
+        self.snapshot_pinned_mode(logical, at, preparation, Some(memory), false)
     }
 
     /// The state of the branch whose identity is `branch` at `at`, within
@@ -461,25 +482,15 @@ impl Store {
         self.snapshot_from_limited(PinnedSource::Cold(branch), at, options, max_memory_bytes)
     }
 
-    fn snapshot_pinned_limited(
+    fn snapshot_pinned_mode(
         &self,
         store: &Store,
         at: &At,
         options: &dyn ReadControl,
-        memory: u64,
-    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
-        self.snapshot_pinned_limited_mode(store, at, options, memory, false)
-    }
-
-    fn snapshot_pinned_limited_mode(
-        &self,
-        store: &Store,
-        at: &At,
-        options: &dyn ReadControl,
-        memory: u64,
+        memory: Option<u64>,
         committed_only: bool,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
-        self.snapshot_from_limited_mode(
+        self.snapshot_from_mode(
             PinnedSource::Resident(branching::BranchStore::Main(store)),
             at,
             options,
@@ -495,31 +506,24 @@ impl Store {
         options: &dyn ReadControl,
         memory: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
-        self.snapshot_from_limited_mode(start, at, options, memory, false)
+        self.snapshot_from_mode(start, at, options, Some(memory), false)
     }
 
-    fn snapshot_from_limited_mode(
+    fn snapshot_from_mode(
         &self,
         start: PinnedSource<'_>,
         at: &At,
         options: &dyn ReadControl,
-        memory: u64,
+        memory: Option<u64>,
         committed_only: bool,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid, SnapshotCharge)> {
         use PinnedSource as Source;
         use branching::readonly::OriginRead;
-        let capacity = self
-            .opts
-            .shared
-            .as_ref()
-            .map_or(self.opts.history_cache_bytes, |scope| {
-                scope.caches.history().capacity()
-            });
-        let memory = memory.min(capacity);
+        let memory = memory.map(|bytes| bytes.min(self.history_cache_capacity()));
         let limit = ReadLimit {
             options,
-            memory: Some(memory),
-            held: crate::history::READ_METADATA_BYTES,
+            memory,
+            held: memory.map_or(0, |_| crate::history::READ_METADATA_BYTES),
         };
         let mut selected = start;
         let mut inherited = None;
@@ -536,7 +540,7 @@ impl Store {
                 Source::Resident(store) => (
                     store.branch_id(),
                     store
-                        .snapshot_at_inner_mode(requested, options, Some(memory), committed_only)
+                        .snapshot_at_inner_mode(requested, options, memory, committed_only)
                         .map(|(snapshot, resolved, charge)| {
                             OriginRead::View(snapshot, resolved, charge)
                         }),

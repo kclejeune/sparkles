@@ -3355,7 +3355,8 @@ impl Store {
 
     /// Resolve a view from an already retained branch store in this dataset family,
     /// following inherited history by identity. Call on the family's owning store,
-    /// as for branch_snapshot_at. The UUID names the branch that owns the commit.
+    /// as for branch_snapshot_at. Unopened origins are read directly from retained
+    /// files. The UUID names the branch that owns the commit.
     pub fn snapshot_at_with_branch(
         &self,
         store: &Store,
@@ -3368,57 +3369,6 @@ impl Store {
             ));
         }
         self.snapshot_pinned(store, at, options)
-    }
-
-    fn snapshot_pinned(
-        &self,
-        store: &Store,
-        at: &At,
-        options: &crate::history::HistoryOptions,
-    ) -> Result<(Arc<Snapshot>, crate::history::Resolved, uuid::Uuid)> {
-        match store.snapshot_at(at, options) {
-            Ok((snapshot, resolved)) => Ok((snapshot, resolved, store.branch_id())),
-            Err(error) => match branch::inherited_commit(&error) {
-                Some(commit) => {
-                    if let At::Time(ms) = at {
-                        let limit = crate::history::ReadLimit {
-                            options,
-                            memory: None,
-                            held: 0,
-                        };
-                        if *ms >= self.origin_timestamp_limited(commit, &limit)? {
-                            return Err(store.unresolved_time_limited(*ms, &limit)?);
-                        }
-                    }
-                    let owner = self.owned_set()?.normalize(commit);
-                    let upstream = self.branch_by_id(owner.branch_id)?;
-                    let (snapshot, resolved, origin) = match at {
-                        At::Time(_) => self.snapshot_pinned(&upstream, at, options)?,
-                        _ => self.snapshot_pinned(&upstream, &At::Commit(commit.seq), options)?,
-                    };
-                    // A historical selector on `store` (named snapshot, commit, or time)
-                    // may carry a semantic configuration distinct from the inherited RDF
-                    // commit's own binding (via `PinnedConfiguration` or `BranchConfigurationOrigin`):
-                    // re-pin it using `store` before returning.
-                    let snapshot = if !matches!(at, At::Head) && self.configuration_activated() {
-                        use crate::history::ReadControl;
-                        let prep = options.temporary(crate::evidence::resolve::MEMORY_BYTES)?;
-                        let (pinned, _held) = self.pin_historical_evidence(
-                            store,
-                            at,
-                            resolved.commit.seq,
-                            snapshot,
-                            &prep,
-                        )?;
-                        pinned
-                    } else {
-                        snapshot
-                    };
-                    Ok((snapshot, resolved, origin))
-                }
-                None => Err(error),
-            },
-        }
     }
 
     /// Resolve `at` on branch `name`, following its history into the upstream. Returns
