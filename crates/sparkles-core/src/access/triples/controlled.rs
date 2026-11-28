@@ -283,8 +283,9 @@ fn prepare_input(
         .flatten();
     let (key, key_held) =
         cache_key_with_evidence(&access, rules.map(Arc::as_ref), ev_fp, preparation)?;
+    let text = crate::text::MaskTextIdentity::of(snap);
     let existing = if use_controlled_cache {
-        snap.counts.prepared_mask_slot(&key, preparation)?
+        snap.counts.prepared_mask_slot(&key, text, preparation)?
     } else {
         None
     };
@@ -351,12 +352,13 @@ fn prepare_input(
     if use_controlled_cache
         && let Some(slot) = snap
             .counts
-            .cache_prepared_mask(key, &snapshot, preparation)?
+            .cache_prepared_mask(key, text, &snapshot, preparation)?
         && let Some(mask) = &snapshot.mask
     {
         mask.attach_cache(
             &snap.counts,
             crate::sparql::stats::MaskCacheKind::Controlled,
+            text,
             slot,
         );
     }
@@ -1615,7 +1617,7 @@ mod tests {
             let _live_holder = view.masked_controlled(&snap, &prep).unwrap();
             let slot = snap
                 .counts
-                .prepared_mask_slot(&key, &prep)
+                .prepared_mask_slot(&key, crate::text::MaskTextIdentity::of(&snap), &prep)
                 .unwrap()
                 .unwrap();
             let held = slot.lock();
@@ -1996,7 +1998,7 @@ mod tests {
         let (key, _held) = cache_key(&view, view.triples.as_ref().unwrap(), &clean).unwrap();
         assert!(
             snap.counts
-                .prepared_mask_slot(&key, &clean)
+                .prepared_mask_slot(&key, crate::text::MaskTextIdentity::of(&snap), &clean)
                 .unwrap()
                 .is_none()
         );
@@ -2058,7 +2060,7 @@ mod tests {
                 cache_key(&access, access.triples.as_ref().unwrap(), &clean).unwrap();
             assert!(
                 snap.counts
-                    .prepared_mask_slot(&key, &clean)
+                    .prepared_mask_slot(&key, crate::text::MaskTextIdentity::of(&snap), &clean)
                     .unwrap()
                     .is_none()
             );

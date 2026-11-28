@@ -357,7 +357,7 @@ impl Recovery {
     /// Publish this job's current state in the store's snapshot, so that text queries
     /// report a failure without waiting for the next commit. The writer lock keeps a
     /// concurrent commit from publishing an older view after this one.
-    fn publish_state(self: &Arc<Self>) {
+    fn publish_state(self: &Arc<Self>, reason: &'static str) {
         let (Some(writer), Some(current), Some(slot)) = (
             self.writer.upgrade(),
             self.current.upgrade(),
@@ -389,7 +389,10 @@ impl Recovery {
             // intent durably before removing the job. A failed retirement leaves
             // the old index stale, with its rebuild path still available.
             match self.root.as_deref().map_or(Ok(()), remove_pending) {
-                Ok(()) => slot.store(None),
+                Ok(()) => {
+                    slot.store(None);
+                    tracing::warn!(target: "sparkles::text", root = ?self.root, config = ?self.config, reason, "discarded the rejected text configuration");
+                }
                 Err(error) => {
                     tracing::warn!(target: "sparkles::store", %error, "could not discard the rejected text configuration");
                 }
@@ -418,7 +421,7 @@ impl Recovery {
                 state.failure = Some(reason);
             }
         }
-        self.publish_state();
+        self.publish_state(reason);
         let mut state = self.state.lock();
         self.active.store(false, Ordering::Release);
         state.running = false;

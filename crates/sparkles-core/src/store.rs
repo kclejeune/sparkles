@@ -4369,8 +4369,6 @@ impl Store {
             && let Some(view) = &live.text
         {
             let mut adjusted = (*snapshot).clone();
-            // A cached mask includes the text view it was made from.
-            adjusted.counts = Default::default();
             adjusted.text = Some(Arc::new(
                 view.with_historical_changes(adjusted.commit, live.clone()),
             ));
@@ -5008,6 +5006,11 @@ impl Store {
                 })
             {
                 return Ok((self.named(&h, name, p, current, head.seq), false));
+            }
+            if p.seq == seq && text.is_some() && p.text_index.is_none() {
+                return Err(Error::Conflict(format!(
+                    "snapshot '{name}' already pins commit {seq} without a full-text index. Use PUT /$/snapshots/{{ds}}/{{name}}/text to add one"
+                )));
             }
             return Err(Error::Conflict(format!(
                 "snapshot '{name}' already pins commit {}",

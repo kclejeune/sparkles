@@ -180,6 +180,7 @@ impl TripleRules {
 /// Link back to the base snapshot's non-owning mask deduplication slot so dropping
 /// the last masked snapshot evicts its dead entry on a best-effort basis.
 pub(crate) struct MaskCacheLink {
+    text: crate::text::MaskTextIdentity,
     cache: std::sync::Weak<crate::sparql::stats::CountCache>,
     kind: crate::sparql::stats::MaskCacheKind,
     slot: crate::sparql::stats::MaskSlot,
@@ -229,7 +230,7 @@ impl Drop for Mask {
         if let Some(link) = self.cache_link.get()
             && let Some(cache) = link.cache.upgrade()
         {
-            cache.evict_mask_slot(link.kind, &self.key, &link.slot);
+            cache.evict_mask_slot(link.kind, &self.key, link.text, &link.slot);
         }
     }
 }
@@ -255,11 +256,13 @@ impl Mask {
         &self,
         cache: &Arc<crate::sparql::stats::CountCache>,
         kind: crate::sparql::stats::MaskCacheKind,
+        text: crate::text::MaskTextIdentity,
         slot: crate::sparql::stats::MaskSlot,
     ) {
         let _ = self.cache_link.set(MaskCacheLink {
             cache: Arc::downgrade(cache),
             kind,
+            text,
             slot,
         });
     }
@@ -305,7 +308,8 @@ pub(super) fn masked(
         key.push_str("|ev:");
         key.push_str(&cfg.fingerprint);
     }
-    let slot = snap.counts.mask_slot(&key);
+    let text = crate::text::MaskTextIdentity::of(snap);
+    let slot = snap.counts.mask_slot(&key, text);
     let mut held = slot.lock();
     if let Some(m) = held.upgrade() {
         return Ok(m);
@@ -340,8 +344,12 @@ pub(super) fn masked(
         Ok(hidden) => hidden,
         Err(err) => {
             drop(held);
-            snap.counts
-                .evict_mask_slot(crate::sparql::stats::MaskCacheKind::Legacy, &key, &slot);
+            snap.counts.evict_mask_slot(
+                crate::sparql::stats::MaskCacheKind::Legacy,
+                &key,
+                text,
+                &slot,
+            );
             return Err(err);
         }
     };
@@ -351,6 +359,7 @@ pub(super) fn masked(
         mask.attach_cache(
             &snap.counts,
             crate::sparql::stats::MaskCacheKind::Legacy,
+            text,
             slot.clone(),
         );
     }

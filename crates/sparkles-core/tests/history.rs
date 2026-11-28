@@ -417,6 +417,24 @@ fn historical_text_search_reverses_inserts_and_deletes_under_the_query_budget() 
 
 #[cfg(feature = "text")]
 #[test]
+fn creating_an_indexed_snapshot_reports_an_existing_pin_without_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = open(dir.path(), StoreOptions::default());
+    s.enable_text(Default::default()).unwrap();
+    let (pin, _) = s.create_snapshot("search", &At::Head, None).unwrap();
+    let Err(Error::Conflict(message)) =
+        s.create_snapshot_with_text("search", &At::Head, &Default::default())
+    else {
+        panic!("creating an indexed pin over an unindexed pin must conflict");
+    };
+    assert!(message.contains(&format!(
+        "already pins commit {} without a full-text index",
+        pin.seq
+    )));
+}
+
+#[cfg(feature = "text")]
+#[test]
 fn named_snapshot_text_survives_compaction_reopen_and_live_disable() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");

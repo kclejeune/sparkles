@@ -282,7 +282,6 @@ impl Store {
             return Ok(None);
         };
         let mut pinned = (**snapshot).clone();
-        pinned.counts = Default::default();
         pinned.text = Some(Arc::new(crate::text::TextView::pinned(
             snapshot.commit,
             LazyTextPin {
@@ -301,7 +300,7 @@ impl Store {
 #[cfg(feature = "text")]
 pub(crate) struct LazyTextPin {
     name: String,
-    id: uuid::Uuid,
+    pub(crate) id: uuid::Uuid,
     path: PathBuf,
     history: std::sync::Weak<Mutex<crate::history::HistoryState>>,
     opened: std::sync::OnceLock<Arc<crate::text::TextView>>,

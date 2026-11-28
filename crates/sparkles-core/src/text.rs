@@ -713,6 +713,42 @@ pub struct RebuildInfo {
     pub docs: u64,
 }
 
+/// The text state retained by a cached triple mask. The surrounding RDF count
+/// cache already identifies the commit and generation being masked.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) enum MaskTextIdentity {
+    #[default]
+    None,
+    #[cfg(feature = "text")]
+    Direct(usize),
+    #[cfg(feature = "text")]
+    Historical(usize),
+    #[cfg(feature = "text")]
+    Pin(uuid::Uuid),
+}
+
+impl MaskTextIdentity {
+    pub(crate) fn of(
+        #[cfg_attr(not(feature = "text"), allow(unused_variables))] snap: &crate::store::Snapshot,
+    ) -> Self {
+        #[cfg(feature = "text")]
+        if let Some(view) = &snap.text {
+            // Pin and historical wrappers are allocated anew on each read. Any
+            // live cached mask keeps its direct view or historical base alive.
+            if let ViewSource::Pin(pin) = &view.source {
+                return Self::Pin(pin.id);
+            }
+            if !view.uncommitted
+                && let Some(base) = &view.overlay_base
+            {
+                return Self::Historical(std::sync::Arc::as_ptr(base).addr());
+            }
+            return Self::Direct(std::sync::Arc::as_ptr(view).addr());
+        }
+        Self::None
+    }
+}
+
 /// The search state a snapshot sees.
 pub struct TextView {
     /// the commit the view reflects

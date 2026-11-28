@@ -503,10 +503,12 @@ sized at about one to two weeks.
 * **Historical full-text.** Same-generation searches use the head index and the
   reversed net delta. The view retains a shared head handle and the query accounts
   for its adjustment and hit buffers. The evaluator scans matching candidates before
-  applying the limit, including on requests for a single hit. Named pins created
-  with `text: true` keep a separate immutable index under `history-text`. Format 3 of
-  `history.json` references the index by UUID, and versioned index metadata records
-  its commit, configuration and dictionary fingerprints. Pin creation installs the
+  applying the limit, including on requests for a single hit. When an adjusted search
+  exceeds `maxHits`, it counts every matching hit so the overflow error reports the
+  full count. Named pins created with `text: true` keep a separate immutable index
+  under `history-text`. Format 3 of `history.json` references the index by UUID,
+  and versioned index metadata records its commit, configuration and dictionary
+  fingerprints. Pin creation installs the
   index before publishing the reference. Removal publishes the new history record
   before reclaiming the files. The first text search on a snapshot holds the history
   mutex while opening the immutable index so removal cannot race its file opens.
