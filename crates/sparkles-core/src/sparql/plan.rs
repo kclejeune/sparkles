@@ -1312,6 +1312,12 @@ impl<'a> Planner<'a> {
             && scratch.is_some()
         {
             held.adopt_charge(&mut scratch)?;
+        } else if let Some(c) = scratch {
+            let bytes = c.bytes();
+            if bytes > 0 {
+                let lease = c.output_lease(bytes)?;
+                self.ctx.retain_plan_lease(lease);
+            }
         }
         Ok(())
     }
@@ -1562,6 +1568,9 @@ impl<'a> Planner<'a> {
                 right,
                 expression,
             } if super::enhancer::is_loop(right) => {
+                if let Some(e) = expression {
+                    super::svcfn::admit_tree(self.ctx, e)?;
+                }
                 let certain = certain_vars(left, self.ctx);
                 let (push, top, _push_list) =
                     self.split_filters(filters, |v| certain.contains(v))?;

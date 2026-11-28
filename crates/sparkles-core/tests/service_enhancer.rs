@@ -1679,3 +1679,70 @@ fn a_guarded_view_scopes_its_entries_by_its_exemptions() {
     wide.store(true, Ordering::SeqCst);
     assert_eq!(run(&data, &count, &o).unwrap(), vec!["1"]);
 }
+
+/// A SERVICE call in an UPDATE WHERE clause does not read from or publish to the cache.
+/// Values inserted by one operation and readable by another operation's SERVICE are not
+/// published, and a rolled-back UPDATE leaves the cache as it was (Sol round-2 P1-1).
+#[test]
+fn an_update_does_not_cache_service_results() {
+    let data = store(&departments(4));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let count = format!("{se} SELECT (COUNT(?id) AS ?n) {{ ?id se:cacheLs () }}");
+    // a SELECT caches the result
+    let select = format!(
+        "SELECT ?p {{ VALUES ?d {{ <urn:dept1> }} SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    rows(&data, &select);
+    assert_eq!(rows(&data, &count), vec!["1"]);
+    // clear for the UPDATE test
+    let admin = QueryOptions {
+        service_cache_mgmt: true,
+        ..opts()
+    };
+    sparkles_core::sparql::query(
+        data.snapshot(),
+        &format!("{se} SELECT (se:cacheRm() AS ?r) {{ }}"),
+        &admin,
+    )
+    .unwrap();
+    assert_eq!(rows(&data, &count), vec!["0"]);
+    // the same loop in an UPDATE WHERE must not publish to the cache
+    let u = format!(
+        "INSERT {{ <urn:test> <urn:n> ?p }} WHERE {{ VALUES ?d {{ <urn:dept2> }} SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    sparkles_core::sparql::update::update(&data, &u, &admin).unwrap();
+    let sent = ep.take();
+    assert!(!sent.is_empty(), "the endpoint received requests");
+    assert_eq!(
+        rows(&data, &count),
+        vec!["0"],
+        "UPDATE must not publish SERVICE results to the cache"
+    );
+    // the inserted data proves the SERVICE ran
+    assert!(
+        !rows(&data, "SELECT ?n { <urn:test> <urn:n> ?n }").is_empty(),
+        "the UPDATE committed its WHERE results"
+    );
+}
+
+/// A deferred OPTIONAL condition that calls se:cacheRm inside EXISTS is refused at
+/// planning time, not deferred to execution (Sol round-2 P2-4).
+#[test]
+fn a_deferred_optional_refuses_cache_rm() {
+    let data = store(&departments(2));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let q = format!(
+        "{se} SELECT ?d ?p {{ ?d a <urn:Department> OPTIONAL {{ SERVICE <loop:{}> {{ ?d <urn:hasEmployee> ?p }} FILTER EXISTS {{ BIND(se:cacheRm() AS ?rm) }} }} }}",
+        ep.url()
+    );
+    let r = run(&data, &q, &opts());
+    assert!(
+        matches!(r, Err(Error::NotPermitted(_))),
+        "expected NotPermitted, got {r:?}"
+    );
+    assert!(ep.take().is_empty(), "no requests should have been sent");
+}

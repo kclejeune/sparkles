@@ -598,13 +598,13 @@ impl Service {
                     if let Some(copy) = tee.take() {
                         *tee = copy.push(&solution)?;
                     }
-                    // A response to a request with a LIMIT holds no more solutions than
-                    // it, so the copy is whole once it has them, even when the query
-                    // reads no further. The answer is read once more first: the copy is
-                    // kept only if the response ends there, and a row past the limit or
-                    // a failure, which the next read meets as it would have, drops it.
-                    // A SILENT call reads its whole answer before any row, and keeps its
-                    // copy at the end, once the response is known to have succeeded.
+                    // A SILENT call reads its whole answer before returning any row and
+                    // caches it at the end. A non-SILENT call that reached the LIMIT
+                    // reads one more row: the copy is kept only if the response ends
+                    // there, and an extra row or failure drops it. An error during the
+                    // read-ahead (such as a timeout when the endpoint stalls after the
+                    // last row) leaves the response uncached rather than failing the
+                    // query, since the demanded rows are already in hand.
                     if silent_prior.is_none()
                         && tee
                             .as_ref()
@@ -625,7 +625,10 @@ impl Service {
                         } else {
                             *tee = None;
                         }
-                        *peeked = Some(after);
+                        match after {
+                            Some(Err(_)) => {}
+                            other => *peeked = Some(other),
+                        }
                     }
                     push(&mut b, bnodes, &ServiceSolution::Remote(&solution));
                     ctx.check()?;
@@ -1088,6 +1091,7 @@ mod tests {
     /// The streamed answer to a request with a LIMIT is cached only once the response
     /// is known to end at the limit: a response that fails after the rows it was asked
     /// for, or sends more of them, leaves the cache as it was, with SILENT or without.
+    /// A read-ahead error (such as a timeout) also leaves the cache as it was.
     #[test]
     fn a_limited_answer_is_cached_only_when_it_ends_at_the_limit() {
         use crate::sparql::svccache::{Parts, Slice};

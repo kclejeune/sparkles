@@ -3562,7 +3562,11 @@ both, a query that calls it fails with `403`, and a call inside EXISTS, includin
 within a SERVICE that runs against the dataset itself, is refused before the query runs.
 A call through `fn:apply` or `afn:eval` is an error of the expression and removes nothing.
 Both functions work in the WHERE clause of an UPDATE, which uses the store's SERVICE
-cache, under the same rules.
+cache, under the same rules. A SERVICE call in an UPDATE WHERE clause does not read
+from or publish to the SERVICE cache, so an uncommitted or rolled-back value never
+reaches a cached entry. The management functions are independent of this: `se:cacheRm`
+removes entries as an external side effect and its removal survives an RDF rollback
+of the same UPDATE, since the cache is not part of the RDF transaction.
 Library users set `QueryOptions::service_cache_mgmt`. Neither function reaches another
 caller's entries, and the results of `se:cacheLs`, and of a LATERAL or EXISTS that calls
 either function, are never kept in the query result cache.

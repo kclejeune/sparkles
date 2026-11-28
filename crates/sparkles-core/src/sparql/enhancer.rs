@@ -1702,49 +1702,63 @@ impl RemoteRun {
                     })
                 } else {
                     match answer {
-                        // the parts copy the response, so they are admitted before
-                        Ok((r, c)) => match c.add(r.retained_bytes()).map(|()| {
-                            charges.push(c);
-                            split(&r, &rl.idx, chunk.len())
-                        }) {
-                            Err(e) => Err(e),
-                            Ok(Some(parts)) => Ok(chunk
+                        Ok((r, c)) => {
+                            // the parts copy the response and each gets its own
+                            // schema clone and row vector
+                            let schema_bytes: u64 = r
+                                .vars
                                 .iter()
-                                .copied()
-                                .zip(parts)
-                                .map(|(i, p)| (i, p, true))
-                                .collect()),
-                            Ok(None) => {
-                                // cut short: one request per input
-                                stats.retried += 1;
-                                let mut out = Vec::new();
-                                let mut err = None;
-                                // Each answer is held before the next request goes out.
-                                let mut retried = held;
-                                for i in chunk {
-                                    match ctx
-                                        .check()
-                                        .and_then(|()| one(&inputs[*i], stats))
-                                        .and_then(|(r, c)| {
-                                            retried = retried.saturating_add(r.retained_bytes());
-                                            admit(retried).map(|()| {
-                                                drop(c);
-                                                r
-                                            })
-                                        }) {
-                                        Ok(r) => out.push((*i, r, true)),
-                                        Err(e) => {
-                                            err = Some(e);
-                                            break;
+                                .filter(|v| *v != rl.idx.as_str())
+                                .map(|v| (v.len() + std::mem::size_of::<String>()) as u64)
+                                .sum();
+                            let split_overhead = chunk.len() as u64
+                                * (schema_bytes + std::mem::size_of::<Rows>() as u64);
+                            let admitted = c
+                                .add(r.retained_bytes().saturating_add(split_overhead))
+                                .map(|()| {
+                                    charges.push(c);
+                                    split(&r, &rl.idx, chunk.len())
+                                });
+                            match admitted {
+                                Err(e) => Err(e),
+                                Ok(Some(parts)) => Ok(chunk
+                                    .iter()
+                                    .copied()
+                                    .zip(parts)
+                                    .map(|(i, p)| (i, p, true))
+                                    .collect()),
+                                Ok(None) => {
+                                    // cut short: one request per input
+                                    stats.retried += 1;
+                                    let mut out = Vec::new();
+                                    let mut err = None;
+                                    let mut retried = held;
+                                    for i in chunk {
+                                        match ctx
+                                            .check()
+                                            .and_then(|()| one(&inputs[*i], stats))
+                                            .and_then(|(r, c)| {
+                                                retried =
+                                                    retried.saturating_add(r.retained_bytes());
+                                                admit(retried).map(|()| {
+                                                    drop(c);
+                                                    r
+                                                })
+                                            }) {
+                                            Ok(r) => out.push((*i, r, true)),
+                                            Err(e) => {
+                                                err = Some(e);
+                                                break;
+                                            }
                                         }
                                     }
-                                }
-                                match err {
-                                    Some(e) => Err(e),
-                                    None => Ok(out),
+                                    match err {
+                                        Some(e) => Err(e),
+                                        None => Ok(out),
+                                    }
                                 }
                             }
-                        },
+                        }
                         Err(e) => Err(e),
                     }
                 };
@@ -1764,8 +1778,9 @@ impl RemoteRun {
                     }
                     Err(e) => failed(ctx, e, rl, chunk, inputs, unit)?,
                 }
-                // the answers' own allocations, which `Rows::bytes` estimates low for
-                // wide rows of unbound slots
+                // release the per-fetch charges before admitting the held total, so
+                // the same rows are not counted twice against the budget
+                drop(charges);
                 let answered: u64 = chunk
                     .iter()
                     .filter_map(|&i| inputs[i].rows.as_ref())
@@ -1774,7 +1789,6 @@ impl RemoteRun {
                 held = held.saturating_add(answered);
                 self.held = held;
                 admit(held)?;
-                drop(charges);
             }
         }
         Ok(())

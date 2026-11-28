@@ -414,6 +414,7 @@ impl Request<'_> {
         if let Some(s) = &self.opts.service_scope {
             ctx.service_scope = s.clone();
         }
+        ctx.use_cache = false;
         ctx.service_cache_mgmt = self.opts.service_cache_mgmt;
         ctx.local_endpoints = self.opts.local_endpoints.clone();
         ctx.service_depth = self.opts.service_depth;

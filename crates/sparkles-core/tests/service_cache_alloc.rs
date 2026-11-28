@@ -102,3 +102,58 @@ fn a_disk_entry_is_admitted_before_it_is_decoded() {
         "{spent} bytes allocated under a budget of {budget}, for decoded rows of {decoded}"
     );
 }
+
+/// Nested RDF 1.2 triple terms allocate a boxed `Triple` and owned names per nesting
+/// level. The admission counts them from `<<` markers in the raw text before parsing,
+/// so the query budget stops the decoding before the parser reaches its peak (Sol
+/// round-2 P1-2).
+#[test]
+fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ServiceCache::new(0);
+    cache.set_disk(Some(Arc::new(
+        DiskTier::open(dir.path().join("svc"), 1 << 20).unwrap(),
+    )));
+    let triple_term = Term::Triple(Box::new(oxrdf::Triple::new(
+        oxrdf::NamedNode::new_unchecked("urn:s"),
+        oxrdf::NamedNode::new_unchecked("urn:p"),
+        Term::Triple(Box::new(oxrdf::Triple::new(
+            oxrdf::NamedNode::new_unchecked("urn:s2"),
+            oxrdf::NamedNode::new_unchecked("urn:p2"),
+            Term::Literal(oxrdf::Literal::new_simple_literal("leaf")),
+        ))),
+    )));
+    let rows = Arc::new(Rows {
+        vars: vec!["v".to_string()],
+        rows: (0..100).map(|_| vec![Some(triple_term.clone())]).collect(),
+    });
+    let url = "http://e/sparql";
+    let k = key("a", url, "nested", &[]);
+    cache.put(
+        k.clone(),
+        Parts::of("a", url, "nested"),
+        Slice::ALL,
+        rows.clone(),
+    );
+    let file = cache.disk().unwrap().bytes();
+    assert!(file > 0, "the entry is on disk");
+    let admitted = std::cell::Cell::new(0u64);
+    let budget = file + (8 << 10);
+    let before = allocated();
+    let r = cache.get_admitted(&k, Slice::ALL, &|n| {
+        admitted.set(admitted.get().saturating_add(n));
+        if admitted.get() > budget {
+            return Err(Error::invalid("over the query's budget"));
+        }
+        Ok(())
+    });
+    let spent = allocated() - before;
+    assert!(
+        r.is_err(),
+        "nested triple terms should exceed a file-sized budget"
+    );
+    assert!(
+        spent < budget + (64 << 10),
+        "{spent} bytes allocated under a budget of {budget}"
+    );
+}

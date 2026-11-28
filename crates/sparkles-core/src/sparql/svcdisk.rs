@@ -955,8 +955,10 @@ fn decode(
         for _ in 0..width {
             let n = take!(peek.u32());
             if n != UNBOUND {
-                take!(peek.take(take!(usize::try_from(n).map_err(|_| Bad::Damaged))));
-                terms = terms.saturating_add(u64::from(n) + TERM_EXTRA);
+                let raw = take!(peek.take(take!(usize::try_from(n).map_err(|_| Bad::Damaged))));
+                let nesting = raw.windows(2).filter(|w| w == b"<<").count() as u64;
+                let nested = nesting * (size_of::<oxrdf::Triple>() as u64 + 3 * 24);
+                terms = terms.saturating_add(u64::from(n) + TERM_EXTRA + nested);
             }
         }
         admit((slots as u64).saturating_add(terms))?;

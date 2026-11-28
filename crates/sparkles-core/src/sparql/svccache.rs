@@ -535,6 +535,8 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 thread_local! {
     static BETWEEN_TIERS: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_DISK_PUT: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -546,9 +548,22 @@ fn between_tiers() {
     })
 }
 
+#[cfg(test)]
+fn after_disk_put() {
+    AFTER_DISK_PUT.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f()
+        }
+    })
+}
+
 #[cfg(not(test))]
 #[inline(always)]
 fn between_tiers() {}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn after_disk_put() {}
 
 /// A store's view of the cache of remote SERVICE results.
 pub struct ServiceCache {
@@ -729,7 +744,9 @@ impl ServiceCache {
 
     /// Keep `rows`, the response to the request `key` with the slice `slice`, unless
     /// they are larger than an eighth of the budget, or the entry kept for the request
-    /// already holds them or holds as many solutions or more.
+    /// already holds them or holds as many solutions or more. A removal that happens
+    /// between the disk write and the memory insert prevents the entry from being kept
+    /// in memory.
     pub fn put(&self, key: String, parts: Parts, slice: Slice, rows: Arc<Rows>) {
         if !self.enabled() {
             return;
@@ -739,6 +756,7 @@ impl ServiceCache {
         {
             return;
         }
+        let before = self.removals.load(Ordering::SeqCst);
         let e = Arc::new(Entry::new(
             Arc::from(key),
             parts,
@@ -749,7 +767,22 @@ impl ServiceCache {
         if let Some(disk) = self.disk() {
             disk.put(&e);
         }
-        self.keep(e);
+        after_disk_put();
+        if self.removals.load(Ordering::SeqCst) != before {
+            return;
+        }
+        self.keep(e.clone());
+        if self.removals.load(Ordering::SeqCst) != before
+            && let Some(c) = &self.store.cache
+        {
+            c.remove_if(
+                &NsKeyRef {
+                    ns: self.ns,
+                    key: &e.key,
+                },
+                |v| Arc::ptr_eq(v, &e),
+            );
+        }
     }
 
     /// Keep `e` in memory, if it is small enough.
@@ -1450,5 +1483,44 @@ mod tests {
             newer,
             "the newer file is kept"
         );
+    }
+
+    fn set_after_disk_put(f: Option<Box<dyn Fn()>>) {
+        AFTER_DISK_PUT.with(|h| *h.borrow_mut() = f);
+    }
+
+    /// A scoped removal that runs between a writer's disk publication and its memory
+    /// insert prevents the writer from resurrecting the removed entry (Sol round-2 P2-1).
+    #[test]
+    fn a_removal_during_put_does_not_resurrect_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "http://e/sparql";
+        for by_scope in [true, false] {
+            let c = Arc::new(ServiceCache::new(1 << 20));
+            let disk = Arc::new(
+                super::super::svcdisk::DiskTier::open(
+                    dir.path().join(format!("svc-{by_scope}")),
+                    1 << 20,
+                )
+                .unwrap(),
+            );
+            c.set_disk(Some(disk));
+            let k = key("a", url, "race", &[]);
+            let remover = c.clone();
+            let rk = k.clone();
+            set_after_disk_put(Some(Box::new(move || {
+                if by_scope {
+                    let _ = remover.remove_in_scope("a", None);
+                } else {
+                    remover.remove(&rk);
+                }
+            })));
+            c.put(k.clone(), Parts::of("a", url, "race"), Slice::ALL, rows(3));
+            set_after_disk_put(None);
+            assert!(
+                c.get(&k, Slice::ALL).is_none(),
+                "by scope {by_scope}: the removed entry was resurrected by put"
+            );
+        }
     }
 }

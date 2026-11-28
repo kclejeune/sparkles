@@ -1402,6 +1402,7 @@ pub struct Ctx {
     strict_decode: AtomicU32,
     // Data and weak retained caches drop before final ledger ownership.
     fast: FastMemory,
+    plan_scratch_leases: parking_lot::Mutex<Vec<QueryMemoryLease>>,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
     // All ordinary payloads, including graphs and ledger callbacks, retire before
     // their actual sources. A new mask can share its original source's backing.
@@ -1917,6 +1918,7 @@ impl Ctx {
             streams: false,
             strict_decode: AtomicU32::new(0),
             fast: Default::default(),
+            plan_scratch_leases: Default::default(),
             memory: Default::default(),
             snap,
             read_source: None,
@@ -3324,6 +3326,10 @@ impl Ctx {
             bytes,
             service: None,
         })
+    }
+
+    pub(super) fn retain_plan_lease(&self, lease: QueryMemoryLease) {
+        self.plan_scratch_leases.lock().push(lease);
     }
 
     pub fn charge(&self, bytes: u64) -> Result<Charge<'_>> {

@@ -56,6 +56,56 @@ pub(super) fn check_rm(ctx: &Ctx) -> Result<()> {
     }
 }
 
+/// Walk every sub-expression of `e` and run the admission check on each. The planner's
+/// `compile` calls [`admit`] one expression at a time, but a deferred OPTIONAL condition
+/// is not compiled until execution, so this walk catches a `se:cacheRm` call buried in
+/// the tree before the condition is deferred.
+pub(super) fn admit_tree(ctx: &Ctx, e: &spargebra::algebra::Expression) -> Result<()> {
+    use spargebra::algebra::Expression as E;
+    admit(ctx, e)?;
+    match e {
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => {
+            admit_tree(ctx, a)?;
+            admit_tree(ctx, b)?;
+        }
+        E::Not(a) | E::UnaryPlus(a) | E::UnaryMinus(a) => admit_tree(ctx, a)?,
+        E::In(a, list) => {
+            admit_tree(ctx, a)?;
+            for x in list {
+                admit_tree(ctx, x)?;
+            }
+        }
+        E::If(a, b, c) => {
+            admit_tree(ctx, a)?;
+            admit_tree(ctx, b)?;
+            admit_tree(ctx, c)?;
+        }
+        E::Coalesce(args) => {
+            for a in args {
+                admit_tree(ctx, a)?;
+            }
+        }
+        E::FunctionCall(_, args) => {
+            for a in args {
+                admit_tree(ctx, a)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Refuse an expression that calls `se:cacheRm` with the wrong number of arguments, or
 /// in a query without the right to. The planner asks this of every expression it
 /// compiles. An EXISTS is compiled before any row reaches it and its pattern is planned

@@ -493,7 +493,11 @@ impl Failure {
 /// more time than this budget has, and whose bytes this budget counts. The time spent
 /// and the time reserved change together under one lock, so a reader never sees a
 /// share's reservation released before its time is spent, and two shares taken at once
-/// never reserve the same time.
+/// never reserve the same time. A single-request dispatch (one without a share) draws
+/// on the parent directly and snapshots the remaining time at dispatch: concurrent
+/// direct dispatches on the same parent can each see the full time left and together
+/// exceed it. Use shares for concurrent requests that must stay within a cumulative
+/// limit.
 #[derive(Debug)]
 pub struct RequestBudget {
     max_bytes: u64,
