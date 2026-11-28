@@ -451,37 +451,62 @@ Item 1286 keeps the Horn share in rooted runs. A rooted run without counting lef
 functional, inverse-functional, asymmetric and disjoint properties and the number
 restrictions that need counting, as the rules without the root do, and still took the
 ontology for its disjunctive axioms, while a run without the option gave the same ontology
-to the Horn rules, which take those axioms. The normalization of a rooted run that was not
-asked to count now refuses the axioms outside OWL 2 EL when it leaves out a Horn axiom that
-needs counting. It tries the axioms that need counting first and refuses before it
-normalizes the rest. It drops the scope of the axiom it leaves out when that scope made no
-fresh classes. The Horn rules then take the axioms in the same run, so the run's memory
-budget, deadline, cancellation and partial answers apply as before. A check after the whole
-normalization, as the Nom refusal makes, left 583 to 3,272 bytes more on the four fixtures
-of the item. Under budgets near the default run's need, that stopped partial runs that the
-default run answered. With the check first, the rooted run's high-water mark equals the
-default run's on sroiq-017, sroiq-030 and sroiq-032 and is 422 bytes below it on mixed-031.
-Under memory budgets stepped by a thirty-second of the default run's high-water mark, the
-rooted run of the four fixtures stops, falls back to the EL rules or answers as the default
-run does, with the same flags. A refused run sets neither `Stats::dl_rooted_over` nor
+to the Horn rules, which take those axioms. A rooted run that was not asked to count now
+checks the axioms outside OWL 2 EL before Tier D normalizes any of them. When the rooted
+rules without counting would leave out an axiom only for a construct that needs counting,
+and the Horn rules take that axiom, the run gives every axiom outside OWL 2 EL to the Horn
+rules and does not try Tier D. The Horn rules then take the axioms in the same build, so
+the run's memory budget, deadline, cancellation and partial answers apply as before.
+
+The check mirrors both normalizations structurally. It reads the axioms, the interner and
+the EL axioms without changing them, its walks allocate nothing, and it polls the run's
+deadline and cancellation every 128 steps. On the Tier D side a minimum of zero hides its
+filler, as the normalization reads it. An axiom that the rooted rules would also leave out
+for a self restriction, a data restriction, the top or bottom property or nesting deeper
+than they read does not refuse, and neither does an irreflexive property. On the Horn side the check follows
+the flattening of an inclusion, the limit of 64 on a minimum that the rules unfold, the
+bottom property and the simple roles that number restrictions and the property axioms need.
+A bounded search for a chain below a role settles its simplicity, and a role that the
+search does not settle does not refuse. An axiom that both rules leave out, such as a
+minimum above 64, therefore keeps the rooted run's disjunctive axioms and their
+consequences.
+
+Over item 805's rewriting the rooted rules read the rewritten axioms, and the Horn rules
+read the original axioms that each one stands for, with the role box of the original
+axioms. A run whose rewriting refuses does not build the rewritten axioms, and its build
+over the original axioms gives them to the Horn rules without asking again, since the
+rooted rules leave out the universal property there for a reason of their own. A Horn
+piece of a rewritten disjunctive axiom, such as the `≥2 r.∃U.A ⊑ ⊥` that a disjoint union
+with two such minimums makes, does not refuse, and the run keeps the rewriting.
+
+A refused run interns nothing before the Horn rules do. Its high-water mark equals the
+default run's on sroiq-017, sroiq-030 and sroiq-032 and is 422 bytes below it on
+mixed-031, and it is at most the default run's on the regression ontologies, including one
+over item 805's rewriting, whose plan is released before the Horn rules build. A first
+design tried the axioms that need counting with the Tier D normalization itself and
+dropped the scope of the one it left out. Its trial classes and nodes stayed in the
+interner, so under budgets near the default run's need it could stop a run that the
+default run answered. A refused run counts as one that did not try Tier D, so
+a memory refusal of its Horn build is the Horn rules' own and does not set
+`Stats::dl_over_budget`, and it sets neither `Stats::dl_rooted_over` nor
 `Stats::dl_rooted_declined`. A run asked to count that passes its bound starts again without
 counting and leaves those axioms out, as before counting was built, which item 1324
-follows. An irreflexive property,
-a self restriction and a data axiom do not refuse the axioms, since the rooted rules leave
-them out for other reasons, which items 1323, 1285 and 768 follow.
+follows. Items 1323, 1285 and 768 follow the irreflexive properties, self restrictions and
+data axioms that the rooted rules still leave out.
 
 At b47b582b, `mixed-031`, `sroiq-017`, `sroiq-030` and `sroiq-032` left out 1, 1, 1 and 4
 more axioms in a rooted run than by default, and `sroiq-032` was consistent where the
 default run and HermiT find it inconsistent. At 17674a34 they left out 2, 1, 2 and 5 more,
 and the consistency of `sroiq-030` and `sroiq-032` was unknown. All four now give the
 default run's answer on one and four threads under both strategies, and `sroiq-030` and
-`sroiq-032` are inconsistent with HermiT's taxonomy. With counting, the three `sroiq`
+`sroiq-032` agree with HermiT on inconsistency and taxonomy. With counting, the three `sroiq`
 fixtures meet the refusal for the Nom rule and give the same answer.
 
 Across the 640 fixtures of item 603, a rooted run at 17674a34 left out an axiom that the
 default run takes on 27 fixtures and missed 1,349 of HermiT's subsumptions, against the
 default run's 1,254. A rooted run now misses 1,225, and no run of either kind answers a
-subsumption that HermiT does not. It recovers 127 subsumptions on `mixed-032`, `sroiq-013`,
+subsumption that HermiT does not. The check before the normalization gives the same counts
+on every fixture as the first design did. It recovers 127 subsumptions on `mixed-032`, `sroiq-013`,
 `sroiq-030` and `sroiq-032` and loses 3 on `sroiq-029` and `sroiq-040`, whose disjunctive
 axioms the rooted rules took beside the Horn axioms they left out. Those come back as the
 rooted rules take the axioms that need counting, which items 896 and 1283 follow, and so
@@ -495,7 +520,9 @@ rules without the root, against which the rooted run leaves out fewer axioms. Th
 regression of [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) that
 left out a minimum above one while the rooted run took the rest now checks that the Horn
 rules take the ontology. The crate's test of item 805's report of a rewritten axiom left
-out now builds the run without counting that follows the counting bound.
+out now builds the run without counting that follows the counting bound. The disjoint union
+of row 1304 keeps its rewriting, and its test checks a consequence that only the rewriting
+gives the rooted rules.
 
 Item 1250 decouples the non-root ground-body cut from full ground-body selection and makes
 mode `129` the default when `Limits::rooted_marker_repair` is enabled. Each stored clause
@@ -4960,8 +4987,10 @@ Sequoia holds back asserted ground facts from a context in a similar way.
 
 A minimum restriction above one in a positive position is not weakened to an existential
 restriction in a rooted run with counting off, since `A ⊑ ≥2 r.{o}` makes `A`
-unsatisfiable. Such an axiom is left out instead, and a run that was not asked to count
-gives the ontology to the Horn rules, as above. With counting on, a minimum
+unsatisfiable. Such an axiom is left out instead. When it is a Horn axiom that the Horn
+rules take, a run that was not asked to count gives the ontology to the Horn rules, as
+above, while a disjunctive axiom with such a minimum is left out as the run takes the rest.
+With counting on, a minimum
 restriction gets inequalities between its successor terms, `M(x) → f_i(x) ≉ f_j(x)`, in
 place of the globally disjoint fresh fillers of the rules above, which a nominal can make
 unsound. Three individuals with `M ⊑ ≥2 r.⊤` and `∀r` over two of three shared constants

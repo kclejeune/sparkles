@@ -10182,6 +10182,8 @@ fn the_run_after_the_counting_bound_names_every_original_axiom_of_a_rewritten_on
         left.contains(&refs[1]) && left.contains(&refs[2]),
         "{left:#?}"
     );
+    // the disjunction is the only axiom outside OWL 2 EL that the run takes
+    assert_eq!(out.stats.outside_el.taken, 1);
 }
 
 #[test]
@@ -10221,7 +10223,7 @@ fn reduced_exclusion_restore_accounts_for_taken_profile_diagnostics() {
         + red.retained_bytes()
         + reduced.capacity() * std::mem::size_of::<&AxiomKind>();
     // the run without counting after the counting bound, which leaves the rewritten
-    // maximum out where a run not asked to count gives the axioms to the Horn rules
+    // minimum out where a run not asked to count gives the axioms to the Horn rules
     // (roadmap item 1286)
     let build = |outside: &Vec<_>, cap| {
         let mut sat = Saturation::new();

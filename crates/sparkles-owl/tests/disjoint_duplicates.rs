@@ -467,9 +467,14 @@ fn original_axiom_diagnostics_and_counts_preserve_repeated_operands() {
         })
         .unwrap();
     assert!(!out.complete);
+    // the rooted run took the union, which the Horn rules leave out, and reports only the
+    // restored original axiom
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert!(out.stats.clauses > 0, "the rooted run took no clause");
     let left = k.excluded();
+    assert_eq!(left.len(), 1, "{left:?}");
     assert!(
-        left.iter().any(|e| e.axiom == expected_orig),
+        left[0].axiom == expected_orig,
         "expected restored original repeated axiom {expected_orig:?}, got {left:?}"
     );
 }

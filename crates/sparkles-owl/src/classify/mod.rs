@@ -90,6 +90,7 @@ mod horn;
 #[cfg(test)]
 mod horn_range_tests;
 mod horn_rules;
+mod horn_share;
 mod index;
 mod numeric;
 mod partial;
@@ -1885,6 +1886,11 @@ pub struct Saturation {
     /// whether the current run's axioms went to the normalization of Tier D, from its
     /// start until the normalization took none
     dl_tried: bool,
+    /// set when a rooted build over item 805's rewriting gives its axioms to the Horn
+    /// rules for their share, so that the build over the original axioms that follows
+    /// gives them too, until [`Saturation::run`] plans the rewriting again (roadmap
+    /// item 1286)
+    horn_share: bool,
     /// set while a run classifies again without Tier D, past Tier D's memory budget
     skip_dl: bool,
     /// set while a run classifies again without counting, past Tier D's bound on derived
@@ -4017,6 +4023,7 @@ impl Saturation {
             disjoint: Vec::new(),
             horn_tried: false,
             dl_tried: false,
+            horn_share: false,
             skip_dl: false,
             no_counting: false,
             no_rooted: false,
@@ -8353,13 +8360,41 @@ impl Saturation {
         // without the option does and leaves the axioms with individuals out (roadmap
         // items 1265 and 1281).
         let rooted = limits.rooted && !self.no_rooted && self.rooted_allowed(&ax);
-        if !candidates.is_empty()
+        let tier_d = !candidates.is_empty()
             && !limits.el_only
             && !self.skip_dl
             && (self.disj_allowed(&ax) || rooted)
             && candidates.iter().any(|k| !dl::shape(k).horn)
-            && dl_norm::eligible(&self.interner, &ax, rooted)
-        {
+            && dl_norm::eligible(&self.interner, &ax, rooted);
+        // A rooted run does not trade the Horn share for its disjunctive axioms. When the
+        // rooted rules without counting would leave out a Horn axiom for lack of counting,
+        // such as a functional property or a minimum above one, and the Horn rules take
+        // it, the axioms go to the Horn rules, as a run without the option gives them. The
+        // check reads the axioms without changing the interner, so the Horn rules intern
+        // what a run without the option does, and the run counts as one that did not try
+        // Tier D (roadmap item 1286). A run that starts again without counting past the
+        // bound of one that counts leaves those axioms out, as before counting was built.
+        // [`Saturation::run`] asks before it builds the rewritten axioms, and a run over the
+        // rewriting that gives its axioms to the Horn rules gives the original axioms to
+        // them too, without asking again, since the rooted rules leave out what the
+        // rewriting lets them take, such as the universal property, for reasons of their
+        // own.
+        let horn_keeps_share = tier_d
+            && rooted
+            && !limits.counting
+            && reduction.is_none()
+            && (self.horn_share
+                || horn_share::refuses(
+                    &candidates,
+                    &self.interner,
+                    horn_share::Roles::El(&ax),
+                    &stop,
+                )
+                .map_err(halt)?);
+        if horn_keeps_share {
+            self.dl_tried = false;
+        }
+        if tier_d && !horn_keeps_share {
             self.dl_tried = true;
             if let Some((flags, d)) = dl_norm::normalize(
                 &candidates,
@@ -8372,11 +8407,6 @@ impl Saturation {
                     rooted,
                     order: limits.number_order,
                     automata: limits.dl_automata_level(),
-                    // a rooted run that was not asked to count keeps the Horn share, while
-                    // one that starts again without counting past its bound leaves the
-                    // axioms that need counting out, as before counting was built (roadmap
-                    // item 1286)
-                    horn_share: rooted && !limits.counting,
                 },
             )
             .map_err(halt)?
@@ -8686,6 +8716,8 @@ impl Saturation {
             self.reset_empty();
         }
         self.canon_want = want_canon;
+        // the Horn share that a build over the rewriting gave up belongs to this run only
+        self.horn_share = false;
         let reduce_mem = limits.max_memory.map(|m| {
             m.saturating_sub(
                 self.merge
@@ -8775,20 +8807,48 @@ impl Saturation {
                             charge: Self::charge_drawing_on(limits, admitted),
                             ..limits.clone()
                         };
-                        let r = self.run_once(
-                            &all,
-                            Some((&red, axioms)),
-                            None,
-                            held_bytes.saturating_add(red_bytes),
-                            &step_limits,
-                            with_taxonomy,
-                            AttemptProvenance::Ineligible,
-                        );
+                        // A rooted run over the rewriting that would leave out a Horn axiom
+                        // for lack of counting, which the Horn rules take from the original
+                        // axioms, gives the axioms to the Horn rules. It does not build the
+                        // rewritten axioms, which a run without the option never holds, and
+                        // the build over the original axioms below gives them to the Horn
+                        // rules (roadmap item 1286). Every axiom that refuses is outside
+                        // OWL 2 EL, so the check reads all the rewritten axioms.
+                        let share = !limits.counting
+                            && all.iter().any(|k| !dl::shape(k).horn)
+                            && match horn_share::refuses(
+                                &all,
+                                &self.interner,
+                                horn_share::Roles::Original(&red, axioms),
+                                &|| poll(limits).is_err(),
+                            ) {
+                                Ok(share) => share,
+                                Err(_) => {
+                                    self.active_hub = None;
+                                    self.hide_internal = false;
+                                    self.dirty = true;
+                                    return Err(poll(limits).err().unwrap_or(Error::Cancelled));
+                                }
+                            };
+                        let r = if share {
+                            self.horn_share = true;
+                            None
+                        } else {
+                            Some(self.run_once(
+                                &all,
+                                Some((&red, axioms)),
+                                None,
+                                held_bytes.saturating_add(red_bytes),
+                                &step_limits,
+                                with_taxonomy,
+                                AttemptProvenance::Ineligible,
+                            ))
+                        };
                         self.active_hub = None;
                         self.hide_internal = false;
                         let _chains = std::mem::take(&mut self.chain_ranged);
                         match r {
-                            Ok(ControlFlow::Continue(mut r))
+                            Some(Ok(ControlFlow::Continue(mut r)))
                                 if self.dl_tried
                                     || (r.2.tier != Tier::Disjunctive
                                         && !self.rewritten_excluded) =>
@@ -8844,7 +8904,7 @@ impl Saturation {
                                     }
                                 }
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 if !self.report_replaced {
                                     // A refused build leaves the previous report public.
                                     self.reset_empty();
@@ -27156,6 +27216,105 @@ mod tests {
             dl_pinned,
             "expected a cap in [{lo_dl}, {hi_dl}] where Saturation::build fails in Tier D normalization/indexing"
         );
+    }
+
+    /// A rooted run that gives its axioms to the Horn rules has not tried Tier D, so a
+    /// pre-saturation memory refusal of the Horn build counts as the Horn rules' own: with
+    /// partial answers off the run falls back to the EL rules and reports the Horn rules
+    /// over budget and not Tier D, as the run without the option does (roadmap item 1286).
+    #[test]
+    fn a_horn_build_refusal_after_the_horn_share_is_not_a_tier_d_overrun() {
+        let mut text = String::from(
+            "Prefix(:=<urn:pre-sat-share:>)\nOntology(\nSubClassOf(:Seed0 :Seed1)\n\
+             SubClassOf(:C0 ObjectUnionOf(:D0 :D1))\nClassAssertion(:C0 :a)\n\
+             FunctionalObjectProperty(:f)\n",
+        );
+        for i in 0..36 {
+            let next = (i + 1) % 36;
+            let next2 = (i + 2) % 36;
+            text.push_str(&format!(
+                "InverseObjectProperties(:r{i} :ri{i})\n\
+                 TransitiveObjectProperty(:r{i})\n\
+                 SubObjectPropertyOf(ObjectPropertyChain(ObjectInverseOf(:r{i}) :r{next}) :r{next2})\n"
+            ));
+            for j in 0..8 {
+                let d = (i * 5 + j) % 36;
+                text.push_str(&format!(
+                    "SubClassOf(:C{i} ObjectAllValuesFrom(:r{next} :D{d}))\n"
+                ));
+            }
+        }
+        text.push(')');
+        let doc = crate::ofn_read::parse(&text).unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let outside: Vec<(usize, (String, String))> = kinds
+            .iter()
+            .enumerate()
+            .filter_map(|(i, k)| {
+                logical(k)
+                    .then(|| el_break(k).map(|b| (i, (b.rule.to_string(), b.message))))
+                    .flatten()
+            })
+            .collect();
+        let limits = |cap: Option<usize>, rooted: bool| Limits {
+            threads: 1,
+            rooted,
+            partial: false,
+            max_memory: cap,
+            ..Limits::default()
+        };
+        let el = Saturation::new()
+            .classify(
+                &kinds,
+                None,
+                &Limits {
+                    el_only: true,
+                    ..limits(None, false)
+                },
+            )
+            .unwrap();
+        let full = Saturation::new()
+            .classify(&kinds, None, &limits(None, true))
+            .unwrap();
+        assert_eq!(full.stats.tier, Tier::Disjunctive);
+        assert_eq!(full.stats.dl_contexts, 0, "the Horn rules take the axioms");
+        let lo = el.stats.peak_memory + 1;
+        let hi = full.stats.peak_memory;
+        let mut pinned = None;
+        for step in 0..=80 {
+            let cap = lo + hi.saturating_sub(lo) * step / 80;
+            let mut probe = Saturation::new();
+            let res = probe.build(
+                &kinds,
+                &outside,
+                None,
+                1,
+                0,
+                0,
+                &limits(Some(cap), true),
+                AttemptProvenance::OriginalDefault,
+            );
+            if matches!(res, Err(Error::Memory { .. })) && probe.horn_tried {
+                assert!(!probe.dl_tried, "cap {cap}: the refused run tried Tier D");
+                pinned = Some(cap);
+                break;
+            }
+        }
+        let cap = pinned.unwrap_or_else(|| {
+            panic!("expected a cap in [{lo}, {hi}] where the Horn build of the rooted run fails")
+        });
+        let got = Saturation::new()
+            .classify(&kinds, None, &limits(Some(cap), true))
+            .expect("the rooted run falls back to the EL rules");
+        let want = Saturation::new()
+            .classify(&kinds, None, &limits(Some(cap), false))
+            .expect("the default run falls back to the EL rules");
+        assert!(got.stats.horn_over_budget, "cap {cap}");
+        assert!(!got.stats.dl_over_budget, "cap {cap}");
+        assert_eq!(got.stats.horn_over_budget, want.stats.horn_over_budget);
+        assert_eq!(got.stats.dl_over_budget, want.stats.dl_over_budget);
+        assert_eq!(got.stats.tier, want.stats.tier);
+        assert_eq!(got.complete, want.complete);
     }
 
     /// Neon r1 B1 fail-first regression: `export_split_leaf` MUST include hidden

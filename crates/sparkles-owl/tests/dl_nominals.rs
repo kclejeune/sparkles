@@ -357,7 +357,8 @@ fn minimum_fillers_are_not_coloured_across_individuals() {
 }
 
 /// An irreflexive property beside a nominal is left out and reported, and the rooted run
-/// takes the rest, as it does with a minimum above one when counting is off.
+/// takes the rest. The Horn rules take the property too, but an irreflexive property does
+/// not give the axioms to them (roadmap item 1323).
 #[test]
 fn an_irreflexive_property_beside_a_nominal_is_left_out() {
     // r(a, a) closes a loop that the rules check only on simple properties without loops
@@ -791,10 +792,22 @@ fn a_rewritten_horn_axiom_that_needs_counting_goes_to_the_horn_rules() {
         let left = declined(body, true);
         assert_eq!(left.len(), 1, "{left:#?}");
         assert!(left[0].contains("ObjectUnionOf"), "{left:#?}");
+        // the run over the rewriting refuses, and its fallback to the original axioms, in
+        // which the rooted rules leave out the universal property, gives them to the Horn
+        // rules too
+        let mut k = Classifier::of(&axioms(body));
+        let out = k.classify(&rooted_limits()).unwrap();
+        assert_eq!(out.stats.clauses, 0, "Tier D took a clause");
+        assert_eq!(out.stats.dl_contexts, 0, "Tier D ran");
     }
 }
 
 /// A disjoint union whose rewritten axioms are left out for two rules is reported once.
+/// Its two minimums rewrite to one Horn axiom that needs counting, `≥2 r.∃U.A ⊑ ⊥`, which
+/// does not give the axioms to the Horn rules, since the disjoint union it stands for
+/// needs case analysis (roadmap item 1286). The run keeps the rewriting, whose universal
+/// restriction over the universal property only the rewriting lets the rooted rules take,
+/// so that `D ⊑ H` follows through the union.
 #[test]
 fn a_disjoint_union_left_out_for_two_rules_is_reported_once() {
     let ax = axioms(
@@ -802,13 +815,23 @@ fn a_disjoint_union_left_out_for_two_rules_is_reported_once() {
              ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
              ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A))
              :D)
-         ClassAssertion(:B :b)",
+         ClassAssertion(:B :b)
+         SubClassOf(:B ObjectAllValuesFrom(owl:topObjectProperty :E))
+         SubClassOf(:E ObjectUnionOf(:F :G))
+         SubClassOf(:F :H)
+         SubClassOf(:G :H)",
     );
     let mut k = Classifier::of(&ax);
-    k.classify(&rooted_limits()).unwrap();
+    let out = k.classify(&rooted_limits()).unwrap();
     let left = k.excluded();
     assert_eq!(left.len(), 1, "{left:#?}");
     assert!(matches!(left[0].axiom, AxiomKind::DisjointUnion(..)));
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert!(out.stats.clauses > 0, "Tier D took no clause");
+    assert!(
+        out.taxonomy.is_subclass(&c("D"), &c("H")),
+        "the run did not keep the rewriting"
+    );
 }
 
 const INTERNAL: &str = "urn:sparkles:internal:";

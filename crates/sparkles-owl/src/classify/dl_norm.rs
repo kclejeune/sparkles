@@ -1659,11 +1659,6 @@ pub struct Allowed {
     /// how far the automata that unfold the universals are reduced, as
     /// [`super::horn::dl_reduction`] reads the levels
     pub automata: u8,
-    /// whether a rooted normalization without counting that leaves out a Horn axiom for
-    /// lack of counting refuses the axioms, so that the Horn rules take them with their
-    /// share, as a run without [`Limits::rooted`](super::Limits::rooted) gives them
-    /// (roadmap item 1286)
-    pub horn_share: bool,
 }
 
 impl Default for Allowed {
@@ -1673,18 +1668,16 @@ impl Default for Allowed {
             rooted: false,
             order: false,
             automata: 2,
-            horn_share: false,
         }
     }
 }
 
 /// The normalization of a Tier D run: the axioms outside OWL 2 EL that it takes, with the
 /// clauses of case analysis, after the EL axioms are in `ax`. `None` when it takes no axiom
-/// that needs case analysis, when the role inclusions are not regular or their automata
-/// pass the limit, or when a rooted run with [`Allowed::horn_share`] leaves out a Horn
-/// axiom for lack of counting, and then `ax` is as it was, the interner aside. The
-/// answer's flags say which axioms were taken. A run that does not allow counting leaves
-/// the axioms that need it out, as the normalization did before it counted.
+/// that needs case analysis, or when the role inclusions are not regular or their automata
+/// pass the limit, and then `ax` is as it was, the interner aside. The answer's flags say
+/// which axioms were taken. A run that does not allow counting leaves the axioms that need
+/// it out, as the normalization did before it counted.
 pub fn normalize(
     axioms: &[&AxiomKind],
     it: &mut Interner,
@@ -1713,55 +1706,6 @@ fn normalize_within(
         && (!it.individuals.is_empty() || axioms.iter().any(|k| super::index::holds_individual(k)));
     let counting = allowed.counting && axioms.iter().any(|k| axiom_counts(k, rooted));
     let order = allowed.order && counting && !rooted;
-    // A rooted run does not trade the Horn share for its disjunctive axioms. A Horn axiom
-    // that the rooted rules leave out because the run does not count, such as a functional
-    // or inverse-functional property, a disjointness of properties or a minimum above one,
-    // sends every axiom outside OWL 2 EL to the Horn rules, which take it as a run without
-    // the option does (roadmap item 1286). The axioms that need counting are tried first,
-    // before the rest are normalized, and the scope of the one they leave out is dropped,
-    // so that a refused run holds no more memory than the Horn rules intern for those
-    // axioms. An axiom that the rules take is normalized again in its scope below, with
-    // the same fresh classes.
-    // A rooted run that counts takes such an axiom or refuses the axioms for the Nom rule
-    // below, and the caller leaves `horn_share` off for a run that starts again without
-    // counting past the bound of one that counts.
-    if rooted && !counting && allowed.horn_share {
-        let mut poll = || if stop() { Err(Halt::Stopped) } else { Ok(()) };
-        for k in axioms {
-            if !axiom_counts(k, rooted) || !super::dl::is_horn_polled(k, &mut poll)? {
-                continue;
-            }
-            let scope = Scope::Dl(it.scope_axiom(k));
-            let new = !it.has_scope(&scope);
-            it.begin_scope(scope);
-            let mut n = Norm {
-                it,
-                out: Out::default(),
-                counting,
-                rooted,
-                order,
-                budget: None,
-                stop,
-                halt: None,
-            };
-            let ok = if Norm::is_role_axiom(k) {
-                n.role_axiom(k).is_ok()
-            } else {
-                n.axiom(k).is_ok()
-            };
-            let halted = n.halt;
-            n.it.end_scope();
-            if let Some(h) = halted {
-                return Err(h);
-            }
-            if !ok {
-                if new {
-                    it.forget_scope(&scope);
-                }
-                return Ok(None);
-            }
-        }
-    }
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles

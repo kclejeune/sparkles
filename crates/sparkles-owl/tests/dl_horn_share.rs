@@ -385,9 +385,11 @@ fn a_partial_rooted_run_keeps_the_horn_share() {
 /// Under memory budgets stepped from an eighth of the default run's high-water mark to
 /// more than it, a rooted run of the four fixtures stops where the default run stops, falls
 /// back to the EL rules where it does, and otherwise gives its answer with the same flags,
-/// since the refusal comes before the normalization interns more than the Horn rules do and
-/// the rooted run's high-water mark is at most the default run's. A cancelled run stops
-/// before it answers.
+/// since the refusal comes before the normalization interns anything and the rooted run's
+/// high-water mark is at most the default run's. The refused run never tries Tier D, so it
+/// reports no Tier D overrun, while the default run of `mixed-031`, whose individuals are
+/// all outside OWL 2 EL, tries Tier D without the root and reports one where its Horn rules
+/// pass the budget. A cancelled run stops before it answers.
 #[test]
 fn a_refused_rooted_run_stops_and_answers_as_the_default_run() {
     let (mut stopped, mut el, mut full) = (0, 0, 0);
@@ -426,7 +428,10 @@ fn a_refused_rooted_run_stops_and_answers_as_the_default_run() {
                         assert_eq!(g.complete, w.complete, "{at}");
                         assert_eq!(g.complete_for_taken, w.complete_for_taken, "{at}");
                         assert_eq!(g.stats.horn_over_budget, w.stats.horn_over_budget, "{at}");
-                        assert_eq!(g.stats.dl_over_budget, w.stats.dl_over_budget, "{at}");
+                        assert!(!g.stats.dl_over_budget, "{at}");
+                        if name != "mixed-031" {
+                            assert!(!w.stats.dl_over_budget, "{at}");
+                        }
                         assert!(
                             !g.stats.dl_rooted_over && !g.stats.dl_rooted_declined,
                             "{at}"
@@ -482,4 +487,190 @@ fn a_refused_rooted_run_is_not_held_to_the_rooted_bound() {
             assert!(!out.stats.dl_over_budget, "{name}");
         }
     }
+}
+
+fn parse(body: &str) -> Vec<Axiom> {
+    ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
+        .unwrap()
+        .axioms
+}
+
+fn ex(names: &[&str]) -> BTreeSet<String> {
+    names
+        .iter()
+        .map(|c| format!("http://ex.org/{c}"))
+        .chain([THING.to_string(), NOTHING.to_string()])
+        .collect()
+}
+
+fn pair(a: &str, b: &str) -> (String, String) {
+    (format!("http://ex.org/{a}"), format!("http://ex.org/{b}"))
+}
+
+/// The union of the tests below: `D ⊑ E ⊔ F` with `E ⊑ G` and `F ⊑ G` gives `D ⊑ G`
+/// to the rooted rules, which the Horn rules leave out.
+const UNION: &str = "SubClassOf(:D ObjectUnionOf(:E :F))
+     SubClassOf(:E :G)
+     SubClassOf(:F :G)
+     ClassAssertion(:D :d)";
+
+/// Whether a rooted run and a run without the option give the same answer, flags and
+/// stops under memory budgets from an eighth of the default run's high-water mark to more
+/// than it, and at that mark itself, with partial answers or not.
+fn same_under_budgets(axioms: &[Axiom], classes: &BTreeSet<String>) {
+    let one = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let peak = Classifier::of(axioms)
+        .classify(&one)
+        .unwrap()
+        .stats
+        .peak_memory;
+    let held = Classifier::of(axioms)
+        .classify(&rooted(&one))
+        .unwrap()
+        .stats
+        .peak_memory;
+    // the check before the normalization interns nothing, so the rooted run holds no
+    // more than the default run
+    assert!(held <= peak, "{held} against {peak}");
+    for budget in (4..=40).map(|s| peak * s / 32).chain([peak, peak - 1]) {
+        for partial in [false, true] {
+            let limits = Limits {
+                threads: 1,
+                partial,
+                max_memory: Some(budget),
+                ..Limits::default()
+            };
+            let at = format!("budget {budget} of {peak}, partial {partial}");
+            let mut k = Classifier::of(axioms);
+            let got = k.classify(&rooted(&limits));
+            let mut plain = Classifier::of(axioms);
+            let want = plain.classify(&limits);
+            match (&got, &want) {
+                (Ok(g), Ok(w)) => {
+                    assert_eq!(answer(&k, g, classes), answer(&plain, w, classes), "{at}");
+                    assert_eq!(g.complete, w.complete, "{at}");
+                    assert_eq!(g.complete_for_taken, w.complete_for_taken, "{at}");
+                    assert_eq!(g.stats.horn_over_budget, w.stats.horn_over_budget, "{at}");
+                    assert_eq!(g.stats.dl_over_budget, w.stats.dl_over_budget, "{at}");
+                    assert_eq!(g.stats.dl_contexts, 0, "{at}");
+                }
+                (Err(Error::Memory { .. }), Err(Error::Memory { .. })) => {}
+                _ => panic!("{at}: {:?} against {:?}", got.err(), want.err()),
+            }
+        }
+    }
+}
+
+/// A rooted run whose first axioms need fresh classes in the Tier D normalization and
+/// whose later axiom refuses holds what the default run holds, under every budget. The
+/// minimum of zero hides its filler, which needs counting, so the first axioms do not
+/// refuse, and the minimum of two on `:q` does.
+#[test]
+fn a_refusal_after_axioms_with_fresh_classes_holds_what_the_default_run_holds() {
+    let mut body = String::from(UNION);
+    let mut names = vec!["D", "E", "F", "G", "Z"];
+    let owned: Vec<String> = (0..24)
+        .flat_map(|i| [format!("A{i}"), format!("B{i}"), format!("C{i}")])
+        .collect();
+    for i in 0..24 {
+        body.push_str(&format!(
+            "\nSubClassOf(:A{i} ObjectIntersectionOf(ObjectComplementOf(:B{i})
+                 ObjectMinCardinality(0 :r ObjectMinCardinality(2 :r))))
+             SubClassOf(:C{i} ObjectIntersectionOf(ObjectComplementOf(:B{i})
+                 ObjectComplementOf(:A{i}) ObjectMinCardinality(2 :q{i})))"
+        ));
+    }
+    body.push_str("\nSubClassOf(:Z ObjectMinCardinality(2 :q))");
+    names.extend(owned.iter().map(String::as_str));
+    let axioms = parse(&body);
+    let classes = ex(&names);
+    let out = Classifier::of(&axioms)
+        .classify(&rooted(&Limits::default()))
+        .unwrap();
+    assert_eq!(out.stats.dl_contexts, 0, "the Horn rules take the axioms");
+    same_under_budgets(&axioms, &classes);
+}
+
+/// A minimum that the Horn rules unfold refuses, while one above their limit of 64, which
+/// both rules leave out, does not, and the rooted run keeps the union and `D ⊑ G`.
+#[test]
+fn a_minimum_the_horn_rules_leave_out_does_not_refuse() {
+    let classes = ex(&["A", "D", "E", "F", "G"]);
+    let d_below_g = pair("D", "G");
+    for n in [2, 64, 65] {
+        let axioms = parse(&format!(
+            "{UNION}\nSubClassOf(:A ObjectMinCardinality({n} :r))"
+        ));
+        let mut k = Classifier::of(&axioms);
+        let out = k.classify(&rooted(&Limits::default())).unwrap();
+        let got = answer(&k, &out, &classes);
+        let want = classify(&axioms, &classes, &Limits::default());
+        if n <= 64 {
+            assert_eq!(got, want, "{n}");
+            assert_eq!(out.stats.dl_contexts, 0, "{n}");
+            assert!(
+                !got.left_out.iter().any(|a| a.contains("MinCardinality")),
+                "{n}: {:?}",
+                got.left_out
+            );
+            assert!(!got.subsumptions.contains(&d_below_g), "{n}");
+        } else {
+            assert!(out.stats.dl_contexts > 0, "the rooted rules take the union");
+            assert!(got.subsumptions.contains(&d_below_g));
+            assert_eq!(got.left_out.len(), 1, "{:?}", got.left_out);
+            assert!(got.left_out.iter().all(|a| a.contains("MinCardinality(65")));
+            // the default run leaves out the union too, and the minimum
+            assert!(want.left_out.len() > got.left_out.len());
+        }
+    }
+}
+
+/// A minimum of zero holds nothing, so a maximum in its filler does not refuse beside a
+/// self restriction or a data restriction, which the rooted rules leave out for their own
+/// reasons, and the rooted run keeps the union.
+#[test]
+fn a_zero_minimum_beside_a_self_or_data_restriction_does_not_refuse() {
+    let classes = ex(&["A", "D", "E", "F", "G"]);
+    for head in [
+        "ObjectHasSelf(:t)",
+        "DataSomeValuesFrom(:dp <http://www.w3.org/2001/XMLSchema#integer>)",
+    ] {
+        let axioms = parse(&format!(
+            "{UNION}\nSubClassOf(ObjectMinCardinality(0 :r ObjectMaxCardinality(1 :s :A)) {head})"
+        ));
+        let mut k = Classifier::of(&axioms);
+        let out = k.classify(&rooted(&Limits::default())).unwrap();
+        let got = answer(&k, &out, &classes);
+        assert!(
+            out.stats.dl_contexts > 0,
+            "{head}: the rooted rules take the union"
+        );
+        assert!(got.subsumptions.contains(&pair("D", "G")), "{head}");
+        assert!(
+            !got.left_out.iter().any(|a| a.contains("ObjectUnionOf")),
+            "{head}: {:?}",
+            got.left_out
+        );
+    }
+}
+
+/// A rooted run over item 805's rewriting that gives its axioms to the Horn rules falls
+/// back to the original axioms, which go to the Horn rules too, and holds, stops and
+/// answers as the default run does under every budget (row 1304's rewritten axiom).
+#[test]
+fn a_refusal_over_the_rewriting_answers_as_the_default_run_under_budgets() {
+    let axioms = parse(
+        "DisjointClasses(
+             ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A)))
+         SubClassOf(
+             ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             owl:Nothing)
+         ClassAssertion(:B :b)
+         SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))",
+    );
+    same_under_budgets(&axioms, &ex(&["A", "B", "Z", "Z1", "Z2"]));
 }
