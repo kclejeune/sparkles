@@ -2427,8 +2427,9 @@ chains, reflexivity or ranges, or to an axiom with a data property or datatype, 
 everything again. The kept state costs memory for the time the dataset is open, about
 115 MB estimated and 190 MB resident for GO, and it is dropped after a run whose estimate
 passes one gigabyte, evicting the other mode's slot when both together pass that cap. A
-run is bounded by the request's deadline and memory budget, from indexing to the taxonomy,
-and answers `507` with `budget: "memory"` past the budget.
+run is bounded by the request's deadline and memory budget, from indexing to the taxonomy
+and through the coverage pass that lists `incomplete`, and answers `507` with
+`budget: "memory"` past the budget.
 
 `tier` names the rules that the ontology's axioms need, `el`, `horn` or `disjunctive`.
 `partial: true` in the body or the query string asks a classification run at any tier
@@ -2440,8 +2441,9 @@ classes are entailed, `incomplete` lists the classes whose superclasses it may m
 most `limit` of them in IRI order with `incompleteCount` counting them all, and every
 other class has its full answer. `consistency` is `consistent`, `inconsistent` or `unknown`.
 It is `unknown` when a run stopped before deciding, when an excluded axiom, unread assertion
-or unmapped triple could change consistency, or when the coverage pass hit a deadline or
-cancellation before deciding, and in those cases every class is in `incomplete`. When the
+or unmapped triple could change consistency, or when a deadline, a cancellation or, in a
+`partial` run, the memory budget stopped the coverage pass before it decided, and in those
+cases every class is in `incomplete`. When the
 coverage pass hits its work bound instead, classes not yet decided stay in `incomplete`, and
 `consistency` becomes `unknown` only if consistency had not yet been established. `consistent`
 is false only for an ontology proved inconsistent, so a caller that needs to know reads

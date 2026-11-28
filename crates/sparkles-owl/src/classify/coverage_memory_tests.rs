@@ -6,6 +6,7 @@
 
 use super::numeric::tests::measure;
 use super::*;
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -306,7 +307,7 @@ fn a_stop_at_any_poll_frees_the_pass() {
 
 /// The meter's estimate of the pass, read beside the allocator inside the pass itself:
 /// its peak covers the allocator's and stays within a fiftieth of it, and what it still
-/// counts when the pass returns covers the list it answers.
+/// counts when the pass returns is the list it answers, to the byte.
 #[test]
 fn the_meter_is_tight_against_the_allocator() {
     for (n, pad) in [(400, 256), (3000, 8), (50, 0), (20000, 40)] {
@@ -336,11 +337,14 @@ fn the_meter_is_tight_against_the_allocator() {
             "{n}x{pad}: the meter's peak {peak} against the allocator's {}",
             sample.peak
         );
-        assert!(
-            live >= sample.live,
-            "{n}x{pad}: the meter still counts {live} of {}",
-            sample.live
+        // the pass's state is freed, and the meter counts the list it answers, which is
+        // all the allocator still sees
+        assert_eq!(
+            live,
+            c.incomplete.capacity() * std::mem::size_of::<&Class>(),
+            "{n}x{pad}"
         );
+        assert_eq!(live, sample.live, "{n}x{pad}");
         drop(c);
     }
 }
@@ -405,4 +409,398 @@ fn the_meter_covers_the_allocator_on_the_dl603_cases() {
             );
         }
     }
+}
+
+fn parse(text: &str) -> Vec<AxiomKind> {
+    crate::ofn_read::parse(text)
+        .expect("test ontology")
+        .axioms
+        .into_iter()
+        .map(|a| a.kind)
+        .collect()
+}
+
+/// The named subclasses of a set of axioms, as a list of classes for the pass.
+fn subclasses(kinds: &[&AxiomKind]) -> Vec<Class> {
+    kinds
+        .iter()
+        .filter_map(|k| match k {
+            AxiomKind::SubClassOf(ClassExpression::Class(c), _) => Some(c.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The walk of an axiom is admitted before it allocates: with a wide axiom first and the
+/// meter refusing the first growth after the index's arrays, the allocator sees nothing
+/// that the meter had not admitted, and the pass frees what it held.
+#[test]
+fn the_walk_of_a_wide_axiom_is_admitted_before_it_allocates() {
+    let pad = "w".repeat(64);
+    let mut text = format!("Prefix(:=<urn:wide1277-{pad}:>)\nOntology(\nDisjointClasses(");
+    for i in 0..3000 {
+        text.push_str(&format!(":W{i} "));
+    }
+    text.push_str(")\n");
+    for i in 0..50 {
+        text.push_str(&format!("SubClassOf(:C{i} :D0)\n"));
+    }
+    text.push_str("SubClassOf(:D0 ObjectUnionOf(:U :V))\n)");
+    let kinds = parse(&text);
+    let kinds: Vec<&AxiomKind> = kinds.iter().collect();
+    assert!(matches!(kinds[0], AxiomKind::DisjointClasses(_)));
+    let left = [*kinds.last().unwrap()];
+    let classes = subclasses(&kinds);
+    let calls = Cell::new(0usize);
+    // the list of classes, then the index's arrays, then nothing more
+    let admit = |_: usize| {
+        calls.set(calls.get() + 1);
+        calls.get() <= 2
+    };
+    let meter = crate::transform::Meter::new(Some(&admit));
+    let refs: Vec<&Class> = classes.iter().collect();
+    let given = std::mem::size_of_val(refs.as_slice());
+    assert!(meter.grow(given));
+    let (r, sample) = measure(|| {
+        crate::transform::coverage_refs(&kinds, &left, true, refs, usize::MAX, &|| false, &meter)
+    });
+    assert_eq!(r, Err(crate::transform::Stopped::Memory));
+    assert_eq!(calls.get(), 3, "the walk's admission is the third");
+    assert!(
+        sample.peak <= meter.peak() - given,
+        "the pass allocated {} past the {} it was admitted",
+        sample.peak,
+        meter.peak() - given
+    );
+    assert_eq!(sample.live, 0);
+    assert_eq!(meter.live(), 0);
+}
+
+/// The scratch bound of a literal's check covers what the check allocates, for the
+/// shapes of XML literal that hold the most: deep nesting, many attributes on one tag
+/// and nested namespace declarations, and for base64 and a date-time.
+#[test]
+fn a_literal_check_stays_within_its_scratch_bound() {
+    let xml = crate::vocab::RDF_XML_LITERAL;
+    let xsd = |l: &str| format!("{}{l}", crate::vocab::XSD);
+    let deep = format!("{}{}", "<a>".repeat(20_000), "</a>".repeat(20_000));
+    let mut wide = String::from("<a");
+    for i in 0..3000 {
+        wide.push_str(&format!(" b{i}='v'"));
+    }
+    wide.push_str("/>");
+    let mut prefixed = String::new();
+    for i in 0..2000 {
+        prefixed.push_str(&format!(
+            "<p{i}:e xmlns:p{i}='urn:ns:&#x41;{i}' p{i}:q='x' r='&#x20;'>"
+        ));
+    }
+    for i in (0..2000).rev() {
+        prefixed.push_str(&format!("</p{i}:e>"));
+    }
+    let mut default = String::new();
+    for i in 0..2000 {
+        default.push_str(&format!("<e xmlns='urn:d:{}'>", i % 7));
+    }
+    default.push_str(&"</e>".repeat(2000));
+    let base64 = "QUJD ".repeat(20_000);
+    let base64 = base64.trim_end();
+    let cases = [
+        (xml.to_string(), deep.as_str()),
+        (xml.to_string(), wide.as_str()),
+        (xml.to_string(), prefixed.as_str()),
+        (xml.to_string(), default.as_str()),
+        (xsd("base64Binary"), base64),
+        (xsd("dateTime"), "2026-11-27T10:00:00Z"),
+        (xsd("string"), "plain"),
+    ];
+    for (datatype, lex) in &cases {
+        let (ok, sample) = measure(|| crate::datatypes::lexical(datatype, lex));
+        assert_eq!(ok, Some(true), "{datatype} {}", &lex[..lex.len().min(40)]);
+        let bound = crate::datatypes::lexical_scratch(datatype, lex);
+        assert!(
+            sample.peak <= bound,
+            "{datatype} {}: the check held {} past its bound {bound}",
+            &lex[..lex.len().min(40)],
+            sample.peak
+        );
+    }
+}
+
+/// The locality checks of the extractions never check a literal again, and the index's
+/// check of it is admitted: the meter's peak covers the allocator's on an ontology whose
+/// one large XML literal the extractions take.
+#[test]
+fn a_literal_is_checked_once_within_the_meter() {
+    let deep = format!("{}{}", "<a>".repeat(20_000), "</a>".repeat(20_000));
+    let mut text = String::from("Prefix(:=<urn:lit1277:>)\nOntology(\n");
+    for i in 0..20 {
+        text.push_str(&format!("SubClassOf(:C{i} :D0)\n"));
+    }
+    text.push_str(&format!(
+        "DataPropertyAssertion(:p :i \"{deep}\"^^<{}>)\n",
+        crate::vocab::RDF_XML_LITERAL
+    ));
+    text.push_str("SubClassOf(:D0 ObjectUnionOf(:U :V))\n)");
+    let kinds = parse(&text);
+    let kinds: Vec<&AxiomKind> = kinds.iter().collect();
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, AxiomKind::DataPropertyAssertion(..)))
+    );
+    let left = [*kinds.last().unwrap()];
+    let classes = subclasses(&kinds);
+    let ((peak, ok), sample) = measure(|| {
+        let meter = crate::transform::Meter::new(None);
+        let mut v: Vec<&Class> = Vec::with_capacity(classes.len());
+        v.extend(classes.iter());
+        assert!(meter.grow(std::mem::size_of_val(v.as_slice())));
+        let c =
+            crate::transform::coverage_refs(&kinds, &left, true, v, usize::MAX, &|| false, &meter);
+        (meter.peak(), c.is_ok())
+    });
+    assert!(ok);
+    assert!(
+        peak >= sample.peak,
+        "the meter's peak {peak} undercounts the allocator's {}",
+        sample.peak
+    );
+}
+
+/// The first poll of the pass comes while the index counts the axioms, before it admits
+/// anything, so a stop that is already armed costs no index.
+#[test]
+fn the_first_poll_comes_before_the_index_admits_anything() {
+    let kinds = ontology(9000, 0);
+    let kinds: Vec<&AxiomKind> = kinds.iter().collect();
+    let mut sat = Saturation::new();
+    let out = sat.classify(&kinds, None, &deferred(None, false)).unwrap();
+    let left: Vec<&AxiomKind> = sat.excluded().iter().map(|e| &e.axiom).collect();
+    let meter = crate::transform::Meter::new(None);
+    let classes = by_depth(&out.taxonomy, &meter).unwrap();
+    let before = meter.peak();
+    let first = Cell::new(None);
+    let stop = || {
+        if first.get().is_none() {
+            first.set(Some(meter.peak()));
+        }
+        true
+    };
+    let r =
+        crate::transform::coverage_refs(&kinds, &left, true, classes, usize::MAX, &stop, &meter);
+    assert_eq!(r, Err(crate::transform::Stopped::Caller));
+    assert_eq!(first.get(), Some(before));
+    assert_eq!(meter.live(), 0);
+}
+
+/// An armed stop wins over a limit that would refuse the index's arrays: the pass answers
+/// as stopped, not with the refusal, since it polls before it admits them.
+#[test]
+fn an_armed_stop_comes_before_the_index_refusal() {
+    let kinds = ontology(9000, 0);
+    let kinds: Vec<&AxiomKind> = kinds.iter().collect();
+    let mut sat = Saturation::new();
+    let free = sat
+        .classify_admitted(&kinds, None, &deferred(None, false))
+        .unwrap();
+    let held = free.classification().stats.memory;
+    let full = free.classification().all_incomplete_bytes().1;
+    // the index's arrays alone hold more than the full list
+    let arrays = kinds.len()
+        * (std::mem::size_of::<Option<u32>>()
+            + std::mem::size_of::<&AxiomKind>()
+            + std::mem::size_of::<Vec<u32>>()
+            + std::mem::size_of::<Option<Vec<Vec<u32>>>>());
+    assert!(arrays > full, "arrays {arrays}, full list {full}");
+    let cap = held + full;
+    let limits = Limits {
+        cancelled: Some(Arc::new(|| true)),
+        ..deferred(Some(cap), false)
+    };
+    let mut sat = Saturation::new();
+    let mut admitted = sat
+        .classify_admitted(&kinds, None, &deferred(Some(cap), false))
+        .unwrap();
+    admitted.limits = limits;
+    let excluded = sat.excluded().to_vec();
+    assert_eq!(admitted.cover(&kinds, &excluded, None).unwrap(), None);
+    let out = admitted.classification();
+    assert!(out.stats.coverage_stopped);
+    assert!(out.has_all_taxonomy_classes());
+    assert_eq!(out.stats.memory, held + full);
+}
+
+/// Declaration-only classes with long IRIs, which the pass's index never holds, and an
+/// excluded axiom over `owl:Thing`, which makes the pass answer every class. Its list of
+/// classes then costs far more than the pass's scratch.
+fn every_class_ontology() -> Vec<AxiomKind> {
+    let pad = "z".repeat(512);
+    let mut text = format!("Prefix(:=<urn:pm1277-{pad}:>)\nOntology(\n");
+    for i in 0..300 {
+        text.push_str(&format!("Declaration(Class(:Z{i}))\n"));
+    }
+    text.push_str("SubClassOf(owl:Thing ObjectUnionOf(:B :C))\nSubClassOf(:X :Y)\n)");
+    parse(&text)
+}
+
+/// A partial run whose pass answers every class falls back to the stopped answer when the
+/// pass's list cannot be merged beside the full list, and fails only when the full list
+/// does not fit either.
+#[test]
+fn a_partial_run_falls_back_when_the_merge_is_refused() {
+    let kinds = every_class_ontology();
+    let kinds: Vec<&AxiomKind> = kinds.iter().collect();
+    let mut sat = Saturation::new();
+    let mut free = sat
+        .classify_admitted(&kinds, None, &deferred(None, true))
+        .unwrap();
+    let held = free.classification().stats.memory;
+    let full = free.classification().all_incomplete_bytes().1;
+    let excluded = sat.excluded().to_vec();
+    assert_eq!(excluded.len(), 1);
+    free.cover(&kinds, &excluded, None).unwrap();
+    let out = free.classification();
+    assert!(out.has_all_taxonomy_classes() && !out.stats.coverage_stopped);
+    let k = out.stats.coverage_memory;
+    assert!(k < full, "scratch {k}, full list {full}");
+    assert_eq!(out.stats.memory, held + full);
+    // the merge holds the pass's list beside the full list
+    assert!(out.stats.peak_memory > held + full);
+
+    // at the full list exactly, the pass fits and the merge does not, so the run answers
+    // as stopped
+    let cap = held + full;
+    assert!(held + k <= cap);
+    let mut sat = Saturation::new();
+    let mut admitted = sat
+        .classify_admitted(&kinds, None, &deferred(Some(cap), true))
+        .unwrap();
+    let excluded = sat.excluded().to_vec();
+    assert_eq!(admitted.cover(&kinds, &excluded, None).unwrap(), None);
+    let out = admitted.classification();
+    assert!(out.stats.coverage_stopped && !out.complete && out.complete_for_taken);
+    assert_eq!(out.consistency, Consistency::Unknown);
+    assert!(out.has_all_taxonomy_classes());
+    assert_eq!(out.stats.memory, held + full);
+    assert!(out.stats.peak_memory <= cap);
+
+    // a strict run at the same limit fails with the merge's refusal
+    let mut sat = Saturation::new();
+    let mut admitted = sat
+        .classify_admitted(&kinds, None, &deferred(Some(cap), false))
+        .unwrap();
+    let excluded = sat.excluded().to_vec();
+    assert!(matches!(
+        admitted.cover(&kinds, &excluded, None),
+        Err(Error::Memory { limit, used }) if limit == cap && used > cap
+    ));
+    assert_eq!(admitted.classification().stats.memory, held);
+
+    // a byte below, the full list is refused too
+    let cap = held + full - 1;
+    let mut sat = Saturation::new();
+    let mut admitted = sat
+        .classify_admitted(&kinds, None, &deferred(Some(cap), true))
+        .unwrap();
+    let excluded = sat.excluded().to_vec();
+    assert!(matches!(
+        admitted.cover(&kinds, &excluded, None),
+        Err(Error::Memory { limit, used }) if limit == cap && used == held + full
+    ));
+    let out = admitted.classification();
+    assert_eq!(out.stats.memory, held);
+    assert!(out.incomplete.is_empty());
+}
+
+/// Many incomplete classes with short IRIs, which the pass answers, and two complete ones
+/// that a later growth adds.
+fn short_subset_ontology() -> Vec<AxiomKind> {
+    let mut text = String::from("Prefix(:=<urn:r:>)\nOntology(\n");
+    for i in 0..400 {
+        text.push_str(&format!("SubClassOf(:C{i} :D0)\n"));
+    }
+    text.push_str("SubClassOf(:D0 ObjectUnionOf(:U :V))\nSubClassOf(:P :Q)\n)");
+    parse(&text)
+}
+
+fn short_subset() -> AdmittedClassification {
+    let kinds = short_subset_ontology();
+    let kinds: Vec<&AxiomKind> = kinds.iter().collect();
+    let mut sat = Saturation::new();
+    let mut admitted = sat
+        .classify_admitted(&kinds, None, &deferred(None, false))
+        .unwrap();
+    let excluded = sat.excluded().to_vec();
+    admitted.cover(&kinds, &excluded, None).unwrap();
+    let out = admitted.classification();
+    assert!(out.incomplete.len() >= 400 && !out.has_all_taxonomy_classes());
+    // the list fills its buffer, so the next growth moves it
+    assert_eq!(out.incomplete.len(), out.incomplete.capacity());
+    admitted
+}
+
+/// A growth of a long list by a few short IRIs moves the list's old buffer beside the new
+/// one, which the run's peak counts, on the way to the full list.
+#[test]
+fn the_full_list_counts_the_old_buffer_it_moves() {
+    let mut admitted = short_subset();
+    let cl = &mut admitted.classification;
+    let before = cl.stats.memory;
+    cl.stats.peak_memory = before;
+    let subset = Classification::incomplete_vec_bytes(&cl.incomplete);
+    let full = cl.all_incomplete_bytes().1;
+    let limits = admitted.limits.clone();
+    let admission = &mut admitted.admission;
+    let (r, sample) = measure(|| cl.admit_all_incomplete(&limits, Some(admission)));
+    r.unwrap();
+    assert!(cl.has_all_taxonomy_classes());
+    let grown = cl.stats.peak_memory - before;
+    assert!(
+        grown >= sample.peak,
+        "the run's peak grew by {grown} for an allocator peak of {}",
+        sample.peak
+    );
+    // what the run holds after the growth is the full list, without the old buffer
+    assert_eq!(cl.stats.memory, before - subset + full);
+}
+
+/// The same for a merge of the pass's list into a list that a previous pass answered.
+#[test]
+fn a_merge_counts_the_old_buffer_it_moves() {
+    let mut admitted = short_subset();
+    let cl = &mut admitted.classification;
+    let before = cl.stats.memory;
+    cl.stats.peak_memory = before;
+    let incoming: Vec<&Class> = cl
+        .taxonomy
+        .classes()
+        .filter(|c| cl.incomplete.binary_search(c).is_err())
+        .take(2)
+        .collect();
+    assert_eq!(incoming.len(), 2);
+    let added: usize = incoming
+        .iter()
+        .map(|c| std::mem::size_of::<Class>() + c.as_str().len())
+        .sum();
+    let limits = admitted.limits.clone();
+    let admission = &mut admitted.admission;
+    let (r, sample) = measure(|| {
+        admit_and_merge_incomplete(
+            &mut cl.incomplete,
+            &cl.taxonomy,
+            &mut cl.stats,
+            &limits,
+            Some(admission),
+            incoming,
+        )
+    });
+    r.unwrap();
+    let grown = cl.stats.peak_memory - before;
+    assert!(
+        grown >= sample.peak,
+        "the run's peak grew by {grown} for an allocator peak of {}",
+        sample.peak
+    );
+    assert_eq!(cl.stats.memory, before + added);
 }

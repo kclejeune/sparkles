@@ -1206,10 +1206,6 @@ struct IncompleteAdmission {
 }
 
 impl IncompleteAdmission {
-    fn admit(&mut self, stats: &Stats, bytes: usize, limits: &Limits) -> Result<usize, Error> {
-        self.admit_beside(stats, bytes, 0, limits)
-    }
-
     /// Admits an incomplete list of `bytes` while `beside` more bytes are held until the
     /// list is built, and answers the estimate without them.
     fn admit_beside(
@@ -1235,10 +1231,6 @@ impl IncompleteAdmission {
             });
         }
         Ok(used)
-    }
-
-    fn record(&mut self, stats: &mut Stats, bytes: usize, used: usize) {
-        self.record_beside(stats, bytes, used, 0);
     }
 
     fn record_beside(&mut self, stats: &mut Stats, bytes: usize, used: usize, beside: usize) {
@@ -1275,11 +1267,14 @@ impl AdmittedClassification {
     /// and lists and every expansion of [`Classification::incomplete`] (both
     /// module-coverage subsets and signature-wide fallbacks) against the originating run's
     /// `max_memory` and `charge` grant before allocating them, reusing an already admitted
-    /// full signature list with zero allocations and zero extra charges. The pass's state
-    /// raises [`Stats::peak_memory`] and [`Stats::coverage_memory`] and is freed before
-    /// this returns. A refusal answers [`Error::Memory`] and leaves the classification as
+    /// full signature list with zero allocations and zero extra charges. The pass's own
+    /// peak is reported as [`Stats::coverage_memory`] and raises [`Stats::peak_memory`]
+    /// beside what the run holds, and its state is freed before this returns. A growth of
+    /// the list counts its old buffer while a reserve moves it. A refusal of the pass or
+    /// of the merge of its list answers [`Error::Memory`] and leaves the classification as
     /// it was, or, with [`Limits::partial`], every class incomplete and
-    /// [`Stats::coverage_stopped`] set.
+    /// [`Stats::coverage_stopped`] set, failing only when the full list does not fit
+    /// either.
     pub fn cover(
         &mut self,
         axioms: &[&AxiomKind],
@@ -1512,6 +1507,7 @@ impl Classification {
                 .is_some()
                 .then_some(&admit as &dyn Fn(usize) -> bool),
         );
+        let mark = meter.mark();
         let c = (|| {
             let left = metered_refs(&meter, excluded.iter().map(|e| &e.axiom))?;
             let classes = by_depth(&self.taxonomy, &meter)?;
@@ -1525,6 +1521,17 @@ impl Classification {
                 &meter,
             )
         })();
+        // the list of left-out axioms and whatever an early refusal left are dropped, and
+        // the meter counts the list the pass answers
+        meter.settle(
+            mark,
+            0,
+            c.as_ref().map_or(0, |c| {
+                c.incomplete
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<&Class>())
+            }),
+        );
         self.stats.coverage = start.elapsed();
         self.stats.coverage_memory = meter.peak();
         // An unadmitted pass leaves the run's estimates as they were and only reports its
@@ -1558,14 +1565,24 @@ impl Classification {
         let consistency_known = c.consistency_known;
         let over_budget = c.over_budget;
         if !c.incomplete.is_empty() {
-            admit_and_merge_incomplete(
+            let merged = admit_and_merge_incomplete(
                 &mut self.incomplete,
                 &self.taxonomy,
                 &mut self.stats,
                 limits,
-                admission,
+                admission.as_deref_mut(),
                 c.incomplete,
-            )?;
+            );
+            match merged {
+                Ok(()) => {}
+                // The list the pass answered is dropped by now, and a partial run answers
+                // as a stopped pass would when its full list fits without it.
+                Err(Error::Memory { .. }) if limits.partial => {
+                    self.stopped_pass_admitted(limits, admission)?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
         }
         self.complete = false;
         if !consistency_known {
@@ -1619,7 +1636,9 @@ impl Classification {
     }
 
     /// The answer of a modules' pass that its deadline, its cancellation or its stream of
-    /// dropped axioms stopped: every class incomplete and the consistency unknown.
+    /// dropped axioms stopped, or whose state or list the memory budget refused in a
+    /// [`partial`](Limits::partial) run: every class incomplete and the consistency
+    /// unknown.
     fn stopped_pass_admitted(
         &mut self,
         limits: &Limits,
@@ -1704,8 +1723,12 @@ impl Classification {
             return Ok(());
         }
 
-        let used = admission.admit(&self.stats, bytes, limits)?;
-        let additional = count - old_len;
+        let additional = count.saturating_sub(old_len);
+        let added_strs = bytes
+            .saturating_sub(count.saturating_mul(std::mem::size_of::<Class>()))
+            .saturating_sub(self.incomplete.iter().map(|c| c.as_str().len()).sum());
+        let beside = moved_buffer(&self.incomplete, additional, added_strs);
+        let used = admission.admit_beside(&self.stats, bytes, beside, limits)?;
         #[cfg(test)]
         let additional = if FAIL_FULL_INCOMPLETE_RESERVE.replace(false) {
             usize::MAX
@@ -1724,9 +1747,21 @@ impl Classification {
             }
         }
         self.incomplete.sort_unstable();
-        admission.record(&mut self.stats, bytes, used);
+        admission.record_beside(&mut self.stats, bytes, used, beside);
         Ok(())
     }
+}
+
+/// What a list of classes holds beside its final estimate while a reserve of `additional`
+/// more moves it: its old buffer, beside the new one, before the `added_strs` bytes of the
+/// added classes' IRIs are cloned. A reserve that fits the list's capacity moves nothing.
+fn moved_buffer(list: &Vec<Class>, additional: usize, added_strs: usize) -> usize {
+    if list.capacity().saturating_sub(list.len()) >= additional {
+        return 0;
+    }
+    list.capacity()
+        .saturating_mul(std::mem::size_of::<Class>())
+        .saturating_sub(added_strs)
 }
 
 /// Admits and merges module-coverage incomplete class references (plus unsatisfiable
@@ -1762,16 +1797,28 @@ fn admit_and_merge_incomplete<'c>(
     if incoming.is_empty() && unsatisfiable_count == 0 {
         return Ok(());
     }
-    let unsatisfiable_bytes = unsatisfiable()
-        .map(|c| std::mem::size_of::<Class>() + c.as_str().len())
-        .sum::<usize>();
+    let unsatisfiable_strs = unsatisfiable()
+        .map(|c| c.as_str().len())
+        .fold(0usize, usize::saturating_add);
+    let unsatisfiable_bytes = unsatisfiable_count
+        .saturating_mul(std::mem::size_of::<Class>())
+        .saturating_add(unsatisfiable_strs);
     let bytes = admission
         .incomplete_memory
         .saturating_add(Classification::incomplete_ref_bytes(&incoming))
         .saturating_add(unsatisfiable_bytes);
-    let beside = incoming.capacity() * std::mem::size_of::<&Class>();
+    let additional = incoming.len().saturating_add(unsatisfiable_count);
+    let added_strs = incoming
+        .iter()
+        .map(|c| c.as_str().len())
+        .fold(unsatisfiable_strs, usize::saturating_add);
+    // the pass's list, which stays held until the list is built, and the list's old
+    // buffer while a reserve moves it
+    let beside = incoming
+        .capacity()
+        .saturating_mul(std::mem::size_of::<&Class>())
+        .saturating_add(moved_buffer(incomplete, additional, added_strs));
     let used = admission.admit_beside(stats, bytes, beside, limits)?;
-    let additional = incoming.len() + unsatisfiable_count;
     if incomplete.try_reserve_exact(additional).is_err() {
         return Err(Error::Memory {
             limit: limits.max_memory.unwrap_or(usize::MAX),
@@ -26867,6 +26914,118 @@ mod tests {
         assert_eq!(out.stats.peak_memory, need);
         assert_eq!(pool_used.load(Ordering::Relaxed), need);
         assert_eq!(pool_calls.load(Ordering::Relaxed), calls);
+
+        // 1e. With declaration-only classes, which the pass's index never holds, the full
+        //     list costs more than the pass's peak, so a cap and a pool that admit the
+        //     subset `S` still refuse the growth to the full list `F` after it.
+        let mut declared_ofn = format!(
+            "Prefix(:=<urn:mod-subset-declared-{pad}:>)\nOntology(\n\
+             SubClassOf(:A :B)\n\
+             SubClassOf(:B :C)\n\
+             SubClassOf(:C ObjectUnionOf(:D :E))\n\
+             SubClassOf(:X :B)\n\
+             SubClassOf(:P :Q)\n"
+        );
+        for i in 0..200 {
+            declared_ofn.push_str(&format!("Declaration(Class(:Z{i}))\n"));
+        }
+        declared_ofn.push(')');
+        let declared_doc = crate::ofn_read::parse(&declared_ofn).unwrap();
+        let declared_kinds: Vec<&AxiomKind> = declared_doc.axioms.iter().map(|a| &a.kind).collect();
+        let deferred =
+            |max_memory: Option<usize>,
+             charge: Option<Arc<dyn Fn(usize) -> bool + Send + Sync>>| Limits {
+                threads: 1,
+                el_only: true,
+                cover_later: true,
+                max_memory,
+                charge,
+                ..Limits::default()
+            };
+        let mut base_sat = Saturation::new();
+        let mut base_admitted = base_sat
+            .classify_admitted(&declared_kinds, None, &deferred(None, None))
+            .unwrap();
+        let m = base_admitted.classification().stats.memory;
+        let (_, f) = base_admitted.classification().all_incomplete_bytes();
+        base_admitted
+            .cover(&declared_kinds, base_sat.excluded(), None)
+            .unwrap();
+        let declared_out = base_admitted.into_classification();
+        assert!(!declared_out.incomplete.is_empty());
+        assert!(!declared_out.has_all_taxonomy_classes());
+        let s = Classification::incomplete_vec_bytes(&declared_out.incomplete);
+        let k = declared_out.stats.coverage_memory;
+        let need = declared_out.stats.peak_memory;
+        assert!(
+            s < f && k < f && need < m + f,
+            "m {m}, s {s}, f {f}, k {k}, need {need}"
+        );
+        // the subset fills its buffer, whose move the full list's long IRIs outweigh
+        assert_eq!(
+            declared_out.incomplete.len(),
+            declared_out.incomplete.capacity()
+        );
+
+        // A cap a byte below `m + f` admits the pass and the subset, then refuses the
+        // full list at `m + f`.
+        let mut sat = Saturation::new();
+        let mut admitted = sat
+            .classify_admitted(&declared_kinds, None, &deferred(Some(m + f - 1), None))
+            .unwrap();
+        admitted
+            .cover(&declared_kinds, sat.excluded(), None)
+            .unwrap();
+        assert_eq!(admitted.classification().stats.memory, m + s);
+        assert!(matches!(
+            admitted.leave_out_unmapped(unmapped.clone()),
+            Err(Error::Memory { limit, used }) if limit == m + f - 1 && used == m + f
+        ));
+        assert_eq!(admitted.classification().stats.memory, m + s);
+
+        // A pool a byte below `m + f` does the same, charging no more than the pass's
+        // peak before it refuses.
+        let pool_used = Arc::new(AtomicUsize::new(0));
+        let pu = pool_used.clone();
+        let mut sat = Saturation::new();
+        let mut admitted = sat
+            .classify_admitted(
+                &declared_kinds,
+                None,
+                &deferred(
+                    None,
+                    Some(Arc::new(move |bytes| {
+                        let prev = pu.load(Ordering::Relaxed);
+                        if prev.saturating_add(bytes) > m + f - 1 {
+                            return false;
+                        }
+                        pu.store(prev + bytes, Ordering::Relaxed);
+                        true
+                    })),
+                ),
+            )
+            .unwrap();
+        admitted
+            .cover(&declared_kinds, sat.excluded(), None)
+            .unwrap();
+        assert_eq!(pool_used.load(Ordering::Relaxed), need);
+        assert!(matches!(
+            admitted.leave_out_unmapped(unmapped.clone()),
+            Err(Error::Memory { used, .. }) if used == m + f
+        ));
+        assert_eq!(pool_used.load(Ordering::Relaxed), need);
+
+        // At `m + f` exactly, both steps fit.
+        let mut sat = Saturation::new();
+        let mut admitted = sat
+            .classify_admitted(&declared_kinds, None, &deferred(Some(m + f), None))
+            .unwrap();
+        admitted
+            .cover(&declared_kinds, sat.excluded(), None)
+            .unwrap();
+        admitted.leave_out_unmapped(unmapped.clone()).unwrap();
+        assert!(admitted.classification().has_all_taxonomy_classes());
+        assert_eq!(admitted.classification().stats.memory, m + f);
 
         // 2. Module coverage directly returning every taxonomy class (base-module hit).
         let full_ofn = format!(

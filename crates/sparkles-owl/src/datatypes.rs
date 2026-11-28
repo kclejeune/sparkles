@@ -74,6 +74,62 @@ pub fn lexical(datatype: &str, lex: &str) -> Option<bool> {
     })
 }
 
+/// An upper bound on the heap bytes that [`lexical`] holds at once while it checks `lex`
+/// against `datatype`, found without allocating. Only the base64 and XML literal checks
+/// allocate, and every other datatype's check holds nothing.
+pub(crate) fn lexical_scratch(datatype: &str, lex: &str) -> usize {
+    if datatype == vocab::RDF_XML_LITERAL {
+        return xml_content_scratch(lex);
+    }
+    if local(datatype) == Some("base64Binary") {
+        // the characters without their spaces, which a collect grows by doubling
+        return vec_scratch::<u8>(lex.len());
+    }
+    0
+}
+
+/// What a vector of `T` holds at its peak while it grows by pushes to at most `n`
+/// elements: a capacity of at most twice `n`, or the smallest capacity the standard
+/// library allocates, and the old buffer beside the new one while it moves.
+fn vec_scratch<T>(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let size = std::mem::size_of::<T>();
+    let least = if size == 1 { 8 } else { 4 };
+    n.max(least).saturating_mul(3).saturating_mul(size)
+}
+
+/// [`lexical_scratch`] of an XML literal. Each element opened holds an entry of the open
+/// list, and each attribute, which an `=` follows, holds at most an entry of the tag's
+/// attributes, of its two sets of names and of the namespace tables, with its value
+/// copied once and a duplicate copy that is dropped.
+fn xml_content_scratch(s: &str) -> usize {
+    let tags = s.bytes().filter(|b| *b == b'<').count();
+    let attributes = s.bytes().filter(|b| *b == b'=').count();
+    if tags == 0 && attributes == 0 {
+        return 0;
+    }
+    use crate::classify::{btree_map_bytes, btree_set_bytes};
+    use std::mem::size_of;
+    // one more entry than the attributes, for a node that splits while it takes the last
+    let entries = attributes.saturating_add(1);
+    let open = vec_scratch::<(&str, usize)>(tags);
+    let tag = vec_scratch::<(&str, &str)>(attributes)
+        .saturating_add(btree_set_bytes::<&str>(entries))
+        .saturating_add(btree_set_bytes::<(Option<usize>, &str)>(entries));
+    // an `Rc` allocates its two counts beside its value
+    let rc = size_of::<usize>()
+        .saturating_mul(2)
+        .saturating_add(size_of::<Cow<'_, str>>());
+    let namespaces = btree_map_bytes::<&str, XmlNamespace<'_>>(entries)
+        .saturating_add(btree_map_bytes::<Rc<Cow<'_, str>>, usize>(entries))
+        .saturating_add(rc.saturating_mul(attributes))
+        .saturating_add(vec_scratch::<(&str, Option<XmlNamespace<'_>>)>(attributes))
+        .saturating_add(s.len().saturating_mul(2));
+    open.saturating_add(tag).saturating_add(namespaces)
+}
+
 /// The constraining facets of `datatype` that OWL 2 supports (§4.1 to §4.8): `None`
 /// for a datatype outside the OWL 2 datatype map, and an empty list for `xsd:boolean`,
 /// `rdf:XMLLiteral` and `rdfs:Literal`, which have none.

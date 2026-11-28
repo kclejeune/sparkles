@@ -20,12 +20,15 @@ their admitted handles live.
 The modules' pass that decides which classes are incomplete when a classification left
 axioms out now admits its index, its extractions and its lists against the classifier's
 memory budget and the pool's grant before each growth, as the saturation is admitted.
-Its peak counts in `Stats::peak_memory` and is reported as the new
-`Stats::coverage_memory`, and the held estimate grows only by the list of incomplete
-classes. A classification whose pass the budget or the pool refuses fails with the
+The new `Stats::coverage_memory` reports the pass's own peak, which raises the run's
+admitted peak in `Stats::peak_memory`, and the held estimate grows only by the list of
+incomplete classes. The walk of each axiom, its literal checks included, is admitted
+before it allocates, and the extractions no longer check literals again. A
+classification whose pass or list merge the budget or the pool refuses fails with the
 memory error, and a `partial` one answers with every class incomplete, the consistency
-unknown and `coverageStopped` set. The pass's index polls the deadline and the
-cancellation every 4,096 axioms. `Stats::coverage_stopped` now also covers that refusal.
+unknown and `coverageStopped` set. The pass polls the deadline and the cancellation every
+4,096 axioms while it counts and indexes the axioms, marks the left-out ones and checks
+the terminology's gates. `Stats::coverage_stopped` now also covers that refusal.
 
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 

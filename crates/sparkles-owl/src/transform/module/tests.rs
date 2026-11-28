@@ -312,7 +312,7 @@ fn the_fast_extraction_is_the_plain_fixpoint() {
         let doc = crate::ofn_read::parse(&std::fs::read_to_string(case).unwrap()).unwrap();
         let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
         let ix = Index::new(&kinds);
-        let mask = ix.terminology_gate();
+        let mask = ix.terminology_gate(&|| false).unwrap();
         let mut classes: Vec<&str> = ix
             .names
             .iter()
@@ -366,6 +366,50 @@ fn the_fast_extraction_is_the_plain_fixpoint() {
         }
     }
     assert!(compared > 5000, "{compared}");
+}
+
+/// The extractions' locality rules read the verdict on each axiom's literals that the
+/// index found once, and never check a literal again: a verdict written over the index's
+/// decides the rules both ways.
+#[test]
+fn the_locality_rules_read_the_literal_verdict_of_the_index() {
+    let (k, _) = read(
+        "NegativeDataPropertyAssertion(:d :x \"seven\"^^<http://www.w3.org/2001/XMLSchema#integer>)
+         NegativeDataPropertyAssertion(:d :x \"7\"^^<http://www.w3.org/2001/XMLSchema#integer>)
+         DataPropertyAssertion(:d :x \"7\"^^<http://www.w3.org/2001/XMLSchema#integer>)
+         DataPropertyAssertion(:d :x \"seven\"^^<http://www.w3.org/2001/XMLSchema#integer>)",
+    );
+    let kinds: Vec<&AxiomKind> = k.iter().collect();
+    let mut ix = Index::new(&kinds);
+    let ill = Lits {
+        ill: true,
+        typed: false,
+    };
+    assert_eq!(
+        ix.lits,
+        [
+            ill,
+            Lits::default(),
+            Lits {
+                ill: false,
+                typed: true
+            },
+            ill
+        ]
+    );
+    // with the property outside the signature, a negative assertion is bottom-local
+    // unless its literal is ill-typed, and an assertion is top-local only when its
+    // literal is typed
+    let local = |ix: &Index<'_>| {
+        let bottom = Extraction::new(ix, Mode::Bottom, None, None);
+        let top = Extraction::new(ix, Mode::Top, None, None);
+        [bottom.local(0), bottom.local(1), top.local(2), top.local(3)]
+    };
+    assert_eq!(local(&ix), [false, true, true, false]);
+    // verdicts written over the index's decide the rules, so the rules check no literal
+    ix.lits.swap(0, 1);
+    ix.lits.swap(2, 3);
+    assert_eq!(local(&ix), [true, false, false, true]);
 }
 
 #[test]

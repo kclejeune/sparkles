@@ -882,7 +882,7 @@ pub(crate) fn finish_classify(
         );
     } else if j["stats"]["coverageStopped"].as_bool() == Some(true) {
         eprintln!(
-            "incomplete answer: a deadline, a cancellation or the memory budget stopped the check of which classes keep their answer, so all {} classes may miss entailments, consistency unknown",
+            "incomplete answer: a deadline, a cancellation or the memory budget stopped the check of which classes keep their answer, so all {} classes may miss entailments. Consistency is unknown.",
             j["incompleteCount"].as_u64().unwrap_or(0),
         );
     } else if j["complete"].as_bool() == Some(false) {

@@ -133,8 +133,9 @@ const POLL_EVERY: usize = 4096;
 /// without `admit` refuses nothing and only counts.
 ///
 /// A vector that reallocates holds its old and its new buffer at once, which the peak
-/// counts. The signature walk of one axiom is counted once it is known, before the index
-/// takes anything of that axiom, and freed after it.
+/// counts. The walk of one axiom, which collects its signature, its needed sets and its
+/// triggers and checks its literals, is admitted before it starts, by a bound that the
+/// axiom's shape gives without allocating, and freed after the index has taken it.
 pub(crate) struct Meter<'m> {
     admit: Option<&'m dyn Fn(usize) -> bool>,
     live: Cell<usize>,
@@ -159,6 +160,21 @@ impl<'m> Meter<'m> {
     #[cfg(test)]
     pub(crate) fn live(&self) -> usize {
         self.live.get()
+    }
+
+    /// What the meter counts now, for [`settle`](Meter::settle) when the state admitted
+    /// after it drops.
+    pub(crate) fn mark(&self) -> usize {
+        self.live.get()
+    }
+
+    /// Counts what the meter counted at `mark`, less `dropped` bytes of it that are freed,
+    /// and `kept` bytes admitted since that are still held, once everything else admitted
+    /// since has dropped. Every exit of a phase that admits through the meter can then
+    /// give back what the phase held without summing each container's size again.
+    pub(crate) fn settle(&self, mark: usize, dropped: usize, kept: usize) {
+        self.live
+            .set(mark.saturating_sub(dropped).saturating_add(kept));
     }
 
     /// Whether the pass may hold `bytes` at once, which raises its peak when it may.
@@ -266,15 +282,43 @@ pub(crate) struct CoverageRefs<'c> {
 ///
 /// The extractions look at no more than `budget` axioms in all, after which the classes
 /// not yet decided are incomplete, so that the answer depends on the input alone. `stop`
-/// is asked every few thousand axioms, while the index is built and while the
+/// is asked every few thousand axioms, while the index is counted and built, while the
+/// left-out axioms are marked and the terminology's gates are checked, and while the
 /// extractions run, and true ends the pass with [`Stopped::Caller`]. `meter` admits every
 /// growth of the pass's state, and a refusal ends the pass with [`Stopped::Memory`]. The
-/// state the pass held is freed when it returns, except the list it answers, which the
-/// meter still counts.
+/// state the pass held is freed when it returns, and with it `classes`, which the meter
+/// is taken to count already. The meter then counts the list the pass answers and no
+/// more of the pass.
 ///
 /// Returns borrowed references into `classes` without cloning class IRIs so callers can
 /// enforce memory admission before materializing an owned `Vec<Class>`.
 pub(crate) fn coverage_refs<'c>(
+    axioms: &[&AxiomKind],
+    left_out: &[&AxiomKind],
+    consistent: bool,
+    classes: Vec<&'c Class>,
+    budget: usize,
+    stop: &dyn Fn() -> bool,
+    meter: &Meter<'_>,
+) -> Result<CoverageRefs<'c>, Stopped> {
+    let given = classes.capacity().saturating_mul(size_of::<&Class>());
+    let mark = meter.mark();
+    let c = coverage_pass(axioms, left_out, consistent, classes, budget, stop, meter);
+    let kept = c.as_ref().map_or(0, |c| {
+        c.incomplete.capacity().saturating_mul(size_of::<&Class>())
+    });
+    meter.settle(mark, given, kept);
+    c
+}
+
+/// Whether `stop` says to stop at the `i`th step of a scan, which asks it once every
+/// [`POLL_EVERY`] steps.
+fn polled(i: usize, stop: &dyn Fn() -> bool) -> bool {
+    i.saturating_add(1).is_multiple_of(POLL_EVERY) && stop()
+}
+
+/// [`coverage_refs`], whose state the meter still counts when it returns.
+fn coverage_pass<'c>(
     axioms: &[&AxiomKind],
     left_out: &[&AxiomKind],
     consistent: bool,
@@ -311,12 +355,20 @@ pub(crate) fn coverage_refs<'c>(
     }
     let mut wanted: FxHashSet<&AxiomKind> =
         FxHashSet::with_capacity_and_hasher(left_out.len(), Default::default());
-    wanted.extend(left_out.iter().copied());
+    for (i, &a) in left_out.iter().enumerate() {
+        if polled(i, stop) {
+            return Err(Stopped::Caller);
+        }
+        wanted.insert(a);
+    }
     let mut left = vec![false; ix.axioms.len()];
     // no more distinct axioms than `wanted` holds, so it never grows
     let mut found: FxHashSet<&AxiomKind> =
         FxHashSet::with_capacity_and_hasher(left_out.len(), Default::default());
     for (j, a) in ix.axioms.iter().enumerate() {
+        if polled(j, stop) {
+            return Err(Stopped::Caller);
+        }
         if wanted.contains(a) {
             left[j] = true;
             found.insert(a);
@@ -325,9 +377,19 @@ pub(crate) fn coverage_refs<'c>(
     // the left-out axioms first in each list, so that an extension that reaches one
     // stops before it checks the others. Each list is in ascending order, so ordering by
     // the axiom's number after its mark keeps the order a stable sort would, without
-    // the stable sort's buffer.
+    // the stable sort's buffer. The lists hold an entry for each entity of each axiom,
+    // and the stop is asked once their entries since it was last asked pass the poll's
+    // count.
+    let mut sorted = 0usize;
     for list in ix.by_trigger.iter_mut().chain(ix.by_entity.iter_mut()) {
         list.sort_unstable_by_key(|&j| (!left[j as usize], j));
+        sorted = sorted.saturating_add(list.len().max(1));
+        if sorted >= POLL_EVERY {
+            sorted = 0;
+            if stop() {
+                return Err(Stopped::Caller);
+            }
+        }
     }
     let ix = ix;
     let work = Work {
@@ -346,11 +408,13 @@ pub(crate) fn coverage_refs<'c>(
         })
     };
     // a left-out declaration or annotation is no logical content
-    let missing = wanted
-        .iter()
-        .any(|a| !found.contains(a) && Index::indexed(a));
-    if missing {
-        return unknown(false);
+    for (i, a) in wanted.iter().enumerate() {
+        if polled(i, stop) {
+            return Err(Stopped::Caller);
+        }
+        if !found.contains(a) && Index::indexed(a) {
+            return unknown(false);
+        }
     }
     // whether the extraction reached a left-out axiom, or None when it halted
     let hits = |x: &mut Extraction<'_>| -> Option<bool> {
@@ -399,7 +463,7 @@ pub(crate) fn coverage_refs<'c>(
     if !meter.grow(ix.axioms.len()) {
         return Err(Stopped::Memory);
     }
-    let terminology = ix.terminology_gate();
+    let terminology = ix.terminology_gate(stop)?;
     if terminology.is_none() {
         meter.free(ix.axioms.len());
     }
@@ -602,8 +666,34 @@ struct Index<'a> {
     /// for each axiom, the sets of entities one of which must lie in the signature for
     /// the axiom not to be bottom-local ([`bottom_needs`]), or None when there are none
     needs: Vec<Option<Vec<Vec<u32>>>>,
+    /// what the literals of each axiom are, found once when the index is built, so that
+    /// the locality rules never check a literal again
+    lits: Vec<Lits>,
     ids: FxHashMap<String, u32>,
     names: Vec<String>,
+}
+
+/// What the literals of an axiom are, for the locality rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Lits {
+    /// the axiom holds a literal outside its datatype's lexical space ([`ill_literal`])
+    ill: bool,
+    /// the axiom is a data property assertion whose literal is in its datatype's lexical
+    /// space
+    typed: bool,
+}
+
+impl Lits {
+    fn of(k: &AxiomKind) -> Lits {
+        Lits {
+            ill: ill_literal(k),
+            typed: matches!(
+                k,
+                AxiomKind::DataPropertyAssertion(_, _, l)
+                    if crate::datatypes::lexical(l.datatype(), l.value()) == Some(true)
+            ),
+        }
+    }
 }
 
 impl<'a> Index<'a> {
@@ -619,23 +709,33 @@ impl<'a> Index<'a> {
     }
 
     /// The index of `given`, with each growth admitted through `meter` when there is one.
-    /// `stop` is asked every [`POLL_EVERY`] axioms.
+    /// `stop` is asked every [`POLL_EVERY`] axioms, while the axioms are counted and
+    /// while they are indexed.
     fn build(
         given: &[&'a AxiomKind],
         meter: Option<&Meter<'_>>,
         stop: &dyn Fn() -> bool,
     ) -> Result<Index<'a>, Halt> {
         let refused = |admitted: bool| if admitted { Ok(()) } else { Err(Halt::Memory) };
-        let n = given.iter().filter(|k| Index::indexed(k)).count();
+        let mut n = 0usize;
+        for (i, k) in given.iter().enumerate() {
+            if polled(i, stop) {
+                return Err(Halt::Stopped);
+            }
+            if Index::indexed(k) {
+                n += 1;
+            }
+        }
         refused(grow(
             meter,
             size_of::<Option<u32>>()
                 .saturating_mul(given.len())
                 .saturating_add(
-                    (size_of::<&AxiomKind>()
-                        + size_of::<Vec<u32>>()
-                        + size_of::<Option<Vec<Vec<u32>>>>())
-                    .saturating_mul(n),
+                    size_of::<&AxiomKind>()
+                        .saturating_add(size_of::<Vec<u32>>())
+                        .saturating_add(size_of::<Option<Vec<Vec<u32>>>>())
+                        .saturating_add(size_of::<Lits>())
+                        .saturating_mul(n),
                 ),
         ))?;
         let mut ix = Index {
@@ -645,12 +745,13 @@ impl<'a> Index<'a> {
             by_entity: Vec::new(),
             by_trigger: Vec::new(),
             needs: Vec::with_capacity(n),
+            lits: Vec::with_capacity(n),
             ids: FxHashMap::default(),
             names: Vec::new(),
         };
         let id_entry = size_of::<(String, u32)>();
         for (i, k) in given.iter().enumerate() {
-            if (i + 1).is_multiple_of(POLL_EVERY) && stop() {
+            if polled(i, stop) {
                 return Err(Halt::Stopped);
             }
             if !Index::indexed(k) {
@@ -660,31 +761,24 @@ impl<'a> Index<'a> {
             let j = ix.axioms.len() as u32;
             ix.place.push(Some(j));
             ix.axioms.push(k);
+            // The walk of the axiom is admitted before it allocates anything, and held
+            // until the index has taken the axiom.
+            let walk = if meter.is_some() { walk_bound(k) } else { 0 };
+            refused(grow(meter, walk))?;
             let mut s = Signature::default();
             s.axiom(k);
+            let lits = Lits::of(k);
+            ix.lits.push(lits);
             // an axiom with an ill-typed literal is never local, so nothing it needs
-            let alts = bottom_needs(k).filter(|_| !ill_literal(k));
-            let mut deps: Vec<&str> = Vec::new();
-            bottom_deps(k, &mut deps);
+            let alts = bottom_needs(k).filter(|_| !lits.ill);
+            // counted first, so that the list is allocated once at its size
+            let mut count = 0usize;
+            bottom_deps(k, &mut |_| count += 1);
+            let mut deps: Vec<&str> = Vec::with_capacity(count);
+            bottom_deps(k, &mut |iri| deps.push(iri));
             deps.sort_unstable();
             deps.dedup();
-            // What the walk of this axiom held at its peak and holds until the index has
-            // taken it: the signature's set, whose IRIs and the copy of one that the
-            // axiom names twice are within the axiom's own heap, the temporaries of the
-            // needed sets, which hold a few words for each operand and so are within it
-            // too, the needed sets and the list of triggers with its last move.
-            let own = crate::classify::axiom_retained_heap_bytes(k);
-            let walk = crate::classify::btree_set_bytes::<Entity>(s.0.len())
-                .saturating_add(own.saturating_mul(2))
-                .saturating_add(alts.as_ref().map_or(0, |alts| {
-                    alts.iter()
-                        .map(|set| set.capacity() * size_of::<&str>())
-                        .sum::<usize>()
-                        + alts.capacity() * size_of::<Vec<&str>>()
-                }))
-                .saturating_add(deps.capacity() * size_of::<&str>() * 2);
-            refused(grow(meter, walk))?;
-            refused(grow(meter, s.0.len() * size_of::<u32>()))?;
+            refused(grow(meter, s.0.len().saturating_mul(size_of::<u32>())))?;
             let mut sig = Vec::with_capacity(s.0.len());
             for e in s.0 {
                 let iri = e.iri().as_str();
@@ -724,12 +818,15 @@ impl<'a> Index<'a> {
                 None => None,
                 Some(alts) => {
                     let kept = |set: &Vec<&str>| set.iter().all(|iri| ix.ids.contains_key(*iri));
-                    let bytes = alts.len() * size_of::<Vec<u32>>()
-                        + alts
-                            .iter()
-                            .filter(|set| kept(set))
-                            .map(|set| set.len() * size_of::<u32>())
-                            .sum::<usize>();
+                    let bytes = alts
+                        .len()
+                        .saturating_mul(size_of::<Vec<u32>>())
+                        .saturating_add(
+                            alts.iter()
+                                .filter(|set| kept(set))
+                                .map(|set| set.len().saturating_mul(size_of::<u32>()))
+                                .fold(0usize, usize::saturating_add),
+                        );
                     refused(grow(meter, bytes))?;
                     let mut out: Vec<Vec<u32>> = Vec::with_capacity(alts.len());
                     for set in alts.iter().filter(|set| kept(set)) {
@@ -766,19 +863,24 @@ impl<'a> Index<'a> {
     /// The axioms of the terminology, when layer 3's syntactic gates hold: no axiom
     /// outside the assertions and keys holds a nominal, and no axiom holds the universal
     /// object property.
-    fn terminology_gate(&self) -> Option<Vec<bool>> {
+    /// `stop` is asked every [`POLL_EVERY`] axioms, and true answers
+    /// [`Stopped::Caller`], which is not a gate that fails.
+    fn terminology_gate(&self, stop: &dyn Fn() -> bool) -> Result<Option<Vec<bool>>, Stopped> {
         if self.ids.contains_key(vocab::OWL_TOP_OBJECT_PROPERTY) {
-            return None;
+            return Ok(None);
         }
         let mut mask = Vec::with_capacity(self.axioms.len());
-        for k in &self.axioms {
+        for (j, k) in self.axioms.iter().enumerate() {
+            if polled(j, stop) {
+                return Err(Stopped::Caller);
+            }
             let assertion = assertion_or_key(k);
             if !assertion && names_nominal(k) {
-                return None;
+                return Ok(None);
             }
             mask.push(!assertion);
         }
-        Some(mask)
+        Ok(Some(mask))
     }
 }
 
@@ -872,7 +974,7 @@ impl<'i> Extraction<'i> {
     ) -> Extraction<'i> {
         let work = work.into();
         // a refusal halts the pass, which then extends nothing
-        let admitted = work.is_none_or(|w| w.grow(ix.names.len() + ix.axioms.len()));
+        let admitted = work.is_none_or(|w| w.grow(ix.names.len().saturating_add(ix.axioms.len())));
         let (base_sig, base_mod) = if admitted {
             (vec![false; ix.names.len()], vec![false; ix.axioms.len()])
         } else {
@@ -896,7 +998,12 @@ impl<'i> Extraction<'i> {
     /// Keeps the module as the base of later extensions; false when the meter refused
     /// the stamps, which leaves the extraction unfrozen and the pass halted.
     fn freeze(&mut self) -> bool {
-        let bytes = (self.ix.names.len() + self.ix.axioms.len()) * size_of::<u32>();
+        let bytes = self
+            .ix
+            .names
+            .len()
+            .saturating_add(self.ix.axioms.len())
+            .saturating_mul(size_of::<u32>());
         if self.work.is_some_and(|w| !w.grow(bytes)) {
             return false;
         }
@@ -916,10 +1023,16 @@ impl<'i> Extraction<'i> {
 
     /// The bytes the meter counts for this extraction.
     fn bytes(&self) -> usize {
-        self.base_sig.capacity()
-            + self.base_mod.capacity()
-            + (self.sig_stamp.capacity() + self.mod_stamp.capacity() + self.added.capacity())
-                * size_of::<u32>()
+        let stamps = self
+            .sig_stamp
+            .capacity()
+            .saturating_add(self.mod_stamp.capacity())
+            .saturating_add(self.added.capacity())
+            .saturating_mul(size_of::<u32>());
+        self.base_sig
+            .capacity()
+            .saturating_add(self.base_mod.capacity())
+            .saturating_add(stamps)
     }
 
     /// Starts an extension of the frozen base.
@@ -985,9 +1098,10 @@ impl<'i> Extraction<'i> {
     fn local(&self, j: usize) -> bool {
         let has = |iri: &str| self.ix.id(iri).is_some_and(|e| self.has_id(e));
         let k = self.ix.axioms[j];
+        let lits = self.ix.lits[j];
         match self.mode {
-            Mode::Bottom => bottom_local(k, &Sig(&has)),
-            Mode::Top => top_local(k, &Sig(&has)),
+            Mode::Bottom => bottom_local_with(k, &Sig(&has), lits),
+            Mode::Top => top_local_with(k, &Sig(&has), lits),
         }
     }
 
@@ -1008,7 +1122,8 @@ impl<'i> Extraction<'i> {
         let mut queue: Vec<u32> = Vec::new();
         self.extend_with(&mut queue, seed, axiom, entity);
         if let Some(w) = self.work {
-            w.meter.free(queue.capacity() * size_of::<u32>());
+            w.meter
+                .free(queue.capacity().saturating_mul(size_of::<u32>()));
         }
     }
 
@@ -1255,10 +1370,10 @@ impl Sig<'_> {
 /// The IRIs whose presence in the signature [`bottom_local`] can read for the axiom, in
 /// any branch: its answer is a function of them alone, so an entity outside them enters
 /// the signature without changing it. Each case mirrors one of [`bottom_local`].
-fn bottom_deps<'k>(k: &'k AxiomKind, out: &mut Vec<&'k str>) {
+fn bottom_deps<'k>(k: &'k AxiomKind, out: &mut dyn FnMut(&'k str)) {
     use AxiomKind as K;
     let ope =
-        |p: &'k ObjectPropertyExpression, out: &mut Vec<&'k str>| out.push(p.named().as_str());
+        |p: &'k ObjectPropertyExpression, out: &mut dyn FnMut(&'k str)| out(p.named().as_str());
     match k {
         K::SubClassOf(a, b) => {
             ce_bottom_deps(a, out);
@@ -1272,7 +1387,7 @@ fn bottom_deps<'k>(k: &'k AxiomKind, out: &mut Vec<&'k str>) {
         }
         K::DisjointClasses(cs) => cs.iter().for_each(|c| ce_bottom_deps(c, out)),
         K::DisjointUnion(c, cs) => {
-            out.push(c.as_str());
+            out(c.as_str());
             cs.iter().for_each(|c| ce_bottom_deps(c, out));
         }
         K::SubObjectPropertyOf(p, _) => match p {
@@ -1299,18 +1414,18 @@ fn bottom_deps<'k>(k: &'k AxiomKind, out: &mut Vec<&'k str>) {
         K::SubDataPropertyOf(p, _)
         | K::DataPropertyRange(p, _)
         | K::FunctionalDataProperty(p)
-        | K::NegativeDataPropertyAssertion(p, _, _) => out.push(p.as_str()),
-        K::EquivalentDataProperties(ps) => out.extend(ps.iter().map(|p| p.as_str())),
-        K::DisjointDataProperties(ps) => out.extend(ps.iter().map(|p| p.as_str())),
+        | K::NegativeDataPropertyAssertion(p, _, _) => out(p.as_str()),
+        K::EquivalentDataProperties(ps) => ps.iter().for_each(|p| out(p.as_str())),
+        K::DisjointDataProperties(ps) => ps.iter().for_each(|p| out(p.as_str())),
         K::DataPropertyDomain(p, c) => {
-            out.push(p.as_str());
+            out(p.as_str());
             ce_top_deps(c, out);
         }
         K::ClassAssertion(c, _) => ce_top_deps(c, out),
         K::HasKey(c, ps, ds) => {
             ce_bottom_deps(c, out);
             ps.iter().for_each(|p| ope(p, out));
-            out.extend(ds.iter().map(|p| p.as_str()));
+            ds.iter().for_each(|p| out(p.as_str()));
         }
         // local for every signature, or for none
         _ => {}
@@ -1321,7 +1436,9 @@ fn bottom_deps<'k>(k: &'k AxiomKind, out: &mut Vec<&'k str>) {
 /// bottom-local, or None when [`bottom_local`] can call it non-local whatever the
 /// signature holds. Each case follows from one of [`bottom_local`]: an axiom about classes
 /// needs a class expression that is not empty, and one about properties a property that
-/// is not. An empty list means the axiom is local for every signature.
+/// is not. An empty list means the axiom is local for every signature. Each set is built
+/// in place by pushes, and the list of sets has room for one per operand, which
+/// [`walk_bound`] counts.
 fn bottom_needs(k: &AxiomKind) -> Option<Vec<Vec<&str>>> {
     use AxiomKind as K;
     fn ope(p: &ObjectPropertyExpression) -> Vec<&str> {
@@ -1330,21 +1447,32 @@ fn bottom_needs(k: &AxiomKind) -> Option<Vec<Vec<&str>>> {
     fn dp(p: &DataProperty) -> Vec<&str> {
         named_dp(p).into_iter().collect()
     }
-    fn each(sets: Vec<Option<Vec<&str>>>) -> Vec<Vec<&str>> {
-        sets.into_iter().flatten().collect()
+    fn nonempty(c: &ClassExpression) -> Option<Vec<&str>> {
+        let mut set = Vec::new();
+        nonempty_needs(c, &mut set).then_some(set)
+    }
+    fn each<'c>(
+        first: Option<Vec<&'c str>>,
+        cs: impl ExactSizeIterator<Item = &'c ClassExpression>,
+    ) -> Vec<Vec<&'c str>> {
+        let mut sets = Vec::with_capacity(cs.len().saturating_add(usize::from(first.is_some())));
+        sets.extend(first);
+        for c in cs {
+            sets.extend(nonempty(c));
+        }
+        sets
     }
     Some(match k {
-        K::SubClassOf(a, _) => each(vec![nonempty_needs(a)]),
-        K::EquivalentClasses(cs) => each(cs.iter().map(nonempty_needs).collect()),
-        K::DisjointClasses(cs) => each(cs.iter().map(nonempty_needs).collect()),
+        K::SubClassOf(a, _) => nonempty(a).into_iter().collect(),
+        K::EquivalentClasses(cs) => each(None, cs.iter()),
+        K::DisjointClasses(cs) => each(None, cs.iter()),
         K::DisjointUnion(c, cs) => {
-            let mut sets = vec![class_needs(c)];
-            sets.extend(cs.iter().map(nonempty_needs));
-            each(sets)
+            let first = class_needs(c).map(|iri| iri.into_iter().collect());
+            each(first, cs.iter())
         }
         K::SubObjectPropertyOf(p, _) => vec![match p {
             SubObjectPropertyExpression::Expression(p) => ope(p),
-            SubObjectPropertyExpression::Chain(ps) => ps.iter().flat_map(ope).collect(),
+            SubObjectPropertyExpression::Chain(ps) => ps.iter().filter_map(named_ope).collect(),
         }],
         K::EquivalentObjectProperties(ps) => ps.iter().map(ope).collect(),
         K::DisjointObjectProperties(ps) => ps.iter().map(ope).collect(),
@@ -1365,11 +1493,14 @@ fn bottom_needs(k: &AxiomKind) -> Option<Vec<Vec<&str>>> {
         | K::NegativeDataPropertyAssertion(p, _, _) => vec![dp(p)],
         K::EquivalentDataProperties(ps) => ps.iter().map(dp).collect(),
         K::DisjointDataProperties(ps) => ps.iter().map(dp).collect(),
-        K::HasKey(c, ps, ds) => each(vec![nonempty_needs(c).map(|mut set| {
-            set.extend(ps.iter().flat_map(ope));
-            set.extend(ds.iter().flat_map(dp));
-            set
-        })]),
+        K::HasKey(c, ps, ds) => nonempty(c)
+            .map(|mut set| {
+                set.extend(ps.iter().filter_map(named_ope));
+                set.extend(ds.iter().filter_map(named_dp));
+                set
+            })
+            .into_iter()
+            .collect(),
         K::Declaration(_)
         | K::AnnotationAssertion(..)
         | K::SubAnnotationPropertyOf(..)
@@ -1391,78 +1522,292 @@ fn named_dp(p: &DataProperty) -> Option<&str> {
     (n != vocab::OWL_TOP_DATA_PROPERTY).then_some(n)
 }
 
-/// The IRIs that must all lie in the signature for [`Sig::bottom`] to be false of the
-/// expression, or None when it is true whatever the signature, as for owl:Nothing.
-fn nonempty_needs(c: &ClassExpression) -> Option<Vec<&str>> {
+/// Pushes onto `set` the IRIs that must all lie in the signature for [`Sig::bottom`] to
+/// be false of the expression, and answers false when it is true whatever the signature,
+/// as for owl:Nothing, in which case `set` holds no answer.
+fn nonempty_needs<'c>(c: &'c ClassExpression, set: &mut Vec<&'c str>) -> bool {
     use ClassExpression as C;
-    Some(match c {
-        C::Class(c) => return class_needs(c),
-        C::ObjectIntersectionOf(cs) => {
-            let mut set = Vec::new();
-            for c in cs {
-                set.extend(nonempty_needs(c)?);
+    match c {
+        C::Class(c) => match class_needs(c) {
+            None => false,
+            Some(iris) => {
+                set.extend(iris);
+                true
             }
-            set
-        }
+        },
+        C::ObjectIntersectionOf(cs) => cs.iter().all(|c| nonempty_needs(c, set)),
         C::ObjectSomeValuesFrom(p, c) => {
-            let mut set = nonempty_needs(c)?;
+            if !nonempty_needs(c, set) {
+                return false;
+            }
             set.extend(named_ope(p));
-            set
+            true
         }
-        C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => named_ope(p).into_iter().collect(),
+        C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => {
+            set.extend(named_ope(p));
+            true
+        }
         C::ObjectMinCardinality(n, p, c) | C::ObjectExactCardinality(n, p, c) if *n > 0 => {
-            let mut set = match c {
-                Some(c) => nonempty_needs(c)?,
-                None => Vec::new(),
-            };
+            if let Some(c) = c
+                && !nonempty_needs(c, set)
+            {
+                return false;
+            }
             set.extend(named_ope(p));
-            set
+            true
         }
-        C::DataSomeValuesFrom(ps, _) => ps.iter().filter_map(named_dp).collect(),
-        C::DataHasValue(p, _) => named_dp(p).into_iter().collect(),
+        C::DataSomeValuesFrom(ps, _) => {
+            set.extend(ps.iter().filter_map(named_dp));
+            true
+        }
+        C::DataHasValue(p, _) => {
+            set.extend(named_dp(p));
+            true
+        }
         C::DataMinCardinality(n, p, _) | C::DataExactCardinality(n, p, _) if *n > 0 => {
-            named_dp(p).into_iter().collect()
+            set.extend(named_dp(p));
+            true
         }
-        C::ObjectOneOf(is) if is.is_empty() => return None,
+        C::ObjectOneOf(is) if is.is_empty() => false,
         // a union, a complement, a universal or an upper bound can be non-empty with no
         // entity of its own in the signature
-        _ => Vec::new(),
-    })
+        _ => true,
+    }
 }
 
-/// [`nonempty_needs`] of a class.
-fn class_needs(c: &Class) -> Option<Vec<&str>> {
+/// The IRIs a signature must hold for a class not to be empty, or None for owl:Nothing,
+/// which always is.
+fn class_needs(c: &Class) -> Option<Option<&str>> {
     match c.as_str() {
         vocab::OWL_NOTHING => None,
-        vocab::OWL_THING => Some(Vec::new()),
-        iri => Some(vec![iri]),
+        vocab::OWL_THING => Some(None),
+        iri => Some(Some(iri)),
+    }
+}
+
+/// An upper bound, found without allocating, on what the index's walk of one axiom holds
+/// at once: the signature's set with its copies of the axiom's IRIs, the needed sets of
+/// [`bottom_needs`], the triggers of [`bottom_deps`] and the scratch of the literals'
+/// checks ([`Lits::of`]). The walk names each entity reference of the axiom at most once
+/// in each of them.
+///
+/// The set's copies, and the copy of an IRI the axiom names twice, which the set drops,
+/// are within twice the axiom's own heap. Each needed set grows by pushes, so it holds at
+/// most twice its entries, or the least capacity of a vector, with its old buffer beside
+/// the new one while it moves, and the list of needed sets has room for one set for each
+/// operand. The list of triggers is counted first and allocated at its size.
+fn walk_bound(k: &AxiomKind) -> usize {
+    use crate::classify::btree_set_bytes;
+    let own = crate::classify::axiom_retained_heap_bytes(k);
+    let refs = entity_refs(k);
+    let sets = need_sets(k);
+    let iri = size_of::<&str>();
+    let signature = btree_set_bytes::<Entity>(refs).saturating_add(own.saturating_mul(2));
+    // Each set holds at most twice its entries or four, and the one that moves holds its
+    // old buffer of at most its entries beside the new one.
+    let set_entries = sets
+        .saturating_mul(4)
+        .saturating_add(refs.saturating_mul(3));
+    let needs = sets
+        .saturating_mul(size_of::<Vec<&str>>())
+        .saturating_add(set_entries.saturating_mul(iri));
+    // the triggers are counted first and allocated once
+    let mut triggers = 0usize;
+    bottom_deps(k, &mut |_| triggers += 1);
+    signature
+        .saturating_add(needs)
+        .saturating_add(triggers.saturating_mul(iri))
+        .saturating_add(literal_scratch(k))
+}
+
+/// The most needed sets that [`bottom_needs`] builds for an axiom, one for each operand
+/// of a list and one or two otherwise.
+fn need_sets(k: &AxiomKind) -> usize {
+    use AxiomKind as K;
+    match k {
+        K::EquivalentClasses(cs) => cs.len(),
+        K::DisjointClasses(cs) => cs.len(),
+        K::DisjointUnion(_, cs) => cs.len().saturating_add(1),
+        K::EquivalentObjectProperties(ps) => ps.len(),
+        K::DisjointObjectProperties(ps) => ps.len(),
+        K::EquivalentDataProperties(ps) => ps.len(),
+        K::DisjointDataProperties(ps) => ps.len(),
+        K::InverseObjectProperties(..) => 2,
+        _ => 1,
+    }
+}
+
+fn sum<T>(xs: impl IntoIterator<Item = T>, f: impl Fn(T) -> usize) -> usize {
+    xs.into_iter().map(f).fold(0, usize::saturating_add)
+}
+
+/// The entity references of an axiom that the signature walk ([`Signature::axiom`])
+/// visits, each of which adds at most one entity to it, one trigger and one entry to a
+/// needed set.
+fn entity_refs(k: &AxiomKind) -> usize {
+    use AxiomKind as K;
+    match k {
+        K::Declaration(_) => 1,
+        K::SubClassOf(a, b) => ce_refs(a).saturating_add(ce_refs(b)),
+        K::EquivalentClasses(cs) => sum(cs, ce_refs),
+        K::DisjointClasses(cs) => sum(cs, ce_refs),
+        K::DisjointUnion(_, cs) => sum(cs, ce_refs).saturating_add(1),
+        K::SubObjectPropertyOf(sub, _) => match sub {
+            SubObjectPropertyExpression::Expression(_) => 2,
+            SubObjectPropertyExpression::Chain(ps) => ps.len().saturating_add(1),
+        },
+        K::EquivalentObjectProperties(ps) => ps.len(),
+        K::DisjointObjectProperties(ps) => ps.len(),
+        K::InverseObjectProperties(..) => 2,
+        K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) => {
+            ce_refs(c).saturating_add(1)
+        }
+        K::FunctionalObjectProperty(_)
+        | K::InverseFunctionalObjectProperty(_)
+        | K::ReflexiveObjectProperty(_)
+        | K::IrreflexiveObjectProperty(_)
+        | K::SymmetricObjectProperty(_)
+        | K::AsymmetricObjectProperty(_)
+        | K::TransitiveObjectProperty(_)
+        | K::FunctionalDataProperty(_) => 1,
+        K::SubDataPropertyOf(..) => 2,
+        K::EquivalentDataProperties(ps) => ps.len(),
+        K::DisjointDataProperties(ps) => ps.len(),
+        K::DataPropertyDomain(_, c) => ce_refs(c).saturating_add(1),
+        K::DataPropertyRange(_, r) | K::DatatypeDefinition(_, r) => dr_refs(r).saturating_add(1),
+        K::HasKey(c, ops, dps) => ce_refs(c)
+            .saturating_add(ops.len())
+            .saturating_add(dps.len()),
+        K::SameIndividual(is) => is.len(),
+        K::DifferentIndividuals(is) => is.len(),
+        K::ClassAssertion(c, _) => ce_refs(c).saturating_add(1),
+        K::ObjectPropertyAssertion(..)
+        | K::NegativeObjectPropertyAssertion(..)
+        | K::DataPropertyAssertion(..)
+        | K::NegativeDataPropertyAssertion(..) => 3,
+        K::AnnotationAssertion(..) | K::SubAnnotationPropertyOf(..) => 2,
+        K::AnnotationPropertyDomain(..) | K::AnnotationPropertyRange(..) => 1,
+    }
+}
+
+fn ce_refs(c: &ClassExpression) -> usize {
+    use ClassExpression as C;
+    match c {
+        C::Class(_) | C::ObjectHasSelf(_) => 1,
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => sum(cs, ce_refs),
+        C::ObjectComplementOf(c) => ce_refs(c),
+        C::ObjectOneOf(is) => is.len(),
+        C::ObjectSomeValuesFrom(_, c) | C::ObjectAllValuesFrom(_, c) => {
+            ce_refs(c).saturating_add(1)
+        }
+        C::ObjectHasValue(..) | C::DataHasValue(..) => 2,
+        C::ObjectMinCardinality(_, _, c)
+        | C::ObjectMaxCardinality(_, _, c)
+        | C::ObjectExactCardinality(_, _, c) => c.as_deref().map_or(0, ce_refs).saturating_add(1),
+        C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => {
+            dr_refs(r).saturating_add(ps.len())
+        }
+        C::DataMinCardinality(_, _, r)
+        | C::DataMaxCardinality(_, _, r)
+        | C::DataExactCardinality(_, _, r) => r.as_ref().map_or(0, dr_refs).saturating_add(1),
+    }
+}
+
+fn dr_refs(r: &DataRange) -> usize {
+    match r {
+        DataRange::Datatype(_) => 1,
+        DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => sum(rs, dr_refs),
+        DataRange::ComplementOf(r) => dr_refs(r),
+        DataRange::OneOf(ls) => ls.len(),
+        DataRange::DatatypeRestriction(_, fs) => fs.len().saturating_add(1),
+    }
+}
+
+/// The most that checking one literal of an axiom holds ([`Lits::of`]), which checks
+/// them one at a time.
+fn literal_scratch(k: &AxiomKind) -> usize {
+    use AxiomKind as K;
+    match k {
+        K::SubClassOf(a, b) => ce_literal_scratch(a).max(ce_literal_scratch(b)),
+        K::EquivalentClasses(cs) => cs.iter().map(ce_literal_scratch).max().unwrap_or(0),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
+            cs.iter().map(ce_literal_scratch).max().unwrap_or(0)
+        }
+        K::ObjectPropertyDomain(_, c)
+        | K::ObjectPropertyRange(_, c)
+        | K::DataPropertyDomain(_, c)
+        | K::ClassAssertion(c, _)
+        | K::HasKey(c, _, _) => ce_literal_scratch(c),
+        K::DataPropertyRange(_, r) | K::DatatypeDefinition(_, r) => dr_literal_scratch(r),
+        K::DataPropertyAssertion(_, _, l) | K::NegativeDataPropertyAssertion(_, _, l) => {
+            lit_scratch(l)
+        }
+        _ => 0,
+    }
+}
+
+fn lit_scratch(l: &Literal) -> usize {
+    crate::datatypes::lexical_scratch(l.datatype(), l.value())
+}
+
+fn dr_literal_scratch(r: &DataRange) -> usize {
+    match r {
+        DataRange::Datatype(_) => 0,
+        DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => {
+            rs.iter().map(dr_literal_scratch).max().unwrap_or(0)
+        }
+        DataRange::ComplementOf(r) => dr_literal_scratch(r),
+        DataRange::OneOf(ls) => ls.iter().map(lit_scratch).max().unwrap_or(0),
+        DataRange::DatatypeRestriction(_, fs) => {
+            fs.iter().map(|f| lit_scratch(&f.value)).max().unwrap_or(0)
+        }
+    }
+}
+
+fn ce_literal_scratch(c: &ClassExpression) -> usize {
+    use ClassExpression as C;
+    match c {
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+            cs.iter().map(ce_literal_scratch).max().unwrap_or(0)
+        }
+        C::ObjectComplementOf(c) => ce_literal_scratch(c),
+        C::ObjectSomeValuesFrom(_, c) | C::ObjectAllValuesFrom(_, c) => ce_literal_scratch(c),
+        C::ObjectMinCardinality(_, _, c)
+        | C::ObjectMaxCardinality(_, _, c)
+        | C::ObjectExactCardinality(_, _, c) => c.as_deref().map_or(0, ce_literal_scratch),
+        C::DataSomeValuesFrom(_, r) | C::DataAllValuesFrom(_, r) => dr_literal_scratch(r),
+        C::DataHasValue(_, l) => lit_scratch(l),
+        C::DataMinCardinality(_, _, r)
+        | C::DataMaxCardinality(_, _, r)
+        | C::DataExactCardinality(_, _, r) => r.as_ref().map_or(0, dr_literal_scratch),
+        _ => 0,
     }
 }
 
 /// The IRIs [`Sig::bottom`] can read for the expression.
-fn ce_bottom_deps<'k>(c: &'k ClassExpression, out: &mut Vec<&'k str>) {
+fn ce_bottom_deps<'k>(c: &'k ClassExpression, out: &mut dyn FnMut(&'k str)) {
     use ClassExpression as C;
     match c {
-        C::Class(c) => out.push(c.as_str()),
+        C::Class(c) => out(c.as_str()),
         C::ObjectComplementOf(c) => ce_top_deps(c, out),
         C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
             cs.iter().for_each(|c| ce_bottom_deps(c, out))
         }
         C::ObjectSomeValuesFrom(p, c) => {
-            out.push(p.named().as_str());
+            out(p.named().as_str());
             ce_bottom_deps(c, out);
         }
-        C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => out.push(p.named().as_str()),
+        C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => out(p.named().as_str()),
         C::ObjectMinCardinality(_, p, c) | C::ObjectExactCardinality(_, p, c) => {
-            out.push(p.named().as_str());
+            out(p.named().as_str());
             if let Some(c) = c {
                 ce_bottom_deps(c, out);
             }
         }
-        C::DataSomeValuesFrom(ps, _) => out.extend(ps.iter().map(|p| p.as_str())),
+        C::DataSomeValuesFrom(ps, _) => ps.iter().for_each(|p| out(p.as_str())),
         C::DataHasValue(p, _)
         | C::DataMinCardinality(_, p, _)
-        | C::DataExactCardinality(_, p, _) => out.push(p.as_str()),
+        | C::DataExactCardinality(_, p, _) => out(p.as_str()),
         C::ObjectOneOf(_)
         | C::ObjectAllValuesFrom(..)
         | C::ObjectMaxCardinality(..)
@@ -1472,7 +1817,7 @@ fn ce_bottom_deps<'k>(c: &'k ClassExpression, out: &mut Vec<&'k str>) {
 }
 
 /// The IRIs [`Sig::top`] can read for the expression.
-fn ce_top_deps<'k>(c: &'k ClassExpression, out: &mut Vec<&'k str>) {
+fn ce_top_deps<'k>(c: &'k ClassExpression, out: &mut dyn FnMut(&'k str)) {
     use ClassExpression as C;
     match c {
         C::ObjectComplementOf(c) => ce_bottom_deps(c, out),
@@ -1480,17 +1825,17 @@ fn ce_top_deps<'k>(c: &'k ClassExpression, out: &mut Vec<&'k str>) {
             cs.iter().for_each(|c| ce_top_deps(c, out))
         }
         C::ObjectAllValuesFrom(p, c) => {
-            out.push(p.named().as_str());
+            out(p.named().as_str());
             ce_top_deps(c, out);
         }
         C::ObjectMaxCardinality(_, p, c) => {
-            out.push(p.named().as_str());
+            out(p.named().as_str());
             if let Some(c) = c {
                 ce_bottom_deps(c, out);
             }
         }
-        C::DataAllValuesFrom(ps, _) => out.extend(ps.iter().map(|p| p.as_str())),
-        C::DataMaxCardinality(_, p, _) => out.push(p.as_str()),
+        C::DataAllValuesFrom(ps, _) => ps.iter().for_each(|p| out(p.as_str())),
+        C::DataMaxCardinality(_, p, _) => out(p.as_str()),
         _ => {}
     }
 }
@@ -1551,9 +1896,15 @@ fn ill_literal(k: &AxiomKind) -> bool {
 
 /// Whether the axiom is bottom-local for the signature: a tautology once every entity
 /// outside it is empty.
+#[cfg(test)]
 fn bottom_local(k: &AxiomKind, s: &Sig<'_>) -> bool {
+    bottom_local_with(k, s, Lits::of(k))
+}
+
+/// [`bottom_local`], with what the axiom's literals are ([`Lits::of`]) found already.
+fn bottom_local_with(k: &AxiomKind, s: &Sig<'_>, lits: Lits) -> bool {
     use AxiomKind as K;
-    if ill_literal(k) {
+    if lits.ill {
         return false;
     }
     let sub_ope = |p: &SubObjectPropertyExpression| match p {
@@ -1603,9 +1954,15 @@ fn bottom_local(k: &AxiomKind, s: &Sig<'_>) -> bool {
 
 /// Whether the axiom is top-local for the signature: a tautology once every class
 /// outside it is everything and every property outside it every pair.
+#[cfg(test)]
 fn top_local(k: &AxiomKind, s: &Sig<'_>) -> bool {
+    top_local_with(k, s, Lits::of(k))
+}
+
+/// [`top_local`], with what the axiom's literals are ([`Lits::of`]) found already.
+fn top_local_with(k: &AxiomKind, s: &Sig<'_>, lits: Lits) -> bool {
     use AxiomKind as K;
-    if ill_literal(k) {
+    if lits.ill {
         return false;
     }
     match k {
@@ -1627,9 +1984,7 @@ fn top_local(k: &AxiomKind, s: &Sig<'_>) -> bool {
         K::ClassAssertion(c, _) => s.t_top(c),
         K::ObjectPropertyAssertion(p, _, _) => s.full_ope(p),
         // every element has every data value, so a literal that has a value
-        K::DataPropertyAssertion(p, _, l) => {
-            s.full_dp(p) && crate::datatypes::lexical(l.datatype(), l.value()) == Some(true)
-        }
+        K::DataPropertyAssertion(p, _, _) => s.full_dp(p) && lits.typed,
         K::Declaration(_) => true,
         K::AnnotationAssertion(..)
         | K::SubAnnotationPropertyOf(..)

@@ -195,20 +195,34 @@ pool's grant, as the saturation is charged. The pass held its index, its extract
 its lists outside both, about 107 MiB on ChEBI lite with the EL-only rules. It now admits
 each growth of that state through the run that classified, before it allocates, and a
 vector that moves to a larger buffer counts both buffers while it moves. The state raises
-the run's peak and leaves its held estimate as it was, so the pool is charged the peak
-and the answer keeps only its list of incomplete classes. A refusal fails a run with
-`Error::Memory`, and a partial run answers as a pass that its deadline stopped would,
-once the state is freed. The index now polls the deadline and the cancellation every
-4,096 axioms, as the extractions do. The lists of each entity's axioms and the classes by
-depth are ordered with unstable sorts on keys that tie nowhere, which give the order the
-stable sorts gave without their buffers. On the 400-class test ontology the pass held
-391 KB at its peak, against 435 KB before, and the estimate matched the counting
-allocator's peak to within 16 bytes on four test ontologies of 50 to 20,000 classes. The
-signature walk of one axiom is bounded by twice the axiom's own heap, and with that bound
-the estimate covers the allocator's peak on all 640 cases of item 603, by at most about
-10 KB on the smallest.
-`Stats::coverage_memory` reports the peak. The figures on ChEBI and GO are not measured
-again.
+the run's admitted peak, `Stats::peak_memory`, by the pass's own peak, which
+`Stats::coverage_memory` reports, and leaves the held estimate as it was. The pool is
+therefore charged the peak, and the answer keeps only its list of incomplete classes. A
+refusal fails a run with `Error::Memory`. A partial run answers as a pass that its
+deadline stopped would, once the state is freed, and it does so too when the pass fits
+but its list cannot be merged beside the full list of classes. A growth of that list
+also counts the list's old buffer while a reserve moves it. The index now polls the
+deadline and the cancellation every 4,096 axioms while it counts the axioms and while it
+indexes them, and the marking of the left-out axioms and the terminology's gates poll at
+the same rate, as the extractions do. An armed stop therefore ends the pass before its
+index admits anything. The lists of each entity's axioms and the classes by depth are
+ordered with unstable sorts on keys that tie nowhere, which give the order the stable
+sorts gave without their buffers.
+
+The walk of one axiom, which collects its signature, its needed sets and its triggers and
+checks its literals, is admitted before it allocates. Its bound comes from the axiom's
+heap and its count of entity references, found without allocating, and covers the scratch
+of the base64 and XML literal checks. The XML bound charges each `<` and each `=` of the
+literal for the most that an element or an attribute can hold, so a literal dense in
+attributes is admitted at several times what its check holds, and a tight budget can
+refuse a pass over such literals that it admitted before the item. The index checks each axiom's literals once and
+keeps the verdict, so the locality rules of the extractions allocate nothing for them.
+When the pass returns, the meter counts the list it answers and nothing else. On the
+400-class test ontology the pass held 392 KB at its peak, against 435 KB before the item,
+and the estimate was within 1.5 KB of the counting allocator's peak on four test
+ontologies of 50 to 20,000 classes, exact on two of them. The estimate covers the
+allocator's peak on all 640 cases of item 603 with the first or the last logical axiom
+left out, by at most about 11 KB. The figures on ChEBI and GO are not measured again.
 
 Item 664 extends incremental OWL 2 EL classification to edits involving individuals,
 nominals, assertions, keys, context merges, universal roles and conditional worlds. Plain
@@ -5899,8 +5913,9 @@ which the classes not yet decided are incomplete, so an answer depends on the in
 alone. `Limits::coverage_work` sets the bound and `Stats::coverage_over` reports it. A
 deadline or cancellation during the pass leaves every class incomplete and the
 consistency unknown with `coverageStopped` set, rather than discard the saturation, and the
-dataset retains the saturation but publishes no such answer. The index of the pass and
-its extractions poll the deadline and the cancellation every 4,096 axioms. On a loaded
+dataset retains the saturation but publishes no such answer. The pass polls the deadline
+and the cancellation every 4,096 axioms while it counts and indexes the axioms, marks the
+left-out ones, checks the terminology's gates and extracts its modules. On a loaded
 laptop with four threads the pass took about 0.4 s on GO and 0.8 s and 107 MiB on ChEBI
 lite with the EL-only rules, which leave axioms of both out. These are single
 approximate runs. `Limits::coverage` false skips it, which the ROBOT-compatible commands
@@ -5909,14 +5924,15 @@ do since they read only the taxonomy.
 The pass's index, its extractions and its lists of axioms and classes count against the
 run's memory budget and the pool's grant, as the saturation does, when the pass runs
 through the run that classified, as it does inside a classification and on the server.
-The pass then admits each growth before it allocates, and its peak counts in
-`Stats::peak_memory` and is reported as `Stats::coverage_memory`, while the held
-estimate grows only by the list of incomplete classes. `Classification::cover` on its
-own admits nothing and only reports the peak. When the budget or the pool refuses the pass, the classification fails with
-the memory error, which the server reports as `budget-exceeded`. A run with `partial`
-answers instead as a pass that its deadline stopped would, with every class incomplete,
-the consistency unknown and `coverageStopped` set, and fails only when the full list of
-classes does not fit either.
+The pass then admits each growth before it allocates. Its own peak is reported as
+`Stats::coverage_memory`, its peak beside what the run holds counts in
+`Stats::peak_memory`, and the held estimate grows only by the list of incomplete classes.
+`Classification::cover` on its own admits nothing and only reports the pass's peak. When
+the budget or the pool refuses the pass, or the merge of the list it answers, the
+classification fails with the memory error, which the server reports as
+`budget-exceeded`. A run with `partial` answers instead as a pass that its deadline
+stopped would, with every class incomplete, the consistency unknown and `coverageStopped`
+set, and fails only when the full list of classes does not fit either.
 
 `strict` on the request, `--strict` on `ontology classify` and `--strict true` on ROBOT's
 `reason`, `reduce` and `materialize` refuse a run that is not complete for the whole
