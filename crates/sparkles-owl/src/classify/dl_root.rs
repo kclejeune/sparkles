@@ -45,7 +45,12 @@
 //! of its successors the markers of its maximal ground atoms and equalities of constants,
 //! so that one edge covers every successor trigger of Definition 4 (the journal's K2).
 //!
-//! The at-most restrictions and the qualified roles of counting are not read in the root.
+//! With counting, a holder at an individual uses the same at-most clause as a holder at
+//! x. Its role premises carry the conditions under which the neighbours exist and belong
+//! to the qualifier. The conclusion stays in their context, where Eq and Pred already
+//! read equalities over constants and their successor terms.
+
+pub(super) mod count;
 
 use super::dl_clause::{
     Clause, Lit, Made, RTerm, Rooted, XL, XLit, admit_lit, hash_table_bytes, hash_table_grow_bound,
@@ -1054,6 +1059,9 @@ fn at_consts<S: Sink>(
     gbody: bool,
 ) -> bool {
     let dx = dix(ix);
+    if dx.counting && count::enabled() && !count::on_max(ix, st, v, prem, gbody, found, out) {
+        return false;
+    }
     let (ts, n) = terms_of(v);
     for k in 0..n {
         let RTerm::Fc(e, u) = ts[k] else { continue };
@@ -10509,6 +10517,307 @@ pub(super) mod tests {
             assert!(d.has(&[XLit::Eq(lo, hi)]));
             assert!(d.has(&[XLit::Atom(b, lo)]));
             assert!(!d.bottom());
+        }
+    }
+
+    #[test]
+    fn a_successor_counts_under_a_holder_edge_or_filler_marker() {
+        // Seed the successor directly. The front end declines the combination
+        // of an explicit inverse, a nominal and a maximum until Nom is built.
+        for conditional in 0..3 {
+            let mut s = Sig::new();
+            let [a, b] = ["a", "b"].map(|n| s.ind(n));
+            let [w, m, f, h] = ["W", "M", "F", "H"].map(|n| s.class(n));
+            let r = s.role("r");
+            s.dl.atmost.push((m, 1, r, f));
+            s.dl.counting = true;
+            let done = saturate_after(s, &[w], Some(w), |ix, _| {
+                let (a, b) = (c(a, ix), c(b, ix));
+                let q = dix(ix).atmosts[0].2;
+                let holder = XLit::Atom(m, a);
+                let edge = XLit::Role(q, a, b);
+                let marker = [holder, edge, XLit::Atom(h, a)][conditional];
+                let mut seeds = vec![
+                    (vec![marker], vec![marker]),
+                    (vec![], vec![XLit::Role(r, a, RTerm::X)]),
+                    (vec![], vec![XLit::Atom(f, b)]),
+                ];
+                for l in [holder, edge] {
+                    if l != marker {
+                        seeds.push((vec![], vec![l]));
+                    }
+                }
+                let body = if conditional == 2 {
+                    vec![marker]
+                } else {
+                    vec![]
+                };
+                seeds.push((body, vec![XLit::Atom(f, RTerm::X)]));
+                seeds
+            });
+            let (a, b) = (c(a, &done.ix), c(b, &done.ix));
+            let dx = dix(&done.ix);
+            let inv = inv_of(&done.ix, dx);
+            let marker = [
+                XLit::Atom(m, a),
+                XLit::Role(dx.atmosts[0].2, a, b),
+                XLit::Atom(h, a),
+            ][conditional]
+                .canon(inv);
+            let eq = XLit::Eq(RTerm::X, b).canon(inv);
+            let clauses = done.clauses();
+            assert!(
+                clauses
+                    .iter()
+                    .any(|(body, head)| body == &[marker] && head == &[eq]),
+                "case {conditional}: {clauses:?}"
+            );
+            assert!(
+                !done.has(&[eq]),
+                "the conditional equality must keep its marker"
+            );
+        }
+    }
+
+    /// A root store with processed role premises. The caller supplies the holder
+    /// last so its one application enumerates exactly the requested subsets.
+    fn counting_store(maximum: u32, neighbours: usize) -> (Index, DlRun, State, Lit) {
+        let mut s = Sig::new();
+        let a = s.ind("a");
+        let m = s.class("M");
+        let r = s.role("r");
+        let values: Vec<_> = (0..neighbours).map(|i| s.ind(&format!("v{i}"))).collect();
+        s.dl.atmost.push((m, maximum, r, TOP));
+        s.dl.counting = true;
+        let (ix, _) = probe_ix(s);
+        let run = DlRun::new(false, Default::default());
+        let edges = values
+            .into_iter()
+            .map(|v| XLit::Role(r, c(a, &ix), c(v, &ix)));
+        let st = indexed_counting_units(&ix, &run, edges);
+        let holder = glit(&run, &ix, m, a);
+        (ix, run, st, holder)
+    }
+
+    fn indexed_counting_units(
+        ix: &Index,
+        run: &DlRun,
+        units: impl IntoIterator<Item = XLit>,
+    ) -> State {
+        let inv = inv_of(ix, dix(ix));
+        let order = Rooted {
+            ix,
+            lits: &run.lits,
+            inv: &inv,
+            ground_total: true,
+        };
+        let mut st = State::default();
+        let mut out = Stops::new(run);
+        for v in units {
+            let Made::Lit(l) = run.lits.lit(v, inv) else {
+                unreachable!()
+            };
+            ds(&mut st).store.add(Clause::new(vec![], vec![l]));
+        }
+        let mut max = Vec::new();
+        while let Some(i) = ds(&mut st).store.next(ix, Some(&order), &mut max) {
+            index_consts(ix, ds(&mut st), &max, i, &mut out);
+        }
+        st
+    }
+
+    #[test]
+    fn a_ground_maximum_reduces_each_disjunct_by_the_same_unit_equality() {
+        for coincides in [false, true] {
+            let mut s = Sig::new();
+            let [a, b, c0, d] = ["a", "b", "c", "d"].map(|n| s.ind(n));
+            let m = s.class("M");
+            let r = s.role("r");
+            let e = s.some_h(r, TOP);
+            s.dl.atmost.push((m, 2, r, TOP));
+            s.dl.counting = true;
+            let (ix, _) = probe_ix(s);
+            let run = DlRun::new(false, Default::default());
+            let [a, b, c0, d] = [a, b, c0, d].map(|v| c(v, &ix));
+            let fc = RTerm::Fc(e, k(a));
+            let named = if coincides { b } else { d };
+            let mut st = indexed_counting_units(
+                &ix,
+                &run,
+                [
+                    XLit::Eq(fc, named),
+                    XLit::Role(r, a, fc),
+                    XLit::Role(r, a, b),
+                    XLit::Role(r, a, c0),
+                ],
+            );
+            let inv = inv_of(&ix, dix(&ix));
+            let mut out = Stops::new(&run);
+            let mut guard = Guard::new(&mut out);
+            let mut found = Found::default();
+            assert!(count::on_max(
+                &ix,
+                &st,
+                XLit::Atom(m, a),
+                &unit(),
+                false,
+                &mut found,
+                &mut guard
+            ));
+            assert_eq!(found.products_len(), usize::from(!coincides));
+            if !coincides {
+                drain_with_admitted(&ix, &mut st, found, &mut guard, &RootDerive);
+                let pairs = [(b, c0), (b, d), (c0, d)]
+                    .map(|(x, y)| run.lits.get(XLit::Eq(x, y), inv).unwrap());
+                assert!(
+                    ds(&mut st)
+                        .store
+                        .clauses
+                        .iter()
+                        .any(|s| s.c.body().is_empty()
+                            && s.c.head().len() == 3
+                            && pairs.iter().all(|l| s.c.head().contains(l)))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_counting_scan_charges_repeated_short_unproductive_reads() {
+        let (ix, run, st, holder) = counting_store(5, 3);
+        let mut out = Stops::new(&run);
+        let mut guard = Guard::new(&mut out);
+        let v = run.lits.view(holder, inv_of(&ix, dix(&ix)));
+        let mut found = Found::default();
+        let before = run.work();
+        for _ in 0..32 {
+            assert!(count::on_max(
+                &ix,
+                &st,
+                v,
+                &unit(),
+                false,
+                &mut found,
+                &mut guard
+            ));
+        }
+        // One rule, three index entries and three maximal role literals per call.
+        assert_eq!(run.work() - before, (32 * 7usize).div_ceil(WORK_READS));
+        assert_eq!(found.products_len(), 0);
+        assert!(!found.over);
+    }
+
+    #[test]
+    fn a_ground_maximum_bounds_width_subsets_and_payload() {
+        for (n, neighbours) in [(12, 13), (4, 21), (4, 17)] {
+            let (ix, run, st, holder) = counting_store(n, neighbours);
+            let mut out = Stops::new(&run);
+            let mut found = Found::default();
+            let v = run.lits.view(holder, inv_of(&ix, dix(&ix)));
+            // The same otherwise oversized ground inference is cut before the
+            // subset bound if its given holder has a ground body.
+            assert!(count::on_max(
+                &ix,
+                &st,
+                v,
+                &(vec![holder], vec![]),
+                true,
+                &mut found,
+                &mut Guard::new(&mut out)
+            ));
+            assert!(!found.over && found.products_len() == 0);
+            assert!(count::on_max(
+                &ix,
+                &st,
+                v,
+                &unit(),
+                false,
+                &mut found,
+                &mut Guard::new(&mut out)
+            ));
+            assert!(found.over, "maximum {n} over {neighbours} neighbours");
+            assert_eq!(found.products_len(), 0);
+            assert_eq!(out.held, 0);
+        }
+    }
+
+    #[test]
+    fn a_ground_maximum_releases_scratch_and_products_when_interrupted() {
+        let neighbours = 8;
+        let scratch = neighbours * std::mem::size_of::<(RTerm, (u32, Lit))>()
+            + (neighbours + 1) * std::mem::size_of::<usize>();
+        // Refuse setup, then the first product, then a later product after some
+        // subsets have succeeded. Drive the actual given-clause interruption path.
+        for budget in [0, scratch, 4096] {
+            let (ix, run, mut st, holder) = counting_store(2, neighbours);
+            let mut out = Stops::new(&run);
+            out.budget = Some(budget);
+            process(
+                &ix,
+                &mut st,
+                &Clause::new(vec![], vec![holder]),
+                &[holder],
+                &mut out,
+            );
+            assert!(ds(&mut st).store.interrupted);
+            assert!(out.stopped() && !out.overflow);
+            assert_eq!(out.held, 0);
+            assert!(out.peak > budget);
+            if budget == 0 {
+                assert_eq!(out.peak, scratch);
+            }
+            // Inspect the product buffer before the normal caller drops it.
+            let mut found = Found::default();
+            let mut out = Stops::new(&run);
+            out.budget = Some(budget);
+            let v = run.lits.view(holder, inv_of(&ix, dix(&ix)));
+            assert!(!count::on_max(
+                &ix,
+                &st,
+                v,
+                &unit(),
+                false,
+                &mut found,
+                &mut Guard::new(&mut out)
+            ));
+            assert_eq!(out.held, 0);
+            if budget <= scratch {
+                assert_eq!(found.products_len(), 0);
+            } else {
+                assert!(
+                    (1..56).contains(&found.products_len()),
+                    "interrupted within the 56 three-element subsets"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_qualified_maximum_at_a_successor_of_a_constant_merges_its_values() {
+        for last in 0..5 {
+            let mut s = Sig::new();
+            let [a, b, c0] = ["a", "b", "c"].map(|n| s.ind(n));
+            let [holder, filler] = ["M", "F"].map(|n| s.class(n));
+            let r = s.role("r");
+            let g = s.role("g");
+            let e = s.some_h(g, TOP);
+            s.dl.atmost.push((holder, 1, r, filler));
+            s.dl.counting = true;
+            let done = saturate_seeded(s, None, |ix, _| {
+                let t = RTerm::Fc(e, k(c(a, ix)));
+                let mut facts = [
+                    XLit::Atom(holder, t),
+                    XLit::Role(r, t, c(b, ix)),
+                    XLit::Role(r, t, c(c0, ix)),
+                    XLit::Atom(filler, c(b, ix)),
+                    XLit::Atom(filler, c(c0, ix)),
+                ];
+                facts.rotate_left(last);
+                facts.into_iter().map(|v| (vec![], vec![v])).collect()
+            });
+            let (b, c0) = (c(b, &done.ix), c(c0, &done.ix));
+            assert!(!done.bottom());
+            assert!(done.has(&[XLit::Eq(b.min(c0), b.max(c0))]));
         }
     }
 

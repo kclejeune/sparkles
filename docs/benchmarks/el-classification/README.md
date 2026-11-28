@@ -95,6 +95,14 @@ and ROBOT is the OWL API tool that OBO release pipelines classify with.
 
 ## Correctness evidence
 
+The [rooted at-most comparison](RESULTS.md#rooted-at-most-agreement) runs
+`el_classify --rooted --counting` on generated ontologies with both expansion strategies.
+It compares the transitive closure of each complete named taxonomy with HermiT, including
+equivalent and unsatisfiable classes and the consistency of the ontology. It records parse
+failures and answers outside the work bound separately. Ratios of derived conclusions
+pair the same input, thread count and strategy on the two builds and include only
+configurations that finish on both.
+
 The property tests in `crates/sparkles-owl/tests/classify.rs` compare the classifier with
 an independent naive implementation of the EL++ completion rules on random ontologies,
 and compare incremental runs with full runs after random additions and removals.

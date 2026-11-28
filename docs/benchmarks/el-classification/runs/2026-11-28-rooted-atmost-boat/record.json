@@ -1,0 +1,63 @@
+{
+  "suite": "rooted-atmost-agreement",
+  "scale": "3,000 generated at-most and 3,000 qualified at-most inputs",
+  "host": "Boat bx_9cw43z44",
+  "source": {
+    "base": "05e2278eda08247c44a01f37fa6048ac7ba3597e",
+    "base_binary_sha256": "e8420ab0299f8003323a81fc46be1609b6bd9d07d14025f06d745b67d08dad91",
+    "repair_binary_sha256": "de54eb9b1ec04a4cccc050aafc2499837dd881bfee2e3707bca1b0a7f406e3ab",
+    "repair_sources_sha256": {
+      "crates/sparkles-owl/src/classify/dl_root.rs": "60c4fc3298ce61d53d1c01271f199a2ae5100a7c132883d9f125db7e9660a92f",
+      "crates/sparkles-owl/src/classify/dl_root/count.rs": "2b17317fe413744a73ff308ded246c71446e99815dc504c2e994133da18a6fd0",
+      "crates/sparkles-owl/src/classify/dl_rules.rs": "cf0eef4c6c9f05b705721fc09d77763e71507d84f7844e41bde8b8b0c5e5eced"
+    }
+  },
+  "method": "Rust 1.99.1, Mr. Boxington 1.29.1, mbx build --release -j 1 -p sparkles-owl --example el_classify. Ran el_classify with --rooted --counting, default bounds, cautious and eager expansion on one and four threads. HermiT 1.4.5.519 checked consistency, unsatisfiable named classes and the named subsumption closure. The clean base and repaired example ran on the same worker against the same HermiT references. No timings were compared.",
+  "raw_sha256": "74bc82eba049ae39a499c661334b05dcfe3ee8fe89e3f7856fd2197c433bad0e",
+  "input_and_reference_digest": {
+    "at": "3fc92e2d63a7d1fb90508a133baeda0d1512ff5551c9d8e069b3dc4553800770",
+    "atq": "f69bbc552ac42b36a1057737dc474d2e474cb679602fd10ee9162dcd854dfdf5"
+  },
+  "results": {
+    "at": {
+      "base": {
+        "files": 3000,
+        "runs": 12000,
+        "href": 10222,
+        "claims": 10222,
+        "hits": 312,
+        "fail": 1508,
+        "ce_diff": 0
+      },
+      "repair": {
+        "files": 3000,
+        "runs": 12000,
+        "href": 10128,
+        "claims": 10128,
+        "hits": 0,
+        "fail": 1508,
+        "ce_diff": 0
+      }
+    },
+    "atq": {
+      "base": {
+        "files": 3000,
+        "runs": 12000,
+        "href": 10894,
+        "claims": 10894,
+        "hits": 256,
+        "fail": 0,
+        "ce_diff": 0
+      },
+      "repair": {
+        "files": 3000,
+        "runs": 12000,
+        "href": 10710,
+        "claims": 10710,
+        "hits": 0,
+        "fail": 0,
+        "ce_diff": 0
+      }
+    }
+  }
+}
