@@ -344,3 +344,65 @@ fn the_meter_is_tight_against_the_allocator() {
         drop(c);
     }
 }
+
+/// The meter covers the allocator on every axiom shape of the 640 cases of roadmap item
+/// 603, with the first and with the last logical axiom left out, which reach the
+/// extractions' layers in different orders.
+#[test]
+fn the_meter_covers_the_allocator_on_the_dl603_cases() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+    let mut cases: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".ofn") && n.matches('.').count() == 1)
+        })
+        .collect();
+    cases.sort();
+    assert_eq!(cases.len(), 640);
+    for case in &cases {
+        let doc = crate::ofn_read::parse(&std::fs::read_to_string(case).unwrap()).unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let classes: Vec<&Class> = doc
+            .axioms
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AxiomKind::Declaration(Entity::Class(c)) => Some(c),
+                _ => None,
+            })
+            .collect();
+        let logical: Vec<&AxiomKind> = kinds
+            .iter()
+            .copied()
+            .filter(|k| logical(k) && !matches!(k, AxiomKind::Declaration(_)))
+            .collect();
+        for left in [logical.first(), logical.last()].into_iter().flatten() {
+            let left = [*left];
+            let ((peak, ok), sample) = measure(|| {
+                let meter = crate::transform::Meter::new(None);
+                let mut v = Vec::with_capacity(classes.len());
+                v.extend(classes.iter().copied());
+                assert!(meter.grow(std::mem::size_of_val(v.as_slice())));
+                let c = crate::transform::coverage_refs(
+                    &kinds,
+                    &left,
+                    true,
+                    v,
+                    usize::MAX,
+                    &|| false,
+                    &meter,
+                );
+                (meter.peak(), c.is_ok())
+            });
+            assert!(ok);
+            assert!(
+                peak >= sample.peak,
+                "{}: the meter's peak {peak} undercounts the allocator's {}",
+                case.display(),
+                sample.peak
+            );
+        }
+    }
+}

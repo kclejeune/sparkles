@@ -203,7 +203,10 @@ once the state is freed. The index now polls the deadline and the cancellation e
 depth are ordered with unstable sorts on keys that tie nowhere, which give the order the
 stable sorts gave without their buffers. On the 400-class test ontology the pass held
 391 KB at its peak, against 435 KB before, and the estimate matched the counting
-allocator's peak to within 16 bytes on four test ontologies of 50 to 20,000 classes.
+allocator's peak to within 16 bytes on four test ontologies of 50 to 20,000 classes. The
+signature walk of one axiom is bounded by twice the axiom's own heap, and with that bound
+the estimate covers the allocator's peak on all 640 cases of item 603, by at most about
+10 KB on the smallest.
 `Stats::coverage_memory` reports the peak. The figures on ChEBI and GO are not measured
 again.
 

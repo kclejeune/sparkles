@@ -83,7 +83,7 @@ mod dl_eq;
 mod dl_norm;
 mod dl_reduce;
 pub(crate) use dl_clause::{hash_table_bytes as hash_table_size, next_hash_table_bytes};
-pub(crate) use dl_reduce::{btree_map_bytes, btree_set_bytes};
+pub(crate) use dl_reduce::{axiom_retained_heap_bytes, btree_map_bytes, btree_set_bytes};
 mod dl_root;
 mod dl_rules;
 mod dt_sat;

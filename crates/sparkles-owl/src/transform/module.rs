@@ -668,16 +668,21 @@ impl<'a> Index<'a> {
             bottom_deps(k, &mut deps);
             deps.sort_unstable();
             deps.dedup();
-            // what the walk of this axiom holds until the index has taken it
+            // What the walk of this axiom held at its peak and holds until the index has
+            // taken it: the signature's set, whose IRIs and the copy of one that the
+            // axiom names twice are within the axiom's own heap, the temporaries of the
+            // needed sets, which hold a few words for each operand and so are within it
+            // too, the needed sets and the list of triggers with its last move.
+            let own = crate::classify::axiom_retained_heap_bytes(k);
             let walk = crate::classify::btree_set_bytes::<Entity>(s.0.len())
-                .saturating_add(s.0.iter().map(|e| e.iri().as_str().len()).sum())
+                .saturating_add(own.saturating_mul(2))
                 .saturating_add(alts.as_ref().map_or(0, |alts| {
                     alts.iter()
                         .map(|set| set.capacity() * size_of::<&str>())
                         .sum::<usize>()
                         + alts.capacity() * size_of::<Vec<&str>>()
                 }))
-                .saturating_add(deps.capacity() * size_of::<&str>());
+                .saturating_add(deps.capacity() * size_of::<&str>() * 2);
             refused(grow(meter, walk))?;
             refused(grow(meter, s.0.len() * size_of::<u32>()))?;
             let mut sig = Vec::with_capacity(s.0.len());
