@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Optional pruning of rooted equality conclusions (item 1284)
+
+With `SPARKLES_ROOTED_EQ_KNOWN=1`, rooted classification skips an equality rewrite
+when the query context already holds the class assertion the rewrite would produce.
+
 ### The marker repair on by default in rooted runs (items 1231 and 1247)
 
 A rooted run now repairs the delivery of conditional ground facts about individuals by

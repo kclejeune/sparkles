@@ -1085,6 +1085,8 @@ pub struct DlRun {
     /// id) in place of Pred, item 1061's forwarding of facts. It holds only with
     /// [`DlRun::shared_facts`], and `SPARKLES_ROOTED_FACT_FORWARD=0` turns it off
     pub(super) forward_facts: bool,
+    /// Skip a constant-to-x rewrite when its new atom is already a query unit.
+    pub(super) skip_known_eq_atoms: bool,
     /// whether item 1061 phase 2 root unit constant-equality discovery is active during
     /// the current saturation round (default off, disabled after the main round)
     pub(super) merge: std::sync::atomic::AtomicBool,
@@ -1153,6 +1155,7 @@ impl DlRun {
             worked,
             shared_facts: shared_facts_switch(),
             forward_facts: forward_facts_switch(),
+            skip_known_eq_atoms: super::dl_eq::skip_known_atoms_switch(),
             ..DlRun::default()
         }
     }
