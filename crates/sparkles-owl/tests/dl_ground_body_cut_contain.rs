@@ -174,9 +174,9 @@ DifferentIndividuals(:a0 :a2)
 DifferentIndividuals(:a0 :a3)
 )";
 
-/// Generated neighbour `H1.ofn` of `g1-051_p0012`, which held the largest store of the
-/// growth without the cut and passes 4 million conclusions uncut with the marker repair off,
-/// filtered or unfiltered. HermiT 1.4.5 oracle: consistent, `C1 ⊑ Nothing`, `Thing ⊑ C0`.
+/// Generated neighbour `H1.ofn` of `g1-051_p0012`, which exceeds the bound of 4 million
+/// conclusions without the cut with the marker repair off, filtered or unfiltered. HermiT
+/// 1.4.5 oracle: consistent, `C1 ⊑ Nothing`, `Thing ⊑ C0`.
 const H1: &str = "Prefix(:=<http://example.org/d#>)
 Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
 Ontology(
@@ -211,9 +211,9 @@ ObjectPropertyAssertion(:r0 :b0 :a0)
 DifferentIndividuals(:a0 :b0)
 )";
 
-/// Generated neighbour `U2.ofn` with a three-way union, which also passes 4 million
-/// conclusions uncut in every marker-repair mode. HermiT 1.4.5 oracle: consistent,
-/// `C1 ⊑ Nothing`, `Thing ⊑ C0`.
+/// Generated neighbour `U2.ofn` with a three-way union, which also exceeds the bound of 4
+/// million conclusions without the cut in every marker-repair mode. HermiT 1.4.5 oracle:
+/// consistent, `C1 ⊑ Nothing`, `Thing ⊑ C0`.
 const U2: &str = "Prefix(:=<http://example.org/d#>)
 Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
 Ontology(
