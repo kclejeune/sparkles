@@ -5453,7 +5453,8 @@ Responses add `Sparkles-At`, the selector in canonical form, and `Sparkles-Head`
 past state they also add `Memento-Datetime`, the commit's time, and
 `Link: <…>; rel="original"` (RFC 7089). `Sparkles-Commit` is the commit read. The
 freshness of inferences (`Sparkles-Inferences`) is reported for the live state only.
-`text:query` works only at the head and returns `501` at a past commit. Vector search
+`text:query` supports bounded reads within the current generation and named snapshots
+with their own text index. See [Full-text search](#full-text-search). Vector search
 works at any commit, and a past commit is always searched exactly. Writes with `at`, even `at=head`, are refused with `400` and
 `code: "at-on-write"`.
 
@@ -5883,9 +5884,11 @@ not copy the log.
 | Method | Path | Description |
 |---|---|---|
 | GET | `/$/snapshots/{ds}` | `{ dataset, datasetId, head, snapshots: NamedSnapshot[] }` |
-| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note?, expires?, warm? }`, as JSON, a form or the query string. `expires` is an RFC 3339 time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). `warm: true` keeps the pinned state materialized (see below). Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
+| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note?, expires?, warm?, text? }`, as JSON, a form or the query string. `expires` is an RFC 3339 time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). `warm: true` keeps the pinned state materialized. `text: true` builds a full-text index for the pin on a persistent dataset. Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
 | GET | `/$/snapshots/{ds}/{name}` | `NamedSnapshot` |
 | DELETE | `/$/snapshots/{ds}/{name}` | `204`. Generations that only this snapshot kept are removed. |
+| PUT | `/$/snapshots/{ds}/{name}/text` | Builds or replaces the pin's full-text index and returns `NamedSnapshot`. |
+| DELETE | `/$/snapshots/{ds}/{name}/text` | Releases the index and keeps the RDF pin. Returns `204`. |
 | GET | `/$/history/{ds}` | `HistoryStatus` |
 | PUT | `/$/history/{ds}` | Sets the retention window and returns `HistoryStatus`. The body is `{ keepCommits?, keepAge?, maxBytes?, schedules?, catalog?, changeLog? }`. `schedules` replaces the pin schedules when it is present, `catalog` replaces the catalog horizon (`null` turns it off), and `changeLog` replaces the change log settings (see [History queries](#history-queries)). |
 
@@ -5893,14 +5896,14 @@ not copy the log.
 type NamedSnapshot = { name: string; ref: string; seq: number; commit: Commit | null;
   created: string; expires: string | null; note: string | null;
   generation: string | null; reconstructable: boolean;
-  warm: boolean };                                   // kept materialized
+  warm: boolean; textBytes?: number };
 type Retention = { keepCommits: number | null;      // the last N commits
   keepAge: string | null;                            // "7d", or seconds
   maxBytes: number | null };                         // a number, or "10GiB" in a PUT
 type Schedule = { prefix: string; every: string; keepLast: number };
 type HistoryStatus = { dataset: string; datasetId: string; head: number;
   oldestReconstructable: number | null; reconstructable: { from: number; to: number }[];
-  bytes: number;   // disk of kept non-current generations
+  bytes: number;   // disk of kept non-current generations and pinned text indexes
   generations: { name: string; baseSeq: number; endSeq: number; bytes: number;
                  current: boolean; heldBy: string[] }[];   // "head", "snapshot:NAME", "retention", "source-holds"
   retention: Retention; schedules: Schedule[]; snapshots: number;
@@ -5931,6 +5934,20 @@ by the history upkeep, so it is ready again within a minute of a restart. The hi
 cache evicts warm states last, only when they alone pass `--history-cache-mb`, so a read
 at a warm pin costs no replay. A pin at the head needs no warming, and an in-memory
 dataset keeps every pinned state in memory anyway.
+
+A pin created with `text: true` keeps a full-text index built with the active
+configuration at creation. Query it with `at=snapshot:NAME`. Its bytes count toward
+dataset quota and `retention.maxBytes`. Pin indexes are kept until they are dropped
+or the RDF pin is deleted or expires. Creating or rebuilding a pin index holds the
+dataset writer, so RDF commits wait during the build.
+
+A missing or unreadable pin index returns `503` for text searches, and RDF reads
+remain available. Rebuild the index using its saved configuration, or the active
+configuration if the pin has no readable saved settings. Ordinary backups omit
+named pins and their index files. When history metadata is carried separately,
+identity-preserving copies keep the reference and reidentified copies keep the
+RDF pin and clear its text reference. Clones and branches use their own active
+full-text configurations.
 
 The **catalog horizon** bounds the commit catalog. Without one, `/$/commits` and
 `sparkles log` keep every commit's metadata forever, at 64 bytes a commit. With
@@ -7014,8 +7031,10 @@ SELECT ?s ?score ?label WHERE {
   store's terms, and the index is then built again with writes waiting. A full rebuild
   reads only the quads whose object is a literal. A bulk commit, such as a large load,
   updates the index by the documents it adds and removes when they are few next to the
-  index, and rebuilds it otherwise. Enabling or reconfiguring an index builds it with
-  writes waiting.
+  index, and rebuilds it otherwise. Online enablement and reconfiguration record commits
+  during a bounded build. Reconfiguration keeps serving the active index until the
+  replacement is installed. During a first build, text search returns `503`. The
+  final catch-up and directory swap take the writer lock.
 * **Startup recovery.** When a persistent dataset opens, a reusable index is verified
   and caught up before the open returns. An index that is missing, damaged, ahead of the
   store or not covering it is rebuilt from RDF by a background worker. RDF reads and
@@ -7030,7 +7049,8 @@ SELECT ?s ?score ?label WHERE {
   is ready at once. A clone builds its index before the clone completes, so the clone
   is ready at once as well. Missing indexes after backup restore, and branch indexes that cannot
   be copied, use the background recovery path.
-  Enabling or reconfiguring an index still builds it synchronously inside its task. An
+  An interrupted online configuration resumes on open. If the installed index already
+  matches the pending configuration, startup reuses it and promotes its settings. An
   explicit rebuild joins a running startup recovery, retries a failed one, or otherwise
   runs the usual online build. Cancelling the HTTP task does not stop a native rebuild
   that has started, and waiters cannot cancel individually. Disabling, reconfiguring or
@@ -7042,6 +7062,15 @@ SELECT ?s ?score ?label WHERE {
   by a `text.dirty` file next to it, is checksum-verified and caught up from the WAL. The
   WAL also restores what was only staged. The index is rebuilt only if it is damaged or
   older than the WAL.
+* **Transaction and historical reads.** Text queries in a write transaction see its
+  staged quad inserts and deletes. A retained commit in the live generation can be
+  searched by reversing at most 10,000 changed quads. A transaction can add at most
+  10,000 indexed literals to a search. Writes staged for a bulk commit become searchable
+  after publication. These adjusted searches build a RAM index for added documents and
+  score both sources using committed index statistics. Rankings can differ from an
+  index built directly at the queried state. The searches account for their working
+  memory and check cancellation and deadlines during the delta walk and hit scan.
+  To search a named snapshot across generations, create it with `text: true`.
 * **Errors.** `400` for malformed calls, unparseable or refused query strings, predicates
   that are not indexed, and datasets without an index. `507` when a search matches more
   than `maxHits` literals and has no limit, or a limit above `maxHits`. A limit of at most
@@ -7074,7 +7103,7 @@ type TextStatus = {
   enabled: true; state: "ready" | "stale" | "rebuilding" | "failed"; docs: number;
   seq: number; storeSeq: number;       // ready when equal: the commit the index reflects
   epoch: number; diskBytes: number; segments: number;
-  config: TextConfig; formatVersion: 2;
+  config: TextConfig; pendingConfig?: TextConfig; formatVersion: 2;
   lastRebuild?: { at: string; ms: number; docs: number }; message?: string;
 };
 type TextHits = {

@@ -258,6 +258,7 @@ impl Store {
             &At::Commit(view.commit().seq),
             options,
             Some(&configuration),
+            None,
         )?;
         if options.warm && result.1 {
             self.warm_snapshots();

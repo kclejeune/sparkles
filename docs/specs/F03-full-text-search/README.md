@@ -2,7 +2,7 @@
 
 > **Status:** implemented in part (Phases 1 and 2, most of Phase 3)
 
-Full-text queries, committed index maintenance, ranked search and the implemented language analyzers are available. Historical search, multi-field documents and the remaining analyzer compatibility work are tracked under items 23, 35, 250 and 251.
+Full-text queries, online index configuration, write-transaction search, bounded historical search and language analyzers are available. Multi-field documents and additional analyzer compatibility are tracked under items 35, 250 and 251.
 
 ## Documents
 

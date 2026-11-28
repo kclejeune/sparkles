@@ -162,6 +162,11 @@ impl Store {
             &h.schedules,
             h.catalog,
         )?;
+        for name in &gone {
+            if let Some(pin) = h.pins.get(name) {
+                self.remove_text_pin(pin.text_index);
+            }
+        }
         h.pins = pins;
         self.collect_locked(&mut h, current, w.head.seq);
         Ok(gone)

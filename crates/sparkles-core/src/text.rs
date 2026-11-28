@@ -853,6 +853,22 @@ impl TextView {
             overlay_base: base,
         }
     }
+
+    #[cfg(feature = "text")]
+    pub(crate) fn with_historical_changes(
+        &self,
+        seq: u64,
+        base: std::sync::Arc<crate::store::Snapshot>,
+    ) -> TextView {
+        TextView {
+            seq,
+            epoch: self.epoch,
+            owner: self.owner,
+            source: self.source.clone(),
+            uncommitted: false,
+            overlay_base: Some(base),
+        }
+    }
 }
 
 /// The error of a search in a write transaction after it changed data.
@@ -1400,14 +1416,12 @@ mod imp {
     impl Resolved {
         pub(super) fn segment(&self, ord: u32) -> &tantivy::SegmentReader {
             let base_segments = self.searcher.segment_readers().len();
-            if (ord as usize) < base_segments || self.overlay.is_none() {
-                self.searcher.segment_reader(ord)
+            if (ord as usize) >= base_segments
+                && let Some(overlay) = &self.overlay
+            {
+                &overlay.segment_readers()[ord as usize - base_segments]
             } else {
-                &self
-                    .overlay
-                    .as_ref()
-                    .expect("overlay segment")
-                    .segment_readers()[ord as usize - base_segments]
+                self.searcher.segment_reader(ord)
             }
         }
     }
@@ -3195,6 +3209,81 @@ mod imp {
     }
 
     impl TextIndex {
+        pub(crate) fn build_pin(
+            root: &Path,
+            config: &TextConfig,
+            snap: &Snapshot,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
+            let built = build_in(Some(root.join("text")), config, 1, snap, 1, 32 << 20, check)?;
+            crate::store::sync_dir(&root.join("text"))?;
+            drop(built);
+            Ok(())
+        }
+
+        pub(crate) fn probe_pin(
+            root: &Path,
+            config: &TextConfig,
+            seq: u64,
+            full: bool,
+        ) -> Result<()> {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let existing = Self::inspect_pin(root, config, seq)?;
+                if full {
+                    verify(&existing.index, &root.join("text"))?;
+                }
+                Ok(())
+            }))
+            .unwrap_or_else(|_| Err(text_err("reading the snapshot text index panicked")))
+        }
+
+        fn inspect_pin(root: &Path, config: &TextConfig, seq: u64) -> Result<ExistingIndex> {
+            let existing = inspect_existing(Some(root), config)
+                .map_err(|reason| text_err(format!("snapshot text index: {reason:?}")))?;
+            if existing.payload.format != FORMAT
+                || existing.payload.seq != seq
+                || existing.payload.config != config_hash(config)
+            {
+                return Err(text_err(
+                    "snapshot text index has the wrong format, commit or configuration",
+                ));
+            }
+            Ok(existing)
+        }
+
+        pub(crate) fn open_pin(root: &Path, config: TextConfig, seq: u64) -> Result<Arc<TextView>> {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let ExistingIndex {
+                    index,
+                    fields,
+                    payload,
+                    ..
+                } = Self::inspect_pin(root, &config, seq)?;
+                let reader: tantivy::IndexReader = index
+                    .reader_builder()
+                    .reload_policy(ReloadPolicy::Manual)
+                    .try_into()
+                    .map_err(text_err)?;
+                Ok(Arc::new(TextView {
+                    seq,
+                    epoch: payload.epoch,
+                    owner: next_owner(),
+                    source: ViewSource::Ready(ReadyView {
+                        slot: Slot::sealed(reader.searcher(), Default::default()),
+                        index: Arc::new(Shared {
+                            fields,
+                            config,
+                            ids: Default::default(),
+                        }),
+                        owner: std::sync::Weak::new(),
+                    }),
+                    uncommitted: false,
+                    overlay_base: None,
+                }))
+            }));
+            result.unwrap_or_else(|_| Err(text_err("reading the snapshot text index panicked")))
+        }
+
         pub(crate) fn recovery_build(
             staging: Option<PathBuf>,
             config: &TextConfig,
@@ -5063,6 +5152,7 @@ mod imp {
                 assert!(changed.uncommitted);
                 let mut historical = (*held).clone();
                 historical.historical = true;
+                historical.text = None;
                 assert!(matches!(
                     query(Arc::new(historical), q, &QueryOptions::default()),
                     Err(Error::HistoryUnsupported(_))

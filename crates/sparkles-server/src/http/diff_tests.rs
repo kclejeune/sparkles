@@ -568,6 +568,35 @@ async fn the_change_feed_reads_the_change_log_across_a_compaction() {
     assert_eq!(ev[0].0, "5");
 }
 
+#[cfg(feature = "text")]
+#[tokio::test]
+async fn indexed_snapshot_text_stays_searchable_after_live_disable() {
+    let s = server(|_| {}).await;
+    let dataset = s.state.get("h").unwrap();
+    update(&s.app, "h", r#"INSERT DATA { <urn:old> <urn:p> "fox" }"#).await;
+    dataset.store.enable_text(Default::default()).unwrap();
+    let response = send(
+        &s.app,
+        Request::post("/$/snapshots/h")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"name":"fox","text":true}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+    assert!(response.json()["textBytes"].as_u64().unwrap() > 0);
+
+    update(&s.app, "h", r#"DELETE DATA { <urn:old> <urn:p> "fox" }"#).await;
+    dataset.store.compact().unwrap();
+    dataset.store.disable_text().unwrap();
+    let uri = "/h/sparql?at=snapshot:fox&query=SELECT%20%3Fs%20%7B%3Fs%20%3Chttp%3A%2F%2Fjena.apache.org%2Ftext%23query%3E%20%22fox%22%7D";
+    let response = get(&s.app, uri).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    let result = response.json();
+    assert_eq!(result["results"]["bindings"].as_array().unwrap().len(), 1);
+    assert_eq!(result["results"]["bindings"][0]["s"]["value"], "urn:old");
+}
+
 #[tokio::test]
 async fn warm_snapshots_are_materialized() {
     let s = server(|_| {}).await;

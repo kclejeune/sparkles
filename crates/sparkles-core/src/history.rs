@@ -120,6 +120,8 @@ pub struct NamedSnapshot {
     pub reconstructable: bool,
     /// kept materialized (see [`SnapshotOptions::warm`])
     pub warm: bool,
+    /// Disk space held by this snapshot's full-text index, when requested.
+    pub text_bytes: u64,
 }
 
 /// Options of a named snapshot ([`Store::create_snapshot_opts`](crate::store::Store::create_snapshot_opts)).
@@ -601,6 +603,8 @@ struct PinFile {
     warm: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     configuration: Option<PinnedConfiguration>,
+    #[serde(default, rename = "textIndex", skip_serializing_if = "Option::is_none")]
+    text_index: Option<uuid::Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -612,6 +616,9 @@ pub(crate) struct Pin {
     /// kept materialized in the history cache
     pub warm: bool,
     pub configuration: Option<PinnedConfiguration>,
+    pub text_index: Option<uuid::Uuid>,
+    /// Derived index bytes, observed from its independently versioned directory.
+    pub text_bytes: u64,
 }
 
 /// What `history.json` holds.
@@ -700,9 +707,15 @@ fn checked_document<C: crate::budgeted::Control>(
             "legacy history cannot certify a configuration binding".into(),
         ));
     }
-    if f.format == 2 {
-        if bytes.len() > super::store::managed_history::MAX_BYTES
-            || serde_json::to_vec_pretty(&f)
+    if f.format < 3 && f.snapshots.iter().any(|pin| pin.text_index.is_some()) {
+        return Err(Error::Corrupt(
+            "older history format contains a text index reference".into(),
+        ));
+    }
+    let has_bindings = f.format == 2 || f.snapshots.iter().any(|pin| pin.configuration.is_some());
+    if f.format >= 2 {
+        if (has_bindings && bytes.len() > super::store::managed_history::MAX_BYTES)
+            || serde_json::to_vec_pretty(f)
                 .map_err(|_| Error::Corrupt("history metadata does not encode".into()))?
                 != bytes
         {
@@ -711,17 +724,24 @@ fn checked_document<C: crate::budgeted::Control>(
             ));
         }
         let mut names = std::collections::BTreeSet::new();
+        let mut text_indexes = std::collections::BTreeSet::new();
         for pin in &f.snapshots {
             control.check(0)?;
-            let configuration = pin.configuration.as_ref().ok_or_else(|| {
-                Error::Corrupt("named snapshot configuration binding is missing".into())
-            })?;
-            let family = configuration
-                .binding
-                .configuration()
-                .map_or(dataset_id, |identity| identity.dataset_id());
-            configuration.validate(family)?;
-            if !valid_name(&pin.name)
+            if let Some(configuration) = &pin.configuration {
+                let family = configuration
+                    .binding
+                    .configuration()
+                    .map_or(dataset_id, |identity| identity.dataset_id());
+                configuration.validate(family)?;
+            } else if has_bindings {
+                return Err(Error::Corrupt(
+                    "named snapshot configuration binding is missing".into(),
+                ));
+            }
+            if pin
+                .text_index
+                .is_some_and(|id| id.is_nil() || !text_indexes.insert(id))
+                || !valid_name(&pin.name)
                 || !names.insert(pin.name.as_str())
                 || pin.note.as_ref().is_some_and(|note| note.len() > 1024)
                 || pin.created.len() > 64
@@ -765,6 +785,8 @@ fn checked_file<C: crate::budgeted::Control>(
                 expires_ms: p.expires.as_deref().and_then(commit::parse_rfc3339_ms),
                 warm: p.warm,
                 configuration: p.configuration,
+                text_index: p.text_index,
+                text_bytes: 0,
             },
         );
     }
@@ -786,7 +808,10 @@ pub(crate) fn write_file(
     schedules: &[Schedule],
     catalog: CatalogHorizon,
 ) -> Result<()> {
-    let format = if pins.values().any(|pin| pin.configuration.is_some()) {
+    let has_bindings = pins.values().any(|pin| pin.configuration.is_some());
+    let format = if pins.values().any(|pin| pin.text_index.is_some()) {
+        3
+    } else if has_bindings {
         2
     } else {
         1
@@ -804,7 +829,7 @@ pub(crate) fn write_file(
                 note: p.note.clone(),
                 expires: p.expires_ms.map(commit::rfc3339_ms),
                 warm: p.warm,
-                configuration: if format == 2 {
+                configuration: if has_bindings {
                     Some(
                         p.configuration
                             .clone()
@@ -813,26 +838,28 @@ pub(crate) fn write_file(
                 } else {
                     None
                 },
+                text_index: p.text_index,
             })
             .collect(),
         schedules: schedules.to_vec(),
         catalog,
     };
     let bytes = serde_json::to_vec_pretty(&f).expect("history serializes");
-    if format == 2 {
-        if bytes.len() > super::store::managed_history::MAX_BYTES
+    if format >= 2
+        && ((has_bindings && bytes.len() > super::store::managed_history::MAX_BYTES)
             || pins.values().any(|pin| {
                 commit::parse_rfc3339_ms(&commit::rfc3339_ms(pin.created_ms))
                     != Some(pin.created_ms)
                     || pin.expires_ms.is_some_and(|expiry| {
                         commit::parse_rfc3339_ms(&commit::rfc3339_ms(expiry)) != Some(expiry)
                     })
-            })
-        {
-            return Err(Error::invalid(
-                "history configuration metadata exceeds its format limits",
-            ));
-        }
+            }))
+    {
+        return Err(Error::invalid(
+            "history configuration metadata exceeds its format limits",
+        ));
+    }
+    if has_bindings {
         crate::commit::require_reader(root, super::store::managed_history::READER)?;
     }
     crate::store::write_atomic(&root.join("history.json"), &bytes)
@@ -846,6 +873,8 @@ pub(crate) fn reidentify_file(root: &Path, old: uuid::Uuid, new: uuid::Uuid) -> 
     }
     let mut c = read_file(root, old)?;
     for pin in c.pins.values_mut() {
+        pin.text_index = None;
+        pin.text_bytes = 0;
         if let Some(configuration) = &mut pin.configuration
             && let ConfigurationBinding::Known {
                 configuration: source,
@@ -1177,7 +1206,17 @@ impl HistoryState {
         // and at most `max_bytes` of disk, counting every kept generation
         if let Some(max) = self.retention.max_bytes {
             let size = |no: &u32| self.gens.get(no).map_or(0, |g| g.bytes);
-            let mut total: u64 = out.keys().map(size).sum();
+            let pinned_text: u64 = self
+                .pins
+                .values()
+                .map(|pin| pin.text_bytes)
+                .try_fold(0u64, u64::checked_add)
+                .unwrap_or(u64::MAX);
+            let mut total: u64 = out
+                .keys()
+                .map(size)
+                .try_fold(pinned_text, u64::checked_add)
+                .unwrap_or(u64::MAX);
             for no in &window_only[dropped..] {
                 if total <= max {
                     break;
@@ -1824,6 +1863,8 @@ mod tests {
                 expires_ms: None,
                 warm: false,
                 configuration: None,
+                text_index: None,
+                text_bytes: 0,
             },
         );
         h.pins.insert(
@@ -1835,6 +1876,8 @@ mod tests {
                 expires_ms: None,
                 warm: false,
                 configuration: None,
+                text_index: None,
+                text_bytes: 0,
             },
         );
         let n = h.needed(3, 12, 0, &ts, 8);
@@ -1851,6 +1894,8 @@ mod tests {
                 expires_ms: None,
                 warm: false,
                 configuration: None,
+                text_index: None,
+                text_bytes: 0,
             },
         );
         assert!(h.needed(3, 12, 0, &ts, 8).is_empty());
@@ -1911,6 +1956,8 @@ mod tests {
                 expires_ms: None,
                 warm: false,
                 configuration: None,
+                text_index: None,
+                text_bytes: 0,
             },
         );
         assert_eq!(keep(&h), [1]);
@@ -1978,9 +2025,71 @@ mod tests {
     }
 
     #[test]
+    fn pin_text_version_does_not_activate_configuration_history() {
+        for already_activated in [false, true] {
+            for (text, bindings, expected_format) in [
+                (false, false, 1),
+                (false, true, 2),
+                (true, false, 3),
+                (true, true, 3),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                let store = crate::store::Store::open(root, Default::default()).unwrap();
+                let dataset_id = store.dataset_id();
+                drop(store);
+                let reader = crate::store::managed_history::READER;
+                if already_activated {
+                    crate::commit::require_reader(root, reader).unwrap();
+                }
+                let before = crate::commit::read_dataset_versions(root)
+                    .unwrap()
+                    .unwrap()
+                    .minimum_reader;
+                let pin = Pin {
+                    seq: 0,
+                    created_ms: 0,
+                    note: None,
+                    expires_ms: None,
+                    warm: false,
+                    configuration: bindings.then(PinnedConfiguration::legacy),
+                    text_index: text.then(uuid::Uuid::new_v4),
+                    text_bytes: 0,
+                };
+                let pins = BTreeMap::from([("example".into(), pin)]);
+                write_file(
+                    root,
+                    dataset_id,
+                    &pins,
+                    Default::default(),
+                    &[],
+                    Default::default(),
+                )
+                .unwrap();
+                let after = crate::commit::read_dataset_versions(root)
+                    .unwrap()
+                    .unwrap()
+                    .minimum_reader;
+                assert_eq!(after, if bindings { reader.max(before) } else { before });
+                let serialized = std::fs::read(root.join("history.json")).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
+                assert_eq!(value["format"], expected_format);
+                let decoded = read_file(root, dataset_id).unwrap();
+                assert_eq!(
+                    decoded.pins["example"].text_index,
+                    pins["example"].text_index
+                );
+                if text && !bindings {
+                    assert!(decoded.pins["example"].configuration.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_newer_history_file_is_unsupported() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("history.json"), br#"{"format": 3}"#).unwrap();
+        std::fs::write(dir.path().join("history.json"), br#"{"format": 4}"#).unwrap();
         let e = read_file(dir.path(), uuid::Uuid::nil())
             .err()
             .expect("refused");
@@ -2017,6 +2126,8 @@ mod tests {
                 expires_ms: None,
                 warm: true,
                 configuration: None,
+                text_index: None,
+                text_bytes: 0,
             },
         );
         write_file(

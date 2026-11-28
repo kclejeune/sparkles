@@ -7,7 +7,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, Multipart, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use caller::CallerContext;
 use oxrdfio::{RdfFormat, RdfSerializer};
@@ -412,6 +412,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/$/snapshots/{ds}/{name}",
             get(history::get_snapshot).delete(history::delete_snapshot),
+        )
+        .route(
+            "/$/snapshots/{ds}/{name}/text",
+            put(history::rebuild_snapshot_text).delete(history::drop_snapshot_text),
         )
         .route(
             "/$/history/{ds}",

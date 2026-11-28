@@ -46,6 +46,7 @@ pub(crate) fn reidentified(
     checked_document(&file, bytes, old, &budget)?;
     for pin in &mut file.snapshots {
         preparation.check()?;
+        pin.text_index = None;
         if let Some(configuration) = &mut pin.configuration
             && let ConfigurationBinding::Known {
                 configuration: source,
@@ -55,6 +56,11 @@ pub(crate) fn reidentified(
         }
     }
     file.dataset_id = new;
+    file.format = if file.snapshots.iter().any(|pin| pin.configuration.is_some()) {
+        2
+    } else {
+        1
+    };
     held.release_to(budget.used());
     preparation.check()?;
     managed_history::encode_pretty(&file, preparation)
@@ -120,6 +126,7 @@ pub(crate) fn validate_persistent(
                 && pin.note == live.note
                 && pin.expires_ms == live.expires_ms
                 && pin.warm == live.warm
+                && pin.text_index == live.text_index
                 && pin.configuration.as_ref().unwrap_or(&legacy)
                     == live.configuration.as_ref().unwrap_or(&legacy)
         });
@@ -244,6 +251,7 @@ mod reidentify_tests {
             expires: Some(commit::rfc3339_ms(5000)),
             warm: true,
             configuration: Some(PinnedConfiguration { binding, selector }),
+            text_index: None,
         }
     }
 

@@ -653,7 +653,7 @@ design remains part of its original record.
 
 ## Outcome
 
-Full-text queries, committed index maintenance, ranked search and the implemented language analyzers are available. Historical search, multi-field documents and the remaining analyzer compatibility work are tracked under items 23, 35, 250 and 251.
+Full-text queries, online index configuration, ranked search, transaction and historical search, and the implemented language analyzers are available. Multi-field documents and the remaining analyzer compatibility work are tracked under items 35, 250 and 251.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
 validation, measurements and the detailed follow-ups. The [landing page](README.md)

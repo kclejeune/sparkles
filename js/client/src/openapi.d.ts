@@ -4007,6 +4007,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/snapshots/{ds}/{name}/text": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Rebuild a named snapshot's full-text index */
+        put: operations["rebuildSnapshotText"];
+        post?: never;
+        /** Drop a named snapshot's full-text index */
+        delete: operations["dropSnapshotText"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/stats": {
         parameters: {
             query?: never;
@@ -11140,6 +11158,8 @@ export interface components {
             /** @description `snapshot:NAME`. */
             ref: string;
             seq: number;
+            /** @description Disk bytes held by the snapshot's full-text index. */
+            textBytes?: number;
             /** @description Kept materialized. */
             warm: boolean;
         };
@@ -13494,6 +13514,8 @@ export interface components {
             /** @description Required, here or in the query string. */
             name?: string;
             note?: string;
+            /** @description Build and keep a full-text index for the snapshot. */
+            text?: boolean | string;
             /** @description Keep the snapshot materialized. */
             warm?: boolean | string;
         };
@@ -13936,6 +13958,7 @@ export interface components {
                 ms: number;
             };
             message?: string;
+            pendingConfig?: components["schemas"]["TextConfig"];
             segments: number;
             /** @description The commit the index reflects. */
             seq: number;
@@ -25892,6 +25915,67 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    rebuildSnapshotText: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The snapshot. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamedSnapshot"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            501: components["responses"]["NotImplemented"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    dropSnapshotText: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The RDF snapshot is still pinned. */
             204: {
                 headers: {
                     [name: string]: unknown;

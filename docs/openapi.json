@@ -19849,6 +19849,10 @@
           "seq": {
             "type": "integer"
           },
+          "textBytes": {
+            "description": "Disk bytes held by the snapshot's full-text index.",
+            "type": "integer"
+          },
           "warm": {
             "description": "Kept materialized.",
             "type": "boolean"
@@ -27692,6 +27696,13 @@
           "note": {
             "type": "string"
           },
+          "text": {
+            "description": "Build and keep a full-text index for the snapshot.",
+            "type": [
+              "boolean",
+              "string"
+            ]
+          },
           "warm": {
             "description": "Keep the snapshot materialized.",
             "type": [
@@ -29179,6 +29190,9 @@
               },
               "message": {
                 "type": "string"
+              },
+              "pendingConfig": {
+                "$ref": "#/components/schemas/TextConfig"
               },
               "segments": {
                 "type": "integer"
@@ -56713,6 +56727,138 @@
           "History"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/$/snapshots/{ds}/{name}/text": {
+      "delete": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#named-snapshots-and-retention"
+        },
+        "operationId": "dropSnapshotText",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The RDF snapshot is still pinned."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Drop a named snapshot's full-text index",
+        "tags": [
+          "History"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "put": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#named-snapshots-and-retention"
+        },
+        "operationId": "rebuildSnapshotText",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedSnapshot"
+                }
+              }
+            },
+            "description": "The snapshot."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Rebuild a named snapshot's full-text index",
+        "tags": [
+          "History"
+        ],
+        "x-sparkles-permission": "admin"
       }
     },
     "/$/stats": {

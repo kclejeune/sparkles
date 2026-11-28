@@ -406,6 +406,17 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
         c.control_keyspace();
         c.catalog(catalog);
         c.text(text);
+        if let Some(id) = c.dataset_id {
+            let warnings = crate::store::text_pins::probe(root, id, c.full);
+            if !warnings.is_empty() {
+                let mut pins = Run::new("snapshot-text");
+                for (file, message) in warnings {
+                    pins.add(Issue::warning(message).file(file));
+                }
+                c.checks
+                    .push(pins.done("snapshot text indexes need attention"));
+            }
+        }
         if let Some(t) = c.checks.iter_mut().find(|x| x.name == "text") {
             t.millis += text_ms;
         }

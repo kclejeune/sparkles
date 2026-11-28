@@ -811,7 +811,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("compaction.json", 1),
     ds("quota.json", 1),
     ds("changelog.json", 1),
-    ds("history.json", 2),
+    ds("history.json", 3),
     ds("branches.json", 3),
     ds("branch.json", 2),
     ds("queries.json", 1),
@@ -821,6 +821,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("validation-status.json", 1),
     ds("text.json", 1),
     ds("text.pending.json", 1),
+    ds("text.snapshot.json", 1),
     ds("reasoning-imports.json", 2),
     named(ds("reasoning.json", 2), "reasoningFormat"),
     named(ds("query-reasoning.json", 1), "queryReasoningFormat"),
@@ -973,10 +974,18 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
         };
         let refused = out.len();
         let checked = check_settings(s.name, &v).and_then(|found| {
-            if matches!(s.name, "history.json" | "branch.json")
-                && found >= 2
-                && let Some(reader) = recorded_reader(dir)
-            {
+            let configuration_history = (s.name == "branch.json" && found >= 2)
+                || (s.name == "history.json"
+                    && (found == 2
+                        || (found == 3
+                            && v.get("snapshots")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|pins| {
+                                    pins.iter().any(|pin| {
+                                        pin.get("configuration").is_some_and(|v| !v.is_null())
+                                    })
+                                }))));
+            if configuration_history && let Some(reader) = recorded_reader(dir) {
                 admit_configuration_version(reader, s.name, found)?;
             }
             Ok(found)
@@ -1024,11 +1033,14 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
 
 /// The bytes of `path`, or `None` when it is longer than `limit`, read without taking
 /// more than `limit + 1` bytes into memory.
-fn read_bounded(path: &std::path::Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_bounded(path: &std::path::Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
+    let read_limit = limit.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "file read limit overflow")
+    })?;
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
-        .take(limit + 1)
+        .take(read_limit)
         .read_to_end(&mut bytes)?;
     Ok((bytes.len() as u64 <= limit).then_some(bytes))
 }
@@ -1750,7 +1762,7 @@ mod history_refusal_nonmutation_tests {
 
     #[test]
     fn supported_corrupt_history_refuses_before_any_metadata_writer() {
-        assert_eq!(super::settings_file("history.json").unwrap().writes, 2);
+        assert_eq!(super::settings_file("history.json").unwrap().writes, 3);
         // An activated dataset admits format 2, so a malformed one is corruption.
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("db");
@@ -1796,6 +1808,8 @@ mod history_refusal_nonmutation_tests {
                     expires_ms: None,
                     warm: false,
                     configuration: Some(crate::history::PinnedConfiguration::legacy()),
+                    text_index: None,
+                    text_bytes: 0,
                 },
             );
         }
@@ -1909,7 +1923,7 @@ mod history_refusal_nonmutation_tests {
         let root = directory.path();
         std::fs::write(
             root.join("history.json"),
-            br#"{"format":3,"futureShape":true}"#,
+            br#"{"format":4,"futureShape":true}"#,
         )
         .unwrap();
         let before = metadata_files(root);

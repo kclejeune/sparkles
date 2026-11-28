@@ -360,19 +360,218 @@ fn dumps_at_a_commit() {
 
 #[cfg(feature = "text")]
 #[test]
-fn full_text_search_only_at_the_head() {
+fn historical_text_search_reverses_inserts_and_deletes_under_the_query_budget() {
     let dir = tempfile::tempdir().unwrap();
     let s = setup(&dir.path().join("db"), StoreOptions::default());
-    upd(&s, "INSERT DATA { <urn:t> <urn:label> \"red fox\" }");
+    upd(&s, r#"INSERT DATA { <urn:old> <urn:label> "fox" }"#);
+    let old = s.snapshot().commit;
     s.enable_text(Default::default()).unwrap();
-    let q = "SELECT ?s { ?s <http://jena.apache.org/text#query> \"fox\" }";
-    let (snap, _) = s.snapshot_at(&At::Head, &Default::default()).unwrap();
-    assert_eq!(query(snap, q, &QueryOptions::default()).unwrap().len(), 1);
-    let (snap, _) = s.snapshot_at(&At::Commit(1), &Default::default()).unwrap();
+    upd(
+        &s,
+        r#"DELETE DATA { <urn:old> <urn:label> "fox" };
+        INSERT DATA { <urn:new> <urn:label> "fox fox fox" }"#,
+    );
+    let q = r#"SELECT ?s { (?s ?score) <http://jena.apache.org/text#query> ("fox" 1) }"#;
+    let subject = |at| {
+        let (snap, _) = s.snapshot_at(&at, &Default::default()).unwrap();
+        let rows = query(snap, q, &QueryOptions::default())
+            .unwrap()
+            .rows()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        rows.iter().next().unwrap().values()[0]
+            .as_ref()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(subject(At::Head), "<urn:new>");
+    assert_eq!(subject(At::Commit(old)), "<urn:old>");
+    let (snap, _) = s
+        .snapshot_at(&At::Commit(old), &Default::default())
+        .unwrap();
+    let memory = QueryOptions {
+        max_memory_bytes: Some(1 << 20),
+        ..Default::default()
+    };
     assert!(matches!(
-        query(snap, q, &QueryOptions::default()),
+        query(snap.clone(), q, &memory),
+        Err(Error::BudgetExceeded(b))
+            if b.kind == sparkles_core::BudgetKind::Memory && b.requested > b.limit
+    ));
+    let stopped = sparkles_core::task::Cancel::new();
+    stopped.cancel();
+    let cancelled = QueryOptions {
+        cancel: Some(stopped.flag()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        query(snap.clone(), q, &cancelled),
+        Err(Error::Cancelled)
+    ));
+    let expired = QueryOptions {
+        deadline: Some(std::time::Instant::now()),
+        ..Default::default()
+    };
+    assert!(matches!(query(snap, q, &expired), Err(Error::Timeout)));
+}
+
+#[cfg(feature = "text")]
+#[test]
+fn named_snapshot_text_survives_compaction_reopen_and_live_disable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let q = r#"SELECT ?s { ?s <http://jena.apache.org/text#query> "fox" }"#;
+    let s = open(&root, StoreOptions::default());
+    upd(&s, r#"INSERT DATA { <urn:old> <urn:label> "fox" }"#);
+    s.enable_text(Default::default()).unwrap();
+    let old = s.snapshot().commit;
+    let pin = s
+        .create_snapshot_with_text("search", &At::Head, &Default::default())
+        .unwrap()
+        .0;
+    assert!(pin.text_bytes > 0);
+    let index = snapshot_text_dir(&root);
+    assert!(s.history().bytes >= pin.text_bytes);
+    upd(
+        &s,
+        r#"DELETE DATA { <urn:old> <urn:label> "fox" };
+        INSERT DATA { <urn:new> <urn:label> "fox fox fox" }"#,
+    );
+    s.compact_with(&Default::default()).unwrap();
+    s.disable_text().unwrap();
+    drop(s);
+
+    let s = open(&root, StoreOptions::default());
+    let pin = s.named_snapshot("search").unwrap();
+    assert!(pin.generation.is_some());
+    assert!(pin.text_bytes > 0);
+    let (snapshot, _) = s
+        .snapshot_at(&At::Snapshot("search".into()), &Default::default())
+        .unwrap();
+    let rows = query(snapshot.clone(), q, &Default::default())
+        .unwrap()
+        .rows()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows.iter().next().unwrap().values()[0]
+            .as_ref()
+            .unwrap()
+            .to_string(),
+        "<urn:old>"
+    );
+    let (past, _) = s
+        .snapshot_at(&At::Commit(old), &Default::default())
+        .unwrap();
+    assert!(matches!(
+        query(past, q, &Default::default()),
         Err(Error::HistoryUnsupported(_))
     ));
+    assert!(s.delete_snapshot("search").unwrap());
+    assert!(!index.exists());
+    // A reader that already opened the index keeps its mapped files through deletion.
+    assert_eq!(query(snapshot, q, &Default::default()).unwrap().len(), 1);
+}
+
+#[cfg(feature = "text")]
+#[test]
+fn expiration_releases_snapshot_text_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = open(dir.path(), StoreOptions::default());
+    s.enable_text(Default::default()).unwrap();
+    s.create_snapshot_with_text(
+        "short",
+        &At::Head,
+        &sparkles_core::history::SnapshotOptions {
+            expires_ms: Some(T0 + 2_000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let index = snapshot_text_dir(dir.path());
+    now().store(T0 + 3_000, Ordering::SeqCst);
+    s.history_tick().unwrap();
+    assert!(s.named_snapshot("short").is_none());
+    assert!(!index.exists());
+}
+
+#[cfg(feature = "text")]
+#[test]
+fn snapshot_text_can_be_repaired_and_dropped_without_releasing_its_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let q = r#"SELECT ?s { ?s <http://jena.apache.org/text#query> "fox" }"#;
+    let s = open(root, StoreOptions::default());
+    upd(&s, r#"INSERT DATA { <urn:old> <urn:label> "fox" }"#);
+    s.enable_text(Default::default()).unwrap();
+    let name = "repair";
+    let at = At::Snapshot(name.into());
+    let pin = s
+        .create_snapshot_with_text(name, &At::Head, &Default::default())
+        .unwrap()
+        .0;
+    let index = snapshot_text_dir(root);
+    upd(&s, r#"DELETE DATA { <urn:old> <urn:label> "fox" }"#);
+    s.compact().unwrap();
+    s.disable_text().unwrap();
+    std::fs::remove_dir_all(index.join("text")).unwrap();
+    let (snapshot, _) = s.snapshot_at(&at, &Default::default()).unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert!(matches!(
+        query(snapshot, q, &Default::default()),
+        Err(Error::TextUnavailable(_))
+    ));
+    let repaired = s.rebuild_snapshot_text(name, &Default::default()).unwrap();
+    assert_eq!(repaired.seq, pin.seq);
+    assert!(!index.exists());
+    let replacement = snapshot_text_dir(root);
+    assert_ne!(replacement, index);
+    let (snapshot, _) = s.snapshot_at(&at, &Default::default()).unwrap();
+    assert_eq!(query(snapshot, q, &Default::default()).unwrap().len(), 1);
+    assert!(s.drop_snapshot_text(name).unwrap());
+    assert!(!replacement.exists());
+    let pin = s.named_snapshot(name).unwrap();
+    assert_eq!(pin.seq, repaired.seq);
+    assert_eq!(pin.text_bytes, 0);
+    let (snapshot, _) = s.snapshot_at(&at, &Default::default()).unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert!(matches!(
+        query(snapshot, q, &Default::default()),
+        Err(Error::HistoryUnsupported(_))
+    ));
+}
+
+#[cfg(feature = "text")]
+#[test]
+fn a_failed_snapshot_text_publish_leaves_only_collectible_staging() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let store = open(root, StoreOptions::default());
+    store.enable_text(Default::default()).unwrap();
+    let blocker = root.join("history.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(
+        store
+            .create_snapshot_with_text("orphan", &At::Head, &Default::default())
+            .is_err()
+    );
+    let orphan = snapshot_text_dir(root);
+    assert!(store.named_snapshot("orphan").is_none());
+    std::fs::remove_dir(blocker).unwrap();
+    drop(store);
+    let reopened = open(root, StoreOptions::default());
+    assert!(!orphan.exists());
+    assert!(reopened.named_snapshot("orphan").is_none());
+}
+
+#[cfg(feature = "text")]
+fn snapshot_text_dir(root: &Path) -> std::path::PathBuf {
+    let dirs = std::fs::read_dir(root.join("history-text"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(dirs.len(), 1);
+    dirs.into_iter().next().unwrap()
 }
 
 fn copy_dir(from: &Path, to: &Path) {

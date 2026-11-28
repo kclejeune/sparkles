@@ -98,6 +98,7 @@ mod replay;
 mod schedule;
 mod simulation;
 mod snapshot;
+pub(crate) mod text_pins;
 #[cfg(feature = "text")]
 pub(crate) mod text_recovery;
 // the geometry tests are the only users
@@ -3796,6 +3797,7 @@ impl Store {
                 set.set_main(&store.current);
             }
         }
+        store.recover_text_pins();
         store.collect_history(gen_no, head.seq);
         store.release_link_if_rebuilt();
         if let Err(e) = store.recover_change_log() {
@@ -4346,10 +4348,40 @@ impl Store {
         crate::history::Resolved,
         history_limited::SnapshotCharge,
     )> {
+        let (snapshot, resolved, charge) = self.materialize_snapshot(at, limit, r, &live)?;
+        #[cfg(feature = "text")]
+        let snapshot = if let Some(pinned) = self.attach_text_pin(at, &snapshot, limit)? {
+            pinned
+        } else if snapshot.historical
+            && Arc::ptr_eq(&snapshot.generation, &live.generation)
+            && let Some(view) = &live.text
+        {
+            let mut adjusted = (*snapshot).clone();
+            adjusted.text = Some(Arc::new(
+                view.with_historical_changes(adjusted.commit, live.clone()),
+            ));
+            Arc::new(adjusted)
+        } else {
+            snapshot
+        };
+        Ok((snapshot, resolved, charge))
+    }
+
+    fn materialize_snapshot<C: HistoryRead>(
+        &self,
+        at: &crate::history::At,
+        limit: C,
+        r: crate::history::Resolved,
+        live: &Arc<Snapshot>,
+    ) -> Result<(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        history_limited::SnapshotCharge,
+    )> {
         if r.commit.seq == live.commit {
             limit.check(history_limited::SHARED_SNAPSHOT_BYTES)?;
             return Ok((
-                live,
+                live.clone(),
                 crate::history::Resolved {
                     historical: false,
                     ..r
@@ -4464,7 +4496,7 @@ impl Store {
         let limit = limit.holding(16 << 10)?;
         let entry = h.gens[&owner].clone();
         let generation =
-            self.history_generation_with(&mut h, owner, current, &live, &entry, seq, &limit)?;
+            self.history_generation_with(&mut h, owner, current, live, &entry, seq, &limit)?;
         let (limit, generation_bytes) =
             if C::ACCOUNTS && !Arc::ptr_eq(&generation, &live.generation) {
                 let retained = generation.retained_bytes_with(&limit)?;
@@ -4473,7 +4505,7 @@ impl Store {
                 (limit, 0)
             };
         let t0 = std::time::Instant::now();
-        let (delta, end) = self.materialize(&h, owner, &entry, &generation, &live, seq, &limit)?;
+        let (delta, end) = self.materialize(&h, owner, &entry, &generation, live, seq, &limit)?;
         let delta_charge = if C::ACCOUNTS {
             let bytes = history_limited::preparation_delta_bytes(&delta)
                 .max(history_limited::SHARED_SNAPSHOT_BYTES);
@@ -4796,6 +4828,7 @@ impl Store {
             generation: owner.and_then(|o| h.gens.get(&o)).map(|g| g.name.clone()),
             reconstructable: owner.is_some(),
             warm: p.warm,
+            text_bytes: p.text_bytes,
         }
     }
 
@@ -4873,7 +4906,40 @@ impl Store {
         at: &crate::history::At,
         o: &crate::history::SnapshotOptions,
     ) -> Result<(crate::history::NamedSnapshot, bool)> {
-        self.create_snapshot_selected(name, at, o, None)
+        self.create_snapshot_selected(name, at, o, None, None)
+    }
+
+    /// Keep a full-text index for this named snapshot in a persistent dataset.
+    pub fn create_snapshot_with_text(
+        &self,
+        name: &str,
+        at: &crate::history::At,
+        o: &crate::history::SnapshotOptions,
+    ) -> Result<(crate::history::NamedSnapshot, bool)> {
+        self.create_snapshot_with_text_controlled(name, at, o, &Default::default())
+    }
+
+    /// Create an indexed pin with cancellation and an absolute build deadline.
+    pub fn create_snapshot_with_text_controlled(
+        &self,
+        name: &str,
+        at: &crate::history::At,
+        o: &crate::history::SnapshotOptions,
+        controls: &crate::history::HistoryOptions,
+    ) -> Result<(crate::history::NamedSnapshot, bool)> {
+        if !cfg!(feature = "text") {
+            return Err(crate::text::not_built());
+        }
+        if self.root.is_none() {
+            return Err(Error::HistoryUnsupported(
+                "a snapshot text index needs a persistent dataset".into(),
+            ));
+        }
+        let result = self.create_snapshot_selected(name, at, o, None, Some(controls))?;
+        if o.warm && result.1 {
+            self.warm_snapshots();
+        }
+        Ok(result)
     }
 
     fn create_snapshot_selected(
@@ -4882,6 +4948,7 @@ impl Store {
         at: &crate::history::At,
         o: &crate::history::SnapshotOptions,
         selected: Option<&crate::history::PinnedConfiguration>,
+        text: Option<&crate::history::HistoryOptions>,
     ) -> Result<(crate::history::NamedSnapshot, bool)> {
         let (note, expires_ms) = (o.note.clone(), o.expires_ms);
         if !crate::history::valid_name(name) {
@@ -4907,8 +4974,11 @@ impl Store {
                 "named snapshots need a persistent dataset".into(),
             ));
         };
-        // no rebuild may run while the pin is being established
-        let w = self.guarded_writer();
+        // Drain pending commits and exclude generation switches while establishing the pin.
+        let w = match text {
+            Some(controls) => self.text_pin_writer(controls)?,
+            None => self.guarded_writer(),
+        };
         let head = w.head;
         let r = self.resolve_with(at, head)?;
         let seq = r.commit.seq;
@@ -4916,6 +4986,7 @@ impl Store {
         let h = hist.lock();
         if let Some(p) = h.pins.get(name) {
             if p.seq == seq
+                && (text.is_none() || p.text_index.is_some())
                 && selected.is_none_or(|selected| {
                     p.configuration
                         .as_ref()
@@ -4965,6 +5036,29 @@ impl Store {
                 self.opts.history_max_generations
             )));
         }
+        #[cfg(feature = "text")]
+        let (text_index, text_bytes) = if let Some(controls) = text {
+            drop(h);
+            let live = self.snapshot();
+            let (snapshot, _, _) = self.materialize_snapshot(
+                at,
+                crate::history::ReadLimit {
+                    options: controls,
+                    memory: Some(self.history_cache_capacity()),
+                    held: crate::history::READ_METADATA_BYTES,
+                },
+                r,
+                &live,
+            )?;
+            let config = self.active_text_pin_config()?;
+            let (id, bytes) = self.build_text_pin(&snapshot, config, controls)?;
+            h = hist.lock();
+            (Some(id), bytes)
+        } else {
+            (None, 0)
+        };
+        #[cfg(not(feature = "text"))]
+        let (text_index, text_bytes) = (None, 0);
         let pin = crate::history::Pin {
             seq,
             created_ms: self.now_ms(),
@@ -4972,6 +5066,8 @@ impl Store {
             expires_ms,
             warm: o.warm,
             configuration,
+            text_index,
+            text_bytes,
         };
         h.pins.insert(name.to_string(), pin.clone());
         if let Err(e) = crate::history::write_file(
@@ -4983,6 +5079,8 @@ impl Store {
             h.catalog,
         ) {
             h.pins.remove(name);
+            // A failed directory sync can follow the metadata rename. Keep the staged
+            // UUID for startup to reconcile against the durable history file.
             return Err(e);
         }
         drop(w);
@@ -5012,6 +5110,7 @@ impl Store {
             h.pins.insert(name.to_string(), pin);
             return Err(e);
         }
+        self.remove_text_pin(pin.text_index);
         self.collect_locked(&mut h, current, w.head.seq);
         Ok(true)
     }
@@ -5207,7 +5306,9 @@ impl Store {
                 .iter()
                 .filter(|g| !g.current)
                 .map(|g| g.bytes)
-                .sum(),
+                .chain(h.pins.values().map(|pin| pin.text_bytes))
+                .try_fold(0u64, u64::checked_add)
+                .unwrap_or(u64::MAX),
             generations,
             retention: h.retention,
             snapshots: h.pins.len(),
@@ -5538,7 +5639,7 @@ impl Store {
                 cfg.clone(),
                 &snap,
                 first_wal_seq,
-                &load_wal,
+                load_wal,
             ) {
                 Ok(Some((ti, view))) => {
                     self.text.store(Some(Arc::new(ti)));

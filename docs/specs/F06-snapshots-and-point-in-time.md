@@ -1431,8 +1431,9 @@ number commits the same way. Result-cache keys use the generation and the commit
 past and live states never share entries.
 
 **Deviations.**
-* `text:query` at a past commit answers `501` with the general `history-unsupported`
-  code, not a separate `text-not-at-commit` code.
+* The initial delivery used the general `history-unsupported` code for past
+  `text:query` calls. [F03](F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12)
+  adds bounded searches in the current generation and indexed named snapshots.
 * A materialization larger than `--history-cache-mb` fails with the shared budget error
   of [C01](C01-observability-and-budgets.md) (`507`, `budget: "memory"`), not a
   `history-memory` code.
