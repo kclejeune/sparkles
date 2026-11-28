@@ -658,7 +658,7 @@ and unsatisfiable classes sit under `owl:Nothing`. A deliberate **Classify tree*
 retains the full-taxonomy POST flow with the actual EL, Horn or disjunctive result of
 [F24](../F24-owl-classification/README.md). Matching fresh RDFS or OWL RL materializations
 also supply bounded property hierarchies and named individual types. General
-classifier-backed property and individual entailments remain under items 588 and 609.
+classifier-backed property and individual entailments remain under item 609.
 
 **Frame.** Selecting an entity opens its frame. The frame lists the entity's annotations,
 its characteristics as checkboxes for properties, and its axioms in sections such as
@@ -797,8 +797,8 @@ engines, the three syntaxes of an expression, the error spans and the caller's g
 Playwright covers the tab, links that run a query, the underline of an unknown name,
 completion and the Manchester add fields against the mock backend and a real server.
 The instances need a classification with the assertions, which the dataset does not
-keep, so an instance query classifies the ontology again. Roadmap item 588 can reuse
-the same engine to answer the entity accessors from the kept classification.
+keep, so an instance query classifies the ontology again. Item 588 answers the named-class
+entity accessors from the kept classification, and instance answers wait for item 590.
 
 ### Thesaurus editor
 
@@ -1092,7 +1092,7 @@ Characteristics clause. Self-subsumptions, types and superclasses of `owl:Thing`
 instead of listed. Annotations, declarations and other rows that no clause takes keep their
 functional-style form. Profile completeness, consistency and
 arbitrary-axiom explanations remain unknown or unavailable. General classifier-backed
-entailments and matching F24 justifications remain in items 588, 622 and 609. The existing
+entailments and matching F24 justifications remain in items 622 and 609. The existing
 mapper and exact-total scans can cost more than a page's output size, and this phase
 establishes no new cold or warm latency claim.
 
@@ -1115,9 +1115,9 @@ and copied Manchester text keeps its syntax. A phone puts Metadata and Hierarchy
 
 **Remaining work.** Item 622 still covers general classifier-backed inferred axiom
 frames and explanation links dependent on matching F24 justifications. Classifier-backed
-property and individual entailments remain in item 609, general entity and axiom reads
-with classification in item 588, search at a past state in item 658 and other servers'
-term pages in item 461. The kept named-class and strict materialization-backed slices
+property and individual entailments remain in item 609, search at a past state in item
+658 and other servers' term pages in item 461. Item 588's kept entity and axiom reads are
+available to the frames, which do not show them yet. The kept named-class and strict materialization-backed slices
 do not complete these parent items, compute on a read miss or use RL witnesses as
 classification explanations.
 

@@ -95,6 +95,23 @@ struct BoundedSink {
     limit: usize,
 }
 
+/// A sink that hands each piece's size to the caller's `tick` before it writes it.
+struct ControlledSink<'a, E> {
+    buf: String,
+    tick: &'a mut dyn FnMut(usize) -> Result<(), E>,
+}
+
+impl<E> PolledWrite<E> for ControlledSink<'_, E> {
+    fn push_str(&mut self, s: &str) -> Result<(), E> {
+        self.buf.push_str(s);
+        Ok(())
+    }
+
+    fn tick(&mut self, work: usize) -> Result<(), E> {
+        (self.tick)(work)
+    }
+}
+
 impl PolledWrite<()> for BoundedSink {
     fn push_str(&mut self, s: &str) -> Result<(), ()> {
         if self.buf.len().saturating_add(s.len()) > self.limit {
@@ -718,6 +735,23 @@ impl Renderer {
         Some(sink.buf)
     }
 
+    /// [`axiom`](Self::axiom) with `tick` called with the size of each piece of the
+    /// text before it is written, so that the caller can stop the rendering of a large
+    /// axiom, such as an equivalence of many classes, with its own error. The text is
+    /// the same as `axiom`'s.
+    pub fn axiom_controlled<E>(
+        &self,
+        ax: &Axiom,
+        tick: &mut dyn FnMut(usize) -> Result<(), E>,
+    ) -> Result<String, E> {
+        let mut sink = ControlledSink {
+            buf: String::new(),
+            tick,
+        };
+        self.write_axiom_polled(ax, &mut sink)?;
+        Ok(sink.buf)
+    }
+
     /// An IRI as a prefixed name, or in angle brackets.
     pub fn iri(&self, iri: &str) -> String {
         for (p, ns) in &self.prefixes {
@@ -1131,3 +1165,38 @@ display!(Individual, individual);
 display!(Literal, literal);
 display!(Annotation, annotation);
 display!(Entity, entity);
+
+#[cfg(test)]
+mod controlled_tests {
+    use super::*;
+
+    #[test]
+    fn a_controlled_rendering_matches_the_plain_one_and_stops_inside_a_large_axiom() {
+        let r = Renderer::new([("ex", "http://ex.org/")]);
+        let class = |i: usize| ClassExpression::Class(Class::new(format!("http://ex.org/C{i}")));
+        let eq = Axiom::equivalent_classes((0..2000).map(class));
+        let sub = Axiom::sub_class_of(
+            Class::new("http://ex.org/A"),
+            Class::new("http://other.org/B"),
+        );
+        for ax in [&eq, &sub] {
+            let mut ticks = 0usize;
+            let text = r
+                .axiom_controlled(ax, &mut |_| -> Result<(), ()> {
+                    ticks += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(text, r.axiom(ax));
+            assert!(ticks > 0);
+        }
+        // a stop partway through the equivalence ends the rendering there
+        let mut ticks = 0usize;
+        let stopped = r.axiom_controlled(&eq, &mut |_| {
+            ticks += 1;
+            if ticks == 100 { Err("stop") } else { Ok(()) }
+        });
+        assert_eq!(stopped, Err("stop"));
+        assert_eq!(ticks, 100);
+    }
+}

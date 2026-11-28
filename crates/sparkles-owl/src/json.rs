@@ -352,6 +352,33 @@ pub fn axiom_fits_bytes(ax: &Axiom, max_bytes: usize) -> bool {
     true
 }
 
+/// [`axiom`] with `tick` called once for each class of an equivalence, the part of an
+/// axiom that can grow with the size of an ontology, and once for any other axiom, so
+/// that the caller can stop a large equivalence with its own error. The value is the
+/// same as `axiom`'s.
+pub fn axiom_controlled<E>(
+    ax: &Axiom,
+    tick: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<Value, E> {
+    let AxiomKind::EquivalentClasses(cs) = &ax.kind else {
+        tick(1)?;
+        return Ok(axiom(ax));
+    };
+    if !ax.annotations.is_empty() {
+        tick(1)?;
+        return Ok(axiom(ax));
+    }
+    let mut classes = Vec::with_capacity(cs.len());
+    for c in cs {
+        tick(1)?;
+        classes.push(class_expression(c));
+    }
+    let mut m = Map::new();
+    m.insert("type".into(), ax.axiom_type().name().into());
+    m.insert("classes".into(), Value::Array(classes));
+    Ok(Value::Object(m))
+}
+
 /// An axiom in its JSON form.
 pub fn axiom(ax: &Axiom) -> Value {
     use AxiomKind as K;
@@ -896,4 +923,31 @@ pub fn read_axiom(v: &Value) -> R<Axiom> {
     let ax = Axiom { kind, annotations };
     crate::validate::axiom(&ax)?;
     Ok(ax)
+}
+
+#[cfg(test)]
+mod controlled_tests {
+    use super::*;
+
+    #[test]
+    fn a_controlled_json_axiom_matches_the_plain_one_and_stops_inside_a_large_equivalence() {
+        let class = |i: usize| ClassExpression::Class(Class::new(format!("http://ex.org/C{i}")));
+        let eq = Axiom::equivalent_classes((0..2000).map(class));
+        let sub = Axiom::sub_class_of(Class::new("http://ex.org/A"), Class::new("http://ex.org/B"));
+        for ax in [&eq, &sub] {
+            let v = axiom_controlled(ax, &mut |_| -> Result<(), ()> { Ok(()) }).unwrap();
+            assert_eq!(v, axiom(ax));
+            assert_eq!(
+                serde_json::to_string(&v).unwrap(),
+                serde_json::to_string(&axiom(ax)).unwrap()
+            );
+        }
+        let mut ticks = 0usize;
+        let stopped = axiom_controlled(&eq, &mut |_| {
+            ticks += 1;
+            if ticks == 100 { Err("stop") } else { Ok(()) }
+        });
+        assert_eq!(stopped, Err("stop"));
+        assert_eq!(ticks, 100);
+    }
 }

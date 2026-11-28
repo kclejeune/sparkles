@@ -2498,7 +2498,7 @@ export interface paths {
         };
         /**
          * Ontology axioms
-         * @description The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. `about` an IRI that the ontology neither declares nor uses is `404`.
+         * @description The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. In an asserted listing, `about` an IRI that the ontology neither declares nor uses is `404`. A `classification=kept` listing instead answers `200` with `entity.present: false` and no axioms for a class the kept result does not hold. A kept listing is admitted to the server's query memory pool and counts the rows it builds against the request's memory limit and the pool. A page past the request's limit or the whole pool is `507`, and one that the busy pool cannot take is `503`.
          */
         get: operations["getOntologyAxioms"];
         put?: never;
@@ -21043,10 +21043,16 @@ export interface operations {
                 assertions?: boolean;
                 /** @description `json` (the default) or `ofn`. */
                 format?: "json" | "ofn";
-                /** @description The most axioms listed, from 1 to 10,000 (100 by default). */
+                /** @description The most axioms listed, from 1 to 10,000 (100 by default), or to 1,000 with `classification=kept`. */
                 limit?: number;
-                /** @description The axioms skipped. */
+                /** @description The axioms skipped. With `classification=kept`, a nonzero offset needs `resultId` and `at=commit:N`. */
                 offset?: number;
+                /** @description `kept` lists the axioms that the dataset's kept classification infers instead of the asserted axioms, without classifying on a miss. Each group of several equivalent classes gives an `EquivalentClasses` axiom and each direct parent group a `SubClassOf` axiom between the groups' first classes. The answer has the kept read's `status`, `reason`, `result` and `outcome`, and `axioms` and `total` are null unless the status is `available`. It is `Cache-Control: no-store` and refuses `inferences`, `assertions` and `format=ofn`. */
+                classification?: "kept";
+                /** @description With `classification=kept`, read the kept EL-only classification. */
+                elOnly?: boolean;
+                /** @description With `classification=kept`, the immutable result to read. */
+                resultId?: string;
             };
             header?: never;
             path: {
@@ -21072,6 +21078,8 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
@@ -21606,8 +21614,16 @@ export interface operations {
                 kind?: string;
                 /** @description Also read the instances, types and property assertions the store holds. */
                 assertions?: boolean;
-                /** @description The most entries of each streamed list, from 1 to 10,000 (100 by default). */
+                /** @description The most entries of each streamed list, from 1 to 10,000 (100 by default), and of each kept page, from 1 to 1,000, with `classification=kept`. */
                 limit?: number;
+                /** @description `kept` adds a `classification` member read from the dataset's kept classification without classifying on a miss: the read's `status`, `reason`, `result` and `outcome`, the class's `entity` status, and the first pages of its direct `parents`, direct `children` and named `equivalents`, which are null unless the class is present in an available result. It covers named classes only, is `Cache-Control: no-store` and refuses `inferences`. */
+                classification?: "kept";
+                /** @description With `classification=kept`, read the kept EL-only classification. */
+                elOnly?: boolean;
+                /** @description With `classification=kept`, the immutable result to read. */
+                resultId?: string;
+                /** @description With `classification=kept`, comma-separated preferred label languages of the kept pages, otherwise Accept-Language. */
+                lang?: string;
             };
             header?: never;
             path: {

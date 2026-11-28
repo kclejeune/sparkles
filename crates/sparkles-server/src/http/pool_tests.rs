@@ -559,3 +559,99 @@ async fn a_query_larger_than_the_whole_pool_answers_507_without_retry_after() {
     );
     assert_eq!(pool(&s).granted(), 0);
 }
+
+#[cfg(feature = "ontology")]
+#[tokio::test]
+async fn kept_axiom_pages_are_admitted_to_the_query_memory_pool() {
+    use sparkles::handles::ontology::OntologyRequest;
+    use sparkles::handles::ontology::classify::ClassifyRequest;
+    const TTL: &str = "@prefix : <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+        :A a owl:Class . :B a owl:Class ; rdfs:subClassOf :A . :C a owl:Class ; owl:equivalentClass :B .";
+    let classified = |state: &AppState| {
+        let ds = state.datasets()["ds"].clone();
+        ds.store
+            .load(&[Source::from_bytes(
+                TTL.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        ds.dataset
+            .ontology()
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest::default(),
+                &Default::default(),
+            )
+            .unwrap();
+    };
+    const KEPT: &str = "/$/ontology/ds/axioms?classification=kept";
+    let s = server(64, Duration::from_millis(200));
+    classified(&s.state);
+    let before_first = pool(&s).granted();
+    let (status, headers, body) = get(&s.app, KEPT).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let j: J = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["status"], "available", "{j}");
+    assert!(j["total"].as_u64().unwrap() >= 2, "{j}");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let admitted = pool(&s).stats().admitted;
+    assert!(admitted >= 1);
+    let after_first = pool(&s).granted();
+    assert_eq!(
+        after_first, before_first,
+        "the page read must release its own charge"
+    );
+    // a busy pool refuses the same page for now, and a retry can pass
+    let held = pool(&s).try_grant(56 * MB).unwrap();
+    let (status, headers, body) = get(&s.app, KEPT).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(headers.contains_key(header::RETRY_AFTER));
+    // the pool's refusal answers before the route, and is not cached either
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let j: J = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["budget"], "server-memory");
+    drop(held);
+    let before_retry = pool(&s).granted();
+    let (status, _, body) = get(&s.app, KEPT).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let j: J = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["status"], "available", "{j}");
+    let after_retry = pool(&s).granted();
+    assert_eq!(
+        after_retry, before_retry,
+        "the retry must release its own charge"
+    );
+    // the asserted listing is not admitted to the pool, and keeps its own caching
+    let before = pool(&s).stats().admitted;
+    let (status, headers, body) = get(&s.app, "/$/ontology/ds/axioms").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(pool(&s).stats().admitted, before);
+    assert!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .is_none_or(|v| v.as_bytes() != b"no-store")
+    );
+    // a page past the request's memory limit cannot pass on a retry
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(64 * MB),
+    )
+    .unwrap();
+    state.limits.query_memory_bytes = Some(64);
+    let state = Arc::new(state);
+    state.attach("ds", DbType::Mem, None).unwrap();
+    classified(&state);
+    state.set_phase(Phase::Ready);
+    let app = router(state.clone());
+    let before_budget = state.catalog.pool().unwrap().granted();
+    let (status, headers, body) = get(&app, KEPT).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+    assert!(!headers.contains_key(header::RETRY_AFTER));
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(state.catalog.pool().unwrap().granted(), before_budget);
+}

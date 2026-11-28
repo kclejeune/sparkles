@@ -485,3 +485,56 @@ fn inferred_browse_kept_roots_report_empty_bottom_inconsistent_and_incomplete_ou
         }
     }
 }
+
+#[test]
+fn inferred_browse_at_a_pinned_snapshot_reads_its_own_commit_without_naming_at() {
+    let ds = fixture();
+    materialize(&ds);
+    let snap = ds.store().snapshot();
+    let mut args = json!({"inferences":true, "kind":"objectProperty", "iri":"urn:r"});
+    // the live handle needs an exact commit, which the pinned snapshot names itself
+    assert!(call(&ds, "hierarchy", args.clone()).is_err());
+    let pinned = wire::call_at(
+        &ds,
+        snap.clone(),
+        "hierarchy",
+        &args,
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    args["at"] = json!(format!("commit:{}", snap.commit));
+    let named = call(&ds, "hierarchy", args.clone()).unwrap();
+    assert_eq!(pinned["children"], named["children"]);
+    assert_eq!(pinned["children"][0]["iri"], "urn:q");
+    // the pin's own commit is accepted, and another state is refused
+    assert!(
+        wire::call_at(
+            &ds,
+            snap.clone(),
+            "hierarchy",
+            &args,
+            &QueryOptions::default()
+        )
+        .is_ok()
+    );
+    args["at"] = json!(format!("commit:{}", snap.commit + 1));
+    assert!(
+        wire::call_at(
+            &ds,
+            snap.clone(),
+            "hierarchy",
+            &args,
+            &QueryOptions::default()
+        )
+        .is_err()
+    );
+    let term = wire::call_at(
+        &ds,
+        snap,
+        "term",
+        &json!({"inferences":true, "iri":"urn:i"}),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(term["commit"], named["commit"], "{term}");
+}

@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Entity and axiom reads from the kept classification (item 588)
+
+`GET /$/ontology/{ds}/entity` and `GET /$/ontology/{ds}/axioms`, the library's wire `entity`
+and `axioms` operations, and the new `Ontologies::kept_entity` and `Ontologies::kept_axioms`
+take `classification=kept`. The entity report gains a
+`classification` member with the kept read's status, result and outcome and the first
+pages of the class's direct parents, children and equivalents. The axiom listing pages
+the `SubClassOf` and `EquivalentClasses` axioms that the kept taxonomy infers, in the order
+of a classification's `format=ofn`, walking the retained taxonomy and charging each page's
+rows to the memory budget and the server's query memory pool, which admits the HTTP
+listing. A miss classifies nothing and answers null pages, and every answer to a `GET`
+that names the selector is `Cache-Control: no-store`, including the refusals of
+branch selection, authentication, the rate limiter and the pool that come before the
+route. A stop or a
+deadline ends a listing while it scans, renders or serializes the page.
+
+`Ontologies::at_snapshot` and `FfiReadTxn::ontology_call` answer reads at a snapshot that a
+read transaction or a historical view holds. They refuse a snapshot of another dataset or
+branch or of a separately opened copy of the dataset. The methods that take a state accept
+only the pinned snapshot, and the request's `at` only at its commit. An unpinned handle's
+`open_at` and `head_at` also refuse a state of another dataset, branch or copy before they
+read a cache, and `kept_entity_at_opened` and `dl_query_opened` refuse an ontology opened
+from one. A pinned
+classification or DL query of an older commit never replaces the head's kept result,
+including a head that was classified while the pinned run waited for the flight. On the JVM, `keptClassification`, the new
+`keptAxioms` and `keptEntity`, the frame projection and the materialized hierarchy,
+individual and term reads now answer a dataset returned by `at()` and an active read
+transaction at their own commit, where they threw `JenaTransactionException` before. They
+still throw it in a write transaction, before anything is flushed. Python and Node.js
+selectors are roadmap item 1339.
+
 ### View access by grant containment
 
 A caller reads an incremental view when its grants cover every quad of the dataset, when

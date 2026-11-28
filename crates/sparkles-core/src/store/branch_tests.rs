@@ -2741,3 +2741,27 @@ fn main_branch_info_releases_the_table_before_it_waits_for_the_writer() {
     let dev_info = s.branch_info("dev").unwrap();
     assert_eq!(dev_info.head.unwrap().seq, dev_receipt.commit.seq);
 }
+
+#[test]
+fn a_state_belongs_to_its_own_branch_of_its_open_family_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("ds"), Default::default()).unwrap();
+    s.create_branch("dev", &Default::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    let mine = s.snapshot();
+    assert!(s.holds_state(&mine));
+    assert!(!dev.holds_state(&mine));
+    assert!(dev.holds_state(&dev.snapshot()));
+    assert!(!s.holds_state(&dev.snapshot()));
+    // a separately opened copy has the same persisted ids and commit, not the same family
+    super::compaction_tests::copy_dir(&dir.path().join("ds"), &dir.path().join("copy"));
+    let copy = Store::open(&dir.path().join("copy"), Default::default()).unwrap();
+    let theirs = copy.snapshot();
+    assert_eq!(
+        (theirs.dataset_id, theirs.branch_id, theirs.commit),
+        (mine.dataset_id, mine.branch_id, mine.commit)
+    );
+    assert!(!s.holds_state(&theirs));
+    assert!(!copy.holds_state(&mine));
+    assert!(copy.holds_state(&theirs));
+}

@@ -357,6 +357,7 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<SearchResults> {
         req.validate()?;
+        self.refuse_pinned("the entity search reads the head")?;
         // a search of a retained commit or of inferences is roadmap item 658
         if req.at.is_some() {
             return Err(Error::invalid(

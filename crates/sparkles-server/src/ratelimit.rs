@@ -153,6 +153,12 @@ pub fn classify(
             // linked-data publishing runs bounded DESCRIBE queries over readable graphs
             || admin == "ld"
             || admin.starts_with("ld/")
+            // a listing of the kept classification's axioms charges its rows to the
+            // query memory pool
+            || (admin == "ontology/{ds}/axioms"
+                && read
+                && form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+                    .any(|(k, v)| k == "classification" && v == "kept"))
         {
             return Some(Class::Query);
         }

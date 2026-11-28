@@ -368,12 +368,31 @@ fn bad_branch(msg: impl Into<String>) -> Response {
 /// body, check that they agree, and run the request with that branch. Responses from a
 /// branch other than `main` name it in `Sparkles-Branch` and `Sparkles-Branch-Id`.
 pub(crate) async fn select(
+    st: St,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // a kept read's refusal here is not cached, as `security_headers` marks the
+    // responses of the routes this layer runs
+    let kept = super::kept_request(req.method(), req.uri());
+    let mut resp = select_branch(st, req, next).await;
+    if kept {
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+    }
+    resp
+}
+
+async fn select_branch(
     State(st): St,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let path = req.uri().path().to_string();
     let mut chosen: Vec<String> = Vec::new();
+    let mut rewrite_kept = false;
     let admin = path.starts_with("/$/");
     // the path form
     if !admin && !path.starts_with("/ui") {
@@ -381,10 +400,6 @@ pub(crate) async fn select(
         let (first, tail) = rest.split_once('/').map_or((rest, ""), |(a, b)| (a, b));
         let decoded = percent_encoding::percent_decode_str(first).decode_utf8_lossy();
         if let Some((ds, b)) = decoded.split_once('@') {
-            if ds.is_empty() || b.is_empty() {
-                return bad_branch(format!("invalid dataset and branch '{decoded}'"));
-            }
-            chosen.push(b.to_string());
             let new_path = if tail.is_empty() && !rest.contains('/') {
                 format!("/{ds}")
             } else {
@@ -394,13 +409,34 @@ pub(crate) async fn select(
                 Some(q) => format!("{new_path}?{q}"),
                 None => new_path,
             };
+            if ds.is_empty() || b.is_empty() {
+                let mut r = bad_branch(format!("invalid dataset and branch '{decoded}'"));
+                let mut parts = req.uri().clone().into_parts();
+                if let Ok(p) = pq.parse() {
+                    parts.path_and_query = Some(p);
+                    if let Ok(u) = Uri::from_parts(parts) {
+                        rewrite_kept = super::kept_request(req.method(), &u);
+                    }
+                }
+                if rewrite_kept {
+                    r.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        header::HeaderValue::from_static("no-store"),
+                    );
+                }
+                return r;
+            }
+            chosen.push(b.to_string());
             let mut parts = req.uri().clone().into_parts();
             match pq.parse() {
                 Ok(p) => parts.path_and_query = Some(p),
                 Err(_) => return bad_branch("invalid path"),
             }
             match Uri::from_parts(parts) {
-                Ok(u) => *req.uri_mut() = u,
+                Ok(u) => {
+                    *req.uri_mut() = u;
+                    rewrite_kept = super::kept_request(req.method(), req.uri());
+                }
                 Err(_) => return bad_branch("invalid path"),
             }
         }
@@ -440,16 +476,30 @@ pub(crate) async fn select(
     distinct.sort();
     distinct.dedup();
     if distinct.len() > 1 {
-        return bad_branch(format!(
+        let mut r = bad_branch(format!(
             "the request names more than one branch: {}",
             distinct.join(", ")
         ));
+        if rewrite_kept {
+            r.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+        }
+        return r;
     }
     let Some(branch) = distinct.pop() else {
         return next.run(req).await;
     };
     if branch != MAIN && !sparkles::branch::valid_name(&branch) {
-        return bad_branch(format!("invalid branch name '{branch}'"));
+        let mut r = bad_branch(format!("invalid branch name '{branch}'"));
+        if rewrite_kept {
+            r.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+        }
+        return r;
     }
     if admin {
         let seg = path.split('/').nth(2).unwrap_or("");

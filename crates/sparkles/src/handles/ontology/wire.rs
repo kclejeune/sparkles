@@ -866,9 +866,27 @@ pub const OPERATIONS: [&str; 16] = [
 fn members(op: &str) -> &'static [&'static str] {
     match op {
         "summary" => &["metrics", "view"],
-        "axioms" => &["type", "about", "assertions", "limit", "offset"],
+        "axioms" => &[
+            "type",
+            "about",
+            "assertions",
+            "limit",
+            "offset",
+            "classification",
+            "elOnly",
+            "resultId",
+        ],
         "entities" => &["kind", "limit", "offset"],
-        "entity" => &["iri", "kind", "assertions", "limit"],
+        "entity" => &[
+            "iri",
+            "kind",
+            "assertions",
+            "limit",
+            "classification",
+            "elOnly",
+            "resultId",
+            "lang",
+        ],
         "check" => &["profiles", "assertions", "maxViolations"],
         "edit" => &["add", "remove", "declare", "target", "message"],
         "removeEntity" => &["iri", "message"],
@@ -1115,6 +1133,94 @@ fn profiles_of(a: &Map<String, J>) -> Result<Vec<Profile>> {
 ///   form), `reasoning` (`auto`, `el` or `rl`), `answers` (a list of
 ///   [`DlAnswers::NAMES`]), `limit`, `threads` and `maxDerived`.
 pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> {
+    call_on(&ds.ontology(), op, args, opts)
+}
+
+/// The operations [`call_at`] answers at a pinned snapshot: the reads of the kept
+/// classification, of a materialization and of a frame projection, which a read
+/// transaction or a historical view on a binding answers at its own commit.
+pub const PINNED_OPERATIONS: [&str; 7] = [
+    "keptClassification",
+    "axioms",
+    "entity",
+    "classify",
+    "hierarchy",
+    "individuals",
+    "term",
+];
+
+/// As [`call`], with every read at `snap`, a snapshot of `ds` that a read transaction or
+/// a historical view holds ([`super::Ontologies::at_snapshot`]). Only these reads of
+/// [`PINNED_OPERATIONS`] are answered, checked before anything is read:
+/// `keptClassification`, `axioms` and `entity` with `classification: "kept"`,
+/// `hierarchy`, `individuals` and `term` with `inferences: true`, and `classify` with
+/// `projection: "frame"` and no target, since a pinned read writes nothing.
+pub fn call_at(
+    ds: &Dataset,
+    snap: std::sync::Arc<crate::store::Snapshot>,
+    op: &str,
+    args: &J,
+    opts: &QueryOptions,
+) -> Result<J> {
+    if !PINNED_OPERATIONS.contains(&op) {
+        return Err(bad(format!(
+            "ontology.{op} reads the live dataset outside a transaction; a pinned read answers {}",
+            PINNED_OPERATIONS.join(", ")
+        )));
+    }
+    let empty = Map::new();
+    let a = match args {
+        J::Null => &empty,
+        J::Object(o) => o,
+        _ => return Err(bad("the arguments are a JSON object")),
+    };
+    pinned_variant(op, a)?;
+    call_on(&ds.ontology().at_snapshot(snap), op, args, opts)
+}
+
+/// Refuse a variant of a [`PINNED_OPERATIONS`] operation that a pinned read does not
+/// answer: an asserted entity or axiom read, an asserted browser read and a
+/// classification without a frame projection or with a target.
+fn pinned_variant(op: &str, a: &Map<String, J>) -> Result<()> {
+    match op {
+        "keptClassification" => Ok(()),
+        "axioms" | "entity" => {
+            if kept_selected(a)? {
+                Ok(())
+            } else {
+                Err(bad(format!(
+                    "a pinned ontology.{op} reads the kept classification: pass classification=kept"
+                )))
+            }
+        }
+        "hierarchy" | "individuals" | "term" => {
+            if boolean(a, "inferences")? == Some(true) {
+                Ok(())
+            } else {
+                Err(bad(format!(
+                    "a pinned ontology.{op} reads the materialization: pass inferences=true"
+                )))
+            }
+        }
+        "classify" => {
+            if projection_of(string(a, "projection")?)?.is_none() {
+                return Err(bad(
+                    "a pinned ontology.classify answers a frame projection: pass projection=frame",
+                ));
+            }
+            if a.get("target").is_some_and(|t| !t.is_null()) {
+                return Err(bad(
+                    "a pinned ontology.classify writes nothing: leave out 'target'",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(bad(format!("ontology.{op} has no pinned read"))),
+    }
+}
+
+fn call_on(handle: &super::Ontologies, op: &str, args: &J, opts: &QueryOptions) -> Result<J> {
+    let ds = &handle.ds;
     let empty = Map::new();
     let a = match args {
         J::Null => &empty,
@@ -1141,7 +1247,6 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
     }
     let req = request_of(a)?;
     let name = ds.name().unwrap_or("");
-    let handle = ds.ontology();
     if op == "keptClassification" {
         let query = kept_query_of(a)?;
         let answer = handle.kept_classification(&req, &query, opts)?;
@@ -1166,6 +1271,13 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 j["metrics"] = super::metrics::body(name, &o, &req, &r, &opts)?;
             }
             Ok(j)
+        }
+        "axioms" if kept_selected(a)? => {
+            let q = kept_axiom_query_of(a)?;
+            // one deadline for the scan and the rendering of its rows
+            let opts = handle.anchored(opts)?;
+            let answer = handle.kept_axioms(&req, &q, &opts)?;
+            kept_axioms_body(name, &answer, &r, &opts)
         }
         "axioms" => {
             let q = AxiomQuery {
@@ -1218,9 +1330,18 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 assertions: boolean(a, "assertions")?.unwrap_or(false),
                 limit: number(a, "limit", 1, MAX_LIMIT)?.unwrap_or(DEFAULT_LIMIT),
             };
+            let kept = kept_entity_query_of(a, &q)?;
+            if let Some(k) = &kept {
+                k.validate(&req)?;
+            }
             let opts = handle.anchored(opts)?;
             let o = handle.open(&req, &opts)?;
-            entity_body(name, &o, &req, &r, &q, &opts)
+            let mut j = entity_body(name, &o, &req, &r, &q, &opts)?;
+            if let Some(k) = &kept {
+                j["classification"] =
+                    kept_entity_json(&handle.kept_entity_at_opened(&req, &o, k, &opts)?)?;
+            }
+            Ok(j)
         }
         "check" => {
             let check = CheckRequest {
@@ -1332,7 +1453,7 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
             let (q, limit) = dl_query_of(a)?;
             let opts = handle.anchored(opts)?;
             let o = handle.open(&req, &opts)?;
-            let q = dl_expression(&handle, &o, a, q, &prefixes, &opts)?;
+            let q = dl_expression(handle, &o, a, q, &prefixes, &opts)?;
             let out = handle.dl_query_opened_admitted(o, &req, &q, &opts)?;
             Ok(dl_query_body(
                 name,
@@ -2176,6 +2297,275 @@ impl ClassifyQuery {
     }
 }
 
+/// Whether the arguments of an `axioms` or `entity` read select the kept
+/// classification (`classification: "kept"`), which is the only value. `elOnly` and
+/// `resultId` select a kept result and need it.
+pub fn kept_selected(a: &Map<String, J>) -> Result<bool> {
+    match string(a, "classification")? {
+        None => {
+            if let Some(k) = ["elOnly", "resultId"].iter().find(|k| a.contains_key(**k)) {
+                return Err(bad(format!("{k} needs classification=kept")));
+            }
+            Ok(false)
+        }
+        Some("kept") => {
+            if a.get("inferences").is_some_and(|v| v != &J::Bool(false)) {
+                return Err(bad(
+                    "classification=kept reads the kept classification of the asserted axioms: leave out 'inferences'",
+                ));
+            }
+            Ok(true)
+        }
+        Some(v) => Err(bad(format!("classification must be kept, not '{v}'"))),
+    }
+}
+fn result_id_of(a: &Map<String, J>) -> Result<Option<uuid::Uuid>> {
+    string(a, "resultId")?
+        .map(|s| {
+            let id =
+                uuid::Uuid::parse_str(s).map_err(|_| bad("resultId must be a canonical UUID"))?;
+            if id.to_string() != s {
+                return Err(bad("resultId must be a canonical UUID"));
+            }
+            Ok(id)
+        })
+        .transpose()
+}
+/// The kept-classification listing of an `axioms` read with `classification: "kept"`.
+pub fn kept_axiom_query_of(a: &Map<String, J>) -> Result<super::kept::KeptAxiomQuery> {
+    if boolean(a, "assertions")?.unwrap_or(false) {
+        return Err(bad(
+            "classification=kept lists inferred class axioms: leave out 'assertions'",
+        ));
+    }
+    Ok(super::kept::KeptAxiomQuery {
+        types: string(a, "type")?.map(parse_axiom_types).transpose()?,
+        about: iri_arg(a, "about")?,
+        offset: number(a, "offset", 0, usize::MAX)?.unwrap_or(0),
+        limit: number(a, "limit", 1, 1000)?.unwrap_or(DEFAULT_LIMIT),
+        result_id: result_id_of(a)?,
+        el_only: boolean(a, "elOnly")?.unwrap_or(false),
+    })
+}
+/// The kept-classification read of an `entity` read with `classification: "kept"`.
+pub fn kept_entity_query_of(
+    a: &Map<String, J>,
+    q: &EntityQuery,
+) -> Result<Option<super::kept::KeptEntityQuery>> {
+    if !kept_selected(a)? {
+        return Ok(None);
+    }
+    if q.limit > 1000 {
+        return Err(bad("classification=kept takes a limit from 1 to 1000"));
+    }
+    Ok(Some(super::kept::KeptEntityQuery {
+        iri: q.iri.clone(),
+        limit: q.limit,
+        result_id: result_id_of(a)?,
+        languages: languages_of(a)?,
+        el_only: boolean(a, "elOnly")?.unwrap_or(false),
+    }))
+}
+/// The `classification` member of an entity read: the selection's status, result and
+/// outcome, the class's status, and the first page of its direct parents, direct
+/// children and equivalent named classes, which are null unless the class is present
+/// in an available result.
+pub fn kept_entity_json(e: &super::kept::KeptEntityRead) -> Result<J> {
+    let mut v =
+        serde_json::to_value(&e.read).map_err(|e| bad(format!("kept classification: {e}")))?;
+    if let J::Object(m) = &mut v {
+        m.remove("page");
+    }
+    v["source"] = json!("keptClassification");
+    v["covers"] = json!(["namedClass"]);
+    let page = |p: &Option<super::kept::Page>| -> Result<J> {
+        serde_json::to_value(p).map_err(|e| bad(format!("kept classification: {e}")))
+    };
+    v["parents"] = page(&e.parents)?;
+    v["children"] = page(&e.children)?;
+    v["equivalents"] = page(&e.equivalents)?;
+    Ok(v)
+}
+/// The JSON of a kept-classification axiom listing. `axioms` and `total` are null
+/// unless the status is available, and `entity` is the status of an `about` class. The
+/// rendering of each row polls `opts`, so that a stop ends even a page whose one
+/// equivalence names every class of an inconsistent ontology. Pass the options the
+/// listing read with, anchored to one deadline ([`Ontologies::anchored`](super::Ontologies::anchored)).
+pub fn kept_axioms_body(
+    name: &str,
+    k: &super::kept::KeptAxioms,
+    r: &Renderer,
+    opts: &QueryOptions,
+) -> Result<J> {
+    let mut v =
+        serde_json::to_value(&k.read).map_err(|e| bad(format!("kept classification: {e}")))?;
+    if let J::Object(m) = &mut v {
+        m.remove("page");
+    }
+    v["dataset"] = json!(name);
+    v["source"] = json!("keptClassification");
+    let mut work = 0usize;
+    let mut tick = |_: usize| super::kept::poll(opts, &mut work);
+    v["axioms"] = match &k.axioms {
+        Some(list) => {
+            let mut rows = Vec::with_capacity(list.len());
+            for ax in list {
+                // the form of `axiom_json` without a graph
+                let ofn = r.axiom_controlled(ax, &mut tick)?;
+                let axiom = sparkles_owl::json::axiom_controlled(ax, &mut tick)?;
+                // the rendered values move into the row: `json!` would copy them again
+                // without polling
+                let mut row = Map::with_capacity(3);
+                row.insert("type".into(), J::String(ax.axiom_type().name().into()));
+                row.insert("ofn".into(), J::String(ofn));
+                row.insert("axiom".into(), axiom);
+                rows.push(J::Object(row));
+            }
+            J::Array(rows)
+        }
+        None => J::Null,
+    };
+    v["total"] = json!(k.total);
+    v["offset"] = json!(k.offset);
+    v["limit"] = json!(k.limit);
+    v["next"] = json!(k.next_offset);
+    Ok(v)
+}
+/// `j` serialized as JSON, byte for byte as [`serde_json::to_vec`] writes it, checking
+/// `opts` after every [`JSON_CHUNK`] bytes of output. The writer splits every incoming
+/// fragment at the remaining byte budget, and each string is escaped in pieces of at
+/// most `JSON_CHUNK` bytes, so the interval between two checks never exceeds
+/// `JSON_CHUNK` bytes.
+pub fn json_bytes_controlled(j: &J, opts: &QueryOptions) -> Result<Vec<u8>> {
+    json_bytes_checked(j, &mut |_| super::check(opts))
+}
+
+/// The most bytes of one string that [`json_bytes_controlled`] scans, escapes and writes
+/// at once.
+pub(crate) const JSON_CHUNK: usize = 64 << 10;
+
+/// [`json_bytes_controlled`] with `check`, which is passed the bytes written so far.
+pub(crate) fn json_bytes_checked(
+    j: &J,
+    check: &mut dyn FnMut(usize) -> Result<()>,
+) -> Result<Vec<u8>> {
+    use std::io::Write;
+    struct Controlled<'a> {
+        out: Vec<u8>,
+        check: &'a mut dyn FnMut(usize) -> Result<()>,
+        since: usize,
+        stopped: Option<Error>,
+    }
+    impl Controlled<'_> {
+        fn poll(&mut self) -> std::io::Result<()> {
+            self.since = 0;
+            if let Err(e) = (self.check)(self.out.len()) {
+                self.stopped = Some(e);
+                return Err(std::io::Error::other("stopped"));
+            }
+            Ok(())
+        }
+    }
+    impl std::io::Write for Controlled<'_> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let mut rest = b;
+            while !rest.is_empty() {
+                let budget = JSON_CHUNK - self.since;
+                let n = rest.len().min(budget);
+                self.out.extend_from_slice(&rest[..n]);
+                self.since += n;
+                if self.since >= JSON_CHUNK {
+                    self.poll()?;
+                }
+                rest = &rest[n..];
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    /// The compact formatter without the quotes around a string, so that a string's
+    /// contents are escaped in chunks between one pair of quotes.
+    struct Contents;
+    impl serde_json::ser::Formatter for Contents {
+        fn begin_string<W: ?Sized + std::io::Write>(&mut self, _: &mut W) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn end_string<W: ?Sized + std::io::Write>(&mut self, _: &mut W) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // a string is escaped one character at a time, so escaping it in pieces split at
+    // character boundaries writes the bytes that escaping it whole does
+    fn string(s: &str, w: &mut Controlled<'_>) -> std::io::Result<()> {
+        w.write_all(b"\"")?;
+        let mut rest = s;
+        while !rest.is_empty() {
+            let mut end = rest.len().min(JSON_CHUNK);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (piece, tail) = rest.split_at(end);
+            serde::Serialize::serialize(
+                piece,
+                &mut serde_json::Serializer::with_formatter(&mut *w, Contents),
+            )
+            .map_err(std::io::Error::other)?;
+            rest = tail;
+            // a piece that ends before a multi-byte character, or holds escapes, can
+            // leave the output count short of a check
+            if !rest.is_empty() && w.since != 0 {
+                w.poll()?;
+            }
+        }
+        w.write_all(b"\"")
+    }
+    fn value(j: &J, w: &mut Controlled<'_>) -> std::io::Result<()> {
+        match j {
+            J::Null | J::Bool(_) | J::Number(_) => {
+                serde_json::to_writer(&mut *w, j).map_err(std::io::Error::other)
+            }
+            J::String(s) => string(s, w),
+            J::Array(a) => {
+                w.write_all(b"[")?;
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        w.write_all(b",")?;
+                    }
+                    value(x, w)?;
+                }
+                w.write_all(b"]")
+            }
+            J::Object(m) => {
+                w.write_all(b"{")?;
+                for (i, (k, x)) in m.iter().enumerate() {
+                    if i > 0 {
+                        w.write_all(b",")?;
+                    }
+                    string(k, w)?;
+                    w.write_all(b":")?;
+                    value(x, w)?;
+                }
+                w.write_all(b"}")
+            }
+        }
+    }
+    check(0)?;
+    let mut w = Controlled {
+        out: Vec::new(),
+        check,
+        since: 0,
+        stopped: None,
+    };
+    match value(j, &mut w) {
+        Ok(()) => Ok(w.out),
+        Err(e) => Err(w
+            .stopped
+            .take()
+            .unwrap_or_else(|| bad(format!("JSON: {e}")))),
+    }
+}
 pub fn kept_query_of(a: &Map<String, J>) -> Result<super::kept::KeptQuery> {
     use super::kept::{KeptQuery, Part};
     if a.contains_key("inferences") {
@@ -2195,16 +2585,7 @@ pub fn kept_query_of(a: &Map<String, J>) -> Result<super::kept::KeptQuery> {
             ));
         }
     };
-    let result_id = string(a, "resultId")?
-        .map(|s| {
-            let id =
-                uuid::Uuid::parse_str(s).map_err(|_| bad("resultId must be a canonical UUID"))?;
-            if id.to_string() != s {
-                return Err(bad("resultId must be a canonical UUID"));
-            }
-            Ok(id)
-        })
-        .transpose()?;
+    let result_id = result_id_of(a)?;
     Ok(KeptQuery {
         part,
         about: iri_arg(a, "about")?,
@@ -2276,6 +2657,16 @@ fn frame_body(name: &str, c: &Classified, req: &OntologyRequest, q: &ClassifyQue
 pub fn decode_arguments(op: &str, bytes: &[u8]) -> Result<J> {
     if matches!(op, "classify" | "keptClassification") {
         decode_argument_object(bytes, op == "keptClassification", op == "classify")
+    } else if matches!(op, "axioms" | "entity") {
+        // a read that names the kept classification takes each selector once, and the
+        // asserted reads keep their legacy decoding, null included
+        let v: J = serde_json::from_slice(bytes)
+            .map_err(|e| bad(format!("invalid ontology JSON: {e}")))?;
+        if v.get("classification").is_some() {
+            decode_argument_object(bytes, true, false)
+        } else {
+            Ok(v)
+        }
     } else {
         // Unrelated legacy operations accept null as an empty argument object.
         serde_json::from_slice(bytes).map_err(|e| bad(format!("invalid ontology JSON: {e}")))

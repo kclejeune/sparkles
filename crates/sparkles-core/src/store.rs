@@ -930,6 +930,10 @@ pub struct Snapshot {
     pub dataset_id: uuid::Uuid,
     /// Logical branch identity (dataset id for `main`, branch UUID for a branch).
     pub branch_id: uuid::Uuid,
+    /// The branch identity set when this snapshot was constructed, for provenance:
+    /// `holds_state` checks it so that cloning a sibling's snapshot and overwriting
+    /// its public `branch_id` is rejected.
+    pub(crate) origin_branch_id: uuid::Uuid,
     pub generation: Arc<Generation>,
     pub delta: Delta,
     pub version: u64,

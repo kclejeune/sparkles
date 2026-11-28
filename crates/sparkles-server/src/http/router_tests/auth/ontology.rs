@@ -46,6 +46,159 @@ async fn kept_classification_reads_do_not_disclose_shared_state_and_scoped_frame
     assert_eq!(denied.headers[header::CACHE_CONTROL], "no-store");
 }
 
+#[tokio::test]
+async fn kept_entity_and_axiom_reads_never_disclose_shared_state_to_a_restricted_reader() {
+    let (_dir, app) = server();
+    let run = as_user(
+        &app,
+        "ofull",
+        "POST",
+        "/$/ontology/ont/classify",
+        &json!({"graph":"http://ex/open"}),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::OK, "{}", run.text());
+    for uri in [
+        format!("/$/ontology/ont/axioms?{OPEN}&classification=kept"),
+        format!("/$/ontology/ont/entity?{OPEN}&iri=http%3A%2F%2Fex%2FA&classification=kept"),
+    ] {
+        let r = as_user(&app, "oopen", "GET", &uri, &json!(null)).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store");
+        let j = r.json();
+        let kept = j.get("classification").unwrap_or(&j);
+        assert_eq!(kept["reason"], "unsupportedScope", "{uri}: {j}");
+        assert!(kept["result"].is_null());
+        assert!(!r.text().contains("http://ex/Hidden"), "{uri}: {j}");
+    }
+    let full = as_user(
+        &app,
+        "ofull",
+        "GET",
+        &format!("/$/ontology/ont/axioms?{OPEN}&classification=kept"),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(full.json()["status"], "available", "{}", full.text());
+}
+
+#[tokio::test]
+async fn authentication_refusals_of_kept_reads_are_never_cached() {
+    let (_dir, app) = server();
+    // a dataset the reader has no grant on answers as missing before the route runs
+    for uri in [
+        "/$/ontology/other/axioms?classification=kept",
+        "/$/ontology/other/entity?iri=http%3A%2F%2Fex%2FA&classification=kept",
+        "/$/ontology/other/classification",
+    ] {
+        let r = as_user(&app, "oread", "GET", uri, &json!(null)).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}: {}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{uri}");
+    }
+    // an anonymous kept read is refused before the route too
+    let denied = call(
+        &app,
+        "GET",
+        "/$/ontology/ont/axioms?classification=kept",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(denied.headers[header::CACHE_CONTROL], "no-store");
+    // the asserted reads keep their own caching
+    for uri in [
+        "/$/ontology/other/axioms",
+        "/$/ontology/other/entity?iri=http%3A%2F%2Fex%2FA",
+    ] {
+        let r = as_user(&app, "oread", "GET", uri, &json!(null)).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}: {}", r.text());
+        assert!(
+            r.headers
+                .get(header::CACHE_CONTROL)
+                .is_none_or(|v| v.as_bytes() != b"no-store"),
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn branch_selection_refusals_of_kept_reads_are_never_cached() {
+    let (_dir, app) = server();
+    // branch selection refuses a conflicting or invalid branch before routing
+    for branch in ["branch=one&branch=two", "branch=a%20b"] {
+        for uri in [
+            format!("/$/ontology/ont/axioms?classification=kept&{branch}"),
+            format!("/$/ontology/ont/entity?iri=http%3A%2F%2Fex%2FA&classification=kept&{branch}"),
+            format!("/$/ontology/ont/classification?{branch}"),
+        ] {
+            let r = as_user(&app, "oread", "GET", &uri, &json!(null)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.text());
+            assert_eq!(r.json()["code"], "invalid-branch", "{uri}");
+            assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{uri}");
+        }
+        // the asserted reads keep their own caching
+        for uri in [
+            format!("/$/ontology/ont/axioms?{branch}"),
+            format!("/$/ontology/ont/entity?iri=http%3A%2F%2Fex%2FA&{branch}"),
+        ] {
+            let r = as_user(&app, "oread", "GET", &uri, &json!(null)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.text());
+            assert_eq!(r.json()["code"], "invalid-branch", "{uri}");
+            assert!(
+                r.headers
+                    .get(header::CACHE_CONTROL)
+                    .is_none_or(|v| v.as_bytes() != b"no-store"),
+                "{uri}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn branch_path_rewrite_refusals_of_kept_reads_are_never_cached() {
+    let (_dir, app) = server();
+    // /$@main/ontology/… rewrites to /$/ontology/…; a conflicting branch selector
+    // must still return no-store on kept routes
+    for uri in [
+        "/$@main/ontology/ont/axioms?classification=kept&branch=other",
+        "/$@main/ontology/ont/entity?iri=http%3A%2F%2Fex%2FA&classification=kept&branch=other",
+        "/$@main/ontology/ont/classification?branch=other",
+    ] {
+        let r = as_user(&app, "oread", "GET", uri, &json!(null)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.text());
+        assert_eq!(r.json()["code"], "invalid-branch", "{uri}");
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{uri}");
+    }
+    // an empty branch in the selector also returns no-store on kept routes
+    for uri in [
+        "/$@/ontology/ont/axioms?classification=kept",
+        "/$@/ontology/ont/entity?iri=http%3A%2F%2Fex%2FA&classification=kept",
+        "/$@/ontology/ont/classification",
+    ] {
+        let r = as_user(&app, "oread", "GET", uri, &json!(null)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.text());
+        assert_eq!(r.json()["code"], "invalid-branch", "{uri}");
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{uri}");
+    }
+    // an asserted read through the alias keeps its existing caching
+    for uri in [
+        "/$@main/ontology/ont/axioms?branch=other",
+        "/$@main/ontology/ont/entity?iri=http%3A%2F%2Fex%2FA&branch=other",
+        "/$@/ontology/ont/axioms",
+    ] {
+        let r = as_user(&app, "oread", "GET", uri, &json!(null)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.text());
+        assert_eq!(r.json()["code"], "invalid-branch", "{uri}");
+        assert!(
+            r.headers
+                .get(header::CACHE_CONTROL)
+                .is_none_or(|v| v.as_bytes() != b"no-store"),
+            "{uri}"
+        );
+    }
+}
+
 const DATA: &str = r#"@prefix : <http://ex/> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .

@@ -125,7 +125,8 @@ impl Ontologies {
             inferences: false,
             ..req.clone()
         });
-        let o = self.open_at(&s.snap, verified.as_ref().unwrap_or(req), &s.opts)?;
+        // the scope's view derives from the state the handle's pin gave it
+        let o = self.open_unchecked(&s.snap, verified.as_ref().unwrap_or(req), &s.opts)?;
         let mut result = Individuals {
             inference_source: s.inference_source.clone(),
             commit: s.snap.commit,

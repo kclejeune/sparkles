@@ -4589,3 +4589,204 @@ async fn el_only_http_classify_kept_and_dl_query_reproduce_elk_separately() {
     .await;
     assert_eq!(q_bad.status, StatusCode::BAD_REQUEST, "{}", q_bad.text());
 }
+
+#[tokio::test]
+async fn kept_entity_and_axioms_routes_read_the_kept_classification_without_classifying() {
+    let s = server();
+    let entity = format!(
+        "/$/ontology/t/entity?iri={}&classification=kept",
+        enc("http://ex.org/Professor")
+    );
+    let axioms = "/$/ontology/t/axioms?classification=kept";
+    // misses classify nothing, answer the status and keep the asserted accessors
+    let e = get(&s.app, &entity).await;
+    assert_eq!(e.status, StatusCode::OK, "{}", e.text());
+    assert_eq!(e.headers[header::CACHE_CONTROL], "no-store");
+    let j = e.json();
+    assert_eq!(j["classification"]["status"], "unavailable", "{j}");
+    assert!(j["classification"]["parents"].is_null());
+    assert!(j["class"]["superClasses"].is_array());
+    let a = get(&s.app, axioms).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.text());
+    assert_eq!(a.headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(a.json()["status"], "unavailable");
+    assert!(a.json()["axioms"].is_null() && a.json()["total"].is_null());
+    let classified = post(&s.app, "/$/ontology/t/classify", json!({})).await;
+    assert_eq!(classified.status, StatusCode::OK, "{}", classified.text());
+    assert_eq!(classified.json()["reused"], false);
+    let kept = get(&s.app, "/$/ontology/t/classification").await.json();
+    let id = kept["result"]["resultId"].as_str().unwrap().to_string();
+    let e = send(&s.app, "GET", &entity, &[("if-none-match", "*")], "").await;
+    assert_eq!(e.status, StatusCode::OK, "{}", e.text());
+    assert_eq!(e.headers[header::CACHE_CONTROL], "no-store");
+    let c = &e.json()["classification"];
+    assert_eq!(c["status"], "available", "{c}");
+    assert_eq!(c["result"]["resultId"], id.as_str());
+    assert_eq!(c["entity"]["present"], true);
+    assert_eq!(c["parents"]["items"][0]["iri"], "http://ex.org/Person");
+    assert_eq!(c["source"], "keptClassification");
+    let a = get(&s.app, axioms).await.json();
+    assert_eq!(a["status"], "available", "{a}");
+    let total = a["total"].as_u64().unwrap();
+    assert!(total >= 1);
+    let list = a["axioms"].as_array().unwrap();
+    assert!(
+        list.iter()
+            .all(|x| matches!(x["type"].as_str(), Some("SubClassOf" | "EquivalentClasses")))
+    );
+    assert!(list.iter().any(|x| x["type"] == "SubClassOf"
+        && x["ofn"].as_str().unwrap().contains("Professor")
+        && x["ofn"].as_str().unwrap().contains("Person")));
+    let about = get(
+        &s.app,
+        &format!("{axioms}&about={}", enc("http://ex.org/Professor")),
+    )
+    .await
+    .json();
+    assert!(about["total"].as_u64().unwrap() >= 1);
+    assert_eq!(about["entity"]["present"], true);
+    let missing = get(
+        &s.app,
+        &format!("{axioms}&about={}", enc("http://ex.org/Missing")),
+    )
+    .await
+    .json();
+    assert_eq!(missing["total"], 0);
+    assert_eq!(missing["entity"]["present"], false);
+    assert!(
+        about["axioms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["ofn"].as_str().unwrap().contains("Professor"))
+    );
+    // a pinned continuation reads the same result
+    let pin = format!("at=commit:{}&resultId={id}", a["commit"]);
+    let page = get(&s.app, &format!("{axioms}&{pin}&limit=1&offset=0")).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+    if total > 1 {
+        let tail = get(&s.app, &format!("{axioms}&{pin}&limit=1&offset=1")).await;
+        assert_eq!(tail.status, StatusCode::OK, "{}", tail.text());
+        assert_eq!(tail.json()["axioms"][0], list[1]);
+    }
+    for query in [
+        "classification=materialized",
+        "elOnly=true",
+        "classification=kept&elOnly=maybe",
+        "classification=kept&classification=kept",
+        "classification=kept&inferences=true",
+        "classification=kept&assertions=true",
+        "classification=kept&format=ofn",
+        "classification=kept&limit=1001",
+        "classification=kept&offset=1",
+        "classification=kept&resultId=bogus",
+    ] {
+        let r = get(&s.app, &format!("/$/ontology/t/axioms?{query}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{query}: {}", r.text());
+    }
+    for query in [
+        "classification=kept&inferences=true",
+        "classification=kept&limit=1001",
+        "elOnly=false",
+    ] {
+        let r = get(
+            &s.app,
+            &format!(
+                "/$/ontology/t/entity?iri={}&{query}",
+                enc("http://ex.org/Professor")
+            ),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{query}: {}", r.text());
+    }
+    // an ordinary entity read keeps its shape
+    let plain = get(
+        &s.app,
+        &format!(
+            "/$/ontology/t/entity?iri={}",
+            enc("http://ex.org/Professor")
+        ),
+    )
+    .await;
+    assert!(plain.json().get("classification").is_none());
+}
+
+#[tokio::test]
+async fn kept_route_refusals_are_never_cached_and_take_strict_selectors() {
+    let s = server();
+    let professor = enc("http://ex.org/Professor");
+    // a refusal before the read, a missing dataset included, is no-store too
+    for (uri, status) in [
+        (
+            "/$/ontology/missing/axioms?classification=kept".to_string(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/$/ontology/missing/entity?iri={professor}&classification=kept"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "/$/ontology/t/axioms?classification=kept&offset=1".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/$/ontology/t/entity?iri={professor}&classification=kept&limit=1001"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/$/ontology/t/axioms?classification=bogus".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let r = get(&s.app, &uri).await;
+        assert_eq!(r.status, status, "{uri}: {}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{uri}");
+    }
+    for query in [
+        "classification=kept&inferences=maybe",
+        "classification=kept&assertions=maybe",
+        "classification=kept&inferences=false&inferences=true",
+        "classification=kept&limit=1&limit=2",
+        "classification=kept&type=SubClassOf&type=EquivalentClasses",
+        "classification=kept&about=urn:a&about=urn:b",
+    ] {
+        let r = get(&s.app, &format!("/$/ontology/t/axioms?{query}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{query}: {}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{query}");
+    }
+    for query in [
+        "classification=kept&inferences=maybe",
+        "classification=kept&assertions=maybe",
+        "classification=kept&assertions=false&assertions=true",
+        "classification=kept&limit=1&limit=2",
+    ] {
+        let r = get(
+            &s.app,
+            &format!("/$/ontology/t/entity?iri={professor}&{query}"),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{query}: {}", r.text());
+    }
+    // the selectors that are written once and as booleans are answered
+    let r = get(
+        &s.app,
+        "/$/ontology/t/axioms?classification=kept&inferences=false&assertions=false",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // an asserted read keeps its own path and caching
+    let r = get(&s.app, "/$/ontology/missing/axioms").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(
+        r.headers
+            .get(header::CACHE_CONTROL)
+            .is_none_or(|v| v.as_bytes() != b"no-store")
+    );
+    let r = get(&s.app, "/$/ontology/t/axioms?assertions=true&limit=1").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(
+        r.headers
+            .get(header::CACHE_CONTROL)
+            .is_none_or(|v| v.as_bytes() != b"no-store")
+    );
+}

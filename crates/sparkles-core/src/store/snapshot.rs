@@ -41,6 +41,7 @@ impl SnapshotBuilder {
         SnapshotBuilder(Snapshot {
             dataset_id: shared.dataset_id,
             branch_id: shared.branch_id,
+            origin_branch_id: shared.branch_id,
             generation,
             delta: Delta::default(),
             version: 0,
@@ -75,6 +76,7 @@ impl SnapshotBuilder {
         SnapshotBuilder(Snapshot {
             dataset_id: base.dataset_id,
             branch_id: base.branch_id,
+            origin_branch_id: base.origin_branch_id,
             generation: base.generation.clone(),
             delta: Delta::default(),
             version: base.version,

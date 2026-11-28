@@ -814,7 +814,7 @@ fn ontology(p: &mut Paths) {
     );
     p.add(
         read(op(GET, "/$/ontology/{ds}/axioms", "getOntologyAxioms", "Ontology", "Ontology axioms"))
-            .doc("The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. `about` an IRI that the ontology neither declares nor uses is `404`.")
+            .doc("The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. In an asserted listing, `about` an IRI that the ontology neither declares nor uses is `404`. A `classification=kept` listing instead answers `200` with `entity.present: false` and no axioms for a class the kept result does not hold. A kept listing is admitted to the server's query memory pool and counts the rows it builds against the request's memory limit and the pool. A page past the request's limit or the whole pool is `507`, and one that the busy pool cannot take is `503`.")
             .see("ontology")
             .param("at")
             .query("inferences", boolean(), "Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale.")
@@ -822,8 +822,11 @@ fn ontology(p: &mut Paths) {
             .query("about", s(), "An entity IRI the axioms mention.")
             .query("assertions", boolean(), "Also list the assertions the store holds.")
             .query("format", json!({ "type": "string", "enum": ["json", "ofn"] }), "`json` (the default) or `ofn`.")
-            .query("limit", int(), "The most axioms listed, from 1 to 10,000 (100 by default).")
-            .query("offset", int(), "The axioms skipped.")
+            .query("limit", int(), "The most axioms listed, from 1 to 10,000 (100 by default), or to 1,000 with `classification=kept`.")
+            .query("offset", int(), "The axioms skipped. With `classification=kept`, a nonzero offset needs `resultId` and `at=commit:N`.")
+            .query("classification", json!({ "type": "string", "enum": ["kept"] }), "`kept` lists the axioms that the dataset's kept classification infers instead of the asserted axioms, without classifying on a miss. Each group of several equivalent classes gives an `EquivalentClasses` axiom and each direct parent group a `SubClassOf` axiom between the groups' first classes. The answer has the kept read's `status`, `reason`, `result` and `outcome`, and `axioms` and `total` are null unless the status is `available`. It is `Cache-Control: no-store` and refuses `inferences`, `assertions` and `format=ofn`.")
+            .query("elOnly", boolean(), "With `classification=kept`, read the kept EL-only classification.")
+            .query("resultId", json!({"type":"string","format":"uuid"}), "With `classification=kept`, the immutable result to read.")
             .resp(
                 "200",
                 "One page of axioms.",
@@ -832,7 +835,7 @@ fn ontology(p: &mut Paths) {
                     "text/owl-functional": { "schema": { "type": "string" } }
                 })),
             )
-            .errors(&[400, 404, 408]),
+            .errors(&[400, 404, 408, 503, 507]),
     );
     p.add(
         read(op(GET, "/$/ontology/{ds}/entities", "listOntologyEntities", "Ontology", "Ontology entities"))
@@ -855,7 +858,11 @@ fn ontology(p: &mut Paths) {
             .query("iri", s(), "The entity's IRI.")
             .query("kind", s(), "The one entity kind answered, such as `Class` (every kind the IRI has by default).")
             .query("assertions", boolean(), "Also read the instances, types and property assertions the store holds.")
-            .query("limit", int(), "The most entries of each streamed list, from 1 to 10,000 (100 by default).")
+            .query("limit", int(), "The most entries of each streamed list, from 1 to 10,000 (100 by default), and of each kept page, from 1 to 1,000, with `classification=kept`.")
+            .query("classification", json!({ "type": "string", "enum": ["kept"] }), "`kept` adds a `classification` member read from the dataset's kept classification without classifying on a miss: the read's `status`, `reason`, `result` and `outcome`, the class's `entity` status, and the first pages of its direct `parents`, direct `children` and named `equivalents`, which are null unless the class is present in an available result. It covers named classes only, is `Cache-Control: no-store` and refuses `inferences`.")
+            .query("elOnly", boolean(), "With `classification=kept`, read the kept EL-only classification.")
+            .query("resultId", json!({"type":"string","format":"uuid"}), "With `classification=kept`, the immutable result to read.")
+            .query("lang", s(), "With `classification=kept`, comma-separated preferred label languages of the kept pages, otherwise Accept-Language.")
             .resp("200", "The entity.", Some(object.clone()))
             .errors(&[400, 404, 408]),
     );

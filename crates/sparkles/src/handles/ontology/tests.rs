@@ -1742,6 +1742,48 @@ fn entity_operations_answer_in_the_route_forms() {
     ));
 }
 
+#[test]
+fn direct_open_at_uses_the_datasets_query_pool() {
+    use crate::DatasetOptions;
+    use crate::sparql::pool::QueryPool;
+    use crate::store::Store;
+
+    let pool = QueryPool::new(8 << 20);
+    let ds = Dataset::from_store_with(
+        Store::in_memory(Default::default()),
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        },
+    );
+    ds.update(&format!("{PREFIXES} INSERT DATA {{ {BASE} }}"))
+        .unwrap();
+    let snap = ds.store().snapshot();
+    let req = OntologyRequest::default();
+    let baseline = pool.granted();
+    let held = pool
+        .try_grant((8 << 20) - pool.granted())
+        .expect("fill the pool");
+    let opts = QueryOptions {
+        no_cache: true,
+        ..Default::default()
+    };
+    match ds.ontology().open_at(&snap, &req, &opts) {
+        Err(Error::BudgetExceeded(b)) => {
+            assert_eq!(b.kind, crate::BudgetKind::ServerMemory);
+        }
+        Err(e) => panic!("expected a pool refusal, got {e:?}"),
+        Ok(_) => panic!("expected a pool refusal, got Ok"),
+    }
+    drop(held);
+    let opened = ds
+        .ontology()
+        .open_at(&snap, &req, &opts)
+        .expect("open succeeds once the pool has room");
+    assert!(pool.granted() > baseline);
+    drop(opened);
+}
+
 // OWL 2 EL classification (spec F24)
 
 mod classification {

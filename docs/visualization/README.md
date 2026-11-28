@@ -706,8 +706,8 @@ are tracked in the [central roadmap](../ROADMAP.md).
 * **Kept and materialized inference frames.** Named-class frames display up to 1,000 rows
   per part from kept classifications, while property and individual frames read fresh
   RDFS/OWL RL materializations without completeness, consistency, or explanation links.
-  General classifier-backed inferred axiom listings and explanations remain planned under
-  F24 (roadmap items 588, 622, and 609). The full **Classify tree** action remains
+  The frames do not yet show the kept inferred axiom listing that the axioms route answers,
+  and explanations remain planned under F24 (roadmap items 622 and 609). The full **Classify tree** action remains
   explicit via legacy POST pages.
 * **Thesaurus editor.** The editor reads up to 2,000 narrower concepts per concept and
   5,000 roots per scheme, and label search returns the first 100 substring matches

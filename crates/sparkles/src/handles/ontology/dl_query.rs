@@ -486,6 +486,7 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<AdmittedDlQueryAnswer> {
         let start = Instant::now();
+        self.check_pinned_opened(&o, req)?;
         let defaults = self.ds.with_query_defaults(opts);
         let opts = defaults.as_ref();
         if req.inferences {
@@ -691,12 +692,15 @@ impl Ontologies {
             ))
         };
         if q.answers.classes() {
-            let keep = self.can_keep(o, opts) && opts.graphs.is_none() && o.snapshot.cacheable;
-            let (consistent, d, excluded) = if keep {
-                answer.incremental = true;
-                // the kept saturation reads the defining axiom beside the ontology's, and
-                // the next run over it lets the axiom go
-                self.with_kept(o, req, q.el_only, opts, "dlQuery", |e| {
+            let keep = self.can_keep(o, opts)
+                && opts.graphs.is_none()
+                && o.snapshot.cacheable
+                && self.may_replace_kept(&o.snapshot);
+            // the kept saturation reads the defining axiom beside the ontology's, and
+            // the next run over it lets the axiom go. A pinned run that the head passed
+            // while it waited for the flight runs on its own.
+            let kept = if keep {
+                self.with_kept_flight(o, req, q.el_only, opts, "dlQuery", |e| {
                     // the threads come first: a wait that ends at the deadline leaves the
                     // kept state as it was
                     let par = admit(q.threads, opts)?;
@@ -719,12 +723,21 @@ impl Ontologies {
                     Ok(((c, d, ex), keep))
                 })?
             } else {
-                stage_axioms(&work, o.ontology.axioms.len() + 1)?;
-                let mut axioms = logical_axioms(&o.ontology);
-                axioms.push(&ax.kind);
-                let par = admit(q.threads, opts)?;
-                let (c, d, ex, _) = describe(&mut Saturation::new(), &axioms, None, par, 0)?;
-                (c, d, ex)
+                None
+            };
+            let (consistent, d, excluded) = match kept {
+                Some(k) => {
+                    answer.incremental = true;
+                    k
+                }
+                None => {
+                    stage_axioms(&work, o.ontology.axioms.len() + 1)?;
+                    let mut axioms = logical_axioms(&o.ontology);
+                    axioms.push(&ax.kind);
+                    let par = admit(q.threads, opts)?;
+                    let (c, d, ex, _) = describe(&mut Saturation::new(), &axioms, None, par, 0)?;
+                    (c, d, ex)
+                }
             };
             answer.consistent = Some(consistent);
             answer.satisfiable = Some(d.satisfiable);
@@ -874,6 +887,19 @@ const RETRY_ENTITIES: usize = 256;
 
 /// The bytes a copy in memory of a triple takes, roughly, for the memory budget.
 const COPY_BYTES_PER_TRIPLE: u64 = 256;
+
+/// Bytes charged to a memory grant, released when it drops.
+#[derive(Debug)]
+pub(super) struct Charged(
+    pub(super) std::sync::Arc<sparkles_core::sparql::pool::PoolGrant>,
+    pub(super) u64,
+);
+
+impl Drop for Charged {
+    fn drop(&mut self) {
+        self.0.release(self.1);
+    }
+}
 
 /// A query under the OWL 2 RL rules by demand reasoning, over a private copy of
 /// the terminology with the defining axiom and, for instance answers, the assertions.
