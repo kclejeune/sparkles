@@ -787,8 +787,10 @@ pub struct Limits {
     /// the most conclusions, kept or redundant, that a run of Tier D with counting derives
     /// before the run starts again without counting, and that a rooted run without
     /// counting derives before the run starts again without the rooted rules. `None`
-    /// takes a bound of [`DL_WORK_BOUND`] conclusions for a run that counts and
-    /// [`ROOTED_WORK_BOUND`] for a rooted run. It applies only with
+    /// takes a bound of [`DL_WORK_BOUND`] conclusions for a run that counts and the
+    /// larger of [`ROOTED_WORK_BOUND`] and 32 conclusions per visible named class for a
+    /// rooted run without counting (unless `SPARKLES_ROOTED_BOUND_PER_CLASS=0` keeps
+    /// [`ROOTED_WORK_BOUND`]). It applies only with
     /// [`counting`](Limits::counting) or [`rooted`](Limits::rooted). A run of Tier D
     /// with neither has the bound of [`dl_attempt_work`](Limits::dl_attempt_work),
     /// except the run that starts again after a run that counted passed it, whose bound
