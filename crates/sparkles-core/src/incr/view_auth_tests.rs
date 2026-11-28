@@ -621,3 +621,115 @@ fn views_do_not_read_views() {
     let e = rt.put(&s, "nested", def).unwrap_err();
     assert!(e.to_string().contains("view:read"), "{e}");
 }
+
+/// Containment against the data: whenever the grant sets of a caller contain those of
+/// a principal, every quad the principal reads, the caller reads too. The grant sets
+/// combine graph sets with patterns, exclusions and guards, and protections by
+/// predicate and by subject class, lifted in some graphs.
+#[test]
+fn containment_holds_against_the_data() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[crate::io::Source::from_bytes(
+        br#"@prefix : <http://ex/> .
+:d :p "default" . :d :age 1 . :d a :Secret .
+<http://ex/a/1> { :a1 :p "a1" . :a1 :age 2 . :a1 a :Secret . }
+<http://ex/a/2> { :a2 :p "a2" . :a2 :age 3 . }
+<http://ex/b/1> { :b1 :p "b1" . :b1 :age 4 . :b1 a :Secret . }
+_:g { :n :p "blank" . }
+"#
+        .to_vec(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .expect("load");
+    let age = protection("age", None);
+    let secret = Arc::new(Protection {
+        name: "secret".into(),
+        predicates: Some(vec!["http://ex/p".into()]),
+        classes: Some(vec!["http://ex/Secret".into()]),
+        subclasses: false,
+        graphs: None,
+        pattern: None,
+        prefixes: Default::default(),
+        hide_inferences: false,
+    });
+    let graph_sets: Vec<Graphs> = vec![
+        Graphs::All,
+        rule(&["default"]),
+        rule(&["http://ex/a/1"]),
+        rule(&["default", "http://ex/a/*"]),
+        rule(&["default", "http://ex/*"]),
+        rule(&["*"]),
+        rule(&["default", "*"]),
+        Graphs::All.without_pattern("http://ex/b/*"),
+        Graphs::All.without_iri("http://ex/a/2"),
+        Graphs::All.guarded("http://ex/a/*", &[]),
+        rule(&["default", "http://ex/*"]).guarded("http://ex/b/*", &[]),
+    ];
+    let lifts: Vec<Graphs> = vec![
+        Graphs::none(),
+        rule(&["default"]),
+        rule(&["http://ex/a/*"]),
+        Graphs::All,
+    ];
+    let mut accesses: Vec<Arc<GraphAccess>> = Vec::new();
+    for g in &graph_sets {
+        accesses.push(Arc::new(GraphAccess::graphs(g.clone(), Graphs::none())));
+        for p in [&age, &secret] {
+            for l in &lifts {
+                accesses.push(Arc::new(GraphAccess::with_triples(
+                    g.clone(),
+                    Graphs::none(),
+                    TripleRules {
+                        rules: vec![Rule {
+                            protection: p.clone(),
+                            read: l.clone(),
+                            write: Graphs::none(),
+                        }],
+                        caller: Caller::default(),
+                        limits: Limits::default(),
+                    },
+                )));
+            }
+        }
+    }
+    let query = "SELECT ?g ?s ?p ?o WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }";
+    let rows: Vec<std::collections::BTreeSet<String>> = accesses
+        .iter()
+        .map(|a| {
+            let r = crate::sparql::query(
+                s.snapshot(),
+                query,
+                &crate::sparql::QueryOptions {
+                    graphs: Some(a.clone()),
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+            .expect("query");
+            r.test_application_rows()
+                .into_iter()
+                .map(|row| format!("{row:?}"))
+                .collect()
+        })
+        .collect();
+    let mut proven = 0;
+    for (i, c) in accesses.iter().enumerate() {
+        for (j, v) in accesses.iter().enumerate() {
+            if covers(Some(c), Some(v)) {
+                proven += 1;
+                let missing: Vec<&String> = rows[j].difference(&rows[i]).collect();
+                assert!(
+                    missing.is_empty(),
+                    "caller {i} misses {missing:?} of principal {j}"
+                );
+            }
+        }
+    }
+    // the comparison proves more than equal grants
+    assert!(
+        proven > accesses.len() * 2,
+        "{proven} of {}",
+        accesses.len()
+    );
+}

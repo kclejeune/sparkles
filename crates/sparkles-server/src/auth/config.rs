@@ -301,6 +301,23 @@ fn check_restricted(what: &str, grants: &[GrantCfg], protections: &BTreeSet<&str
                 }
             }
         }
+        let view_only = g
+            .endpoints
+            .as_ref()
+            .is_some_and(|es| !es.is_empty() && es.iter().all(|e| view_entry(e).is_some()));
+        if view_only
+            && (g.level != Level::Read
+                || g.graphs.is_some()
+                || !g.lifts.is_empty()
+                || g.server_models)
+        {
+            bail!(
+                "{what}: the grant on '{}' names only views, so it must be a read grant \
+                 without graphs, lifts or server_models (it declassifies its views and \
+                 opens nothing else)",
+                g.dataset
+            );
+        }
         if let Some(es) = &g.endpoints {
             if es.is_empty() {
                 bail!(

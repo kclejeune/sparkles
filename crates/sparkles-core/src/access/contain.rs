@@ -132,8 +132,10 @@ pub(super) fn disjoint(p: &str, e: &str) -> bool {
 /// Whether every triple that the protections of `v` leave visible, those of `c` leave
 /// visible too, within the graphs both read. Each protection that `c` keeps in force
 /// for reads must be in force for `v` as well, and `c` must lift it wherever `v` does.
-/// Whether a protection hides a quad then depends on the protection and the quad alone,
-/// except for a pattern that binds the caller, which needs the same caller.
+/// Masks evaluate subject classes and patterns on the unmasked snapshot, so whether a
+/// protection hides a quad depends on the protection, the quad and the store, and not
+/// on the reader, except for a pattern that binds the caller, which needs the same
+/// caller.
 fn triples_contain(c: Option<&TripleRules>, v: Option<&TripleRules>) -> Result<(), Gap> {
     let Some(c) = c else {
         return Ok(());

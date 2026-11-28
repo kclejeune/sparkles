@@ -4163,7 +4163,9 @@ endpoints = ["query", "view:team-sizes"]
 ```
 
 Naming a view opens no endpoint and adds no graph, so the grantee reads the view through
-an endpoint that a grant opens, here `query`. Each refusal, each declassified read and
+an endpoint that a grant opens, here `query`. A grant that names only views must be a
+`read` grant without `graphs`, `lifts` or `server_models`, and grants no level on the
+dataset by itself. Each refusal, each declassified read and
 each other decision not already cached is written to the audit log as a `view_access`
 record with the dataset, the view, the decision, its reason and the caller. Listings
 return a view's `rows` and `stateBytes` only to callers who may read it.

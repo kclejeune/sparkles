@@ -268,9 +268,17 @@ impl Restricted {
         glob(&self.dataset, ds)
             && branch_covered(&self.branches, branch)
             && match (e, &self.endpoints) {
-                (_, None) | (None, Some(_)) => true,
+                (_, None) => true,
+                // a grant that names only views reaches the dataset through nothing
+                (None, Some(es)) => !es.is_empty(),
                 (Some(e), Some(es)) => es.iter().any(|x| x.covers(e)),
             }
+    }
+
+    /// Whether the grant names views and no endpoint: it declassifies those views and
+    /// grants no level, graph, protection lift or permission (spec F13 §6.1).
+    pub fn view_only(&self) -> bool {
+        self.endpoints.as_ref().is_some_and(|es| es.is_empty())
     }
 
     fn graphs(&self) -> sparkles::access::Graphs {
@@ -351,7 +359,7 @@ impl Grants {
         let restricted = self
             .restricted
             .iter()
-            .filter(|r| every_branch(&r.branches) && glob(&r.dataset, name))
+            .filter(|r| every_branch(&r.branches) && glob(&r.dataset, name) && !r.view_only())
             .map(|r| r.level);
         full.chain(restricted).max()
     }
@@ -980,29 +988,31 @@ impl Principal {
         let view = if self.is_local() {
             None
         } else {
-            self.access.view(&qualified, e, self.caller()).map(|mut v| {
-                // a principal whose reads hide graphs whatever its grants say reads
-                // no view by name either
-                let names = match &self.hidden {
-                    Some(_) => Vec::new(),
-                    None => self.access.views(&qualified),
-                };
-                let id = self.id();
-                v.views = sparkles::access::ViewGrants::new(names, Some(id.as_str()));
-                v
-            })
+            self.access.view(&qualified, e, self.caller())
         };
         // reports graphs are readable only when the guard proves the view covers what
         // their builds read; an unrestricted view has nothing to prove
         let view = view.map(|v| crate::graphrag::guard::apply(v, self.guard.as_ref()));
-        let Some(hidden) = &self.hidden else {
-            return view.map(Arc::new);
+        let mut v = match &self.hidden {
+            None => view?,
+            Some(hidden) => {
+                let mut v = view.unwrap_or_else(sparkles::access::GraphAccess::all);
+                for p in hidden.iter() {
+                    v.read = v.read.without_pattern(p);
+                    v.write = v.write.without_pattern(p);
+                }
+                v
+            }
         };
-        let mut v = view.unwrap_or_else(sparkles::access::GraphAccess::all);
-        for p in hidden.iter() {
-            v.read = v.read.without_pattern(p);
-            v.write = v.write.without_pattern(p);
-        }
+        // the views that grants name (spec F13 §6.1), and the caller as audit records of
+        // view decisions name it; a principal whose reads hide graphs whatever its
+        // grants say reads no view by name
+        let names = match &self.hidden {
+            Some(_) => Vec::new(),
+            None => self.access.views(&qualified),
+        };
+        let id = self.id();
+        v.views = sparkles::access::ViewGrants::new(names, Some(id.as_str()));
         Some(Arc::new(v))
     }
 

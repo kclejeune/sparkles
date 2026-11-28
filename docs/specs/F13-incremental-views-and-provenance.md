@@ -1801,21 +1801,29 @@ pattern are compared one by one. A pattern counts as contained only when a patte
 caller proves to match everything it matches, and the caller's excluded patterns, guards
 and protected graphs such as the graph of inferences cannot reach into it. Every
 protection that the caller keeps in force for reads must be in force for the principal
-too, and the caller must lift it wherever the principal lifts it. A protection whose
-pattern binds the caller also needs the same caller attributes. Every test is sound and
+too, and the caller must lift it wherever the principal lifts it. Masks evaluate subject
+classes and patterns on the unmasked snapshot, so such a protection hides the same quads
+from both readers, and a protection whose pattern binds the caller also needs the same
+caller attributes. The projection of review-policy output hides only quads without
+supports the reader can read, so a caller whose graphs and lifts contain the principal's
+hides no more of it. Every test is sound and
 incomplete, so a containment that the comparison cannot prove refuses the read with
 `403 view-access`. When containment fails, a `view:{name}` grant on the dataset declassifies
 the view for its grantee alone, and a caller with the same graphs and no such grant is
 still refused. A grant names views in its `endpoints` list. Naming a view opens no
-endpoint and adds no graph, protection lift or write, so its grantee reads the view
-through an endpoint that another grant opens, such as `query`. A token scope that no
+endpoint and adds no graph, protection lift or write. A grant that names only views must
+be a `read` grant without graphs, lifts or `server_models`, and grants no level on the
+dataset at all, so its grantee reaches the dataset, and reads the view through an
+endpoint such as `query`, only by another grant. A token scope that no
 longer reaches the dataset, or a principal whose reads hide graphs whatever its grants
 say, carries no view grants. A view's definition refuses `SERVICE view:read` with
 `400 not-incremental`, so a principal's own view grants never widen what a view reads.
 
 The decision is taken under no lock, before the read waits for the view, evaluates a
 fallback or reserves memory, so a refused caller is answered at once and not after
-`viewWaitMs`. Decisions are cached per view name, caller grant set and principal grant
+`viewWaitMs`. A view that is not attached yet has no resolved principal, so a restricted
+caller's read waits for the attachment as any read does, and `authorize_view` decides
+such a view as one that reads every quad. Decisions are cached per view name, caller grant set and principal grant
 set. An entry is found by a hash of all three and used only when all three are equal to
 the request's, so a change of the caller's grants, of the view's principal or of the
 policy that resolves it misses the cache whatever the hash. The runtime also empties the
@@ -1848,12 +1856,17 @@ inferences, excluded patterns, guards, a protection lifted on a narrower or wide
 protection the principal does not have and a pattern that binds the caller. They check
 cache hits and misses, misses after narrowed grants, a new definition, a policy epoch
 and a deletion, the cache bound, the audit records of each decision without graph names,
-an immediate refusal of a view that is behind, the deadline of a permitted read, and the
-refusal of a view that reads a view. The server tests in
+an immediate refusal of a view that is behind, the deadline of a permitted read, the
+refusal of a view that reads a view, and a differential test over a store with named,
+blank and protected data that checks, for every pair of 99 grant sets the comparison
+proves contained, that the caller reads every row the principal reads. The server tests in
 `router_tests/auth/views.rs` read a view through `SERVICE view:read` as contained,
-declassified, narrower and view-only callers, check the redaction of listings, the
-validation of `view:{name}` entries, and the dataset, principal and absence of graph names
-in the JSON audit lines.
+declassified, narrower and view-only callers, also below a join so that the result cache
+cannot answer a narrower caller, check the redaction of listings, the validation of
+`view:{name}` entries, that view grants follow their dataset, branch and token scope and
+drop under hidden graphs, and the dataset, principal and absence of graph names in the
+JSON audit lines. Route-level refusals of `manage` operations are not recorded as
+`view_access` records.
 
 The comparison of IRI patterns is incomplete. A caller pattern with literal text between
 two `*`, such as `http://*/data/*`, proves no containment of another pattern, and an

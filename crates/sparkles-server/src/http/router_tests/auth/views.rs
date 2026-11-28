@@ -69,6 +69,9 @@ endpoints = ["view:secret-count"]
 
 const SECRET: &str = "http://ex/b/1";
 const READ: &str = "PREFIX view: <urn:x-sparkles:view#> SELECT ?n WHERE { SERVICE view:read { [] view:name \"secret-count\" ; view:bind ?n } }";
+/// The view's rows joined with a count of what the caller reads, so that a node above
+/// the view read is the query's root.
+const JOINED: &str = "PREFIX view: <urn:x-sparkles:view#> SELECT ?n ?c WHERE { SERVICE view:read { [] view:name \"secret-count\" ; view:bind ?n } { SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o } } }";
 
 fn enc(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect()
@@ -114,10 +117,14 @@ async fn server() -> AuthServer {
 }
 
 async fn read_as(s: &AuthServer, user: &str) -> R {
+    query_as(s, user, READ).await
+}
+
+async fn query_as(s: &AuthServer, user: &str, q: &str) -> R {
     call(
         &s.app,
         "GET",
-        &format!("/graphs/sparql?query={}", enc(READ)),
+        &format!("/graphs/sparql?query={}", enc(q)),
         &[("authorization", &b(user)), ("accept", "text/csv")],
         "",
     )
@@ -139,9 +146,19 @@ async fn view_reads_follow_containment_and_named_grants() {
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
     assert!(r.text().contains("view-access"), "{}", r.text());
     assert!(!r.text().contains(SECRET), "{}", r.text());
-    // a grant that only names a view opens no endpoint
+    // a grant that only names a view opens nothing, so the dataset stays hidden
     let r = read_as(&s, "vonly").await;
-    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = get_as(&s.app, "/$/views/graphs", Some(&b("vonly"))).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    // the result cache never answers a narrower caller with a granted caller's rows,
+    // also when the view read sits below a join; both callers read the same graphs
+    for _ in 0..2 {
+        let r = query_as(&s, "vnamed", JOINED).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let r = query_as(&s, "vnarrow", JOINED).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    }
 }
 
 /// A grant that names a view adds no graph, no protection and no write.
@@ -150,13 +167,11 @@ async fn a_grant_that_names_a_view_reads_nothing_else() {
     let s = server().await;
     let auth = s.state.auth.clone().unwrap();
     let only = auth.user_principal("vonly").unwrap();
-    assert!(!only.can_at("graphs", Endpoint::Query, crate::auth::Level::Read));
-    assert!(!only.can_at("graphs", Endpoint::Update, crate::auth::Level::Write));
-    let v = only.view("graphs", Endpoint::Query).unwrap();
-    assert!(!v.readable(None));
-    assert!(!v.read.allows_iri(SECRET));
-    assert!(v.triples.is_none());
-    assert!(v.views.grants("secret-count"));
+    assert!(only.level("graphs").is_none());
+    assert!(only.level_any_branch("graphs").is_none());
+    for e in Endpoint::ALL {
+        assert!(!only.can_at("graphs", e, crate::auth::Level::Read), "{e:?}");
+    }
     let named = auth
         .user_principal("vnamed")
         .unwrap()
@@ -204,9 +219,24 @@ level = "read"
         let e = format!("{:#}", parse(&format!("[\"{bad}\"]")).unwrap_err());
         assert!(e.contains("not a view name"), "{bad}: {e}");
     }
-    let cfg = parse(r#"["query", "view:team-sizes"]"#).unwrap();
-    let _ = cfg;
+    parse(r#"["query", "view:team-sizes"]"#).unwrap();
     parse(r#"["view:team-sizes"]"#).unwrap();
+    // a grant that names only views declassifies them and grants nothing else
+    let only = |extra: &str| {
+        crate::auth::config::FileConfig::parse(&format!(
+            "{}{extra}\nendpoints = [\"view:team-sizes\"]\n",
+            base.replace("level = \"read\"\n", "")
+        ))
+    };
+    only("level = \"read\"").unwrap();
+    for bad in [
+        "level = \"write\"",
+        "level = \"read\"\ngraphs = [\"http://ex/*\"]",
+        "level = \"read\"\nserver_models = true",
+    ] {
+        let e = format!("{:#}", only(bad).unwrap_err());
+        assert!(e.contains("names only views"), "{bad}: {e}");
+    }
 }
 
 /// The audit log names the dataset, the view, the decision and the caller, and never
@@ -269,4 +299,80 @@ fn view_decisions_are_audited_without_graph_names() {
     assert!(!text.contains(SECRET), "{text}");
     assert!(!text.contains("http://ex/a/"), "{text}");
     assert!(!text.contains("vnarrow-pw"), "{text}");
+}
+
+/// The view grants follow the dataset, the branch and token scopes of their grant, and a
+/// principal whose reads hide graphs whatever its grants say reads no view by name but
+/// is still named in audit records.
+#[tokio::test]
+async fn view_grants_follow_their_scope() {
+    use crate::auth::{Access, Grants, Level, Restricted, Scope};
+    let grant = |dataset: &str, branches: Option<Vec<String>>| Restricted {
+        dataset: dataset.into(),
+        level: Level::Read,
+        graphs: None,
+        endpoints: Some(Vec::new()),
+        lifts: Vec::new(),
+        branches,
+        server_models: false,
+        views: vec!["v".into()],
+    };
+    let grants = Grants {
+        restricted: vec![
+            grant("graphs", None),
+            grant("dev-only", Some(vec!["dev".into()])),
+        ],
+        ..Default::default()
+    };
+    let a = Access::of(grants.clone());
+    assert_eq!(a.views("graphs"), ["v"]);
+    assert!(a.views("other").is_empty(), "another dataset");
+    assert!(
+        a.views("dev-only").is_empty(),
+        "a branch the grant does not cover"
+    );
+    assert_eq!(a.views("dev-only@dev"), ["v"]);
+    let scoped = |ds: &str| Access {
+        grants: grants.clone(),
+        scopes: vec![Scope {
+            datasets: [(ds.to_string(), Level::Read)].into(),
+            server: Vec::new(),
+        }],
+    };
+    assert_eq!(scoped("graphs").views("graphs"), ["v"]);
+    assert!(
+        scoped("other").views("graphs").is_empty(),
+        "a scope that does not reach it"
+    );
+    // a grant that names only views grants no level
+    assert!(a.level("graphs").is_none());
+    assert!(grants.every_branch_level("graphs").is_none());
+
+    let s = server().await;
+    let auth = s.state.auth.clone().unwrap();
+    let hidden = auth
+        .user_principal("vnamed")
+        .unwrap()
+        .hiding_graphs(&["http://ex/zzz/*".into()])
+        .view("graphs", Endpoint::Query)
+        .unwrap();
+    assert!(!hidden.views.grants("secret-count"));
+    assert!(
+        hidden
+            .views
+            .audit_id()
+            .is_some_and(|id| id.contains("vnamed"))
+    );
+    let admin = auth
+        .user_principal("alice")
+        .unwrap()
+        .hiding_graphs(&["http://ex/zzz/*".into()])
+        .view("graphs", Endpoint::Query)
+        .unwrap();
+    assert!(
+        admin
+            .views
+            .audit_id()
+            .is_some_and(|id| id.contains("alice"))
+    );
 }
