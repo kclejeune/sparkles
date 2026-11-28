@@ -5629,6 +5629,90 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "text")]
+    #[test]
+    fn backup_restores_rdf_pins_with_and_without_reidentifying_the_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        crate::sparql::update::update(
+            &s,
+            r#"INSERT DATA { <urn:old> <urn:label> "fox" }"#,
+            &Default::default(),
+        )
+        .unwrap();
+        s.enable_text(Default::default()).unwrap();
+        let pin = s
+            .create_snapshot_with_text("fox", &At::Head, &Default::default())
+            .unwrap()
+            .0;
+        ins(&s, 2);
+        let capture = s.backup_capture("snapshot-text").unwrap();
+        assert!(capture.file("history.json").is_none());
+        // Ordinary backups omit the pin catalog. Exercise restores that also
+        // carry its authenticated metadata, as native history captures do.
+        let pin_bytes = std::fs::read(s.root.as_ref().unwrap().join("history.json")).unwrap();
+        let preparation = capture_preparation();
+        crate::history::capture::validate_persistent(
+            Some(&pin_bytes),
+            s.dataset_id(),
+            &s.history.as_ref().unwrap().lock(),
+            &preparation,
+        )
+        .unwrap();
+        let transformed = crate::history::capture::reidentified(
+            &pin_bytes,
+            s.dataset_id(),
+            uuid::Uuid::new_v4(),
+            &preparation,
+        )
+        .unwrap();
+        let imported: serde_json::Value = serde_json::from_slice(&transformed.value).unwrap();
+        assert_eq!(imported["format"], 1);
+        assert!(imported["snapshots"][0].get("textIndex").is_none());
+        for reidentify in [false, true] {
+            let root = dir
+                .path()
+                .join(if reidentify { "new-id" } else { "same-id" });
+            capture.write_to(&root).unwrap();
+            std::fs::write(root.join("history.json"), &pin_bytes).unwrap();
+            if reidentify {
+                crate::commit::reidentify(
+                    &root,
+                    uuid::Uuid::new_v4(),
+                    crate::commit::ForkedFrom {
+                        id: capture.dataset_id,
+                        seq: capture.commit.seq,
+                    },
+                )
+                .unwrap();
+            }
+            let restored = Store::open(&root, StoreOptions::default()).unwrap();
+            assert_eq!(restored.dataset_id() == capture.dataset_id, !reidentify);
+            let named = restored.named_snapshot("fox").unwrap();
+            assert_eq!(named.seq, pin.seq);
+            assert_eq!(named.text_bytes, 0);
+            let (snapshot, _) = restored
+                .snapshot_at(&At::Snapshot("fox".into()), &Default::default())
+                .unwrap();
+            assert_eq!(snapshot.len(), 1);
+            let bytes = std::fs::read(root.join("history.json")).unwrap();
+            let history: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if reidentify {
+                assert_eq!(history["format"], 1);
+                assert!(history["snapshots"][0].get("textIndex").is_none());
+            } else {
+                assert_eq!(history["format"], 3);
+                assert!(history["snapshots"][0]["textIndex"].is_string());
+                let answer = crate::sparql::query(
+                    snapshot,
+                    r#"SELECT ?s { ?s <http://jena.apache.org/text#query> "fox" }"#,
+                    &Default::default(),
+                );
+                assert!(matches!(answer, Err(Error::TextUnavailable(_))));
+            }
+        }
+    }
+
     #[test]
     fn restored_capture_continues_the_sequence() {
         let dir = tempfile::tempdir().unwrap();

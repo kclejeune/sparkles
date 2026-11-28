@@ -27,8 +27,9 @@ use crate::error::Result;
 use crate::index::{ALL_COLS, Block, ColMask, Key, Perm, PermIndex, bound_cols, pad};
 use crate::store::KeySet;
 use crate::store::{Delta, Snapshot};
+use crate::text::MaskTextIdentity;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::sync::{Arc, Weak};
 
 /// Rows a scan reads in the time of one index probe, for weighing a correction that
@@ -147,10 +148,10 @@ pub struct CountCache {
     /// holds the `Arc<Vec<Id>>`
     views: Mutex<FxHashMap<String, CachedVisibleGraphs>>,
     /// non-owning slots for legacy masked snapshots (`GraphAccess::masked`)
-    masks: Mutex<FxHashMap<String, MaskSlot>>,
+    masks: Mutex<MaskSlots>,
     /// non-owning slots for controlled masked snapshots (`GraphAccess::masked_controlled`),
     /// kept separate from legacy `masks` so legacy callers cannot upgrade paid masks
-    controlled_masks: Mutex<FxHashMap<String, MaskSlot>>,
+    controlled_masks: Mutex<MaskSlots>,
     /// the correction of each predicate pattern table for the snapshot's delta (see
     /// [`super::patternplan`]), `None` when the delta touches too many subjects
     patterns: Mutex<FxHashMap<PatternKey, Option<Arc<crate::patterns::Correction>>>>,
@@ -178,6 +179,20 @@ type PatternKey = (crate::patterns::Scope, usize, usize);
 /// request waits for the first and reuses the live `Arc<Snapshot>` without keeping it
 /// alive after the last owning view or caller drops.
 pub(crate) type MaskSlot = Arc<Mutex<Weak<Snapshot>>>;
+
+type MaskSlots = hashbrown::HashMap<MaskKey<String>, MaskSlot, FxBuildHasher>;
+
+#[derive(PartialEq, Eq, Hash)]
+struct MaskKey<S> {
+    policy: S,
+    text: MaskTextIdentity,
+}
+
+impl hashbrown::Equivalent<MaskKey<String>> for MaskKey<&str> {
+    fn equivalent(&self, key: &MaskKey<String>) -> bool {
+        self.text == key.text && self.policy == key.policy
+    }
+}
 
 impl CountCache {
     /// Entries kept before the cache starts over.
@@ -248,13 +263,13 @@ impl CountCache {
         self.uid
     }
 
-    /// The slot of a legacy view's masked snapshot, by the view's key.
-    pub(crate) fn mask_slot(&self, k: &str) -> MaskSlot {
-        if k.len() > Self::MAX_CACHE_KEY_BYTES {
+    /// The slot of a legacy masked snapshot, by its policy and text state.
+    pub(crate) fn mask_slot(&self, policy: &str, text: MaskTextIdentity) -> MaskSlot {
+        if policy.len() > Self::MAX_CACHE_KEY_BYTES {
             return MaskSlot::default();
         }
         let mut m = self.masks.lock();
-        if let Some(s) = m.get(k) {
+        if let Some(s) = m.get(&MaskKey { policy, text }) {
             return s.clone();
         }
         m.retain(|_, slot| slot.try_lock().is_none_or(|guard| guard.strong_count() > 0));
@@ -263,18 +278,25 @@ impl CountCache {
             m.clear();
         }
         let s = MaskSlot::default();
-        m.insert(k.to_string(), s.clone());
+        m.insert(
+            MaskKey {
+                policy: policy.into(),
+                text,
+            },
+            s.clone(),
+        );
         s
     }
 
     pub(crate) fn prepared_mask_slot(
         &self,
-        key: &str,
+        policy: &str,
+        text: MaskTextIdentity,
         preparation: &crate::access::Preparation,
     ) -> Result<Option<MaskSlot>> {
         let slots = preparation.lock(&self.controlled_masks)?;
         for (stored, slot) in slots.iter() {
-            if preparation.compare(stored, key)?.is_eq() {
+            if stored.text == text && preparation.compare(&stored.policy, policy)?.is_eq() {
                 return Ok(Some(slot.clone()));
             }
         }
@@ -288,14 +310,15 @@ impl CountCache {
     /// never keep a masked snapshot alive past its last owner.
     pub(crate) fn cache_prepared_mask(
         &self,
-        key: String,
+        policy: String,
+        text: MaskTextIdentity,
         value: &Arc<Snapshot>,
         preparation: &crate::access::Preparation,
     ) -> Result<Option<MaskSlot>> {
         // Keep standard HashMap hashing and any relocation bounded. Large keys
         // still produce exact views and can reuse live entries through the
         // controlled comparison path; a cold result simply skips this cache.
-        if key.len() > Self::MAX_CACHE_KEY_BYTES {
+        if policy.len() > Self::MAX_CACHE_KEY_BYTES {
             preparation.check()?;
             return Ok(None);
         }
@@ -304,11 +327,11 @@ impl CountCache {
         slots.retain(|_, slot| slot.try_lock().is_none_or(|guard| guard.strong_count() > 0));
         for (stored, existing) in slots.iter() {
             preparation.check()?;
-            if stored.len() > Self::MAX_CACHE_KEY_BYTES {
+            if stored.policy.len() > Self::MAX_CACHE_KEY_BYTES {
                 preparation.check()?;
                 return Ok(None);
             }
-            if preparation.compare(stored, &key)?.is_eq() {
+            if stored.text == text && preparation.compare(&stored.policy, &policy)?.is_eq() {
                 // Another live controlled builder already holds this key.
                 if existing.try_lock().is_none_or(|g| g.strong_count() > 0) {
                     preparation.check()?;
@@ -317,6 +340,7 @@ impl CountCache {
                 break;
             }
         }
+        let key = MaskKey { policy, text };
         if slots.len() >= Self::VIEW_ENTRIES && !slots.contains_key(&key) {
             preparation.check()?;
             return Ok(None);
@@ -330,17 +354,24 @@ impl CountCache {
 
     /// Best-effort removal of a mask slot whose owning masked snapshot has just been
     /// dropped, if no concurrent builder has replaced it with a live snapshot.
-    pub(crate) fn evict_mask_slot(&self, kind: MaskCacheKind, key: &str, slot: &MaskSlot) {
+    pub(crate) fn evict_mask_slot(
+        &self,
+        kind: MaskCacheKind,
+        policy: &str,
+        text: MaskTextIdentity,
+        slot: &MaskSlot,
+    ) {
+        let key = MaskKey { policy, text };
         let mut m = match kind {
             MaskCacheKind::Legacy => self.masks.lock(),
             MaskCacheKind::Controlled => self.controlled_masks.lock(),
         };
         let should_remove = m
-            .get(key)
+            .get(&key)
             .filter(|current| Arc::ptr_eq(current, slot))
             .is_some_and(|current| current.try_lock().is_some_and(|g| g.strong_count() == 0));
         if should_remove {
-            m.remove(key);
+            m.remove(&key);
         }
     }
 
@@ -385,7 +416,7 @@ impl CountCache {
 
     #[cfg(test)]
     pub(crate) fn live_mask_count(&self) -> usize {
-        let count = |map: &Mutex<FxHashMap<String, MaskSlot>>| {
+        let count = |map: &Mutex<MaskSlots>| {
             map.lock()
                 .values()
                 .filter(|slot| slot.try_lock().is_some_and(|g| g.strong_count() > 0))

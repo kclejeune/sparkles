@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Online, transactional and historical full-text search
+
+Live datasets can enable or reconfigure full-text indexing while writes continue.
+Reconfiguration keeps the active index available until it installs the replacement.
+SPARQL text searches see earlier inserts and deletes in the same write transaction.
+Retained commits in the live generation support bounded text search, and a named
+snapshot created with `text: true` keeps its own index across compaction and restart.
+Persistent copies carry the active text settings. A copy taken during first enablement
+has full-text search disabled until it is enabled on the copy.
+
 ### Optional pruning of rooted equality conclusions (item 1284)
 
 With `SPARKLES_ROOTED_EQ_KNOWN=1`, rooted classification skips an equality rewrite
@@ -1583,6 +1593,10 @@ item 318). `scripts/eval-ask --profile-stages` records the Ask stage diagnostics
 each evaluation child.
 
 ### Compatibility
+
+- The enabled full-text index status can include an optional `pendingConfig`
+  field during online configuration. Existing status fields and the disabled
+  response retain their previous shape.
 
 - `DlQueryRequest`, `KeptQuery` and `DlReasoningUsed` in `sparkles::handles::ontology`
   add a public `el_only: bool` field for EL-only (ELK) classification and DL queries

@@ -182,7 +182,7 @@ fn snapshot_json_for(s: &NamedSnapshot, restricted: bool) -> J {
 }
 
 fn snapshot_json(s: &NamedSnapshot) -> J {
-    json!({
+    let mut json = json!({
         "name": s.name,
         "ref": format!("snapshot:{}", s.name),
         "seq": s.seq,
@@ -193,7 +193,11 @@ fn snapshot_json(s: &NamedSnapshot) -> J {
         "generation": s.generation,
         "reconstructable": s.reconstructable,
         "warm": s.warm,
-    })
+    });
+    if s.text_bytes != 0 {
+        json["textBytes"] = s.text_bytes.into();
+    }
+    json
 }
 
 fn history_json(name: &str, ds: &Dataset, h: &sparkles::history::HistoryStatus) -> J {
@@ -367,6 +371,44 @@ pub(super) async fn list_snapshots(
     })))
 }
 
+pub(super) async fn rebuild_snapshot_text(
+    State(st): St,
+    Path((dataset_name, name)): Path<(String, String)>,
+) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(&st, &dataset_name)?;
+    let (cancel, _cancel_on_drop) = super::cancel_on_drop();
+    let controls = HistoryOptions {
+        cancel: Some(cancel),
+        deadline: std::time::Instant::now().checked_add(st.default_timeout),
+    };
+    blocking(move || {
+        let snapshot = ds.dataset.snapshots().rebuild_text(&name, &controls)?;
+        Ok(Json(snapshot_json(&snapshot)).into_response())
+    })
+    .await
+}
+
+pub(super) async fn drop_snapshot_text(
+    State(st): St,
+    Path((dataset_name, name)): Path<(String, String)>,
+) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(&st, &dataset_name)?;
+    blocking(move || {
+        if ds.dataset.snapshots().drop_text(&name)? {
+            Ok(StatusCode::NO_CONTENT.into_response())
+        } else {
+            Err(err(StatusCode::NOT_FOUND, "snapshot does not exist"))
+        }
+    })
+    .await
+}
+
 pub(super) async fn create_snapshot(
     State(st): St,
     Path(name): Path<String>,
@@ -383,7 +425,7 @@ pub(super) async fn create_snapshot(
         "application/json" => {
             let j: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
-            for k in ["name", "at", "note", "expires", "warm"] {
+            for k in ["name", "at", "note", "expires", "warm", "text"] {
                 match j.get(k) {
                     Some(J::String(v)) => params.0.push((k.to_string(), v.clone())),
                     Some(J::Number(n)) => params.0.push((k.to_string(), n.to_string())),
@@ -422,16 +464,24 @@ pub(super) async fn create_snapshot(
         ),
     };
     let warm = params.get("warm").is_some_and(truthy);
+    let text = params.get("text").is_some_and(truthy);
+    let (cancel, _cancel_on_drop) = super::cancel_on_drop();
+    let controls = HistoryOptions {
+        cancel: Some(cancel),
+        deadline: std::time::Instant::now().checked_add(st.default_timeout),
+    };
     blocking(move || {
-        let (snap, created) = ds.dataset.snapshots().create(
-            &snap_name,
-            &at,
-            &sparkles::history::SnapshotOptions {
-                note,
-                expires_ms: expires,
-                warm,
-            },
-        )?;
+        let options = sparkles::history::SnapshotOptions {
+            note,
+            expires_ms: expires,
+            warm,
+        };
+        let snapshots = ds.dataset.snapshots();
+        let (snap, created) = if text {
+            snapshots.create_with_text(&snap_name, &at, &options, &controls)?
+        } else {
+            snapshots.create(&snap_name, &at, &options)?
+        };
         let status = if created {
             StatusCode::CREATED
         } else {

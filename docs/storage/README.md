@@ -157,7 +157,7 @@ Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
 
 ### Versioning and history
 
-* **Historical retention and search.** Point-in-time reads require a retained generation even if the change log still holds the diffs, and full-text search covers head commits only (roadmap [items 23 and 52](../ROADMAP.md)).
+* **Historical retention and search.** Point-in-time reads require a retained generation even if the change log still holds the diffs. Full-text search at an older generation requires a named snapshot created with `text: true`. RDF reads at an indexed pin open no text files. Backups and clones omit derived snapshot text files. Pin rebasing and derived index restoration are tracked in [item 52](../ROADMAP.md). Remote and archive clones remain planned.
 * **Large bulk commits in the change log.** Bulk commits loading or dropping more than 1,000,000 quads into a non-empty dataset record counts only in the change log, and a crash immediately after a bulk commit can omit its change-log entry (roadmap [item 52](../ROADMAP.md)).
 * **RDF Patch and replication.** Multi-transaction (`TX … TC`) patches commit as one transaction, patches from other datasets cannot target existing blank nodes, and neither rotating patch logs nor streaming replicas exist (roadmap [items 66 and 74](../ROADMAP.md)).
 
@@ -165,4 +165,4 @@ Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
 
 Core design specifications for this area are [C05](../specs/C05-tabular-imports.md), [C13](../specs/C13-automatic-compaction.md), [C26](../specs/C26-durable-jobs-and-delivery.md), [F09](../specs/F09-branches-and-merges.md), [F10](../specs/F10-replication.md), [F19](../specs/F19-mappings-and-virtual-graphs/README.md), [X07](../specs/X07-cold-sparse-reads.md), [X09](../specs/X09-group-commit-by-default.md), [X11](../specs/X11-index-compression-and-predicate-patterns.md), and [X16](../specs/X16-storage-consolidation/SPEC.md). Write measurements live in [docs/benchmarks/writes/RESULTS.md](../benchmarks/writes/RESULTS.md).
 
-The central [roadmap](../ROADMAP.md) owns priorities and dependencies, and its [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs) cover items 1, 7, 17, 23, 27, 52, 66, 74, 84, 88, 160, 343, 395, 448, 496–498, 516, 560, 572, 573, 754, 833, and 1097.
+The central [roadmap](../ROADMAP.md) owns priorities and dependencies, and its [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs) cover items 1, 7, 17, 27, 52, 66, 74, 84, 88, 160, 343, 395, 448, 496–498, 516, 560, 572, 573, 754, 833, and 1097.

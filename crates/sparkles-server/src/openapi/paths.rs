@@ -3392,9 +3392,9 @@ fn history(p: &mut Paths) {
                 "application/x-www-form-urlencoded": { "schema": sref("SnapshotRequest") },
             }),
         )
-        .json("200", "The name already pins that commit.", "NamedSnapshot")
+        .json("200", "Existing pin meets the request.", "NamedSnapshot")
         .json("201", "Created.", "NamedSnapshot")
-        .errors(&[400, 409, 410]),
+        .errors(&[400, 408, 409, 410, 501, 503, 507]),
     );
     p.add(
         op(
@@ -3417,6 +3417,30 @@ fn history(p: &mut Paths) {
         )
         .see("named-snapshots-and-retention")
         .no_content("Deleted."),
+    );
+    p.add(
+        op(
+            PUT,
+            "/$/snapshots/{ds}/{name}/text",
+            "rebuildSnapshotText",
+            "History",
+            "Rebuild a named snapshot's full-text index",
+        )
+        .see("named-snapshots-and-retention")
+        .json("200", "The snapshot.", "NamedSnapshot")
+        .errors(&[400, 408, 410, 501, 503, 507]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/snapshots/{ds}/{name}/text",
+            "dropSnapshotText",
+            "History",
+            "Drop a named snapshot's full-text index",
+        )
+        .see("named-snapshots-and-retention")
+        .no_content("The RDF snapshot is still pinned.")
+        .errors(&[404]),
     );
     p.add(
         op(

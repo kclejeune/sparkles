@@ -250,6 +250,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/vector/{ds}/{name}/projection", &["GET", "POST"]),
     ("/$/snapshots/{ds}", &["GET", "POST"]),
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
+    ("/$/snapshots/{ds}/{name}/text", &["PUT", "DELETE"]),
     ("/$/history/{ds}", &["GET", "PUT"]),
     ("/$/validation/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/rdfs/{ds}", &["GET", "PUT", "DELETE"]),
@@ -664,6 +665,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/cache/clear/{ds}"
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
+        | "/$/snapshots/{ds}/{name}/text"
         | "/$/history/{ds}"
         | "/$/queries/{ds}/{name}"
         // a stored mapping names connections, and can read any table they reach

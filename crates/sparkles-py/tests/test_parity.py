@@ -70,6 +70,8 @@ DEFERRED = {
     "reasoning.query.clear",
     "reasoning.query.get",
     "reasoning.query.set",
+    "snapshots.drop_text",
+    "snapshots.rebuild_text",
 }
 
 

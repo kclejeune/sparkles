@@ -142,6 +142,31 @@ pub struct TextConfig {
     pub dictionaries: std::collections::BTreeMap<String, String>,
 }
 
+/// Durable intent of an online configuration. Bind it to the last active settings
+/// so an intervening change by another program cannot be silently undone.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingTextConfig {
+    pub base: Option<String>,
+    pub config: TextConfig,
+}
+
+#[cfg(feature = "text")]
+impl PendingTextConfig {
+    pub(crate) fn applies_to(&self, active: Option<&TextConfig>) -> bool {
+        active == Some(&self.config) || self.base == active.map(config_hash)
+    }
+}
+
+pub(crate) fn read_pending_config(root: &std::path::Path) -> Result<Option<PendingTextConfig>> {
+    const NAME: &str = "text.pending.json";
+    match std::fs::read(root.join(NAME)) {
+        Ok(bytes) => crate::formats::settings_from_slice(NAME, &bytes).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl TextConfig {
     /// The configuration with `dictionaries` naming the installed dictionary of each
     /// dictionary analyzer its languages use. Fails when one is missing or this build
@@ -671,6 +696,9 @@ pub struct TextStatus {
     pub disk_bytes: u64,
     pub segments: usize,
     pub config: TextConfig,
+    /// Configuration being built alongside the active index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_config: Option<TextConfig>,
     pub format_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_rebuild: Option<RebuildInfo>,
@@ -683,6 +711,42 @@ pub struct RebuildInfo {
     pub at: String,
     pub ms: f64,
     pub docs: u64,
+}
+
+/// The text state retained by a cached triple mask. The surrounding RDF count
+/// cache already identifies the commit and generation being masked.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) enum MaskTextIdentity {
+    #[default]
+    None,
+    #[cfg(feature = "text")]
+    Direct(usize),
+    #[cfg(feature = "text")]
+    Historical(usize),
+    #[cfg(feature = "text")]
+    Pin(uuid::Uuid),
+}
+
+impl MaskTextIdentity {
+    pub(crate) fn of(
+        #[cfg_attr(not(feature = "text"), allow(unused_variables))] snap: &crate::store::Snapshot,
+    ) -> Self {
+        #[cfg(feature = "text")]
+        if let Some(view) = &snap.text {
+            // Pin and historical wrappers are allocated anew on each read. Any
+            // live cached mask keeps its direct view or historical base alive.
+            if let ViewSource::Pin(pin) = &view.source {
+                return Self::Pin(pin.id);
+            }
+            if !view.uncommitted
+                && let Some(base) = &view.overlay_base
+            {
+                return Self::Historical(std::sync::Arc::as_ptr(base).addr());
+            }
+            return Self::Direct(std::sync::Arc::as_ptr(view).addr());
+        }
+        Self::None
+    }
 }
 
 /// The search state a snapshot sees.
@@ -700,6 +764,9 @@ pub struct TextView {
     /// index does not cover: searches are refused
     #[cfg_attr(not(feature = "text"), allow(dead_code))]
     pub(crate) uncommitted: bool,
+    /// RDF state represented by this searcher, when the text call must apply its delta.
+    #[cfg(feature = "text")]
+    pub(crate) overlay_base: Option<std::sync::Arc<crate::store::Snapshot>>,
 }
 
 #[cfg(feature = "text")]
@@ -707,6 +774,7 @@ pub struct TextView {
 enum ViewSource {
     Ready(ReadyView),
     Unavailable(UnavailableState),
+    Pin(std::sync::Arc<crate::store::text_pins::LazyTextPin>),
     /// The view of a grouped commit whose fence has not published it yet. Its changes
     /// wait in a [`Staged`] and reach the live index only at publication, so a search
     /// waits for that and then uses the view the publication made (X09 section 17.2).
@@ -762,7 +830,7 @@ impl TextView {
     pub(crate) fn is_available(&self) -> bool {
         match &self.source {
             ViewSource::Ready(_) => true,
-            ViewSource::Unavailable(_) => false,
+            ViewSource::Unavailable(_) | ViewSource::Pin(_) => false,
             // not published yet: it will be ready unless its fence fails
             ViewSource::Pending(p) => match p.get() {
                 None => true,
@@ -780,6 +848,7 @@ impl TextView {
             owner: 0,
             source: ViewSource::Unavailable(state),
             uncommitted: false,
+            overlay_base: None,
         }
     }
 
@@ -806,11 +875,29 @@ impl TextView {
                 Err(unavailable("dataset", state.name(), self.seq, data_seq))
             }
             ViewSource::Pending(p) => p.published(self.seq, data_seq)?.ready(data_seq),
+            ViewSource::Pin(_) => Err(unavailable("snapshot", "unopened", self.seq, data_seq)),
+        }
+    }
+
+    #[cfg(feature = "text")]
+    pub(crate) fn pinned(seq: u64, pin: crate::store::text_pins::LazyTextPin) -> Self {
+        Self {
+            seq,
+            epoch: 0,
+            owner: next_owner(),
+            source: ViewSource::Pin(std::sync::Arc::new(pin)),
+            uncommitted: false,
+            overlay_base: None,
         }
     }
 
     /// This view for a write transaction with uncommitted changes.
-    pub(crate) fn with_uncommitted_changes(&self) -> TextView {
+    pub(crate) fn with_uncommitted_changes(
+        &self,
+        #[cfg_attr(not(feature = "text"), allow(unused_variables))] base: Option<
+            std::sync::Arc<crate::store::Snapshot>,
+        >,
+    ) -> TextView {
         TextView {
             seq: self.seq,
             epoch: self.epoch,
@@ -819,6 +906,24 @@ impl TextView {
             #[cfg(feature = "text")]
             source: self.source.clone(),
             uncommitted: true,
+            #[cfg(feature = "text")]
+            overlay_base: base,
+        }
+    }
+
+    #[cfg(feature = "text")]
+    pub(crate) fn with_historical_changes(
+        &self,
+        seq: u64,
+        base: std::sync::Arc<crate::store::Snapshot>,
+    ) -> TextView {
+        TextView {
+            seq,
+            epoch: self.epoch,
+            owner: self.owner,
+            source: self.source.clone(),
+            uncommitted: false,
+            overlay_base: Some(base),
         }
     }
 }
@@ -827,9 +932,8 @@ impl TextView {
 #[cfg_attr(not(feature = "text"), allow(dead_code))]
 pub(crate) fn uncommitted_changes() -> Error {
     Error::Unsupported(
-        "text:query cannot run in a write transaction after the transaction has changed \
-         data, because the full-text index covers committed data only: search before the \
-         first change or after the commit"
+        "text:query cannot index these uncommitted changes: the transaction has a staged \
+         bulk write or more than 10000 newly indexed literals"
             .into(),
     )
 }
@@ -865,6 +969,11 @@ pub(crate) struct TextProbe {
     pub configured: bool,
     /// `text.json` does not parse
     pub config_error: Option<String>,
+    /// an online configuration is pending
+    pub pending: bool,
+    /// The installed index already matches the pending configuration.
+    pub pending_installed: bool,
+    pub pending_error: Option<String>,
     /// this build has no full-text support: only the configuration was read
     pub unsupported: bool,
     /// `<root>/text/` exists
@@ -885,6 +994,23 @@ pub(crate) struct TextProbe {
     pub damaged: Vec<(String, String)>,
 }
 
+impl TextProbe {
+    fn check_pending(&mut self, root: &std::path::Path) -> Option<PendingTextConfig> {
+        match read_pending_config(root) {
+            Ok(intent) => {
+                self.pending = intent.is_some();
+                self.configured |= self.pending;
+                intent
+            }
+            Err(error) => {
+                self.configured = true;
+                self.pending_error = Some(error.to_string());
+                None
+            }
+        }
+    }
+}
+
 /// The commit payload of the index's `meta.json`.
 #[derive(Debug)]
 pub(crate) struct ProbePayload {
@@ -900,6 +1026,8 @@ pub(crate) use imp::probe;
 #[cfg(not(feature = "text"))]
 pub(crate) fn probe(root: &std::path::Path, _checksums: bool) -> TextProbe {
     let mut p = TextProbe::default();
+    let _ = p.check_pending(root);
+    p.unsupported = p.configured;
     match std::fs::read(root.join("text.json")) {
         Ok(b) => {
             p.configured = true;
@@ -969,7 +1097,7 @@ impl StandardAnalyzer {
 }
 
 #[cfg(feature = "text")]
-pub(crate) use imp::read_config as imp_read_config;
+pub(crate) use imp::{FORMAT as TEXT_INDEX_FORMAT, config_hash, read_config as imp_read_config};
 #[cfg(feature = "text")]
 pub use imp::{Staged, TextIndex};
 #[cfg(feature = "text")]
@@ -1034,7 +1162,7 @@ mod imp {
     /// The index format. Format 2 keeps each document's terms in columns (fast fields),
     /// where format 1 kept them in the doc store. An index of another format is rebuilt
     /// on open.
-    const FORMAT: u32 = 2;
+    pub(crate) const FORMAT: u32 = 2;
     const TOKENIZER: &str = "sparkles_standard";
 
     #[derive(Clone)]
@@ -1345,7 +1473,22 @@ mod imp {
     #[derive(Clone)]
     pub(crate) struct Resolved {
         pub(crate) searcher: tantivy::Searcher,
+        pub(super) overlay: Option<tantivy::Searcher>,
+        pub(super) adjusted: bool,
         pub(super) uncertain: Arc<FxHashSet<u64>>,
+    }
+
+    impl Resolved {
+        pub(super) fn segment(&self, ord: u32) -> &tantivy::SegmentReader {
+            let base_segments = self.searcher.segment_readers().len();
+            if (ord as usize) >= base_segments
+                && let Some(overlay) = &self.overlay
+            {
+                &overlay.segment_readers()[ord as usize - base_segments]
+            } else {
+                self.searcher.segment_reader(ord)
+            }
+        }
     }
 
     /// The views of the commits applied between two seals share a slot, set when the
@@ -1358,6 +1501,8 @@ mod imp {
             let slot = Slot::default();
             let _ = slot.0.set(Some(Resolved {
                 searcher,
+                overlay: None,
+                adjusted: false,
                 uncertain,
             }));
             Arc::new(slot)
@@ -1671,7 +1816,7 @@ mod imp {
         h.finish()
     }
 
-    fn config_hash(c: &TextConfig) -> String {
+    pub(crate) fn config_hash(c: &TextConfig) -> String {
         let bytes = serde_json::to_vec(c).unwrap();
         let d = sha2::Sha256::digest(&bytes);
         d.iter().map(|b| format!("{b:02x}")).collect()
@@ -1822,14 +1967,19 @@ mod imp {
         mut after_snapshot: impl FnMut(&tantivy::IndexMeta),
     ) -> super::TextProbe {
         let mut p = super::TextProbe::default();
-        let config = match read_config(root) {
-            Ok(Some(c)) => c,
-            Ok(None) => return p,
+        let pending = p.check_pending(root);
+        let active = match read_config(root) {
+            Ok(config) => config,
             Err(e) => {
                 p.configured = true;
                 p.config_error = Some(e.to_string());
                 return p;
             }
+        };
+        let pending = pending.filter(|intent| intent.applies_to(active.as_ref()));
+        let pending = pending.as_ref().map(|intent| &intent.config);
+        let Some(config) = active.as_ref().or(pending) else {
+            return p;
         };
         p.configured = true;
         p.dirty = marker(root).exists();
@@ -1847,10 +1997,6 @@ mod imp {
                     return p;
                 }
             };
-            if index.schema() != schema(&config).0 {
-                p.open_error = Some("unexpected index schema".into());
-                return p;
-            }
             let meta = match index.load_metas() {
                 Ok(m) => m,
                 Err(e) => {
@@ -1860,12 +2006,23 @@ mod imp {
             };
             p.payload = None;
             p.payload_error = None;
-            match meta.payload.as_deref().map(serde_json::from_str::<Payload>) {
+            let payload = meta.payload.as_deref().map(serde_json::from_str::<Payload>);
+            let pending_installed = pending.filter(|cfg| {
+                matches!(&payload, Some(Ok(pl)) if pl.format == FORMAT && pl.config == config_hash(cfg))
+                    && meta.schema == schema(cfg).0
+            });
+            p.pending_installed = pending_installed.is_some();
+            let config = pending_installed.unwrap_or(config);
+            if meta.schema != schema(config).0 {
+                p.open_error = Some("unexpected index schema".into());
+                return p;
+            }
+            match payload {
                 Some(Ok(pl)) => {
                     p.payload = Some(super::ProbePayload {
                         format_ok: pl.format == FORMAT,
                         seq: pl.seq,
-                        config_matches: pl.config == config_hash(&config),
+                        config_matches: pl.config == config_hash(config),
                     })
                 }
                 Some(Err(e)) => p.payload_error = Some(e.to_string()),
@@ -2266,6 +2423,137 @@ mod imp {
                 doc: Some(d),
             })
         }
+    }
+
+    /// Build only the literals added by the adjusted view. The caller holds the
+    /// memory charge for the writer arena, documents and resulting RAM files.
+    pub(super) fn build_overlay(
+        ctx: &crate::sparql::ctx::Ctx,
+        base: &Snapshot,
+        shared: &Shared,
+        committed: &tantivy::Searcher,
+        charge: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Option<tantivy::Searcher>> {
+        let snap = &ctx.snap;
+        let config = &shared.config;
+        let mut writer = None;
+        const DOCS: u64 = 10_000;
+        const BYTES: u64 = 128 << 20;
+        const ARENA: u64 = 2 << 20;
+        let over_budget = |requested| {
+            Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::Memory,
+                limit: BYTES,
+                requested,
+            })
+        };
+        let mut documents = 0u64;
+        let mut historical_changes = 0u64;
+        let mut bytes = 0u64;
+        let mut build = |q: &[Id; 4]| -> Result<()> {
+            ctx.check()?;
+            if snap.historical {
+                historical_changes += 1;
+                if historical_changes > DOCS {
+                    return Err(Error::HistoryUnsupported(
+                        "historical full-text search spans more than 10000 changed quads".into(),
+                    ));
+                }
+            }
+            if !matches!(q[2].tag(), Tag::Vocab | Tag::Delta)
+                || snap
+                    .mask
+                    .as_ref()
+                    .is_some_and(|mask| mask.hides(&q.map(|id| id.0)))
+                || base.contains(q)?
+                || !snap.contains(q)?
+                || !ctx
+                    .with_controlled_key(q[2], |key| Ok(string_literal(key).is_some()))?
+                    .unwrap_or(false)
+            {
+                return Ok(());
+            }
+
+            // Admission precedes copying RDF keys. Cover the document, analyzer,
+            // postings and fast fields while the writer and RAM files overlap.
+            let key_cost = |id| {
+                ctx.with_controlled_key(id, |key| {
+                    (key.len() as u64)
+                        .checked_mul(32)
+                        .ok_or_else(|| over_budget(u64::MAX))
+                })
+                .map(|n| n.unwrap_or(0))
+            };
+            let mut growth = 4096u64;
+            for id in q {
+                growth = growth
+                    .checked_add(key_cost(*id)?)
+                    .ok_or_else(|| over_budget(u64::MAX))?;
+            }
+            let requested = bytes
+                .checked_add(growth)
+                .ok_or_else(|| over_budget(u64::MAX))?;
+            if requested > BYTES {
+                return Err(over_budget(requested));
+            }
+            charge(requested)?;
+            // Ineligible documents need only transient state. A fresh Terms keeps
+            // predicate/graph keys from accumulating when many are out of scope.
+            let Some(Doc { doc: Some(doc), .. }) =
+                Terms::default().document(snap, &shared.fields, config, q)
+            else {
+                return Ok(());
+            };
+            documents += 1;
+            if documents > DOCS {
+                return Err(super::uncommitted_changes());
+            }
+            bytes = requested;
+            if writer.is_none() {
+                bytes = bytes
+                    .checked_add(ARENA)
+                    .ok_or_else(|| over_budget(u64::MAX))?;
+                if bytes > BYTES {
+                    return Err(over_budget(bytes));
+                }
+                charge(bytes)?;
+                let source = committed.index();
+                let index = Index::builder()
+                    .schema(source.schema())
+                    .tokenizers(source.tokenizers().clone())
+                    .fast_field_tokenizers(source.fast_field_tokenizer().clone())
+                    .create_in_ram()
+                    .map_err(text_err)?;
+                writer =
+                    Some(tantivy::SingleSegmentIndexWriter::new(index, 1 << 20).map_err(text_err)?);
+            }
+            ctx.check()?;
+            writer
+                .as_mut()
+                .expect("opened above")
+                .add_document(doc)
+                .map_err(text_err)
+        };
+        let mut result = Ok(());
+        let target_keys = snap
+            .mask
+            .as_ref()
+            .and_then(|mask| mask.text_delta.as_ref())
+            .map_or_else(|| snap.delta.change_keys(), |[ins, del]| [ins, del]);
+        crate::store::Delta::changes_between(target_keys, base.delta.change_keys(), |q| {
+            result = build(q);
+            result.is_ok()
+        });
+        result?;
+        ctx.check()?;
+        charge(bytes)?;
+        let Some(writer) = writer else {
+            return Ok(None);
+        };
+        let index = writer.finalize().map_err(text_err)?;
+        ctx.check()?;
+        let reader = index.reader().map_err(text_err)?;
+        Ok(Some(reader.searcher()))
     }
 
     /// Copy a pinned committed Tantivy checkpoint into a branch-owned directory.
@@ -2696,6 +2984,7 @@ mod imp {
                 owner: inner.owner,
                 source: ViewSource::Pending(outcome.clone()),
                 uncommitted: false,
+                overlay_base: None,
             });
             let staged = Staged {
                 inner: inner.clone(),
@@ -2783,7 +3072,7 @@ mod imp {
         /// Old sealed views can keep their searchers, but no writer may touch that path.
         /// The caller owns the store's lifecycle lock and drained writer admission.
         pub(crate) fn retire(&self) -> Result<()> {
-            if self.inner.retirement_failed.load(Ordering::SeqCst) {
+            if self.retirement_failed() {
                 return Err(text_err(
                     "a failed full-text retirement must be rebuilt or reopened",
                 ));
@@ -2800,6 +3089,10 @@ mod imp {
                 self.inner.fail_locked(&mut self.inner.live.lock(), error);
             }
             result
+        }
+
+        pub(crate) fn retirement_failed(&self) -> bool {
+            self.inner.retirement_failed.load(Ordering::SeqCst)
         }
 
         /// Rebuild the whole index from `snap` and return its view. On disk, the new
@@ -2920,7 +3213,7 @@ mod imp {
     }
 
     pub(crate) fn cleanup_staging(root: &Path) -> Result<()> {
-        for name in ["text.new", "text.old"] {
+        for name in ["text.new", "text.old", "text.configure"] {
             match std::fs::remove_dir_all(root.join(name)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
                 _ => {}
@@ -2949,8 +3242,20 @@ mod imp {
         memory_budget: usize,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Built> {
-        let t0 = std::time::Instant::now();
         let new_dir = root.map(|r| r.join("text.new"));
+        build_in(new_dir, config, epoch, snap, threads, memory_budget, check)
+    }
+
+    fn build_in(
+        new_dir: Option<PathBuf>,
+        config: &TextConfig,
+        epoch: u64,
+        snap: &Snapshot,
+        threads: usize,
+        memory_budget: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Built> {
+        let t0 = std::time::Instant::now();
         let (index, fields) = new_index(new_dir.as_deref(), config)?;
         let mut docs = 0u64;
         {
@@ -2993,20 +3298,95 @@ mod imp {
     }
 
     impl TextIndex {
-        pub(crate) fn recovery_build(
+        pub(crate) fn build_pin(
             root: &Path,
             config: &TextConfig,
             snap: &Snapshot,
             check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
+            let built = build_in(Some(root.join("text")), config, 1, snap, 1, 32 << 20, check)?;
+            crate::store::sync_dir(&root.join("text"))?;
+            drop(built);
+            Ok(())
+        }
+
+        pub(crate) fn probe_pin(
+            root: &Path,
+            config: &TextConfig,
+            seq: u64,
+            full: bool,
+        ) -> Result<()> {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let existing = Self::inspect_pin(root, config, seq)?;
+                if full {
+                    verify(&existing.index, &root.join("text"))?;
+                }
+                Ok(())
+            }))
+            .unwrap_or_else(|_| Err(text_err("reading the snapshot text index panicked")))
+        }
+
+        fn inspect_pin(root: &Path, config: &TextConfig, seq: u64) -> Result<ExistingIndex> {
+            let existing = inspect_existing(Some(root), config)
+                .map_err(|reason| text_err(format!("snapshot text index: {reason:?}")))?;
+            if existing.payload.format != FORMAT
+                || existing.payload.seq != seq
+                || existing.payload.config != config_hash(config)
+            {
+                return Err(text_err(
+                    "snapshot text index has the wrong format, commit or configuration",
+                ));
+            }
+            Ok(existing)
+        }
+
+        pub(crate) fn open_pin(root: &Path, config: TextConfig, seq: u64) -> Result<Arc<TextView>> {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let ExistingIndex {
+                    index,
+                    fields,
+                    payload,
+                    ..
+                } = Self::inspect_pin(root, &config, seq)?;
+                let reader: tantivy::IndexReader = index
+                    .reader_builder()
+                    .reload_policy(ReloadPolicy::Manual)
+                    .try_into()
+                    .map_err(text_err)?;
+                Ok(Arc::new(TextView {
+                    seq,
+                    epoch: payload.epoch,
+                    owner: next_owner(),
+                    source: ViewSource::Ready(ReadyView {
+                        slot: Slot::sealed(reader.searcher(), Default::default()),
+                        index: Arc::new(Shared {
+                            fields,
+                            config,
+                            ids: Default::default(),
+                        }),
+                        owner: std::sync::Weak::new(),
+                    }),
+                    uncommitted: false,
+                    overlay_base: None,
+                }))
+            }));
+            result.unwrap_or_else(|_| Err(text_err("reading the snapshot text index panicked")))
+        }
+
+        pub(crate) fn recovery_build(
+            staging: Option<PathBuf>,
+            config: &TextConfig,
+            epoch: u64,
+            snap: &Snapshot,
+            check: &dyn Fn() -> Result<()>,
         ) -> Result<Built> {
             check()?;
-            cleanup_staging(root)?;
             // Bound automatic recovery to two writer threads within the existing
             // 64 MiB total arena budget. Single-CPU hosts keep one writer.
             let threads = std::thread::available_parallelism()
                 .map_or(1, |n| n.get())
                 .min(2);
-            build_index(Some(root), config, 1, snap, threads, 64 << 20, check)
+            build_in(staging, config, epoch, snap, threads, 64 << 20, check)
         }
 
         /// Build the index of `snap` into `root/text` for a store that is not open yet,
@@ -3065,7 +3445,7 @@ mod imp {
         /// Caller owns final writer admission and completes this durability fence even
         /// if cancellation arrives after admission. No detached worker publishes.
         pub(crate) fn recovery_install(
-            root: &Path,
+            root: Option<&Path>,
             config: TextConfig,
             built: Built,
             head: &Snapshot,
@@ -3078,9 +3458,9 @@ mod imp {
                 docs,
                 started,
             } = built;
-            let (index, fields, dir) = publish_built(Some(root), &config, index, fields, dir)?;
+            let (index, fields, dir) = publish_built(root, &config, index, fields, dir)?;
             let live = live_of(index, fields, &config, dir, head.commit)?;
-            let inner = inner_of(Some(root), config, live, epoch);
+            let inner = inner_of(root, config, live, epoch);
             *inner.last_rebuild.lock() = Some(RebuildInfo {
                 at: crate::commit::rfc3339_ms(crate::commit::now_ms()),
                 ms: started.elapsed().as_secs_f64() * 1000.,
@@ -3188,6 +3568,7 @@ mod imp {
                     owner: Arc::downgrade(self),
                 }),
                 uncommitted: false,
+                overlay_base: None,
             })
         }
 
@@ -3459,6 +3840,8 @@ mod imp {
             }
             let _ = slot.0.set(Some(Resolved {
                 searcher: live.reader.searcher(),
+                overlay: None,
+                adjusted: false,
                 uncertain: Arc::new(live.uncertain.clone()),
             }));
             live.open = None;
@@ -3811,6 +4194,7 @@ mod imp {
                     .map_or(0, |r| crate::store::dir_size(&r.join("text"))),
                 segments: searcher.segment_readers().len(),
                 config: self.config.clone(),
+                pending_config: None,
                 format_version: FORMAT,
                 last_rebuild: self.last_rebuild.lock().clone(),
                 message: stale,
@@ -4606,7 +4990,19 @@ mod imp {
                     .is_err()
             );
             assert!(inner.retirement_failed.load(Ordering::SeqCst));
+            assert!(store.text_needs_direct_maintain());
+            assert!(!root.path().join("text.pending.json").exists());
+            let status = store.text_status().unwrap();
+            assert_eq!(status.state, "stale");
+            assert!(status.message.unwrap().contains("retirement repair probe"));
+            crate::sparql::update::update(
+                &store,
+                r#"INSERT DATA { <urn:after> <urn:p> "repair after retirement" }"#,
+                &Default::default(),
+            )
+            .unwrap();
             store.rebuild_text().unwrap();
+            assert!(!store.text_needs_direct_maintain());
             assert!(!inner.retirement_failed.load(Ordering::SeqCst));
             assert!(inner.ticks.load(Ordering::SeqCst));
             let query = crate::sparql::query(
@@ -4615,9 +5011,44 @@ mod imp {
                 &Default::default(),
             )
             .unwrap();
-            assert_eq!(query.len(), 1);
+            assert_eq!(query.len(), 2);
             store.disable_text().unwrap();
             assert!(!root.path().join("text").exists());
+        }
+
+        #[test]
+        fn text_overlay_checks_cancellation_after_admitting_a_document() {
+            use crate::sparql::ctx::Ctx;
+            let store = crate::store::Store::in_memory(Default::default());
+            store.enable_text(Default::default()).unwrap();
+            let mut tx = store.write();
+            let quad = oxrdf::Quad::new(
+                oxrdf::NamedNode::new_unchecked("urn:overlay"),
+                oxrdf::NamedNode::new_unchecked("urn:label"),
+                oxrdf::Literal::from("quokka"),
+                oxrdf::GraphName::DefaultGraph,
+            );
+            let id = tx.encode_quad(&quad, &mut Default::default()).unwrap();
+            assert!(tx.insert(id).unwrap());
+            let ctx = Ctx::new(Arc::new(tx.view()));
+            let base = tx.base();
+            let view = base.text.as_ref().unwrap();
+            let shared = &view.ready(base.commit).unwrap().index;
+            let committed = &view.resolved().unwrap().searcher;
+            assert!(
+                build_overlay(&ctx, base, shared, committed, &mut |_| Ok(()))
+                    .unwrap()
+                    .is_some()
+            );
+            let mut admitted = 0;
+            let stopped = build_overlay(&ctx, base, shared, committed, &mut |bytes| {
+                admitted += 1;
+                assert!(bytes > 0);
+                ctx.cancel.store(true, Ordering::Relaxed);
+                Ok(())
+            });
+            assert!(matches!(stopped, Err(Error::Cancelled)));
+            assert!(admitted > 0);
         }
 
         #[test]
@@ -4817,11 +5248,12 @@ mod imp {
                 )
                 .unwrap();
                 assert!(plain.boolean);
-                let changed = held.text.as_ref().unwrap().with_uncommitted_changes();
+                let changed = held.text.as_ref().unwrap().with_uncommitted_changes(None);
                 assert!(!changed.is_available());
                 assert!(changed.uncommitted);
                 let mut historical = (*held).clone();
                 historical.historical = true;
+                historical.text = None;
                 assert!(matches!(
                     query(Arc::new(historical), q, &QueryOptions::default()),
                     Err(Error::HistoryUnsupported(_))

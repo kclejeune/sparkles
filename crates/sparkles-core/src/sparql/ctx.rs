@@ -5726,7 +5726,7 @@ impl Charge<'_> {
 
     /// Reconcile retained physical storage without moving it to a ledger account.
     /// Callers admit growth before allocating and release a shrink after dropping it.
-    pub(super) fn resize(&self, bytes: u64) -> Result<()> {
+    pub(crate) fn resize(&self, bytes: u64) -> Result<()> {
         let current = self.bytes.get();
         if bytes > current {
             self.add(bytes - current)?;

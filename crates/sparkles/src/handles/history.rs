@@ -37,6 +37,33 @@ impl Snapshots {
         self.ds.store().create_snapshot_opts(name, at, opts)
     }
 
+    /// Pin a commit and keep a full-text index for it on disk.
+    pub fn create_with_text(
+        &self,
+        name: &str,
+        at: &At,
+        opts: &SnapshotOptions,
+        controls: &crate::history::HistoryOptions,
+    ) -> Result<(NamedSnapshot, bool)> {
+        self.ds
+            .store()
+            .create_snapshot_with_text_controlled(name, at, opts, controls)
+    }
+
+    /// Rebuild a named snapshot's full-text index.
+    pub fn rebuild_text(
+        &self,
+        name: &str,
+        controls: &crate::history::HistoryOptions,
+    ) -> Result<NamedSnapshot> {
+        self.ds.store().rebuild_snapshot_text(name, controls)
+    }
+
+    /// Drop a named snapshot's full-text index while keeping its RDF pin.
+    pub fn drop_text(&self, name: &str) -> Result<bool> {
+        self.ds.store().drop_snapshot_text(name)
+    }
+
     /// Remove the snapshot `name`; whether it existed.
     pub fn delete(&self, name: &str) -> Result<bool> {
         self.ds.store().delete_snapshot(name)

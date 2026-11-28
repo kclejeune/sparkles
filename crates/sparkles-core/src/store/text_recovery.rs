@@ -40,12 +40,14 @@ struct State {
     done: bool,
     cancelled: bool,
     failure: Option<&'static str>,
+    warning: Option<&'static str>,
     /// automatic retries scheduled after exhausted runs
     retries: usize,
 }
 
 pub(super) struct Recovery {
-    root: PathBuf,
+    root: Option<PathBuf>,
+    configure: bool,
     config: TextConfig,
     owner: u64,
     active: AtomicBool,
@@ -67,9 +69,10 @@ impl Recovery {
         &self.config
     }
 
-    fn new(store: &Store, config: TextConfig) -> Arc<Self> {
+    fn new(store: &Store, config: TextConfig, configure: bool) -> Arc<Self> {
         Arc::new(Self {
-            root: store.root.clone().expect("persistent recovery"),
+            root: store.root.clone(),
+            configure,
             config,
             owner: crate::text::next_owner(),
             active: AtomicBool::new(true),
@@ -90,19 +93,69 @@ impl Recovery {
         !self.ready.load(Ordering::Acquire)
     }
 
+    pub(super) fn failed_configuration(&self) -> bool {
+        self.configure && self.state.lock().failure.is_some()
+    }
+
+    pub(super) fn message(&self) -> Option<String> {
+        let state = self.state.lock();
+        state.failure.or(state.warning).map(str::to_owned)
+    }
+
+    fn hook(&self, name: &'static str) {
+        if let Some(root) = &self.root {
+            hook(root, name);
+        }
+    }
+
+    fn staging(&self) -> Option<PathBuf> {
+        // Bulk writes can still rebuild the active index while configuration is
+        // building. Each build owns its own staging directory.
+        self.root.as_ref().map(|root| {
+            root.join(if self.configure {
+                "text.configure"
+            } else {
+                "text.new"
+            })
+        })
+    }
+
+    fn cleanup(&self) -> Result<()> {
+        match (self.root.as_deref(), self.staging()) {
+            (Some(_), Some(staging)) if self.configure => remove_text_dir(&staging),
+            (Some(root), _) => crate::text::cleanup_staging(root),
+            (None, _) => Ok(()),
+        }
+    }
+
+    fn check_quota(&self) -> Result<()> {
+        if let (Some(quota), Some(root), Some(staging)) =
+            (self.quota.upgrade(), self.root.as_deref(), self.staging())
+        {
+            quota.check_rebuild(Some(&root.join("text")), &staging)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn view(&self, seq: u64) -> Arc<TextView> {
         TextView::recovering(seq, self.owner, self.state.lock().failure.is_some())
     }
 
     pub(super) fn record(&self, snapshot: &Snapshot, log: &[(u8, [Id; 4])]) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
         let mut j = self.journal.lock();
         if let Some(generation) = j.generation {
             if generation != snapshot.generation.uid
-                || log.len() > JOURNAL.saturating_sub(j.quads.len())
+                || j.quads
+                    .len()
+                    .checked_add(log.len())
+                    .is_none_or(|n| n > JOURNAL)
             {
                 j.invalid = true;
                 j.quads.clear();
-            } else if !j.invalid && self.active.load(Ordering::Acquire) {
+            } else if !j.invalid {
                 j.quads.extend(log.iter().map(|(_, q)| *q));
             }
         }
@@ -147,9 +200,9 @@ impl Recovery {
         if !self.active.load(Ordering::Acquire) {
             return Err(Error::Cancelled);
         }
-        match self.reserve {
-            Some(r) => crate::disk::check_reserve(&self.root, r, 0, false),
-            None => Ok(()),
+        match (self.root.as_deref(), self.reserve) {
+            (Some(root), Some(r)) => crate::disk::check_reserve(root, r, 0, false),
+            _ => Ok(()),
         }
     }
 
@@ -201,10 +254,17 @@ impl Recovery {
                 };
                 snap
             };
-            hook(&self.root, "admitted");
+            self.hook("admitted");
+            self.cleanup()?;
+            let epoch = start.text.as_ref().map_or(0, |view| view.epoch);
+            let epoch = epoch
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid("text epoch exhausted"))?;
             let mut built =
-                TextIndex::recovery_build(&self.root, &self.config, &start, &|| self.check())?;
-            hook(&self.root, "built");
+                TextIndex::recovery_build(self.staging(), &self.config, epoch, &start, &|| {
+                    self.check()
+                })?;
+            self.hook("built");
             for _round in 0..ROUNDS {
                 let (head, changes) = {
                     let _w = self.lock(&writer)?;
@@ -222,16 +282,11 @@ impl Recovery {
                 TextIndex::recovery_catch_up(&mut built, &self.config, &head, &changes, &|| {
                     self.check()
                 })?;
-                hook(&self.root, "caught-up");
+                self.hook("caught-up");
                 // Refuse an already oversized build before taking the writer lock.
                 // Publication repeats this check after applying the final tail.
-                if let Some(quota) = self.quota.upgrade() {
-                    quota.check_rebuild(
-                        Some(&self.root.join("text")),
-                        &self.root.join("text.new"),
-                    )?;
-                }
-                hook(&self.root, "quota-checked");
+                self.check_quota()?;
+                self.hook("quota-checked");
                 let _w = self.lock(&writer)?;
                 self.owns(&slot)?;
                 let head = current.load_full();
@@ -247,17 +302,42 @@ impl Recovery {
                 // cancellation check the admitted directory durability fence completes.
                 drop(journal);
                 self.check()?;
-                hook(&self.root, "publishing");
+                self.hook("publishing");
                 TextIndex::recovery_catch_up(&mut built, &self.config, &head, &tail, &|| Ok(()))?;
                 // Fence writes and quota changes while validating the completed index.
-                if let Some(quota) = self.quota.upgrade() {
-                    quota.check_rebuild(
-                        Some(&self.root.join("text")),
-                        &self.root.join("text.new"),
-                    )?;
+                self.check_quota()?;
+                if let Some(old) = index.load_full() {
+                    old.retire()?;
                 }
-                let (ti, view) =
-                    TextIndex::recovery_install(&self.root, self.config.clone(), built, &head)?;
+                let install = || {
+                    if let Some(root) = self.root.as_deref().filter(|_| self.configure) {
+                        remove_text_dir(&root.join("text.old"))?;
+                    }
+                    TextIndex::recovery_install(
+                        self.root.as_deref(),
+                        self.config.clone(),
+                        built,
+                        &head,
+                    )
+                };
+                let (ti, view) = match install() {
+                    Ok(replacement) => replacement,
+                    Err(error) => {
+                        index.store(None);
+                        let mut snapshot = (*head).clone();
+                        snapshot.text = Some(self.view(head.commit));
+                        current.store(Arc::new(snapshot));
+                        return Err(error);
+                    }
+                };
+                if let Some(root) = self.root.as_deref().filter(|_| self.configure) {
+                    self.hook("before-promote");
+                    if let Err(error) = promote_pending(root, &self.config) {
+                        self.state.lock().warning =
+                            Some("full-text index installed; could not persist active settings");
+                        tracing::warn!(target: "sparkles::store", %error, "could not promote the text configuration");
+                    }
+                }
                 index.store(Some(Arc::new(ti)));
                 let mut snapshot = (*head).clone();
                 snapshot.text = Some(view);
@@ -269,7 +349,7 @@ impl Recovery {
             // A restart, for a changed generation or an exhausted catch-up alike.
             drop(built);
             *self.journal.lock() = Journal::default();
-            crate::text::cleanup_staging(&self.root)?;
+            self.cleanup()?;
         }
         Ok(false)
     }
@@ -277,7 +357,7 @@ impl Recovery {
     /// Publish this job's current state in the store's snapshot, so that text queries
     /// report a failure without waiting for the next commit. The writer lock keeps a
     /// concurrent commit from publishing an older view after this one.
-    fn publish_state(self: &Arc<Self>) {
+    fn publish_state(self: &Arc<Self>, reason: &'static str) {
         let (Some(writer), Some(current), Some(slot)) = (
             self.writer.upgrade(),
             self.current.upgrade(),
@@ -297,6 +377,26 @@ impl Recovery {
             }
         };
         if !slot.load().as_ref().is_some_and(|c| Arc::ptr_eq(c, self)) {
+            return;
+        }
+        if self.configure
+            && self
+                .index
+                .upgrade()
+                .is_some_and(|index| index.load().is_some())
+        {
+            // The replacement never took ownership of the active path. Reject the
+            // intent durably before removing the job. A failed retirement leaves
+            // the old index stale, with its rebuild path still available.
+            match self.root.as_deref().map_or(Ok(()), remove_pending) {
+                Ok(()) => {
+                    slot.store(None);
+                    tracing::warn!(target: "sparkles::text", root = ?self.root, config = ?self.config, reason, "discarded the rejected text configuration");
+                }
+                Err(error) => {
+                    tracing::warn!(target: "sparkles::store", %error, "could not discard the rejected text configuration");
+                }
+            }
             return;
         }
         loop {
@@ -321,24 +421,25 @@ impl Recovery {
                 state.failure = Some(reason);
             }
         }
-        self.publish_state();
+        self.publish_state(reason);
         let mut state = self.state.lock();
+        self.active.store(false, Ordering::Release);
         state.running = false;
         state.done = true;
         self.done.notify_all();
     }
 
-    fn execute(self: Arc<Self>) {
+    pub(super) fn execute(self: Arc<Self>) -> Result<()> {
         {
             let mut state = self.state.lock();
             if !self.active.load(Ordering::Acquire) {
                 state.done = true;
                 self.done.notify_all();
-                return;
+                return Err(Error::Cancelled);
             }
             // An explicit rebuild may queue a job again while a worker is taking it.
             if state.running || state.done {
-                return;
+                return Ok(());
             }
             state.running = true;
         }
@@ -348,7 +449,7 @@ impl Recovery {
         // it before releasing the Store lock or allowing another staging owner.
         match &result {
             Ok(Err(error)) => {
-                tracing::warn!(target: "sparkles::text", root = %self.root.display(), %error, "background text recovery stopped")
+                tracing::warn!(target: "sparkles::text", root = ?self.root, %error, "background text recovery stopped")
             }
             Err(panic) => {
                 let cause = panic
@@ -356,46 +457,55 @@ impl Recovery {
                     .copied()
                     .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("non-string panic");
-                tracing::error!(target: "sparkles::text", root = %self.root.display(), %cause, "background text recovery panicked");
+                tracing::error!(target: "sparkles::text", root = ?self.root, %cause, "background text recovery panicked");
             }
             Ok(Ok(_)) => {}
         }
-        let cleanup = crate::text::cleanup_staging(&self.root);
+        let cleanup = self.cleanup();
         if let Err(error) = &cleanup {
-            tracing::warn!(target: "sparkles::text", root = %self.root.display(), %error, "background text recovery cleanup failed");
+            tracing::warn!(target: "sparkles::text", root = ?self.root, %error, "background text recovery cleanup failed");
         }
         if let Some(quota) = self.quota.upgrade() {
             quota.invalidate();
         }
-        match (&result, &cleanup) {
-            (Ok(Ok(true)), Ok(())) => {}
+        match (result, cleanup) {
+            (Ok(Ok(true)), _) => {}
             (Ok(Ok(false)), Ok(())) => {
                 let mut state = self.state.lock();
                 if self.active.load(Ordering::Acquire) && state.retries < RETRY_DELAYS.len() {
                     let delay = RETRY_DELAYS[state.retries];
                     state.retries += 1;
-                    tracing::info!(target: "sparkles::text", root = %self.root.display(), retry = state.retries, ?delay, "background text recovery exhausted its restarts; retrying later");
+                    tracing::info!(target: "sparkles::text", root = ?self.root, retry = state.retries, ?delay, "background text recovery exhausted its restarts; retrying later");
                     // Waiters keep waiting: the job is not done until a retry ends.
                     state.running = false;
                     drop(state);
-                    if !enqueue(&self, delay) {
-                        self.fail("full-text recovery queue unavailable; retry rebuild");
+                    if enqueue(&self, delay) {
+                        return Ok(());
                     }
-                    return;
+                    let reason = "full-text recovery queue unavailable; retry rebuild";
+                    self.fail(reason);
+                    return Err(Error::TextUnavailable(reason.into()));
                 }
                 drop(state);
-                self.fail("full-text recovery restart budget exceeded; retry rebuild");
-                return;
+                let reason = "full-text recovery restart budget exceeded; retry rebuild";
+                self.fail(reason);
+                return Err(Error::TextUnavailable(reason.into()));
             }
-            _ => {
+            (Ok(Err(error)), _) | (_, Err(error)) => {
                 self.fail("full-text recovery failed; retry rebuild");
-                return;
+                return Err(error);
+            }
+            (Err(_), Ok(())) => {
+                let reason = "full-text recovery failed; retry rebuild";
+                self.fail(reason);
+                return Err(Error::TextUnavailable(reason.into()));
             }
         }
         let mut state = self.state.lock();
         state.running = false;
         state.done = true;
         self.done.notify_all();
+        Ok(())
     }
 
     pub(super) fn status(&self, seq: u64) -> TextStatus {
@@ -426,7 +536,8 @@ impl Recovery {
             disk_bytes: 0,
             segments: 0,
             config: self.config.clone(),
-            format_version: 2,
+            pending_config: None,
+            format_version: crate::text::TEXT_INDEX_FORMAT,
             last_rebuild: None,
             message,
         }
@@ -487,7 +598,7 @@ fn work(pool: &'static Pool) {
             }
         };
         if let Some(job) = job.upgrade() {
-            job.execute();
+            let _ = job.execute();
         }
     }
 }
@@ -523,16 +634,23 @@ fn enqueue(job: &Arc<Recovery>, delay: Duration) -> bool {
 }
 
 impl Store {
-    pub(super) fn register_text_recovery(&self, config: TextConfig) -> Arc<Recovery> {
-        let job = Recovery::new(self, config);
+    pub(super) fn register_text_recovery(
+        &self,
+        config: TextConfig,
+        configure: bool,
+    ) -> Arc<Recovery> {
+        let job = Recovery::new(self, config, configure);
         self.text_recovery.store(Some(job.clone()));
+        if self.text.load().is_some() {
+            return job;
+        }
         // Retry enrollment changes only text metadata. Preserve a concurrent RDF
         // commit (or geo publication) instead of storing a cloned obsolete head.
         loop {
             let previous = self.current.load_full();
             let mut snapshot = (*previous).clone();
             snapshot.text = Some(job.view(snapshot.commit));
-            hook(&job.root, "registered-snapshot");
+            job.hook("registered-snapshot");
             let observed = self.current.compare_and_swap(&previous, Arc::new(snapshot));
             if Arc::ptr_eq(&observed, &previous) {
                 break;
@@ -547,12 +665,6 @@ impl Store {
         }
     }
 
-    pub(super) fn start_text_recovery(&self, config: TextConfig) -> Arc<Recovery> {
-        let job = self.register_text_recovery(config);
-        self.enqueue_text_recovery(&job);
-        job
-    }
-
     pub(super) fn stop_text_recovery(&self) {
         if let Some(job) = self.text_recovery.load_full() {
             job.cancel_and_wait();
@@ -562,7 +674,7 @@ impl Store {
 
     pub(super) fn retry_text_recovery(&self) -> Option<Arc<Recovery>> {
         let job = self.text_recovery.load_full()?;
-        if !job.pending() {
+        if !job.pending() || (job.failed_configuration() && self.text.load().is_some()) {
             return None;
         }
         let config = job.config.clone();
@@ -571,8 +683,10 @@ impl Store {
             // Keep the old auxiliary slot installed until atomic replacement, so
             // no grouped commit can slip through an index/recovery-disabled gap.
             job.cancel_and_wait();
-            hook(&job.root, "retry-replacing");
-            self.start_text_recovery(config)
+            job.hook("retry-replacing");
+            let retry = self.register_text_recovery(config, job.configure);
+            self.enqueue_text_recovery(&retry);
+            retry
         } else {
             // A job waiting out a retry delay starts now for an explicit rebuild.
             if !job.state.lock().running {
@@ -580,6 +694,31 @@ impl Store {
             }
             job
         })
+    }
+}
+
+fn remove_text_dir(dir: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+pub(super) fn promote_pending(root: &Path, config: &TextConfig) -> Result<()> {
+    if crate::text::imp_read_config(root)?.as_ref() != Some(config) {
+        write_atomic(
+            &root.join("text.json"),
+            &crate::formats::settings_to_vec("text.json", config)?,
+        )?;
+    }
+    remove_pending(root)
+}
+
+pub(super) fn remove_pending(root: &Path) -> Result<()> {
+    match std::fs::remove_file(root.join("text.pending.json")) {
+        Ok(()) => sync_dir(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1070,6 +1209,298 @@ mod tests {
         wait(&reopened);
         assert_eq!(reopened.snapshot().commit, before.commit);
         assert_eq!(count(&reopened), 1);
+    }
+
+    #[test]
+    fn online_configuration_serves_the_active_index_and_catches_writes() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Arc::new(Store::open(root, Default::default()).unwrap());
+        for previous in [false, true] {
+            let mut built = Pause::new(root, "built");
+            let desired = TextConfig {
+                max_hits: if previous { 5 } else { 4 },
+                ..Default::default()
+            };
+            let writer = store.clone();
+            let desired_for_task = desired.clone();
+            let task = std::thread::spawn(move || writer.enable_text(desired_for_task));
+            built.reached();
+            let status = store.text_status().unwrap();
+            if previous {
+                assert_eq!(status.state, "ready");
+                assert_eq!(status.config.max_hits, 4);
+                assert_eq!(status.pending_config.unwrap().max_hits, 5);
+            } else {
+                assert_eq!(status.state, "rebuilding");
+                assert!(matches!(
+                    query(store.snapshot(), QUERY, &Default::default()),
+                    Err(Error::TextUnavailable(_))
+                ));
+            }
+            assert_eq!(
+                crate::text::read_pending_config(root)
+                    .unwrap()
+                    .unwrap()
+                    .config
+                    .max_hits,
+                desired.max_hits
+            );
+            let insert = if previous {
+                r#"INSERT DATA { <http://ex/b> <http://ex/p> "fox again" }"#
+            } else {
+                r#"INSERT DATA { <http://ex/a> <http://ex/p> "fox" }"#
+            };
+            // The writer returns before the replacement is allowed to publish.
+            update(&store, insert);
+            if previous {
+                assert_eq!(count(&store), 2);
+            }
+            built.resume();
+            let status = task.join().unwrap().unwrap();
+            assert_eq!(status.state, "ready");
+            assert_eq!(status.config.max_hits, desired.max_hits);
+            assert!(status.pending_config.is_none());
+            assert!(!root.join("text.pending.json").exists());
+            assert_eq!(count(&store), if previous { 2 } else { 1 });
+        }
+        drop(store);
+        let reopened = Store::open(root, Default::default()).unwrap();
+        assert_eq!(reopened.text_status().unwrap().config.max_hits, 5);
+        assert_eq!(count(&reopened), 2);
+    }
+
+    #[test]
+    fn same_configuration_reuses_a_ready_index_and_failed_promotion_rolls_forward() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        let store = Arc::new(Store::open(root, Default::default()).unwrap());
+        let ready = store.text_status().unwrap();
+        let owner = store.snapshot().text.as_ref().unwrap().owner;
+        assert_eq!(store.enable_text(ready.config).unwrap().epoch, ready.epoch);
+        assert_eq!(store.snapshot().text.as_ref().unwrap().owner, owner);
+
+        let mut promotion = Pause::new(root, "before-promote");
+        let changing = store.clone();
+        let task = std::thread::spawn(move || {
+            changing.enable_text(TextConfig {
+                max_hits: 8,
+                ..Default::default()
+            })
+        });
+        promotion.reached();
+        let blocker = root.join("text.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        promotion.resume();
+        let status = task.join().unwrap().unwrap();
+        assert_eq!(status.state, "ready");
+        assert_eq!(status.config.max_hits, 8);
+        assert!(status.message.unwrap().contains("persist active settings"));
+        assert!(root.join("text.pending.json").exists());
+        assert_eq!(count(&store), 1);
+        std::fs::remove_dir(blocker).unwrap();
+
+        drop(store);
+        let reopened = Store::open(root, Default::default()).unwrap();
+        let rolled = reopened.text_status().unwrap();
+        assert_eq!(rolled.state, "ready");
+        assert_eq!(rolled.epoch, status.epoch);
+        assert_eq!(rolled.config.max_hits, 8);
+        assert!(reopened.text_recovery.load().is_none());
+        assert!(!root.join("text.pending.json").exists());
+        assert_eq!(count(&reopened), 1);
+    }
+
+    #[test]
+    fn promotion_warning_does_not_hide_an_active_index_failure() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        let store = Arc::new(Store::open(root, Default::default()).unwrap());
+        let ready = store.text_status().unwrap();
+        let owner = store.snapshot().text.as_ref().unwrap().owner;
+        assert_eq!(store.enable_text(ready.config).unwrap().epoch, ready.epoch);
+        assert_eq!(store.snapshot().text.as_ref().unwrap().owner, owner);
+
+        let mut promotion = Pause::new(root, "before-promote");
+        let changing = store.clone();
+        let task = std::thread::spawn(move || {
+            changing.enable_text(TextConfig {
+                max_hits: 8,
+                ..Default::default()
+            })
+        });
+        promotion.reached();
+        let blocker = root.join("text.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        promotion.resume();
+        let status = task.join().unwrap().unwrap();
+        assert_eq!(status.state, "ready");
+        assert_eq!(status.config.max_hits, 8);
+        assert!(status.message.unwrap().contains("persist active settings"));
+        assert!(root.join("text.pending.json").exists());
+        assert_eq!(count(&store), 1);
+        std::fs::remove_dir(blocker).unwrap();
+
+        store.fail_next_text_commit();
+        update(&store, r#"INSERT DATA { <urn:b> <urn:p> "fox" }"#);
+        let stale = store.text_status().unwrap();
+        assert_eq!(stale.state, "stale");
+        assert!(stale.message.unwrap().contains("injected"));
+        let rebuilt = store.rebuild_text().unwrap();
+        assert_eq!(rebuilt.config.max_hits, 8);
+        assert!(store.text_status().unwrap().message.is_none());
+        assert!(!root.join("text.pending.json").exists());
+        assert_eq!(count(&store), 2);
+    }
+
+    #[test]
+    fn failed_reconfiguration_keeps_the_old_index_and_group_admission() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        let store = Arc::new(Store::open(root, Default::default()).unwrap());
+        let mut admitted = Pause::new(root, "admitted");
+        let changing = store.clone();
+        let task = std::thread::spawn(move || {
+            changing.enable_text(TextConfig {
+                max_hits: 6,
+                ..Default::default()
+            })
+        });
+        admitted.reached();
+        let blocker = root.join("text.configure");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        admitted.resume();
+        assert!(task.join().unwrap().is_err());
+        let status = store.text_status().unwrap();
+        assert_eq!(status.state, "ready");
+        assert_eq!(status.config.max_hits, TextConfig::default().max_hits);
+        assert!(status.pending_config.is_none());
+        assert!(status.message.is_none());
+        assert!(store.text_recovery.load().is_none());
+        assert!(!root.join("text.pending.json").exists());
+        assert!(!store.text_needs_direct_maintain());
+        assert!(store.index_fallback().is_none());
+        assert_eq!(count(&store), 1);
+        std::fs::remove_file(blocker).unwrap();
+
+        let rebuilt = store.rebuild_text().unwrap();
+        assert_eq!(rebuilt.config.max_hits, TextConfig::default().max_hits);
+        assert!(store.text_status().unwrap().pending_config.is_none());
+        drop(store);
+        let reopened = Store::open(root, Default::default()).unwrap();
+        assert_eq!(reopened.text_status().unwrap().config, rebuilt.config);
+        assert!(reopened.text_recovery.load().is_none());
+        assert_eq!(count(&reopened), 1);
+    }
+
+    #[test]
+    fn interrupted_configuration_intent_resumes_and_unknown_versions_are_refused() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        let pending = root.join("text.pending.json");
+        std::fs::write(&pending, br#"{"format":999}"#).unwrap();
+        assert!(Store::open(root, Default::default()).is_err());
+        let cfg = TextConfig {
+            max_hits: 7,
+            ..Default::default()
+        };
+        write_atomic(
+            &pending,
+            &crate::formats::settings_to_vec(
+                "text.pending.json",
+                &crate::text::PendingTextConfig {
+                    base: Some(crate::text::config_hash(&TextConfig::default())),
+                    config: cfg,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut built = Pause::new(root, "built");
+        let store = Store::open(root, Default::default()).unwrap();
+        built.reached();
+        assert_eq!(count(&store), 1);
+        assert_eq!(
+            store
+                .text_status()
+                .unwrap()
+                .pending_config
+                .unwrap()
+                .max_hits,
+            7
+        );
+        built.resume();
+        wait(&store);
+        assert_eq!(store.text_status().unwrap().config.max_hits, 7);
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn check_recognizes_an_installed_pending_text_configuration() {
+        let _serial = serial();
+        for reconfigure in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            if reconfigure {
+                populate(root);
+            }
+            let store = Arc::new(Store::open(root, Default::default()).unwrap());
+            let mut promotion = Pause::new(root, "before-promote");
+            let changing = store.clone();
+            let task = std::thread::spawn(move || {
+                changing.enable_text(TextConfig {
+                    max_hits: 8,
+                    languages: crate::text::Languages::from_args(&["en"]).unwrap(),
+                    ..Default::default()
+                })
+            });
+            promotion.reached();
+            let probe = crate::text::probe(root, true);
+            assert!(probe.pending && probe.pending_installed && probe.index_dir);
+            assert!(probe.open_error.is_none());
+            assert!(probe.payload.unwrap().config_matches);
+            let report = crate::check::check(root, &Default::default()).unwrap();
+            let text = report.get("text").unwrap();
+            assert_eq!(text.warnings, 1, "{text:?}");
+            assert!(text.issues[0].message.contains("promoted on open"));
+            assert_eq!(text.issues[0].file.as_deref(), Some("text.pending.json"));
+            promotion.resume();
+            task.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_snapshot_text_build_reports_unavailable_during_startup_recovery() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        std::fs::remove_dir_all(root.join("text")).unwrap();
+        let mut admitted = Pause::new(root, "admitted");
+        let store = Store::open(root, Default::default()).unwrap();
+        admitted.reached();
+        assert!(matches!(
+            store.create_snapshot_with_text(
+                "search",
+                &crate::history::At::Head,
+                &Default::default()
+            ),
+            Err(Error::TextUnavailable(_))
+        ));
+        admitted.resume();
+        wait(&store);
+        store
+            .create_snapshot_with_text("search", &crate::history::At::Head, &Default::default())
+            .unwrap();
     }
 
     #[test]

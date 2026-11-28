@@ -406,6 +406,17 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
         c.control_keyspace();
         c.catalog(catalog);
         c.text(text);
+        if let Some(id) = c.dataset_id {
+            let warnings = crate::store::text_pins::probe(root, id, c.full);
+            if !warnings.is_empty() {
+                let mut pins = Run::new("snapshot-text");
+                for (file, message) in warnings {
+                    pins.add(Issue::warning(message).file(file));
+                }
+                c.checks
+                    .push(pins.done("snapshot text indexes need attention"));
+            }
+        }
         if let Some(t) = c.checks.iter_mut().find(|x| x.name == "text") {
             t.millis += text_ms;
         }
@@ -793,7 +804,7 @@ impl Checker<'_> {
                     "a generation above CURRENT that open set aside instead of removing; inspect it, then rename it back and point CURRENT at it, or delete it"
                         .to_string(),
                 )
-            } else if n == "text.new" || n == "text.old" {
+            } else if matches!(n.as_str(), "text.new" | "text.old" | "text.configure") {
                 Some("left by an interrupted full-text rebuild; removed on open".to_string())
             } else if n.ends_with(".deleting") {
                 Some("left by an interrupted deletion; safe to remove".to_string())
@@ -2168,6 +2179,20 @@ impl Checker<'_> {
             return;
         }
         let mut run = Run::new("text");
+        if let Some(e) = p.pending_error {
+            run.add(Issue::error(format!("{e}: open fails")).file("text.pending.json"));
+            self.checks
+                .push(run.done("unreadable pending configuration"));
+            return;
+        }
+        if p.pending {
+            let message = if p.pending_installed {
+                "the index matches the pending full-text configuration, which is promoted on open"
+            } else {
+                "an online full-text configuration is pending"
+            };
+            run.add(Issue::warning(message).file("text.pending.json"));
+        }
         if let Some(e) = p.config_error {
             run.add(Issue::error(format!("{e}: open fails")).file("text.json"));
             self.checks.push(run.done("unreadable configuration"));

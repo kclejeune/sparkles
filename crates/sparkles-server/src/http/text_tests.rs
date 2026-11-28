@@ -79,10 +79,8 @@ async fn text_search_returns_hits_with_snippets() {
     }
 }
 
-/// An update operation after a change cannot search the index, which does not cover the
-/// change: `501`, and the request changes nothing. The first operation still searches.
 #[tokio::test]
-async fn updates_refuse_searches_after_their_own_changes() {
+async fn updates_search_their_own_changes() {
     let dir = tempfile::tempdir().unwrap();
     let st = Arc::new(
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
@@ -124,14 +122,16 @@ async fn updates_refuse_searches_after_their_own_changes() {
          INSERT { ?s <urn:seen> true } WHERE { ?s text:query \"fox\" }",
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
-    assert!(body.contains("write transaction"), "{body}");
-    assert_eq!(ds.store.head_commit().seq, head);
-    let (status, body) = update(
-        "PREFIX text: <http://jena.apache.org/text#> \
-         INSERT { ?s <urn:seen> true } WHERE { ?s text:query \"fox\" }",
-    )
-    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(ds.store.head_commit().seq, head + 1);
+    let (status, j) = get_json(
+        &app,
+        "/c/sparql?query=SELECT%20%3Fs%20%7B%3Fs%20%3Curn%3Aseen%3E%20true%7D%20ORDER%20BY%20%3Fs",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let rows = j["results"]["bindings"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["s"]["value"], "urn:new");
+    assert_eq!(rows[1]["s"]["value"], "urn:old");
 }

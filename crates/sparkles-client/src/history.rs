@@ -194,6 +194,7 @@ impl SnapshotRequest {
             at: None,
             expires: None,
             note: None,
+            text: None,
             warm: None,
             extra: Default::default(),
         }

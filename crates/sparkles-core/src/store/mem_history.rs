@@ -116,6 +116,7 @@ impl Store {
             generation: Some("mem".into()),
             reconstructable: true,
             warm: p.warm,
+            text_bytes: 0,
         }
     }
 
@@ -181,6 +182,8 @@ impl Store {
             expires_ms: o.expires_ms,
             warm: o.warm,
             configuration,
+            text_index: None,
+            text_bytes: 0,
         };
         m.pins.insert(name.to_string(), (pin.clone(), snap));
         Ok((self.mem_named(name, &pin), true))

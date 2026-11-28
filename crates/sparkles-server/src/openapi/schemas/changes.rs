@@ -367,6 +367,7 @@ fn history(put: &mut dyn FnMut(&str, J)) {
                     "note": string(),
                     "expires": { "type": ["string", "integer"], "description": "An RFC 3339 time, a duration from now, or seconds." },
                     "warm": { "type": ["boolean", "string"], "description": "Keep the snapshot materialized." },
+                    "text": { "type": ["boolean", "string"], "description": "Build and keep a full-text index for the snapshot." },
                 }),
             ),
             "A named snapshot to create. Each member can also be a query parameter.",

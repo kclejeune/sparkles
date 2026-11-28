@@ -1259,3 +1259,154 @@ fn rdfs_on_read_derives_from_visible_triples() {
         ]
     );
 }
+
+#[cfg(feature = "text")]
+#[test]
+fn masked_historical_text_preserves_warm_counts_and_text_views() {
+    use sparkles_core::access::Preparation;
+    use sparkles_core::index::Perm;
+    use sparkles_core::sparql::plan::GraphFilter;
+    use sparkles_core::sparql::query_snapshot_prepared;
+    use sparkles_core::sparql::stats::{CountKey, Measure, exact_counts};
+    use sparkles_core::store::Snapshot;
+    use sparkles_core::text::{PredicateSet, TextConfig};
+    use std::fmt::Write;
+
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path(), Default::default()).unwrap();
+    let mut rdf = String::from("<http://ex/visible> <http://ex/label> \"fox\" .\n");
+    for n in 0..10_001 {
+        writeln!(rdf, "<http://ex/hidden{n}> <http://ex/salary> \"fox\" .").unwrap();
+    }
+    store
+        .load(&[Source::from_bytes(
+            rdf.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    store.enable_text(Default::default()).unwrap();
+    // The commit overlay must restore this hit. The pin already indexes it.
+    ok(
+        &store,
+        "INSERT DATA { ex:restored ex:alias \"fox\" }",
+        &Default::default(),
+    );
+    let seq = store.snapshot().commit;
+    store
+        .create_snapshot_with_text("search", &At::Head, &Default::default())
+        .unwrap();
+    ok(
+        &store,
+        r#"DELETE DATA { ex:restored ex:alias "fox" . ex:hidden0 ex:salary "fox" };
+            INSERT DATA { ex:new ex:label "fox" }"#,
+        &Default::default(),
+    );
+    let commit = At::Commit(seq);
+    let pin = At::Snapshot("search".into());
+    let read = |at| store.snapshot_at(at, &Default::default()).unwrap().0;
+    let historical = read(&commit);
+    let indexed = read(&pin);
+    let count_key = CountKey {
+        perm: Perm::Pso,
+        prefix: vec![],
+        grouped: true,
+        measure: Measure::Rows,
+        graphs: GraphFilter::All,
+    };
+    let counts = exact_counts(&historical, &count_key, None, u64::MAX, &|| Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts.total(), 10_003);
+    for (at, snap) in [
+        (&commit, &read(&commit)),
+        (&pin, &indexed),
+        (&pin, &read(&pin)),
+    ] {
+        let warm = exact_counts(snap, &count_key, None, 0, &|| {
+            panic!("the {at:?} read must reuse counts")
+        })
+        .unwrap()
+        .expect("warm counts must answer without scanning");
+        assert!(Arc::ptr_eq(&counts, &warm));
+    }
+
+    let options = writer(&[(salaries(), Graphs::none(), Graphs::none())], "staff");
+    let access = options.graphs.as_ref().unwrap();
+    let preparation = Preparation::for_request(&options).unwrap();
+    let mask = |snap: &Arc<Snapshot>| {
+        let legacy = access.masked(snap).unwrap();
+        let controlled = access.masked_controlled(snap, &preparation).unwrap();
+        assert_eq!(legacy.hidden_quad_count(), 10_001);
+        (legacy, controlled)
+    };
+    let query_text = format!("{SPARQL_PREFIXES}SELECT ?s {{ ?s text:query \"fox\" }} ORDER BY ?s");
+    let check_hits = |result: Result<sparkles_core::sparql::QueryResult, Error>,
+                      expected: &[&str]| {
+        let result = result.unwrap();
+        let rows = result.rows().unwrap();
+        let subjects: Vec<_> = rows
+            .iter()
+            .map(|row| row.values()[0].as_ref().unwrap().to_string())
+            .collect();
+        assert_eq!(subjects, expected);
+    };
+    let check_view = |snap, legacy, expected: &[&str]| {
+        check_hits(query(legacy, &query_text, &options), expected);
+        check_hits(
+            query_snapshot_prepared(snap, &query_text, options.clone()),
+            expected,
+        );
+    };
+    let both = ["<http://ex/restored>", "<http://ex/visible>"];
+    let only_label = ["<http://ex/visible>"];
+    let (old_historical_mask, old_historical_controlled) = mask(&historical);
+    let (old_pin_mask, old_pin_controlled) = mask(&indexed);
+    for (at, legacy, controlled) in [
+        (&commit, &old_historical_mask, &old_historical_controlled),
+        (&pin, &old_pin_mask, &old_pin_controlled),
+    ] {
+        let again = read(at);
+        let (again_mask, again_controlled) = mask(&again);
+        assert!(Arc::ptr_eq(legacy, &again_mask));
+        assert_eq!(controlled.mask_id(), again_controlled.mask_id());
+        check_view(again, again_mask, &both);
+    }
+    assert_ne!(old_historical_mask.mask_id(), old_pin_mask.mask_id());
+    assert_ne!(
+        old_historical_controlled.mask_id(),
+        old_pin_controlled.mask_id()
+    );
+
+    // The live replacement changes the historical overlay while the pin keeps its
+    // original configuration. Removing and rebuilding the pin adopts the live one.
+    store
+        .enable_text(TextConfig {
+            predicates: PredicateSet::Only(vec!["http://ex/label".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+    let replacement = read(&commit);
+    let (replacement_mask, _replacement_controlled) = mask(&replacement);
+    check_view(replacement, replacement_mask, &only_label);
+    check_view(historical, old_historical_mask, &both);
+    check_view(indexed.clone(), old_pin_mask.clone(), &both);
+
+    store
+        .rebuild_snapshot_text("search", &Default::default())
+        .unwrap();
+    let rebuilt = read(&pin);
+    let (rebuilt_mask, rebuilt_controlled) = mask(&rebuilt);
+    assert_ne!(old_pin_mask.mask_id(), rebuilt_mask.mask_id());
+    assert_ne!(old_pin_controlled.mask_id(), rebuilt_controlled.mask_id());
+    check_view(rebuilt, rebuilt_mask, &both);
+
+    assert!(store.drop_snapshot_text("search").unwrap());
+    store
+        .rebuild_snapshot_text("search", &Default::default())
+        .unwrap();
+    let replacement = read(&pin);
+    let (replacement_mask, _replacement_controlled) = mask(&replacement);
+    check_view(replacement, replacement_mask, &only_label);
+    check_view(indexed, old_pin_mask, &both);
+}

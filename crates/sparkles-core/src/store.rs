@@ -104,6 +104,7 @@ mod replay;
 mod schedule;
 mod simulation;
 mod snapshot;
+pub(crate) mod text_pins;
 #[cfg(feature = "text")]
 pub(crate) mod text_recovery;
 // the geometry tests are the only users
@@ -647,10 +648,22 @@ impl Delta {
     /// The walk passes over the key-set leaves the two deltas share (see
     /// [`KeySet::symmetric_difference`]), so two snapshots of one store compare in time
     /// proportional to their deltas' leaves and the writes between them.
-    pub fn changes_since(&self, other: &Delta, mut f: impl FnMut(&[Id; 4]) -> bool) -> bool {
+    pub fn changes_since(&self, other: &Delta, f: impl FnMut(&[Id; 4]) -> bool) -> bool {
+        Self::changes_between(self.change_keys(), other.change_keys(), f)
+    }
+
+    pub(crate) fn change_keys(&self) -> [&KeySet; 2] {
         let i = Perm::Gspo.index();
-        self.ins[i].symmetric_difference(&other.ins[i], |k| f(&Perm::Gspo.to_quad(k)))
-            && self.del[i].symmetric_difference(&other.del[i], |k| f(&Perm::Gspo.to_quad(k)))
+        [&self.ins[i], &self.del[i]]
+    }
+
+    pub(crate) fn changes_between(
+        [ins, del]: [&KeySet; 2],
+        [other_ins, other_del]: [&KeySet; 2],
+        mut f: impl FnMut(&[Id; 4]) -> bool,
+    ) -> bool {
+        ins.symmetric_difference(other_ins, |k| f(&Perm::Gspo.to_quad(k)))
+            && del.symmetric_difference(other_del, |k| f(&Perm::Gspo.to_quad(k)))
     }
 
     /// Whether the inserted keys of `perm` (PSO or POS) hold one starting with `a, b`.
@@ -3456,7 +3469,8 @@ impl Store {
         let mut version = 0;
         let mut replayed: Vec<CommitInfo> = Vec::new();
         // the quads each replayed commit changed, for catching up the full-text index
-        let text_on = cfg!(feature = "text") && root.join("text.json").exists();
+        let text_on = cfg!(feature = "text")
+            && (root.join("text.json").exists() || root.join("text.pending.json").exists());
         let mut wal_text: Vec<(u64, Vec<[Id; 4]>)> = Vec::new();
         let mut wal_len = 0u64;
         let mut wal_index = wal::WalIndex::new(base.seq);
@@ -3815,6 +3829,7 @@ impl Store {
                 set.set_main(&store.current);
             }
         }
+        store.recover_text_pins();
         store.collect_history(gen_no, head.seq);
         store.release_link_if_rebuilt();
         if let Err(e) = store.recover_change_log() {
@@ -4365,10 +4380,40 @@ impl Store {
         crate::history::Resolved,
         history_limited::SnapshotCharge,
     )> {
+        let (snapshot, resolved, charge) = self.materialize_snapshot(at, limit, r, &live)?;
+        #[cfg(feature = "text")]
+        let snapshot = if let Some(pinned) = self.attach_text_pin(at, &snapshot, limit)? {
+            pinned
+        } else if snapshot.historical
+            && Arc::ptr_eq(&snapshot.generation, &live.generation)
+            && let Some(view) = &live.text
+        {
+            let mut adjusted = (*snapshot).clone();
+            adjusted.text = Some(Arc::new(
+                view.with_historical_changes(adjusted.commit, live.clone()),
+            ));
+            Arc::new(adjusted)
+        } else {
+            snapshot
+        };
+        Ok((snapshot, resolved, charge))
+    }
+
+    fn materialize_snapshot<C: HistoryRead>(
+        &self,
+        at: &crate::history::At,
+        limit: C,
+        r: crate::history::Resolved,
+        live: &Arc<Snapshot>,
+    ) -> Result<(
+        Arc<Snapshot>,
+        crate::history::Resolved,
+        history_limited::SnapshotCharge,
+    )> {
         if r.commit.seq == live.commit {
             limit.check(history_limited::SHARED_SNAPSHOT_BYTES)?;
             return Ok((
-                live,
+                live.clone(),
                 crate::history::Resolved {
                     historical: false,
                     ..r
@@ -4483,7 +4528,7 @@ impl Store {
         let limit = limit.holding(16 << 10)?;
         let entry = h.gens[&owner].clone();
         let generation =
-            self.history_generation_with(&mut h, owner, current, &live, &entry, seq, &limit)?;
+            self.history_generation_with(&mut h, owner, current, live, &entry, seq, &limit)?;
         let (limit, generation_bytes) =
             if C::ACCOUNTS && !Arc::ptr_eq(&generation, &live.generation) {
                 let retained = generation.retained_bytes_with(&limit)?;
@@ -4492,7 +4537,7 @@ impl Store {
                 (limit, 0)
             };
         let t0 = std::time::Instant::now();
-        let (delta, end) = self.materialize(&h, owner, &entry, &generation, &live, seq, &limit)?;
+        let (delta, end) = self.materialize(&h, owner, &entry, &generation, live, seq, &limit)?;
         let delta_charge = if C::ACCOUNTS {
             let bytes = history_limited::preparation_delta_bytes(&delta)
                 .max(history_limited::SHARED_SNAPSHOT_BYTES);
@@ -4815,6 +4860,7 @@ impl Store {
             generation: owner.and_then(|o| h.gens.get(&o)).map(|g| g.name.clone()),
             reconstructable: owner.is_some(),
             warm: p.warm,
+            text_bytes: p.text_bytes,
         }
     }
 
@@ -4892,7 +4938,40 @@ impl Store {
         at: &crate::history::At,
         o: &crate::history::SnapshotOptions,
     ) -> Result<(crate::history::NamedSnapshot, bool)> {
-        self.create_snapshot_selected(name, at, o, None)
+        self.create_snapshot_selected(name, at, o, None, None)
+    }
+
+    /// Keep a full-text index for this named snapshot in a persistent dataset.
+    pub fn create_snapshot_with_text(
+        &self,
+        name: &str,
+        at: &crate::history::At,
+        o: &crate::history::SnapshotOptions,
+    ) -> Result<(crate::history::NamedSnapshot, bool)> {
+        self.create_snapshot_with_text_controlled(name, at, o, &Default::default())
+    }
+
+    /// Create an indexed pin with cancellation and an absolute build deadline.
+    pub fn create_snapshot_with_text_controlled(
+        &self,
+        name: &str,
+        at: &crate::history::At,
+        o: &crate::history::SnapshotOptions,
+        controls: &crate::history::HistoryOptions,
+    ) -> Result<(crate::history::NamedSnapshot, bool)> {
+        if !cfg!(feature = "text") {
+            return Err(crate::text::not_built());
+        }
+        if self.root.is_none() {
+            return Err(Error::HistoryUnsupported(
+                "a snapshot text index needs a persistent dataset".into(),
+            ));
+        }
+        let result = self.create_snapshot_selected(name, at, o, None, Some(controls))?;
+        if o.warm && result.1 {
+            self.warm_snapshots();
+        }
+        Ok(result)
     }
 
     fn create_snapshot_selected(
@@ -4901,6 +4980,7 @@ impl Store {
         at: &crate::history::At,
         o: &crate::history::SnapshotOptions,
         selected: Option<&crate::history::PinnedConfiguration>,
+        text: Option<&crate::history::HistoryOptions>,
     ) -> Result<(crate::history::NamedSnapshot, bool)> {
         let (note, expires_ms) = (o.note.clone(), o.expires_ms);
         if !crate::history::valid_name(name) {
@@ -4926,8 +5006,11 @@ impl Store {
                 "named snapshots need a persistent dataset".into(),
             ));
         };
-        // no rebuild may run while the pin is being established
-        let w = self.guarded_writer();
+        // Drain pending commits and exclude generation switches while establishing the pin.
+        let w = match text {
+            Some(controls) => self.text_pin_writer(controls)?,
+            None => self.guarded_writer(),
+        };
         let head = w.head;
         let r = self.resolve_with(at, head)?;
         let seq = r.commit.seq;
@@ -4935,6 +5018,7 @@ impl Store {
         let h = hist.lock();
         if let Some(p) = h.pins.get(name) {
             if p.seq == seq
+                && (text.is_none() || p.text_index.is_some())
                 && selected.is_none_or(|selected| {
                     p.configuration
                         .as_ref()
@@ -4942,6 +5026,11 @@ impl Store {
                 })
             {
                 return Ok((self.named(&h, name, p, current, head.seq), false));
+            }
+            if p.seq == seq && text.is_some() && p.text_index.is_none() {
+                return Err(Error::Conflict(format!(
+                    "snapshot '{name}' already pins commit {seq} without a full-text index. Use PUT /$/snapshots/{{ds}}/{{name}}/text to add one"
+                )));
             }
             return Err(Error::Conflict(format!(
                 "snapshot '{name}' already pins commit {}",
@@ -4984,6 +5073,29 @@ impl Store {
                 self.opts.history_max_generations
             )));
         }
+        #[cfg(feature = "text")]
+        let (text_index, text_bytes) = if let Some(controls) = text {
+            drop(h);
+            let config = self.active_text_pin_config()?;
+            let live = self.snapshot();
+            let (snapshot, _, _) = self.materialize_snapshot(
+                at,
+                crate::history::ReadLimit {
+                    options: controls,
+                    memory: Some(self.history_cache_capacity()),
+                    held: crate::history::READ_METADATA_BYTES,
+                },
+                r,
+                &live,
+            )?;
+            let (id, bytes) = self.build_text_pin(&snapshot, config, None, controls)?;
+            h = hist.lock();
+            (Some(id), bytes)
+        } else {
+            (None, 0)
+        };
+        #[cfg(not(feature = "text"))]
+        let (text_index, text_bytes) = (None, 0);
         let pin = crate::history::Pin {
             seq,
             created_ms: self.now_ms(),
@@ -4991,6 +5103,8 @@ impl Store {
             expires_ms,
             warm: o.warm,
             configuration,
+            text_index,
+            text_bytes,
         };
         h.pins.insert(name.to_string(), pin.clone());
         if let Err(e) = crate::history::write_file(
@@ -5002,6 +5116,8 @@ impl Store {
             h.catalog,
         ) {
             h.pins.remove(name);
+            // A failed directory sync can follow the metadata rename. Keep the staged
+            // UUID for startup to reconcile against the durable history file.
             return Err(e);
         }
         drop(w);
@@ -5031,6 +5147,7 @@ impl Store {
             h.pins.insert(name.to_string(), pin);
             return Err(e);
         }
+        self.remove_text_pin(pin.text_index);
         self.collect_locked(&mut h, current, w.head.seq);
         Ok(true)
     }
@@ -5226,7 +5343,9 @@ impl Store {
                 .iter()
                 .filter(|g| !g.current)
                 .map(|g| g.bytes)
-                .sum(),
+                .chain(h.pins.values().map(|pin| pin.text_bytes))
+                .try_fold(0u64, u64::checked_add)
+                .unwrap_or(u64::MAX),
             generations,
             retention: h.retention,
             snapshots: h.pins.len(),
@@ -5437,35 +5556,61 @@ impl Store {
 
     // ------------------------------------------------------------ full-text ------
 
-    /// Open the full-text index if `text.json` enables it (rebuilding it if needed).
+    /// Open the active full-text index and resume an interrupted configuration or recovery.
     fn open_text(&self, wal: &[(u64, Vec<[Id; 4]>)]) -> Result<()> {
         let Some(root) = &self.root else {
             return Ok(());
         };
         #[cfg(feature = "text")]
         {
-            let Some(mut cfg) = crate::text::imp_read_config(root)? else {
-                return Ok(());
-            };
-            // An installed dictionary that differs from the one the index was built with
-            // becomes the index's dictionary: the configuration changes, so the index is
-            // rebuilt in the background below. A missing one leaves the configuration as
-            // it is, and the index cannot open until the dictionary is installed.
-            if !cfg.dictionaries.is_empty() {
+            let cfg = crate::text::imp_read_config(root)?;
+            let mut pending = crate::text::read_pending_config(root)?;
+            if pending
+                .as_ref()
+                .is_some_and(|intent| !intent.applies_to(cfg.as_ref()))
+            {
+                // A later active settings edit supersedes this intent.
+                text_recovery::remove_pending(root)?;
+                pending = None;
+            }
+            let refresh = |cfg: &crate::text::TextConfig| {
+                if cfg.dictionaries.is_empty() {
+                    return cfg.clone();
+                }
                 match cfg.clone().with_dictionaries() {
-                    Ok(refreshed) if refreshed.dictionaries != cfg.dictionaries => {
-                        tracing::warn!(target: "sparkles::store", "{}: an installed text dictionary changed; rebuilding the full-text index", root.display());
-                        write_atomic(
-                            &root.join("text.json"),
-                            &crate::formats::settings_to_vec("text.json", &refreshed)?,
-                        )?;
-                        cfg = refreshed;
-                    }
-                    Ok(_) => {}
+                    Ok(refreshed) => refreshed,
                     Err(e) => {
                         tracing::error!(target: "sparkles::store", "{}: full-text dictionary: {e}", root.display());
+                        cfg.clone()
                     }
                 }
+            };
+            if let Some(intent) = pending.as_mut() {
+                let refreshed = refresh(&intent.config);
+                if refreshed != intent.config {
+                    intent.config = refreshed;
+                    write_atomic(
+                        &root.join("text.pending.json"),
+                        &crate::formats::settings_to_vec("text.pending.json", intent)?,
+                    )?;
+                }
+            }
+            let cfg = cfg.map(|config| -> Result<_> {
+                let refreshed = refresh(&config);
+                if pending.is_none() && refreshed != config {
+                    tracing::warn!(target: "sparkles::store", "{}: an installed text dictionary changed; rebuilding the full-text index", root.display());
+                    write_atomic(
+                        &root.join("text.json"),
+                        &crate::formats::settings_to_vec("text.json", &refreshed)?,
+                    )?;
+                }
+                Ok(refreshed)
+            }).transpose()?;
+            if cfg.is_none() && pending.is_none() {
+                if root.join("text.configure").exists() {
+                    crate::text::cleanup_staging(root)?;
+                }
+                return Ok(());
             }
             let snap = self.snapshot();
             let first_wal_seq = snap
@@ -5517,15 +5662,16 @@ impl Store {
             // commits that the branch does not have, so it is never copied. Without a usable checkpoint the index recovers in the background.
             if snap.generation.linked().is_some()
                 && !root.join("text").exists()
+                && let Some(cfg) = &cfg
                 && let (Some(ident), Some(set)) = (&self.branching.ident, self.branch_set())
                 && let Some(source) = set.current_of(ident.from.branch_id)
                 && let Some(view) = &source.text
                 && let Err(e) =
-                    crate::text::seed_branch(view, root, &cfg, ident.from.seq.min(snap.commit))
+                    crate::text::seed_branch(view, root, cfg, ident.from.seq.min(snap.commit))
             {
                 tracing::warn!(target: "sparkles::store", "cannot reuse upstream text index: {e}; recovering in the background");
             }
-            match crate::text::TextIndex::open_ready(
+            let reuse = |cfg: &crate::text::TextConfig| match crate::text::TextIndex::open_ready(
                 root,
                 cfg.clone(),
                 &snap,
@@ -5534,23 +5680,42 @@ impl Store {
             ) {
                 Ok(Some((ti, view))) => {
                     self.text.store(Some(Arc::new(ti)));
-                    let mut s = (*snap).clone();
-                    s.text = Some(view);
-                    self.current.store(Arc::new(s));
+                    let mut snapshot = (*snap).clone();
+                    snapshot.text = Some(view);
+                    self.current.store(Arc::new(snapshot));
+                    true
                 }
-                Ok(None) => {
-                    self.register_text_recovery(cfg);
-                }
+                Ok(None) => false,
                 Err(e) => {
                     tracing::error!(target: "sparkles::store", "full-text startup: {e}; recovering");
-                    self.register_text_recovery(cfg);
+                    false
                 }
+            };
+            if let Some(intent) = pending {
+                if reuse(&intent.config) {
+                    // An interrupted publication already installed the desired index.
+                    // Serving it is safe even if settings cannot be promoted yet.
+                    if let Err(error) = text_recovery::promote_pending(root, &intent.config) {
+                        tracing::warn!(target: "sparkles::store", %error, "could not promote the recovered text configuration");
+                    }
+                } else {
+                    if let Some(cfg) = &cfg
+                        && cfg != &intent.config
+                    {
+                        reuse(cfg);
+                    }
+                    self.register_text_recovery(intent.config, true);
+                }
+            } else if let Some(cfg) = cfg
+                && !reuse(&cfg)
+            {
+                self.register_text_recovery(cfg, false);
             }
         }
         #[cfg(not(feature = "text"))]
         let _ = wal;
         #[cfg(not(feature = "text"))]
-        if root.join("text.json").exists() {
+        if root.join("text.json").exists() || root.join("text.pending.json").exists() {
             tracing::warn!(
                 target: "sparkles::store",
                 "{}: full-text search is configured but this build has no `text` feature",
@@ -5568,19 +5733,33 @@ impl Store {
         self.text_recovery
             .load()
             .as_ref()
-            .is_some_and(|job| job.pending())
-            || self.text.load().as_ref().is_some_and(|t| t.rebuilding())
+            .is_some_and(|job| self.text_recovery_excludes_group(job))
+            || self
+                .text
+                .load()
+                .as_ref()
+                .is_some_and(|t| t.rebuilding() || t.retirement_failed())
+    }
+
+    #[cfg(feature = "text")]
+    fn text_recovery_excludes_group(&self, job: &text_recovery::Recovery) -> bool {
+        job.pending() && (!job.failed_configuration() || self.text.load().is_none())
     }
 
     /// Apply a WAL commit's changes to the full-text index and give `snap` its view.
     fn maintain_text(&self, snap: &mut Snapshot, log: &[(u8, [Id; 4])]) {
         #[cfg(feature = "text")]
-        if let Some(job) = self.text_recovery.load_full().filter(|j| j.pending()) {
-            job.record(snap, log);
-            snap.text = Some(job.view(snap.commit));
-        } else if let Some(ti) = self.text.load_full() {
-            let prev = snap.text.take();
-            snap.text = ti.apply_commit(snap, log, prev.as_ref());
+        {
+            let recovery = self.text_recovery.load_full().filter(|j| j.pending());
+            if let Some(job) = &recovery {
+                job.record(snap, log);
+            }
+            if let Some(ti) = self.text.load_full() {
+                let prev = snap.text.take();
+                snap.text = ti.apply_commit(snap, log, prev.as_ref());
+            } else if let Some(job) = recovery {
+                snap.text = Some(job.view(snap.commit));
+            }
         }
         #[cfg(not(feature = "text"))]
         let _ = (snap, log);
@@ -5596,12 +5775,12 @@ impl Store {
         snap: &mut Snapshot,
         log: &[(u8, [Id; 4])],
     ) -> Option<crate::text::Staged> {
-        debug_assert!(
+        assert!(
             self.text_recovery
                 .load()
                 .as_ref()
-                .is_none_or(|job| !job.pending()),
-            "a grouped commit while full-text recovery is pending"
+                .is_none_or(|job| !self.text_recovery_excludes_group(job)),
+            "a grouped commit while full-text recovery is recording"
         );
         let ti = self.text.load_full()?;
         self.failpoint("group-staging-text");
@@ -5616,65 +5795,96 @@ impl Store {
     /// previous view stays, and text queries report the index as stale).
     fn rebuild_text_locked(&self, snap: &mut Snapshot, old: &Snapshot) {
         #[cfg(feature = "text")]
-        if let Some(job) = self.text_recovery.load_full().filter(|j| j.pending()) {
-            job.changed_generation();
-            snap.text = Some(job.view(snap.commit));
-        } else if let Some(ti) = self.text.load_full() {
-            let incremental = ti.apply_bulk(old, snap).unwrap_or_else(|e| {
-                tracing::warn!(target: "sparkles::store", "full-text index after a bulk commit: {e}; rebuilding");
-                None
-            });
-            // an online rebuild that runs meanwhile builds the index again once it is
-            // done, since the generation changed: until then the index is behind
-            let view = match incremental {
-                Some(v) => Ok(Some(v)),
-                None => ti.try_rebuild(snap),
-            };
-            snap.text = match view {
-                Ok(Some(v)) => Some(v),
-                Ok(None) => old.text.clone(),
-                Err(e) => {
-                    tracing::error!(target: "sparkles::store", "full-text rebuild after a bulk commit failed: {e}");
-                    old.text.clone()
-                }
-            };
+        {
+            let recovery = self.text_recovery.load_full().filter(|j| j.pending());
+            if let Some(job) = &recovery {
+                job.changed_generation();
+            }
+            if let Some(ti) = self.text.load_full() {
+                let incremental = ti.apply_bulk(old, snap).unwrap_or_else(|e| {
+                    tracing::warn!(target: "sparkles::store", "full-text index after a bulk commit: {e}; rebuilding");
+                    None
+                });
+                // an online rebuild that runs meanwhile builds the index again once it is
+                // done, since the generation changed: until then the index is behind
+                let view = match incremental {
+                    Some(v) => Ok(Some(v)),
+                    None => ti.try_rebuild(snap),
+                };
+                snap.text = match view {
+                    Ok(Some(v)) => Some(v),
+                    Ok(None) => old.text.clone(),
+                    Err(e) => {
+                        tracing::error!(target: "sparkles::store", "full-text rebuild after a bulk commit failed: {e}");
+                        old.text.clone()
+                    }
+                };
+            } else if let Some(job) = recovery {
+                snap.text = Some(job.view(snap.commit));
+            }
         }
         #[cfg(not(feature = "text"))]
         let _ = (snap, old);
     }
 
-    /// Enable (or reconfigure) full-text search and build the index from the current
-    /// state. The configuration is kept in `text.json`. This synchronous operation
-    /// cancels and joins startup recovery before installing the requested configuration.
+    /// Enable or reconfigure full-text search online. This call waits for publication.
+    /// A previous active index continues to serve during the build.
     #[cfg(feature = "text")]
     pub fn enable_text(&self, cfg: crate::text::TextConfig) -> Result<crate::text::TextStatus> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
-        // the dictionaries of dictionary analyzers are found before anything changes
         let cfg = cfg.with_dictionaries()?;
+        let job = {
+            let _lifecycle = self.text_lifecycle.lock();
+            self.stop_text_recovery();
+            let w = self.guarded_writer();
+            if w.poisoned {
+                return Err(Error::Poisoned);
+            }
+            if w.closed {
+                return Err(Error::Cancelled);
+            }
+            if let Some(ti) = self.text.load_full()
+                && ti.config() == &cfg
+            {
+                let snap = self.snapshot();
+                let status = ti.status(snap.text.as_deref(), snap.commit);
+                if status.state == "ready" {
+                    if let Some(root) = &self.root {
+                        // A successful swap may have left its settings promotion pending.
+                        text_recovery::promote_pending(root, &cfg)?;
+                    }
+                    return Ok(status);
+                }
+            }
+            if let Some(root) = &self.root {
+                let base = crate::text::imp_read_config(root)?
+                    .as_ref()
+                    .map(crate::text::config_hash);
+                write_atomic(
+                    &root.join("text.pending.json"),
+                    &crate::formats::settings_to_vec(
+                        "text.pending.json",
+                        &crate::text::PendingTextConfig {
+                            base,
+                            config: cfg.clone(),
+                        },
+                    )?,
+                )?;
+            }
+            self.register_text_recovery(cfg, true)
+        };
+        job.clone().execute()?;
+        job.wait()?;
         let _lifecycle = self.text_lifecycle.lock();
-        self.stop_text_recovery();
-        // an online rebuild of the current index finishes first (it builds in `text.new`)
-        let current = self.text.load_full();
-        let _rebuild = current.as_ref().map(|t| t.lock_rebuild());
-        let _w = self.guarded_writer();
-        if let Some(current) = &current {
-            current.retire()?;
+        if !self
+            .text_recovery
+            .load()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &job))
+        {
+            return Err(Error::Cancelled);
         }
-        self.text.store(None);
-        if let Some(root) = &self.root {
-            write_atomic(
-                &root.join("text.json"),
-                &crate::formats::settings_to_vec("text.json", &cfg)?,
-            )?;
-        }
-        let snap = self.snapshot();
-        let (ti, view) = crate::text::TextIndex::open(self.root.as_deref(), cfg, &snap, &[])?;
-        let ti = Arc::new(ti);
-        self.text.store(Some(ti.clone()));
-        let mut s = (*snap).clone();
-        s.text = Some(view.clone());
-        self.current.store(Arc::new(s));
-        Ok(ti.status(Some(&view), snap.commit))
+        self.text_status().ok_or(Error::Cancelled)
     }
 
     /// Turn full-text search off and delete its index. Cancels and joins startup
@@ -5690,16 +5900,21 @@ impl Store {
         if let Some(current) = &current {
             current.retire()?;
         }
+        if let Some(root) = &self.root {
+            text_recovery::remove_pending(root)?;
+            match std::fs::remove_file(root.join("text.json")) {
+                Ok(()) => sync_dir(root)?,
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
         self.text.store(None);
         let mut s = (*self.snapshot()).clone();
         s.text = None;
         self.current.store(Arc::new(s));
         if let Some(root) = &self.root {
-            match std::fs::remove_file(root.join("text.json")) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
             let _ = std::fs::remove_dir_all(root.join("text"));
+            let _ = std::fs::remove_dir_all(root.join("text.configure"));
             let _ = std::fs::remove_file(root.join("text.dirty"));
         }
         Ok(())
@@ -5726,10 +5941,9 @@ impl Store {
             // from disabling/reconfiguring this dataset and cancelling the join.
             drop(lifecycle);
             #[cfg(test)]
-            text_recovery::hook(
-                self.root.as_deref().expect("persistent recovery"),
-                "manual-join",
-            );
+            if let Some(root) = &self.root {
+                text_recovery::hook(root, "manual-join");
+            }
             job.wait()?;
             let _lifecycle = self.text_lifecycle.lock();
             if !self
@@ -5747,6 +5961,19 @@ impl Store {
             .text
             .load_full()
             .ok_or_else(|| Error::invalid("full-text search is not enabled"))?;
+        if let Some(job) = self.text_recovery.load_full() {
+            if job.failed_configuration() {
+                if let Some(root) = &self.root {
+                    text_recovery::remove_pending(root)?;
+                }
+                self.stop_text_recovery();
+            } else if !job.pending() && job.message().is_some() {
+                if let Some(root) = &self.root {
+                    text_recovery::promote_pending(root, ti.config())?;
+                }
+                self.stop_text_recovery();
+            }
+        }
         // before the writer lock, which a rebuild holding this waits for
         let guard = ti.lock_rebuild();
         let start = {
@@ -5783,14 +6010,21 @@ impl Store {
     #[cfg(feature = "text")]
     pub fn text_status(&self) -> Option<crate::text::TextStatus> {
         let snap = self.snapshot();
-        if let Some(job) = self.text_recovery.load_full().filter(|job| job.pending()) {
-            return Some(job.status(snap.commit));
-        }
+        let recovery = self.text_recovery.load_full();
         if let Some(ti) = self.text.load_full() {
-            return Some(ti.status(snap.text.as_deref(), snap.commit));
+            let mut status = ti.status(snap.text.as_deref(), snap.commit);
+            if let Some(job) = recovery {
+                if job.pending() {
+                    status.pending_config = Some(job.config().clone());
+                }
+                if status.message.is_none() {
+                    status.message = job.message();
+                }
+            }
+            return Some(status);
         }
-        self.text_recovery
-            .load_full()
+        recovery
+            .filter(|job| job.pending())
             .map(|job| job.status(snap.commit))
     }
 
@@ -6542,12 +6776,17 @@ impl Store {
                 .text_recovery
                 .load()
                 .as_ref()
-                .is_some_and(|job| job.pending())
+                .is_some_and(|job| self.text_recovery_excludes_group(job))
             {
                 return Some(Fallback::TextRecovering);
             }
-            if self.text.load().as_ref().is_some_and(|t| t.rebuilding()) {
-                return Some(Fallback::TextRebuilding);
+            if let Some(index) = self.text.load().as_ref() {
+                if index.retirement_failed() {
+                    return Some(Fallback::TextRecovering);
+                }
+                if index.rebuilding() {
+                    return Some(Fallback::TextRebuilding);
+                }
             }
         }
         if self.geo.load().is_some() {
@@ -8059,15 +8298,15 @@ impl Store {
             }
         };
         let mut out = Vec::new();
+        // Persistent copies use the same durable active settings as file backup.
         #[cfg(feature = "text")]
-        // a configured index that is still recovering keeps its configuration too
-        let text_cfg = match self.text.load().as_ref() {
-            Some(ti) => Some(serde_json::to_vec_pretty(ti.config()).unwrap()),
-            None => self
-                .text_recovery
+        let text_cfg = if self.root.is_some() {
+            read("text.json")?
+        } else {
+            self.text
                 .load()
                 .as_ref()
-                .map(|job| serde_json::to_vec_pretty(job.config()).unwrap()),
+                .map(|ti| serde_json::to_vec_pretty(ti.config()).unwrap())
         };
         #[cfg(not(feature = "text"))]
         let text_cfg = read("text.json")?;
@@ -8783,10 +9022,10 @@ impl WriteTxn<'_> {
             .cacheable(false)
             .results(Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)))
             .delta(self.delta.clone())
-            // the full-text index does not cover this transaction's changes either, and
-            // a search has no plan without it: refused once there are changes
             .text(match &self.base.text {
-                Some(t) if self.is_dirty() => Some(Arc::new(t.with_uncommitted_changes())),
+                Some(t) if self.is_dirty() => Some(Arc::new(
+                    t.with_uncommitted_changes(self.bulk.is_empty().then(|| self.base.clone())),
+                )),
                 t => t.clone(),
             })
             // the index does not cover this transaction's changes: plans without it

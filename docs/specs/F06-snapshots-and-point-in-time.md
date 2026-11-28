@@ -151,7 +151,7 @@ Error bodies keep the `{ "error": … }` shape and gain a stable `code`.
 | Unknown snapshot name | 404 | `no-such-snapshot` | `no snapshot 'v9' in dataset ds` |
 | The commit existed but its data is gone, or its metadata is gone (`< firstRetained`) | **410** | `history-gone` | See below. |
 | In-memory dataset with `at` ≠ head | 501 | `history-unsupported` | `point-in-time reads need a persistent dataset` |
-| `text:query` at a historical snapshot | 501 | `text-not-at-commit` | `full-text search is only available at the head (commit 57); this query reads commit 42` |
+| `text:query` at a historical commit without a supported index | 501 | `history-unsupported` | `historical full-text search requires an active index in the current generation or an indexed named snapshot; this query reads commit 42` |
 | Materialization exceeds the history memory budget | 507 | `budget: "history-memory"` | Same as other budgets (`limit`, `requested`). |
 | Timeout or cancellation during materialization | 408 / 503 | — | Unchanged. |
 | A sealed WAL fails its CRC check before the target commit | 500 | — | `corrupt index: gen-0003/wal.log: checksum mismatch …` |
@@ -1431,8 +1431,9 @@ number commits the same way. Result-cache keys use the generation and the commit
 past and live states never share entries.
 
 **Deviations.**
-* `text:query` at a past commit answers `501` with the general `history-unsupported`
-  code, not a separate `text-not-at-commit` code.
+* The initial delivery used the general `history-unsupported` code for past
+  `text:query` calls. [F03](F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12)
+  adds bounded searches in the current generation and indexed named snapshots.
 * A materialization larger than `--history-cache-mb` fails with the shared budget error
   of [C01](C01-observability-and-budgets.md) (`507`, `budget: "memory"`), not a
   `history-memory` code.

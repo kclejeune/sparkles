@@ -91,6 +91,131 @@ fn err(s: &Store, q: &str) -> String {
 }
 
 #[test]
+fn text_search_reads_the_current_transaction_and_abort_leaves_the_live_index() {
+    let s = mem();
+    let live = s.text_status().unwrap();
+    let query = "SELECT ?s { (?s ?score) text:query (rdfs:label \"fox\" 1) }";
+    let next = s.snapshot().commit + 1;
+    {
+        let mut tx = s.write();
+        let label = oxrdf::NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label");
+        let quad = |subject, object| {
+            oxrdf::Quad::new(
+                oxrdf::NamedNode::new_unchecked(subject),
+                label.clone(),
+                object,
+                oxrdf::GraphName::DefaultGraph,
+            )
+        };
+        let removed = quad(
+            "http://example.org/b1",
+            oxrdf::Literal::new_language_tagged_literal("The Quick Brown Fox", "en").unwrap(),
+        );
+        let added = quad(
+            "http://example.org/extra",
+            oxrdf::Literal::from("fox (quokka)"),
+        );
+        let removed = tx.encode_quad(&removed, &mut Default::default()).unwrap();
+        let added = tx.encode_quad(&added, &mut Default::default()).unwrap();
+        assert!(tx.delete(removed).unwrap());
+        assert!(tx.insert(added).unwrap());
+        let tx_view = std::sync::Arc::new(tx.view());
+        assert_eq!(rows_at(tx_view.clone(), query), ["extra"]);
+        assert_eq!(
+            rows_at(tx_view.clone(), "SELECT ?s { ?s text:query \"quoka~1\" }"),
+            ["extra"]
+        );
+        let memory = QueryOptions {
+            max_memory_bytes: Some(1 << 20),
+            ..Default::default()
+        };
+        assert!(matches!(
+            sparkles_core::sparql::query(tx_view, &format!("{P}{query}"), &memory),
+            Err(sparkles_core::Error::BudgetExceeded(b))
+                if b.kind == sparkles_core::BudgetKind::Memory && b.requested > b.limit
+        ));
+    }
+    assert_eq!(rows(&s, query), ["b1"]);
+    assert!(rows(&s, "SELECT ?s { ?s text:query \"quokka\" }").is_empty());
+    let after = s.text_status().unwrap();
+    assert_eq!((after.docs, after.seq), (live.docs, live.seq));
+    assert_eq!(s.snapshot().commit + 1, next);
+}
+
+#[test]
+fn later_update_operations_search_staged_text() {
+    let s = Store::in_memory(Default::default());
+    s.enable_text(Default::default()).unwrap();
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!(
+            r#"{P}
+            INSERT DATA {{ ex:q rdfs:label "quokka" }};
+            INSERT {{ ?s ex:found true }} WHERE {{ ?s text:query "quokka" }};
+            DELETE DATA {{ ex:q rdfs:label "quokka" }};
+            INSERT {{ ?s ex:unexpected true }} WHERE {{ ?s text:query "quokka" }}
+        "#
+        ),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(rows(&s, "SELECT ?s { ?s ex:found true }"), ["q"]);
+    assert!(rows(&s, "SELECT ?s { ?s ex:unexpected true }").is_empty());
+    assert!(rows(&s, "SELECT ?s { ?s text:query \"quokka\" }").is_empty());
+}
+
+#[test]
+fn adjusted_search_counts_visible_hits_against_the_same_cap() {
+    let s = Store::in_memory(Default::default());
+    let label = "http://www.w3.org/2000/01/rdf-schema#label";
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!(r#"INSERT DATA {{ <urn:a> <{label}> "fox" . <urn:b> <{label}> "fox" }}"#),
+        &Default::default(),
+    )
+    .unwrap();
+    s.enable_text(TextConfig {
+        max_hits: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = format!(r#"{P}SELECT ?s {{ ?s text:query "fox" }}"#);
+    let refused = |res: sparkles_core::Result<sparkles_core::sparql::QueryResult>| {
+        assert!(matches!(res, Err(sparkles_core::Error::BudgetExceeded(b))
+            if b.kind == sparkles_core::BudgetKind::Rows && b.limit == 1 && b.requested > b.limit));
+    };
+    refused(query(s.snapshot(), &q, &Default::default()));
+    let mut tx = s.write();
+    let quad = |subject| {
+        oxrdf::Quad::new(
+            oxrdf::NamedNode::new_unchecked(subject),
+            oxrdf::NamedNode::new_unchecked(label),
+            oxrdf::Literal::from("fox"),
+            oxrdf::GraphName::DefaultGraph,
+        )
+    };
+    let removed = tx
+        .encode_quad(&quad("urn:b"), &mut Default::default())
+        .unwrap();
+    assert!(tx.delete(removed).unwrap());
+    assert_eq!(
+        query(std::sync::Arc::new(tx.view()), &q, &Default::default())
+            .unwrap()
+            .len(),
+        1
+    );
+    let added = tx
+        .encode_quad(&quad("urn:c"), &mut Default::default())
+        .unwrap();
+    assert!(tx.insert(added).unwrap());
+    refused(query(
+        std::sync::Arc::new(tx.view()),
+        &q,
+        &Default::default(),
+    ));
+}
+
+#[test]
 fn retrieval_semantics() {
     let s = mem();
     // A1: default graph only; tokens, not substrings; typed literals not indexed
@@ -308,7 +433,7 @@ fn updates_are_visible_to_the_next_query() {
 /// instead of returning hits that miss its inserts and keep its deletes. After the
 /// commit the search sees the changes.
 #[test]
-fn transactions_refuse_text_searches_after_a_change() {
+fn transactions_search_their_own_changes() {
     use sparkles_core::sparql::update::update_in;
     let text_q = "SELECT ?s { ?s text:query \"fox\" }";
     let plain_q = "SELECT ?s { ?s rdfs:label \"fox\" }";
@@ -350,24 +475,18 @@ fn transactions_refuse_text_searches_after_a_change() {
         update_in(&mut txn, &format!("{P}{change}"), &o).unwrap();
         // ordinary queries see the change
         assert_eq!(sorted(rows_at(view(&txn), plain_q)), during, "{change}");
-        // searches are refused
-        let e = query(view(&txn), &format!("{P}{text_q}"), &o)
-            .err()
-            .unwrap_or_else(|| panic!("{change}: the search ran"));
-        assert!(
-            matches!(e, sparkles_core::Error::Unsupported(_))
-                && e.to_string().contains("write transaction"),
-            "{change}: {e}"
-        );
-        // so are the searches of later update operations
-        let e = update_in(
+        assert_eq!(sorted(rows_at(view(&txn), text_q)), during, "{change}");
+        update_in(
             &mut txn,
-            &format!("{P}DELETE {{ ?s ex:seen true }} WHERE {{ ?s text:query \"fox\" }}"),
+            &format!("{P}INSERT {{ ?s ex:later true }} WHERE {{ ?s text:query \"fox\" }}"),
             &o,
         )
-        .err()
-        .unwrap_or_else(|| panic!("{change}: the update's search ran"));
-        assert!(e.to_string().contains("write transaction"), "{change}: {e}");
+        .unwrap();
+        assert_eq!(
+            sorted(rows_at(view(&txn), "SELECT ?s { ?s ex:later true }")),
+            during,
+            "{change}"
+        );
         txn.commit().unwrap();
         // after the commit, both see the change
         assert_eq!(sorted(rows(&s, plain_q)), after, "{change}");

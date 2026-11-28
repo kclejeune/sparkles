@@ -180,6 +180,7 @@ impl TripleRules {
 /// Link back to the base snapshot's non-owning mask deduplication slot so dropping
 /// the last masked snapshot evicts its dead entry on a best-effort basis.
 pub(crate) struct MaskCacheLink {
+    text: crate::text::MaskTextIdentity,
     cache: std::sync::Weak<crate::sparql::stats::CountCache>,
     kind: crate::sparql::stats::MaskCacheKind,
     slot: crate::sparql::stats::MaskSlot,
@@ -206,6 +207,9 @@ pub struct Mask {
     /// the bytes of delta nodes the masked snapshot alone owns: those that hiding the
     /// quads copied or created
     pub(crate) retained: u64,
+    /// Original GSPO roots for text overlays. The mask's deletions are not RDF changes.
+    #[cfg(feature = "text")]
+    pub(crate) text_delta: Option<[crate::store::KeySet; 2]>,
     /// optional non-owning link to evict our dead slot from the base snapshot's cache
     pub(crate) cache_link: std::sync::OnceLock<MaskCacheLink>,
 }
@@ -226,12 +230,23 @@ impl Drop for Mask {
         if let Some(link) = self.cache_link.get()
             && let Some(cache) = link.cache.upgrade()
         {
-            cache.evict_mask_slot(link.kind, &self.key, &link.slot);
+            cache.evict_mask_slot(link.kind, &self.key, link.text, &link.slot);
         }
     }
 }
 
 impl Mask {
+    #[cfg(feature = "text")]
+    fn text_delta(snap: &Snapshot) -> Option<[crate::store::KeySet; 2]> {
+        snap.text.as_ref()?.overlay_base.as_ref()?;
+        Some(
+            snap.mask
+                .as_ref()
+                .and_then(|mask| mask.text_delta.clone())
+                .unwrap_or_else(|| snap.delta.change_keys().map(Clone::clone)),
+        )
+    }
+
     /// Whether the quad `[s, p, o, g]` is hidden.
     pub fn hides(&self, q: &[u64; 4]) -> bool {
         self.hidden.binary_search(q).is_ok()
@@ -241,11 +256,13 @@ impl Mask {
         &self,
         cache: &Arc<crate::sparql::stats::CountCache>,
         kind: crate::sparql::stats::MaskCacheKind,
+        text: crate::text::MaskTextIdentity,
         slot: crate::sparql::stats::MaskSlot,
     ) {
         let _ = self.cache_link.set(MaskCacheLink {
             cache: Arc::downgrade(cache),
             kind,
+            text,
             slot,
         });
     }
@@ -291,7 +308,8 @@ pub(super) fn masked(
         key.push_str("|ev:");
         key.push_str(&cfg.fingerprint);
     }
-    let slot = snap.counts.mask_slot(&key);
+    let text = crate::text::MaskTextIdentity::of(snap);
+    let slot = snap.counts.mask_slot(&key, text);
     let mut held = slot.lock();
     if let Some(m) = held.upgrade() {
         return Ok(m);
@@ -326,8 +344,12 @@ pub(super) fn masked(
         Ok(hidden) => hidden,
         Err(err) => {
             drop(held);
-            snap.counts
-                .evict_mask_slot(crate::sparql::stats::MaskCacheKind::Legacy, &key, &slot);
+            snap.counts.evict_mask_slot(
+                crate::sparql::stats::MaskCacheKind::Legacy,
+                &key,
+                text,
+                &slot,
+            );
             return Err(err);
         }
     };
@@ -337,6 +359,7 @@ pub(super) fn masked(
         mask.attach_cache(
             &snap.counts,
             crate::sparql::stats::MaskCacheKind::Legacy,
+            text,
             slot.clone(),
         );
     }
@@ -397,6 +420,8 @@ pub(crate) fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot 
             key,
             hidden,
             retained,
+            #[cfg(feature = "text")]
+            text_delta: Mask::text_delta(snap),
             cache_link: std::sync::OnceLock::new(),
         })),
         ..snap.clone()

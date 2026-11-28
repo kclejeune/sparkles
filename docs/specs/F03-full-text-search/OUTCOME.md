@@ -85,8 +85,8 @@ admission excluded continuously. A ready view's owner also distinguishes same-co
 configuration replacements in the result cache. Same-family callbacks are refused before
 lifecycle locks or joins and keep their query/commit failure sticky.
 
-Explicit enable/reconfigure remain synchronous. Explicit rebuild is a synchronous online
-build or a join/retry of startup recovery. HTTP task cancellation retains the existing
+The Rust configuration call waits for the online build to publish. Explicit rebuild is
+a synchronous online build or a join or retry of startup recovery. HTTP task cancellation retains the existing
 synchronous native rebuild behavior; this change introduces no per-waiter Ctl API.
 An admitted directory publication fence completes before automatic cancellation returns.
 Cancellation is checked between batches of documents and before each blocking step of a
@@ -476,39 +476,49 @@ sized at about one to two weeks.
   and user dictionaries for Kuromoji and Nori remain, as item 250.
 * **Analyzers for the other languages of jena-text,** such as Greek, Arabic, Persian and
   Hindi, which use Snowball stemmers or none today. Item 251 records them.
-* **Online enable and reconfigure.** `Store::enable_text` in
-  `crates/sparkles-core/src/store.rs` takes the writer lock (`guarded_writer`) for the
-  whole build, and *Online rebuilds* above records that reconfiguring still builds
-  with writes waiting. Enabling and reconfiguring reuse the online rebuild: write
-  `text.json` as pending, start the journal under the lock, build into `text.new`
-  from a snapshot with writes going on, apply the journal under the lock and swap.
-  Until the swap, a reconfigured index keeps serving searches with its old
-  configuration, and a newly enabled one answers `503` with `text-unavailable`, the
-  error a search gets today while startup recovery rebuilds the index. `GET /$/text/{ds}` shows the pending
-  configuration beside the active one. Acceptance: enabling the index on 10.5M triples
-  while single-triple writes run keeps their median latency within twice the latency
-  without the build, as the rebuild measurement above does.
-* **Search after uncommitted writes.** A `text:query` in a write transaction after the
-  transaction changed data fails with `uncommitted_changes()` (`text.rs`, checked in
-  `text/search.rs` through `view.uncommitted`). The transaction's own inserts and
-  deletes are in its delta. A search in that state runs against the committed index,
-  drops hits whose quads the transaction deleted, and adds hits from an in-memory
-  Tantivy index (`RamDirectory`) of the transaction's inserted literals, built on the
-  first search and extended on later ones. Scores of the two indexes are not
-  comparable as BM25 statistics differ, so the merged hits are re-scored with the
-  committed index's document frequencies, which the searcher exposes. A transaction
-  whose inserted text passes a budget (by default 10,000 literals) keeps the current
-  error. Acceptance: in one transaction, insert `ex:a rdfs:label "quokka"`, then
-  `text:query "quokka"` returns `ex:a`; delete an existing indexed literal, and it
-  is no longer returned.
-* **Historical full-text.** A `text:query` at `?at=` answers `501`
-  ([F06 §11.6](../F06-snapshots-and-point-in-time.md)). Two steps: first, a search at a
-  past commit in the current generation runs against the head index and corrects it by
-  the commits between, as the transaction case above does with the reversed changes
-  from the change log (bounded by the same budget). Second, a pin can be created with
-  `text: true`, which builds and keeps a Tantivy index for the pinned state in the
-  pin's directory, charged to the pin's bytes in retention. Other past states keep
-  answering `501`.
+* **Online enable and reconfigure.** The configuration builder uses the bounded recovery
+  journal and a separate `text.configure` directory. Writes continue during the scan
+  and update the active index while the journal records changes for the new one.
+  Commits take the solo path while the journal records. The final catch-up retires
+  the old writer and checkpoint before it reuses the path. The
+  versioned `text.pending.json` binds the requested settings to the recorded active
+  configuration. Recovery promotes an already installed matching index or resumes the
+  build. A failed build discards the intent while an earlier index remains active.
+  A retirement failure leaves that index stale and routes commits through the solo path
+  until repair. If publication fails after the old writer has retired, text searches
+  report unavailable until recovery installs an index. A failed settings promotion after
+  installation leaves the replacement searchable. Copies and backups carry the durable
+  active settings from `text.json`. The 10.5M-triple acceptance measurements for
+  first enablement and reconfiguration remain open under
+  [roadmap item 1345](../../ROADMAP.md#performance-follow-ups). They compare median
+  single-triple write latency during each build with the same workload without a
+  build, including a baseline with grouped commits disabled. The acceptance threshold
+  is twice the baseline median.
+* **Search after uncommitted writes.** Text reads compare the transaction's delta with
+  its base. The evaluator indexes newly visible literals in a private Tantivy
+  `RamDirectory` and verifies committed hits against RDF visibility before counting or
+  ranking them. Both sources use the committed corpus's BM25 statistics. The private
+  index is built per call and charged to its query. Bulk-staged writes and transactions
+  with more than 10,000 newly indexed literals are refused.
+* **Historical full-text.** Same-generation searches use the head index and the
+  reversed net delta. The view retains a shared head handle and the query accounts
+  for its adjustment and hit buffers. The evaluator scans matching candidates before
+  applying the limit, including on requests for a single hit. When an adjusted search
+  exceeds `maxHits`, it counts every matching hit so the overflow error reports the
+  full count. Named pins created with `text: true` keep a separate immutable index
+  under `history-text`. Format 3 of `history.json` references the index by UUID,
+  and versioned index metadata records its commit, configuration and dictionary
+  fingerprints. Pin creation installs the
+  index before publishing the reference. Removal publishes the new history record
+  before reclaiming the files. The first text search on a snapshot holds the history
+  mutex while opening the immutable index so removal cannot race its file opens.
+  Creating or rebuilding a pin index holds the RDF writer through the build. The
+  current-generation path counts up to 10,000 underlying quad changes before applying
+  the caller's triple mask. Temporary index work has a 128 MiB admission ceiling.
+  Other retained commits need an indexed named pin. Ordinary backups omit named
+  pins and their derived files. When a copy carries pin metadata under a new
+  dataset identity, it clears the derived file reference. Restoring pinned
+  indexes is tracked under item 52.
 
 **Multi-field entity documents** (item 35, Tier 4, [ROADMAP](../../ROADMAP.md)). Documents
 are per quad (`text.rs`: the key is a hash of the s, p, o and g keys), so a query cannot
