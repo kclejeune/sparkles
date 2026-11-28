@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### View access by grant containment
+
+A caller reads an incremental view when its grants cover every quad of the dataset, when
+they contain the grants of the view's principal, or when a grant names the view. The
+containment test compares graphs, IRI patterns, guards and protections from the grant
+sets alone and refuses whatever it cannot prove. A grant names a view in its `endpoints`
+as `view:{name}`, which declassifies it for the grantee without opening an endpoint or
+adding a graph. Decisions are cached per caller and view, and refusals, declassified
+reads and uncached decisions are written to the `sparkles::audit` log as `view_access`
+records without graph names. Rust callers ask `Views::authorize` before reading or
+watching a view for someone else. This completes roadmap item 222.
+
+- **Rust compatibility.** `GraphAccess` has a new public field `views` of type
+  `ViewGrants`. Struct literals add `views: Default::default()`, and the constructors
+  set it to no views. `Host` has a new method `view_access` with a default that writes
+  the audit record.
+
 ### Hierarchical memory budgets for reasoning and views
 
 Reasoning, ontology reads and maintained views share the dataset's query memory pool.
