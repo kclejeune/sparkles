@@ -2288,6 +2288,7 @@ impl ChangeLog {
             if result.is_ok() {
                 inner.alloc = inner.written_end;
             }
+            // A quota walk may have cached the old length after padding was withdrawn.
             if let Some(quota) = &self.quota {
                 quota.account_changes(self.dataset_id, inner.alloc - inner.written_end, None);
             }

@@ -2022,7 +2022,8 @@ fn a18_the_first_rebuild_of_a_linked_branch_keeps_the_quota() {
     dev.flush_change_log().unwrap();
     s.quota.invalidate();
     let used = s.disk_usage();
-    s.set_quota(Some(used + (64 << 10))).unwrap();
+    // Leave room for a small write while the staged index itself exceeds the quota.
+    s.set_quota(Some(used + (16 << 10))).unwrap();
     let b = dev.compaction_blocker(false).expect("the quota blocks it");
     assert_eq!(b.reason, "quota", "{}", b.detail);
     let e = dev.compact().unwrap_err();

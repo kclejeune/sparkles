@@ -8503,12 +8503,23 @@ fn write_snapshot(
 pub use crate::task::ProgressFn;
 
 pub(crate) fn dir_size(p: &Path) -> u64 {
+    dir_size_skipping(p, &|_| false)
+}
+
+fn dir_size_skipping(p: &Path, skip: &impl Fn(&Path) -> bool) -> u64 {
     let Ok(rd) = std::fs::read_dir(p) else {
         return 0;
     };
     rd.flatten()
         .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => dir_size(&e.path()),
+            Ok(m) if m.is_dir() => {
+                let path = e.path();
+                if skip(&path) {
+                    0
+                } else {
+                    dir_size_skipping(&path, skip)
+                }
+            }
             Ok(m) => m.len(),
             Err(_) => 0,
         })

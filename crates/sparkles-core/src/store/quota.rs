@@ -12,10 +12,10 @@
 //! set, and after every rebuild. Between walks, small commits account for growth in
 //! their files as they write them. A rebuild is checked with walks of its own.
 
-use super::{Store, dir_size, write_atomic};
+use super::{Store, dir_size, dir_size_skipping, write_atomic};
 use crate::error::{Budget, BudgetKind, Error, Result};
 use parking_lot::{Mutex, RwLock};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -394,6 +394,27 @@ impl Quota {
         Ok(())
     }
 
+    /// Check a linked branch's new index against the dataset's quota after building it.
+    pub(super) fn check_linked_compaction(&self, store: Uuid) -> Result<()> {
+        let (Some(limit), Some(root)) = (self.limit(), &self.root) else {
+            return Ok(());
+        };
+        let measured = self.measured.lock();
+        let other_builds: FxHashSet<_> = measured
+            .stores
+            .iter()
+            .filter(|(id, _)| **id != store)
+            .filter_map(|(_, usage)| usage.building.as_deref())
+            .collect();
+        // Skip the other builds in the same walk, since their sizes can still change.
+        let projected = dir_size_skipping(root, &|path| other_builds.contains(path))
+            .saturating_sub(measured.padding);
+        if projected > limit {
+            return Err(Self::exceeded(limit, projected));
+        }
+        Ok(())
+    }
+
     /// Before a rebuild that commits (a bulk load or replace) publishes the generation
     /// it built in `new`. Once published, the dataset takes the directory as it is now,
     /// less the generation `old` that `new` replaces. Before, it takes the directory less
@@ -729,12 +750,21 @@ mod tests {
         allocated - s.change_log_status().unwrap().bytes
     }
 
+    fn annotation_padding(s: &Store) -> u64 {
+        let path = s.root.as_ref().unwrap().join(crate::annotations::FILE);
+        match std::fs::read(path) {
+            Ok(bytes) => (bytes.len() - crate::annotations::records_end(&bytes).unwrap()) as u64,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => panic!("reading annotations: {e}"),
+        }
+    }
+
     fn assert_quota_usage(main: &Store, stores: &[&Store]) {
         let padding: u64 = stores
             .iter()
             .map(|s| {
                 let (wal, vocab) = generation_padding(s);
-                wal + vocab + change_padding(s)
+                wal + vocab + change_padding(s) + annotation_padding(s)
             })
             .sum();
         main.quota.invalidate();
@@ -747,6 +777,7 @@ mod tests {
         let opts = StoreOptions {
             wal_prealloc_bytes: 128 << 10,
             change_log: false,
+            commit_digests: true,
             ..Default::default()
         };
         let main = Store::open(dir.path(), opts.clone()).unwrap();
@@ -766,6 +797,7 @@ mod tests {
         for store in [&main, &*left, &*right] {
             let (wal, vocab) = generation_padding(store);
             assert!(wal > 0 && vocab > 0, "WAL {wal}, vocabulary {vocab}");
+            assert!(annotation_padding(store) > 0);
         }
         assert_quota_usage(&main, &[&main, &left, &right]);
 
@@ -877,6 +909,47 @@ mod tests {
         .unwrap();
         assert_eq!(change_padding(&main), 0);
         assert_quota_usage(&main, &[&main]);
+    }
+
+    #[test]
+    fn first_linked_compaction_excludes_padding_and_sibling_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            wal_prealloc_bytes: 128 << 10,
+            ..Default::default()
+        };
+        let main = Store::open(dir.path(), opts).unwrap();
+        insert(&main, "seed").unwrap();
+        main.create_branch("dev", &Default::default()).unwrap();
+        main.create_branch("sibling", &Default::default()).unwrap();
+        let dev = main.branch("dev").unwrap();
+        let sibling = main.branch("sibling").unwrap();
+        insert(&sibling, "sibling-write").unwrap();
+        main.flush_change_log().unwrap();
+        sibling.flush_change_log().unwrap();
+        assert!(dev.snapshot().generation.linked().is_some());
+
+        assert_quota_usage(&main, &[&main, &dev, &sibling]);
+        let limit = main.disk_usage() + (64 << 10);
+        main.set_quota(Some(limit)).unwrap();
+        assert!(
+            main.disk_bytes() > limit,
+            "unused padding alone exceeds the headroom"
+        );
+
+        // Register files as a sibling's in-progress compaction would.
+        let staging = sibling.root.as_ref().unwrap().join("quota-test-build");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::File::create(staging.join("data"))
+            .unwrap()
+            .set_len(128 << 10)
+            .unwrap();
+        main.quota.exclude(sibling.dataset_id(), Some(&staging));
+
+        assert!(dev.compaction_blocker(false).is_none());
+        dev.compact().unwrap();
+        assert!(dev.snapshot().generation.linked().is_none());
+        assert!(main.disk_usage() <= limit);
     }
 
     #[test]
