@@ -808,7 +808,11 @@ impl ServiceCache {
         if let Some(disk) = self.disk()
             && let Err(e) = disk.remove(key)
         {
-            tracing::warn!(error = %e, "a SERVICE cache entry stays on disk");
+            tracing::warn!(
+                target: "sparkles::sparql::svccache",
+                error = %e,
+                "a SERVICE cache entry stays on disk"
+            );
         }
         between_tiers();
         let _gate = self

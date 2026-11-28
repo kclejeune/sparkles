@@ -127,7 +127,11 @@ impl Store {
         let tier = match self.open_service_cache_tier(&staged) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(error = %e, "the SERVICE cache's disk tier is left out");
+                tracing::warn!(
+                    target: "sparkles::store::service_cache",
+                    error = %e,
+                    "the SERVICE cache's disk tier is left out"
+                );
                 None
             }
         };
