@@ -405,8 +405,8 @@ On the same corpora and 4,000 further generated ontologies, 170,620 rooted runs 
 gave 89,134 answers in full. Apart from one row of a search whose temporary files
 collided, the answers that differ from HermiT's are the four configurations of one of the
 further generated ontologies, which has a second loss. That loss does not come from the
-order of arrival, and ontologies built around individuals
-with at-most restrictions find it often. The original at-most rule applied an individual's restriction only in the
+order of arrival, and ontologies built around individuals with at-most restrictions find
+it often. The original at-most rule applied an individual's restriction only in the
 context of its singleton. Of 10,222 complete answers on the generated at-most set, 312
 differed from HermiT's. On the qualified set 256 of 10,894 differed. A containment that
 counted even unqualified edges found these losses but gave up the consistent cases of
@@ -419,13 +419,17 @@ earlier generated and fixture sets.
 The [ground at-most rule](#item-1229-at-most-restrictions-at-constants) now derives the
 merge where its premises hold. Four regressions exercise named and anonymous values,
 disjunctive premises and a merge conditional on the queried class. Further tests cover a
-qualifier entailed under a query, a maximum above one, an alternative in the head of a
-guarded restriction and a restriction on a successor of a constant. All 568 previously
-incorrect generated answers now finish and agree with HermiT, including all four
+qualifier entailed under a query, a maximum above one, a holder with a second class
+disjunct and a restriction on a successor of a constant. At revision `a271ea00`, all
+568 previously incorrect generated answers finished and agreed with HermiT, including all four
 configurations of the qualified case missed by the narrower containment. The
 [agreement report](../../benchmarks/el-classification/RESULTS.md#rooted-at-most-agreement)
-records coverage and the distribution of derived conclusions. Item 1229 stays open
-for the completeness argument for ground counting and late Pred replay.
+records coverage and the distribution of derived conclusions for that revision. The
+subsequent repair narrowed the ground-body cut to ground inferences and charged
+short index scans to the work bound. Tests exercise conditional counting in a successor,
+the bounds on counting products and the propagation of an equality between two
+successors of one individual. Item 1229 stays open for the completeness argument for
+ground counting and late Pred replay.
 
 Item 1231 records a loss of rooted runs. A fact that holds in a context only under the
 queried class and concerns an individual reached from another individual must reach the
@@ -5405,7 +5409,9 @@ the local element `x` can miss that subsumption.
 
 A rooted run that counts also instantiates the at-most clause at a constant or a
 successor term of a constant. It uses maximal premises in the same context and respects
-the rooted cut on clauses with a selected ground body. For a holder of
+the rooted cut on premises with a ground body literal when every participating term
+is ground. In a successor, a ground marker such as `M(a) → M(a)` may meet a local
+edge such as `r(a,x)`. The resulting equality keeps the marker in its body. For a holder of
 `≤n r.B` at term `u`, it takes one qualified edge from `u` to each of `n+1` syntactically
 distinct terms. Its conclusion contains the disjunction of all pairwise equalities of
 those terms. In every interpretation at least two of the values coincide. When a
@@ -5415,6 +5421,14 @@ then coincides already satisfies the conclusion. When the restriction has other 
 disjuncts, the conclusion keeps those alternatives at `u`.
 For example, a maximum of two over three values gives three alternative equalities.
 Choosing any one pair unconditionally would change the meaning.
+
+For a maximum at `x`, counting disables the nominal-successor shortcut in
+`into_nominal`. An existential into a singleton therefore supplies a successor term
+`f(x)` to the ordinary `at_most` rule. The nominal and equality rules then identify the
+term with the named value and rewrite the consequences of the merge. This covers
+two named existential values and a named value beside an anonymous one. An edge
+to a constant or its successor term with no corresponding existential witness is
+outside this argument.
 
 Qualification combines a matching edge, including one on a subrole, with a premise
 for the filler at its other end. Either arrival can complete the inference. Likewise

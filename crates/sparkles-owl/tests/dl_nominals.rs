@@ -5839,7 +5839,8 @@ fn an_at_most_restriction_at_an_individual_refutes_a_case_under_a_class() {
 #[test]
 fn a_conditional_existential_qualifies_a_named_neighbour() {
     check_subsumptions(
-        "ClassAssertion(ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:s :Q)) :a)
+        "Declaration(Class(:D))
+         ClassAssertion(ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:s :Q)) :a)
          ObjectPropertyAssertion(:r :a :b)
          ObjectPropertyAssertion(:r :a :c)
          ClassAssertion(:B :b)
@@ -5849,7 +5850,7 @@ fn a_conditional_existential_qualifies_a_named_neighbour() {
          SubClassOf(owl:Thing ObjectUnionOf(ObjectOneOf(:c) :B))",
         true,
         &[("A", "B")],
-        &[("B", "A")],
+        &[("B", "A"), ("D", "B")],
     );
 }
 
@@ -5885,5 +5886,107 @@ fn a_counted_clause_at_an_individual_preserves_its_class_disjunct() {
         true,
         &[("K", "Ans")],
         &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn conditional_maximum_at_a_named_individual_counts_a_local_successor_edge() {
+    check_subsumptions(
+        "SubClassOf(:K ObjectSomeValuesFrom(:p :W))
+         SubClassOf(:K ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:a) ObjectMaxCardinality(1 :r))))
+         ObjectPropertyAssertion(:r :a :b)
+         ClassAssertion(:C :b)
+         SubClassOf(:W ObjectUnionOf(ObjectOneOf(:a) :D))
+         SubClassOf(:W ObjectSomeValuesFrom(:r :E))
+         SubClassOf(ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :E)) :D)
+         SubClassOf(ObjectSomeValuesFrom(:p :D) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("W", "D")],
+    );
+}
+
+#[test]
+fn local_maximum_clashes_on_two_different_named_values() {
+    let out = rooted(
+        "SubClassOf(:A ObjectMaxCardinality(1 :r))
+         SubClassOf(:A ObjectHasValue(:r :b))
+         SubClassOf(:A ObjectHasValue(:r :c))
+         DifferentIndividuals(:b :c)",
+        true,
+        &[("A", "Nothing")],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+}
+
+#[test]
+fn local_maximum_merges_named_and_anonymous_values() {
+    check_subsumptions(
+        "SubClassOf(:A ObjectMaxCardinality(1 :r))
+         SubClassOf(:A ObjectHasValue(:r :b))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:A ObjectHasValue(:p :b))
+         SubClassOf(ObjectSomeValuesFrom(:p :C) :Ans)",
+        true,
+        &[("A", "Ans")],
+        &[("Ans", "A")],
+    );
+}
+
+#[test]
+fn local_maximum_moves_a_class_between_named_values() {
+    check_subsumptions(
+        "SubClassOf(:A ObjectMaxCardinality(1 :r))
+         SubClassOf(:A ObjectHasValue(:r :b))
+         SubClassOf(:A ObjectHasValue(:r :c))
+         ClassAssertion(:C :c)
+         SubClassOf(:A ObjectHasValue(:p :b))
+         SubClassOf(ObjectSomeValuesFrom(:p :C) :Ans)",
+        true,
+        &[("A", "Ans")],
+        &[("Ans", "A")],
+    );
+}
+
+#[test]
+fn local_maximum_reaches_a_conjunction_at_a_named_value() {
+    check_subsumptions(
+        "SubClassOf(:K ObjectMaxCardinality(1 :r))
+         SubClassOf(:K ObjectHasValue(:r :a))
+         SubClassOf(:K ObjectHasValue(:r :b))
+         ClassAssertion(:C :b)
+         EquivalentClasses(:Ans ObjectSomeValuesFrom(:r ObjectIntersectionOf(ObjectOneOf(:a) :C)))",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn ground_maximum_moves_atoms_between_successors_of_one_individual() {
+    check_subsumptions(
+        "ClassAssertion(ObjectIntersectionOf(ObjectSomeValuesFrom(:r :B) ObjectSomeValuesFrom(:r :C) ObjectMaxCardinality(1 :r)) :a)
+         SubClassOf(:K ObjectHasValue(:p :a))
+         SubClassOf(ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C))) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn ground_maximum_leaves_an_unqualified_value_distinct() {
+    check_subsumptions(
+        "ClassAssertion(ObjectMaxCardinality(1 :r :Q) :a)
+         ObjectPropertyAssertion(:r :a :b)
+         ObjectPropertyAssertion(:r :a :c)
+         ClassAssertion(:Q :b)
+         ClassAssertion(:C :c)
+         SubClassOf(:K ObjectHasValue(:p :b))
+         SubClassOf(ObjectSomeValuesFrom(:p :C) :Ans)",
+        true,
+        &[],
+        &[("K", "Ans")],
     );
 }

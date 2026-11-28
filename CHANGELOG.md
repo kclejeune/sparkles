@@ -9,7 +9,9 @@ named individual or a successor term of an individual wherever the restriction, 
 and qualifiers hold together. A query can use a merge that depends on its class without
 exporting that equality as an unconditional fact. This repairs missing subsumptions in
 the generated at-most and qualified at-most cases and preserves the consistent answers
-for compound qualifiers from item 897.
+for compound qualifiers from item 897. In the corpus comparison, 302 previously
+complete configurations reached the work bound and fell back, 118 on the at-most set
+and 184 on the qualified set.
 
 ### A closure check of the Pred replay
 

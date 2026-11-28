@@ -23,15 +23,15 @@ work bound excluded 118 formerly correct answers on the first set and 184 on the
 second. The first set gained 24 other complete answers. Both versions rejected 377
 inputs where duplicate union operands collapse to one. Replacing each such union
 with its operand produced 1,448 complete answers in 1,508 runs, all agreeing
-with HermiT.
+with HermiT. Roadmap item 1319 tracks the parser rejections.
 
 On inputs and configurations completed by both versions, total derived conclusions
 changed by -9.1% and +2.9% on the two sets. The median ratios were
 1.000 and 1.001, the 95th percentiles were 1.24 and 1.19, and the maxima
 were 7.58 and 5.52. Of 20,814 jointly completed configurations, 72 more than doubled
-their conclusions. Total DL work increased by 7.2% and 17.5%. A maximum of two with three neighbours can introduce
-three alternative equalities into subsequent inferences. Item 1232 tracks the cost
-of repeated products.
+their conclusions. Total DL work increased by 7.2% and 17.5%. A maximum of two with
+three neighbours can introduce three alternative equalities into subsequent inferences.
+Item 1232 tracks the cost of repeated products.
 
 ## Agreement
 

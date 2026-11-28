@@ -64,31 +64,24 @@ fn roles_at(d: &DlSt, t: RTerm) -> &[u32] {
 /// the maximal literal itself in each caller before treating it as a premise.
 fn maxima(d: &DlSt, i: u32) -> &[Lit] {
     let s = &d.store.clauses[i as usize];
-    if s.dead || s.gbody {
-        &[]
-    } else {
-        d.store.maxima(i)
+    if s.dead { &[] } else { d.store.maxima(i) }
+}
+
+fn pivots(d: &DlSt, lit: Lit) -> &[u32] {
+    d.store.by_xl.get(&lit).map_or(&[], Vec::as_slice)
+}
+
+fn has_unit<S: Sink>(d: &DlSt, l: Lit, found: &mut Found, out: &mut S) -> Option<bool> {
+    for &i in pivots(d, l) {
+        if !scanning(found, out) {
+            return None;
+        }
+        let s = &d.store.clauses[i as usize];
+        if !s.dead && s.c.body().is_empty() && s.c.head().len() == 1 {
+            return Some(true);
+        }
     }
-}
-
-fn pivots(d: &DlSt, lit: Lit) -> impl Iterator<Item = Pivot> + '_ {
-    d.store
-        .by_xl
-        .get(&lit)
-        .into_iter()
-        .flatten()
-        .copied()
-        .filter_map(move |i| {
-            let s = &d.store.clauses[i as usize];
-            (!s.dead && !s.gbody).then_some((i, lit))
-        })
-}
-
-fn has_unit(d: &DlSt, l: Lit) -> bool {
-    pivots(d, l).any(|(i, _)| {
-        let c = &d.store.clauses[i as usize].c;
-        c.body().is_empty() && c.head().len() == 1
-    })
+    Some(false)
 }
 
 /// A unit equality in this context permits the same substitution in every head
@@ -97,6 +90,7 @@ fn reduced_value<S: Sink>(
     d: &DlSt,
     t: RTerm,
     inv: impl Fn(Role) -> Option<Role> + Copy,
+    found: &mut Found,
     out: &mut Guard<'_, S>,
 ) -> Option<RTerm> {
     if !matches!(t, RTerm::Fc(..)) {
@@ -104,8 +98,8 @@ fn reduced_value<S: Sink>(
     }
     let ids = d.store.terms.as_deref().and_then(|by| by.eqs.get(&t));
     let mut value = None;
-    for (j, &i) in ids.into_iter().flatten().enumerate() {
-        if !scanning(j, out) {
+    for &i in ids.into_iter().flatten() {
+        if !scanning(found, out) {
             return None;
         }
         let s = &d.store.clauses[i as usize];
@@ -122,15 +116,28 @@ fn reduced_value<S: Sink>(
     Some(value.map_or(t, RTerm::C))
 }
 
-/// Charge long index scans even if they do not produce an inference.
-fn scanning<S: Sink>(offset: usize, out: &mut S) -> bool {
-    const BLOCK: usize = 256;
-    if (offset + 1).is_multiple_of(BLOCK) {
-        out.worked(BLOCK / WORK_READS);
-        out.go_on()
-    } else {
-        !out.stopped()
+/// Prepay a block on its first read. All scans for this given share the unused
+/// reads, including partner lookups and successive subsets. The last partial
+/// block is therefore charged even if the rule exits early.
+fn scanning<S: Sink>(found: &mut Found, out: &mut S) -> bool {
+    if out.stopped() {
+        return false;
     }
+    if found.count_reads_left == 0 {
+        out.worked(1);
+        found.count_reads_left = WORK_READS as u8;
+        if !out.go_on() {
+            return false;
+        }
+    }
+    found.count_reads_left -= 1;
+    true
+}
+
+#[derive(Clone, Copy)]
+struct Given<'a> {
+    side: &'a Side,
+    gbody: bool,
 }
 
 pub(super) fn on_max<S: Sink>(
@@ -138,21 +145,31 @@ pub(super) fn on_max<S: Sink>(
     st: &State,
     v: XLit,
     prem: &Side,
+    gbody: bool,
     found: &mut Found,
     out: &mut Guard<'_, S>,
 ) -> bool {
     let Some(d) = dl(st) else { return true };
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
+    if found.over {
+        return true;
+    }
     if let XLit::Atom(a, t) = v {
-        if !on_filler(ix, st, a, t, prem, found, out) {
+        if !(gbody && ground(t)) && !on_filler(ix, st, a, t, prem, found, out) {
             return false;
         }
     } else if !matches!(v, XLit::Role(..)) {
         return true;
     }
     for (u, s, t) in directions(v, inv) {
+        if ground(t) && gbody {
+            continue;
+        }
         for (k, &(r, b)) in dx.quals.iter().enumerate() {
+            if !scanning(found, out) {
+                return false;
+            }
             if !dx.sub(ix, s, r) {
                 continue;
             }
@@ -165,57 +182,78 @@ pub(super) fn on_max<S: Sink>(
                 RTerm::Fx(e) => st.subs.contains(&e) && dx.core(e).contains(&b),
                 _ => false,
             };
+            let Some(mut edge) = QualifiedEdge::lookup(ix, d, XLit::Role(q, u, t), found, out)
+            else {
+                return false;
+            };
+            if edge.held {
+                continue;
+            }
             if implicit {
-                if !qualify(ix, st, (u, q, t), prem, None, found, out) {
+                if !edge.qualify(ix, st, prem, None, found, out) {
                     return false;
                 }
             } else if ground(t) {
-                for p in pivots(d, a) {
-                    if !qualify(ix, st, (u, q, t), prem, Some(p), found, out) {
+                for &i in pivots(d, a) {
+                    if !scanning(found, out) {
+                        return false;
+                    }
+                    let s = &d.store.clauses[i as usize];
+                    if s.dead || s.gbody {
+                        continue;
+                    }
+                    let p = (i, a);
+                    if !edge.qualify(ix, st, prem, Some(p), found, out) {
                         return false;
                     }
                 }
             } else {
-                for (j, &i) in with_term(d, t).iter().enumerate() {
-                    if !scanning(j, out) {
+                for &i in with_term(d, t) {
+                    if !scanning(found, out) {
                         return false;
                     }
-                    if maxima(d, i).contains(&a)
-                        && !qualify(ix, st, (u, q, t), prem, Some((i, a)), found, out)
-                    {
-                        return false;
+                    for &l in maxima(d, i) {
+                        if !scanning(found, out) {
+                            return false;
+                        }
+                        if l == a {
+                            if !edge.qualify(ix, st, prem, Some((i, a)), found, out) {
+                                return false;
+                            }
+                            break;
+                        }
                     }
                 }
             }
         }
     }
-    for (g, n, q, extra) in dx
-        .atmosts
-        .iter()
-        .map(|&(a, n, q)| (Some(a), n, q, &[][..]))
-        .chain(dx.lazy.iter().map(|(g, n, q, h)| (*g, *n, *q, h.as_ref())))
-    {
-        let rule = Maximum {
-            guard: g,
-            n,
-            q,
-            extra,
-        };
+    let given = Given { side: prem, gbody };
+    for &(guard, n, q) in &dx.atmosts {
+        if !scanning(found, out) {
+            return false;
+        }
+        let rule = Maximum { guard, n, q };
         if let XLit::Atom(a, t) = v
             && ground(t)
-            && Some(a) == g
+            && a == guard
         {
-            if !rule.apply(ix, d, t, None, prem, found, out) {
+            if !rule.apply(ix, st, t, None, given, found, out) {
                 return false;
             }
             out.release_to(found.held_bytes());
+            if found.over {
+                return true;
+            }
         }
         for (u, s, t) in directions(v, inv) {
             if dx.sub(ix, s, q) {
-                if !rule.apply(ix, d, u, Some(t), prem, found, out) {
+                if !rule.apply(ix, st, u, Some(t), given, found, out) {
                     return false;
                 }
                 out.release_to(found.held_bytes());
+                if found.over {
+                    return true;
+                }
             }
         }
     }
@@ -238,17 +276,39 @@ pub(in crate::classify) fn on_filler<S: Sink>(
     let Some(d) = dl(st) else { return true };
     let inv = inv_of(ix, dx);
     for &q in qs {
+        if !scanning(found, out) {
+            return false;
+        }
+        // t and q are fixed, but the role scan discovers the holder u. Reuse
+        // its unit check when several premises give the same qualified edge.
+        let mut previous: Option<QualifiedEdge> = None;
         let (r, _) = dx.quals[((q - dx.base) / 2) as usize];
-        for (j, &i) in roles_at(d, t).iter().enumerate() {
-            if !scanning(j, out) {
+        for &i in roles_at(d, t) {
+            if !scanning(found, out) {
                 return false;
             }
+            if ground(t) && d.store.clauses[i as usize].gbody {
+                continue;
+            }
             for &l in maxima(d, i) {
+                if !scanning(found, out) {
+                    return false;
+                }
                 for (u, s, z) in directions(out.dl().lits.view(l, inv), inv) {
-                    if z == t
-                        && dx.sub(ix, s, r)
-                        && !qualify(ix, st, (u, q, t), prem, Some((i, l)), found, out)
-                    {
+                    if z != t || !dx.sub(ix, s, r) {
+                        continue;
+                    }
+                    let v = XLit::Role(q, u, t);
+                    let edge = match &mut previous {
+                        Some(edge) if edge.v == v => edge,
+                        slot => {
+                            let Some(edge) = QualifiedEdge::lookup(ix, d, v, found, out) else {
+                                return false;
+                            };
+                            slot.insert(edge)
+                        }
+                    };
+                    if !edge.held && !edge.qualify(ix, st, prem, Some((i, l)), found, out) {
                         return false;
                     }
                 }
@@ -258,107 +318,166 @@ pub(in crate::classify) fn on_filler<S: Sink>(
     true
 }
 
-fn qualify<S: Sink>(
-    ix: &Index,
-    st: &State,
-    (u, q, t): (RTerm, Role, RTerm),
-    prem: &Side,
-    partner: Option<Pivot>,
-    found: &mut Found,
-    out: &mut Guard<'_, S>,
-) -> bool {
-    let Some(Made::Lit(add)) = lit_admitted(ix, out, XLit::Role(q, u, t)) else {
-        return false;
-    };
-    let d = dl(st).expect("a counting premise has a clause store");
-    if has_unit(d, add) {
-        return true;
-    }
-    let (body, head, without, fact) = match partner {
-        Some((i, l)) => {
-            let s = &d.store.clauses[i as usize];
-            (s.c.body(), s.c.head(), Some(l), s.fact)
-        }
-        None => (&[][..], &[][..], None, false),
-    };
-    found.rule = "qual-at";
-    put_with_fact_parts_admitted(
-        ix,
-        st,
-        out,
-        found,
-        ground(t),
-        fact,
-        prem,
-        body,
-        head,
-        without,
-        Some(add),
-    )
+struct QualifiedEdge {
+    v: XLit,
+    add: Option<Lit>,
+    held: bool,
 }
 
-struct Maximum<'a> {
-    guard: Option<Ex>,
+impl QualifiedEdge {
+    fn lookup<S: Sink>(
+        ix: &Index,
+        d: &DlSt,
+        v: XLit,
+        found: &mut Found,
+        out: &mut S,
+    ) -> Option<Self> {
+        let add = out.dl().lits.get(v, inv_of(ix, dix(ix)));
+        let held = match add {
+            Some(l) => has_unit(d, l, found, out)?,
+            None => false,
+        };
+        Some(Self { v, add, held })
+    }
+
+    fn qualify<S: Sink>(
+        &mut self,
+        ix: &Index,
+        st: &State,
+        prem: &Side,
+        partner: Option<Pivot>,
+        found: &mut Found,
+        out: &mut Guard<'_, S>,
+    ) -> bool {
+        let add = match self.add {
+            Some(l) => l,
+            None => {
+                let Some(Made::Lit(l)) = lit_admitted(ix, out, self.v) else {
+                    return false;
+                };
+                self.add = Some(l);
+                l
+            }
+        };
+        let d = dl(st).expect("a counting premise has a clause store");
+        let (body, head, without, fact) = match partner {
+            Some((i, l)) => {
+                let s = &d.store.clauses[i as usize];
+                (s.c.body(), s.c.head(), Some(l), s.fact)
+            }
+            None => (&[][..], &[][..], None, false),
+        };
+        found.rule = "qual-at";
+        put_with_fact_parts_admitted(
+            ix,
+            st,
+            out,
+            found,
+            no_xy(self.v),
+            fact,
+            prem,
+            body,
+            head,
+            without,
+            Some(add),
+        )
+    }
+}
+
+struct Maximum {
+    guard: Ex,
     n: u32,
     q: Role,
-    extra: &'a [Ex],
 }
 
-impl Maximum<'_> {
+impl Maximum {
     /// With a new holder the product chooses n+1 edges. With a new edge its
     /// neighbour and premise are fixed, so choose only n others and one holder.
     #[allow(clippy::too_many_arguments)]
     fn apply<S: Sink>(
         &self,
         ix: &Index,
-        d: &DlSt,
+        st: &State,
         u: RTerm,
         fixed: Option<RTerm>,
-        prem: &Side,
+        given: Given,
         found: &mut Found,
         out: &mut Guard<'_, S>,
     ) -> bool {
         let dx = dix(ix);
         let inv = inv_of(ix, dx);
-        let mut holder = None;
-        if fixed.is_some()
-            && let Some(a) = self.guard
-        {
-            let Some(l) = out.dl().lits.get(XLit::Atom(a, u), inv) else {
+        let d = dl(st).expect("a counting premise has a clause store");
+        let holder = if fixed.is_some() {
+            let Some(l) = out.dl().lits.get(XLit::Atom(self.guard, u), inv) else {
                 return true;
             };
-            if pivots(d, l).next().is_none() {
+            if pivots(d, l).is_empty() {
                 return true;
             }
-            holder = Some(l);
-        }
+            Some(l)
+        } else {
+            None
+        };
         let ids = roles_at(d, u);
+        let k = (self.n as usize).saturating_add(usize::from(fixed.is_none()));
         let mut refs_count = 0usize;
+        let mut gbody_count = 0;
+        let mut local = fixed.is_some_and(|t| !ground(t));
         // Count the exact number of borrowed edge references before allocating.
-        let scan = |out: &mut Guard<'_, S>, visit: &mut dyn FnMut(RTerm, Pivot)| {
-            for (j, &i) in ids.iter().enumerate() {
-                if !scanning(j, out) {
-                    return false;
-                }
-                for &l in maxima(d, i) {
-                    for (w, s, t) in directions(out.dl().lits.view(l, inv), inv) {
-                        if w == u && Some(t) != fixed && dx.sub(ix, s, self.q) {
-                            visit(t, (i, l));
+        let scan =
+            |found: &mut Found, out: &mut Guard<'_, S>, visit: &mut dyn FnMut(RTerm, Pivot)| {
+                for &i in ids {
+                    if !scanning(found, out) {
+                        return false;
+                    }
+                    for &l in maxima(d, i) {
+                        if !scanning(found, out) {
+                            return false;
+                        }
+                        for (w, s, t) in directions(out.dl().lits.view(l, inv), inv) {
+                            if w == u && Some(t) != fixed && dx.sub(ix, s, self.q) {
+                                visit(t, (i, l));
+                            }
                         }
                     }
                 }
-            }
-            true
-        };
-        if !scan(out, &mut |_, _| refs_count += 1) {
+                true
+            };
+        if !scan(found, out, &mut |t, (i, _)| {
+            refs_count += 1;
+            gbody_count += usize::from(d.store.clauses[i as usize].gbody);
+            local |= k != 0 && !ground(t);
+        }) {
             return false;
         }
-        let k = (self.n as usize).saturating_add(usize::from(fixed.is_none()));
+        // When every possible subset is ground, discard cut premises before
+        // applying any memory or subset bound. Mixed pools need the per-subset cut.
+        if !local {
+            if given.gbody {
+                return true;
+            }
+            refs_count -= gbody_count;
+        }
+        let eligible = |i: u32| {
+            let s = &d.store.clauses[i as usize];
+            !s.dead && (local || !s.gbody)
+        };
         if refs_count < k {
             return true;
         }
         // Sorted references and the start of each group live through the products.
-        let holder_count = holder.map_or(0, |l| pivots(d, l).count());
+        let mut holder_count = 0;
+        if let Some(l) = holder {
+            for &i in pivots(d, l) {
+                if !scanning(found, out) {
+                    return false;
+                }
+                holder_count += usize::from(eligible(i));
+            }
+            if holder_count == 0 {
+                return true;
+            }
+        }
         let total = refs_count.checked_add(holder_count);
         let Some(scratch) = total
             .and_then(|n| n.checked_mul(size_of::<(RTerm, Pivot)>()))
@@ -369,17 +488,28 @@ impl Maximum<'_> {
             out.speculative_overflow();
             return false;
         };
-        if !out.ensure_admitted(found.held_bytes().saturating_add(scratch)) {
+        let Some(need) = found.held_bytes().checked_add(scratch) else {
+            out.speculative_overflow();
+            return false;
+        };
+        if !out.ensure_admitted(need) {
             return false;
         }
         let mut refs = Vec::with_capacity(refs_count + holder_count);
-        if !scan(out, &mut |t, p| refs.push((t, p))) {
+        if !scan(found, out, &mut |t, p| {
+            if eligible(p.0) {
+                refs.push((t, p));
+            }
+        }) {
             return false;
         }
         refs.sort_unstable();
         refs.dedup();
         let mut starts = Vec::with_capacity(refs_count + 1);
         for (i, (t, _)) in refs.iter().enumerate() {
+            if !scanning(found, out) {
+                return false;
+            }
             if i == 0 || refs[i - 1].0 != *t {
                 starts.push(i);
             }
@@ -388,7 +518,14 @@ impl Maximum<'_> {
         starts.push(refs.len());
         let edge_count = refs.len();
         if let Some(l) = holder {
-            refs.extend(pivots(d, l).map(|p| (u, p)));
+            for &i in pivots(d, l) {
+                if !scanning(found, out) {
+                    return false;
+                }
+                if eligible(i) {
+                    refs.push((u, (i, l)));
+                }
+            }
         }
         let (refs, holders) = refs.split_at(edge_count);
         if groups < k {
@@ -410,7 +547,7 @@ impl Maximum<'_> {
         }
         found.rule = "atmost-at";
         loop {
-            if out.stopped() {
+            if !scanning(found, out) {
                 return false;
             }
             let mut terms = [RTerm::X; AT_MOST_WIDEST];
@@ -427,11 +564,10 @@ impl Maximum<'_> {
             }
             if !self.product(
                 ix,
-                d,
-                u,
+                st,
                 &terms[..width],
                 &lists[..k + usize::from(!holders.is_empty())],
-                prem,
+                given,
                 scratch,
                 found,
                 out,
@@ -455,20 +591,26 @@ impl Maximum<'_> {
     fn product<S: Sink>(
         &self,
         ix: &Index,
-        d: &DlSt,
-        u: RTerm,
+        st: &State,
         terms: &[RTerm],
         lists: &[&[(RTerm, Pivot)]],
-        prem: &Side,
+        given: Given,
         scratch: usize,
         found: &mut Found,
         out: &mut Guard<'_, S>,
     ) -> bool {
         let inv = inv_of(ix, dix(ix));
+        let d = dl(st).expect("a counting premise has a clause store");
+        let pure = terms.iter().copied().all(ground);
+        if pure && given.gbody {
+            return true;
+        }
+        let prem = given.side;
+        let eligible = |i: u32| !pure || !d.store.clauses[i as usize].gbody;
         let mut reduced = [RTerm::X; AT_MOST_WIDEST];
         let terms = if terms.len() > 2 {
             for (j, &term) in terms.iter().enumerate() {
-                let Some(t) = reduced_value(d, term, inv, out) else {
+                let Some(t) = reduced_value(d, term, inv, found, out) else {
                     return false;
                 };
                 if reduced[..j].contains(&t) {
@@ -487,30 +629,19 @@ impl Maximum<'_> {
                 .flat_map(|(j, &a)| terms[..j].iter().map(move |&b| XLit::Eq(a, b)))
         };
         // A held unit equality satisfies the whole disjunctive conclusion.
-        if pairs().any(|v| out.dl().lits.get(v, inv).is_some_and(|l| has_unit(d, l))) {
-            return true;
-        }
-        // D1 delivers a unit equality from the root when every premise has an
-        // unconditional root proof and the context registered for its constants.
-        if terms.len() == 2
-            && self.extra.is_empty()
-            && d.given_fact
-            && prem.0.is_empty()
-            && prem.1.is_empty()
-            && terms.iter().all(|t| match *t {
-                RTerm::C(c) | RTerm::Fc(_, c) => {
-                    d.root.as_deref().is_some_and(|r| r.edged.contains(&c))
+        for v in pairs() {
+            if !scanning(found, out) {
+                return false;
+            }
+            if let Some(l) = out.dl().lits.get(v, inv) {
+                match has_unit(d, l, found, out) {
+                    Some(true) => return true,
+                    Some(false) => {}
+                    None => return false,
                 }
-                _ => false,
-            })
-            && lists.iter().all(|list| {
-                list.iter()
-                    .any(|&(_, (i, _))| d.store.clauses[i as usize].fact)
-            })
-        {
-            return true;
+            }
         }
-        let head_len = self.extra.len() + terms.len() * (terms.len() - 1) / 2;
+        let head_len = terms.len() * (terms.len() - 1) / 2;
         let mut bytes = lists
             .len()
             .checked_mul(size_of::<Vec<Side>>())
@@ -521,13 +652,50 @@ impl Maximum<'_> {
                 )?)
             });
         let mut longest = 0usize;
+        let mut root_facts = pure && terms.len() == 2 && d.given_fact;
         for list in lists {
-            longest = longest.max(list.len());
+            bytes = bytes.and_then(|b| b.checked_add(list.len().checked_mul(size_of::<Side>())?));
+            let mut count = 0;
+            let mut fact = false;
             for &(_, (i, l)) in *list {
-                bytes = bytes.and_then(|b| {
-                    b.checked_add(size_of::<Side>())?
-                        .checked_add(side_bytes(&d.store.clauses[i as usize].c, l)?)
-                });
+                if !scanning(found, out) {
+                    return false;
+                }
+                if !eligible(i) {
+                    continue;
+                }
+                count += 1;
+                fact |= d.store.clauses[i as usize].fact;
+                bytes = bytes
+                    .and_then(|b| b.checked_add(side_bytes(&d.store.clauses[i as usize].c, l)?));
+            }
+            if count == 0 {
+                return true;
+            }
+            longest = longest.max(count);
+            root_facts &= fact;
+        }
+        if root_facts {
+            let Some(Made::Lit(l)) = lit_admitted(ix, out, XLit::Eq(terms[0], terms[1])) else {
+                return false;
+            };
+            let lits = &out.dl().lits;
+            if routable_unit_parts(ix, st, lits, &prem.0, &[], &prem.1, &[], None, Some(l)) {
+                if super::super::dl_rules::tracing() {
+                    trace_shared_parts(
+                        ix,
+                        st,
+                        lits,
+                        found.rule,
+                        &prem.0,
+                        &[],
+                        &prem.1,
+                        &[],
+                        None,
+                        Some(l),
+                    );
+                }
+                return true;
             }
         }
         let Some(bytes) = bytes else {
@@ -535,7 +703,11 @@ impl Maximum<'_> {
             return false;
         };
         let pruning = if longest > 1 {
-            longest.saturating_mul(PRUNE_SCRATCH_ELEM)
+            let Some(pruning) = longest.checked_mul(PRUNE_SCRATCH_ELEM) else {
+                out.speculative_overflow();
+                return false;
+            };
+            pruning
         } else {
             0
         };
@@ -544,22 +716,27 @@ impl Maximum<'_> {
         }
         let mut head = Vec::with_capacity(prem.1.len() + head_len);
         head.extend_from_slice(&prem.1);
-        for v in self.extra.iter().map(|&a| XLit::Atom(a, u)).chain(pairs()) {
+        for v in pairs() {
             let Some(Made::Lit(l)) = lit_admitted(ix, out, v) else {
                 return false;
             };
             head.push(l);
         }
-        let product = lists
-            .iter()
-            .map(|list| {
-                list.iter()
-                    .map(|&(_, (i, l))| side(&d.store.clauses[i as usize].c, l))
-                    .collect()
-            })
-            .collect();
+        let mut product = Vec::with_capacity(lists.len());
+        for list in lists {
+            let mut sides = Vec::with_capacity(list.len());
+            for &(_, (i, l)) in *list {
+                if !scanning(found, out) {
+                    return false;
+                }
+                if eligible(i) {
+                    sides.push(side(&d.store.clauses[i as usize].c, l));
+                }
+            }
+            product.push(sides);
+        }
         let base = (prem.0.clone(), head);
-        if terms.iter().copied().all(ground) {
+        if pure {
             found.ground_products(product, base);
         } else {
             found.products(product, base);

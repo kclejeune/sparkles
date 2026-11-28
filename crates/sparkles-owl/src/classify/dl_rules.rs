@@ -3393,6 +3393,8 @@ pub(super) fn merge_with_exact(a: &Side, b: &Side, l: Lit) -> Side {
 /// the choices that the restriction on ground inferences leaves out are not derived.
 #[derive(Default)]
 pub(super) struct Found {
+    /// Index reads left in the current prepaid counting block.
+    pub(super) count_reads_left: u8,
     one: Vec<(Side, &'static str)>,
     one_side_bytes: usize,
     prods: Vec<(Vec<Vec<Side>>, Side, bool, &'static str)>,
@@ -6290,7 +6292,7 @@ fn rooted_max<S: Sink>(
     if l.kind() == X && !super::dl_root::univ_from_x(ix, st, l.atom(), prem, found, guard) {
         return false;
     }
-    if dx.counting && !gbody && matches!(l.kind(), X | Y | F) && super::dl_root::count::enabled() {
+    if dx.counting && matches!(l.kind(), X | Y | F) && super::dl_root::count::enabled() {
         let inv = |s| dx.inv(ix, s);
         if let super::dl_clause::XLit::Atom(a, t) = guard.dl().lits.view(l, inv)
             && !super::dl_root::count::on_filler(ix, st, a, t, prem, found, guard)
