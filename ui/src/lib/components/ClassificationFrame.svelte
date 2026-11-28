@@ -56,6 +56,7 @@
   });
   function runClassify() {
     if (opts.parsedDeadline.error) return;
+    materialized = false;
     void model.classify(opts.requestOptions);
   }
   // The read has pinned labels but no proven historical prefix map. Rendering
@@ -200,6 +201,7 @@
         {target}
         {graph}
         {imports}
+        {mode}
         {iri}
         {commit}
         {items}
@@ -327,7 +329,7 @@
             <h4>{type}</h4>
             <ul>
               {#each rows as row (row.ofn)}
-                <li><code>{row.ofn}</code><span class="badge">Inferred</span></li>
+                <li><code>{row.ofn}</code> <span class="badge">Inferred</span></li>
               {/each}
             </ul>
           {/if}

@@ -172,11 +172,18 @@ export async function fetchTerm(
   target: string,
   sel: BrowseSelection,
   iri: string,
-  q: { lang?: readonly string[]; mentions?: number; incoming?: number; sourceId?: string } = {},
+  q: {
+    lang?: readonly string[];
+    mode?: 'lenient' | 'strict';
+    mentions?: number;
+    incoming?: number;
+    sourceId?: string;
+  } = {},
   signal?: AbortSignal,
 ): Promise<TermPage> {
   const p = params(sel, {
     iri,
+    mode: q.mode,
     sourceId: q.sourceId,
     mentions: q.mentions,
     incoming: q.incoming,

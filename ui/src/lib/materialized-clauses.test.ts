@@ -15,6 +15,31 @@ const name = (iri: string) => iri.replace('urn:', '');
 const text = (ts: { text: string }[]) => ts.map((t) => t.text).join('');
 
 describe('materializedClauses', () => {
+  it('groups class clauses, marks asserted overlap and counts trivial subsumptions', () => {
+    const items = [
+      item({ type: 'SubClassOf', subClass: 'urn:A', superClass: 'urn:B' }, 'parent'),
+      item({ type: 'EquivalentClasses', classes: ['urn:A', 'urn:C'] }, 'equivalent'),
+      item({ type: 'DisjointClasses', classes: ['urn:A', 'urn:D'] }, 'disjoint'),
+      item({ type: 'SubClassOf', subClass: 'urn:A', superClass: OWL + 'Thing' }, 'top'),
+      item({ type: 'SubClassOf', subClass: 'urn:A', superClass: 'urn:A' }, 'self'),
+    ];
+    const frame = materializedClauses('Class', 'urn:A', items, new Set(['parent']), name, {});
+    expect(
+      frame.clauses.map(({ word, rows }) => [word, rows.map((row) => text(row.tokens))]),
+    ).toEqual([
+      ['SubClassOf', ['B']],
+      ['EquivalentTo', ['C']],
+      ['DisjointWith', ['D']],
+    ]);
+    expect(frame.clauses.flatMap(({ rows }) => rows.map((row) => row.alsoAsserted))).toEqual([
+      true,
+      false,
+      false,
+    ]);
+    expect(frame.other).toEqual([]);
+    expect(frame.trivial).toBe(2);
+  });
+
   it('puts an individual’s inferred types and facts in their frame clauses', () => {
     const items = [
       item({ type: 'ClassAssertion', class: 'urn:Artist', individual: 'urn:ada' }, 'CA(Artist)'),

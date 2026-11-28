@@ -261,6 +261,122 @@ test('the class frame requests a scoped materialization only after the fallback 
   expect(reads[0].searchParams.get('at')).toMatch(/^commit:\d+$/);
 });
 
+test('classifying clears fallback permission even if the kept result is replaced', async ({
+  page,
+}) => {
+  const iri = UNI + 'Professor';
+  const parent = UNI + 'Agent';
+  const reads: URL[] = [];
+  const unavailable = (url: URL) => ({
+    ...kept(url),
+    status: 'unavailable',
+    reason: 'notKept',
+    result: null,
+    outcome: null,
+    entity: null,
+  });
+  await page.route('**/$/ontology/uni/classification?*', (route) => {
+    const url = new URL(route.request().url());
+    return route.fulfill({ json: unavailable(url) });
+  });
+  await page.route('**/$/ontology/uni/term?*', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('inferences') !== 'true') return route.fallback();
+    reads.push(url);
+    const { commit } = kept(url);
+    const axioms = [parent, 'http://www.w3.org/2002/07/owl#Thing'].map((superClass) => ({
+      type: 'SubClassOf',
+      ofn: `SubClassOf(<${iri}> <${superClass}>)`,
+      axiom: { type: 'SubClassOf', subClass: iri, superClass },
+      graph: 'urn:x-sparkles:inferred',
+    }));
+    await route.fulfill({
+      json: {
+        iri,
+        commit,
+        axioms,
+        names: { [parent]: { label: 'Materialized agent', labelLang: 'en' } },
+        inferenceSource: {
+          kind: 'materialization',
+          sourceId: `sha256:${'a'.repeat(64)}`,
+          profile: 'rdfs',
+          producerCommit: commit,
+          commit,
+          boundStoreId: 'branch-a',
+          familyId: 'family',
+          inputGraphs: ['default'],
+          inputGraphCount: 1,
+          inputGraphsTruncated: false,
+          warnings: [],
+          warningCount: 0,
+          warningsTruncated: false,
+          complete: null,
+          consistency: 'unknown',
+          justifications: 'unavailable',
+        },
+      },
+    });
+  });
+  await page.route('**/$/ontology/uni/classify?*', (route) => {
+    const { commit, result, outcome } = kept(new URL(route.request().url()));
+    const empty = { items: [], total: 0, limit: 100, truncated: false };
+    return route.fulfill({
+      json: {
+        commit,
+        frame: {
+          iri,
+          result,
+          outcome,
+          unsatisfiable: false,
+          parents: empty,
+          equivalents: empty,
+          excluded: empty,
+          sources: empty,
+          retention: { kept: true, resultId: result.resultId },
+        },
+      },
+    });
+  });
+  await page.route('**/$/ontology/uni/axioms?*', (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('classification') !== 'kept') return route.fallback();
+    expect(url.searchParams.get('resultId')).toBe('immutable-a');
+    return route.fulfill({
+      json: {
+        ...unavailable(url),
+        status: 'mismatch',
+        reason: 'resultChanged',
+        source: 'keptClassification',
+      },
+    });
+  });
+
+  await page.goto(`/ui/browse?ds=uni&iri=${encodeURIComponent(iri)}`);
+  const region = page.getByRole('region', { name: 'Inferred class axioms', exact: true });
+  const openFallback = region.getByRole('button', { name: 'Read fresh materialized axioms' });
+  const fallback = region.getByRole('region', { name: 'Materialized inferred axioms' });
+  await expect(openFallback).toBeVisible();
+  expect(reads).toHaveLength(0);
+  await openFallback.click();
+  await expect(fallback).toContainText('Materialized RDFS facts at commit');
+  await expect(fallback).toContainText('SubClassOf:');
+  const row = fallback.getByRole('listitem').filter({ hasText: 'Materialized agent' });
+  await expect(row.getByText('Inferred', { exact: true })).toBeVisible();
+  await expect(fallback).toContainText('One trivial entailment');
+  expect(reads).toHaveLength(1);
+  expect(reads[0].searchParams.get('iri')).toBe(iri);
+  expect(reads[0].searchParams.get('at')).toMatch(/^commit:\d+$/);
+  expect(reads[0].searchParams.get('mode')).toBe('lenient');
+
+  await region.getByRole('button', { name: 'Classify', exact: true }).click();
+  await region.getByText('Kept taxonomy axioms', { exact: true }).click();
+  await region.getByRole('button', { name: 'Read taxonomy axioms', exact: true }).click();
+  await expect(region).toContainText('does not match this source or result pin');
+  await expect(openFallback).toBeVisible();
+  await expect(fallback).toHaveCount(0);
+  expect(reads).toHaveLength(1);
+});
+
 test('full-IRI rendering uses the pinned IRI rather than a label or mutable prefix', async ({
   page,
 }) => {

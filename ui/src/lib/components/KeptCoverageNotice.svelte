@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { iriForm } from '$lib/iri-form.svelte';
   import {
     keptAvailability,
     readKeptClassification,
@@ -12,6 +11,7 @@
     target,
     graph,
     imports,
+    mode = 'lenient',
     commit,
     pins,
     revision,
@@ -19,6 +19,7 @@
     target: string;
     graph: string | null;
     imports: boolean;
+    mode?: 'lenient' | 'strict';
     commit: number | null;
     pins?: InferredPins;
     revision: number;
@@ -31,8 +32,8 @@
       target,
       selection: { graph, imports },
       commit,
-      mode: 'lenient' as const,
-      languages: [...iriForm.languages],
+      mode,
+      languages: [],
     };
     const resultId = pins?.classificationId;
     void revision;

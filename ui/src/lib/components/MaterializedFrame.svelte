@@ -13,6 +13,7 @@
     target,
     graph,
     imports = true,
+    mode = 'lenient',
     kind,
     iri,
     commit,
@@ -25,6 +26,7 @@
     target: string;
     graph: string | null;
     imports?: boolean;
+    mode?: 'lenient' | 'strict';
     kind: EntityKind;
     iri: string;
     commit: number | null;
@@ -41,7 +43,14 @@
     const view =
       commit == null
         ? null
-        : { target, selection: { graph, imports }, iri, commit, languages: [...iriForm.languages] };
+        : {
+            target,
+            selection: { graph, imports },
+            mode,
+            iri,
+            commit,
+            languages: [...iriForm.languages],
+          };
     const capturedPins = pins;
     untrack(() => model.reset(view, capturedPins));
   });
@@ -86,7 +95,7 @@
     >
   </div>
   {#if kind !== 'Class'}
-    <KeptCoverageNotice {target} {graph} {imports} {commit} {pins} {revision} />
+    <KeptCoverageNotice {target} {graph} {imports} {mode} {commit} {pins} {revision} />
   {/if}
   {#if commit == null}<p>Waiting for the displayed source commit.</p>
   {:else if model.loading}<p>Reading materialized facts…</p>{/if}
