@@ -204,8 +204,8 @@ but its list cannot be merged beside the full list of classes. A growth of that 
 also counts the list's old buffer while a reserve moves it. The index now polls the
 deadline and the cancellation every 4,096 axioms while it counts the axioms and while it
 indexes them, and the marking of the left-out axioms and the terminology's gates poll at
-the same rate, as the extractions do. An armed stop therefore ends the pass before its
-index admits anything. The lists of each entity's axioms and the classes by depth are
+the same rate, as the extractions do. The pass also polls once when it starts, so an
+armed stop ends it before it admits any scratch, whatever the size of the input. The lists of each entity's axioms and the classes by depth are
 ordered with unstable sorts on keys that tie nowhere, which give the order the stable
 sorts gave without their buffers.
 

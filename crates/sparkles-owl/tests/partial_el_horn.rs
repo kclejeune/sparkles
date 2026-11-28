@@ -63,6 +63,18 @@ fn pairs(t: &sparkles_owl::classify::Taxonomy, cs: &[Class]) -> BTreeSet<(String
 fn check_partial(part: &Classification, full: &Classification, cs: &[Class]) {
     let got = pairs(&part.taxonomy, cs);
     let want = pairs(&full.taxonomy, cs);
+    if part.complete_for_taken && part.stats.coverage_stopped {
+        // a stop in the modules' pass keeps the taxonomy and leaves the consistency
+        // unknown, with every class incomplete
+        assert!(!part.complete);
+        assert_eq!(part.consistency, Consistency::Unknown);
+        assert_eq!(got, want);
+        let open: BTreeSet<&Class> = part.incomplete.iter().collect();
+        for c in part.taxonomy.classes() {
+            assert!(open.contains(c), "{c:?} is not incomplete");
+        }
+        return;
+    }
     if part.complete_for_taken {
         assert_eq!(part.consistent, full.consistent);
         assert_eq!(part.consistency, full.consistency);

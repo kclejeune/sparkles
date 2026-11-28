@@ -1509,6 +1509,10 @@ impl Classification {
         );
         let mark = meter.mark();
         let c = (|| {
+            // an armed stop ends the pass before it admits its first scratch
+            if stop() {
+                return Err(crate::transform::Stopped::Caller);
+            }
             let left = metered_refs(&meter, excluded.iter().map(|e| &e.axiom))?;
             let classes = by_depth(&self.taxonomy, &meter)?;
             crate::transform::coverage_refs(

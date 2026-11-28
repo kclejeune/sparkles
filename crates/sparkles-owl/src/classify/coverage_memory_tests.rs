@@ -631,6 +631,69 @@ fn an_armed_stop_comes_before_the_index_refusal() {
     assert_eq!(out.stats.memory, held + full);
 }
 
+/// On an ontology below the first periodic poll, an armed stop still wins over a limit
+/// that refuses the pass's scratch but admits the full list, with `partial` off: the pass
+/// polls when it starts. The stopped answer is the one an unlimited run gives.
+#[test]
+fn an_armed_stop_on_a_small_ontology_comes_before_any_refusal() {
+    let kinds = ontology(200, 0);
+    let kinds: Vec<&AxiomKind> = kinds.iter().collect();
+    assert!(kinds.len() < 4096);
+    let mut sat = Saturation::new();
+    let free = sat
+        .classify_admitted(&kinds, None, &deferred(None, false))
+        .unwrap();
+    let held = free.classification().stats.memory;
+    let full = free.classification().all_incomplete_bytes().1;
+    let cap = held + full;
+    let run = |cap: Option<usize>, armed: bool| {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let p = polls.clone();
+        let mut sat = Saturation::new();
+        let mut admitted = sat
+            .classify_admitted(&kinds, None, &deferred(cap, false))
+            .unwrap();
+        admitted.limits = Limits {
+            cancelled: Some(Arc::new(move || {
+                p.fetch_add(1, Ordering::Relaxed);
+                armed
+            })),
+            ..deferred(cap, false)
+        };
+        let excluded = sat.excluded().to_vec();
+        let r = admitted.cover(&kinds, &excluded, None);
+        (
+            r,
+            admitted.into_classification(),
+            polls.load(Ordering::Relaxed),
+        )
+    };
+    // unarmed, the cap refuses the pass's scratch
+    let (r, _, _) = run(Some(cap), false);
+    assert!(
+        matches!(r, Err(Error::Memory { limit, used }) if limit == cap && used > cap),
+        "{r:?}"
+    );
+    // armed, the pass stops at its first poll and answers the full list
+    let (r, capped, polls) = run(Some(cap), true);
+    assert_eq!(r.unwrap(), None);
+    assert_eq!(polls, 1);
+    assert!(capped.stats.coverage_stopped && !capped.stats.coverage_over);
+    assert!(!capped.complete && capped.complete_for_taken);
+    assert_eq!(capped.consistency, Consistency::Unknown);
+    assert!(capped.has_all_taxonomy_classes());
+    assert_eq!(capped.stats.memory, held + full);
+    assert!(capped.stats.peak_memory <= cap);
+    // the same stopped answer with no limit
+    let (r, unlimited, polls) = run(None, true);
+    assert_eq!(r.unwrap(), None);
+    assert_eq!(polls, 1);
+    assert!(unlimited.stats.coverage_stopped && !unlimited.stats.coverage_over);
+    assert_eq!(unlimited.consistency, Consistency::Unknown);
+    assert_eq!(unlimited.incomplete, capped.incomplete);
+    assert_eq!(unlimited.stats.memory, held + full);
+}
+
 /// Declaration-only classes with long IRIs, which the pass's index never holds, and an
 /// excluded axiom over `owl:Thing`, which makes the pass answer every class. Its list of
 /// classes then costs far more than the pass's scratch.

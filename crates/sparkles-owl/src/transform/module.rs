@@ -685,13 +685,17 @@ struct Lits {
 
 impl Lits {
     fn of(k: &AxiomKind) -> Lits {
+        // a positive data property assertion holds one literal, checked once for both
+        if let AxiomKind::DataPropertyAssertion(_, _, l) = k {
+            let v = crate::datatypes::lexical(l.datatype(), l.value());
+            return Lits {
+                ill: v == Some(false),
+                typed: v == Some(true),
+            };
+        }
         Lits {
             ill: ill_literal(k),
-            typed: matches!(
-                k,
-                AxiomKind::DataPropertyAssertion(_, _, l)
-                    if crate::datatypes::lexical(l.datatype(), l.value()) == Some(true)
-            ),
+            typed: false,
         }
     }
 }
