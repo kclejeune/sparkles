@@ -4688,8 +4688,11 @@ the names that lost their witnesses. The run also requires that nothing was cut 
 bound, and when the relations were cut, `skip_weaken` is empty and every clause takes
 every inclusion, as in item 894.
 
-This suffices because a name of a minimum occurs only in positions where a smaller class
-leaves the axiom true, apart from its witness clause and the order's relations.
+This suffices because a name `G` of a minimum `≥n r.F` occurs only in positive positions,
+apart from its witness clause and the order's relations. The induction gives
+`G ⊆ ≥n r.F` in every model of `O_b`, and replacing a positive occurrence of a class by a
+larger class keeps an axiom true. Replacing each positive occurrence of `G` by its minimum
+therefore keeps the axiom of `O_b` true and gives the axiom of `T`.
 `dl_norm`'s `at_least` is the one site that makes such a name, and it returns the name as
 the positive form of the minimum to `pos`, its only caller. No site of `dl_norm` places a
 result of `pos` on a left side. The left sides of inclusions, the disjointness sets, the
@@ -4756,10 +4759,16 @@ neighbours in `B`. A model of the axiom extends to the guarded set when `Y_i` is
 `≥n_i r_i.F_i` on the elements of the plain guard, and `B`, each name of a negative
 existential restriction within it and the qualified role are read exactly, as the
 expressions they stand for and as the edges into `F`. A clause then counts only
-neighbours in `F`, so it fires only where the axiom's left side holds, and its head holds
-there. A model of the guarded set may put further neighbours in `B`, and the converse
-direction does not need the reverse inclusion. In such a model, an element of the left
-side satisfies the plain guard and each minimum, every neighbour in a filler `F_i` is in
+neighbours in `F`. The clause of another minimum `≥n_i r_i.F_i` can fire where the axiom's
+left side is false, such as at an element of the plain guard with enough neighbours in
+`F_i` and none in the first minimum's filler, and its head `Y_i` holds there because `Y_i`
+is read as that minimum. The first clause fires where the plain guard, each `Y_i` and its
+own minimum hold, which is the left side of the normalized axiom. A minimum that came from
+an exact bound `=n r.F` can then have more than `n` neighbours in `F`, and the disjunct
+`≥(n+1) r.F` that the normalization added to the head holds. Otherwise the original left
+side holds and the axiom gives its head. A model of the guarded set may put further
+neighbours in `B`, and the converse direction does not need the reverse inclusion. In
+such a model, an element of the left side satisfies the plain guard and each minimum, every neighbour in a filler `F_i` is in
 its `B_i` and so qualifies, the clauses of the other minimums give each `Y_i`, the first
 clause applies with its `n` qualified neighbours, and the head holds, which is the axiom.
 These are DL-clauses of the paper's Section 2.4, and the rules that apply item 728's clauses apply
@@ -4863,11 +4872,11 @@ its classification with counting requested takes 5.7 to 6.0 s against 1.6 to 1.8
 without counting, with the order or without it. ore_ont_14817's classification with
 counting requested takes 10.7 to 11.9 s against 3.1 to 3.5 s, and 7.0 s when
 `number_order` is false, whose attempt passes the memory budget before the bound of
-conclusions. That of ore_ont_9663 takes 10.6 to 11.1 s against 8.4 to 8.8 s. Each of these
-times is of the whole classification, which is the failed attempt, then the run without
-counting under its own bound of 4 million conclusions, and then the Horn rules, since the
-run without counting also passes its bound on ore_ont_541 and ore_ont_14817. The medians
-do not separate the attempt's own time from the fallback's.
+conclusions. That of ore_ont_9663 takes 10.6 to 11.1 s against 8.4 to 8.8 s. Every time
+here is of the whole classification. A time with counting requested covers the failed
+attempt and then the run without counting under its own bound of 4 million conclusions.
+On ore_ont_541 and ore_ont_14817 that run also passes its bound, and the Horn rules
+follow. The times without counting include no counting attempt. The medians do not separate the attempt's own time from the fallback's.
 The single runs on four threads put three more files above twice their time without
 counting, and on one thread ore_ont_8273, ore_ont_11110 and ore_ont_12141 derive
 the same conclusions in both runs and take the same time within the rounds' spread.
