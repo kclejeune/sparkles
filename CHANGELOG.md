@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### One meter for the marker repair and the rooted premise lists (item 1280)
+
+Tier D's rooted rules and the marker repair of item 1231 read their premise lists through
+one meter, which checks the run's work bound, memory budget, deadline and cancellation once
+every 1,024 reads, with the count since the last check shared across an activation. It reads
+the premise lists of a returned clause and their pruning on initial arrival and on a late
+premise's replay, the index of a clause that the root offers, the diagnostic's redundancy test
+of its products, and Hyper's and Join's premise lists and the root's offer of a fact on the
+default path. Its new reads charge nothing to the work bound, so the counts of derived
+conclusions do not change. A returned clause admits its premise lists exactly before it
+builds them, and its product that is not ground charges its own tables as they grow in place
+of the upfront bound, which could exceed them more than a thousand times. A test harness
+grows each input dimension of the metered steps and asserts a fixed number of reads between
+two checks. Item 1319 follows the premise lists that the meter does not read.
+
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 
 Term and value decoding in SPARQL UPDATE, ARQ property functions, registered property and aggregate extensions, custom aggregates, hybrid search, history service, path search, vector top-k, remote SERVICE and LATERAL enhancers, GeoSPARQL planner rewrites and aggregates, planner range and lexical probes and RDFS schema and explanation decoding now uses checked decode helpers that enforce live cancellation, deadline and memory controls while keeping decoded-output credit alive across multi-term operations. Plan and error diagnostic rendering decodes terms through `plan_term` so describing a plan never latches a decode refusal, and RDFS explanation keeps its answer memory limit separate from its decode workspace accounting. This lands the first wave of roadmap item 1308.

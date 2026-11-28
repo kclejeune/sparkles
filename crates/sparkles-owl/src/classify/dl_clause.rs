@@ -1213,6 +1213,37 @@ impl Rooted<'_> {
     }
 }
 
+/// [`subset`] of two sorted slices, telling `read` of each literal of `b`
+/// that it steps over, `None` once read answers false.
+#[inline]
+pub(super) fn subset_with<F: FnMut(usize) -> bool + ?Sized>(
+    a: &[Lit],
+    b: &[Lit],
+    read: &mut F,
+) -> Option<bool> {
+    if a.len() > b.len() {
+        return Some(false);
+    }
+    let mut j = 0;
+    for &x in a {
+        loop {
+            if !read(1) {
+                return None;
+            }
+            if j < b.len() && b[j] < x {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        if j == b.len() || b[j] != x {
+            return Some(false);
+        }
+        j += 1;
+    }
+    Some(true)
+}
+
 /// Whether sorted `a` is a subset of sorted `b`.
 /// Whether the sorted literals `a` without repeats are among the sorted literals `b`
 /// without repeats.
@@ -1621,6 +1652,48 @@ impl Store {
     /// `sig`: a clause that does has its last head literal in `c`'s head.
     pub(super) fn subsumed(&self, c: &Clause, sig: u64) -> bool {
         self.subsumed_parts(c.body(), c.head(), sig)
+    }
+
+    /// [`Store::subsumed`], telling `read` of each candidate it reads and of each literal
+    /// that a comparison steps over, for item 1280's meter, and `None` once read answers
+    /// false.
+    pub(super) fn subsumed_with(
+        &self,
+        c: &Clause,
+        sig: u64,
+        read: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<bool> {
+        let (body, head) = (c.body(), c.head());
+        let check = |ids: &[u32], read: &mut dyn FnMut(usize) -> bool| -> Option<bool> {
+            for &i in ids {
+                if !read(1) {
+                    return None;
+                }
+                let s = &self.clauses[i as usize];
+                if s.sig & !sig == 0
+                    && !s.dead
+                    && subset_with(s.c.body(), body, read)?
+                    && subset_with(s.c.head(), head, read)?
+                {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        };
+        if check(&self.empty, read)? {
+            return Some(true);
+        }
+        for l in head {
+            if !read(1) {
+                return None;
+            }
+            if let Some(ids) = self.by_last.get(l)
+                && check(ids, read)?
+            {
+                return Some(true);
+            }
+        }
+        Some(false)
     }
 
     /// Upper bound on peak index/container allocation (excluding the clause's own literal

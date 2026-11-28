@@ -478,12 +478,10 @@ default.
 
 The repair keeps the resource contract of the rest of Tier D, and the contract is
 cooperative. A run charges each conclusion that it derives to the work bound, and several
-of the repair's scans also charge one conclusion for every 16 entries that they read,
-while others do not. The preparation of an inference, such as the premise lists of a rule
-and their pruning, takes time and memory in proportion to the clauses that the context
-already holds and is not charged while it runs. The redundancy test of each derived
-conclusion against the stored clauses is not counted either, here as in the rest of Tier
-D. The run checks the work bound, the memory budget, the deadline and a cancellation at
+of the repair's scans also charge one conclusion for every 16 entries that they read.
+Item 1280's meter, described below, counts the reads of the repair's other preparation
+and of the rooted rules' premise lists. The redundancy test of each derived conclusion
+against the stored clauses is not counted, here as in the rest of Tier D. The run checks the work bound, the memory budget, the deadline and a cancellation at
 cooperative checkpoints, which come after every 256 choices of a product, after every 64
 sends of a loop and whenever a worker adds its counts of applied conclusions to the run's
 totals. Earlier builds added retained index growth to the memory estimate only after
@@ -507,7 +505,7 @@ product enumeration and marker-repair handlers are guarded against callback unwi
 Non-ground `fold` and ground products pre-admit candidate buffers, retained union payloads,
 table rehashes, step-list growth and `prune` scratch, keep drained buffers charged until
 emitted when switching to streaming at 4,096 unions, and account for live union payloads
-when `slack_covered` pre-reserves table slack on M-return. The discretionary Horn and Tier
+beside any table slack that M-return reserved before item 1280 removed that reservation. The discretionary Horn and Tier
 D memory allowance now uses a deterministic `.len()`-based logical input size independent
 of thread count while `Limits::max_memory` and `Limits::charge` continue to observe full
 container capacities, and `Saturation::retained_bytes` includes `DlRun::lits`. Counting-allocator
@@ -516,7 +514,8 @@ concurrent literal and ledger boundaries, non-ground and ground products, marker
 unwind cleanup and multi-chunk thread invariance. Remaining estimation boundaries outside
 item 1291 are the upfront 32-slot `Segs` directory, `Table::push` segment allocations,
 un-admitted `Lits::lit` calls outside root initialization, which remain post-counted in
-`DlRun::bytes`, and premise-list preparation and read metering, which remain in item 1280.
+`DlRun::bytes`, and the reads of premise-list preparation, which item 1280 meters as
+described below.
 
 Item 1075 delivers demand-driven binary case splitting over disjunctive constant
 equalities in rooted runs behind the default-off `Limits::rooted_eq_split` switch, as
@@ -531,52 +530,60 @@ the checked-in HermiT oracle and exact `describe` instances, and across all 50 `
 fixtures it completes within the bound with zero taxonomy differences against HermiT.
 Enabling the switch by default waits on benchmark-host qualification under item 823.
 
-A returned clause reserves memory before its products run, both on initial arrival and when a
-late premise replays saved returns. Before item 1291, the product of a clause that
-is not ground charged each union that it kept, as every rule did, but not the table that
-records its unions nor the spare capacity of each step's list. These grow with the number of
-unions a step makes. With the repair's wide products on g1-051_p0012, at a bound of 400
-million conclusions under a budget of 256 MiB, one product's table reached 504,475 unions
-and 51 MB, and the heap reached 286 MB. Initial arrivals therefore reserve a bound on those
-tables before draining their products and release it after them, and each late-replay batch
-reserves the checked sum of its held products and the largest product's table bound before
-draining. The table model runs in 128-bit arithmetic and saturates once at the end, and an
-unrepresentable bound or estimate overflow stops the run cleanly with a memory stop before
-enumeration rather than clamping the reservation or promising a hard allocation ceiling. A
-refused reservation rolls back any debit it added and stops the run as a refused charge does.
-The bound takes one union per choice of the product,
-which can exceed the unions a step keeps by more than a thousand times. That overcount is
-what makes it a bound. Its model of a step's tables, taken at the unions that the step
-actually keeps, is smaller than the growth of the heap past the estimate in the heaviest
-returns without the reservation, 18.7 MB against 23.3 MB under the budget of 256 MiB and
-24.6 MB against 173.6 MB under the default budget. In the initial-arrival measurements on
-those files, the return reservation stopped g1-051_p0012 earlier at a heap of 179 MB under
-256 MiB, caused no refusal on part022 p01, g1-051_p0121 and g1-051_p0012 at 4 million
-conclusions or on g1-051_p0012 with `SPARKLES_ROOTED_MARKER_REPAIR=129` at 400 million, and
-stopped the default-budget run of 1 GiB at a heap of 256 MB against 1.29 GB without the
-reservation, so that run did not finish under its own budget either way. Item 1291 now
-charges those product tables and step lists directly on both default and repair paths, while
-item 1280 replaces the loose upfront bound with a shared meter.
+Before item 1280, a returned clause reserved a bound on the tables of its product that is
+not ground before the product ran, both on initial arrival and when a late premise replayed
+saved returns. The bound took one union per choice of the product, which can exceed the
+unions a step keeps by more than a thousand times, and on a product of 2^57 choices it
+could not be represented at all. Item 1291 made the product charge its tables and step lists
+directly as they grow, on both default and repair paths, so the upfront bound only
+duplicated a charge that the product already made.
 
-Some steps of the repair and of the rooted rules read between two checks without counting
-what they read. The steps named here are the ones that were measured or reproduced, and
-other preparation falls under the rule above. The premise lists of a returned clause are
-prepared for one return, and for up to 64 returns when a late premise replays them,
-before the next check. On the three files where the returns derive most, part022 p01,
-g1-051_p0121 and g1-051_p0012 under the containment arm with the repair at 1 and at 129,
-a list read at most 548 premises and kept at most 378, one pruning of a list made at most
-38,226 comparisons, and the preparation of a batch of returns allocated at most 143 KB,
-at most 6.4% of the holder's store at the time. The index of a clause that the root
-offers to its holders is built for the whole body before the first check, so that step is
-bounded by one clause's body. With `SPARKLES_ROOTED_MARKER_DIAG=1`, the redundancy test
-of each of the diagnostic's products scans the context's stored clauses without a count.
-The marker pass that the diagnostic and the decline check run after a rooted run
-saturates checks no bound. The decline check runs it on every rooted run with the check
-on, with the repair on or off. When the last step of a wide product passes 4,096 unions,
-the product derives the 4,097 unions that it holds before its next check, also with the
-repair off. Item 1260 follows the stop latency of the marker pass and of the wide
-product, and item 1280 gives the repair and the store's premise lists one meter that
-counts these reads.
+Item 1280 gives the repair and the rooted rules' premise lists one meter,
+`dl_rules::Meter`. A read is one entry of the store's index, one literal of a clause, or one
+step of a comparison of two premises. A meter checks the run's work bound, memory budget,
+deadline and cancellation once every 1,024 reads, so between two checks it counts at most
+1,024 reads of one read each, or 1,039 in the diagnostic, whose choice of a product counts as
+16 reads. The count since the last check lives in the activation's sink, which all meters of
+an activation share, so that many short scans in a row still meet a check. The meter's checks
+are new, and its reads charge nothing to the work bound except where a scan of the repair
+charged one conclusion for every 16 entries before. Those scans keep that charge, so runs
+with the repair off and the repair's own counts of derived conclusions are unchanged. The
+meter reads these steps.
+
+- The premise lists of a returned clause are read twice, once to size them and once to build
+  them, including M-return-cf's test of each premise's body. The lists, the product's slot
+  and the pruning's scratch are admitted before the lists are built, and the pruning of each
+  list reads through the meter, a read for each comparison of two sides and for each literal
+  that a comparison steps over. This holds on initial arrival and for every return that a
+  late premise replays, with one meter across the replay, and a replay batch checks the
+  bounds before it drains.
+- The root's offer of a clause whose body is ground triggers reads through the meter for
+  each body literal it tests, looks up in the index or compares to choose the holders it
+  scans.
+- The diagnostic's redundancy test of each product reads the stored candidates and the
+  literals of their comparisons through its meter, as do the copies of the chosen premises.
+- On the default path, Hyper's partner lists, its test of root facts over a constant, Join's
+  premises over a ground body literal and the destinations of the root's offer of a fact read
+  through a meter, and the offer admits its list of destinations before it builds it.
+
+The upfront bound is gone. A return's premise lists are admitted exactly before they are
+built, and the product charges its own tables as they grow. On a return of 64 × 64 premises
+whose conclusions a stored unit subsumes, a counting allocator measures the heap within the
+charged peak and the charge within four times the heap. A return of 2^57 choices now runs
+until its tables pass the budget, within its second step and before it derives anything,
+where before it stopped at once on an unrepresentable bound. A test harness grows the
+premises per literal, the length of a premise, the returned body, the returns of a late
+premise, the holders and body of an offered clause, the stored clauses of the diagnostic's
+test and Join's premises eight times over, and asserts each time that no more than the
+cadence of reads passes between two checks, that every read the fixture needs is counted
+and that the sink sees a check for every 1,024 reads.
+
+Item 1319 follows the premise lists that the meter does not read. These are Pred's lists in
+the root, the pruning of the products of the other rules on the default path, and the scans
+of the equality split and merge, which keep a counter of their own. The marker pass that the
+decline check and the diagnostic run after a rooted run saturates checks no bound, and the
+last step of a wide product derives up to 4,097 unions between two checks. Item 1260 follows
+both.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
