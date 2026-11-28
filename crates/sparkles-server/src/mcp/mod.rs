@@ -15,6 +15,7 @@ mod ask;
 pub(crate) mod branches;
 #[cfg(feature = "auth")]
 mod bridge;
+mod catalog;
 mod complete;
 mod context;
 mod draft;
@@ -591,6 +592,9 @@ impl McpServer {
     /// `http.rs` when it calls one (the call itself is checked against the scopes).
     pub fn allows(&self, p: &Principal, name: &str) -> bool {
         match name {
+            n if catalog::READ.contains(&n) || catalog::WRITE.contains(&n) => {
+                catalog::listed(self, p, n)
+            }
             "sparql_update" => self.may_update(&p.without_oauth_scopes()),
             n if branches::WRITE_TOOLS.contains(&n) => {
                 self.offers(n) && self.may_write_somewhere(&p.without_oauth_scopes())

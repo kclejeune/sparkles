@@ -565,6 +565,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         // outermost, so that a request counts as active from its first byte to the end
         // of its response body (see `alloc`)
+        .layer(axum::middleware::from_fn(
+            crate::resources::manager::no_store,
+        ))
         .layer(axum::middleware::from_fn(crate::alloc::track))
 }
 
@@ -1505,7 +1508,7 @@ pub(crate) fn cancel_on_drop() -> (Arc<AtomicBool>, CancelOnDrop) {
 /// parameter (capped at `--max-timeout`, else `--update-timeout`), and cancellation
 /// when the client disconnects (keep the returned guard in the handler's future). The
 /// deadline starts with [`WriteDeadline::start`], once the body has been received.
-fn body_write_options(
+pub(crate) fn body_write_options(
     st: &AppState,
     params: &Params,
     headers: &HeaderMap,
@@ -1517,6 +1520,13 @@ fn body_write_options(
     let (cancel, guard) = cancel_on_drop();
     opts.cancel = Some(cancel);
     Ok((WriteDeadline { opts, timeout }, guard))
+}
+
+pub(crate) fn dataset_write_precondition(
+    headers: &HeaderMap,
+    id: sparkles::commit::DatasetId,
+) -> Option<sparkles::guard::Precondition> {
+    conditional::write_precondition(headers, id, &Target::Dataset)
 }
 
 /// The author a write records in the change log: the authenticated caller (its
@@ -1533,13 +1543,13 @@ pub(crate) fn author(p: &Principal) -> Option<Arc<str>> {
 }
 
 /// Write options whose deadline is not set yet (see [`body_write_options`]).
-struct WriteDeadline {
+pub(crate) struct WriteDeadline {
     opts: sparkles::guard::WriteOptions,
     timeout: Option<Duration>,
 }
 
 impl WriteDeadline {
-    fn start(mut self) -> (sparkles::guard::WriteOptions, Option<Duration>) {
+    pub(crate) fn start(mut self) -> (sparkles::guard::WriteOptions, Option<Duration>) {
         self.opts.deadline = self.timeout.map(|t| std::time::Instant::now() + t);
         (self.opts, self.timeout)
     }
@@ -3345,7 +3355,7 @@ const DISK_CHECK_EVERY: u64 = 64 << 20;
 /// The ceilings of a streamed request body (Graph Store writes, uploads): its size
 /// after decoding (`--max-upload-mb`), and the free space its temporary files leave on
 /// disk (`--min-free-disk-mb`).
-struct BodyBudget {
+pub(crate) struct BodyBudget {
     max: Option<u64>,
     reserve: Option<u64>,
     read: u64,
@@ -3354,7 +3364,7 @@ struct BodyBudget {
 }
 
 impl BodyBudget {
-    fn new(limits: &crate::state::Limits) -> BodyBudget {
+    pub(crate) fn new(limits: &crate::state::Limits) -> BodyBudget {
         BodyBudget {
             max: limits.max_upload_bytes,
             reserve: limits.min_free_disk_bytes,
@@ -3364,7 +3374,7 @@ impl BodyBudget {
     }
 
     /// Count `n` more bytes of the body: `413` past `--max-upload-mb`.
-    fn read(&mut self, n: usize) -> ApiResult<()> {
+    pub(crate) fn read(&mut self, n: usize) -> ApiResult<()> {
         self.read += n as u64;
         match self.max {
             Some(max) if self.read > max => Err(err(
@@ -3381,7 +3391,7 @@ impl BodyBudget {
     /// Before writing `n` bytes to a file in `dir`: `507` when the free space there
     /// would come within [`DISK_CHECK_EVERY`] of the reserve. Checked on the first write
     /// and then every [`DISK_CHECK_EVERY`] bytes.
-    fn disk(&mut self, dir: &std::path::Path, n: usize) -> ApiResult<()> {
+    pub(crate) fn disk(&mut self, dir: &std::path::Path, n: usize) -> ApiResult<()> {
         let Some(reserve) = self.reserve else {
             return Ok(());
         };

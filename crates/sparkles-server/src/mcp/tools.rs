@@ -85,7 +85,11 @@ pub fn run(
 
 /// Bound structured evidence without allocating a second serialized response. MCP's
 /// mirrored text and protocol envelope are outside this structured-content budget.
-fn evidence_bytes(value: &Value, limit: usize, ctx: &ErrorContext) -> Result<(), ToolError> {
+pub(super) fn evidence_bytes(
+    value: &Value,
+    limit: usize,
+    ctx: &ErrorContext,
+) -> Result<(), ToolError> {
     struct Limited {
         remaining: usize,
     }
@@ -148,6 +152,9 @@ const INBOX_TOOLS: &[&str] = &[
 
 fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, ToolError> {
     match name {
+        n if super::catalog::READ.contains(&n) || super::catalog::WRITE.contains(&n) => {
+            super::catalog::run(t, n, args)
+        }
         n if super::evidence::NAMES.contains(&n) => t.evidence(n, args),
         "list_datasets" => t.list_datasets(args),
         "describe_schema" => t.describe_schema(args),

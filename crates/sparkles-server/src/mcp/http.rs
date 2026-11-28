@@ -499,7 +499,7 @@ impl Endpoint {
     /// are those of any branch.
     #[cfg(feature = "auth")]
     fn scope_challenge(&self, p: &Principal, message: &Value) -> Option<Response> {
-        use crate::auth::{Level, oauth};
+        use crate::auth::{Level, ServerPerm, oauth};
         let auth = self.state.auth.as_ref()?;
         let (public, _) = crate::auth::protected_resource(&self.state, &auth.policy())?;
         // a response or notification of the client asks for nothing
@@ -509,12 +509,26 @@ impl Endpoint {
             .then(|| message.pointer("/params/name").and_then(Value::as_str))
             .flatten();
         let args = message.pointer("/params/arguments");
+        let full = p.without_oauth_scopes();
+        if tool.is_some_and(|name| {
+            (super::catalog::READ.contains(&name)
+                || (super::catalog::WRITE.contains(&name) && name != "catalog_mint_iri"))
+                && super::catalog::listed(&self.server, p, name)
+        }) && full.has(ServerPerm::ServerAdmin)
+            && !p.has(ServerPerm::ServerAdmin)
+        {
+            return Some(crate::auth::insufficient_scope(
+                p,
+                &public,
+                oauth::ADMIN,
+                "catalog access needs server admin",
+            ));
+        }
         let need = if tool.is_some_and(|t| super::branches::call_writes(t, args)) {
             Level::Write
         } else {
             Level::Read
         };
-        let full = p.without_oauth_scopes();
         let target = self.scope_target(p, method, tool, message);
         let reaches =
             |who: &Principal, ds: &str| who.level_any_branch(ds).is_some_and(|l| l >= need);

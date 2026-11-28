@@ -305,7 +305,7 @@ impl Tools<'_> {
     /// `Sparkles-Commit-Message` header, checked like the HTTP API's.
     pub(super) fn commit_message(&self, arg: Option<&str>) -> Result<Option<Arc<str>>, ToolError> {
         match arg {
-            Some(m) => sparkles::annotations::validate_message(m)
+            Some(m) => sparkles::annotations::validate_user_message(m)
                 .map_err(|e| ToolError::bad_argument(format!("message: {e}"))),
             None => match &self.call.headers {
                 Some(h) => crate::http::commit_message_header(h).map_err(ToolError::bad_argument),

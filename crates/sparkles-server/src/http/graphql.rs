@@ -463,20 +463,18 @@ pub(super) async fn put_config(
     {
         message = Some(m.to_string());
     }
-    if let Some(m) = &message
-        && (m.len() > 1024 || m.chars().any(char::is_control))
-    {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "message must be at most 1024 bytes without control characters",
-        ));
-    }
+    let message = message
+        .as_deref()
+        .map(sparkles::annotations::validate_user_message)
+        .transpose()?
+        .flatten()
+        .map(|m| m.to_string());
     let if_version = precondition(&headers, ds.dataset.graphql().get(None).is_some())?;
     let author = (!p.name.is_empty()).then(|| p.name.to_string());
     blocking(move || {
         let change = Change {
             author,
-            message: message.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
+            message,
             dataset_commit: Some(ds.store.snapshot().commit),
             if_version,
         };

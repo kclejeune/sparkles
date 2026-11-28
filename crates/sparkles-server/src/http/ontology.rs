@@ -873,7 +873,9 @@ pub(super) async fn edit(
         },
         message: match o.get("message") {
             None | Some(J::Null) => None,
-            Some(J::String(m)) => Some(m.clone()),
+            Some(J::String(m)) => {
+                sparkles::annotations::validate_user_message(m)?.map(|message| message.to_string())
+            }
             Some(_) => return Err(bad("message: a string")),
         },
     };
@@ -972,7 +974,7 @@ pub(super) async fn remove_entity(
     let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers, Some(&p))?;
     wopts.opts.graphs = opts.graphs.clone();
     if let Some(m) = params.get("message") {
-        wopts.opts.message = Some(std::sync::Arc::from(m));
+        wopts.opts.message = sparkles::annotations::validate_user_message(m)?;
     }
     if wopts.opts.precondition.is_none() {
         wopts.opts.precondition =
@@ -1741,7 +1743,12 @@ pub(super) async fn classify(
         assertions: flag("assertions")?,
         threads: number("threads", 0, 0, 1024)?,
         target: text("target")?.map(|g| graph_ref(&g)).transpose()?,
-        message: text("message")?,
+        message: text("message")?
+            .as_deref()
+            .map(sparkles::annotations::validate_user_message)
+            .transpose()?
+            .flatten()
+            .map(|message| message.to_string()),
         about: about.clone(),
         el_only: flag("elOnly")?,
         partial: flag("partial")?,

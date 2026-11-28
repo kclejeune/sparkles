@@ -46,6 +46,22 @@ The server maintains a catalog of external sources, vocabularies, and datasets i
 * **Licence tracking and obligation propagation.** SPDX expressions classify into open, attribution, share-alike, and restricted tiers, with missing licences forbidding redistribution. Obligations propagate through imports and graph sources to each dataset graph, generating a `NOTICE` file. Restricted terms require recorded administrator acceptance. The licence gate warns by default and refuses only under `serve --license-policy enforce`. Export and publication routes do not consult the licence gate.
 * **Vocabulary namespaces.** Each vocabulary owns its namespaces and prefixes uniquely within the server. Vocabulary headers can be read from dataset graphs and compared against the catalog, and one request installs a vocabulary's prefixes and imported prefixes into a dataset.
 
+Open **Datasets → Sources** to register a URL with a checksum, assemble a recipe
+and load its named graphs into an existing or new dataset. The same page can install
+pinned vocabulary bundles and reload graphs from a prior source-load commit. If a
+dataset was created before a load failed, the dataset remains available for retry.
+The [source manager API](../API.md#source-manager), `sparkles source --help` and the
+`catalog_*` MCP tools use the same source pins and authorization. Start with the
+[curated resource records](../examples/resource-catalog/README.md) or preview
+public catalog metadata with `sparkles source harvest`.
+
+Source loads run in the request using the outbound destination policy. Each selected
+file is staged under the data directory with free-space checks. A load replaces its
+listed graphs after all checksums match. The manifest records the pins and graph
+assignments under the load commit. Keep the commit's metadata and the pinned catalog
+records for reloads. Existing prefixes must agree with the bundle, and every new
+binding is subject to settings locks and the prefix limit.
+
 ### Linked-data publishing
 
 The linked-data front end resolves IRIs under hosted vocabulary namespaces and configured version IRIs from the resource catalog ([API.md](../API.md#linked-data-publishing), [C32](../specs/C32-linked-data-publishing/README.md)).
@@ -104,7 +120,7 @@ Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
 * **Metrics and Fuseki parity.** Sparkles has no JVM metrics, assembler payloads cover only single-dataset settings, and direct Graph Store naming is set only at startup via `--gsp-direct-naming` rather than the settings API (roadmap [item 76](../ROADMAP.md)). Missing ARQ functions (`js:`, `afn:context`, `lfn:`, `JSON` query form, `EXISTS { … }` group element, multi-argument `AGG`, no-op `afn:print`/`afn:execTime`, and code-point `afn:collation`) are tracked in roadmap [item 69](../ROADMAP.md).
 * **Access control limits.** The change feed refuses callers with data-dependent triple protections, and protections hide triples rather than IRIs referenced inside visible triples (roadmap [item 75](../ROADMAP.md)).
 * **GraphQL and stored query limits.** GraphQL lacks mutations, subscriptions, persisted queries, `persistedOnly`, and a web UI page; nested lists are not connections, nested `first` slices responses after generating all field values, parent ids pass as terms instead of engine ids, and blank-node parents expand into `UNION` branches (roadmap [item 37](../ROADMAP.md)). Stored queries lack stored updates, multi-value parameters, and per-user private queries (roadmap [item 39](../ROADMAP.md)).
-* **Resource catalog limits.** The catalog does not fetch remote sources; content-addressed storage, recipes, harvesters, load manifests, mirrors, update monitoring, IRI minting, and vocabulary graph bundles remain planned (roadmap [item 458](../ROADMAP.md)). Export and publication routes do not enforce licence gate verdicts (roadmap [item 525](../ROADMAP.md)), Croissant export is absent (roadmap [item 526](../ROADMAP.md)), and catalog access is restricted to server administrators.
+* **Resource catalog limits.** Recipes verify registered HTTP and HTTPS source distributions and replace named graphs. Content-addressed storage, mirrors and update monitoring remain planned under [item 458](../ROADMAP.md) and its dependencies. In-memory datasets share 128 manifests and 16 MiB of manifest data. An I/O failure persisting a manifest requires reopening the dataset before further writes. Export and publication routes do not enforce licence gate verdicts (roadmap [item 525](../ROADMAP.md)), Croissant export is absent (roadmap [item 526](../ROADMAP.md)), and catalog access is restricted to server administrators.
 * **Hybrid-core scheduling.** Performance-core pinning applies only on Linux kernels exposing `/sys/devices/cpu_core/cpus` and `/sys/devices/cpu_atom/cpus` (Intel hybrid CPUs) and was tuned on one processor; other hybrid CPUs and macOS are uncovered (roadmap [item 576](../ROADMAP.md)).
 * **Single-node deployment, backups, and encryption at rest.** Sparkles runs on a single node on local disk without clustering or replicas (roadmap [item 66](../ROADMAP.md)). Live RDF files on local disk are unencrypted (roadmap [item 65](../ROADMAP.md)). Backups operate per dataset without whole-server backups, retained-history capture, or storage-retention policies (roadmap [item 61](../ROADMAP.md)). Backup repository keys cannot be managed through the HTTP API, Vault, or cloud KMS, write-only age-recipient repositories are not implemented, and without `--secrets-key` runtime secrets are sealed by a generated key stored inside the data directory (roadmap [item 65](../ROADMAP.md)).
 

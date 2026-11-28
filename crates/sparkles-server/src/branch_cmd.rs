@@ -961,7 +961,7 @@ fn local_merge(loc: &Path, a: &MergeArgs, res: Option<&J>, opts: StoreOptions) -
         ..Default::default()
     };
     if let Some(m) = &a.message {
-        o.write.message = sparkles::annotations::validate_message(m)?;
+        o.write.message = sparkles::annotations::validate_user_message(m)?;
     }
     if let Some(rs) = res {
         for r in rs
@@ -1339,7 +1339,7 @@ fn pick_options(a: &PickArgs, res: Option<&J>) -> Result<MergeOptions> {
         ..Default::default()
     };
     if let Some(m) = &a.message {
-        o.write.message = sparkles::annotations::validate_message(m)?;
+        o.write.message = sparkles::annotations::validate_user_message(m)?;
     }
     if let Some(rs) = res {
         for r in rs

@@ -1,0 +1,39 @@
+{
+  "id": "w3c-vocabularies",
+  "kind": "dataset",
+  "title": "W3C vocabulary graphs",
+  "versions": [
+    {
+      "version": "1",
+      "graphs": [
+        {
+          "graph": "urn:example:dcat",
+          "sources": [
+            {
+              "resource": "dcat",
+              "version": "3"
+            }
+          ]
+        },
+        {
+          "graph": "urn:example:prov",
+          "sources": [
+            {
+              "resource": "prov",
+              "version": "2013"
+            }
+          ]
+        },
+        {
+          "graph": "urn:example:skos",
+          "sources": [
+            {
+              "resource": "skos",
+              "version": "2009"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

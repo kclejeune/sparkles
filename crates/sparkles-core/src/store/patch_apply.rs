@@ -564,7 +564,7 @@ fn header_message(opts: &mut WriteOptions, value: &Term) -> Result<()> {
     if let Term::Literal(l) = value
         && l.datatype() == oxrdf::vocab::xsd::STRING
     {
-        opts.message = crate::annotations::validate_message(l.value())?;
+        opts.message = crate::annotations::validate_user_message(l.value())?;
     }
     Ok(())
 }

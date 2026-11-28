@@ -1303,7 +1303,7 @@ fn merge_options(st: &AppState, v: &J, preview: bool) -> ApiResult<MergeAsk> {
                 .ok_or_else(|| invalid("invalid-merge", "limit: 1 to 10000"))? as usize;
     }
     if let Some(m) = s("message") {
-        o.write.message = Some(m.into());
+        o.write.message = sparkles::annotations::validate_user_message(&m)?;
     }
     let dry_run = v.get("dryRun").and_then(J::as_bool).unwrap_or(false) && !preview;
     Ok(MergeAsk {

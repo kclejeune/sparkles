@@ -66,6 +66,16 @@
           "type": "string"
         }
       },
+      "commit": {
+        "description": "The commit sequence of the source load.",
+        "in": "path",
+        "name": "commit",
+        "required": true,
+        "schema": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
       "commitMessage": {
         "description": "The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted.",
         "in": "header",
@@ -25276,6 +25286,9 @@
           "id": {
             "type": "string"
           },
+          "iriPolicy": {
+            "$ref": "#/components/schemas/VocabularyIriPolicy"
+          },
           "kind": {
             "enum": [
               "source",
@@ -25415,6 +25428,9 @@
             "description": "1 to 64 letters, digits, `.`, `_` and `-`, starting with a letter or digit.",
             "type": "string"
           },
+          "iriPolicy": {
+            "$ref": "#/components/schemas/VocabularyIriPolicy"
+          },
           "kind": {
             "enum": [
               "source",
@@ -25550,6 +25566,9 @@
           "id": {
             "description": "The route's id, when given.",
             "type": "string"
+          },
+          "iriPolicy": {
+            "$ref": "#/components/schemas/VocabularyIriPolicy"
           },
           "kind": {
             "enum": [
@@ -27805,6 +27824,223 @@
         },
         "type": "object"
       },
+      "SourceHarvestPreview": {
+        "additionalProperties": false,
+        "properties": {
+          "candidates": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "distributions": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "byteSize": {
+                        "type": "integer"
+                      },
+                      "mediaType": {
+                        "type": "string"
+                      },
+                      "sha256": {
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      },
+                      "url": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "url"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "namespace": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "title": {
+                  "type": "string"
+                },
+                "version": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "title",
+                "version",
+                "namespace",
+                "distributions"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "inputs": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "files": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "graph": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "rdfFormat": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "files",
+                "rdfFormat",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "candidates",
+          "inputs"
+        ],
+        "type": "object"
+      },
+      "SourceHarvestRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "document": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "obo-foundry",
+              "bioregistry",
+              "lov",
+              "ckan",
+              "databus",
+              "dcat",
+              "qleverfile"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "document"
+        ],
+        "type": "object"
+      },
+      "SourceImportLock": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "const": 1,
+            "type": "integer"
+          },
+          "imports": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "pin": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "resource": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "resource",
+                    "version"
+                  ],
+                  "type": "object"
+                },
+                "sha256": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pin",
+                "sha256"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "const": "import-lock"
+          },
+          "root": {
+            "additionalProperties": false,
+            "properties": {
+              "pin": {
+                "additionalProperties": false,
+                "properties": {
+                  "resource": {
+                    "type": "string"
+                  },
+                  "version": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "resource",
+                  "version"
+                ],
+                "type": "object"
+              },
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "pin",
+              "sha256"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kind",
+          "format",
+          "root",
+          "imports"
+        ],
+        "type": "object"
+      },
       "SourceList": {
         "description": "The sources `list_sources` found.",
         "externalDocs": {
@@ -27885,6 +28121,240 @@
           "commit",
           "sources",
           "truncated"
+        ],
+        "type": "object"
+      },
+      "SourceLoadManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "by": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "format": {
+            "const": 1,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "const": "load-manifest"
+          },
+          "plan": {
+            "$ref": "#/components/schemas/SourceLoadPlan"
+          },
+          "recipe": {
+            "$ref": "#/components/schemas/SourceRecipe"
+          },
+          "reloadedFrom": {
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "format",
+          "id",
+          "datasetId",
+          "recipe",
+          "plan",
+          "reloadedFrom",
+          "by"
+        ],
+        "type": "object"
+      },
+      "SourceLoadPlan": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "byteSize": {
+                  "oneOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "rdfFormat": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "source": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "resource": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "resource",
+                    "version"
+                  ],
+                  "type": "object"
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "graph",
+                "source",
+                "url",
+                "rdfFormat",
+                "sha256",
+                "byteSize"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "format": {
+            "const": 1,
+            "type": "integer"
+          },
+          "kind": {
+            "const": "load-plan"
+          },
+          "prefixes": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "recommendedIndexes": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "kind",
+          "format",
+          "files",
+          "prefixes",
+          "recommendedIndexes"
+        ],
+        "type": "object"
+      },
+      "SourceLoadResult": {
+        "additionalProperties": false,
+        "properties": {
+          "manifest": {
+            "$ref": "#/components/schemas/SourceLoadManifest"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/Receipt"
+          }
+        },
+        "required": [
+          "receipt",
+          "manifest"
+        ],
+        "type": "object"
+      },
+      "SourceRecipe": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "const": 1,
+            "type": "integer"
+          },
+          "inputs": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "files": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "rdfFormat": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "source": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "resource": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "resource",
+                    "version"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "source",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "const": "recipe"
+          },
+          "prefixes": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "recommendedIndexes": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "kind",
+          "format",
+          "inputs"
         ],
         "type": "object"
       },
@@ -31280,6 +31750,163 @@
           "resource",
           "version",
           "graphs"
+        ],
+        "type": "object"
+      },
+      "VocabularyIriMintRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "VocabularyIriPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "rule": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "const": "slug"
+                  },
+                  "template": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "template"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "const": "uuid"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "const": "ulid"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "end": {
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "const": "sequence"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "stem": {
+                    "type": "string"
+                  },
+                  "width": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "stem",
+                  "width",
+                  "start",
+                  "end"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "const": "obo"
+                  },
+                  "ranges": {
+                    "additionalProperties": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "end": {
+                          "type": "integer"
+                        },
+                        "start": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "start",
+                        "end"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "object"
+                  },
+                  "stem": {
+                    "type": "string"
+                  },
+                  "width": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "stem",
+                  "width",
+                  "ranges"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        },
+        "required": [
+          "namespace",
+          "rule"
+        ],
+        "type": "object"
+      },
+      "VocabularyIriReservation": {
+        "additionalProperties": false,
+        "properties": {
+          "iri": {
+            "type": "string"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/Receipt"
+          }
+        },
+        "required": [
+          "iri",
+          "receipt"
         ],
         "type": "object"
       },
@@ -54972,6 +55599,108 @@
         "x-sparkles-permission": "server-admin"
       }
     },
+    "/$/resources/{id}/mint/{ds}": {
+      "post": {
+        "description": "Uses the vocabulary's policy and records the reservation in a dedicated graph on main. Needs Query access to the whole dataset and Update access to the reservation graph.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "mintVocabularyIri",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VocabularyIriMintRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VocabularyIriReservation"
+                }
+              }
+            },
+            "description": "Reserved IRI and commit."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Mint a vocabulary IRI",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
     "/$/resources/{id}/notice": {
       "get": {
         "description": "The NOTICE of a version as plain text, with each licence, its attribution, its page and the graphs it covers. Needs server `admin`.",
@@ -55278,6 +56007,289 @@
           }
         ],
         "summary": "Remove a version",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources/{id}/versions/{version}/bundle/{ds}": {
+      "post": {
+        "description": "Replaces the named graph of each pinned vocabulary in the bundle and installs its prefixes on main. Needs server admin, Query access and Upload access to every target graph.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "installVocabularyBundle",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/version"
+          },
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceLoadResult"
+                }
+              }
+            },
+            "description": "Commit and manifest."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Install pinned vocabulary graphs and prefixes",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "write and server-admin"
+      }
+    },
+    "/$/resources/{id}/versions/{version}/lock": {
+      "get": {
+        "description": "Returns transitive imports in stable order with version record digests. Needs server admin.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "getSourceImportLock",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/version"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceImportLock"
+                }
+              }
+            },
+            "description": "Import lock."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Export a pinned import lock",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      },
+      "post": {
+        "description": "Checks the document version, pins and digests against the current catalog. Needs server admin.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "checkSourceImportLock",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/version"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceImportLock"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceImportLock"
+                }
+              }
+            },
+            "description": "Verified import lock."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Verify a pinned import lock",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/resources/{id}/versions/{version}/recipe": {
+      "get": {
+        "description": "Builds a recipe from the version's graph sources. Needs server admin.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "getCatalogRecipe",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/version"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceRecipe"
+                }
+              }
+            },
+            "description": "Dataset recipe."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a dataset version's recipe",
         "tags": [
           "Catalog"
         ],
@@ -57660,6 +58672,429 @@
           "History"
         ],
         "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/sources": {
+      "get": {
+        "description": "Lists source resources and their versions. Needs server admin.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "listCatalogSources",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceList"
+                }
+              }
+            },
+            "description": "Catalog sources."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List catalog sources",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/sources/harvest": {
+      "post": {
+        "description": "Reads supplied metadata and returns source candidates or Qleverfile inputs. Needs server admin.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "harvestCatalogSources",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceHarvestRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceHarvestPreview"
+                }
+              }
+            },
+            "description": "Harvest preview."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Preview harvested catalog entries",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/sources/plan": {
+      "post": {
+        "description": "Resolves pinned single-graph distributions without downloading. Needs server admin.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "planCatalogLoad",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceRecipe"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceLoadPlan"
+                }
+              }
+            },
+            "description": "Resolved plan."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Plan a source load",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/sources/{ds}/load": {
+      "post": {
+        "description": "Verifies downloads and atomically replaces the recipe's named graphs on main. Needs server admin, Query access and Upload access to every target graph.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "loadCatalogSources",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceRecipe"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceLoadResult"
+                }
+              }
+            },
+            "description": "Commit and manifest."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Replace graphs from pinned sources",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "write and server-admin"
+      }
+    },
+    "/$/sources/{ds}/manifests/{commit}": {
+      "get": {
+        "description": "Checks the manifest against its commit annotation. Needs server admin and full Query access on main.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "getSourceLoadManifest",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/commit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceLoadManifest"
+                }
+              }
+            },
+            "description": "Recorded provenance."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read a source load manifest",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "read and server-admin"
+      }
+    },
+    "/$/sources/{ds}/manifests/{commit}/reload": {
+      "post": {
+        "description": "Uses the same pins, checksums and graph targets to make a new replacement commit on main. Needs server admin, full Query access and Upload access to every target graph.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#source-manager"
+        },
+        "operationId": "reloadCatalogSources",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/commit"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceLoadResult"
+                }
+              }
+            },
+            "description": "Commit and manifest."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Reload graphs from a source manifest",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "write and server-admin"
       }
     },
     "/$/stats": {

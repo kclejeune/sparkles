@@ -147,6 +147,7 @@ impl StopFlag {
 /// requests have drained ([`Startup::stop_and_join`]).
 pub fn begin_shutdown(st: &AppState, stop: &StopFlag) {
     st.set_phase(crate::obs::Phase::Draining);
+    st.resources.stop.store(true, Ordering::Relaxed);
     stop.0.store(true, Ordering::SeqCst);
 }
 

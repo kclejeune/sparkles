@@ -57,7 +57,7 @@ pub fn run(a: PatchArgs, opts: StoreOptions, no_validate: bool) -> Result<()> {
     let message = a
         .message
         .as_deref()
-        .map(sparkles::annotations::validate_message)
+        .map(sparkles::annotations::validate_user_message)
         .transpose()?
         .flatten();
     let Some(loc) = a.loc else {

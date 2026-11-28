@@ -285,7 +285,12 @@ async fn reauthenticate(
         options.idempotency_key = request.idempotency_key;
         options.if_head = request.if_head;
         options.dry_run = request.dry_run;
-        options.message = request.message.map(Arc::from);
+        options.message = request
+            .message
+            .as_deref()
+            .map(sparkles::annotations::validate_user_message)
+            .transpose()?
+            .flatten();
         options.author = crate::http::author(&p);
         options.write = opts.graphs.clone();
         options.authority = Some(fence.clone());

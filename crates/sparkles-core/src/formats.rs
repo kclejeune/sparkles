@@ -390,6 +390,16 @@ pub const ANNOTATIONS: FileKind = FileKind {
     reads: &[1],
 };
 
+/// A source load's provenance beside its annotated data commit.
+pub const SOURCE_MANIFEST: FileKind = FileKind {
+    id: "source-manifest",
+    files: "source-manifests/COMMIT.json",
+    marker: "`format` of the load-manifest document",
+    class: Class::Primary,
+    writes: 1,
+    reads: &[1],
+};
+
 /// A branch generation's link to the logs it inherits, with its base overlay.
 pub const LINK: FileKind = FileKind {
     id: "link",
@@ -734,6 +744,7 @@ pub const KINDS: &[&FileKind] = &[
     &COMMITS,
     &CHANGE_LOG,
     &ANNOTATIONS,
+    &SOURCE_MANIFEST,
     &LINK,
     &CATALOG,
     &MIGRATION_STATE,
@@ -885,7 +896,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     server("policy-state.json", 1),
     server("runs.json", 1),
     // the resource catalog (spec C30, format 2 adds versionIri and snapshot pins for C32)
-    server("resources.json", 2),
+    server("resources.json", 3),
     server(".key-epoch.json", 1),
 ];
 

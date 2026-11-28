@@ -1,0 +1,24 @@
+{
+  "id": "prov",
+  "kind": "vocabulary",
+  "title": "PROV Ontology",
+  "namespaces": [
+    {
+      "prefix": "prov",
+      "iri": "http://www.w3.org/ns/prov#"
+    }
+  ],
+  "versions": [
+    {
+      "version": "2013",
+      "distributions": [
+        {
+          "url": "https://www.w3.org/ns/prov-o.ttl",
+          "mediaType": "text/turtle",
+          "byteSize": 68795,
+          "sha256": "7d203989f67b38bca572253942acc5a1bf24ce3ccfece16f072dcb4be2b79a96"
+        }
+      ]
+    }
+  ]
+}

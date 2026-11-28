@@ -6161,8 +6161,9 @@ The design is in [C30 Resource catalog](specs/C30-resource-catalog/README.md).
 The resource catalog records the sources, vocabularies and datasets a server works with,
 their versions and their licences. It describes data and never holds any. The catalog
 is the file `resources.json` of the data directory, and a server without a data
-directory keeps it in memory. Every route needs server `admin`, except the install
-route, which needs `admin` on its dataset. Writes answer `403 server-read-only` on a
+directory keeps it in memory. Catalog administration needs server `admin`. The
+prefix install needs dataset `admin` and the IRI reservation uses Query and Update
+grants. Writes answer `403 server-read-only` on a
 read-only server.
 
 | Route | What it does |
@@ -6214,8 +6215,9 @@ carry `versionIri`, `snapshot`, `issued`, `notes`, a `license` that overrides th
 resource's, `distributions` and `imports`. `versionIri` is an absolute IRI unique across
 the catalog that is emitted as `owl:versionIRI` in DCAT output, and `snapshot` is a
 point-in-time selector (`snapshot:NAME`, `commit:N`, `N`, `time:<RFC 3339>` or `head`)
-that pins linked-data reads of that version. Using `versionIri` or `snapshot` writes
-`resources.json` at format 2, while catalogs without them stay at format 1. A version of
+that pins linked-data reads of that version. Catalogs with an `iriPolicy` use format 3
+of `resources.json`. Catalogs with `versionIri` or `snapshot` use format 2 when there is
+no IRI policy. Other catalogs use format 1. A version of
 a dataset resource lists its `graphs`, each with the `sources` it
 was built from. An import or a source is a pin, `{"resource": …, "version": …}`, of a
 version that exists. A version never changes once it is added, so a correction is a new
@@ -6293,6 +6295,59 @@ A prefix that the dataset binds to another IRI is `409 prefix-conflict` with the
 `installed`, those it `replaced` and those that were `unchanged`. A prefix write that
 lands between the install's read and its write makes the install read again, so it
 never overwrites a binding it did not check.
+
+### Source manager
+
+Source management responses carry `Cache-Control: no-store`. Its load operations
+target the main branch. With `If-Match`, the dataset head must match the supplied tag
+before the write.
+
+| Route | Operation |
+|---|---|
+| `GET /$/sources` | Lists the source resources of the catalog. |
+| `POST /$/sources/harvest` | Reads `kind` and `document` and previews source candidates or file rules. |
+| `GET /$/resources/{id}/versions/{version}/recipe` | Builds a recipe from a dataset version's graph sources. |
+| `POST /$/sources/plan` | Resolves a recipe to its distribution URLs, byte sizes when known, checksums and graph assignments. |
+| `POST /$/sources/{ds}/load` | Runs a recipe and returns the commit receipt and manifest. |
+| `GET /$/sources/{ds}/manifests/{commit}` | Reads the manifest of a retained source-load commit. |
+| `POST /$/sources/{ds}/manifests/{commit}/reload` | Verifies the original pinned plan and replaces the same graphs in a new commit. |
+| `GET /$/resources/{id}/versions/{version}/lock` | Exports a deterministic lock with digests of the root and transitive imports. |
+| `POST /$/resources/{id}/versions/{version}/lock` | Validates the supplied lock against the catalog. |
+| `POST /$/resources/{id}/versions/{version}/bundle/{ds}` | Replaces a graph per pinned vocabulary version and binds its namespaces. |
+| `POST /$/resources/{id}/mint/{ds}` | Reserves an IRI using the vocabulary's policy. The JSON body may supply `label`. |
+
+A recipe is `{"kind":"recipe","format":1,"inputs":[...]}`. Each input names a
+`source` with `resource` and `version`, and an absolute named `graph` IRI outside
+the Sparkles reserved namespace. Optional `files` matches the last URL path segment
+with `*`. Optional `rdfFormat` specifies the single-graph RDF syntax. Distributions
+need a pinned SHA-256 and an HTTP or HTTPS URL. Optional `prefixes` binds new
+dataset prefixes in the same commit. Optional `recommendedIndexes` carries
+recommendations for the administrator.
+
+A load needs server `admin`, Query access to each target graph and write access to
+each through the Upload endpoint. Manifest reads and reloads require full Query
+access to the dataset. Restricted terms must have recorded acceptance before any of
+their bytes are fetched. The load verifies the raw response bytes, including any
+compression, before parsing. A load also aborts if the server access policy changes
+during execution. A digest or size mismatch leaves the dataset unchanged.
+
+A manifest is bound to the original dataset ID and to a retained commit by the
+digest in its commit annotation. A same-identity restore preserves that reference.
+An identity-changing restore keeps the copied files and returns `404 no-source-manifest`
+for the source dataset's manifest. A matching annotation with incomplete or corrupt
+files returns `503 source-manifest-unreadable`. An I/O failure while persisting a
+manifest leaves the commit unpublished and blocks further writes until the store
+reopens. In-memory datasets share a limit of 128 manifests and 16 MiB of manifest
+data per server. Pruning and dataset removal free those records at the next
+in-memory source load.
+
+A vocabulary resource can carry an `iriPolicy` with `namespace` and `rule`. Rules
+have `kind` of `slug`, `uuid`, `ulid`, `sequence` or `obo`. Slug rules require
+a `template` containing `{slug}`. A sequence has `stem`, `width`, `start` and
+`end`. An OBO rule has `stem`, `width` and non-overlapping `ranges` keyed by
+principal ID, each with `start` and `end`. The vocabulary must already name a graph
+on the target dataset. Minting requires full Query access on the dataset and write
+access to its reservation graph through Update.
 
 ## Linked-data publishing
 
@@ -12454,7 +12509,15 @@ profiles are defined in one table of the server.
 | `all` | Every tool. |
 | `explore` | `list_datasets`, `describe_schema`, `draft_shapes`, `diff_schema`, `sparql_query`, `explain_query`, `describe_resource`, `find_paths`, `graph_algorithm`, `list_commits`, `list_changes`, `search_text`, `search_semantic`, `similar_entities`, `check_query`, `similar_queries`, `community_reports`, `why_empty`, `ask`, `share_query`, `explain_inference` and `graphql_query`. |
 | `memory` | `list_datasets`, `describe_schema`, `sparql_query`, `describe_resource`, `search_text`, `search_semantic`, `similar_entities`, `check_query`, `similar_queries`, `link_entities`, `recall`, `community_reports`, `read_chunks`, `list_sources`, `ingest_profile`, `assert_facts`, `register_source`, `propose_claims`, `withdraw_claims`, `resolve_evidence` and `find_evidence_dependents`. |
-| `admin` | `list_datasets`, `describe_schema`, `draft_shapes`, `diff_schema`, `sparql_query`, `explain_query`, `list_commits`, `list_changes`, `validate_shacl`, `validate_shex`, `format`, `lint`, `ontology_axioms`, `entailment_diff`, `review_claims`, `resolve_identities`, `sparql_update` and the branch tools. |
+| `admin` | `list_datasets`, `describe_schema`, `draft_shapes`, `diff_schema`, `sparql_query`, `explain_query`, `list_commits`, `list_changes`, `validate_shacl`, `validate_shex`, `format`, `lint`, `ontology_axioms`, `entailment_diff`, `review_claims`, `resolve_identities`, `sparql_update`, the branch tools and the resource catalog tools. |
+
+The resource catalog tools are `catalog_sources`, `catalog_plan`, `catalog_harvest`,
+`catalog_import_lock`, `catalog_manifest`, `catalog_load`, `catalog_reload`,
+`catalog_install_bundle` and `catalog_mint_iri`. These tools use the same permissions
+as the [source manager routes](#source-manager). Loads, reloads, bundle installation
+and minting require MCP writes to be enabled. On HTTP, a caller with server admin
+grants and a narrower OAuth token can discover the administrative tools and
+request `sparkles:admin` when making the call.
 
 Several profiles and tool names combine into the union of their tools, and `all` among
 them offers every tool. A tool that the build lacks is skipped. An unknown profile or

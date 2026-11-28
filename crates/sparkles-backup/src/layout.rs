@@ -147,11 +147,13 @@ pub const ROOT_FILES: [&str; 26] = [
     "control.bin",
 ];
 
-/// A manifest file path: one of [`ROOT_FILES`], or `gen-NNNN/<file>` with 4 to 8 digits
+/// A manifest path can name a root file, a configuration history file, a source
+/// manifest, or `gen-NNNN/<file>` with 4 to 8 digits
 /// and a file name of `[A-Za-z0-9._-]{1,64}` other than `.` and `..`. Anything else
 /// (absolute paths, `..`, more levels) is refused before a path is joined.
 pub fn valid_backup_path(p: &str) -> bool {
-    if ROOT_FILES.contains(&p) || configuration_history_path(p) {
+    if ROOT_FILES.contains(&p) || configuration_history_path(p) || source_manifest_seq(p).is_some()
+    {
         return true;
     }
     let Some((dir, file)) = p.split_once('/') else {
@@ -165,6 +167,13 @@ pub fn valid_backup_path(p: &str) -> bool {
         && file
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+/// The commit of a source manifest at its canonical backup path.
+pub(crate) fn source_manifest_seq(path: &str) -> Option<u64> {
+    use sparkles_core::store::source_manifests::{DIRECTORY, file_seq};
+    let (dir, file) = path.split_once('/')?;
+    (dir == DIRECTORY).then(|| file_seq(file)).flatten()
 }
 
 /// Primary configuration history has a closed path grammar. In particular, a

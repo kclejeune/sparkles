@@ -287,11 +287,23 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
                 );
             }
         }
+        let source_manifest = crate::layout::source_manifest_seq(&f.path);
+        if let Some(seq) = source_manifest
+            && (seq > m.commit.seq
+                || f.definition.is_some()
+                || f.kind != sparkles_core::store::FileKind::Immutable)
+        {
+            return bad(
+                &field("path"),
+                "source manifest must be immutable data at the backup cut".into(),
+            );
+        }
         if let Some(d) = &f.definition {
             check_definition(m, i, f, d)?;
         } else if !valid_backup_path(&f.path) {
             return bad(&field("path"), format!("{:?} is not allowed", f.path));
         } else if !history
+            && source_manifest.is_none()
             && let Some((dir, _)) = f.path.split_once('/')
             && dir != m.generation
         {

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Verified source loads and vocabulary policies
+
+Source recipes verify pinned distribution checksums and replace the listed graphs in
+one commit. The source manager supports load manifests and reloads, deterministic
+import locks, public metadata harvest previews, vocabulary graph bundles and IRI
+reservations. The HTTP API, `sparkles source` and the MCP catalog tools expose the
+operations. The Sources page registers URLs, builds recipes and shows provenance.
+
+#### Format
+
+`resources.json` uses format 3 when a vocabulary sets `iriPolicy`. Recipes, load
+plans, import locks and commit-bound load manifests start at format 1. Persistent
+backups include source manifests through the captured commit.
+
 ### The rooted bound scales with the named classes (item 1061)
 
 The bound of a rooted run without counting is now 32 derived conclusions for each visible

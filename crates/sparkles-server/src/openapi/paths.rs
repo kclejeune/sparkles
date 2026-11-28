@@ -537,8 +537,82 @@ pub(super) fn add_all(p: &mut Paths) {
     openapi(p);
 }
 
+/// Source load and vocabulary management from spec C30.
+fn source_manager(p: &mut Paths) {
+    let tag = "Catalog";
+    let base =
+        |method, route, id, summary| op(method, route, id, tag, summary).see("source-manager");
+    let write = |operation: Op| {
+        operation
+            .param("ifMatch")
+            .errors(&[400, 403, 404, 408, 409, 412, 413, 502, 503, 507])
+    };
+    let manifest_commit = |operation: Op| operation.param("commit");
+    p.add(
+        base(
+            GET,
+            "/$/sources",
+            "listCatalogSources",
+            "List catalog sources",
+        )
+        .doc("Lists source resources and their versions. Needs server admin.")
+        .json("200", "Catalog sources.", "ResourceList")
+        .errors(&[403, 503]),
+    );
+    p.add(
+        base(
+            POST,
+            "/$/sources/plan",
+            "planCatalogLoad",
+            "Plan a source load",
+        )
+        .doc("Resolves pinned single-graph distributions without downloading. Needs server admin.")
+        .json_body(true, "SourceRecipe")
+        .json("200", "Resolved plan.", "SourceLoadPlan")
+        .errors(&[400, 403, 404, 503]),
+    );
+    p.add(base(POST, "/$/sources/harvest", "harvestCatalogSources", "Preview harvested catalog entries")
+        .doc("Reads supplied metadata and returns source candidates or Qleverfile inputs. Needs server admin.")
+        .json_body(true, "SourceHarvestRequest").json("200", "Harvest preview.", "SourceHarvestPreview")
+        .errors(&[400, 403, 413]));
+    p.add(write(base(POST, "/$/sources/{ds}/load", "loadCatalogSources", "Replace graphs from pinned sources")
+        .doc("Verifies downloads and atomically replaces the recipe's named graphs on main. Needs server admin, Query access and Upload access to every target graph.")
+        .json_body(true, "SourceRecipe").json("200", "Commit and manifest.", "SourceLoadResult")));
+    p.add(manifest_commit(base(GET, "/$/sources/{ds}/manifests/{commit}", "getSourceLoadManifest", "Read a source load manifest")
+        .doc("Checks the manifest against its commit annotation. Needs server admin and full Query access on main.")
+        .json("200", "Recorded provenance.", "SourceLoadManifest").errors(&[400, 403, 404, 503])));
+    p.add(write(manifest_commit(base(POST, "/$/sources/{ds}/manifests/{commit}/reload", "reloadCatalogSources", "Reload graphs from a source manifest")
+        .doc("Uses the same pins, checksums and graph targets to make a new replacement commit on main. Needs server admin, full Query access and Upload access to every target graph.")
+        .json("200", "Commit and manifest.", "SourceLoadResult"))));
+    p.add(
+        base(
+            GET,
+            "/$/resources/{id}/versions/{version}/recipe",
+            "getCatalogRecipe",
+            "Get a dataset version's recipe",
+        )
+        .doc("Builds a recipe from the version's graph sources. Needs server admin.")
+        .json("200", "Dataset recipe.", "SourceRecipe")
+        .errors(&[400, 403, 404, 503]),
+    );
+    p.add(base(GET, "/$/resources/{id}/versions/{version}/lock", "getSourceImportLock", "Export a pinned import lock")
+        .doc("Returns transitive imports in stable order with version record digests. Needs server admin.")
+        .json("200", "Import lock.", "SourceImportLock").errors(&[400, 403, 404, 409, 503]));
+    p.add(base(POST, "/$/resources/{id}/versions/{version}/lock", "checkSourceImportLock", "Verify a pinned import lock")
+        .doc("Checks the document version, pins and digests against the current catalog. Needs server admin.")
+        .json_body(true, "SourceImportLock").json("200", "Verified import lock.", "SourceImportLock")
+        .errors(&[400, 403, 404, 409, 503]));
+    p.add(write(base(POST, "/$/resources/{id}/versions/{version}/bundle/{ds}", "installVocabularyBundle", "Install pinned vocabulary graphs and prefixes")
+        .doc("Replaces the named graph of each pinned vocabulary in the bundle and installs its prefixes on main. Needs server admin, Query access and Upload access to every target graph.")
+        .json("200", "Commit and manifest.", "SourceLoadResult")));
+    p.add(write(base(POST, "/$/resources/{id}/mint/{ds}", "mintVocabularyIri", "Mint a vocabulary IRI")
+        .doc("Uses the vocabulary's policy and records the reservation in a dedicated graph on main. Needs Query access to the whole dataset and Update access to the reservation graph.")
+        .json_body(true, "VocabularyIriMintRequest").json("200", "Reserved IRI and commit.", "VocabularyIriReservation")));
+}
+
 /// The resource catalog of spec C30.
 fn resources(p: &mut Paths) {
+    source_manager(p);
     let tag = "Catalog";
     let rdf_or_json = || {
         let mut m = Map::new();

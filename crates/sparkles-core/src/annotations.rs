@@ -106,6 +106,21 @@ pub fn validate_message(m: &str) -> Result<Option<Arc<str>>> {
     Ok(Some(Arc::from(m)))
 }
 
+/// Validate a message supplied by a client. The source loader reserves its
+/// annotation prefix to bind an immutable provenance file to publication.
+pub fn validate_user_message(m: &str) -> Result<Option<Arc<str>>> {
+    let message = validate_message(m)?;
+    if message
+        .as_deref()
+        .is_some_and(|m| m.starts_with(crate::store::source_manifests::ANNOTATION))
+    {
+        return Err(Error::invalid(
+            "the source manifest commit message prefix is reserved",
+        ));
+    }
+    Ok(message)
+}
+
 /// The annotations of one store: every annotated commit, in memory, backed by
 /// `annotations.bin` for persistent stores.
 pub(crate) struct Annotations {

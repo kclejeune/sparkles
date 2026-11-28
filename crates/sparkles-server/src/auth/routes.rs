@@ -22,6 +22,8 @@ pub enum Need {
     Interactive,
     /// that level on the route's `{ds}`
     Dataset(Level),
+    /// A dataset level together with a server permission.
+    DatasetAndServer(Level, ServerPerm),
     Server(ServerPerm),
 }
 
@@ -204,6 +206,22 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/resources/{id}/header", &["GET"]),
     ("/$/resources/{id}/recipes", &["GET"]),
     ("/$/resources/{id}/install/{ds}", &["POST"]),
+    ("/$/sources", &["GET"]),
+    ("/$/sources/plan", &["POST"]),
+    ("/$/sources/harvest", &["POST"]),
+    ("/$/sources/{ds}/load", &["POST"]),
+    ("/$/sources/{ds}/manifests/{commit}", &["GET"]),
+    ("/$/sources/{ds}/manifests/{commit}/reload", &["POST"]),
+    ("/$/resources/{id}/versions/{version}/recipe", &["GET"]),
+    (
+        "/$/resources/{id}/versions/{version}/lock",
+        &["GET", "POST"],
+    ),
+    (
+        "/$/resources/{id}/versions/{version}/bundle/{ds}",
+        &["POST"],
+    ),
+    ("/$/resources/{id}/mint/{ds}", &["POST"]),
     // linked-data publishing front end (C32): filtered by the handlers to datasets and
     // graphs the caller may read
     ("/$/ld", &["GET"]),
@@ -516,6 +534,13 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // the server's resource catalog (C30); installing a vocabulary's prefixes changes
         // one dataset's settings
         "/$/resources/{id}/install/{ds}" => Dataset(Admin),
+        "/$/sources/{ds}/manifests/{commit}" => DatasetAndServer(Read, ServerPerm::ServerAdmin),
+        "/$/sources/{ds}/load"
+        | "/$/sources/{ds}/manifests/{commit}/reload"
+        | "/$/resources/{id}/versions/{version}/bundle/{ds}" => {
+            DatasetAndServer(Write, ServerPerm::ServerAdmin)
+        }
+        "/$/resources/{id}/mint/{ds}" => Dataset(Write),
         "/$/resources"
         | "/$/resources/{id}"
         | "/$/resources/{id}/versions"
@@ -524,7 +549,12 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/resources/{id}/license"
         | "/$/resources/{id}/notice"
         | "/$/resources/{id}/header"
-        | "/$/resources/{id}/recipes" => Server(ServerPerm::ServerAdmin),
+        | "/$/resources/{id}/recipes"
+        | "/$/resources/{id}/versions/{version}/recipe"
+        | "/$/resources/{id}/versions/{version}/lock"
+        | "/$/sources"
+        | "/$/sources/plan"
+        | "/$/sources/harvest" => Server(ServerPerm::ServerAdmin),
         // linked-data publishing front end (C32): handlers enforce dataset, graph and
         // triple read permissions
         "/$/ld"
@@ -835,7 +865,13 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/{ds}/get" => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" if get => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" => Endpoint::GspRw,
-        "/{ds}/upload" | "/{ds}/mappings/{name}/run" => Endpoint::Upload,
+        "/{ds}/upload"
+        | "/{ds}/mappings/{name}/run"
+        | "/$/sources/{ds}/load"
+        | "/$/sources/{ds}/manifests/{commit}/reload"
+        | "/$/resources/{id}/versions/{version}/bundle/{ds}" => Endpoint::Upload,
+        "/$/sources/{ds}/manifests/{commit}" => Endpoint::Query,
+        "/$/resources/{id}/mint/{ds}" => Endpoint::Update,
         "/{ds}/patch" => Endpoint::Patch,
         "/{ds}/shacl" => Endpoint::Shacl,
         "/{ds}/shex" => Endpoint::Shex,
@@ -951,7 +987,9 @@ fn origin_gated(method: &Method, need: Need) -> bool {
     !safe(method)
         || matches!(
             need,
-            Need::Dataset(Level::Write | Level::Admin) | Need::Server(ServerPerm::ServerAdmin)
+            Need::Dataset(Level::Write | Level::Admin)
+                | Need::DatasetAndServer(_, ServerPerm::ServerAdmin)
+                | Need::Server(ServerPerm::ServerAdmin)
         )
 }
 
@@ -1667,8 +1705,18 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
 
     // 4.–6. decide
     let unauth = |h: &HeaderMap| unauthorized(realm, h, "authentication required", None, basic, "");
+    if let Need::Server(perm) | Need::DatasetAndServer(_, perm) = need
+        && !p.has(perm)
+    {
+        if p.is_anonymous() {
+            return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
+        }
+        count(Denied::Forbidden);
+        let msg = format!("{} permission required", perm.as_str());
+        return finish(forbidden(&p, &msg));
+    }
     match need {
-        Need::Public | Need::Caller => {}
+        Need::Public | Need::Caller | Need::Server(_) => {}
         Need::Authed => {
             if p.is_anonymous() {
                 return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
@@ -1687,17 +1735,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                 ));
             }
         }
-        Need::Server(perm) => {
-            if !p.has(perm) {
-                if p.is_anonymous() {
-                    return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
-                }
-                count(Denied::Forbidden);
-                let msg = format!("{} permission required", perm.as_str());
-                return finish(forbidden(&p, &msg));
-            }
-        }
-        Need::Dataset(lvl) => {
+        Need::Dataset(lvl) | Need::DatasetAndServer(lvl, _) => {
             let ds = ds_of(&route, req.uri()).unwrap_or_default();
             // the branch routes need the dataset visible on some branch; their handlers
             // check each branch a request names

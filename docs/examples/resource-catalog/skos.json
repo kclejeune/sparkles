@@ -1,0 +1,24 @@
+{
+  "id": "skos",
+  "kind": "vocabulary",
+  "title": "Simple Knowledge Organization System",
+  "namespaces": [
+    {
+      "prefix": "skos",
+      "iri": "http://www.w3.org/2004/02/skos/core#"
+    }
+  ],
+  "versions": [
+    {
+      "version": "2009",
+      "distributions": [
+        {
+          "url": "https://www.w3.org/2009/08/skos-reference/skos.rdf",
+          "mediaType": "application/rdf+xml",
+          "byteSize": 28966,
+          "sha256": "e79633b8d0564816cee8a99f5c9acf9a0e6fc7257c7209acd684ecad53a89dd6"
+        }
+      ]
+    }
+  ]
+}

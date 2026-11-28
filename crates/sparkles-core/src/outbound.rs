@@ -629,6 +629,27 @@ impl Drop for RequestBudget {
     }
 }
 
+/// A streaming download whose I/O failures are scrubbed before they reach callers.
+pub struct Download(reqwest::Response);
+
+impl Download {
+    pub fn status(&self) -> reqwest::StatusCode {
+        self.0.status()
+    }
+
+    pub async fn chunk(&mut self) -> crate::Result<Option<impl AsRef<[u8]>>> {
+        match self.0.chunk().await {
+            Ok(chunk) => Ok(chunk),
+            Err(e) if e.is_timeout() => Err(crate::Error::Timeout),
+            Err(e) => Err(crate::Error::Invalid(hidden(
+                self.0.url().as_str(),
+                "the download body could not be read",
+                &e,
+            ))),
+        }
+    }
+}
+
 impl OutboundPolicy {
     /// Parse and check a URL: its scheme and, for an IP-literal host, the address.
     /// A host name is checked when it is resolved ([`check_host`](Self::check_host)).
@@ -978,41 +999,7 @@ impl OutboundPolicy {
         abort: Option<AbortCheck>,
         deadline: Instant,
     ) -> reqwest::Result<reqwest::blocking::Client> {
-        let (p, slot, max) = (self.clone(), failed.clone(), self.max_redirects);
-        let custom = self.tls.is_custom();
-        let redirected_for_policy = redirected.clone();
-        let redirect = reqwest::redirect::Policy::custom(move |a| {
-            // Receiving any redirect proves an earlier hop already reached a server,
-            // so later DNS/connect aborts must never be classified as before-send.
-            redirected_for_policy.store(true, Ordering::SeqCst);
-            if a.previous().len() > max {
-                return a.error(format!("more than {max} redirects"));
-            }
-            // the TLS options were given for the first server only
-            if custom
-                && a.previous()
-                    .first()
-                    .is_some_and(|first| first.origin() != a.url().origin())
-            {
-                let m = format!(
-                    "redirect to {}: another server, while the TLS options are set for {}",
-                    a.url(),
-                    a.previous()[0].origin().ascii_serialization()
-                );
-                *slot.lock() = Some(Failure::Refused(m.clone()));
-                return a.error(m);
-            }
-            match p.check_parsed(a.url()) {
-                Ok(()) => a.follow(),
-                Err(f) => {
-                    let m = format!("redirect to {}: {f}", a.url());
-                    if matches!(f, Failure::Refused(_)) {
-                        *slot.lock() = Some(Failure::Refused(m.clone()));
-                    }
-                    a.error(m)
-                }
-            }
-        });
+        let redirect = self.redirect_policy(failed, redirected.clone());
         let mut b = reqwest::blocking::Client::builder()
             .connect_timeout(self.connect_timeout)
             .timeout(self.timeout)
@@ -1036,6 +1023,124 @@ impl OutboundPolicy {
             b = b.tls_danger_accept_invalid_certs(true);
         }
         b.build()
+    }
+    fn redirect_policy(
+        &self,
+        failed: &Arc<Mutex<Option<Failure>>>,
+        redirected: Arc<AtomicBool>,
+    ) -> reqwest::redirect::Policy {
+        let (p, slot, max) = (self.clone(), failed.clone(), self.max_redirects);
+        let custom = self.tls.is_custom();
+        reqwest::redirect::Policy::custom(move |a| {
+            // Receiving any redirect proves an earlier hop already reached a server,
+            // so later DNS/connect aborts must never be classified as before-send.
+            redirected.store(true, Ordering::SeqCst);
+            if a.previous().len() > max {
+                let message = format!("more than {max} redirects");
+                *slot.lock() = Some(Failure::Failed(message.clone()));
+                return a.error(message);
+            }
+            // the TLS options were given for the first server only
+            if custom
+                && a.previous()
+                    .first()
+                    .is_some_and(|first| first.origin() != a.url().origin())
+            {
+                let m = format!(
+                    "redirect to {}: another server, while the TLS options are set for {}",
+                    a.url(),
+                    a.previous()[0].origin().ascii_serialization()
+                );
+                *slot.lock() = Some(Failure::Refused(m.clone()));
+                return a.error(m);
+            }
+            match p.check_parsed(a.url()) {
+                Ok(()) => a.follow(),
+                Err(f) => {
+                    let m = format!("redirect to {}: {f}", a.url());
+                    let failure = match f {
+                        Failure::Refused(_) => Failure::Refused(m.clone()),
+                        other => other,
+                    };
+                    *slot.lock() = Some(failure);
+                    a.error(m)
+                }
+            }
+        })
+    }
+
+    /// Open a download through the same checks as the blocking outbound client. The
+    /// caller owns the response budget and may drop either a pending send or a body
+    /// read to abort it, including while the connection is idle.
+    pub async fn open_download(&self, url: &str, deadline: Instant) -> crate::Result<Download> {
+        #[cfg(any(test, feature = "failpoints"))]
+        if probe::intercept(url) {
+            return Err(crate::Error::invalid("owned test refused outbound send"));
+        }
+        let failure = |f: Failure| crate::Error::Invalid(f.to_string());
+        let u = self.check_url(url).map_err(failure)?;
+        let failed = Arc::new(Mutex::new(None));
+        let redirected = Arc::new(AtomicBool::new(false));
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .redirect(self.redirect_policy(&failed, redirected.clone()))
+            .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
+            .dns_resolver(Arc::new(Pinned {
+                policy: self.clone(),
+                failed: failed.clone(),
+                aborted: Arc::default(),
+                initial_dns_in_flight: Arc::default(),
+                redirected,
+                abort: None,
+                deadline,
+            }))
+            .user_agent(concat!("sparkles/", env!("CARGO_PKG_VERSION")));
+        let build_error = |e: reqwest::Error| {
+            crate::Error::Invalid(hidden(url, "the HTTP client could not be built", &e))
+        };
+        if let Some(pem) = &self.tls.extra_roots_pem {
+            builder = builder
+                .tls_certs_merge(reqwest::Certificate::from_pem_bundle(pem).map_err(build_error)?);
+        }
+        if self.tls.insecure_skip_verify {
+            builder = builder.tls_danger_accept_invalid_certs(true);
+        }
+        let client = builder.build().map_err(build_error)?;
+        let mut request = client.get(u).header("Accept", "*/*");
+        if let Some(hook) = HOOK.get() {
+            let mut headers = Vec::new();
+            hook(&mut |k, v| headers.push((k.to_string(), v.to_string())));
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+        }
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(self.timeout);
+        if remaining.is_zero() {
+            return Err(crate::Error::Timeout);
+        }
+        match request.timeout(remaining).send().await {
+            Ok(response) => Ok(Download(response)),
+            Err(e) => {
+                if let Some(f) = failed.lock().take() {
+                    return Err(failure(f));
+                }
+                if e.is_timeout() || Instant::now() >= deadline {
+                    return Err(crate::Error::Timeout);
+                }
+                let what = if e.is_redirect() {
+                    "the download redirect failed"
+                } else {
+                    "the download request failed"
+                };
+                Err(crate::Error::Invalid(hidden(url, what, &e)))
+            }
+        }
     }
 }
 

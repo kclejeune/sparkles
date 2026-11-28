@@ -2178,6 +2178,8 @@ fn publish(
     let st = r.ctx.server.state.clone();
     let p = r.ctx.principal.clone();
     let control = control_of(r);
+    let message =
+        sparkles::annotations::validate_user_message(&message).map_err(|e| api(e.into()))?;
     let mut attempt = 0;
 
     let refresh_for_moved_head =
@@ -2303,7 +2305,7 @@ fn publish(
             && input.links.is_empty()
             && input.assessments.is_empty());
         options.proposal_graph = proposes.then(|| t.proposal_graph.clone());
-        options.message = Some(Arc::from(message.as_str()));
+        options.message = message.clone();
         options.author = crate::http::author(&p);
         options.write = write_view(r, &t.main, &t.logical, &t.branch);
         options.authority = Some(

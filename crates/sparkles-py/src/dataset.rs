@@ -967,7 +967,7 @@ impl PyDataset {
             return Err(PyTypeError::new_err("data must be str or bytes"));
         };
         let message = match message {
-            Some(m) => sparkles::annotations::validate_message(&m).py(py)?,
+            Some(m) => sparkles::annotations::validate_user_message(&m).py(py)?,
             None => None,
         };
         let ds = self.ds_for_write(py)?;

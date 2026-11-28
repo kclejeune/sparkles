@@ -3578,6 +3578,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/resources/{id}/mint/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint a vocabulary IRI
+         * @description Uses the vocabulary's policy and records the reservation in a dedicated graph on main. Needs Query access to the whole dataset and Update access to the reservation graph.
+         */
+        post: operations["mintVocabularyIri"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/resources/{id}/notice": {
         parameters: {
             query?: never;
@@ -3653,6 +3673,70 @@ export interface paths {
          * @description Removes a version that nothing references (`409 resource-in-use` otherwise). Needs server `admin`.
          */
         delete: operations["deleteResourceVersion"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}/versions/{version}/bundle/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Install pinned vocabulary graphs and prefixes
+         * @description Replaces the named graph of each pinned vocabulary in the bundle and installs its prefixes on main. Needs server admin, Query access and Upload access to every target graph.
+         */
+        post: operations["installVocabularyBundle"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}/versions/{version}/lock": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export a pinned import lock
+         * @description Returns transitive imports in stable order with version record digests. Needs server admin.
+         */
+        get: operations["getSourceImportLock"];
+        put?: never;
+        /**
+         * Verify a pinned import lock
+         * @description Checks the document version, pins and digests against the current catalog. Needs server admin.
+         */
+        post: operations["checkSourceImportLock"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/resources/{id}/versions/{version}/recipe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a dataset version's recipe
+         * @description Builds a recipe from the version's graph sources. Needs server admin.
+         */
+        get: operations["getCatalogRecipe"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -4080,6 +4164,126 @@ export interface paths {
         post?: never;
         /** Drop a named snapshot's full-text index */
         delete: operations["dropSnapshotText"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List catalog sources
+         * @description Lists source resources and their versions. Needs server admin.
+         */
+        get: operations["listCatalogSources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/sources/harvest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview harvested catalog entries
+         * @description Reads supplied metadata and returns source candidates or Qleverfile inputs. Needs server admin.
+         */
+        post: operations["harvestCatalogSources"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/sources/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Plan a source load
+         * @description Resolves pinned single-graph distributions without downloading. Needs server admin.
+         */
+        post: operations["planCatalogLoad"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/sources/{ds}/load": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replace graphs from pinned sources
+         * @description Verifies downloads and atomically replaces the recipe's named graphs on main. Needs server admin, Query access and Upload access to every target graph.
+         */
+        post: operations["loadCatalogSources"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/sources/{ds}/manifests/{commit}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a source load manifest
+         * @description Checks the manifest against its commit annotation. Needs server admin and full Query access on main.
+         */
+        get: operations["getSourceLoadManifest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/sources/{ds}/manifests/{commit}/reload": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reload graphs from a source manifest
+         * @description Uses the same pins, checksums and graph targets to make a new replacement commit on main. Needs server admin, full Query access and Upload access to every target graph.
+         */
+        post: operations["reloadCatalogSources"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -13009,6 +13213,7 @@ export interface components {
             /** @description An absolute IRI. */
             homepage?: string;
             id: string;
+            iriPolicy?: components["schemas"]["VocabularyIriPolicy"];
             /** @enum {string} */
             kind: "source" | "vocabulary" | "dataset";
             /** @description An SPDX licence expression. Absent means no licence is known, which forbids redistribution. */
@@ -13054,6 +13259,7 @@ export interface components {
             homepage?: string;
             /** @description 1 to 64 letters, digits, `.`, `_` and `-`, starting with a letter or digit. */
             id: string;
+            iriPolicy?: components["schemas"]["VocabularyIriPolicy"];
             /** @enum {string} */
             kind: "source" | "vocabulary" | "dataset";
             /** @description An SPDX licence expression. Absent means no licence is known, which forbids redistribution. */
@@ -13098,6 +13304,7 @@ export interface components {
             homepage?: string;
             /** @description The route's id, when given. */
             id?: string;
+            iriPolicy?: components["schemas"]["VocabularyIriPolicy"];
             /** @enum {string} */
             kind: "source" | "vocabulary" | "dataset";
             /** @description An SPDX licence expression. Absent means no licence is known, which forbids redistribution. */
@@ -13745,6 +13952,50 @@ export interface components {
             /** @description Keep the snapshot materialized. */
             warm?: boolean | string;
         };
+        SourceHarvestPreview: {
+            candidates: {
+                distributions: {
+                    byteSize?: number;
+                    mediaType?: string;
+                    sha256?: string;
+                    url: string;
+                }[];
+                id: string;
+                namespace: string | null;
+                title: string;
+                version: string | null;
+            }[];
+            inputs: {
+                files: string[];
+                graph: string | null;
+                rdfFormat: string;
+            }[];
+        };
+        SourceHarvestRequest: {
+            document: string;
+            /** @enum {string} */
+            kind: "obo-foundry" | "bioregistry" | "lov" | "ckan" | "databus" | "dcat" | "qleverfile";
+        };
+        SourceImportLock: {
+            /** @constant */
+            format: 1;
+            imports: {
+                pin: {
+                    resource: string;
+                    version: string;
+                };
+                sha256: string;
+            }[];
+            /** @constant */
+            kind: "import-lock";
+            root: {
+                pin: {
+                    resource: string;
+                    version: string;
+                };
+                sha256: string;
+            };
+        };
         /** @description The sources `list_sources` found. */
         SourceList: {
             branch?: string;
@@ -13769,6 +14020,66 @@ export interface components {
                 title?: string;
             }[];
             truncated: boolean;
+        };
+        SourceLoadManifest: {
+            by: string;
+            datasetId: string;
+            /** @constant */
+            format: 1;
+            id: string;
+            /** @constant */
+            kind: "load-manifest";
+            plan: components["schemas"]["SourceLoadPlan"];
+            recipe: components["schemas"]["SourceRecipe"];
+            reloadedFrom: number | null;
+        };
+        SourceLoadPlan: {
+            files: {
+                byteSize: number | null;
+                graph: string;
+                rdfFormat: string;
+                sha256: string;
+                source: {
+                    resource: string;
+                    version: string;
+                };
+                url: string;
+            }[];
+            /** @constant */
+            format: 1;
+            /** @constant */
+            kind: "load-plan";
+            prefixes: {
+                [key: string]: string;
+            };
+            recommendedIndexes: {
+                [key: string]: string;
+            };
+        };
+        SourceLoadResult: {
+            manifest: components["schemas"]["SourceLoadManifest"];
+            receipt: components["schemas"]["Receipt"];
+        };
+        SourceRecipe: {
+            /** @constant */
+            format: 1;
+            inputs: {
+                files?: string | null;
+                graph: string;
+                rdfFormat?: string | null;
+                source: {
+                    resource: string;
+                    version: string;
+                };
+            }[];
+            /** @constant */
+            kind: "recipe";
+            prefixes?: {
+                [key: string]: string;
+            };
+            recommendedIndexes?: {
+                [key: string]: string;
+            };
         };
         /** @description `application/x-sparkles+json`, the UI's result format. */
         SparklesResult: {
@@ -14764,6 +15075,45 @@ export interface components {
             resource: string;
             version: string | null;
         };
+        VocabularyIriMintRequest: {
+            label?: string | null;
+        };
+        VocabularyIriPolicy: {
+            namespace: string;
+            rule: {
+                /** @constant */
+                kind: "slug";
+                template: string;
+            } | {
+                /** @constant */
+                kind: "uuid";
+            } | {
+                /** @constant */
+                kind: "ulid";
+            } | {
+                end: number;
+                /** @constant */
+                kind: "sequence";
+                start: number;
+                stem: string;
+                width: number;
+            } | {
+                /** @constant */
+                kind: "obo";
+                ranges: {
+                    [key: string]: {
+                        end: number;
+                        start: number;
+                    };
+                };
+                stem: string;
+                width: number;
+            };
+        };
+        VocabularyIriReservation: {
+            iri: string;
+            receipt: components["schemas"]["Receipt"];
+        };
         /** @description A watch of the caller's. */
         Watch: {
             /** @description The branch's current name. A renamed branch keeps its watches. */
@@ -15173,6 +15523,8 @@ export interface components {
         changes: number;
         /** @description The name of a notification channel. */
         channel: string;
+        /** @description The commit sequence of the source load. */
+        commit: number;
         /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
         commitMessage: string;
         /** @description The `next` of the previous page. Send the same selection with it. */
@@ -25159,6 +25511,50 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    mintVocabularyIri: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VocabularyIriMintRequest"];
+            };
+        };
+        responses: {
+            /** @description Reserved IRI and commit. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VocabularyIriReservation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            413: components["responses"]["PayloadTooLarge"];
+            502: components["responses"]["BadGateway"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     getResourceNotice: {
         parameters: {
             query?: {
@@ -25293,6 +25689,147 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    installVocabularyBundle: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+                /** @description A version of the resource. */
+                version: components["parameters"]["version"];
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Commit and manifest. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceLoadResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            413: components["responses"]["PayloadTooLarge"];
+            502: components["responses"]["BadGateway"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getSourceImportLock: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+                /** @description A version of the resource. */
+                version: components["parameters"]["version"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Import lock. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceImportLock"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    checkSourceImportLock: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+                /** @description A version of the resource. */
+                version: components["parameters"]["version"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceImportLock"];
+            };
+        };
+        responses: {
+            /** @description Verified import lock. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceImportLock"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getCatalogRecipe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+                /** @description A version of the resource. */
+                version: components["parameters"]["version"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dataset recipe. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceRecipe"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
@@ -26436,6 +26973,202 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listCatalogSources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Catalog sources. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    harvestCatalogSources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceHarvestRequest"];
+            };
+        };
+        responses: {
+            /** @description Harvest preview. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceHarvestPreview"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            413: components["responses"]["PayloadTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    planCatalogLoad: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceRecipe"];
+            };
+        };
+        responses: {
+            /** @description Resolved plan. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceLoadPlan"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    loadCatalogSources: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceRecipe"];
+            };
+        };
+        responses: {
+            /** @description Commit and manifest. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceLoadResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            413: components["responses"]["PayloadTooLarge"];
+            502: components["responses"]["BadGateway"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getSourceLoadManifest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The commit sequence of the source load. */
+                commit: components["parameters"]["commit"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recorded provenance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceLoadManifest"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reloadCatalogSources: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The commit sequence of the source load. */
+                commit: components["parameters"]["commit"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Commit and manifest. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceLoadResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            413: components["responses"]["PayloadTooLarge"];
+            502: components["responses"]["BadGateway"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
