@@ -475,6 +475,148 @@ a synthetic family whose conditions nest two or more deep grows with the repair'
 which is item 1251. The repair's completeness is not proved, and the check stays on by
 default.
 
+Item 1250 records a conditional argument for the cut. It holds for a run without
+counting, and it rests on the obligations of the journal's proof that the departures of
+item 804 already leave open, so it is not a proof that a rooted run with the selection off
+is complete. A clause of a context other than the root is ground-bodied when its body
+holds a literal that mentions neither `x` nor `y`, which is a ground literal, a literal
+over a successor term `f(u)` of a constant or a ground marker. A marker over `x`, such as
+`A(x) → A(x)`, does not make a clause ground-bodied. The cut leaves such a clause out of
+four inferences in that context. The first is Hyper at a constant, apart from the
+universals along a role atom between the constant and `x`, `y` or `f(x)`. The second is
+Hyper on a role atom from a constant whose other end is a constant or `f(u)`, and on that
+path the inferences with a disjoint role are skipped when either premise is cut. The third
+is Join with the clause on the side of the head, and the fourth is Eq or Factor whose two
+literals both mention neither `x` nor `y`. The clause stays a premise of Hyper over `x`,
+of Pred and Succ, of Join on the side of the body, of Eq and Factor with a literal over
+`x`, `y` or `f(x)`, and of the inferences local to the context. It also stays a premise of
+the universals at `x` along a role atom `r(x, u)` to a constant `u`, in either order of
+arrival, and these still merge the bodies of their premises, so `B(v) → (∀r.D)(x)` and
+`E(w) → r(x, u)` give `B(v) ∧ E(w) → D(u)`. The root's clauses are never cut.
+
+The argument has four parts. The first is the stage of facts. The model construction of
+item 1220's proof work starts from the clauses with an empty body of the query context and
+of the root, none of which is ground-bodied, so the cut leaves every inference among them in
+place. The second is the discharge of a ground body in the query context, and it covers
+only body literals whose terms are all constants. Join takes such a literal as its pivot
+and no other, the index of ground body literals holds only such literals, and registration
+with the root uses the same test, so a body literal over a successor term of a constant,
+such as `B(f(u))`, is not discharged by Join. Take a clause in the query context whose body
+literals that mention neither `x` nor `y` are all over constants and all hold in the model,
+and whose head is false in it. Each such body literal has a producer, a processed clause
+with an empty body and the literal maximal, held by the query context or delivered to it
+as a root fact by registration. The induction uses two properties of the producer. Its
+body is empty, so it is not ground-bodied and Join takes it on the side of the head. The
+rest of its head must be false in the model, which holds when it is the clause that makes
+the literal true there, and for a disjunctive producer this means that every other
+disjunct is false. Join with the
+clause on the side of the body and the producer on the side of the head is not cut, and
+the Join exemption keeps its conclusion, since the producer has no ground body literal.
+The conclusion has one ground body literal fewer, and its head is the clause's head with
+the rest of the producer's head, which is false in the model. Otherwise a live clause
+subsumes the conclusion with no more ground body literals and a head that is still false.
+Processing the clause first finds the producer through the index of maximal literals, and
+processing the producer first finds the clause through the index of ground body literals,
+so the order of arrival does not matter. After at most as many Joins as the body has
+literals over constants, the clause has no ground body and takes every inference.
+
+The third part is the elements outside the stage of facts. Each inference that the same
+construction needs at such an element has a pivot of its own, an atom over `x`, a literal
+over `f(x)` or a role atom between `x` and a constant, and the cut keeps all of them. A
+ground-bodied clause whose head holds a literal over a constant either has that literal
+true in the model, where its consequences follow from the clause with an empty body that
+produces it, or is assumed to reach the query context or the root by Pred with its ground
+body intact. In the query context the second part discharges the ground body, while the
+root does not apply the ground-body cut. Pred accepts a clause whose body holds atoms over
+`x`, role atoms `s(y, x)` and literals over constants alone, and whose head holds
+predecessor triggers, constant inequalities or role atoms between `x` and a constant, with
+the role-atom head handled on the rooted path over `f(u)` while ordinary Pred refuses it.
+The assumption therefore covers a clause of a shape that `pred_ready` accepts and the
+corresponding Pred path sends, and a clause of another shape needs a replacement of that
+shape with the same residual head. The fourth part is item 1231's return in mode `129`. The argument resolves
+a returned root clause against producers with an empty body in the query context, or
+against live clauses that subsume them, and the filter keeps those premises, since it
+excludes only holder premises with a ground body literal. The return finds a premise
+through the index of maximal literals, so a live clause that subsumes a producer serves
+as a premise only when it keeps the returned body literal maximal. A subsumer that drops
+that literal needs a separate argument. A returned clause is recorded under every literal
+of its body before the filter runs, and a late premise registers its holder before the
+filter can exclude it, so the order of arrival does not matter here either.
+
+The cut stops part of the growth as well. The side of the head of a Join is a clause
+without a ground body literal, so a Join's conclusion holds part of the ground body of the
+side of the body and never the union of two ground bodies. Hyper at a constant, Hyper on a
+role atom from a constant to a constant or to `f(u)`, the inferences with a disjoint role on
+that path and the ground equality inferences no longer copy a ground body into new
+conditional ground heads. The conditional facts over constants and over `f(u)` that these
+inferences made from other conditional facts, and that Pred took as partners, are no longer
+made. The universals at `x` along a role atom to a constant are not cut and still merge the
+bodies of their premises into a conditional fact over the constant, so the cut leaves that
+route of growth in place. Pred itself keeps ground-bodied partners, since a candidate that
+left them out broke the return of facts over `f(u)` that hold under a marker. The growth is
+cut where the routes above make those partners and not in Pred.
+
+Six obligations stay open. The first is the assumption of the third part, that a
+ground-bodied clause outside the query context whose literal is false in the model, or a
+replacement of the shape that Pred sends, reaches the query context or the root by Pred.
+The second is the holder of such a clause. A clause with a ground body and a literal over
+`f(u)` in its head can be held by a context other than the query context, and the argument
+does not show that such a context can discharge its body or that another context holds a
+replacement with the residual head and the maximality that a later inference needs, so the
+second part covers the query context only. The third is the lifting of clauses with `f(u)`
+to every context, which is the obligation of item 804's departures. The fourth is a body
+literal over a successor term of a constant in the query context, which Join does not take
+as a pivot. The argument needs to show that such a body cannot arise in this part of the
+construction or how its literal is discharged. The fifth is a live clause in mode `129` that
+subsumes a producer and drops the returned body literal. The sixth is that counting is not
+covered and that the filter of the return is checked only against the uses of the return
+that the argument names. No measured run loses an entailment to any of them, and all six
+stay with item 1220's proof, which item 823 waits for. An earlier design also proposed
+selecting one ground body literal for Join and pruning a product early against the store.
+The consult on the design found that the first needs the holder argument above, which is
+open, and that the second breaks the product's guarantee that every union reaches the
+redundancy test, so neither was built.
+
+The cut finishes the ontologies of the item. The measured set holds 104 generated input
+files around g1-051_p0012, which are g1-051_p0011, g1-051_p0012, g1-051_p0121, 17 one-axiom
+deletions, 22 further reductions, 25 ablations, 24 files of item 1251's family with ground
+conditions nested one and two deep, the two files of part022 and 11 fixtures and reductions
+from the tests of the cut. Some files share their axioms, such as `misc/d00.ofn` and
+`q3b-del/d00.ofn`, so the 104 files hold 91 distinct ontologies, and every count below is
+over the 104 files. Each ran on one thread under the cautious strategy and on four under the
+eager one, with the selection off, the partners of item 1220's repair off, the check off, a
+bound of 4 million conclusions and HermiT 1.4.5's taxonomy as the reference. These runs use
+`Saturation::classify` over the logical axioms, as the `el_classify` example does, which
+derives fewer conclusions than `Classifier` on the same file, so g1-051_p0012 takes 143,778
+conclusions in mode `129` on one thread here against the 251,217 above. The harness
+records a combined fallback flag (`dl_rooted_over || dl_over_budget`), which covers
+work-limit and memory-budget fallbacks on the cut and uncut arms (where decline is off)
+and also decline fallbacks on the selection-on arms. Without the cut and with the repair
+off, 26 files fall back under the 4 million conclusion limit in 50 runs. Of these, 24 fall
+back in both configurations, H3 only on one thread and min-C3 only on four threads.
+Without the cut, 37 files fall back in 74 runs in each of modes `129` and `1`, and
+g1-051_p0012 finishes only with the repair off, at 455,969 conclusions on one thread. With
+the cut, every file finishes with the repair off except C4, which falls back with the
+selection on as well. With the repair on, three files of item 1251's family with
+conditions two deep fall back too. Every complete rooted disjunctive answer agrees with HermiT, in 204 runs with the
+repair off and 198 in each of modes `129` and `1`. The two runs of `misc/r1_meet.ofn` in
+each mode finish complete in Tier EL, so they are not among those runs, and they agree with
+HermiT as well. g1-051_p0012 takes 141,886 conclusions with the repair off, 143,778 in mode
+`129` and 145,794 in mode `1` on one thread, H1 takes 135,615, 138,457 and 140,992, and
+g1-051_p0121 takes 95,081, 101,181 and 135,892. The runs with the selection on keep the
+check on and were made with the repair off and in mode `129`. In each of those modes, 156
+runs finish as complete rooted disjunctive runs both with the cut and the selection off and
+with the selection on, and over them the cut derives 1.002 times the total conclusions of
+the selection with the repair off and 1.006 times in mode `129`. With the repair off, 156
+runs also finish as complete rooted disjunctive runs both with and without the cut, and over
+them the cut derives 0.32 times the total conclusions of the uncut runs. C2, C3, min-C2 and
+min-C3 finish between 602,198 and 2,590,900 conclusions with the repair off, above the
+default bound of 524,288, with the cut as with the selection, and U4 does so in mode `129`.
+One file costs more. part022 p01 takes 568,223 conclusions on one thread with the cut,
+against 390,545 without it and 507,837 with the selection, so it exceeds the default bound
+of 524,288 with the selection off, as it does on four threads under the eager strategy with
+the selection on. Item 1324 follows it and C4.
+
 The repair keeps the resource contract of the rest of Tier D, and the contract is
 cooperative. A run charges each conclusion that it derives to the work bound, and several
 of the repair's scans also charge one conclusion for every 16 entries that they read,

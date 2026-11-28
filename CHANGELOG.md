@@ -34,6 +34,16 @@ their admitted handles live.
   The new types keep the credit through Arc clones. `AdmittedEntailmentDiff` and
   `AdmittedDlQueryAnswer` provide shared ownership of admitted output. The existing
   diff and DL query methods still return application-owned values.
+### Growing ground conditions with the selection off (item 1250)
+
+The F24 specification now records a conditional completeness argument for the cut of
+ground-bodied clauses in rooted runs with the selection of ground body literals off, and
+names the obligations it leaves open, which stay with item 1220. On 104 generated input
+files around g1-051_p0012 configured with a 4 million conclusion limit, every file except
+C4 finishes with item 1231's repair off, and every complete rooted disjunctive answer
+agrees with HermiT in every mode of the repair. The containment test adds the generated
+files H1 and U2, which fall back without the cut. Item 1324 follows the cut's cost on
+part022 p01 and the fallback on C4. This completes roadmap item 1250.
 
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 
