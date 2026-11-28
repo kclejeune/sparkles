@@ -1862,6 +1862,7 @@ const _: () = {
         size_of::<DlSt>()
             == size_of::<Store>()
                 + 8
+                + size_of::<Option<u32>>()
                 + size_of::<FxHashSet<Box<[Lit]>>>()
                 + size_of::<FxHashMap<Ex, Vec<u32>>>()
                 + size_of::<FxHashSet<(Ex, u32)>>()
