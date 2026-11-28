@@ -628,6 +628,70 @@ fn a_minimum_the_horn_rules_leave_out_does_not_refuse() {
     }
 }
 
+/// A minimum above 64 with an empty filler, and a maximum in the body whose dual is one,
+/// is empty for the Horn rules, while the rooted rules with counting unfold it before they
+/// read its filler and leave it out past 64. It does not refuse, and the rooted run keeps
+/// the union and `D ⊑ G`.
+#[test]
+fn a_bottom_minimum_past_the_tier_d_bound_does_not_refuse() {
+    let classes = ex(&["A", "D", "E", "F", "G"]);
+    for (axiom, shown) in [
+        (
+            "SubClassOf(:A ObjectMinCardinality(65 :r owl:Nothing))",
+            "MinCardinality(65",
+        ),
+        (
+            "SubClassOf(ObjectMaxCardinality(64 :r owl:Nothing) :A)",
+            "MaxCardinality(64",
+        ),
+    ] {
+        let axioms = parse(&format!("{UNION}\n{axiom}"));
+        let mut k = Classifier::of(&axioms);
+        let out = k.classify(&rooted(&Limits::default())).unwrap();
+        let got = answer(&k, &out, &classes);
+        assert!(
+            out.stats.dl_contexts > 0,
+            "{axiom}: the rooted rules take the union"
+        );
+        assert!(got.subsumptions.contains(&pair("D", "G")), "{axiom}");
+        assert_eq!(got.left_out.len(), 1, "{axiom}: {:?}", got.left_out);
+        assert!(
+            got.left_out.iter().all(|a| a.contains(shown)),
+            "{axiom}: {:?}",
+            got.left_out
+        );
+    }
+}
+
+/// Disjuncts that the Horn rules intern as one expression are one disjunct, such as an
+/// existential restriction and the minimum of one with its filler, or two maximums of one
+/// whose fillers differ by `owl:Thing`. The axiom refuses, and the rooted run answers as
+/// the default run does.
+#[test]
+fn disjuncts_the_horn_rules_intern_as_one_refuse() {
+    let classes = ex(&["A", "B", "D", "E", "F", "G"]);
+    for axiom in [
+        "SubClassOf(:A ObjectIntersectionOf(ObjectMinCardinality(2 :s)
+             ObjectUnionOf(ObjectSomeValuesFrom(:r :B) ObjectMinCardinality(1 :r :B))))",
+        "SubClassOf(:A ObjectUnionOf(ObjectMaxCardinality(1 :r :B)
+             ObjectMaxCardinality(1 :r ObjectIntersectionOf(:B owl:Thing))))",
+    ] {
+        let axioms = parse(&format!("{UNION}\n{axiom}"));
+        let mut k = Classifier::of(&axioms);
+        let out = k.classify(&rooted(&Limits::default())).unwrap();
+        let got = answer(&k, &out, &classes);
+        let want = classify(&axioms, &classes, &Limits::default());
+        assert_eq!(got, want, "{axiom}");
+        assert_eq!(out.stats.dl_contexts, 0, "{axiom}");
+        assert!(!got.subsumptions.contains(&pair("D", "G")), "{axiom}");
+        assert!(
+            !got.left_out.iter().any(|a| a.contains("Cardinality")),
+            "{axiom}: {:?}",
+            got.left_out
+        );
+    }
+}
+
 /// A minimum of zero holds nothing, so a maximum in its filler does not refuse beside a
 /// self restriction or a data restriction, which the rooted rules leave out for their own
 /// reasons, and the rooted run keeps the union.

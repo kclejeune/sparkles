@@ -463,13 +463,23 @@ the EL axioms without changing them, its walks allocate nothing, and it polls th
 deadline and cancellation every 128 steps. On the Tier D side a minimum of zero hides its
 filler, as the normalization reads it. An axiom that the rooted rules would also leave out
 for a self restriction, a data restriction, the top or bottom property or nesting deeper
-than they read does not refuse, and neither does an irreflexive property. On the Horn side the check follows
-the flattening of an inclusion, the limit of 64 on a minimum that the rules unfold, the
-bottom property and the simple roles that number restrictions and the property axioms need.
-A bounded search for a chain below a role settles its simplicity, and a role that the
-search does not settle does not refuse. An axiom that both rules leave out, such as a
-minimum above 64, therefore keeps the rooted run's disjunctive axioms and their
-consequences.
+than they read does not refuse, and neither does an irreflexive property. The rooted rules
+with counting unfold a minimum in a positive position, and the dual of a maximum in a
+negative one, before they read its filler, so a minimum above 64 there does not refuse even
+when its filler is empty and the Horn rules take the axiom. On the Horn side the check
+follows the flattening of an inclusion, the limit of 64 on a minimum that the rules unfold,
+the bottom property and the simple roles that number restrictions and the property axioms
+need. The Horn rules remove the repeats of an interned expression from a disjunction, and
+the check compares the disjuncts it can match without interning them, such as an
+existential restriction and a minimum of one with the same filler. Two disjuncts that it
+cannot match count as distinct. A bounded search for a chain below a role settles its
+simplicity, reads an equivalence of properties as the ring of inclusions that the Horn rules
+build, and charges and polls every step. It follows that ring one inclusion at a time, so
+a member of an equivalence of more than 64 properties is a role that it does not settle. A
+role that the search does not settle does not refuse. An axiom that both rules leave out, such as a minimum above 64 with a filler that is
+not empty, therefore keeps the rooted run's disjunctive axioms and their consequences. The
+test for an individual in the axioms walks them without listing their individuals and polls
+as it goes.
 
 Over item 805's rewriting the rooted rules read the rewritten axioms, and the Horn rules
 read the original axioms that each one stands for, with the role box of the original

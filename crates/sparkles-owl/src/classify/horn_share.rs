@@ -12,10 +12,14 @@
 //! Its walks allocate nothing, and it polls `stop` every [`POLL_TICKS`] steps. It refuses
 //! only for an axiom that the Tier D normalization without counting leaves out for a
 //! construct that needs counting and for no other reason, and that the Horn normalization
-//! takes. Each half mirrors its normalization structurally. Where the mirror cannot tell,
-//! as with a role whose simplicity its bounded search does not settle, it answers that the
-//! axiom does not refuse, which keeps the rooted run's answer as it was before the item.
+//! takes. Each half mirrors its normalization structurally, with the bound on the minimums
+//! that each one unfolds and the repeats that the Horn normalization removes from a
+//! disjunction once it has interned its disjuncts. Where the mirror cannot tell, as with a
+//! role whose simplicity its bounded search does not settle or two disjuncts whose
+//! normalized forms it does not compare, it answers that the axiom does not refuse, which
+//! keeps the rooted run's answer as it was before the item.
 
+use super::dl_norm::MAX_MIN;
 use super::horn::MAX_AT_LEAST;
 use super::index::{Axioms, Halt, Interner, Role, RoleName};
 use crate::model::*;
@@ -36,6 +40,9 @@ const ROLE_DEPTH: usize = 64;
 /// How many role inclusions the search for a chain below one role reads at most before it
 /// calls the role not simple.
 const ROLE_WORK: usize = 1 << 22;
+/// How many comparisons the test of two disjuncts for one normalized expression makes at
+/// most before it calls them distinct.
+const SAME_WORK: usize = 4096;
 
 /// The role box that the Horn rules would build for the check.
 pub enum Roles<'a> {
@@ -98,14 +105,155 @@ fn refusing(
             return Err(Halt::Stopped);
         }
         if takes {
-            // the run is rooted, as the normalization reads it, only with an individual;
-            // the test of an axiom's anonymous individuals lists them for a moment, once
-            let rooted = !it.individuals.is_empty()
-                || candidates.iter().any(|k| super::index::holds_individual(k));
-            return Ok(rooted.then_some(i));
+            // the run is rooted, as the normalization reads it, only with an individual
+            if !it.individuals.is_empty() {
+                return Ok(Some(i));
+            }
+            for k in candidates {
+                match s.holds_individual(k) {
+                    Some(true) => return Ok(Some(i)),
+                    Some(false) => {}
+                    None if s.halted => return Err(Halt::Stopped),
+                    // past the nesting bound the walk does not tell, and does not refuse
+                    None => return Ok(None),
+                }
+            }
+            return Ok(None);
         }
     }
     Ok(None)
+}
+
+/// The positions of an expression in the axioms of the Tier D normalization: positive,
+/// negative or both, as an equivalence or a disjoint union has its operands.
+#[derive(Clone, Copy)]
+struct Pol {
+    pos: bool,
+    neg: bool,
+}
+
+impl Pol {
+    const POS: Pol = Pol {
+        pos: true,
+        neg: false,
+    };
+    const NEG: Pol = Pol {
+        pos: false,
+        neg: true,
+    };
+    const BOTH: Pol = Pol {
+        pos: true,
+        neg: true,
+    };
+
+    fn flip(self) -> Pol {
+        Pol {
+            pos: self.neg,
+            neg: self.pos,
+        }
+    }
+}
+
+/// What the Horn normalization makes of an expression, as far as the check compares two
+/// of them: two equal shapes normalize to the same expression of the interner, and two
+/// that the check cannot compare are [`Shape::Opaque`].
+#[derive(Clone, Copy, Default)]
+enum Shape<'c> {
+    Top,
+    Bottom,
+    Class(&'c Class),
+    Nominal(&'c Individual),
+    /// `∃p.f`, whose filler has the expression's position
+    Exist(&'c ObjectPropertyExpression, Fill<'c>),
+    /// `≤1 p.f` in a positive position, whose filler is in a negative one
+    AtMost1(&'c ObjectPropertyExpression, Fill<'c>),
+    /// an intersection of more than one operand besides `owl:Thing`
+    Conj(&'c std::collections::BTreeSet<ClassExpression>),
+    /// a fresh class, or what the check does not compare
+    #[default]
+    Opaque,
+}
+
+/// The filler of a restriction in a [`Shape`].
+#[derive(Clone, Copy)]
+enum Fill<'c> {
+    Top,
+    Expr(&'c ClassExpression),
+    Nominal(&'c Individual),
+}
+
+fn fill(g: Option<&ClassExpression>) -> Fill<'_> {
+    g.map_or(Fill::Top, Fill::Expr)
+}
+
+/// The shape of an expression in a positive (`pos`) or a negative position, as
+/// `horn::Norm::pos` and `horn::Norm::neg` intern it. An intersection drops `owl:Thing`
+/// and a union `owl:Nothing`, and one that keeps a single operand is that operand, as
+/// both do. An existential restriction, a minimum of one and a value restriction are one
+/// shape, and a maximum of one in a positive position another.
+fn shape(c: &ClassExpression, pos: bool) -> Shape<'_> {
+    match c {
+        C::Class(k) => match class_v(k) {
+            V::Top => Shape::Top,
+            V::Bottom => Shape::Bottom,
+            V::Other => Shape::Class(k),
+        },
+        C::ObjectIntersectionOf(cs) => {
+            let mut rest = cs.iter().filter(|c| class_of(c) != Some(V::Top));
+            match (rest.next(), rest.next()) {
+                (None, _) => Shape::Top,
+                (Some(c), None) => shape(c, pos),
+                _ if cs.iter().any(|c| class_of(c) == Some(V::Bottom)) => Shape::Bottom,
+                _ => Shape::Conj(cs),
+            }
+        }
+        C::ObjectUnionOf(cs) => {
+            if cs.iter().any(|c| class_of(c) == Some(V::Top)) {
+                return Shape::Top;
+            }
+            let mut rest = cs.iter().filter(|c| class_of(c) != Some(V::Bottom));
+            match (rest.next(), rest.next()) {
+                (None, _) => Shape::Bottom,
+                (Some(c), None) => shape(c, pos),
+                _ => Shape::Opaque,
+            }
+        }
+        C::ObjectSomeValuesFrom(p, g) => Shape::Exist(p, Fill::Expr(g)),
+        C::ObjectMinCardinality(0, ..) => Shape::Top,
+        C::ObjectMinCardinality(1, p, g) => Shape::Exist(p, fill(g.as_deref())),
+        C::ObjectHasValue(p, a) => Shape::Exist(p, Fill::Nominal(a)),
+        C::ObjectOneOf(is) if is.len() == 1 => {
+            is.iter().next().map_or(Shape::Opaque, Shape::Nominal)
+        }
+        C::ObjectMaxCardinality(1, p, g) if pos => Shape::AtMost1(p, fill(g.as_deref())),
+        _ => Shape::Opaque,
+    }
+}
+
+/// The shape of a filler in a positive (`pos`) or a negative position.
+fn fill_shape(f: Fill<'_>, pos: bool) -> Shape<'_> {
+    match f {
+        Fill::Top => Shape::Top,
+        Fill::Expr(g) => shape(g, pos),
+        Fill::Nominal(i) => Shape::Nominal(i),
+    }
+}
+
+fn class_of(c: &ClassExpression) -> Option<V> {
+    match c {
+        C::Class(k) => Some(class_v(k)),
+        _ => None,
+    }
+}
+
+/// The shape of a disjunct of a Horn inclusion's head, in a positive position.
+fn head_shape(h: Head<'_>) -> Shape<'_> {
+    match h {
+        Head::Expr(c) => shape(c, true),
+        Head::Min(1, p, g) => Shape::Exist(p, fill(g)),
+        Head::Max(1, p, g) => Shape::AtMost1(p, fill(g)),
+        _ => Shape::Opaque,
+    }
 }
 
 /// The value of an expression of a normalization, as far as its checks read it.
@@ -146,23 +294,6 @@ fn name_of(p: &ObjectPropertyExpression) -> (&str, bool) {
     }
 }
 
-/// The runs of equal operands of a multiset, with their lengths.
-fn runs<T: PartialEq>(s: &[T]) -> impl Iterator<Item = (&T, usize)> {
-    let mut i = 0;
-    std::iter::from_fn(move || {
-        if i >= s.len() {
-            return None;
-        }
-        let mut j = i + 1;
-        while j < s.len() && s[j] == s[i] {
-            j += 1;
-        }
-        let run = (&s[i], j - i);
-        i = j;
-        Some(run)
-    })
-}
-
 /// A role of the role box: an object property, or a role that the binarization of a
 /// chain introduces.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -181,30 +312,25 @@ struct Td {
 
 /// What one Horn inclusion `⊓lhs ⊑ ⊔rhs` holds as its flattening reads it.
 #[derive(Default)]
-struct Sub {
+struct Sub<'c> {
     steps: usize,
     body_bottom: bool,
     head_top: bool,
+    /// the distinct disjuncts of the head, two for two or more
     head: usize,
+    /// the first disjunct of the head
+    first: Shape<'c>,
 }
 
-impl Sub {
+impl Sub<'_> {
     fn left(&mut self, v: V) {
         if v == V::Bottom {
             self.body_bottom = true;
         }
     }
 
-    fn right(&mut self, v: V) {
-        match v {
-            V::Top => self.head_top = true,
-            V::Bottom => {}
-            V::Other => self.head += 1,
-        }
-    }
-
-    /// Whether the Horn rules take the inclusion: one disjunct in the head at most, unless
-    /// the inclusion holds anyway.
+    /// Whether the Horn rules take the inclusion: one disjunct in the head at most, as the
+    /// normalization removes repeats, unless the inclusion holds anyway.
     fn finish(&self) -> Option<()> {
         (self.head_top || self.body_bottom || self.head <= 1).then_some(())
     }
@@ -257,6 +383,97 @@ impl<'a> Scan<'a> {
         !self.halted
     }
 
+    /// The length of the run of operands equal to `s[i]` that starts at `i` in a sorted
+    /// multiset, polling as it compares them, `None` once `stop` came.
+    fn run(&mut self, s: &[ClassExpression], i: usize) -> Option<usize> {
+        if !self.tick() {
+            return None;
+        }
+        let mut j = i + 1;
+        while j < s.len() && s[j] == s[i] {
+            if !self.tick() {
+                return None;
+            }
+            j += 1;
+        }
+        Some(j - i)
+    }
+
+    /// The operands of a sorted multiset that occur once, `None` once `stop` came.
+    fn unique(&mut self, s: &[ClassExpression]) -> Option<usize> {
+        let (mut i, mut unique) = (0, 0);
+        while i < s.len() {
+            let n = self.run(s, i)?;
+            unique += usize::from(n == 1);
+            i += n;
+        }
+        Some(unique)
+    }
+
+    /// Whether an axiom holds an individual outside its annotations, named or anonymous,
+    /// as `index::holds_individual` reads a logical axiom, with no list of them. `None`
+    /// once `stop` came or past the nesting bound.
+    fn holds_individual(&mut self, k: &AxiomKind) -> Option<bool> {
+        Some(match k {
+            K::SubClassOf(a, b) => self.ce_individual(a, 0)? || self.ce_individual(b, 0)?,
+            K::EquivalentClasses(cs) => self.any_individual(cs)?,
+            K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
+                self.any_individual(cs.as_slice())?
+            }
+            K::ObjectPropertyDomain(_, c)
+            | K::ObjectPropertyRange(_, c)
+            | K::DataPropertyDomain(_, c)
+            | K::HasKey(c, _, _) => self.ce_individual(c, 0)?,
+            K::ClassAssertion(..)
+            | K::ObjectPropertyAssertion(..)
+            | K::NegativeObjectPropertyAssertion(..)
+            | K::DataPropertyAssertion(..)
+            | K::NegativeDataPropertyAssertion(..) => true,
+            K::SameIndividual(is) => !is.is_empty(),
+            K::DifferentIndividuals(is) => !is.is_empty(),
+            // a declaration of an individual is not logical, and the other axioms hold none
+            _ => false,
+        })
+    }
+
+    fn any_individual<'c>(
+        &mut self,
+        cs: impl IntoIterator<Item = &'c ClassExpression>,
+    ) -> Option<bool> {
+        for c in cs {
+            if self.ce_individual(c, 0)? {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    fn ce_individual(&mut self, c: &ClassExpression, depth: usize) -> Option<bool> {
+        if !self.tick() || depth > MAX_DEPTH {
+            return None;
+        }
+        let d = depth + 1;
+        Some(match c {
+            C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+                for c in cs {
+                    if self.ce_individual(c, d)? {
+                        return Some(true);
+                    }
+                }
+                false
+            }
+            C::ObjectComplementOf(g)
+            | C::ObjectSomeValuesFrom(_, g)
+            | C::ObjectAllValuesFrom(_, g)
+            | C::ObjectMinCardinality(_, _, Some(g))
+            | C::ObjectMaxCardinality(_, _, Some(g))
+            | C::ObjectExactCardinality(_, _, Some(g)) => self.ce_individual(g, d)?,
+            C::ObjectOneOf(is) => !is.is_empty(),
+            C::ObjectHasValue(..) => true,
+            _ => false,
+        })
+    }
+
     // --- The Tier D normalization of a rooted run without counting ---
 
     /// Whether the rooted Tier D normalization without counting leaves the axiom out for
@@ -281,8 +498,8 @@ impl<'a> Scan<'a> {
             }
             K::SubClassOf(c, d) => {
                 self.td_flat(c, d, &mut f);
-                self.td(c, 0, &mut f);
-                self.td(d, 0, &mut f);
+                self.td(c, 0, Pol::NEG, &mut f);
+                self.td(d, 0, Pol::POS, &mut f);
             }
             K::EquivalentClasses(cs) if cs.len() >= 2 => {
                 let mut prev = cs.iter().next_back();
@@ -291,34 +508,50 @@ impl<'a> Scan<'a> {
                         self.td_flat(p, c, &mut f);
                     }
                     prev = Some(c);
-                    self.td(c, 0, &mut f);
+                    self.td(c, 0, Pol::BOTH, &mut f);
                 }
             }
             K::DisjointClasses(cs) => {
-                let unique = runs(cs.as_slice()).filter(|(_, n)| *n == 1).count();
-                for (c, n) in runs(cs.as_slice()) {
+                // `c ⊑ ⊥` for an operand that occurs more than once, and the pairwise
+                // disjointness of those that occur once
+                let cs = cs.as_slice();
+                let Some(unique) = self.unique(cs) else {
+                    return false;
+                };
+                let mut i = 0;
+                while i < cs.len() {
+                    let Some(n) = self.run(cs, i) else {
+                        return false;
+                    };
                     if n > 1 || unique >= 2 {
-                        self.td(c, 0, &mut f);
+                        self.td(&cs[i], 0, Pol::NEG, &mut f);
                     }
+                    i += n;
                 }
             }
             K::DisjointUnion(_, ds) => {
                 // `C ⊑ ⊔ds` with the operands that occur once, and `d ⊑ C` for each
-                let mut head = 1;
-                for (c, n) in runs(ds.as_slice()) {
+                let ds = ds.as_slice();
+                let (mut head, mut i) = (1, 0);
+                while i < ds.len() {
+                    let Some(n) = self.run(ds, i) else {
+                        return false;
+                    };
+                    let c = &ds[i];
                     if n == 1 {
                         self.td_steps(c, true, &mut head, &mut f);
                         let mut steps = 1;
                         self.td_steps(c, false, &mut steps, &mut f);
                     }
-                    self.td(c, 0, &mut f);
+                    self.td(c, 0, Pol::BOTH, &mut f);
+                    i += n;
                 }
             }
             K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
                 self.td_role(p, &mut f);
-                self.td(c, 0, &mut f);
+                self.td(c, 0, Pol::POS, &mut f);
             }
-            K::ClassAssertion(c, _) => self.td(c, 0, &mut f),
+            K::ClassAssertion(c, _) => self.td(c, 0, Pol::POS, &mut f),
             // the other axioms hold no construct that needs counting
             _ => return false,
         }
@@ -331,8 +564,10 @@ impl<'a> Scan<'a> {
         }
     }
 
-    /// The flattening of `c ⊑ d` as Tier D's `sub` reads it without counting, which
-    /// leaves out an inclusion past [`MAX_STEPS`].
+    /// The flattening of `c ⊑ d` as Tier D's `sub` reads it, which leaves out an inclusion
+    /// past [`MAX_STEPS`]. The steps are those of a run with counting, which moves a
+    /// minimum above one in the body to the head as well, and so at least those of a run
+    /// without it.
     fn td_flat(&mut self, c: &ClassExpression, d: &ClassExpression, f: &mut Td) {
         let mut steps = 0;
         self.td_steps(c, false, &mut steps, f);
@@ -354,19 +589,32 @@ impl<'a> Scan<'a> {
                 }
             }
             (C::ObjectComplementOf(g), _) => self.td_steps(g, !right, steps, f),
-            // a universal or a maximum in the body is a head disjunct of its own
-            (C::ObjectAllValuesFrom(..), false) => *steps += 1,
-            (C::ObjectMaxCardinality(n, ..), false) if n.checked_add(1).is_some() => *steps += 1,
+            // a universal, a maximum or, with counting, a minimum above one in the body is
+            // a head disjunct of its own
+            (C::ObjectAllValuesFrom(..), false) => self.td_step(steps, f),
+            (C::ObjectMaxCardinality(n, ..), false) if n.checked_add(1).is_some() => {
+                self.td_step(steps, f)
+            }
+            (C::ObjectMinCardinality(n, ..), false) if *n >= 2 => self.td_step(steps, f),
             _ => {}
         }
     }
 
-    /// The Tier D normalization without counting of `c`, which treats each construct alike
-    /// in a positive and a negative position: a rooted run leaves out a minimum above one,
-    /// a maximum above zero and an exact cardinality above zero in either, as a maximum in
-    /// a negative position is the minimum above it in a positive one. The depth grows at
-    /// least as fast as the normalization's.
-    fn td(&mut self, c: &ClassExpression, depth: usize, f: &mut Td) {
+    fn td_step(&mut self, steps: &mut usize, f: &mut Td) {
+        *steps += 1;
+        if *steps > MAX_STEPS {
+            f.other = true;
+        }
+    }
+
+    /// The Tier D normalization without counting of `c` in the positions `pol`. A rooted
+    /// run leaves out a minimum above one, a maximum above zero and an exact cardinality
+    /// above zero in either position, as a maximum in a negative position is the minimum
+    /// above it in a positive one. The run with counting unfolds a minimum in a positive
+    /// position and the dual of a maximum in a negative one before it reads the filler,
+    /// and leaves either out past [`MAX_MIN`]. The depth grows at least as fast as the
+    /// normalization's.
+    fn td(&mut self, c: &ClassExpression, depth: usize, pol: Pol, f: &mut Td) {
         if f.other || !self.tick() || depth > MAX_DEPTH {
             f.other = true;
             return;
@@ -376,33 +624,42 @@ impl<'a> Scan<'a> {
             C::Class(_) | C::ObjectOneOf(_) | C::ObjectMinCardinality(0, ..) => {}
             C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
                 for c in cs {
-                    self.td(c, d, f);
+                    self.td(c, d, pol, f);
                 }
             }
-            C::ObjectComplementOf(g) => self.td(g, d, f),
+            C::ObjectComplementOf(g) => self.td(g, d, pol.flip(), f),
             C::ObjectSomeValuesFrom(p, g) | C::ObjectAllValuesFrom(p, g) => {
                 self.td_role(p, f);
-                self.td(g, d, f);
+                self.td(g, d, pol, f);
             }
             // `≥1 p.f` is `∃p.f`
             C::ObjectMinCardinality(1, p, g) => {
                 self.td_role(p, f);
                 if let Some(g) = g {
-                    self.td(g, d + 1, f);
+                    self.td(g, d + 1, pol, f);
                 }
             }
             // `≤0 p.f` is `∀p.¬f`, and in a negative position its dual is `∃p.f`
             C::ObjectMaxCardinality(0, p, g) | C::ObjectExactCardinality(0, p, g) => {
                 self.td_role(p, f);
                 if let Some(g) = g {
-                    self.td(g, d + 1, f);
+                    self.td(g, d + 1, pol.flip(), f);
                 }
             }
             // what needs counting
-            C::ObjectMinCardinality(_, p, g)
-            | C::ObjectMaxCardinality(_, p, g)
-            | C::ObjectExactCardinality(_, p, g) => {
+            C::ObjectMinCardinality(n, p, g)
+            | C::ObjectMaxCardinality(n, p, g)
+            | C::ObjectExactCardinality(n, p, g) => {
                 f.counting = true;
+                let (min, max) = match c {
+                    C::ObjectMinCardinality(..) => (true, false),
+                    C::ObjectMaxCardinality(..) => (false, true),
+                    _ => (true, true),
+                };
+                if (min && pol.pos && *n > MAX_MIN) || (max && pol.neg && *n >= MAX_MIN) {
+                    f.other = true;
+                    return;
+                }
                 self.td_role(p, f);
                 if let Some(g) = g {
                     self.td_any(g, d + 1, f);
@@ -415,7 +672,8 @@ impl<'a> Scan<'a> {
     }
 
     /// Whether the Tier D normalization with counting leaves out something inside the
-    /// filler of a number restriction, in either position.
+    /// filler of a number restriction, in either position. A number restriction past the
+    /// bound of [`Scan::td`] counts as left out in any position.
     fn td_any(&mut self, c: &ClassExpression, depth: usize, f: &mut Td) {
         if f.other || !self.tick() || depth > MAX_DEPTH {
             f.other = true;
@@ -434,9 +692,14 @@ impl<'a> Scan<'a> {
                 self.td_role(p, f);
                 self.td_any(g, d, f);
             }
-            C::ObjectMinCardinality(_, p, g)
-            | C::ObjectMaxCardinality(_, p, g)
-            | C::ObjectExactCardinality(_, p, g) => {
+            C::ObjectMinCardinality(n, p, g)
+            | C::ObjectMaxCardinality(n, p, g)
+            | C::ObjectExactCardinality(n, p, g) => {
+                let min = matches!(c, C::ObjectMinCardinality(..));
+                if *n > MAX_MIN || (!min && *n == MAX_MIN) {
+                    f.other = true;
+                    return;
+                }
                 self.td_role(p, f);
                 if let Some(g) = g {
                     self.td_any(g, d + 1, f);
@@ -505,36 +768,47 @@ impl<'a> Scan<'a> {
                 Some(())
             }
             K::DisjointClasses(cs) => {
-                for (c, n) in runs(cs.as_slice()) {
+                let cs = cs.as_slice();
+                let mut i = 0;
+                while i < cs.len() {
+                    let n = self.run(cs, i)?;
                     if n > 1 {
-                        self.h_empty(c)?;
+                        self.h_empty(&cs[i])?;
                     }
+                    i += n;
                 }
-                self.h_disjoint(cs.as_slice())
+                self.h_disjoint(cs)
             }
             K::DisjointUnion(c, ds) => {
+                let ds = ds.as_slice();
                 let class = class_v(c);
                 let mut s = Sub::default();
                 self.h_step(&mut s)?;
                 s.left(class);
-                for (d, n) in runs(ds.as_slice()) {
+                let mut i = 0;
+                while i < ds.len() {
+                    let n = self.run(ds, i)?;
                     if n == 1 {
-                        self.h_right(Head::Expr(d), &mut s)?;
+                        self.h_right(Head::Expr(&ds[i]), &mut s)?;
                     }
+                    i += n;
                 }
                 s.finish()?;
-                for (d, n) in runs(ds.as_slice()) {
+                let mut i = 0;
+                while i < ds.len() {
+                    let n = self.run(ds, i)?;
                     if n == 1 {
                         let mut s = Sub::default();
-                        self.h_left(d, &mut s)?;
+                        self.h_left(&ds[i], &mut s)?;
                         self.h_step(&mut s)?;
-                        s.right(class);
+                        self.h_head(&mut s, class, Shape::Opaque);
                         s.finish()?;
                     } else {
-                        self.h_empty(d)?;
+                        self.h_empty(&ds[i])?;
                     }
+                    i += n;
                 }
-                self.h_disjoint(ds.as_slice())
+                self.h_disjoint(ds)
             }
             // `∃p.⊤ ⊑ c`
             K::ObjectPropertyDomain(p, c) => {
@@ -593,16 +867,17 @@ impl<'a> Scan<'a> {
     /// The pairwise disjointness of the operands that occur once, with one disjointness
     /// set when every one has a negative form and an inclusion for each pair otherwise.
     fn h_disjoint(&mut self, cs: &[ClassExpression]) -> Option<()> {
-        let unique = runs(cs).filter(|(_, n)| *n == 1).count();
-        if unique < 2 {
+        if self.unique(cs)? < 2 {
             return Some(());
         }
-        let mut all = true;
-        for (c, n) in runs(cs) {
-            if n == 1 && self.h_neg(c, 0).is_none() {
+        let (mut all, mut i) = (true, 0);
+        while i < cs.len() {
+            let n = self.run(cs, i)?;
+            if n == 1 && self.h_neg(&cs[i], 0).is_none() {
                 all = false;
                 break;
             }
+            i += n;
         }
         if self.halted {
             return None;
@@ -610,30 +885,94 @@ impl<'a> Scan<'a> {
         if all {
             return Some(());
         }
-        for (i, (a, n)) in runs(cs).enumerate() {
-            if n != 1 {
-                continue;
-            }
-            for (b, m) in runs(cs).skip(i + 1) {
-                if m != 1 {
-                    continue;
+        let mut i = 0;
+        while i < cs.len() {
+            let n = self.run(cs, i)?;
+            let mut j = i + n;
+            while n == 1 && j < cs.len() {
+                let m = self.run(cs, j)?;
+                if m == 1 {
+                    let mut s = Sub::default();
+                    self.h_left(&cs[i], &mut s)?;
+                    self.h_left(&cs[j], &mut s)?;
+                    s.finish()?;
                 }
-                let mut s = Sub::default();
-                self.h_left(a, &mut s)?;
-                self.h_left(b, &mut s)?;
-                s.finish()?;
+                j += m;
             }
+            i += n;
         }
         Some(())
     }
 
-    fn h_step(&mut self, s: &mut Sub) -> Option<()> {
+    /// A disjunct of a Horn inclusion's head with its value and shape. A disjunct whose
+    /// shape is that of the first does not count again, as the normalization removes
+    /// repeats of an interned expression.
+    fn h_head<'c>(&mut self, s: &mut Sub<'c>, v: V, h: Shape<'c>) {
+        match v {
+            V::Top => s.head_top = true,
+            V::Bottom => {}
+            V::Other => match s.head {
+                0 => {
+                    s.head = 1;
+                    s.first = h;
+                }
+                1 if self.same(s.first, h, true, &mut 0) => {}
+                _ => s.head = 2,
+            },
+        }
+    }
+
+    /// Whether two shapes in a positive (`pos`) or a negative position normalize to the
+    /// same expression, as far as the check tells. It answers `false` when it cannot tell,
+    /// past [`SAME_WORK`] comparisons or once `stop` came, which keeps the repeats apart
+    /// and the Tier D run as it was.
+    fn same<'c>(&mut self, a: Shape<'c>, b: Shape<'c>, pos: bool, work: &mut usize) -> bool {
+        *work += 1;
+        if *work > SAME_WORK || !self.tick() {
+            return false;
+        }
+        match (a, b) {
+            (Shape::Top, Shape::Top) | (Shape::Bottom, Shape::Bottom) => true,
+            (Shape::Class(x), Shape::Class(y)) => x == y,
+            (Shape::Nominal(x), Shape::Nominal(y)) => x == y,
+            (Shape::Exist(p, f), Shape::Exist(q, g)) => {
+                p == q && self.same(fill_shape(f, pos), fill_shape(g, pos), pos, work)
+            }
+            // the filler of a maximum is in a negative position
+            (Shape::AtMost1(p, f), Shape::AtMost1(q, g)) => {
+                p == q && self.same(fill_shape(f, false), fill_shape(g, false), false, work)
+            }
+            // the same operands besides `owl:Thing`, each of one a repeat of one of the other
+            (Shape::Conj(xs), Shape::Conj(ys)) => {
+                self.within(xs, ys, pos, work) && self.within(ys, xs, pos, work)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether every operand of `xs` besides `owl:Thing` has the shape of one of `ys`.
+    fn within<'c>(
+        &mut self,
+        xs: &'c std::collections::BTreeSet<ClassExpression>,
+        ys: &'c std::collections::BTreeSet<ClassExpression>,
+        pos: bool,
+        work: &mut usize,
+    ) -> bool {
+        let thing = |c: &ClassExpression| class_of(c) == Some(V::Top);
+        xs.iter().filter(|x| !thing(x)).all(|x| {
+            ys.iter()
+                .filter(|y| !thing(y))
+                .any(|y| self.same(shape(x, pos), shape(y, pos), pos, work))
+        })
+    }
+
+    fn h_step(&mut self, s: &mut Sub<'_>) -> Option<()> {
         s.steps += 1;
         (s.steps <= MAX_STEPS && self.tick()).then_some(())
     }
 
     /// A conjunct of a Horn inclusion's body, as `horn::Norm::sub` flattens it.
-    fn h_left(&mut self, c: &ClassExpression, s: &mut Sub) -> Option<()> {
+    fn h_left<'c>(&mut self, c: &'c ClassExpression, s: &mut Sub<'c>) -> Option<()> {
         self.h_step(s)?;
         match c {
             C::ObjectIntersectionOf(cs) => {
@@ -660,7 +999,7 @@ impl<'a> Scan<'a> {
     }
 
     /// A disjunct of a Horn inclusion's head, as `horn::Norm::sub` flattens it.
-    fn h_right(&mut self, h: Head<'_>, s: &mut Sub) -> Option<()> {
+    fn h_right<'c>(&mut self, h: Head<'c>, s: &mut Sub<'c>) -> Option<()> {
         self.h_step(s)?;
         let v = match h {
             Head::Expr(C::ObjectUnionOf(cs)) => {
@@ -683,7 +1022,7 @@ impl<'a> Scan<'a> {
             Head::Min(n, p, g) => self.h_at_least(n, p, g, 1)?,
             Head::Max(n, p, g) => self.h_at_most(n, p, g, 1)?,
         };
-        s.right(v);
+        self.h_head(s, v, head_shape(h));
         Some(())
     }
 
@@ -708,12 +1047,15 @@ impl<'a> Scan<'a> {
                 v
             }
             C::ObjectUnionOf(cs) => {
-                let (mut top, mut n) = (false, 0);
+                // the distinct disjuncts, as the normalization removes repeats
+                let (mut top, mut n, mut first) = (false, 0, Shape::Opaque);
                 for c in cs {
                     match self.h_pos(c, d)? {
                         V::Top => top = true,
                         V::Bottom => {}
-                        V::Other => n += 1,
+                        V::Other if n == 0 => (n, first) = (1, shape(c, true)),
+                        V::Other if n == 1 && self.same(first, shape(c, true), true, &mut 0) => {}
+                        V::Other => n = 2,
                     }
                 }
                 match (top, n) {
@@ -893,9 +1235,12 @@ impl<'a> Scan<'a> {
     /// Whether a role is below the target of a chain or of its mirror image, through the
     /// role inclusions closed under inverses, as `horn::RoleBox::new` marks the roles that
     /// are not simple. The role axioms are those the Horn rules take, which leave out the
-    /// top property's and the bottom property's. The search does not enter a role on its
-    /// path again, and answers `true` when it passes [`ROLE_DEPTH`] or [`ROLE_WORK`] or
-    /// `stop` comes, so that a role it does not settle is not simple.
+    /// top property's and the bottom property's. An equivalence of `k` properties is the
+    /// ring of `k` inclusions that the Horn rules build, so that the search reads it in
+    /// linear steps. Every step counts toward [`ROLE_WORK`] and polls `stop`. The search
+    /// does not enter a role on its path again, and answers `true` when it passes
+    /// [`ROLE_DEPTH`] or [`ROLE_WORK`] or `stop` comes, so that a role it does not settle
+    /// is not simple.
     fn below_chain(&mut self, name: Key<'_>, inv: bool, work: &mut usize) -> bool {
         self.below_chain_from(name, inv, (name, inv), work)
     }
@@ -934,78 +1279,90 @@ impl<'a> Scan<'a> {
         let plain = |p: &ObjectPropertyExpression| !top_or_bottom(p.named().as_str());
         // a chain's target and its mirror's are not simple, nor what is above them
         for (_, t) in el.map_or(&[][..], |a| &a.chains[..]) {
-            *work += 1;
-            if self.role(*t).is_some_and(|(n, _)| n == name) {
+            if self.charge(work) || self.role(*t).is_some_and(|(n, _)| n == name) {
                 return true;
             }
         }
         for &k in roles {
-            *work += 1;
+            if self.charge(work) {
+                return true;
+            }
             match k {
                 K::TransitiveObjectProperty(p) if plain(p) && iri(p) == name => return true,
                 K::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), s)
-                    if ps.len() >= 2 && plain(s) && ps.iter().all(plain) && iri(s) == name =>
+                    if ps.len() >= 2 && plain(s) && iri(s) == name =>
                 {
-                    return true;
+                    // the Horn rules leave out a chain through the top or bottom property
+                    match self.all_plain(ps.iter(), work) {
+                        Some(false) => {}
+                        _ => return true,
+                    }
                 }
                 _ => {}
             }
         }
         // the inclusions `a ⊑ b` into the role, with their mirrors `a⁻ ⊑ b⁻`
+        let edge = |s: &mut Self, a: (Key<'a>, bool), b: (Key<'a>, bool), work: &mut usize| {
+            b.0 == name && s.visit(a.0, a.1 ^ b.1 ^ inv, root, work)
+        };
         let subs = el.map_or(&[][..], |a| &a.role_subs[..]);
         for &(a, b) in subs {
-            *work += 1;
-            if *work > ROLE_WORK || !self.tick() {
+            if self.charge(work) {
                 return true;
             }
-            if let (Some((an, ai)), Some((bn, bi))) = (self.role(a), self.role(b))
-                && bn == name
-                && self.visit(an, ai ^ bi ^ inv, root, work)
+            if let (Some(a), Some(b)) = (self.role(a), self.role(b))
+                && edge(self, a, b, work)
             {
                 return true;
             }
         }
+        let key = |p: &'a ObjectPropertyExpression| {
+            let (n, i) = name_of(p);
+            (Key::Iri(n), i)
+        };
+        let flip = |(n, i): (Key<'a>, bool)| (n, !i);
         for &k in roles {
-            *work += 1;
-            if *work > ROLE_WORK || !self.tick() {
+            if self.charge(work) {
                 return true;
             }
-            let mut edge = |s: &mut Self, a: (Key<'a>, bool), b: (Key<'a>, bool)| {
-                b.0 == name && s.visit(a.0, a.1 ^ b.1 ^ inv, root, work)
-            };
-            let key = |p: &'a ObjectPropertyExpression| {
-                let (n, i) = name_of(p);
-                (Key::Iri(n), i)
-            };
-            let flip = |(n, i): (Key<'a>, bool)| (n, !i);
             let found = match k {
                 K::SubObjectPropertyOf(SubObjectPropertyExpression::Expression(p), s)
                     if plain(p) && plain(s) =>
                 {
-                    edge(self, key(p), key(s))
+                    edge(self, key(p), key(s), work)
                 }
                 K::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), s)
                     if ps.len() == 1 && plain(&ps[0]) && plain(s) =>
                 {
-                    edge(self, key(&ps[0]), key(s))
+                    edge(self, key(&ps[0]), key(s), work)
                 }
-                K::EquivalentObjectProperties(ps) if ps.iter().all(plain) => {
-                    let mut found = false;
-                    'pairs: for a in ps.iter() {
-                        for b in ps.iter() {
-                            if a != b && edge(self, key(a), key(b)) {
-                                found = true;
-                                break 'pairs;
+                // the ring `p_i ⊑ p_(i+1)` that the Horn rules build, one edge per property
+                K::EquivalentObjectProperties(ps) => match self.all_plain(ps.iter(), work) {
+                    None => true,
+                    Some(false) => false,
+                    Some(true) => {
+                        let mut prev = ps.iter().next_back();
+                        let mut found = false;
+                        for b in ps {
+                            if self.charge(work) {
+                                return true;
                             }
+                            if let Some(a) = prev
+                                && edge(self, key(a), key(b), work)
+                            {
+                                found = true;
+                                break;
+                            }
+                            prev = Some(b);
                         }
+                        found
                     }
-                    found
-                }
+                },
                 // p ⊑ q⁻ and q⁻ ⊑ p
                 K::InverseObjectProperties(p, q) if plain(p) && plain(q) => {
-                    edge(self, key(p), flip(key(q))) || edge(self, flip(key(q)), key(p))
+                    edge(self, key(p), flip(key(q)), work) || edge(self, flip(key(q)), key(p), work)
                 }
-                K::SymmetricObjectProperty(p) if plain(p) => edge(self, key(p), flip(key(p))),
+                K::SymmetricObjectProperty(p) if plain(p) => edge(self, key(p), flip(key(p)), work),
                 _ => false,
             };
             if found {
@@ -1013,6 +1370,31 @@ impl<'a> Scan<'a> {
             }
         }
         false
+    }
+
+    /// One step of the search for a chain, `true` once it passes [`ROLE_WORK`] or `stop`
+    /// came.
+    fn charge(&mut self, work: &mut usize) -> bool {
+        *work += 1;
+        *work > ROLE_WORK || !self.tick()
+    }
+
+    /// Whether every property of a role axiom is neither the top nor the bottom property,
+    /// `None` once the search passes [`ROLE_WORK`] or `stop` came.
+    fn all_plain<'p>(
+        &mut self,
+        ps: impl Iterator<Item = &'p ObjectPropertyExpression>,
+        work: &mut usize,
+    ) -> Option<bool> {
+        for p in ps {
+            if self.charge(work) {
+                return None;
+            }
+            if top_or_bottom(p.named().as_str()) {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 }
 
@@ -1057,6 +1439,78 @@ mod tests {
         assert!(check(&[sub(class("A"), min(64, "r", Some(class("B"))))]));
         assert!(check(&[K::FunctionalObjectProperty(prop("r"))]));
         assert!(check(&[sub(class("A"), max(1, "r", Some(class("B"))))]));
+    }
+
+    fn nothing() -> ClassExpression {
+        C::Class(Class::new(vocab::OWL_NOTHING))
+    }
+
+    fn and(cs: impl IntoIterator<Item = ClassExpression>) -> ClassExpression {
+        C::ObjectIntersectionOf(cs.into_iter().collect())
+    }
+
+    fn or(cs: impl IntoIterator<Item = ClassExpression>) -> ClassExpression {
+        C::ObjectUnionOf(cs.into_iter().collect())
+    }
+
+    fn some(p: &str, f: ClassExpression) -> ClassExpression {
+        C::ObjectSomeValuesFrom(prop(p), Box::new(f))
+    }
+
+    /// An empty filler makes a minimum empty for the Horn rules at any number, while the
+    /// rooted rules with counting unfold a minimum in a positive position, or the dual of a
+    /// maximum in a negative one, before they read its filler, and leave it out past 64.
+    #[test]
+    fn a_bottom_minimum_refuses_up_to_the_tier_d_bound() {
+        assert!(check(&[sub(class("A"), min(64, "r", Some(nothing())))]));
+        assert!(check(&[sub(max(63, "r", Some(nothing())), class("A"))]));
+        // a minimum in a negative position is the maximum below it, which has no bound
+        assert!(check(&[sub(min(65, "r", Some(nothing())), class("A"))]));
+        assert!(!check(&[sub(class("A"), min(65, "r", Some(nothing())))]));
+        assert!(!check(&[sub(max(64, "r", Some(nothing())), class("A"))]));
+        assert!(!check(&[sub(
+            class("A"),
+            min(2, "r", Some(min(65, "s", Some(nothing()))))
+        )]));
+    }
+
+    /// Disjuncts that the Horn normalization interns as one expression are one disjunct.
+    #[test]
+    fn disjuncts_with_one_normalized_form_are_one() {
+        let b = || class("B");
+        let union = or([some("r", b()), min(1, "r", Some(b()))]);
+        assert!(check(&[sub(class("A"), and([min(2, "s", None), union]))]));
+        let head = or([
+            max(1, "r", Some(b())),
+            max(1, "r", Some(and([b(), C::Class(Class::thing())]))),
+        ]);
+        assert!(check(&[sub(class("A"), head)]));
+        // `∃r.⊤`, a minimum of one without a filler and a value restriction's nominal
+        let a = || Individual::named("http://example.org/a");
+        let union = or([
+            some("r", C::Class(Class::thing())),
+            min(1, "r", None),
+            min(2, "s", None),
+        ]);
+        assert!(!check(&[sub(class("A"), union)]));
+        let union = or([
+            C::ObjectHasValue(prop("r"), a()),
+            some("r", C::ObjectOneOf([a()].into_iter().collect())),
+        ]);
+        assert!(check(&[sub(class("A"), and([min(2, "s", None), union]))]));
+        // two intersections of the same operands in another order
+        let union = or([
+            some("r", and([b(), class("C")])),
+            some("r", and([class("C"), b(), C::Class(Class::thing())])),
+        ]);
+        assert!(check(&[sub(class("A"), and([min(2, "s", None), union]))]));
+        // distinct disjuncts are not Horn
+        let union = or([some("r", b()), some("r", class("C"))]);
+        assert!(!check(&[sub(class("A"), and([min(2, "s", None), union]))]));
+        let head = or([max(1, "r", Some(b())), max(1, "r", Some(class("C")))]);
+        assert!(!check(&[sub(class("A"), head)]));
+        let head = or([max(1, "r", Some(b())), max(1, "s", Some(b()))]);
+        assert!(!check(&[sub(class("A"), head)]));
     }
 
     #[test]
@@ -1135,6 +1589,91 @@ mod tests {
         // it polls every POLL_TICKS steps, not every step
         assert_eq!(calls.get(), 4);
         assert!(refuses_with(&wide, &|| false).unwrap());
+    }
+
+    /// One equivalence of many properties, one of them an inverse, beside a functional
+    /// property that is not among them: the search reads the equivalence in linear steps
+    /// and polls inside it.
+    #[test]
+    fn the_check_stops_inside_one_wide_role_equivalence() {
+        let wide = K::EquivalentObjectProperties(
+            (0..100_000)
+                .map(|i| prop(&format!("q{i}")))
+                .chain([P::InverseOf(ObjectProperty::new("http://example.org/q0"))])
+                .collect(),
+        );
+        let axioms = [K::FunctionalObjectProperty(prop("f")), wide];
+        let calls = std::cell::Cell::new(0usize);
+        let stop = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 3
+        };
+        assert!(matches!(refuses_with(&axioms, &stop), Err(Halt::Stopped)));
+        assert_eq!(calls.get(), 4);
+        assert!(refuses_with(&axioms, &|| false).unwrap());
+        // a property in the ring is simple too, through the ring's inclusions
+        let ring = K::EquivalentObjectProperties(["p", "q", "s"].into_iter().map(prop).collect());
+        assert!(check(&[
+            K::FunctionalObjectProperty(prop("q")),
+            ring.clone()
+        ]));
+        let below = K::TransitiveObjectProperty(prop("s"));
+        assert!(!check(&[
+            K::FunctionalObjectProperty(prop("q")),
+            ring,
+            below
+        ]));
+        // the search follows the ring one inclusion at a time, so that a member of an
+        // equivalence wider than its depth bound is a role it does not settle
+        let ring = |k: usize| {
+            K::EquivalentObjectProperties((0..k).map(|i| prop(&format!("q{i}"))).collect())
+        };
+        let functional = K::FunctionalObjectProperty(prop("q0"));
+        assert!(check(&[functional.clone(), ring(ROLE_DEPTH)]));
+        assert!(!check(&[functional, ring(ROLE_DEPTH + 2)]));
+    }
+
+    /// Without an individual in the interner, the check finds one in the axioms, named or
+    /// anonymous and in any position the normalization reads, and not in a declaration.
+    #[test]
+    fn the_check_finds_an_individual_in_the_axioms() {
+        let counting = sub(class("Z"), min(2, "r", None));
+        let check_empty = |extra: AxiomKind| {
+            let axioms = [counting.clone(), extra];
+            let refs: Vec<&AxiomKind> = axioms.iter().collect();
+            refuses(
+                &refs,
+                &Interner::default(),
+                Roles::El(&Axioms::default()),
+                &|| false,
+            )
+            .unwrap()
+        };
+        let nested = |i: Individual| {
+            sub(
+                class("B"),
+                some(
+                    "r",
+                    min(1, "s", Some(C::ObjectOneOf([i].into_iter().collect()))),
+                ),
+            )
+        };
+        assert!(check_empty(nested(Individual::anonymous("x"))));
+        assert!(check_empty(nested(Individual::named(
+            "http://example.org/a"
+        ))));
+        assert!(check_empty(K::DisjointClasses(
+            [
+                class("B"),
+                C::ObjectHasValue(prop("r"), Individual::anonymous("x"))
+            ]
+            .into_iter()
+            .collect()
+        )));
+        assert!(!check_empty(sub(class("B"), class("C"))));
+        assert!(!check_empty(K::Declaration(Entity::NamedIndividual(
+            NamedIndividual::new("http://example.org/a")
+        ))));
     }
 
     /// The ontology's EL axioms and interner, and its axioms outside OWL 2 EL with the
@@ -1235,6 +1774,34 @@ mod tests {
             "ClassAssertion(ObjectMinCardinality(2 :r) :a)",
             "SubClassOf(:A ObjectUnionOf(:B ObjectMinCardinality(2 :r)))",
             "SubClassOf(:A ObjectMinCardinality(2 :r ObjectUnionOf(:B :C)))",
+            "SubClassOf(:A ObjectMinCardinality(64 :r owl:Nothing))",
+            "SubClassOf(:A ObjectMinCardinality(65 :r owl:Nothing))",
+            "SubClassOf(ObjectMaxCardinality(63 :r owl:Nothing) :A)",
+            "SubClassOf(ObjectMaxCardinality(64 :r owl:Nothing) :A)",
+            "SubClassOf(ObjectMinCardinality(65 :r owl:Nothing) :A)",
+            "SubClassOf(:A ObjectMinCardinality(2 :r ObjectMinCardinality(65 :s owl:Nothing)))",
+            "SubClassOf(:A ObjectIntersectionOf(ObjectMinCardinality(2 :s) ObjectUnionOf(ObjectSomeValuesFrom(:r :B) ObjectMinCardinality(1 :r :B))))",
+            "SubClassOf(:A ObjectUnionOf(ObjectMaxCardinality(1 :r :B) ObjectMaxCardinality(1 :r ObjectIntersectionOf(:B owl:Thing))))",
+            "SubClassOf(:A ObjectUnionOf(ObjectMaxCardinality(1 :r :B) ObjectMaxCardinality(1 :r :C)))",
+            "ClassAssertion(ObjectMinCardinality(64 :r owl:Nothing) :a)",
+            "ClassAssertion(ObjectMinCardinality(65 :r owl:Nothing) :a)",
+            "ObjectPropertyRange(:r ObjectMinCardinality(65 :s owl:Nothing))",
+            "ObjectPropertyDomain(:r ObjectMinCardinality(65 :s owl:Nothing))",
+            "EquivalentClasses(:A ObjectMinCardinality(65 :r owl:Nothing))",
+            "DisjointClasses(:B ObjectMaxCardinality(63 :r owl:Nothing))",
+            "DisjointClasses(:B ObjectMaxCardinality(64 :r owl:Nothing))",
+            "DisjointUnion(:C ObjectMinCardinality(65 :r owl:Nothing) :D)",
+            "SubClassOf(:A ObjectComplementOf(ObjectMaxCardinality(64 :r owl:Nothing)))",
+            "SubClassOf(:A ObjectExactCardinality(65 :r owl:Nothing))",
+            "SubClassOf(ObjectExactCardinality(64 :r owl:Nothing) :A)",
+            "SubClassOf(:A ObjectIntersectionOf(ObjectMinCardinality(2 :s) ObjectUnionOf(ObjectHasValue(:r :a) ObjectSomeValuesFrom(:r ObjectOneOf(:a)))))",
+            "SubClassOf(:A ObjectIntersectionOf(ObjectMinCardinality(2 :s) ObjectUnionOf(ObjectMinCardinality(1 :r) ObjectSomeValuesFrom(:r owl:Thing))))",
+            "SubClassOf(:A ObjectIntersectionOf(ObjectMinCardinality(2 :s) ObjectUnionOf(ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C)) ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C owl:Thing)))))",
+            "SubClassOf(:A ObjectIntersectionOf(ObjectMinCardinality(2 :s) ObjectUnionOf(ObjectSomeValuesFrom(:r :B) ObjectSomeValuesFrom(:r ObjectUnionOf(:B owl:Nothing)))))",
+            "SubClassOf(ObjectIntersectionOf(:A ObjectMinCardinality(2 :r :B)) ObjectMaxCardinality(1 :r :B))",
+            "SubClassOf(ObjectIntersectionOf(:A ObjectMaxCardinality(0 :r ObjectMaxCardinality(1 :s :B))) ObjectSomeValuesFrom(:r ObjectMaxCardinality(1 :s :B)))",
+            "FunctionalObjectProperty(:q) EquivalentObjectProperties(:p :q ObjectInverseOf(:s))",
+            "FunctionalObjectProperty(:q) EquivalentObjectProperties(:p :q ObjectInverseOf(:s)) TransitiveObjectProperty(:s)",
         ];
         for (n, body) in synthetic.iter().enumerate() {
             let text = format!("Prefix(:=<urn:dl1286:>)\nOntology(\n{body}\n)");
