@@ -8786,11 +8786,14 @@ impl WriteTxn<'_> {
     /// Snapshot view including this transaction's uncommitted changes. It keeps the
     /// committed version number, but marks the view non-cacheable and disables its
     /// result cache. Its data differs from that committed identity, so result and
-    /// projection caches must neither be read nor populated through this view.
+    /// projection caches must neither be read nor populated through this view. The
+    /// cache of remote SERVICE results, which holds no local data, is the store's.
     pub fn view(&self) -> Snapshot {
         SnapshotBuilder::of_base(&self.base)
             .cacheable(false)
-            .results(Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)))
+            .results(Arc::new(
+                crate::sparql::cache::ResultCache::sharing_service(&self.base.results),
+            ))
             .delta(self.delta.clone())
             // the full-text index does not cover this transaction's changes either, and
             // a search has no plan without it: refused once there are changes

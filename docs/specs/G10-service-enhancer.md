@@ -423,7 +423,10 @@ cross-dataset SERVICE.
   (`Entry::range`). A plain SERVICE records the request text without the slice and the
   slice on its plan node (`ServiceKey`), and a LIMIT that the planner passes into the
   request narrows that slice. The streamed SERVICE stores the response to a request with
-  a LIMIT once it holds that many solutions, even when the query reads no further. A
+  a LIMIT once it holds that many solutions and one more read finds the end of the
+  response, even when the query reads no further. A row past the limit or a failure on
+  that read leaves the cache as it was, and a SILENT call stores its response only once
+  it has read all of it. A
   remote loop splits the slice off its pattern once
   (`enhancer::outer_slice`). A miss sends the request as the query writes it, and a
   response replaces the entry of its request only when the entry cannot answer it and
@@ -432,7 +435,9 @@ cross-dataset SERVICE.
   (`Parts`), so listing and removal compare the caller's scope as a whole and never
   search the key for a separator. The server's scope names the credential with the
   bound of its OIDC scopes (`Principal::access_id`), the endpoint, the dataset with its
-  branch, and a SHA-256 of the request's graph view.
+  branch, and a SHA-256 of the request's graph view. A view with guards adds the
+  SHA-256 of the view as its guards are decided for the request's snapshot, so two
+  requests whose guards let different graphs through never share an entry.
 - An entry answers for a time to live, `--service-cache-ttl` (3,600 s) or the dataset's
   `ttlSeconds`, in memory and on disk, and an expired entry is removed when it is read.
 - `svcdisk.rs` keeps a persistent dataset's entries in `service-cache/` when its
@@ -441,18 +446,29 @@ cross-dataset SERVICE.
   least recently used first under `diskMb` (default `--service-cache-disk-mb`, 256 MiB).
   The tier's index and files change under one lock, every file carries a generation that
   a read checks after it reads, and the removals of `se:cacheRm`, a clear and turning the
-  tier off sync the directory before they return. `formats.rs` registers the files as
+  tier off sync the directory before they return. A removal takes entries off disk, then
+  moves a counter that lookups check, and then takes them out of memory, so a lookup
+  running beside it does not put a removed entry back. An entry whose file cannot be
+  removed stays in memory too and is not counted, and a failed sync fails the query that
+  removed. A keyed removal, which `cache+clear` makes, leaves a file of another version
+  alone, and an entry too large to write takes the older file of its request away. `formats.rs` registers the files as
   the kind `service-cache` (version 1) and the settings file `service-cache.json`
   (format 1). `Store::set_service_cache_settings`, `service_cache_settings` and
-  `service_cache_status` read and change the setting, which is checked and whose tier is
-  opened before the file is written. `StoreOptions::service_cache_files`, which a
+  `service_cache_status` read and change the setting, one change at a time. The setting is
+  checked, and a tier is opened where none is in use, before the file is written. A new
+  cap applies to the tier in use once the file is written, so no second tier indexes the
+  directory, and turning the tier off retires it, after which a query that still holds
+  it writes nothing. `StoreOptions::service_cache_files`, which a
   read-only server turns off, leaves the directory untouched.
 - `svcfn.rs` implements `se:cacheLs` as a VALUES leaf that the planner builds from the
   caller's entries, and `se:cacheRm` as a function that removes within the caller's scope.
   `QueryOptions::service_cache_mgmt` grants removal, and the server sets it under
   `--service-cache-mgmt` for a caller with `admin` on the dataset through the endpoint
-  of the request. The Fuseki converter reports a server-wide `se:enableMgmt true` with
-  that flag, `false` as the default, and a dataset's own `true` as unsupported.
+  of the request. Both functions work in the WHERE clause of an update, whose view of
+  uncommitted data shares the store's SERVICE cache and keeps no other result. The
+  Fuseki converter reports a server-wide `se:enableMgmt true` with that flag, `false` as
+  the default, and a dataset's own `true`, or its `false` under a server-wide `true`, as
+  unsupported.
 - `parallel` and `parallel+n` keep up to n requests of a remote loop in flight, capped by
   `OutboundPolicy::service_parallel_max` (`--service-parallel-max`, 4).
   `RemoteRun::send` sends each wave of requests on scoped threads in the caller's span
@@ -470,20 +486,28 @@ cross-dataset SERVICE.
   and three more, the solutions, the bytes and the age in seconds. The sketch named a
   pattern hash. The pattern text keeps Jena's columns and shows the caller only its own
   entries. The endpoint is listed, and written to disk, without the user information,
-  query string and fragment of its URL. The disk files hold the SHA-256 of the caller's
-  scope, never the scope itself. The query result cache keeps no result of a query that
-  calls `se:cacheLs`.
+  query string and fragment of its URL, parsed as the outbound client parses it before a
+  request, so every spelling the client accepts is cleaned alike. A URL that is not HTTP
+  or HTTPS is listed as `urn:x-sparkles:unlisted-endpoint`. The disk files hold the
+  SHA-256 of the caller's scope, never the scope itself. The query result cache keeps no
+  result of a query that calls `se:cacheLs`, and none of a LATERAL or loop over the
+  dataset whose pattern calls `se:cacheLs` or `se:cacheRm`, which the planner treats as
+  property function and side effect wherever it meets them.
 - `se:cacheRm` called by name is refused when the query is planned, so a caller without
-  the right gets `403` and not an unbound value. A call through `fn:apply` or `afn:eval`
+  the right gets `403` and not an unbound value. The refusal covers a call in an EXISTS
+  pattern that no row reaches, but not one inside a SERVICE that goes to another
+  endpoint, which answers it as it likes. A call through `fn:apply` or `afn:eval`
   is an error of the expression that removes nothing, since the planner cannot see its
   function. It is marked as having side effects, so no cache of results or expressions
   answers a call of it.
 - The dataset setting is a settings file with a library API. Its HTTP route is roadmap
   item 1339, and the metrics sketched below are roadmap item 1340.
 - `parallel` alone takes the cap, as `bulk` alone takes the configured size. The shares
-  of a wave split the time the budget has left equally, and a request whose share
-  cannot be reserved is not sent. A failure once the budget's time is spent fails the
-  query under SILENT too. The budget's bytes need no share, because they are counted
+  of a wave split the time the budget has left equally. A wave whose time left gives a
+  request no share is not sent and fails the query, as does a request that fails once
+  its share's time is spent, under SILENT too, as a request out of the budget's time
+  does. The budget's spent and reserved time change together under one lock. A wave of
+  one request draws on the budget directly, as every other outbound request does. The budget's bytes need no share, because they are counted
   atomically as responses stream in and bound concurrent requests as they bound one. A
   loop over an in-process endpoint sends one request at a time. The eager loop now
   holds its answers on a memory charge until it has joined them, where it used to admit
@@ -494,16 +518,20 @@ cross-dataset SERVICE.
   1341 passes cancellation to the outbound client.
 - The time to live changes the behaviour of the memory tier, whose entries used to live
   until they were evicted. `--service-cache-ttl 0` keeps that behaviour.
-- A lookup admits a slice copied out of an entry before it copies it, and a disk read
-  admits the file's bytes before it reads them and the decoded rows once they are known.
-  Decoding allocates at most 32 times the largest file the tier keeps, an eighth of its
-  cap.
+- A lookup admits a slice copied out of an entry, with its variable names, before it
+  copies it. A disk read admits the file's bytes before it reads them, more if the file
+  grew since it was indexed, and each decoded row with its terms before it allocates
+  them, so a file that fits the query's memory while its rows do not is refused before
+  the rows exist. A listing admits its own storage before it grows. Decoding allocates at
+  most 32 times the largest file the tier keeps, an eighth of its cap. A remote loop
+  keeps the answers it takes from the cache charged for as long as it holds them, and
+  every fetched solution is admitted before it is copied.
 - A read-only server neither reads nor changes `service-cache/`, so its SERVICE cache
   is in memory only.
 - Clones and backups carry neither the directory nor `service-cache.json`, so a clone
   starts with an empty cache and the default setting.
 
-**Tests.** `crates/sparkles-core/tests/service_enhancer.rs` adds thirteen tests against the
+**Tests.** `crates/sparkles-core/tests/service_enhancer.rs` adds eighteen tests against the
 in-process endpoint. They cover slices answered inside an entry and sent past it, an
 endpoint that caps its responses without saying so, a LIMIT pushed into a plain SERVICE
 in both execution modes, `se:cacheLs` and `se:cacheRm` across two scopes with and
@@ -512,7 +540,12 @@ at a time with the endpoint's peak of requests in flight, the deadline that stop
 further waves, cancellation during a wave, the shared outbound time with and without
 SILENT, the memory admission of parallel answers in both modes and of a listing,
 `se:cacheRm` through `fn:apply` and `afn:eval`, listings kept out of the query result
-cache, and a disk tier read back after the store is opened again. Unit tests in `svccache.rs`, `svcdisk.rs`, `store/service_cache.rs`,
+cache, listings and removals inside a correlated LATERAL and a loop over the dataset
+across two callers, a wave out of time under SILENT, removal in an update, a removal in
+an EXISTS refused when the query is planned, a guarded view whose exemptions change, and
+a disk tier read back after the store is opened again.
+`crates/sparkles-core/tests/service_cache_alloc.rs` counts the reading thread's
+allocations to show that a disk entry is refused before it is decoded. Unit tests in `svccache.rs`, `svcdisk.rs`, `store/service_cache.rs`,
 `outbound.rs`, `enhancer.rs`, the server's `auth/api.rs` and the Fuseki converter cover
 slice service, expiry, scope isolation for scopes that are prefixes of one another or
 contain the key's separator, scopes by credential, view and branch, removal through the
@@ -520,7 +553,11 @@ request's endpoint, round trips of every term kind, eviction under the cap, torn
 changed, misnamed and unknown-version files, files that cannot be removed, admission
 before reads, counts past the end of a file, backups and clones without the tier, a
 refused setting, a read-only store, time shares, the `enableMgmt` values and the option
-parser.
+parser. They also cover every spelling of an HTTP URL the outbound client accepts with
+credentials, a lookup between the two tiers of a removal, a refresh beside a newer file,
+a streamed answer that fails or runs on after its limit, a tier held across a change of
+its cap and across turning it off, a settings write that fails, and shares taken by many
+threads at once.
 
 **Measurements.** The ignored test `measure_bulk_and_cache` ran at commit `de30fe83` in
 a release build on a Boat worker with 8 vCPUs and 16 GiB, at a load average of about 1,

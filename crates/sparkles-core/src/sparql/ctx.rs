@@ -1567,6 +1567,9 @@ enum ResourceRefusal {
     ServiceRefused(String),
     UnconfiguredExtension,
     Corrupt(String),
+    /// A side effect of an expression that failed, such as a removal from the SERVICE
+    /// cache whose files could not be synced, which only its call site records.
+    Io(String),
 }
 
 impl ResourceRefusal {
@@ -1609,6 +1612,7 @@ impl ResourceRefusal {
             Self::ServiceRefused(message) => Error::Service(message),
             Self::UnconfiguredExtension => super::extensions::unconfigured(),
             Self::Corrupt(message) => Error::Corrupt(message),
+            Self::Io(message) => Error::Io(std::io::Error::other(message)),
             Self::Parent {
                 component,
                 code,
@@ -2630,6 +2634,22 @@ impl Ctx {
             failure.failure.lock().get_or_insert(refusal);
             failure.failed.store(true, Ordering::Release);
         }
+    }
+
+    /// Record that a side effect of an expression failed with `error`, such as a removal
+    /// from the SERVICE cache whose files could not be synced, so the query's next check
+    /// fails with it. The expression itself can only give a type error, and no other
+    /// error is recorded this way.
+    pub(crate) fn fail_side_effect(&self, error: &Error) {
+        if self.memory_failure.failed.load(Ordering::Acquire) {
+            return;
+        }
+        let failure = &self.memory_failure;
+        failure
+            .failure
+            .lock()
+            .get_or_insert(ResourceRefusal::Io(error.to_string()));
+        failure.failed.store(true, Ordering::Release);
     }
 
     /// Run `f` as optional evaluation on this thread, such as the misses of an optional

@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -64,6 +64,17 @@ const UNBOUND: u32 = u32::MAX;
 const ALLOC_FACTOR: u64 = 32;
 
 type Digest32 = [u8; 32];
+
+/// The number of the next temporary file, unique in the process, so that two tiers that
+/// ever share a directory never write one temporary name.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// What a decoded term may keep allocated beyond its text: the strings of its parts and,
+/// for a triple term, its box.
+const TERM_EXTRA: u64 = 64;
+
+/// The allowance a lookup admits.
+type Admit<'a> = &'a dyn Fn(u64) -> crate::error::Result<()>;
 
 fn digest(s: &[u8]) -> Digest32 {
     Sha256::digest(s).into()
@@ -141,10 +152,48 @@ impl Index {
 /// The entries of one dataset's SERVICE cache on disk.
 pub struct DiskTier {
     dir: PathBuf,
-    cap: u64,
+    /// the bytes the files may take, which [`DiskTier::resize`] changes under the index
+    /// lock
+    cap: AtomicU64,
     index: Mutex<Index>,
-    /// the number of the next temporary file
-    seq: AtomicU64,
+    /// set under the index lock once the tier is turned off, after which it writes,
+    /// reads and removes nothing, so a query that still holds it cannot touch a
+    /// directory that a later tier uses
+    retired: AtomicBool,
+}
+
+/// What a removal by scope did to the files: the key digests it removed and those of
+/// files it could not remove, which stay, and whether the removals are durable.
+pub(crate) struct Removal {
+    removed: HashSet<Digest32>,
+    stuck: HashSet<Digest32>,
+    /// the failure of the directory sync that makes the removals durable
+    pub(crate) synced: std::io::Result<()>,
+}
+
+impl Removal {
+    fn none() -> Removal {
+        Removal {
+            removed: HashSet::new(),
+            stuck: HashSet::new(),
+            synced: Ok(()),
+        }
+    }
+
+    /// How many files were removed.
+    pub(crate) fn count(&self) -> u64 {
+        self.removed.len() as u64
+    }
+
+    /// Whether the file of the request `key` was removed.
+    pub(crate) fn removed(&self, key: &str) -> bool {
+        self.removed.contains(&digest(key.as_bytes()))
+    }
+
+    /// Whether the file of the request `key` could not be removed and stays.
+    pub(crate) fn stuck(&self, key: &str) -> bool {
+        self.stuck.contains(&digest(key.as_bytes()))
+    }
 }
 
 impl DiskTier {
@@ -197,9 +246,9 @@ impl DiskTier {
         }
         let tier = DiskTier {
             dir,
-            cap,
+            cap: AtomicU64::new(cap),
             index: Mutex::new(index),
-            seq: AtomicU64::new(0),
+            retired: AtomicBool::new(false),
         };
         tier.evict(&mut tier.lock(), None);
         Ok(tier)
@@ -212,7 +261,29 @@ impl DiskTier {
 
     /// The bytes the files may take.
     pub fn capacity(&self) -> u64 {
-        self.cap
+        self.cap.load(Ordering::Acquire)
+    }
+
+    /// Change the cap of the tier in use, evicting the least recently used files over
+    /// it, under the index lock, so that a write or removal running meanwhile sees the
+    /// tier before the change or after it and never a second index of its directory.
+    pub fn resize(&self, cap: u64) {
+        let mut index = self.lock();
+        self.cap.store(cap, Ordering::Release);
+        self.evict(&mut index, None);
+    }
+
+    /// Stop using the tier: from now on it writes, reads and removes nothing. Its index
+    /// is emptied under its lock, so a query that holds the tier and the store that
+    /// removes or reuses its directory never act on the same files.
+    pub fn retire(&self) {
+        let mut index = self.lock();
+        self.retired.store(true, Ordering::Release);
+        *index = Index::default();
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
     }
 
     /// The bytes the files take.
@@ -227,7 +298,7 @@ impl DiskTier {
 
     /// The largest file the tier writes.
     pub fn max_entry_bytes(&self) -> u64 {
-        self.cap / 8
+        self.capacity() / 8
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Index> {
@@ -258,26 +329,28 @@ impl DiskTier {
         }
     }
 
-    /// Make the removals so far durable. A failure is ignored, since the entries are
-    /// gone from the index either way and the files are a cache.
-    fn sync(&self) {
-        let _ = crate::fsutil::sync_dir(&self.dir);
+    /// Make the removals so far durable.
+    fn sync(&self) -> std::io::Result<()> {
+        crate::fsutil::sync_dir(&self.dir)
     }
 
     /// The live entry of the request `key`, read from its file. An entry older than
-    /// `ttl` (when it is not zero) is removed. `admit` admits the file's bytes before
-    /// they are read and the decoded rows' bytes once they are known, and a refusal is
-    /// the lookup's error. Decoding allocates at most [`ALLOC_FACTOR`] times the
-    /// largest file.
+    /// `ttl` (when it is not zero) is removed. `admit` admits the bytes of the file
+    /// before they are read, more of them if the file grew since it was indexed, and
+    /// what decoding allocates before it allocates it, row by row. A refusal is the
+    /// lookup's error.
     pub fn get(
         &self,
         key: &str,
         ttl: Duration,
-        admit: &dyn Fn(u64) -> crate::error::Result<()>,
+        admit: Admit<'_>,
     ) -> crate::error::Result<Option<Entry>> {
         let d = digest(key.as_bytes());
         let (id, ver, size) = {
             let mut index = self.lock();
+            if self.is_retired() {
+                return Ok(None);
+            }
             let tick = index.next_tick();
             let Some(info) = index.files.get_mut(&d) else {
                 return Ok(None);
@@ -289,14 +362,14 @@ impl DiskTier {
             (info.id, info.ver, info.size)
         };
         admit(size)?;
-        let bytes = match read_bounded(&self.path(&d), self.max_entry_bytes()) {
-            Ok(b) => b,
-            Err(_) => {
+        let bytes = match read_bounded(&self.path(&d), self.max_entry_bytes(), size, admit)? {
+            Some(b) => b,
+            None => {
                 self.drop_if(&d, ver);
                 return Ok(None);
             }
         };
-        let e = match decode(&bytes, Check::Key(key), self.max_entry_bytes()) {
+        let e = match decode(&bytes, Check::Key(key), self.max_entry_bytes(), admit)? {
             Ok(e) => e,
             Err(Bad::Version) => return Ok(None),
             Err(Bad::Damaged) => {
@@ -314,7 +387,6 @@ impl DiskTier {
             return Ok(None);
         }
         let mut e = e.entry.expect("decoded with its key");
-        admit(e.rows.retained_bytes())?;
         e.id = id;
         Ok(Some(e))
     }
@@ -323,23 +395,30 @@ impl DiskTier {
     /// a file of another version holds its key. The entry keeps its id. A failed write
     /// leaves the tier as it was.
     pub fn put(&self, e: &Entry) {
+        let d = digest(e.key().as_bytes());
         let Some(bytes) = encode(e, self.max_entry_bytes()) else {
+            // the entry replaces the request's earlier one, which must not answer for it
+            // from disk when the new one is kept in memory only
+            let mut index = self.lock();
+            if !self.is_retired() && index.files.get(&d).is_some_and(|i| i.scope.is_some()) {
+                self.drop_file(&mut index, &d);
+            }
             return;
         };
-        let d = digest(e.key().as_bytes());
         let path = self.path(&d);
         let tmp = self.dir.join(format!(
             ".{}.tmp-{}-{}",
             hex(&d),
             std::process::id(),
-            self.seq.fetch_add(1, Ordering::Relaxed)
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        if std::fs::write(&tmp, &bytes).is_err() {
+        if self.is_retired() || std::fs::write(&tmp, &bytes).is_err() {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
         let mut index = self.lock();
-        if index.files.get(&d).is_some_and(|i| i.scope.is_none())
+        if self.is_retired()
+            || index.files.get(&d).is_some_and(|i| i.scope.is_none())
             || std::fs::rename(&tmp, &path).is_err()
         {
             drop(index);
@@ -366,7 +445,8 @@ impl DiskTier {
     /// unless it alone is over it. A file that cannot be removed is passed over.
     fn evict(&self, index: &mut Index, keep: Option<Digest32>) {
         let mut stuck = HashSet::new();
-        while index.total > self.cap {
+        let cap = self.capacity();
+        while index.total > cap {
             let others = index
                 .files
                 .iter()
@@ -384,47 +464,71 @@ impl DiskTier {
         }
     }
 
-    /// Drop the entry of the request `key`.
-    pub fn remove(&self, key: &str) {
+    /// Drop the entry of the request `key`, with the directory synced after. A file
+    /// of another version stays, since a newer release may read it, and only a clear
+    /// and eviction remove it. The error is that of a file that stays or of the sync.
+    pub fn remove(&self, key: &str) -> std::io::Result<()> {
         let d = digest(key.as_bytes());
         let mut index = self.lock();
-        if index.files.contains_key(&d) && self.drop_file(&mut index, &d) {
-            drop(index);
-            self.sync();
+        if self.is_retired() || !index.files.get(&d).is_some_and(|i| i.scope.is_some()) {
+            return Ok(());
         }
+        if !self.drop_file(&mut index, &d) {
+            return Err(std::io::Error::other(
+                "a SERVICE cache file cannot be removed",
+            ));
+        }
+        drop(index);
+        self.sync()
     }
 
     /// The live entries of `scope`, but for those whose keys are in `skip`. `admit`
-    /// admits each file's bytes before it is read, and a refusal is the listing's error.
+    /// admits the listing's own storage before it grows and each file's bytes before
+    /// it is read, and a refusal is the listing's error.
     pub fn list(
         &self,
         scope: &str,
         ttl: Duration,
         skip: &HashSet<Arc<str>>,
-        admit: &dyn Fn(u64) -> crate::error::Result<()>,
+        admit: Admit<'_>,
     ) -> crate::error::Result<Vec<Listed>> {
         let scope = digest(scope.as_bytes());
+        admit((skip.len() as u64).saturating_mul((size_of::<Digest32>() + 8) as u64))?;
         let skip: HashSet<Digest32> = skip.iter().map(|k| digest(k.as_bytes())).collect();
+        type Candidate = (Digest32, u64, u64, u64);
         // an expired file is passed over without reading it
-        let mine: Vec<(Digest32, u64, u64, u64)> = self
-            .lock()
-            .files
-            .iter()
-            .filter(|(d, i)| i.scope == Some(scope) && !skip.contains(*d))
-            .filter(|(_, i)| {
+        let mine: Vec<Candidate> = {
+            let index = self.lock();
+            if self.is_retired() {
+                return Ok(Vec::new());
+            }
+            let live = |(d, i): &(&Digest32, &FileInfo)| {
                 let stored = UNIX_EPOCH.checked_add(Duration::from_secs(i.stored));
-                stored.is_some_and(|s| !expired(s, ttl))
-            })
-            .map(|(d, i)| (*d, i.id, i.ver, i.size))
-            .collect();
+                i.scope == Some(scope)
+                    && !skip.contains(*d)
+                    && stored.is_some_and(|s| !expired(s, ttl))
+            };
+            let n = index.files.iter().filter(live).count();
+            admit((n as u64).saturating_mul(size_of::<Candidate>() as u64))?;
+            let mut mine = Vec::with_capacity(n);
+            mine.extend(
+                index
+                    .files
+                    .iter()
+                    .filter(live)
+                    .map(|(d, i)| (*d, i.id, i.ver, i.size)),
+            );
+            mine
+        };
         let mut out = Vec::new();
         for (d, id, ver, size) in mine {
             admit(size)?;
-            let Ok(bytes) = read_bounded(&self.path(&d), self.max_entry_bytes()) else {
-                continue;
+            let bytes = match read_bounded(&self.path(&d), self.max_entry_bytes(), size, admit)? {
+                Some(b) => b,
+                None => continue,
             };
             let check = Check::Digests { key: d, scope };
-            let e = match decode(&bytes, check, self.max_entry_bytes()) {
+            let e = match decode(&bytes, check, self.max_entry_bytes(), admit)? {
                 Ok(e) => e,
                 Err(Bad::Version) => continue,
                 Err(Bad::Damaged) => {
@@ -435,6 +539,7 @@ impl DiskTier {
             if expired(e.stored, ttl) || self.lock().files.get(&d).is_none_or(|i| i.ver != ver) {
                 continue;
             }
+            admit(size_of::<Listed>() as u64)?;
             out.push(Listed {
                 id,
                 endpoint: e.endpoint,
@@ -450,33 +555,43 @@ impl DiskTier {
         Ok(out)
     }
 
-    /// Remove the entries of `scope`, or with `id` only the entry with that id. Returns
-    /// how many were removed, after their removal is durable.
-    pub fn remove_in_scope(&self, scope: &str, id: Option<u64>) -> u64 {
+    /// Remove the entries of `scope`, or with `id` only the entry with that id, with
+    /// one sync of the directory after them. Files of another version are not in any
+    /// scope and stay.
+    pub(crate) fn remove_in_scope(&self, scope: &str, id: Option<u64>) -> Removal {
         let scope = digest(scope.as_bytes());
         let mut index = self.lock();
+        if self.is_retired() {
+            return Removal::none();
+        }
         let victims: Vec<Digest32> = index
             .files
             .iter()
             .filter(|(_, i)| i.scope == Some(scope) && id.is_none_or(|id| i.id == id))
             .map(|(d, _)| *d)
             .collect();
-        let mut n = 0u64;
-        for d in &victims {
-            if self.drop_file(&mut index, d) {
-                n += 1;
+        let mut out = Removal::none();
+        for d in victims {
+            if self.drop_file(&mut index, &d) {
+                out.removed.insert(d);
+            } else {
+                out.stuck.insert(d);
             }
         }
         drop(index);
-        if n > 0 {
-            self.sync();
+        if !out.removed.is_empty() {
+            out.synced = self.sync();
         }
-        n
+        out
     }
 
-    /// Remove every file, of every version, and return how many could not be removed.
-    pub fn clear(&self) -> usize {
+    /// Remove every file, of every version, with the directory synced after. The error
+    /// is that of the sync, or names how many files could not be removed and stay.
+    pub fn clear(&self) -> std::io::Result<()> {
         let mut index = self.lock();
+        if self.is_retired() {
+            return Ok(());
+        }
         let all: Vec<Digest32> = index.files.keys().copied().collect();
         let mut left = 0;
         for d in &all {
@@ -485,8 +600,13 @@ impl DiskTier {
             }
         }
         drop(index);
-        self.sync();
-        left
+        self.sync()?;
+        match left {
+            0 => Ok(()),
+            n => Err(std::io::Error::other(format!(
+                "{n} SERVICE cache files cannot be removed"
+            ))),
+        }
     }
 
     /// The seconds since the epoch when the entry of `key` was stored, if it is on disk.
@@ -507,17 +627,36 @@ fn expired(stored: SystemTime, ttl: Duration) -> bool {
     !ttl.is_zero() && SystemTime::now().duration_since(stored).unwrap_or_default() >= ttl
 }
 
-/// The bytes of the file at `path`, refused when it is longer than `limit`.
-fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    let f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    let header = HEAD as u64;
-    if len > limit.saturating_add(header) {
-        return Err(std::io::Error::other("larger than the tier keeps"));
+/// The bytes of the file at `path`, or `None` when it cannot be read or is longer than
+/// `limit`. `admitted` bytes were admitted for it. A file that grew since is admitted
+/// for the difference with `admit` before it is read, and a refusal is the error.
+fn read_bounded(
+    path: &Path,
+    limit: u64,
+    admitted: u64,
+    admit: Admit<'_>,
+) -> crate::error::Result<Option<Vec<u8>>> {
+    let Ok(f) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return Ok(None);
+    };
+    if len > limit.saturating_add(HEAD as u64) {
+        return Ok(None);
     }
-    let mut out = Vec::with_capacity(usize::try_from(len).map_err(std::io::Error::other)?);
-    f.take(len).read_to_end(&mut out)?;
-    Ok(out)
+    let Ok(cap) = usize::try_from(len) else {
+        return Ok(None);
+    };
+    if len > admitted {
+        admit(len - admitted)?;
+    }
+    let mut out = Vec::with_capacity(cap);
+    // at most the bytes admitted, should the file grow while it is read
+    if f.take(len).read_to_end(&mut out).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(out))
 }
 
 /// The scope digest and the stored time of the file at `path`, `None` for a file of
@@ -621,10 +760,11 @@ fn encode(e: &Entry, limit: u64) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A decoded file: the entry when the key was given, and what a listing shows.
+/// A decoded file: the entry when the key was given, or what a listing shows.
 struct Decoded {
     entry: Option<Entry>,
     stored: SystemTime,
+    /// for a listing only, empty for a lookup
     endpoint: String,
     pattern: String,
     binding: String,
@@ -676,12 +816,18 @@ impl<'a> Reader<'a> {
         std::str::from_utf8(self.take(n)?).map_err(|_| Bad::Damaged)
     }
 
-    fn string(&mut self) -> Result<String, Bad> {
+    /// A string, borrowed from the bytes.
+    fn str(&mut self) -> Result<&'a str, Bad> {
         let n = self.u32()?;
         if n == UNBOUND {
             return Err(Bad::Damaged);
         }
-        Ok(self.text(n)?.to_string())
+        self.text(n)
+    }
+
+    #[cfg(test)]
+    fn string(&mut self) -> Result<String, Bad> {
+        Ok(self.str()?.to_string())
     }
 }
 
@@ -694,122 +840,176 @@ enum Check<'a> {
     Digests { key: Digest32, scope: Digest32 },
 }
 
-fn decode(bytes: &[u8], check: Check<'_>, limit: u64) -> Result<Decoded, Bad> {
+/// Decode a file, admitting with `admit` what it allocates before it allocates it: the
+/// strings a listing keeps, and the variable names, the rows' vectors and each row with
+/// its terms of an entry. The outer error is a refusal of `admit`.
+fn decode(
+    bytes: &[u8],
+    check: Check<'_>,
+    limit: u64,
+    admit: Admit<'_>,
+) -> crate::error::Result<Result<Decoded, Bad>> {
     let mut r = Reader { b: bytes };
-    if r.take(8)? != MAGIC {
-        return Err(Bad::Damaged);
+    macro_rules! take {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(b) => return Ok(Err(b)),
+            }
+        };
     }
-    if r.u32()? != VERSION {
-        return Err(Bad::Version);
+    if take!(r.take(8)) != MAGIC {
+        return Ok(Err(Bad::Damaged));
     }
-    let len = r.usize()?;
-    let sum = r.digest()?;
+    if take!(r.u32()) != VERSION {
+        return Ok(Err(Bad::Version));
+    }
+    let len = take!(r.usize());
+    let sum = take!(r.digest());
     if r.b.len() != len || digest(r.b) != sum {
-        return Err(Bad::Damaged);
+        return Ok(Err(Bad::Damaged));
     }
-    let stored = UNIX_EPOCH
-        .checked_add(Duration::from_secs(r.u64()?))
-        .ok_or(Bad::Damaged)?;
-    let key_digest = r.digest()?;
-    let scope_digest = r.digest()?;
+    let stored = take!(
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(take!(r.u64())))
+            .ok_or(Bad::Damaged)
+    );
+    let key_digest = take!(r.digest());
+    let scope_digest = take!(r.digest());
     let (key, want) = match check {
         Check::Key(k) => (Some(k), (digest(k.as_bytes()), None)),
         Check::Digests { key, scope } => (None, (key, Some(scope))),
     };
     if key_digest != want.0 || want.1.is_some_and(|s| s != scope_digest) {
-        return Err(Bad::Damaged);
+        return Ok(Err(Bad::Damaged));
     }
-    let (scope_len, url_len, pattern_len) = (r.usize()?, r.usize()?, r.usize()?);
-    let offset = r.usize()?;
+    let (scope_len, url_len, pattern_len) = (take!(r.usize()), take!(r.usize()), take!(r.usize()));
+    let offset = take!(r.usize());
     let slice = Slice {
         offset,
-        limit: match r.u64()? {
+        limit: match take!(r.u64()) {
             u64::MAX => None,
-            l => Some(usize::try_from(l).map_err(|_| Bad::Damaged)?),
+            l => Some(take!(usize::try_from(l).map_err(|_| Bad::Damaged))),
         },
     };
-    let endpoint = r.string()?;
-    let pattern = r.string()?;
-    let binding = r.string()?;
-    let width = usize::try_from(r.u32()?).map_err(|_| Bad::Damaged)?;
+    let endpoint = take!(r.str());
+    let pattern = take!(r.str());
+    let binding = take!(r.str());
+    let width = take!(usize::try_from(take!(r.u32())).map_err(|_| Bad::Damaged));
     // every name takes at least its length
     if width > r.b.len() / 4 {
-        return Err(Bad::Damaged);
+        return Ok(Err(Bad::Damaged));
     }
-    let mut vars = Vec::with_capacity(width);
+    let mut names = Vec::new();
+    if key.is_some() {
+        admit((width as u64).saturating_mul(size_of::<String>() as u64))?;
+        names.reserve_exact(width);
+    }
     for _ in 0..width {
-        vars.push(r.string()?);
+        let v = take!(r.str());
+        if key.is_some() {
+            admit(v.len() as u64)?;
+            names.push(v.to_string());
+        }
     }
-    let count = r.usize()?;
+    let count = take!(r.usize());
     // every slot of a row takes at least its length and a row without slots a byte, so
     // the bytes left bound the count, and the rows' vectors are bounded before they are
     // allocated
-    let per_row = width.checked_mul(4).ok_or(Bad::Damaged)?.max(1);
-    let row_alloc = width
-        .checked_mul(size_of::<Option<Term>>())
-        .and_then(|n| n.checked_add(size_of::<Vec<Option<Term>>>()))
-        .ok_or(Bad::Damaged)?;
-    let alloc = count.checked_mul(row_alloc).ok_or(Bad::Damaged)?;
+    let per_row = take!(width.checked_mul(4).ok_or(Bad::Damaged)).max(1);
+    let slots = take!(
+        width
+            .checked_mul(size_of::<Option<Term>>())
+            .ok_or(Bad::Damaged)
+    );
+    let row_alloc = take!(
+        slots
+            .checked_add(size_of::<Vec<Option<Term>>>())
+            .ok_or(Bad::Damaged)
+    );
+    let alloc = take!(count.checked_mul(row_alloc).ok_or(Bad::Damaged));
     if count > r.b.len() / per_row || alloc as u64 > limit.saturating_mul(ALLOC_FACTOR) {
-        return Err(Bad::Damaged);
+        return Ok(Err(Bad::Damaged));
     }
     let Some(key) = key else {
-        return Ok(Decoded {
+        admit(
+            (endpoint.len() as u64)
+                .saturating_add(pattern.len() as u64)
+                .saturating_add(binding.len() as u64),
+        )?;
+        return Ok(Ok(Decoded {
             entry: None,
             stored,
-            endpoint,
-            pattern,
-            binding,
+            endpoint: endpoint.to_string(),
+            pattern: pattern.to_string(),
+            binding: binding.to_string(),
             rows: count,
-        });
+        }));
     };
+    admit((count as u64).saturating_mul(size_of::<Vec<Option<Term>>>() as u64))?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
+        // the row's terms are weighed from their lengths before any is parsed
+        let mut peek = Reader { b: r.b };
+        let mut terms = 0u64;
+        for _ in 0..width {
+            let n = take!(peek.u32());
+            if n != UNBOUND {
+                take!(peek.take(take!(usize::try_from(n).map_err(|_| Bad::Damaged))));
+                terms = terms.saturating_add(u64::from(n) + TERM_EXTRA);
+            }
+        }
+        admit((slots as u64).saturating_add(terms))?;
         let mut row = Vec::with_capacity(width);
-        if width == 0 && r.u8()? != 0 {
-            return Err(Bad::Damaged);
+        if width == 0 && take!(r.u8()) != 0 {
+            return Ok(Err(Bad::Damaged));
         }
         for _ in 0..width {
-            let n = r.u32()?;
+            let n = take!(r.u32());
             row.push(if n == UNBOUND {
                 None
             } else {
-                Some(r.text(n)?.parse::<Term>().map_err(|_| Bad::Damaged)?)
+                Some(take!(
+                    take!(r.text(n)).parse::<Term>().map_err(|_| Bad::Damaged)
+                ))
             });
         }
         rows.push(row);
     }
     if !r.b.is_empty() {
-        return Err(Bad::Damaged);
+        return Ok(Err(Bad::Damaged));
     }
     let parts = Parts::from_lens(scope_len, url_len, pattern_len);
-    let total = scope_len
-        .checked_add(url_len)
-        .and_then(|n| n.checked_add(pattern_len))
-        .and_then(|n| n.checked_add(3))
-        .ok_or(Bad::Damaged)?;
+    let total = take!(
+        scope_len
+            .checked_add(url_len)
+            .and_then(|n| n.checked_add(pattern_len))
+            .and_then(|n| n.checked_add(3))
+            .ok_or(Bad::Damaged)
+    );
     if total > key.len() {
-        return Err(Bad::Damaged);
+        return Ok(Err(Bad::Damaged));
     }
+    admit((key.len() + size_of::<Entry>() + size_of::<Rows>()) as u64)?;
     let entry = Entry::new(
         Arc::from(key),
         parts,
         slice,
-        Arc::new(Rows { vars, rows }),
+        Arc::new(Rows { vars: names, rows }),
         stored,
     );
     // the scope digest is that of the key's own scope
     if digest(entry.scope().as_bytes()) != scope_digest {
-        return Err(Bad::Damaged);
+        return Ok(Err(Bad::Damaged));
     }
-    Ok(Decoded {
+    Ok(Ok(Decoded {
         entry: Some(entry),
         stored,
-        endpoint,
-        pattern,
-        binding,
+        endpoint: String::new(),
+        pattern: String::new(),
+        binding: String::new(),
         rows: count,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -1028,12 +1228,16 @@ mod tests {
         let last = bad.len() - 1;
         bad[last] ^= 1;
         assert_eq!(
-            decode(&bad, Check::Key(e.key()), u64::MAX).err(),
+            decode(&bad, Check::Key(e.key()), u64::MAX, &|_| Ok(()))
+                .unwrap()
+                .err(),
             Some(Bad::Damaged)
         );
         // another key's file under this name
         assert_eq!(
-            decode(&good, Check::Key("other"), u64::MAX).err(),
+            decode(&good, Check::Key("other"), u64::MAX, &|_| Ok(()))
+                .unwrap()
+                .err(),
             Some(Bad::Damaged)
         );
         // another version
@@ -1050,10 +1254,12 @@ mod tests {
         );
         assert!(file.exists(), "the newer file is kept");
         assert_eq!(
-            decode(&newer, Check::Key(e.key()), u64::MAX).err(),
+            decode(&newer, Check::Key(e.key()), u64::MAX, &|_| Ok(()))
+                .unwrap()
+                .err(),
             Some(Bad::Version)
         );
-        t.clear();
+        t.clear().unwrap();
         assert!(!file.exists(), "clear removes every version");
         // a file without the magic and a leftover temporary file go at open
         std::fs::write(&file, b"not a cache file").unwrap();
@@ -1093,7 +1299,9 @@ mod tests {
         let mut b = body.clone();
         b[rows_at..rows_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(
-            decode(&reseal(b), Check::Key(e.key()), u64::MAX).err(),
+            decode(&reseal(b), Check::Key(e.key()), u64::MAX, &|_| Ok(()))
+                .unwrap()
+                .err(),
             Some(Bad::Damaged)
         );
         let mut b = body.clone();
@@ -1101,10 +1309,16 @@ mod tests {
         let at = PREFIX + 8 * 5;
         b[at..at + 4].copy_from_slice(&(u32::MAX - 1).to_le_bytes());
         assert_eq!(
-            decode(&reseal(b), Check::Key(e.key()), u64::MAX).err(),
+            decode(&reseal(b), Check::Key(e.key()), u64::MAX, &|_| Ok(()))
+                .unwrap()
+                .err(),
             Some(Bad::Damaged)
         );
-        assert!(decode(&reseal(body), Check::Key(e.key()), u64::MAX).is_ok());
+        assert!(
+            decode(&reseal(body), Check::Key(e.key()), u64::MAX, &|_| Ok(()))
+                .unwrap()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1119,9 +1333,9 @@ mod tests {
         for e in [&a, &b, &c] {
             t.put(e);
         }
-        assert_eq!(t.remove_in_scope("a", Some(c.id)), 0);
-        assert_eq!(t.remove_in_scope("a", Some(a.id)), 1);
-        assert_eq!(t.remove_in_scope("a", None), 1);
+        assert_eq!(t.remove_in_scope("a", Some(c.id)).count(), 0);
+        assert_eq!(t.remove_in_scope("a", Some(a.id)).count(), 1);
+        assert_eq!(t.remove_in_scope("a", None).count(), 1);
         assert_eq!(t.entries(), 1);
         let l = t
             .list("ab", Duration::ZERO, &HashSet::new(), &|_| Ok(()))
@@ -1180,7 +1394,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o555)).unwrap();
             let locked = std::fs::remove_file(&fa).is_err();
             if locked {
-                assert_eq!(t.remove_in_scope("a", Some(a.id)), 0);
+                assert_eq!(t.remove_in_scope("a", Some(a.id)).count(), 0);
                 assert!(
                     t.get(a.key(), Duration::ZERO, &|_| Ok(()))
                         .unwrap()
@@ -1191,16 +1405,16 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             if !locked {
                 // the file went in the probe (run as root): write it again
-                t.remove(a.key());
+                t.remove(a.key()).unwrap();
                 t.put(&a);
             }
         }
-        assert_eq!(t.remove_in_scope("a", Some(a.id)), 1);
+        assert_eq!(t.remove_in_scope("a", Some(a.id)).count(), 1);
         assert!(!fa.exists());
     }
 
-    /// A read and a listing admit the file's bytes before they read it, and the decoded
-    /// rows once they are known, and stop at a refusal.
+    /// A read and a listing admit the file's bytes before they read it, and what they
+    /// decode before they decode it, and stop at a refusal.
     #[test]
     fn reads_and_listings_admit_before_they_allocate() {
         use std::cell::Cell;
@@ -1218,21 +1432,103 @@ mod tests {
         };
         assert!(t.get(e.key(), Duration::ZERO, &note).unwrap().is_some());
         let v = asked.take();
-        assert_eq!((v.len(), v[0]), (2, size), "{v:?}");
-        assert!(v[1] >= e.rows.bytes(), "{v:?}");
+        assert_eq!(v[0], size, "{v:?}");
+        assert!(v[1..].iter().sum::<u64>() >= e.rows.bytes(), "{v:?}");
         let refuse = |_| Err(crate::error::Error::invalid("over budget"));
         assert!(t.get(e.key(), Duration::ZERO, &refuse).is_err());
         assert!(
             t.list("a", Duration::ZERO, &HashSet::new(), &refuse)
                 .is_err()
         );
+        // the file and no more refuses the rows
+        let left = Cell::new(size);
+        let file_only = |n: u64| match left.get().checked_sub(n) {
+            Some(l) => {
+                left.set(l);
+                Ok(())
+            }
+            None => Err(crate::error::Error::invalid("over budget")),
+        };
+        assert!(t.get(e.key(), Duration::ZERO, &file_only).is_err());
         assert_eq!(
             t.list("a", Duration::ZERO, &HashSet::new(), &note)
                 .unwrap()
                 .len(),
             1
         );
-        assert_eq!(asked.take(), vec![size]);
+        assert!(asked.take().contains(&size));
         assert_eq!(t.entries(), 1, "a refusal removes nothing");
+    }
+
+    /// A keyed removal leaves a file of another version, and an entry that replaces
+    /// a request's file but is too large to write takes the old file away with it.
+    #[test]
+    fn keyed_removal_keeps_other_versions_and_replacement_drops_stale_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DIR);
+        let t = DiskTier::open(path.clone(), 1 << 20).unwrap();
+        let e = entry("a", "p", SystemTime::now());
+        t.put(&e);
+        let file = t.path(&digest(e.key().as_bytes()));
+        let mut newer = std::fs::read(&file).unwrap();
+        newer[8..12].copy_from_slice(&(VERSION + 1).to_le_bytes());
+        std::fs::write(&file, &newer).unwrap();
+        drop(t);
+        let t = DiskTier::open(path.clone(), 1 << 20).unwrap();
+        t.remove(e.key()).unwrap();
+        assert_eq!(t.remove_in_scope("a", None).count(), 0);
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            newer,
+            "the newer file is kept"
+        );
+        t.clear().unwrap();
+        // a stale file of this version goes when its replacement cannot be written
+        t.put(&e);
+        assert!(file.exists());
+        let big = Entry::new(
+            Arc::from(e.key()),
+            e.parts(),
+            Slice::ALL,
+            Arc::new(Rows {
+                vars: vec!["a".into()],
+                rows: (0..40_000)
+                    .map(|i| vec![Some(Literal::from(i).into())])
+                    .collect(),
+            }),
+            SystemTime::now(),
+        );
+        t.put(&big);
+        assert!(!file.exists(), "the stale file answers for the new entry");
+        assert_eq!(t.entries(), 0);
+    }
+
+    /// A retired tier writes, reads and removes nothing, and a resize evicts under the
+    /// lock of the tier in use.
+    #[test]
+    fn retired_and_resized_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DIR);
+        let t = DiskTier::open(path.clone(), 1 << 20).unwrap();
+        let es: Vec<Entry> = (0..4)
+            .map(|i| entry("a", &format!("p{i}"), SystemTime::now()))
+            .collect();
+        for e in &es {
+            t.put(e);
+        }
+        let one = t.bytes() / 4;
+        t.resize(one * 2);
+        assert_eq!(t.entries(), 2);
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 2);
+        t.retire();
+        assert!(
+            t.get(es[3].key(), Duration::ZERO, &|_| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        t.put(&es[0]);
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 2, "written");
+        assert_eq!(t.remove_in_scope("a", None).count(), 0);
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 2, "removed");
     }
 }

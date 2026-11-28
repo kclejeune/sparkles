@@ -3551,16 +3551,21 @@ SELECT (SUM(se:cacheRm(?id)) AS ?removed) { ?id se:cacheLs (<https://dbpedia.org
 `se:cacheLs` binds the entry's id and up to six positions, each optional and each a
 variable or a term the entry must match. The first three are Jena's, the endpoint, the
 pattern and the values substituted into it. The last three are the entry's solutions,
-its bytes and its age in seconds. The endpoint is listed without its user information,
-query string and fragment. `se:cacheRm()` removes every entry of the caller and
+its bytes and its age in seconds. An http or https endpoint is listed without its user
+information, query string and fragment, and any other endpoint is listed as
+`urn:x-sparkles:unlisted-endpoint`. `se:cacheRm()` removes every entry of the caller and
 `se:cacheRm(?id)` one entry, and each returns the number removed once the removal is on
-disk. A query may call `se:cacheRm` only when the server runs with
-`--service-cache-mgmt` and the caller has `admin` on the dataset through the endpoint it
-uses, which is Jena's `enableMgmt`. Any other query that calls it fails with `403`. A call
-through `fn:apply` or `afn:eval` is an error of the expression and removes nothing.
+disk. A removal that the disk could not sync fails the query. A query may call
+`se:cacheRm` only when the server runs with `--service-cache-mgmt` and the caller has
+`admin` on the dataset through the endpoint it uses, which is Jena's `enableMgmt`. Without
+both, a query that calls it fails with `403`, and a call inside EXISTS, including one
+within a SERVICE that runs against the dataset itself, is refused before the query runs.
+A call through `fn:apply` or `afn:eval` is an error of the expression and removes nothing.
+Both functions work in the WHERE clause of an UPDATE, which uses the store's SERVICE
+cache, under the same rules.
 Library users set `QueryOptions::service_cache_mgmt`. Neither function reaches another
-caller's entries, and the results of `se:cacheLs` are never kept in the query result
-cache.
+caller's entries, and the results of `se:cacheLs`, and of a LATERAL or EXISTS that calls
+either function, are never kept in the query result cache.
 
 ### Aggregate errors
 

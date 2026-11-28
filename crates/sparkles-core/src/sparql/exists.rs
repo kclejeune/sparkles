@@ -1903,6 +1903,7 @@ fn property_functions(patterns: &[TriplePattern]) -> std::result::Result<(), Str
                 super::textpf::TEXT_QUERY
                     | crate::vector::VECTOR_SEARCH
                     | super::hybrid::HYBRID_SEARCH
+                    | super::svcfn::CACHE_LS
             ) || crate::geo::SpatialPfKind::from_iri(iri).is_some()
         });
     if calls {
@@ -1925,15 +1926,18 @@ fn zero_length(p: &PropertyPathExpression) -> bool {
     }
 }
 
-/// Free of functions whose value differs between calls with the same arguments (also in
-/// nested EXISTS patterns).
-fn pure(e: &Expression) -> bool {
+/// Free of functions whose value differs between calls with the same arguments or that
+/// change what later calls see (also in nested EXISTS patterns): the extension functions
+/// that [`super::exprcache`] counts as impure, dynamic calls whose function is not known
+/// before they run, and `se:cacheRm`.
+pub(super) fn pure(e: &Expression) -> bool {
     use Expression as E;
     match e {
         E::FunctionCall(
             Function::Rand | Function::Uuid | Function::StrUuid | Function::BNode,
             _,
         ) => false,
+        E::FunctionCall(Function::Custom(n), _) if impure_extension(n.as_str()) => false,
         E::FunctionCall(_, l) | E::Coalesce(l) => l.iter().all(pure),
         E::Or(a, b)
         | E::And(a, b)
@@ -1955,10 +1959,26 @@ fn pure(e: &Expression) -> bool {
     }
 }
 
+/// The extension functions [`pure`] refuses.
+fn impure_extension(iri: &str) -> bool {
+    iri == super::svcfn::CACHE_RM
+        || iri.strip_prefix(super::expr::FN) == Some("apply")
+        || matches!(
+            iri.strip_prefix(super::expr::AFN),
+            Some("uuid" | "struuid" | "wait" | "print" | "execTime" | "eval")
+        )
+}
+
+/// Free of what [`pure`] refuses, and of `se:cacheLs`, whose solutions are the caller's
+/// cache entries at the moment it runs.
 pub(super) fn pure_pattern(gp: &GraphPattern) -> bool {
     use GraphPattern as GP;
     match gp {
-        GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => true,
+        GP::Bgp { patterns } => !patterns.iter().any(|t| {
+            matches!(&t.predicate, NamedNodePattern::NamedNode(p)
+                if p.as_str() == super::svcfn::CACHE_LS)
+        }),
+        GP::Path { .. } | GP::Values { .. } => true,
         GP::Filter { expr, inner } => pure(expr) && pure_pattern(inner),
         GP::Extend {
             inner, expression, ..

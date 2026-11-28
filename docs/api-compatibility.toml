@@ -10,6 +10,10 @@ schema_version = 1
 #   and service_cache_disk_bytes, and OutboundPolicy::service_parallel_max, new public
 #   fields of structs that callers may build with a literal, and the slice and key parts
 #   that sparql::svccache::ServiceCache::get and put now take (item 38, CHANGELOG).
+#   StoreOptions::service_cache_files is a new public field. ServiceCache::remove_in_scope
+#   now returns Result<u64>, ServiceCache::clear, svcdisk::DiskTier::remove and clear
+#   return io::Result<()>, DiskTier::remove_in_scope is crate-private, DiskTier::resize
+#   and retire are new, and svccache exports CACHE_LS, CACHE_RM and UNLISTED_ENDPOINT.
 enforced = ["http", "cli"]
 pending = ["rust", "bindings", "mcp", "metrics", "cli-json-exit", "deprecation", "release-install"]
 

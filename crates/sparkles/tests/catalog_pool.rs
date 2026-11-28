@@ -85,7 +85,7 @@ fn memory_clones_get_their_own_cache_namespace() {
     assert!(ra.entries() > 0 && rb.entries() > 0);
     // what `POST /$/cache/clear/b` does
     rb.clear();
-    rb.service.clear();
+    rb.service.clear().unwrap();
     assert_eq!(rb.entries(), 0);
     let hits = ra.hits();
     a.query_with(q, &Default::default()).unwrap();

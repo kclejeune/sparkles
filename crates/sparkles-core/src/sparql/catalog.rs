@@ -166,15 +166,16 @@ pub fn extension_aggregates() -> Vec<String> {
     out
 }
 
-/// Every property function IRI: `text:query`, the vector and hybrid searches, ARQ's
-/// `list:` and `apf:` libraries, and with the `geo` feature Jena's `spatial:` property
-/// functions.
+/// Every property function IRI: `text:query`, the vector and hybrid searches, the
+/// service enhancer's `se:cacheLs`, ARQ's `list:` and `apf:` libraries, and with the
+/// `geo` feature Jena's `spatial:` property functions.
 pub fn property_functions() -> Vec<String> {
     #[cfg_attr(not(feature = "geo"), allow(unused_mut))]
     let mut out = vec![
         super::textpf::TEXT_QUERY.to_string(),
         crate::vector::VECTOR_SEARCH.to_string(),
         super::hybrid::HYBRID_SEARCH.to_string(),
+        super::svcfn::CACHE_LS.to_string(),
     ];
     out.extend(super::arqpf::iris());
     #[cfg(feature = "geo")]

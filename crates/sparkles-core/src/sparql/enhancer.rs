@@ -1163,13 +1163,22 @@ pub(super) fn check_allowed(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// The solutions of one response, as terms by variable name.
-pub(super) fn fetch_rows(ctx: &Ctx, url: &NamedNode, query: &str) -> Result<Rows> {
-    fetch_rows_within(ctx, url, query, None, None)
+/// The solutions of one response, as terms by variable name, with each solution
+/// admitted on `charge` before it is kept, for the eager SERVICE without `loop`, which
+/// holds the rows on `charge` until it has made its table of them.
+pub(super) fn fetch_rows_charged(
+    ctx: &Ctx,
+    url: &NamedNode,
+    query: &str,
+    charge: &Charge<'_>,
+) -> Result<Rows> {
+    fetch_rows_within(ctx, url, query, None, Some(charge))
 }
 
-/// [`fetch_rows`] drawing on `share` in place of the request's outbound budget, with
-/// each solution admitted on `charge` before it is kept.
+/// [`fetch_rows_charged`] drawing on `share` in place of the request's outbound budget,
+/// with what each solution adds admitted on `charge` before it is copied: the variable
+/// names with the first one, the row with its terms, and the growth of the rows'
+/// vector. The query's cancellation and deadline are polled before each copy.
 fn fetch_rows_within(
     ctx: &Ctx,
     url: &NamedNode,
@@ -1178,19 +1187,31 @@ fn fetch_rows_within(
     charge: Option<&Charge<'_>>,
 ) -> Result<Rows> {
     let mut vars: Vec<String> = Vec::new();
-    let mut rows = Vec::new();
+    let mut rows: Vec<Vec<Option<Term>>> = Vec::new();
+    let admit = |n: u64| charge.map_or(Ok(()), |c| c.add(n));
     super::exec::fetch_within(ctx, url, query, share, &mut |sol| {
+        ctx.check()?;
         if vars.is_empty() && sol.variables().len() != 0 {
+            let names = sol.variables().len() * size_of::<String>()
+                + sol.variables().map(str::len).sum::<usize>();
+            admit(names as u64)?;
             vars = sol.variables().map(str::to_owned).collect();
         }
-        let row = vars
-            .iter()
-            .map(|v| sol.get(v.as_str()).cloned())
-            .collect::<Vec<_>>();
-        if let Some(c) = charge {
-            c.add(Rows::retained_row_bytes(&row))?;
+        let terms = vars.iter().filter_map(|v| sol.get(v.as_str()));
+        let mut bytes = Rows::retained_slots_bytes(vars.len(), terms);
+        if rows.len() == rows.capacity() {
+            let grown = rows.capacity().max(4);
+            bytes = bytes.saturating_add((grown * size_of::<Vec<Option<Term>>>()) as u64);
+            admit(bytes)?;
+            rows.reserve_exact(grown);
+        } else {
+            admit(bytes)?;
         }
-        rows.push(row);
+        rows.push(
+            vars.iter()
+                .map(|v| sol.get(v.as_str()).cloned())
+                .collect::<Vec<_>>(),
+        );
         ctx.check()
     })?;
     Ok(Rows { vars, rows })
@@ -1210,8 +1231,17 @@ type Fetched<'c> = Result<(Rows, Charge<'c>)>;
 /// Each solution is admitted on its request's charge before it is kept, and every
 /// solution checks for cancellation and the deadline, as does every dispatch. Each
 /// request runs in the caller's span.
+///
+/// The time a wave cannot reserve is the outbound budget's, spent: when the time left
+/// does not give every request of the wave a share, or when a request fails once its
+/// share's time is spent, `fetch_all` fails as a whole, so SILENT does not hide it and
+/// no later wave goes out, as one request out of the budget's time fails the query.
+/// A wave of one request draws on the budget directly, as every other outbound request
+/// of the query does.
 fn fetch_all<'c>(ctx: &'c Ctx, url: &NamedNode, queries: &[String]) -> Result<Vec<Fetched<'c>>> {
     let one = |q: &str, share: Option<&Arc<RequestBudget>>| -> Fetched<'c> {
+        // the last poll before the request is built and sent
+        ctx.check()?;
         let charge = ctx.charge(0)?;
         let rows = fetch_rows_within(ctx, url, q, share, Some(&charge))?;
         Ok((rows, charge))
@@ -1219,31 +1249,36 @@ fn fetch_all<'c>(ctx: &'c Ctx, url: &NamedNode, queries: &[String]) -> Result<Ve
     if queries.len() <= 1 {
         return Ok(queries.iter().map(|q| one(q, None)).collect());
     }
+    let spent = || {
+        Error::Service(format!(
+            "<{}>: the outbound requests of this request have no time left",
+            url.as_str()
+        ))
+    };
     let n = u32::try_from(queries.len()).unwrap_or(u32::MAX);
     let each = ctx.outbound_budget.remaining_time() / n;
+    if each.is_zero() {
+        return Err(spent());
+    }
     let mut shares = Vec::with_capacity(queries.len());
     for _ in queries {
         ctx.check()?;
-        shares.push(ctx.outbound_budget.share(each));
+        shares.push(ctx.outbound_budget.share(each).ok_or_else(spent)?);
     }
     let span = tracing::Span::current();
-    let answers = std::thread::scope(|scope| {
+    let answers: Vec<(Fetched<'c>, bool)> = std::thread::scope(|scope| {
         let handles: Vec<_> = queries
             .iter()
             .zip(shares)
             .map(|(q, share)| {
                 let span = span.clone();
                 let one = &one;
-                scope.spawn(move || -> Fetched<'c> {
+                scope.spawn(move || -> (Fetched<'c>, bool) {
                     let _entered = span.enter();
-                    ctx.check()?;
-                    let Some(share) = share else {
-                        return Err(Error::Service(format!(
-                            "<{}>: the outbound requests of this request have no time left",
-                            url.as_str()
-                        )));
-                    };
-                    one(q, Some(&share))
+                    let answer = one(q, Some(&share));
+                    // a failure once the share's time is spent is the budget's
+                    let out = answer.is_err() && share.remaining_time().is_zero();
+                    (answer, out)
                 })
             })
             .collect();
@@ -1252,7 +1287,14 @@ fn fetch_all<'c>(ctx: &'c Ctx, url: &NamedNode, queries: &[String]) -> Result<Ve
             .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
             .collect()
     });
-    Ok(answers)
+    let mut out = Vec::with_capacity(answers.len());
+    for (answer, spent_share) in answers {
+        if spent_share {
+            return Err(answer.err().unwrap_or_else(spent));
+        }
+        out.push(answer);
+    }
+    Ok(out)
 }
 
 /// The rows of one input, as a table of `vars`, leaving out the variables in `skip`
@@ -1519,14 +1561,19 @@ impl RemoteRun {
             if kept_cost > row_decode.bytes() {
                 row_decode.add(kept_cost - row_decode.bytes())?;
             }
+            let mut kept_cost = kept_cost;
             if let Some(k) = &input.key {
                 if rl.cache.reads() {
                     // what the lookup allocates is admitted before it is, on the
-                    // charge that settles into the kept lease below
+                    // charge that settles into the kept lease below, which keeps the
+                    // answer charged for as long as the input holds it
                     input.rows = cache.get_admitted(k, self.slice, &|n| row_decode.add(n))?;
                     if let Some(rows) = &input.rows {
                         self.stats.cache_hits += 1;
-                        self.held = self.held.saturating_add(rows.bytes());
+                        kept_cost = kept_cost.saturating_add(rows.retained_bytes());
+                        if kept_cost > row_decode.bytes() {
+                            row_decode.add(kept_cost - row_decode.bytes())?;
+                        }
                     }
                 } else {
                     cache.remove(k);
@@ -1679,7 +1726,7 @@ impl RemoteRun {
                                         .check()
                                         .and_then(|()| one(&inputs[*i], stats))
                                         .and_then(|(r, c)| {
-                                            retried = retried.saturating_add(r.bytes());
+                                            retried = retried.saturating_add(r.retained_bytes());
                                             admit(retried).map(|()| {
                                                 drop(c);
                                                 r
@@ -1717,10 +1764,12 @@ impl RemoteRun {
                     }
                     Err(e) => failed(ctx, e, rl, chunk, inputs, unit)?,
                 }
+                // the answers' own allocations, which `Rows::bytes` estimates low for
+                // wide rows of unbound slots
                 let answered: u64 = chunk
                     .iter()
                     .filter_map(|&i| inputs[i].rows.as_ref())
-                    .map(|rows| rows.bytes())
+                    .map(|rows| rows.retained_bytes())
                     .sum();
                 held = held.saturating_add(answered);
                 self.held = held;
@@ -1743,8 +1792,8 @@ impl RemoteRun {
             .unwrap_or(l.len())
     }
 
-    /// The bytes of the answers the loop holds (cached and fetched). Distinct keys and
-    /// inputs are charged separately on `self.kept_lease`.
+    /// The bytes of the fetched answers the loop holds. Answers from the cache, with the
+    /// distinct keys and inputs, are charged separately on `self.kept_lease`.
     pub(super) fn answer_bytes(&self) -> u64 {
         self.held
     }

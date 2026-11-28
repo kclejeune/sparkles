@@ -11,6 +11,8 @@
 //! than an eighth of the budget is not kept. Only complete responses are stored. A bulk
 //! response that an endpoint cut short is never split into entries.
 
+pub use super::svcfn::{CACHE_LS, CACHE_RM};
+
 use oxrdf::Term;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -346,10 +348,15 @@ impl Entry {
         if start == 0 && stop == self.rows.rows.len() {
             return Ok(Some(self.rows.clone()));
         }
+        let vars = self.rows.vars.len() * std::mem::size_of::<String>()
+            + self.rows.vars.iter().map(String::len).sum::<usize>();
         let copy: u64 = self.rows.rows[start..stop]
             .iter()
             .map(Rows::retained_row_bytes)
-            .fold(std::mem::size_of::<Rows>() as u64, u64::saturating_add);
+            .fold(
+                (std::mem::size_of::<Rows>() + vars) as u64,
+                u64::saturating_add,
+            );
         admit(copy)?;
         Ok(Some(Arc::new(Rows {
             vars: self.rows.vars.clone(),
@@ -372,10 +379,11 @@ pub struct Listed {
 }
 
 impl Listed {
-    /// The bytes [`Listed::of`] allocates for `e`, at most.
+    /// The bytes [`Listed::of`] allocates for `e`, at most, with its place in the
+    /// listing and in the set of keys a listing has seen.
     fn bytes_of(e: &Entry) -> u64 {
         let text = e.endpoint().len() + e.pattern().len() + e.binding().len();
-        (text + std::mem::size_of::<Listed>()) as u64
+        (text + 2 * std::mem::size_of::<Listed>() + 2 * std::mem::size_of::<Arc<str>>()) as u64
     }
 
     fn of(e: &Entry) -> Listed {
@@ -391,19 +399,42 @@ impl Listed {
     }
 }
 
-/// `url` as `se:cacheLs` lists it and the disk tier writes it: without the user name
-/// and password of its authority, its query string and its fragment, any of which may
-/// hold a credential.
+/// What `se:cacheLs` lists, and the disk tier writes, for an endpoint whose URL it does
+/// not show.
+pub const UNLISTED_ENDPOINT: &str = "urn:x-sparkles:unlisted-endpoint";
+
+/// `url` as `se:cacheLs` lists it and the disk tier writes it: parsed as the outbound
+/// client parses it before it sends a request, so every spelling it accepts is read
+/// alike, and written without the user name and password of its authority, its query
+/// string and its fragment, any of which may hold a credential. A URL that is not one
+/// the client sends to, an HTTP or HTTPS URL, is listed as [`UNLISTED_ENDPOINT`].
 pub fn listed_endpoint(url: &str) -> String {
-    let url = &url[..url.find(['?', '#']).unwrap_or(url.len())];
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    let end = rest.find('/').unwrap_or(rest.len());
-    match rest[..end].rfind('@') {
-        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
-        None => url.to_string(),
+    match reqwest::Url::parse(url) {
+        Ok(mut u) if matches!(u.scheme(), "http" | "https") => {
+            // an HTTP URL has an authority, so both are always cleared
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
+            u.into()
+        }
+        _ => UNLISTED_ENDPOINT.to_string(),
     }
+}
+
+/// `scope` narrowed to the graph view `view`, decided for one snapshot: the scope with
+/// the SHA-256 of the view's debug form, which shows each guard's exemptions once they
+/// are decided and is the same in every process of one release.
+pub(crate) fn view_scope(scope: &str, view: &crate::access::GraphAccess) -> String {
+    use sha2::Digest;
+    let d = sha2::Sha256::digest(format!("{view:?}").as_bytes());
+    let mut out = String::with_capacity(scope.len() + 1 + 64);
+    out.push_str(scope);
+    out.push('|');
+    for b in d {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// The most shards a cache of query results has. quick_cache splits the byte budget
@@ -498,6 +529,27 @@ impl ServiceStore {
 /// The default time to live of an entry: one hour.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 
+// A test's reader that runs between the two tiers of a removal, where a concurrent
+// lookup could otherwise find the entry in one tier and not the other.
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_TIERS: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn between_tiers() {
+    BETWEEN_TIERS.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f()
+        }
+    })
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn between_tiers() {}
+
 /// A store's view of the cache of remote SERVICE results.
 pub struct ServiceCache {
     store: Arc<ServiceStore>,
@@ -513,6 +565,9 @@ pub struct ServiceCache {
     /// moves on every removal and change of the disk tier, so that an entry read from
     /// disk before one is not kept in memory after it
     removals: AtomicU64,
+    /// held while the dataset's setting changes, so that two changes apply one after
+    /// the other
+    settings: std::sync::Mutex<()>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -537,6 +592,7 @@ impl ServiceCache {
             disk: std::sync::RwLock::new(None),
             memory_settings: Default::default(),
             removals: AtomicU64::new(0),
+            settings: std::sync::Mutex::new(()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -562,15 +618,35 @@ impl ServiceCache {
         self.disk.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Keep entries in `disk` too, or no longer on disk with `None`.
+    /// Keep entries in `disk` too, or no longer on disk with `None`. A tier it
+    /// replaces is retired ([`DiskTier::retire`](super::svcdisk::DiskTier::retire)), so a
+    /// query that still holds it neither writes nor removes a file after this returns.
     pub fn set_disk(&self, disk: Option<Arc<super::svcdisk::DiskTier>>) {
-        *self.disk.write().unwrap_or_else(|e| e.into_inner()) = disk;
+        let old = {
+            let mut w = self.disk.write().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *w, disk.clone())
+        };
+        if let Some(old) = old
+            && !disk.as_ref().is_some_and(|d| Arc::ptr_eq(d, &old))
+        {
+            old.retire();
+        }
         self.removed();
     }
 
-    /// Record a removal, after it is done.
+    /// The lock that a change of the dataset's setting holds.
+    pub(crate) fn settings_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.settings.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a removal between its disk tier and its memory. A removal takes the
+    /// entries off disk first, then moves this counter, and then takes them out of
+    /// memory. A lookup reads the counter before it reads a file and keeps what it read
+    /// in memory only when the counter has not moved, checking again after, so whatever
+    /// a lookup keeps during a removal is either on disk after the removal took it off,
+    /// which it cannot be, or in memory before the removal empties memory.
     fn removed(&self) {
-        self.removals.fetch_add(1, Ordering::AcqRel);
+        self.removals.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) fn memory_settings(&self) -> crate::store::ServiceCacheSettings {
@@ -624,7 +700,7 @@ impl ServiceCache {
             Some(e) => e.serve_admitted(want, admit)?,
             None => None,
         };
-        let before = self.removals.load(Ordering::Acquire);
+        let before = self.removals.load(Ordering::SeqCst);
         if r.is_none()
             && let Some(disk) = self.disk()
             && let Some(e) = disk.get(key, self.ttl(), admit)?
@@ -632,10 +708,10 @@ impl ServiceCache {
             r = e.serve_admitted(want, admit)?;
             // an entry that a removal may have dropped while it was read is not kept,
             // and one kept as a removal ran is dropped again
-            if self.removals.load(Ordering::Acquire) == before {
+            if self.removals.load(Ordering::SeqCst) == before {
                 let e = Arc::new(e);
                 self.keep(e.clone());
-                if self.removals.load(Ordering::Acquire) != before
+                if self.removals.load(Ordering::SeqCst) != before
                     && let Some(c) = &self.store.cache
                 {
                     c.remove_if(&NsKeyRef { ns: self.ns, key }, |v| Arc::ptr_eq(v, &e));
@@ -698,15 +774,20 @@ impl ServiceCache {
         self.store.max_entry_bytes.max(disk)
     }
 
-    /// Drop every entry of the request `key`, whatever its slice, in memory and on disk.
+    /// Drop every entry of the request `key`, whatever its slice, on disk and then in
+    /// memory (see [`ServiceCache::removed`]). A file of another version stays. A file
+    /// that cannot be removed is logged, since the response that follows replaces it.
     pub fn remove(&self, key: &str) {
+        if let Some(disk) = self.disk()
+            && let Err(e) = disk.remove(key)
+        {
+            tracing::warn!(error = %e, "a SERVICE cache entry stays on disk");
+        }
+        self.removed();
+        between_tiers();
         if let Some(c) = &self.store.cache {
             c.remove(&NsKeyRef { ns: self.ns, key });
         }
-        if let Some(disk) = self.disk() {
-            disk.remove(key);
-        }
-        self.removed();
     }
 
     /// The live entries of `scope` in memory and on disk, by id.
@@ -740,10 +821,16 @@ impl ServiceCache {
         Ok(out)
     }
 
-    /// Remove the entries of `scope`, or with `id` only the entry with that id, in
-    /// memory and on disk. Returns how many were removed.
-    pub fn remove_in_scope(&self, scope: &str, id: Option<u64>) -> u64 {
-        let mut n = 0u64;
+    /// Remove the entries of `scope`, or with `id` only the entry with that id, on disk
+    /// and then in memory (see [`ServiceCache::removed`]). Returns how many were
+    /// removed, once their removal from disk is durable. An entry whose file cannot be
+    /// removed stays in memory too and is not counted, and a failed sync of the
+    /// directory is the error, after the entries it removed are out of memory too.
+    pub fn remove_in_scope(&self, scope: &str, id: Option<u64>) -> crate::error::Result<u64> {
+        let removal = self.disk().map(|d| d.remove_in_scope(scope, id));
+        self.removed();
+        between_tiers();
+        let mut n = removal.as_ref().map_or(0, |r| r.count());
         let hit = |e: &Entry| e.scope() == scope && id.is_none_or(|id| e.id == id);
         if let Some(c) = &self.store.cache {
             let keys: Vec<Arc<str>> = c
@@ -752,30 +839,31 @@ impl ServiceCache {
                 .map(|(k, _)| k.key)
                 .collect();
             for key in keys {
+                if removal.as_ref().is_some_and(|r| r.stuck(&key)) {
+                    continue;
+                }
                 let k = NsKeyRef {
                     ns: self.ns,
                     key: &key,
                 };
-                if c.remove_if(&k, |e| hit(e)).is_some() {
+                if c.remove_if(&k, |e| hit(e)).is_some()
+                    && !removal.as_ref().is_some_and(|r| r.removed(&key))
+                {
                     n += 1;
-                    if let Some(disk) = self.disk() {
-                        disk.remove(&key);
-                    }
                 }
             }
         }
-        if let Some(disk) = self.disk() {
-            n = n.saturating_add(disk.remove_in_scope(scope, id));
+        if let Some(r) = removal {
+            r.synced?;
         }
-        self.removed();
-        n
+        Ok(n)
     }
 
-    /// Drop this view's entries, in memory and on disk. Another namespace's stay.
-    pub fn clear(&self) {
-        if let Some(disk) = self.disk() {
-            disk.clear();
-        }
+    /// Drop this view's entries, on disk and then in memory. Another namespace's stay.
+    /// The error is the disk tier's, after memory is emptied too.
+    pub fn clear(&self) -> std::io::Result<()> {
+        let disk = self.disk().map_or(Ok(()), |d| d.clear());
+        self.removed();
         if let Some(c) = &self.store.cache {
             if self.shared {
                 let ns = self.ns;
@@ -784,7 +872,7 @@ impl ServiceCache {
                 c.clear();
             }
         }
-        self.removed();
+        disk
     }
 
     /// The entries of this view's namespace in memory.
@@ -1024,7 +1112,7 @@ mod tests {
                 &second
             ));
             one.put("same key".into(), Parts::default(), Slice::ALL, first);
-            one.clear();
+            one.clear().unwrap();
             assert_eq!(one.entries(), 0);
             assert_eq!(one.bytes(), 0);
             assert!(Arc::ptr_eq(
@@ -1215,13 +1303,21 @@ mod tests {
             "credentials are not listed"
         );
         assert_eq!(mine[0].pattern, "p");
-        assert_eq!(c.remove_in_scope("a", Some(mine[0].id + 1_000_000)), 0);
-        assert_eq!(c.remove_in_scope("a", None), 1);
+        assert_eq!(
+            c.remove_in_scope("a", Some(mine[0].id + 1_000_000))
+                .unwrap(),
+            0
+        );
+        assert_eq!(c.remove_in_scope("a", None).unwrap(), 1);
         assert_eq!(c.entries(), 2);
         assert_eq!(c.list("ab").len(), 1);
         let other = c.list("ab")[0].id;
-        assert_eq!(c.remove_in_scope("a", Some(other)), 0, "another scope's id");
-        assert_eq!(c.remove_in_scope("ab", Some(other)), 1);
+        assert_eq!(
+            c.remove_in_scope("a", Some(other)).unwrap(),
+            0,
+            "another scope's id"
+        );
+        assert_eq!(c.remove_in_scope("ab", Some(other)).unwrap(), 1);
         assert_eq!(c.entries(), 1);
     }
 
@@ -1229,8 +1325,130 @@ mod tests {
     fn credentials_are_left_out_of_listed_endpoints() {
         assert_eq!(listed_endpoint("https://u:p@h:1/x?a@b"), "https://h:1/x");
         assert_eq!(listed_endpoint("https://h/x?key=secret#t"), "https://h/x");
-        assert_eq!(listed_endpoint("https://u@h#f"), "https://h");
+        assert_eq!(listed_endpoint("https://u@h#f"), "https://h/");
         assert_eq!(listed_endpoint("https://h/x@y"), "https://h/x@y");
-        assert_eq!(listed_endpoint("urn:x?y"), "urn:x");
+        assert_eq!(listed_endpoint("urn:x?y"), UNLISTED_ENDPOINT);
+    }
+
+    /// Fictional credentials in every form of an HTTP URL that the outbound client
+    /// accepts are left out of what a listing shows and the disk tier writes.
+    #[test]
+    fn credentials_never_reach_listings_in_any_accepted_form() {
+        for url in [
+            "http://u5er:s3cret@h/x",
+            "http:/u5er:s3cret@h/x",
+            "http:u5er:s3cret@h/x",
+            "http:///u5er:s3cret@h/x",
+            "HTTP://u5er:s3cret@h/x",
+            "http:\\\\u5er:s3cret@h/x",
+            "https:\\u5er:s3cret@h:8443/x",
+            " http://u5er:s3cret@h/x",
+            "http://u5er:s3cret@h",
+            "https://h/x?token=s3cret",
+            "https://h/x#s3cret",
+            "http://u5er:s3cret@[::1/x",
+            "u5er:s3cret@h/x",
+        ] {
+            let shown = listed_endpoint(url);
+            assert!(
+                !shown.contains("s3cret") && !shown.contains("u5er"),
+                "{url} is listed as {shown}"
+            );
+        }
+        assert_eq!(listed_endpoint("https://h/x@y"), "https://h/x@y");
+    }
+
+    fn set_between_tiers(f: Option<Box<dyn Fn()>>) {
+        BETWEEN_TIERS.with(|h| *h.borrow_mut() = f);
+    }
+
+    /// A lookup that runs while a removal is between its tiers does not keep the entry
+    /// in memory after the removal returns (Neon round-1 P1-2).
+    #[test]
+    fn a_removal_is_not_undone_by_a_lookup_between_its_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Arc::new(ServiceCache::new(1 << 20));
+        c.set_disk(Some(Arc::new(
+            super::super::svcdisk::DiskTier::open(dir.path().join("svc"), 1 << 20).unwrap(),
+        )));
+        let url = "http://e/sparql";
+        for by_scope in [true, false] {
+            let k = key("a", url, "p", &[]);
+            c.put(k.clone(), Parts::of("a", url, "p"), Slice::ALL, rows(3));
+            assert!(c.get(&k, Slice::ALL).is_some());
+            let (reader, rk) = (c.clone(), k.clone());
+            set_between_tiers(Some(Box::new(move || {
+                let _ = reader.get(&rk, Slice::ALL);
+            })));
+            if by_scope {
+                assert_eq!(c.remove_in_scope("a", None).unwrap(), 1);
+            } else {
+                c.remove(&k);
+            }
+            set_between_tiers(None);
+            assert!(
+                c.get(&k, Slice::ALL).is_none(),
+                "by scope {by_scope}: the removed entry came back"
+            );
+            assert!(c.list("a").is_empty(), "by scope {by_scope}");
+        }
+        // a lookup that read the file just before a removal keeps nothing either
+        let k = key("a", url, "q", &[]);
+        c.put(k.clone(), Parts::of("a", url, "q"), Slice::ALL, rows(3));
+        let cold = ServiceCache::new(1 << 20);
+        cold.set_disk(c.disk());
+        let calls = std::cell::Cell::new(0);
+        let r = cold.get_admitted(&k, Slice::ALL, &|_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                assert_eq!(cold.remove_in_scope("a", None).unwrap(), 1);
+            }
+            Ok(())
+        });
+        assert!(r.is_ok());
+        assert!(cold.get(&k, Slice::ALL).is_none(), "kept after its removal");
+    }
+
+    /// The refresh that `cache+clear` makes, a removal of the request's entry and a
+    /// write of the new response, leaves a file of a newer version alone (Sol round-1
+    /// #8), and a removal by scope does too.
+    #[test]
+    fn a_refresh_keeps_a_newer_file() {
+        use super::super::svcdisk::DiskTier;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc");
+        let url = "http://e/sparql";
+        let k = key("a", url, "p", &[]);
+        let c = ServiceCache::new(1 << 20);
+        c.set_disk(Some(Arc::new(
+            DiskTier::open(path.clone(), 1 << 20).unwrap(),
+        )));
+        c.put(k.clone(), Parts::of("a", url, "p"), Slice::ALL, rows(2));
+        let file = std::fs::read_dir(&path)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut newer = std::fs::read(&file).unwrap();
+        newer[8..12].copy_from_slice(&(super::super::svcdisk::VERSION + 1).to_le_bytes());
+        std::fs::write(&file, &newer).unwrap();
+        let c = ServiceCache::new(1 << 20);
+        c.set_disk(Some(Arc::new(
+            DiskTier::open(path.clone(), 1 << 20).unwrap(),
+        )));
+        assert!(c.get(&k, Slice::ALL).is_none());
+        c.remove(&k);
+        c.put(k.clone(), Parts::of("a", url, "p"), Slice::ALL, rows(3));
+        assert_eq!(
+            c.remove_in_scope("a", None).unwrap(),
+            1,
+            "the entry in memory"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            newer,
+            "the newer file is kept"
+        );
     }
 }

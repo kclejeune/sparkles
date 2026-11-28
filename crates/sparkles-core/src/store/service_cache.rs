@@ -82,14 +82,18 @@ impl Store {
     }
 
     /// Replace the dataset's SERVICE cache setting (`None` or the defaults: remove it).
-    /// The setting is checked, and a disk tier it calls for is opened, before a
-    /// persistent store writes `service-cache.json`, so a setting that is refused leaves
-    /// the store and its file as they were. Turning the disk tier off removes its files.
-    /// A store that keeps no SERVICE cache files
+    /// The setting is checked, and a disk tier it calls for where none is in use is
+    /// opened, before a persistent store writes `service-cache.json`, so a setting that
+    /// is refused leaves the store and its file as they were. A new cap for the tier in
+    /// use applies to that tier once the file is written, so no second tier ever indexes
+    /// its directory, and turning the tier off retires it and then removes its files.
+    /// Changes of the setting apply one at a time. A store that keeps no SERVICE cache
+    /// files
     /// ([`StoreOptions::service_cache_files`](super::StoreOptions::service_cache_files))
     /// refuses a setting.
     pub fn set_service_cache_settings(&self, s: Option<ServiceCacheSettings>) -> Result<()> {
         let s = s.unwrap_or_default();
+        let _one_at_a_time = self.results.service.settings_lock();
         let staged = self.stage_service_cache_settings(&s)?;
         if let Some(root) = &self.root {
             if !self.opts.service_cache_files {
@@ -118,6 +122,7 @@ impl Store {
     /// Apply the setting a store reads when it opens. A disk tier that cannot be opened
     /// is left out with a warning, since its entries are a cache.
     pub(super) fn apply_service_cache_settings(&self, s: &ServiceCacheSettings) -> Result<()> {
+        let _one_at_a_time = self.results.service.settings_lock();
         let staged = self.stage_service_cache_settings(s)?;
         let tier = match self.open_service_cache_tier(&staged) {
             Ok(t) => t,
@@ -154,16 +159,15 @@ impl Store {
         Ok(Staged { ttl, disk })
     }
 
-    /// The disk tier `staged` calls for when it is not the one in use, opened.
+    /// The disk tier `staged` calls for, opened when no tier of its directory is in
+    /// use. The tier in use keeps its index and takes a new cap when the setting is
+    /// installed.
     fn open_service_cache_tier(&self, staged: &Staged) -> Result<Option<Arc<DiskTier>>> {
         let Tier::On(dir, cap) = &staged.disk else {
             return Ok(None);
         };
         let cache = &self.results.service;
-        if cache
-            .disk()
-            .is_some_and(|d| d.dir() == dir && d.capacity() == *cap)
-        {
+        if cache.disk().is_some_and(|d| d.dir() == dir) {
             return Ok(None);
         }
         Ok(Some(Arc::new(DiskTier::open(dir.clone(), *cap)?)))
@@ -180,27 +184,43 @@ impl Store {
         cache.set_ttl(staged.ttl);
         match &staged.disk {
             Tier::Untouched => {}
-            Tier::On(..) => {
-                if let Some(t) = tier {
-                    cache.set_disk(Some(t));
+            Tier::On(_, cap) => match tier {
+                Some(t) => cache.set_disk(Some(t)),
+                None => {
+                    if let Some(d) = cache.disk()
+                        && d.capacity() != *cap
+                    {
+                        d.resize(*cap);
+                    }
                 }
-            }
+            },
             Tier::Off(dir) => {
+                // the retired tier writes nothing more, so its directory can go
                 if cache.disk().is_some() {
                     cache.set_disk(None);
                 }
-                match std::fs::remove_dir_all(dir) {
-                    Ok(()) => {
-                        if let Some(root) = &self.root {
-                            sync_dir(root)?;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
+                remove_tier_dir(dir)?;
+                if let Some(root) = &self.root {
+                    sync_dir(root)?;
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Remove the directory of a retired tier. A write of the tier that was under way when
+/// it retired can leave a temporary file as the directory is emptied, which a second
+/// attempt removes.
+fn remove_tier_dir(dir: &Path) -> Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if tries < 2 => tries += 1,
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
@@ -332,7 +352,7 @@ mod tests {
         }
         // clearing the cache empties the tier, and a reset removes the directory
         put(&s, "q");
-        s.result_cache().service.clear();
+        s.result_cache().service.clear().unwrap();
         assert_eq!(s.service_cache_status().unwrap().disk_entries, 0);
         put(&s, "r");
         s.set_service_cache_settings(None).unwrap();
@@ -423,7 +443,7 @@ mod tests {
         assert!(s.result_cache().service.disk().is_none());
         assert!(s.result_cache().service.get(&k, Slice::ALL).is_none());
         put(&s, "q");
-        s.result_cache().service.clear();
+        s.result_cache().service.clear().unwrap();
         assert!(s.set_service_cache_settings(None).is_err());
         assert!(
             s.set_service_cache_settings(Some(ServiceCacheSettings::default()))
@@ -436,5 +456,96 @@ mod tests {
             std::fs::read(root.join(SERVICE_CACHE_FILE)).unwrap(),
             settings
         );
+    }
+    /// A query that holds the tier across a change of its cap writes through the one
+    /// index of the directory, and one that holds it across turning the tier off and on
+    /// again writes nothing. A setting whose file cannot be written evicts nothing.
+    #[test]
+    fn a_held_tier_and_a_failed_write_keep_one_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = Store::open(
+            &root,
+            StoreOptions {
+                service_cache_bytes: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let on = |mb| {
+            Some(ServiceCacheSettings {
+                disk: true,
+                disk_mb: Some(mb),
+                ttl_seconds: None,
+            })
+        };
+        let big = |name: &str| {
+            let k = key("scope", "http://e/sparql", name, &[]);
+            s.result_cache().service.put(
+                k,
+                Parts::of("scope", "http://e/sparql", name),
+                Slice::ALL,
+                Arc::new(Rows {
+                    vars: vec!["x".into()],
+                    rows: vec![vec![Some(
+                        oxrdf::Literal::new_simple_literal("a".repeat(300_000)).into(),
+                    )]],
+                }),
+            );
+        };
+        s.set_service_cache_settings(on(4)).unwrap();
+        let held = s.result_cache().service.disk().unwrap();
+        for i in 0..4 {
+            big(&format!("p{i}"));
+        }
+        let tier = root.join(svcdisk::DIR);
+        let files = || std::fs::read_dir(&tier).unwrap().count();
+        assert_eq!((held.entries(), files()), (4, 4));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let locked = std::fs::write(root.join("probe"), b"").is_err();
+            if locked {
+                assert!(s.set_service_cache_settings(on(1)).is_err());
+                assert_eq!(
+                    (held.entries(), files()),
+                    (4, 4),
+                    "evicted before the write"
+                );
+                assert_eq!(held.capacity(), 4 << 20);
+            }
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_file(root.join("probe"));
+        }
+        // a smaller cap applies to the tier in use, which the query still holds
+        s.set_service_cache_settings(on(1)).unwrap();
+        assert!(Arc::ptr_eq(
+            &held,
+            &s.result_cache().service.disk().unwrap()
+        ));
+        assert_eq!(held.capacity(), 1 << 20);
+        assert!(held.bytes() <= 1 << 20);
+        assert_eq!(held.entries(), files());
+        assert!(files() < 4);
+        put(&s, "after");
+        assert_eq!(held.entries(), files());
+        // off and on again: the held tier is retired and writes nothing
+        s.set_service_cache_settings(None).unwrap();
+        s.set_service_cache_settings(on(4)).unwrap();
+        let fresh = s.result_cache().service.disk().unwrap();
+        assert!(!Arc::ptr_eq(&held, &fresh));
+        let e = crate::sparql::svccache::Entry::new(
+            Arc::from(key("scope", "http://e/sparql", "late", &[]).as_str()),
+            Parts::of("scope", "http://e/sparql", "late"),
+            Slice::ALL,
+            Arc::new(Rows {
+                vars: vec!["x".into()],
+                rows: vec![vec![Some(oxrdf::Literal::from(1).into())]],
+            }),
+            std::time::SystemTime::now(),
+        );
+        held.put(&e);
+        assert_eq!((fresh.entries(), files()), (0, 0), "the retired tier wrote");
     }
 }

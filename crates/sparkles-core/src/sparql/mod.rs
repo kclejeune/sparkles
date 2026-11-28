@@ -1208,6 +1208,7 @@ fn restrict_source_ctx(
         .clone();
     if access.reads_all() {
         ctx.graphs = Some(access.clone());
+        scope_to_view(ctx);
         return ctx.check();
     }
     let mut visible = Buffer::new(&preparation)?;
@@ -1315,6 +1316,7 @@ fn restrict_source_ctx(
         .merge(kept);
     ctx.dataset = dataset;
     ctx.graphs = Some(access.clone());
+    scope_to_view(ctx);
     ctx.check()
 }
 
@@ -1334,7 +1336,21 @@ pub(crate) fn restrict_ctx(
     ds.restrict_checked(&snap, a, &|id| ctx.term_checked(id))?;
     ctx.dataset = ds;
     ctx.graphs = Some(a.clone());
+    scope_to_view(ctx);
     Ok(())
+}
+
+/// Narrow the request's scope in the cache of remote SERVICE results to the graph view
+/// it reads, once its guards are decided against its snapshot. The caller's scope
+/// names the view as configured, and a guard's exemptions follow the data, so two
+/// requests of one caller whose guards let different graphs through never share an
+/// entry, and a listing in the narrower view shows none of the broader one's.
+fn scope_to_view(ctx: &mut Ctx) {
+    if let Some(view) = &ctx.graphs
+        && view.has_guards()
+    {
+        ctx.service_scope = svccache::view_scope(&ctx.service_scope, view).into();
+    }
 }
 
 fn split(

@@ -15,10 +15,13 @@
 //! it ([`QueryOptions::service_cache_mgmt`](super::QueryOptions::service_cache_mgmt)),
 //! which the server does for a caller with `admin` on the dataset when management is
 //! turned on, as Jena's `enableMgmt` context symbol does. Any other query that calls it
-//! by name fails when it is planned. A call through `fn:apply` or `afn:eval`, whose
-//! function the planner cannot see, is an error of the expression and removes nothing,
-//! with the right or without it. Neither function reaches another caller's entries,
-//! since both compare the entry's scope with the caller's as a whole.
+//! by name fails when it is planned, including a call inside an EXISTS pattern that no
+//! row reaches. A call inside a SERVICE to a remote endpoint is the endpoint's and is
+//! not refused. A call through `fn:apply` or `afn:eval`, whose function the planner
+//! cannot see, is an error of the expression and removes nothing, with the right or
+//! without it. Neither function reaches another caller's entries, since both compare the
+//! entry's scope with the caller's as a whole. A removal whose files cannot be synced
+//! fails the query with that error once the expression has run.
 
 use super::ctx::Ctx;
 use super::plan::{Kind, Node, PT, Planner};
@@ -55,23 +58,151 @@ pub(super) fn check_rm(ctx: &Ctx) -> Result<()> {
 
 /// Refuse an expression that calls `se:cacheRm` with the wrong number of arguments, or
 /// in a query without the right to. The planner asks this of every expression it
-/// compiles.
+/// compiles. An EXISTS is compiled before any row reaches it and its pattern is planned
+/// only then, so the calls in its pattern that run here are checked now too.
 pub(super) fn admit(ctx: &Ctx, e: &spargebra::algebra::Expression) -> Result<()> {
     use spargebra::algebra::{Expression, Function};
-    if let Expression::FunctionCall(Function::Custom(n), args) = e
-        && n.as_str() == CACHE_RM
-    {
-        check_rm(ctx)?;
-        if args.len() > 1 {
-            return Err(Error::invalid(
-                "se:cacheRm takes no argument or an entry's id",
-            ));
+    match e {
+        Expression::FunctionCall(Function::Custom(n), args) if n.as_str() == CACHE_RM => {
+            check_rm(ctx)?;
+            if args.len() > 1 {
+                return Err(Error::invalid(
+                    "se:cacheRm takes no argument or an entry's id",
+                ));
+            }
         }
+        Expression::Exists(p) if !ctx.service_cache_mgmt && calls_rm(ctx, p)? => check_rm(ctx)?,
+        _ => {}
     }
     Ok(())
 }
 
-/// `se:cacheRm()` with `id` `None`, `se:cacheRm(id)` otherwise: the entries removed.
+/// Whether `root` calls `se:cacheRm` by name where this query runs it: anywhere but
+/// inside a SERVICE that the planner sends elsewhere, which is every SERVICE but one
+/// over the dataset itself. A remote endpoint answers its pattern as it likes, and one
+/// of the process's own endpoints plans it as a query of its own without the right to
+/// remove. The walk keeps its own stack, so a deep pattern does not exhaust the thread's.
+fn calls_rm(ctx: &Ctx, root: &spargebra::algebra::GraphPattern) -> Result<bool> {
+    use spargebra::algebra::{
+        AggregateExpression as A, Expression as E, Function, GraphPattern as GP,
+        OrderExpression as O,
+    };
+    enum Item<'a> {
+        P(&'a GP),
+        E(&'a E),
+    }
+    fn order(o: &O) -> &E {
+        match o {
+            O::Asc(e) | O::Desc(e) => e,
+        }
+    }
+    let mut stack = vec![Item::P(root)];
+    while let Some(item) = stack.pop() {
+        ctx.check()?;
+        match item {
+            Item::P(gp) => match gp {
+                GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => {}
+                GP::Extend {
+                    inner, expression, ..
+                }
+                | GP::Assign {
+                    inner, expression, ..
+                }
+                | GP::Unfold {
+                    inner, expression, ..
+                } => stack.extend([Item::P(inner), Item::E(expression)]),
+                GP::Join { left, right }
+                | GP::Lateral { left, right }
+                | GP::Union { left, right }
+                | GP::Minus { left, right }
+                | GP::SemiJoin { left, right }
+                | GP::AntiJoin { left, right } => stack.extend([Item::P(left), Item::P(right)]),
+                GP::LeftJoin {
+                    left,
+                    right,
+                    expression,
+                } => {
+                    stack.extend([Item::P(left), Item::P(right)]);
+                    stack.extend(expression.iter().map(Item::E));
+                }
+                GP::Filter { inner, expr } => stack.extend([Item::P(inner), Item::E(expr)]),
+                GP::OrderBy { inner, expression } => {
+                    stack.push(Item::P(inner));
+                    stack.extend(expression.iter().map(|o| Item::E(order(o))));
+                }
+                GP::Group {
+                    inner, aggregates, ..
+                } => {
+                    stack.push(Item::P(inner));
+                    for (_, a) in aggregates {
+                        match a {
+                            A::CountSolutions { .. } => {}
+                            A::FunctionCall { expr, .. } => stack.push(Item::E(expr)),
+                            A::Fold {
+                                expr,
+                                value,
+                                order: o,
+                                ..
+                            } => {
+                                stack.push(Item::E(expr));
+                                stack.extend(value.iter().map(Item::E));
+                                stack.extend(o.iter().map(|o| Item::E(order(o))));
+                            }
+                        }
+                    }
+                }
+                GP::Service {
+                    name,
+                    inner,
+                    silent,
+                } => {
+                    if matches!(
+                        super::enhancer::effective(name, inner, *silent),
+                        Ok(Some(e)) if e.target == super::enhancer::Target::SelfDataset
+                    ) {
+                        stack.push(Item::P(inner));
+                    }
+                }
+                GP::Graph { inner, .. }
+                | GP::Project { inner, .. }
+                | GP::Distinct { inner }
+                | GP::Reduced { inner }
+                | GP::Slice { inner, .. } => stack.push(Item::P(inner)),
+            },
+            Item::E(e) => match e {
+                E::FunctionCall(Function::Custom(n), _) if n.as_str() == CACHE_RM => {
+                    return Ok(true);
+                }
+                E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => {}
+                E::Or(a, b)
+                | E::And(a, b)
+                | E::Equal(a, b)
+                | E::SameTerm(a, b)
+                | E::Greater(a, b)
+                | E::GreaterOrEqual(a, b)
+                | E::Less(a, b)
+                | E::LessOrEqual(a, b)
+                | E::Add(a, b)
+                | E::Subtract(a, b)
+                | E::Multiply(a, b)
+                | E::Divide(a, b) => stack.extend([Item::E(a), Item::E(b)]),
+                E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => stack.push(Item::E(a)),
+                E::In(a, l) => {
+                    stack.push(Item::E(a));
+                    stack.extend(l.iter().map(Item::E));
+                }
+                E::If(a, b, c) => stack.extend([Item::E(a), Item::E(b), Item::E(c)]),
+                E::Coalesce(l) | E::FunctionCall(_, l) => stack.extend(l.iter().map(Item::E)),
+                E::Exists(p) => stack.push(Item::P(p)),
+            },
+        }
+    }
+    Ok(false)
+}
+
+/// `se:cacheRm()` with `id` `None`, `se:cacheRm(id)` otherwise: the entries removed. A
+/// removal whose files cannot be synced records that failure, which the query's next
+/// check returns.
 pub(super) fn cache_rm(ctx: &Ctx, id: Option<i64>) -> u64 {
     let id = match id {
         Some(i) => match u64::try_from(i) {
@@ -80,10 +211,18 @@ pub(super) fn cache_rm(ctx: &Ctx, id: Option<i64>) -> u64 {
         },
         None => None,
     };
-    ctx.snap
+    match ctx
+        .snap
         .results
         .service
         .remove_in_scope(&ctx.service_scope, id)
+    {
+        Ok(n) => n,
+        Err(e) => {
+            ctx.fail_side_effect(&e);
+            0
+        }
+    }
 }
 
 /// The leaf of one `se:cacheLs` call: a table of the caller's entries, as the call's
@@ -121,8 +260,10 @@ pub(super) fn cache_ls_leaf(
         let n = i64::try_from(n).unwrap_or(i64::MAX);
         ctx.intern_term(&Term::Literal(Literal::from(n)))
     };
-    // the listing and the table are admitted as they grow
+    // the listing, the terms it interns and the table are admitted as they grow, and
+    // what the leaf keeps, its terms and its table, stays charged with the plan
     let charge = ctx.charge(0)?;
+    let mut kept = 0u64;
     let listed = ctx
         .snap
         .results
@@ -132,6 +273,9 @@ pub(super) fn cache_ls_leaf(
     let mut t = Table::new(vars.clone());
     let mut row = vec![Id::UNDEF; vars.len()];
     for l in listed {
+        let interned = (l.endpoint.len() + l.pattern.len() + l.binding.len()) as u64 + 3 * 64;
+        charge.add(interned)?;
+        kept = kept.saturating_add(interned);
         let endpoint = match NamedNode::new(l.endpoint.clone()) {
             Ok(n) => Term::NamedNode(n),
             Err(_) => Term::Literal(Literal::new_simple_literal(l.endpoint.clone())),
@@ -162,9 +306,12 @@ pub(super) fn cache_ls_leaf(
         if ok {
             ctx.check()?;
             charge.add(row_bytes)?;
+            kept = kept.saturating_add(row_bytes);
             t.push_row(&row);
         }
     }
+    charge.resize(kept)?;
+    p.retain_plan_scratch(Some(charge))?;
     let est = t.len() as f64;
     let desc = format!("{LS_DESC} {} entries of the caller", t.len());
     Ok(Node::leaf(Kind::Values(t), vars, est, desc))

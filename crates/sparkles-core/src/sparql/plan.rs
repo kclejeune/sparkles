@@ -2506,6 +2506,7 @@ impl<'a> Planner<'a> {
                     | super::textpf::TEXT_QUERY
                     | crate::vector::VECTOR_SEARCH
                     | super::hybrid::HYBRID_SEARCH
+                    | super::svcfn::CACHE_LS
                     | super::georewrite::SPATIAL_EQUALS
             ) || crate::geo::SpatialPfKind::from_iri(iri).is_some()
                 || rewrite && crate::geo::Relation::from_property(iri).is_some()

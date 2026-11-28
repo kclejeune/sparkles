@@ -120,6 +120,9 @@ enum Source {
         answer: Box<RemoteAnswer>,
         /// the copy of the answer read so far, for the cache once it has all of it
         tee: Option<Tee>,
+        /// what the answer gave after the solutions a LIMIT asks for, read ahead to
+        /// learn whether the response ended cleanly there: `Some(None)` for its end
+        peeked: Option<Option<Result<sparesults::QuerySolution>>>,
     },
     Local {
         /// Declared before `hold`, so that the call ends before its hold is released.
@@ -419,6 +422,7 @@ impl Service {
         self.source = Some(Source::Remote {
             answer: Box::new(answer),
             tee,
+            peeked: None,
         });
         Ok(())
     }
@@ -550,16 +554,28 @@ impl Service {
                 b.table.push_row(&row);
             };
         let ended = match self.source.as_mut().expect("an open answer") {
-            Source::Remote { answer, tee } => {
+            Source::Remote {
+                answer,
+                tee,
+                peeked,
+            } => {
                 let _entered = answer.span.clone().entered();
                 loop {
                     if b.table.len >= cap {
                         break false;
                     }
                     ctx.check()?;
-                    let Some(solution) = answer.next_solution() else {
+                    let next = match peeked.take() {
+                        Some(next) => next,
+                        None => answer.next_solution(),
+                    };
+                    let Some(solution) = next else {
                         ctx.check()?;
-                        if let Some(tee) = tee.take() {
+                        // a response with more solutions than its LIMIT is not the
+                        // answer the request asked for
+                        if let Some(tee) = tee.take()
+                            && tee.slice.limit.is_none_or(|l| tee.rows.rows.len() <= l)
+                        {
                             ctx.snap.results.service.put(
                                 tee.key,
                                 tee.parts,
@@ -582,18 +598,34 @@ impl Service {
                     if let Some(copy) = tee.take() {
                         *tee = copy.push(&solution)?;
                     }
-                    // a response to a request with a LIMIT holds no more solutions than
+                    // A response to a request with a LIMIT holds no more solutions than
                     // it, so the copy is whole once it has them, even when the query
-                    // reads no further
-                    if tee
-                        .as_ref()
-                        .is_some_and(|t| t.slice.limit == Some(t.rows.rows.len()))
-                        && let Some(t) = tee.take()
+                    // reads no further. The answer is read once more first: the copy is
+                    // kept only if the response ends there, and a row past the limit or
+                    // a failure, which the next read meets as it would have, drops it.
+                    // A SILENT call reads its whole answer before any row, and keeps its
+                    // copy at the end, once the response is known to have succeeded.
+                    if silent_prior.is_none()
+                        && tee
+                            .as_ref()
+                            .is_some_and(|t| t.slice.limit == Some(t.rows.rows.len()))
                     {
-                        ctx.snap
-                            .results
-                            .service
-                            .put(t.key, t.parts, t.slice, Arc::new(t.rows));
+                        ctx.check()?;
+                        let after = answer.next_solution();
+                        if after.is_none() {
+                            ctx.check()?;
+                            if let Some(t) = tee.take() {
+                                ctx.snap.results.service.put(
+                                    t.key,
+                                    t.parts,
+                                    t.slice,
+                                    Arc::new(t.rows),
+                                );
+                            }
+                        } else {
+                            *tee = None;
+                        }
+                        *peeked = Some(after);
                     }
                     push(&mut b, bnodes, &ServiceSolution::Remote(&solution));
                     ctx.check()?;
@@ -806,6 +838,7 @@ mod tests {
             Source::Remote {
                 answer: Box::new(answer),
                 tee: None,
+                peeked: None,
             },
         );
         let err = svc.fill(&ctx, 10, None).err();
@@ -862,6 +895,7 @@ mod tests {
             Source::Remote {
                 answer: Box::new(answer),
                 tee: Some(tee),
+                peeked: None,
             },
         );
         let err = svc.fill(&ctx, 4, None).err();
@@ -1049,5 +1083,76 @@ mod tests {
         assert!(svc.done());
         drop(hold);
         assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
+    }
+
+    /// The streamed answer to a request with a LIMIT is cached only once the response
+    /// is known to end at the limit: a response that fails after the rows it was asked
+    /// for, or sends more of them, leaves the cache as it was, with SILENT or without.
+    #[test]
+    fn a_limited_answer_is_cached_only_when_it_ends_at_the_limit() {
+        use crate::sparql::svccache::{Parts, Slice};
+        let head = br#"{"head":{"vars":["s"]},"results":{"bindings":["#.to_vec();
+        let row = |v: &str| format!(r#"{{"s":{{"type":"literal","value":"{v}"}}}}"#);
+        for (tail, cached) in [
+            (format!("{},{}]}}}}", row("a"), row("b")), true),
+            (
+                format!("{},{},{}]}}}}", row("a"), row("b"), row("c")),
+                false,
+            ),
+            (format!("{},{},{{\"s\":", row("a"), row("b")), false),
+        ] {
+            for silent in [None, Some(0)] {
+                let ctx = ctx(1 << 20);
+                let var = ctx.var("s");
+                let mut chunks = std::collections::VecDeque::new();
+                chunks.push_back(head.clone());
+                chunks.push_back(tail.clone().into_bytes());
+                let reader = ChunkedReader {
+                    chunks,
+                    armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    cancel_on_first_armed_read: None,
+                    triggered: false,
+                    reads_after_first_armed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                };
+                let answer = RemoteAnswer::from_reader(
+                    Box::new(reader),
+                    sparesults::QueryResultsFormat::Json,
+                    "http://test.invalid/sparql",
+                )
+                .unwrap();
+                let key = "limited".to_string();
+                let slice = Slice::ALL.limited(2);
+                let tee = Tee::new(
+                    &ctx,
+                    key.clone(),
+                    ctx.snap.results.service.max_entry_bytes(),
+                )
+                .unwrap()
+                .of(Parts::default(), slice);
+                let mut svc = test_service(
+                    &ctx,
+                    var,
+                    Source::Remote {
+                        answer: Box::new(answer),
+                        tee: Some(tee),
+                        peeked: None,
+                    },
+                );
+                // the query reads the two rows it asked for, and no further
+                let first = svc.fill(&ctx, 2, silent);
+                if silent.is_some() {
+                    // a SILENT drain reads on to the end
+                    let mut r = first.map(|_| ());
+                    while r.is_ok() && svc.source.is_some() {
+                        r = svc.fill(&ctx, 2, silent).map(|_| ());
+                    }
+                }
+                assert_eq!(
+                    ctx.snap.results.service.get(&key, slice).is_some(),
+                    cached,
+                    "{tail} silent {silent:?}"
+                );
+            }
+        }
     }
 }

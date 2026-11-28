@@ -103,8 +103,9 @@ static RESULT_CACHE_UIDS: AtomicU64 = AtomicU64::new(1);
 pub struct ResultCache {
     /// process-unique identity of this result cache view
     uid: u64,
-    /// the cache of remote SERVICE results, cleared with this one
-    pub service: super::svccache::ServiceCache,
+    /// the cache of remote SERVICE results, cleared with this one, which the view of a
+    /// transaction's uncommitted data shares with the store
+    pub service: Arc<super::svccache::ServiceCache>,
     store: Arc<ResultStore>,
     ns: u32,
     /// whether other views share the storage
@@ -126,7 +127,11 @@ impl ResultCache {
         let store = Arc::new(ResultStore::new(bytes, service_bytes));
         ResultCache {
             uid: RESULT_CACHE_UIDS.fetch_add(1, Ordering::Relaxed),
-            service: super::svccache::ServiceCache::view(store.service().clone(), 0, false),
+            service: Arc::new(super::svccache::ServiceCache::view(
+                store.service().clone(),
+                0,
+                false,
+            )),
             store,
             ns: 0,
             shared: false,
@@ -136,11 +141,22 @@ impl ResultCache {
         }
     }
 
+    /// A cache that keeps no query results and shares `of`'s cache of remote SERVICE
+    /// results, for a view of a transaction's uncommitted data. Its local results differ
+    /// from those of the commit it starts from, so none are read or kept, while an
+    /// endpoint's answer, which a caller's scope keys, is the same, and the service
+    /// enhancer's functions in an update see the caller's entries.
+    pub(crate) fn sharing_service(of: &ResultCache) -> ResultCache {
+        let mut c = ResultCache::new(0, 0.0);
+        c.service = of.service.clone();
+        c
+    }
+
     /// A view of `store` for namespace `ns`.
     pub fn attach(store: &Arc<ResultStore>, ns: u32, min_ms: f64) -> ResultCache {
         ResultCache {
             uid: RESULT_CACHE_UIDS.fetch_add(1, Ordering::Relaxed),
-            service: super::svccache::ServiceCache::attach(store.service(), ns),
+            service: Arc::new(super::svccache::ServiceCache::attach(store.service(), ns)),
             store: store.clone(),
             ns,
             shared: true,
@@ -728,8 +744,9 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             // and generated names are local to it
             let _ = write!(
                 s,
-                "{}|{}|{:?}|{:?}|{:?}|{:?}",
+                "{}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
                 l.pattern,
+                l.optional,
                 l.unscoped,
                 match &l.graph {
                     super::plan::ActiveGraph::Var(v) => format!("?{}", ctx.var_name(*v)),
@@ -745,8 +762,14 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
                     .map(|v| ctx.var_name(*v))
                     .collect::<Vec<_>>(),
             );
-            // a remote loop's results are the endpoint's
-            l.service.is_none() && super::exists::pure_pattern(&l.pattern)
+            // a remote loop's results are the endpoint's, and the right side and the
+            // condition of an OPTIONAL one are compiled only as rows reach them
+            l.service.is_none()
+                && super::exists::pure_pattern(&l.pattern)
+                && l.optional
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .is_none_or(super::exists::pure)
         }
         Kind::RegisteredProperty(_) => false,
         Kind::PropertyFn(spec) => {

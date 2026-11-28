@@ -12829,17 +12829,20 @@ fn service(
             store.remove(&key);
             None
         };
+        // what a lookup decoded or copied, and the rows a request fetched, stay charged
+        // until the table of them is made
+        let fetched = ctx.charge(0)?;
         let rows = match hit {
             Some(rows) => {
                 drop(key);
-                drop(key_credit);
                 rows
             }
             None => {
-                let rows = std::sync::Arc::new(super::enhancer::fetch_rows(ctx, &url, query)?);
+                let rows = std::sync::Arc::new(super::enhancer::fetch_rows_charged(
+                    ctx, &url, query, &fetched,
+                )?);
                 let parts = super::svccache::Parts::of(&ctx.service_scope, url.as_str(), text);
                 store.put(key, parts, slice, rows.clone());
-                drop(key_credit);
                 rows
             }
         };
@@ -12863,6 +12866,7 @@ fn service(
             ctx.check()?;
             t.push_row(&row);
         }
+        drop((key_credit, fetched));
         return Ok(t);
     }
     let mut t = Table::new(vars.to_vec());

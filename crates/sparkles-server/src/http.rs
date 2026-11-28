@@ -5012,7 +5012,7 @@ async fn clear_cache(State(st): St, Path(name): Path<String>) -> ApiResult<Json<
     let (entries, bytes) = (c.entries(), c.bytes());
     let (s_entries, s_bytes) = (c.service.entries(), c.service.bytes());
     c.clear();
-    c.service.clear();
+    c.service.clear().map_err(Error::from)?;
     Ok(Json(json!({
         "cleared": entries,
         "bytes": bytes,

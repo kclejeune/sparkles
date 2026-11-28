@@ -1086,6 +1086,18 @@ PREFIX ja:     <http://jena.hpl.hp.com/2005/11/Assembler#>
         "{}",
         p.report.text()
     );
+    // a dataset's false under the server's true would not hold
+    let p = plan_of("true", "false");
+    assert!(
+        has(&p, Kind::Unsupported, "would allow it"),
+        "{}",
+        p.report.text()
+    );
+    assert!(
+        !has(&p, Kind::Converted, "the default"),
+        "{}",
+        p.report.text()
+    );
     let p = plan_of("sometimes", "");
     assert!(
         has(&p, Kind::Unsupported, "not true or false"),

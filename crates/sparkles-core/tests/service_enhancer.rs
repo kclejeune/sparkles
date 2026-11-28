@@ -349,7 +349,7 @@ fn bulk_requests_cut_short_are_sent_again_per_input() {
             ("ASC", 10, 10),
         ] {
             data.result_cache().clear();
-            data.result_cache().service.clear();
+            data.result_cache().service.clear().unwrap();
             ep.limit.store(limit, Ordering::SeqCst);
             let q = format!(
                 "SELECT * {{ {{ SELECT ?d {{ ?d a <urn:Department> }} ORDER BY {dir}(?d) }} \
@@ -423,7 +423,7 @@ fn cache_per_input_and_per_caller() {
     assert!(ep.take().is_empty());
     let svc = &data.result_cache().service;
     assert!(svc.entries() > 0 && svc.bytes() > 0 && svc.hits() > 0);
-    data.result_cache().service.clear();
+    data.result_cache().service.clear().unwrap();
     assert_eq!(rows(&data, &q(three, "cache")), first);
     assert_eq!(ep.take().len(), 1);
     // without loop, the whole result is one entry
@@ -526,7 +526,7 @@ fn measure_bulk_and_cache() {
         let mut reqs = 0;
         for _ in 0..3 {
             if clear {
-                local.result_cache().service.clear();
+                local.result_cache().service.clear().unwrap();
             }
             ep.take();
             let t = Instant::now();
@@ -936,7 +936,7 @@ fn slices_are_answered_from_the_entries_that_hold_them() {
     let all = rows(&data, &q(""));
     assert_eq!(all.len(), 9);
     ep.take();
-    data.result_cache().service.clear();
+    data.result_cache().service.clear().unwrap();
     let first5 = rows(&data, &q("LIMIT 5"));
     assert_eq!(first5.len(), 5);
     let sent = ep.take();
@@ -996,7 +996,7 @@ fn a_short_response_is_not_the_end_of_the_result() {
     };
     ep.limit.store(4, Ordering::SeqCst);
     for first in ["LIMIT 20", ""] {
-        data.result_cache().service.clear();
+        data.result_cache().service.clear().unwrap();
         assert_eq!(rows(&data, &q("cache:", first)).len(), 4, "{first}: capped");
         ep.take();
         for later in ["OFFSET 4 LIMIT 3", "OFFSET 6", "OFFSET 2 LIMIT 4"] {
@@ -1040,7 +1040,7 @@ fn a_pushed_limit_bounds_the_entry() {
         }
     };
     for mode in [ExecutionMode::Eager, ExecutionMode::Streaming] {
-        data.result_cache().service.clear();
+        data.result_cache().service.clear().unwrap();
         let q = |k: usize| {
             format!(
                 "SELECT ?p ?n {{ SERVICE <cache:{url}> {{ ?d <urn:hasEmployee> ?p }} BIND(STR(?p) AS ?n) }} LIMIT {k}"
@@ -1290,13 +1290,15 @@ fn parallel_requests_share_the_outbound_time() {
     }
 }
 
-/// A query cancelled while a wave is in flight sends no later wave. The requests in
-/// flight end when their responses arrive (roadmap item 1341), so the query waits for
-/// one wave and not for the three it would send.
+/// A query cancelled while a wave is in flight sends no later wave. The test cancels
+/// once the endpoint holds the first wave's requests, so the wave is known to have
+/// started, and the requests in flight end when their responses arrive (roadmap item
+/// 1341). The query then waits for one wave and not for the three it would send.
 #[test]
 fn parallel_requests_stop_when_cancelled() {
     let data = store(&departments(12));
-    let ep = Endpoint::start(data.clone(), Duration::from_secs(2));
+    let delay = Duration::from_millis(800);
+    let ep = Endpoint::start(data.clone(), delay);
     let q = format!(
         "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:parallel+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
         ep.url()
@@ -1304,19 +1306,24 @@ fn parallel_requests_stop_when_cancelled() {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut o = opts();
     o.cancel = Some(cancel.clone());
-    let flag = cancel.clone();
+    let (flag, seen) = (cancel.clone(), ep.queries.clone());
     let t = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
+        // the rendezvous: the first wave's requests have reached the endpoint
+        let started = Instant::now();
+        while seen.lock().unwrap().is_empty() && started.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         flag.store(true, Ordering::SeqCst);
     });
     let started = Instant::now();
     let r = run(&data, &q, &o);
     t.join().unwrap();
     assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
-    let took = started.elapsed();
-    assert!(took < Duration::from_millis(3500), "{took:?}");
     let sent = ep.take().len();
-    assert!(sent <= 4, "{sent} requests were sent");
+    assert!((1..=4).contains(&sent), "{sent} requests were sent");
+    // one wave, with ample room for a loaded worker, against the three it would send
+    let took = started.elapsed();
+    assert!(took < delay * 3, "{took:?}");
 }
 
 /// `se:cacheRm` called through `fn:apply` or `afn:eval` removes nothing, with the right
@@ -1468,4 +1475,207 @@ fn a_disk_cache_outlives_the_store() {
     assert_eq!(rows(&local, &q), first);
     assert!(ep.take().is_empty(), "the entries were not read from disk");
     assert_eq!(local.result_cache().service.entries(), 2);
+}
+
+/// A store whose query result cache keeps every result, however fast, over Jena's
+/// departments.
+fn caching_store(n: usize) -> Arc<Store> {
+    let data = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    data.load(&[Source::from_bytes(
+        departments(n).into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    Arc::new(data)
+}
+
+/// `se:cacheLs` and `se:cacheRm` inside a correlated LATERAL or a loop over the dataset
+/// itself are never answered by the query result cache: another caller sees its own
+/// listing, and each removal removes (Sol and Neon round-1 P1).
+#[test]
+fn correlated_listings_and_removals_skip_the_result_cache() {
+    let data = caching_store(9);
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let cached = |ds: &[&str]| {
+        let vs: Vec<String> = ds.iter().map(|d| format!("<urn:{d}>")).collect();
+        format!(
+            "SELECT ?p {{ VALUES ?d {{ {} }} SERVICE <loop:cache:{url}> {{ ?d <urn:hasEmployee> ?p }} }}",
+            vs.join(" ")
+        )
+    };
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let caching = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    run(&data, &cached(&["dept1", "dept2"]), &caching).unwrap();
+    let mut bob = caching.clone();
+    bob.service_scope = Some("bob".into());
+    let count = format!("{se} SELECT (COUNT(?id) AS ?n) {{ ?id se:cacheLs () }}");
+    for ls in [
+        format!(
+            "{se} SELECT (COUNT(?id) AS ?n) {{ VALUES ?x {{ 1 }} LATERAL {{ ?id se:cacheLs () FILTER(?x = 1) }} }}"
+        ),
+        format!(
+            "{se} SELECT (COUNT(?id) AS ?n) {{ VALUES ?x {{ 1 }} SERVICE <loop:> {{ ?id se:cacheLs () FILTER(?x = 1) }} }}"
+        ),
+    ] {
+        assert_eq!(run(&data, &ls, &caching).unwrap(), vec!["2"], "{ls}");
+        assert_eq!(
+            run(&data, &ls, &bob).unwrap(),
+            vec!["0"],
+            "{ls}: another caller's listing"
+        );
+    }
+    let mut admin = caching.clone();
+    admin.service_cache_mgmt = true;
+    for rm in [
+        format!(
+            "{se} SELECT ?n {{ VALUES ?x {{ 1 }} LATERAL {{ BIND(se:cacheRm() + ?x - ?x AS ?n) }} }}"
+        ),
+        format!(
+            "{se} SELECT ?n {{ VALUES ?x {{ 1 }} SERVICE <loop:> {{ BIND(se:cacheRm() + ?x - ?x AS ?n) }} }}"
+        ),
+    ] {
+        run(&data, &cached(&["dept1", "dept2"]), &caching).unwrap();
+        assert_eq!(run(&data, &rm, &admin).unwrap(), vec!["2"], "{rm}");
+        run(&data, &cached(&["dept3"]), &caching).unwrap();
+        assert_eq!(
+            run(&data, &rm, &admin).unwrap(),
+            vec!["1"],
+            "{rm}: a removal answered from the result cache"
+        );
+        assert_eq!(run(&data, &count, &caching).unwrap(), vec!["0"], "{rm}");
+        assert!(
+            matches!(run(&data, &rm, &caching), Err(Error::NotPermitted(_))),
+            "{rm}: removal without the right"
+        );
+    }
+}
+
+/// A wave of `parallel+n` whose share of the outbound time rounds to nothing fails the
+/// query under SILENT too, as one request out of time does (Neon round-1 P1-3).
+#[test]
+fn parallel_requests_out_of_time_fail_with_silent() {
+    let data = store(&departments(6));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let mut o = opts();
+    o.outbound.request_timeout = Duration::from_nanos(2);
+    for p in ["parallel+3:", "parallel+4:bulk+2:"] {
+        let q = format!(
+            "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE SILENT <loop:{p}{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+            ep.url()
+        );
+        let r = run(&data, &q, &o);
+        assert!(r.is_err(), "{p}: {r:?}");
+    }
+    ep.take();
+}
+
+/// `se:cacheRm` in the WHERE clause of an update removes the caller's entries when the
+/// update's options grant it, and is refused otherwise (Neon round-1 P2-1).
+#[test]
+fn an_update_removes_with_the_right() {
+    let data = store(&departments(4));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let cached = format!(
+        "SELECT ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    rows(&data, &cached);
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let count = format!("{se} SELECT (COUNT(?id) AS ?n) {{ ?id se:cacheLs () }}");
+    assert_eq!(rows(&data, &count), vec!["2"]);
+    let u =
+        format!("{se} INSERT {{ <urn:removed> <urn:n> ?n }} WHERE {{ BIND(se:cacheRm() AS ?n) }}");
+    let r = sparkles_core::sparql::update::update(&data, &u, &opts());
+    assert!(matches!(r, Err(Error::NotPermitted(_))), "{r:?}");
+    assert_eq!(rows(&data, &count), vec!["2"]);
+    let admin = QueryOptions {
+        service_cache_mgmt: true,
+        ..opts()
+    };
+    sparkles_core::sparql::update::update(&data, &u, &admin).unwrap();
+    assert_eq!(rows(&data, &count), vec!["0"]);
+    assert_eq!(
+        rows(&data, "SELECT ?n { <urn:removed> <urn:n> ?n }"),
+        vec!["2"]
+    );
+}
+
+/// A removal refused for want of the right inside an EXISTS that no row reaches still
+/// fails the query when it is planned (Sol round-1 #9). A call inside a SERVICE to a
+/// remote endpoint is the endpoint's and is not refused here.
+#[test]
+fn a_removal_inside_exists_is_refused_at_planning() {
+    let data = store(&departments(2));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    for q in [
+        format!("{se} SELECT * {{ FILTER(false && EXISTS {{ BIND(se:cacheRm() AS ?n) }}) }}"),
+        format!(
+            "{se} SELECT * {{ ?d a <urn:Department> FILTER NOT EXISTS {{ FILTER EXISTS {{ BIND(se:cacheRm() AS ?n) }} }} }}"
+        ),
+        format!(
+            "{se} SELECT * {{ ?d a <urn:Department> FILTER EXISTS {{ SERVICE <loop:> {{ BIND(se:cacheRm() AS ?n) }} }} }}"
+        ),
+    ] {
+        let r = run(&data, &q, &opts());
+        assert!(matches!(r, Err(Error::NotPermitted(_))), "{q}: {r:?}");
+    }
+    // sent to the endpoint, which refuses it as an unknown function or answers it
+    let remote = format!(
+        "{se} SELECT * {{ ?d a <urn:Department> FILTER EXISTS {{ SERVICE SILENT <{}> {{ BIND(se:cacheRm() AS ?n) }} }} }}",
+        ep.url()
+    );
+    let r = run(&data, &remote, &opts());
+    assert!(!matches!(r, Err(Error::NotPermitted(_))), "{r:?}");
+}
+
+/// A guard whose exemptions change with the data gives the same caller a scope of its
+/// own for each set of graphs it lets through, so a listing in one view shows none of
+/// the entries cached in another (Sol round-1 #13).
+#[test]
+fn a_guarded_view_scopes_its_entries_by_its_exemptions() {
+    use sparkles_core::access::{Decider, GraphAccess, Graphs, GuardDecision};
+    use sparkles_core::store::Snapshot;
+    struct Flip(Arc<AtomicBool>);
+    impl GuardDecision for Flip {
+        fn exempt(&self, _snap: &Arc<Snapshot>) -> Vec<String> {
+            if self.0.load(Ordering::SeqCst) {
+                vec!["urn:g1".into()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+    let data = store(&departments(4));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let wide = Arc::new(AtomicBool::new(true));
+    let view = Graphs::All.guarded_by("urn:g*", Decider(Arc::new(Flip(wide.clone()))));
+    let o = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(view.clone(), view))),
+        ..opts()
+    };
+    let cached = format!(
+        "SELECT ?p {{ VALUES ?d {{ <urn:dept1> }} SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let count = format!("{se} SELECT (COUNT(?id) AS ?n) {{ ?id se:cacheLs () }}");
+    run(&data, &cached, &o).unwrap();
+    assert_eq!(run(&data, &count, &o).unwrap(), vec!["1"]);
+    wide.store(false, Ordering::SeqCst);
+    assert_eq!(
+        run(&data, &count, &o).unwrap(),
+        vec!["0"],
+        "the narrower view lists the broader one's entry"
+    );
+    wide.store(true, Ordering::SeqCst);
+    assert_eq!(run(&data, &count, &o).unwrap(), vec!["1"]);
 }
