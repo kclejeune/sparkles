@@ -97,6 +97,7 @@ impl StoredTool {
             Kind::Ask => "ASK",
             Kind::Construct => "CONSTRUCT",
             Kind::Describe => "DESCRIBE",
+            Kind::Update => "UPDATE",
         };
         let base = self
             .stored

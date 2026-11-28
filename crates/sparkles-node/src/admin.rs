@@ -865,23 +865,35 @@ fn run_admin(
                 },
                 ..Default::default()
             };
-            let saved = ds
-                .queries()
-                .put(text(a, "name")?, decode(&a["definition"])?, change)?;
+            let viewer = a["viewer"].as_str();
+            let is_admin = a["isAdmin"].as_bool().unwrap_or(true);
+            let saved = ds.queries().put(
+                text(a, "name")?,
+                decode(&a["definition"])?,
+                change,
+                viewer,
+                is_admin,
+            )?;
             json!({
                 "stored": value(saved.stored)?,
                 "created": saved.created,
                 "changed": saved.changed,
             })
         }
-        "queries.delete" => value(ds.queries().delete(
-            text(a, "name")?,
-            if a["ifVersion"].is_null() {
-                None
-            } else {
-                Some(number(a, "ifVersion")?)
-            },
-        )?)?,
+        "queries.delete" => {
+            let viewer = a["viewer"].as_str();
+            let is_admin = a["isAdmin"].as_bool().unwrap_or(true);
+            value(ds.queries().delete(
+                text(a, "name")?,
+                if a["ifVersion"].is_null() {
+                    None
+                } else {
+                    Some(number(a, "ifVersion")?)
+                },
+                viewer,
+                is_admin,
+            )?)?
+        }
         "branches.list" => value(ds.branches()?)?,
         "branches.get" => value(ds.branch_info(text(a, "name")?)?)?,
         "branches.create" => value(ds.create_branch(

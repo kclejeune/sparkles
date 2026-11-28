@@ -216,7 +216,9 @@ pub(super) async fn put_query(
             dataset_commit: Some(ds.store.snapshot().commit),
             if_version,
         };
-        let saved = ds.dataset.queries().put(&name, def, change)?;
+        let viewer = (!p.name.is_empty()).then(|| p.name.as_ref());
+        let is_admin = p.can(&ds.name, crate::auth::Level::Admin);
+        let saved = ds.dataset.queries().put(&name, def, change, viewer, is_admin)?;
         let status = if saved.created {
             StatusCode::CREATED
         } else {
@@ -236,16 +238,28 @@ pub(super) async fn put_query(
 pub(super) async fn delete_query(
     st: St,
     Path((ds_name, name)): Path<(String, String)>,
+    Extension(p): Extension<Principal>,
     headers: HeaderMap,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = dataset(&st, &ds_name)?;
-    let exists = ds.dataset.queries().get(&name, None).is_some();
+    let viewer = (!p.name.is_empty()).then(|| p.name.as_ref());
+    let is_admin = p.can(&ds.name, crate::auth::Level::Admin);
+    let exists = ds
+        .dataset
+        .queries()
+        .get_visible(&name, None, viewer, is_admin)
+        .is_some();
     let if_version = precondition(&headers, exists)?.filter(|v| *v > 0);
     blocking(move || {
-        if ds.dataset.queries().delete(&name, if_version)? {
+        let viewer = (!p.name.is_empty()).then(|| p.name.as_ref());
+        if ds
+            .dataset
+            .queries()
+            .delete(&name, if_version, viewer, is_admin)?
+        {
             Ok(StatusCode::NO_CONTENT.into_response())
         } else {
             Err(not_found(&ds.name, &name))
@@ -289,7 +303,7 @@ fn values(params: &Params, json_body: Option<J>) -> ApiResult<BTreeMap<String, J
     Ok(out)
 }
 
-/// `GET` or `POST /{ds}/queries/{name}`: run a stored query.
+/// `GET` or `POST /{ds}/queries/{name}`: run a stored query or update.
 pub(super) async fn run(
     st: St,
     Path((ds_name, name)): Path<(String, String)>,
@@ -299,6 +313,7 @@ pub(super) async fn run(
     headers: HeaderMap,
     QueryBody(body): QueryBody,
 ) -> ApiResult {
+    use sparkles::stored::DefKind;
     let ds = dataset(&st, &ds_name)?;
     let mut params = Params::from_query(&uri);
     let mut json_body = None;
@@ -327,6 +342,44 @@ pub(super) async fn run(
     }
     let given = values(&params, json_body)?;
     let (stored, bindings) = queries.bind(&name, version, &given)?;
+    let v = stored.version.version;
+
+    if stored.definition.kind == DefKind::Update {
+        if method != Method::POST {
+            return Err(err(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "a stored update can only be run with POST",
+            ));
+        }
+        if st.read_only {
+            return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+        }
+        crate::obs::log_query_text(&stored.definition.query);
+        let mut opts = super::CallerContext::for_caller(&st, &ds, &p)
+            .options(&params, crate::auth::Endpoint::Update);
+        opts.initial_bindings = bindings.initial;
+        opts.list_bindings = bindings.lists;
+        let wopts = super::validation::write_options(&st, &params, &headers, opts.timeout)?;
+        let (cancel, _cancel_on_drop) = super::cancel_on_drop();
+        opts.cancel = Some(cancel);
+        opts.write = wopts;
+        let query_text = stored.definition.query.clone();
+        let wanted = super::receipt_wanted(&params, &headers);
+        let restricted = p.can(&ds.name, crate::auth::Level::Admin);
+        let r = super::blocking(move || {
+            let stats = ds
+                .dataset
+                .update_with(&query_text, &opts)?;
+            Ok(super::update_response(&ds.dataset, stats, wanted, !restricted))
+        })
+        .await?;
+        let mut r = r;
+        if let Ok(h) = HeaderValue::from_str(&v.to_string()) {
+            r.headers_mut().insert(SPARKLES_QUERY_VERSION, h);
+        }
+        return Ok(r);
+    }
+
     // the definition's result format, unless the request names one
     let accept = headers
         .get(header::ACCEPT)
@@ -339,7 +392,6 @@ pub(super) async fn run(
     {
         params.0.push(("format".into(), f.clone()));
     }
-    let v = stored.version.version;
     crate::obs::log_query_text(&stored.definition.query);
     let r: Response = super::run_query(
         st.0.clone(),

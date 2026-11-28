@@ -126,7 +126,7 @@ pub(crate) fn sparql_query_full(
         return Err(t.ctx(&[], 0.0).engine(Error::Cancelled));
     }
     let a: SparqlQueryArgs = parse(args)?;
-    let (out, whole) = t.run_sparql_with(a, Vec::new(), true)?;
+    let (out, whole) = t.run_sparql_with(a, Default::default(), true)?;
     Ok((out, whole.unwrap_or(Value::Null)))
 }
 
@@ -1289,14 +1289,14 @@ impl Tools<'_> {
 
     fn sparql_query(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: SparqlQueryArgs = parse(args)?;
-        self.run_sparql(a, Vec::new())
+        self.run_sparql(a, Default::default())
     }
 
     /// `sparql_query` with `bindings` as initial bindings (stored queries).
     pub(super) fn run_sparql(
         &self,
         a: SparqlQueryArgs,
-        bindings: Vec<(String, Term)>,
+        bindings: sparkles::stored::Bindings,
     ) -> Result<Outcome, ToolError> {
         self.run_sparql_with(a, bindings, false).map(|(o, _)| o)
     }
@@ -1307,7 +1307,7 @@ impl Tools<'_> {
     fn run_sparql_with(
         &self,
         a: SparqlQueryArgs,
-        bindings: Vec<(String, Term)>,
+        bindings: sparkles::stored::Bindings,
         full: bool,
     ) -> Result<(Outcome, Option<Value>), ToolError> {
         let cfg = self.cfg();
@@ -1378,7 +1378,8 @@ impl Tools<'_> {
         if let Some(m) = a.aggregate_errors {
             opts.aggregate_errors = Some(m);
         }
-        opts.initial_bindings = bindings;
+        opts.initial_bindings = bindings.initial;
+        opts.list_bindings = bindings.lists;
         let request = self
             .call
             .preparation

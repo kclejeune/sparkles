@@ -175,6 +175,9 @@ pub struct QueryOptions {
     /// A blank node with a stored node's label (`_:b…`) is that stored node. Any other
     /// label, such as a node a query minted (`_:q…`), is a new blank node of this query.
     pub initial_bindings: Vec<(String, Term)>,
+    /// List bindings (stored query list parameters): each entry becomes a `VALUES`
+    /// block joined at the top of the WHERE clause during planning.
+    pub list_bindings: Vec<(String, Vec<Term>)>,
     /// prefixes made available to the query (Fuseki doesn't do this; the CLI does)
     pub prefixes: Vec<(String, String)>,
     /// Executor optimizations in effect (all on by default; see [`Optimizations`]).
@@ -1913,18 +1916,25 @@ fn prepare_query_input_policy(
         .map(|(name, term)| planner.bind_initial(name, term))
         .collect();
     let saved_pattern = pattern;
+    // list bindings: each becomes a VALUES block joined with the WHERE pattern
+    let list_applied = inject_list_values(pattern.clone(), &opts.list_bindings);
+    let pattern_ref = if opts.list_bindings.is_empty() {
+        pattern
+    } else {
+        &list_applied
+    };
     let (kind, pattern) = match parsed {
-        Query::Select { .. } => (QueryKind::Select, pattern.clone()),
+        Query::Select { .. } => (QueryKind::Select, pattern_ref.clone()),
         Query::Ask { .. } => (
             QueryKind::Ask,
             GraphPattern::Slice {
-                inner: Box::new(pattern.clone()),
+                inner: Box::new(pattern_ref.clone()),
                 start: 0,
                 length: Some(1),
             },
         ),
-        Query::Construct { .. } => (QueryKind::Construct, pattern.clone()),
-        Query::Describe { .. } => (QueryKind::Describe, pattern.clone()),
+        Query::Construct { .. } => (QueryKind::Construct, pattern_ref.clone()),
+        Query::Describe { .. } => (QueryKind::Describe, pattern_ref.clone()),
     };
     planner.view_patterns = inherited.and_then(|view| view.patterns.as_deref());
     let input = if planner.view_patterns.is_some() {
@@ -2294,6 +2304,8 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         for (name, term) in &opts.initial_bindings {
             planner.bind_initial(name, term);
         }
+        // list bindings: each becomes a VALUES block joined with the WHERE pattern
+        let pattern = inject_list_values(pattern.clone(), &opts.list_bindings);
         // the shape that execution plans: ASK as a slice of one solution
         let kind = match parsed {
             Query::Select { .. } => QueryKind::Select,
@@ -2303,11 +2315,11 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         };
         let pattern = match kind {
             QueryKind::Ask => GraphPattern::Slice {
-                inner: Box::new(pattern.clone()),
+                inner: Box::new(pattern),
                 start: 0,
                 length: Some(1),
             },
-            _ => pattern.clone(),
+            _ => pattern,
         };
         let pattern = rdfs::apply(&ctx, &pattern);
         let node = planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?;
@@ -2326,6 +2338,106 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         }
         Ok((parsed.to_sse(), info))
     })
+}
+
+/// Inject `VALUES` blocks for list parameters: each list becomes a `Values` node
+/// joined inside the innermost group of the pattern, so that FILTER, LIMIT and
+/// aggregates see the bound variables.
+pub fn inject_list_values(
+    pattern: GraphPattern,
+    lists: &[(String, Vec<Term>)],
+) -> GraphPattern {
+    if lists.is_empty() {
+        return pattern;
+    }
+    let mut values_nodes = Vec::new();
+    for (name, terms) in lists {
+        if terms.is_empty() {
+            continue;
+        }
+        let var = spargebra::term::Variable::new_unchecked(name);
+        let bindings: Vec<Vec<Option<spargebra::term::GroundTerm>>> = terms
+            .iter()
+            .map(|t| {
+                vec![Some(match t {
+                    Term::NamedNode(n) => spargebra::term::GroundTerm::NamedNode(n.clone()),
+                    Term::Literal(l) => spargebra::term::GroundTerm::Literal(l.clone()),
+                    _ => return vec![None],
+                })]
+            })
+            .collect();
+        values_nodes.push(GraphPattern::Values {
+            variables: vec![var],
+            bindings,
+        });
+    }
+    if values_nodes.is_empty() {
+        return pattern;
+    }
+    inject_values_inner(pattern, &values_nodes)
+}
+
+/// Descend through Project, Distinct, Reduced, Slice, OrderBy, Group and Filter to
+/// find the innermost evaluation group, then join the VALUES blocks there. The VALUES
+/// must be inside Filter so that the filter condition can see the bound variables.
+fn inject_values_inner(p: GraphPattern, values: &[GraphPattern]) -> GraphPattern {
+    match p {
+        GraphPattern::Project { inner, variables } => GraphPattern::Project {
+            inner: Box::new(inject_values_inner(*inner, values)),
+            variables,
+        },
+        GraphPattern::Distinct { inner } => GraphPattern::Distinct {
+            inner: Box::new(inject_values_inner(*inner, values)),
+        },
+        GraphPattern::Reduced { inner } => GraphPattern::Reduced {
+            inner: Box::new(inject_values_inner(*inner, values)),
+        },
+        GraphPattern::Slice {
+            inner,
+            start,
+            length,
+        } => GraphPattern::Slice {
+            inner: Box::new(inject_values_inner(*inner, values)),
+            start,
+            length,
+        },
+        GraphPattern::OrderBy { inner, expression } => GraphPattern::OrderBy {
+            inner: Box::new(inject_values_inner(*inner, values)),
+            expression,
+        },
+        GraphPattern::Group {
+            inner,
+            variables,
+            aggregates,
+        } => GraphPattern::Group {
+            inner: Box::new(inject_values_inner(*inner, values)),
+            variables,
+            aggregates,
+        },
+        GraphPattern::Filter { inner, expr } => GraphPattern::Filter {
+            inner: Box::new(inject_values_inner(*inner, values)),
+            expr,
+        },
+        GraphPattern::Extend {
+            inner,
+            variable,
+            expression,
+        } => GraphPattern::Extend {
+            inner: Box::new(inject_values_inner(*inner, values)),
+            variable,
+            expression,
+        },
+        other => {
+            let mut result = other;
+            for v in values {
+                result = GraphPattern::Join {
+                    left: Box::new(v.clone()),
+                    right: Box::new(result),
+                };
+            }
+            result
+        }
+    }
 }
 
 /// Instantiate a template term (CONSTRUCT / INSERT), recursing into RDF 1.2 triple

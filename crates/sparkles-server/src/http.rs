@@ -1796,7 +1796,7 @@ async fn query_endpoint(
         return Err(err(StatusCode::BAD_REQUEST, "missing 'query' parameter"));
     }
     crate::obs::log_query_text(&query);
-    run_query(st, ds, p, uri, headers, params, query, Vec::new()).await
+    run_query(st, ds, p, uri, headers, params, query, Default::default()).await
 }
 
 /// The query of the startup warm-up ([`crate::warm`]) on `ds`, run as `/{ds}/sparql`
@@ -1817,7 +1817,7 @@ pub(crate) async fn warm_up_query(
         headers,
         params,
         query,
-        Vec::new(),
+        Default::default(),
     )
     .await
 }
@@ -1881,7 +1881,7 @@ pub(crate) async fn run_query(
     headers: HeaderMap,
     params: Params,
     query: String,
-    bindings: Vec<(String, oxrdf::Term)>,
+    bindings: sparkles::stored::Bindings,
 ) -> ApiResult {
     let io = io_profile(&params, &p)?;
     let requested = match params.get("execution") {
@@ -1924,7 +1924,7 @@ pub(crate) async fn run_query(
     let execution = sparkles::sparql::choose_execution(&sparkles::sparql::Consumer {
         requested,
         default: st.default_execution,
-        initial_bindings: !bindings.is_empty(),
+        initial_bindings: !bindings.initial.is_empty() || !bindings.lists.is_empty(),
         ..Default::default()
     })
     .map_err(|e| err(StatusCode::BAD_REQUEST, e.message()))?;
@@ -1932,7 +1932,8 @@ pub(crate) async fn run_query(
     if execution == sparkles::sparql::ExecutionMode::Streaming {
         let rdf_format = rdf_format(&params, &headers, false);
         let native_graph = params_wants_sparkles(&headers);
-        opts.initial_bindings = bindings;
+        opts.initial_bindings = bindings.initial;
+        opts.list_bindings = bindings.lists;
         let prefixes = crate::settings::prefixes::bound(&st, &ds);
         return cursor::run(
             ds,
@@ -1965,10 +1966,18 @@ pub(crate) async fn run_query(
     let quick_key = if bindings.is_empty() {
         inline::QuickQueries::key(&ds.name, &query)
     } else {
-        let values: Vec<String> = bindings.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        inline::QuickQueries::key(&ds.name, &format!("{query}\n{}", values.join("\n")))
+        let mut parts: Vec<String> = bindings
+            .initial
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        for (k, vs) in &bindings.lists {
+            parts.push(format!("{k}=[{}]", vs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")));
+        }
+        inline::QuickQueries::key(&ds.name, &format!("{query}\n{}", parts.join("\n")))
     };
-    opts.initial_bindings = bindings;
+    opts.initial_bindings = bindings.initial;
+    opts.list_bindings = bindings.lists;
     // A graph-algorithm call can take milliseconds on a cached projection and much
     // longer after a commit, and work in place cannot stop when its client goes away.
     // The first run of a query decides from its parsed algebra whether it has a SERVICE

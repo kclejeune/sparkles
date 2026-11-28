@@ -235,7 +235,7 @@ pub(super) async fn run(
         #[cfg(test)]
         prepared.probe.events.lock().push("projection");
         let query = ds.dataset.algorithms().query_text(&req, summary)?;
-        let run = super::run_query(st, ds, p, uri, headers, params, query, Vec::new());
+        let run = super::run_query(st, ds, p, uri, headers, params, query, Default::default());
         #[cfg(test)]
         return probe::CURRENT.scope(prepared.probe, run).await;
         #[cfg(not(test))]

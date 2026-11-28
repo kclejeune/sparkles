@@ -34,8 +34,10 @@ ex:c ex:name \"Cy\" ; ex:age 45 ; ex:knows ex:a ."
 }
 
 fn names(s: &Store, d: &Definition, g: Value) -> Vec<String> {
+    let bindings = d.bind(&given(g), &prefixes()).unwrap();
     let opts = QueryOptions {
-        initial_bindings: d.bind(&given(g), &prefixes()).unwrap(),
+        initial_bindings: bindings.initial,
+        list_bindings: bindings.lists,
         ..Default::default()
     };
     let r = query(s.snapshot(), &d.query, &opts).unwrap();
@@ -68,15 +70,14 @@ fn values_cannot_inject_text() {
         json!({ "name": { "type": "string" } }),
     );
     let s = store();
-    // a string is one literal, whatever it contains
     assert!(names(&s, &d, json!({ "name": "Ann\" } UNION { ?p ?q ?r } #" })).is_empty());
     assert_eq!(
         d.bind(&given(json!({ "name": "x\" }" })), &prefixes())
-            .unwrap()[0]
+            .unwrap()
+            .initial[0]
             .1,
         Term::Literal(Literal::new_simple_literal("x\" }"))
     );
-    // a term parameter takes exactly one term
     let t = def(
         "SELECT ?p WHERE { ?p <http://ex.org/knows> ?who }",
         json!({ "who": { "type": "term" } }),
@@ -96,11 +97,11 @@ fn values_cannot_inject_text() {
     }
     assert_eq!(
         t.bind(&given(json!({ "who": "ex:a" })), &prefixes())
-            .unwrap()[0]
+            .unwrap()
+            .initial[0]
             .1,
         Term::NamedNode(NamedNode::new_unchecked("http://ex.org/a"))
     );
-    // an IRI parameter takes an IRI only
     let i = def(
         "SELECT ?n WHERE { ?who <http://ex.org/name> ?n }",
         json!({ "who": { "type": "iri" } }),
@@ -142,12 +143,12 @@ fn types_are_checked() {
             &p,
         )
         .unwrap();
-    assert_eq!(b.len(), 4);
+    assert_eq!(b.initial.len(), 4);
     assert!(
-        b.iter()
+        b.initial
+            .iter()
             .any(|(n, t)| n == "t" && t.to_string() == "\"hi\"@en")
     );
-    // unknown and missing names
     assert!(d.bind(&given(json!({ "zzz": 1 })), &p).is_err());
     let r = def(PEOPLE, json!({ "min": { "type": "integer" } }));
     let e = r.bind(&given(json!({})), &p).unwrap_err().to_string();
@@ -171,7 +172,7 @@ fn definitions_are_checked() {
     let bad = [
         (
             def("INSERT DATA { <a:a> <a:b> <a:c> }", json!({})),
-            "updates",
+            "queries",
         ),
         (def("SELECT ?x {", json!({})), "syntax"),
         (
@@ -225,7 +226,6 @@ fn definitions_are_checked() {
         let e = d.check().unwrap_err().to_string();
         assert!(e.contains(want), "{want}: {e}");
     }
-    // a variable whose name extends the parameter's is not the parameter
     let d = def(
         "SELECT ?minimum WHERE { ?s ?p ?minimum }",
         json!({ "min": { "type": "integer" } }),
@@ -257,18 +257,20 @@ fn versions_and_persistence() {
                 dataset_commit: Some(4),
                 if_version: Some(0),
             },
+            Some("ann"),
+            true,
         )
         .unwrap();
     assert!(s1.changed && s1.created);
     assert_eq!(s1.stored.version.version, 1);
     assert_eq!(s1.stored.version.parent, None);
-    // the same definition adds no version
-    let again = c.put("adults", d1.clone(), Change::default()).unwrap();
+    let again = c
+        .put("adults", d1.clone(), Change::default(), None, true)
+        .unwrap();
     assert!(!again.changed);
     assert_eq!(again.stored.version.version, 1);
     let mut d2 = d1.clone();
     d2.description = Some("People of age".into());
-    // a stale version is refused
     let e = c
         .put(
             "adults",
@@ -277,15 +279,20 @@ fn versions_and_persistence() {
                 if_version: Some(0),
                 ..Default::default()
             },
+            None,
+            true,
         )
         .unwrap_err();
     assert!(matches!(e, Error::PreconditionFailed(_)), "{e}");
-    let s2 = c.put("adults", d2.clone(), Change::default()).unwrap();
+    let s2 = c
+        .put("adults", d2.clone(), Change::default(), None, true)
+        .unwrap();
     assert_eq!(s2.stored.version.version, 2);
     assert_eq!(s2.stored.version.parent, Some(1));
     assert_ne!(s2.stored.version.digest, s1.stored.version.digest);
-    assert!(c.put("bad name", d1.clone(), Change::default()).is_err());
-    // reopened from the file
+    assert!(c
+        .put("bad name", d1.clone(), Change::default(), None, true)
+        .is_err());
     let c2 = Catalog::open(Some(dir.path())).unwrap();
     assert_eq!(c2.get("adults", None).unwrap().definition, d2);
     assert_eq!(c2.get("adults", Some(1)).unwrap().definition, d1);
@@ -300,9 +307,9 @@ fn versions_and_persistence() {
         c2.get("adults", Some(1)).unwrap().version.author.as_deref(),
         Some("ann")
     );
-    assert!(c2.delete("adults", Some(1)).is_err());
-    assert!(c2.delete("adults", None).unwrap());
-    assert!(!c2.delete("adults", None).unwrap());
+    assert!(c2.delete("adults", Some(1), None, true).is_err());
+    assert!(c2.delete("adults", None, None, true).unwrap());
+    assert!(!c2.delete("adults", None, None, true).unwrap());
     assert!(!dir.path().join(FILE).exists());
 }
 
@@ -315,10 +322,150 @@ fn old_versions_are_dropped() {
             json!({ "min": { "type": "integer", "default": 18 } }),
         );
         d.description = Some(format!("v{i}"));
-        c.put("q", d, Change::default()).unwrap();
+        c.put("q", d, Change::default(), None, true).unwrap();
     }
     let v = c.versions("q").unwrap();
     assert_eq!(v.len(), MAX_VERSIONS);
     assert_eq!(v[0].version, MAX_VERSIONS as u64 + 5);
     assert!(c.get("q", Some(1)).is_none());
+}
+
+#[test]
+fn stored_updates_are_checked() {
+    let u: Definition = serde_json::from_value(json!({
+        "kind": "update",
+        "query": "DELETE { ?s <http://ex.org/status> ?o } INSERT { ?s <http://ex.org/status> \"done\" } WHERE { ?s <http://ex.org/status> ?o FILTER(?s = ?item) }",
+        "parameters": { "item": { "type": "iri" } }
+    }))
+    .unwrap();
+    assert_eq!(u.check().unwrap(), Kind::Update);
+
+    let bad_query_as_update: Definition = serde_json::from_value(json!({
+        "kind": "update",
+        "query": "SELECT * WHERE { ?s ?p ?o }",
+    }))
+    .unwrap();
+    let e = bad_query_as_update.check().unwrap_err().to_string();
+    assert!(e.contains("updates"), "{e}");
+
+    let query_as_update: Definition = serde_json::from_value(json!({
+        "kind": "query",
+        "query": "INSERT DATA { <a:a> <a:b> <a:c> }",
+    }))
+    .unwrap();
+    let e = query_as_update.check().unwrap_err().to_string();
+    assert!(e.contains("queries"), "{e}");
+
+    let data_only_with_params: Definition = serde_json::from_value(json!({
+        "kind": "update",
+        "query": "INSERT DATA { <a:a> <a:b> <a:c> }",
+        "parameters": { "x": { "type": "iri" } }
+    }))
+    .unwrap();
+    let e = data_only_with_params.check().unwrap_err().to_string();
+    assert!(e.contains("WHERE"), "{e}");
+
+    let update_no_results: Definition = serde_json::from_value(json!({
+        "kind": "update",
+        "query": "INSERT DATA { <a:a> <a:b> <a:c> }",
+        "results": "json"
+    }))
+    .unwrap();
+    let e = update_no_results.check().unwrap_err().to_string();
+    assert!(e.contains("result format"), "{e}");
+}
+
+#[test]
+fn list_parameters() {
+    let d = def(
+        "SELECT ?name WHERE { ?p <http://ex.org/name> ?name ; <http://ex.org/age> ?age FILTER(?p = ?who) } ORDER BY ?name",
+        json!({ "who": { "type": "iri", "list": true } }),
+    );
+    assert_eq!(d.check().unwrap(), Kind::Select);
+    let s = store();
+    let b = d
+        .bind(
+            &given(json!({ "who": ["<http://ex.org/a>", "<http://ex.org/c>"] })),
+            &prefixes(),
+        )
+        .unwrap();
+    assert!(b.initial.is_empty());
+    assert_eq!(b.lists.len(), 1);
+    assert_eq!(b.lists[0].0, "who");
+    assert_eq!(b.lists[0].1.len(), 2);
+
+    let opts = QueryOptions {
+        list_bindings: b.lists,
+        ..Default::default()
+    };
+    let r = query(s.snapshot(), &d.query, &opts).unwrap();
+    let names: Vec<String> = r
+        .test_application_rows()
+        .into_iter()
+        .map(|row| match &row[0] {
+            Some(Term::Literal(l)) => l.value().to_string(),
+            t => format!("{t:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["Ann", "Cy"]);
+
+    let too_many = d.bind(
+        &given(json!({ "who": (0..1001).map(|i| format!("<http://ex.org/{i}>")).collect::<Vec<_>>() })),
+        &prefixes(),
+    );
+    assert!(too_many.is_err());
+
+    let non_list_array = def(
+        PEOPLE,
+        json!({ "min": { "type": "integer" } }),
+    );
+    let e = non_list_array
+        .bind(&given(json!({ "min": [1, 2] })), &prefixes())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("list"), "{e}");
+}
+
+#[test]
+fn private_queries() {
+    let c = Catalog::open(None).unwrap();
+    let mut priv_def = def(PEOPLE, json!({ "min": { "type": "integer", "default": 18 } }));
+    priv_def.visibility = Visibility::Private;
+    priv_def.owner = Some("alice".into());
+    c.put("my-query", priv_def.clone(), Change::default(), Some("alice"), false)
+        .unwrap();
+    assert_eq!(c.list_visible(Some("alice"), false).len(), 1);
+    assert_eq!(c.list_visible(Some("bob"), false).len(), 0);
+    assert_eq!(c.list_visible(None, true).len(), 1);
+    assert!(c.get_visible("my-query", None, Some("alice"), false).is_some());
+    assert!(c.get_visible("my-query", None, Some("bob"), false).is_none());
+    assert!(c.get_visible("my-query", None, None, true).is_some());
+
+    let e = c
+        .delete("my-query", None, Some("bob"), false)
+        .unwrap();
+    assert!(!e);
+
+    assert!(c.delete("my-query", None, Some("alice"), false).unwrap());
+
+    let mut shared = def(PEOPLE, json!({}));
+    shared.visibility = Visibility::Dataset;
+    let e = c
+        .put("shared", shared, Change::default(), Some("alice"), false)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("admin"), "{e}");
+}
+
+#[test]
+fn format_1_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = r#"{"format":1,"queries":{"q":{"versions":[{"version":1,"created":"2026-01-01T00:00:00Z","digest":"abc","definition":{"query":"SELECT * WHERE { ?s ?p ?o }"}}]}}}"#;
+    std::fs::write(dir.path().join(FILE), v1).unwrap();
+    let c = Catalog::open(Some(dir.path())).unwrap();
+    let s = c.get("q", None).unwrap();
+    assert_eq!(s.definition.kind, DefKind::Query);
+    assert_eq!(s.definition.visibility, Visibility::Dataset);
+    assert!(s.definition.owner.is_none());
+    assert!(!s.definition.parameters.values().any(|p| p.list));
 }

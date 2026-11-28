@@ -121,6 +121,9 @@ fn parse_param(s: &str) -> Result<(String, Parameter)> {
             datatype: None,
             language: None,
             allowed: None,
+            list: false,
+            min_items: None,
+            max_items: None,
         },
     ))
 }
@@ -262,20 +265,26 @@ pub fn run(cmd: QueriesCmd, opts: StoreOptions) -> Result<()> {
                         results,
                         mcp: !no_mcp,
                         questions: Vec::new(),
+                        kind: Default::default(),
+                        owner: None,
+                        visibility: Default::default(),
                     }
                 }
             };
             // the store's lock keeps a server from changing the catalog meanwhile
             let ds = open_dataset(&loc, opts)?;
+            let author = std::env::var("USER").ok();
             let saved = ds.queries().put(
                 &name,
                 def,
                 Change {
-                    author: std::env::var("USER").ok(),
+                    author: author.clone(),
                     message,
                     dataset_commit: Some(ds.snapshot().commit),
                     if_version: None,
                 },
+                author.as_deref(),
+                true,
             )?;
             if saved.changed {
                 writeln!(out, "{name}: version {}", saved.stored.version.version)?;
@@ -288,7 +297,11 @@ pub fn run(cmd: QueriesCmd, opts: StoreOptions) -> Result<()> {
             }
         }
         QueriesCmd::Delete { loc, name } => {
-            if !open_dataset(&loc, opts)?.queries().delete(&name, None)? {
+            let author = std::env::var("USER").ok();
+            if !open_dataset(&loc, opts)?
+                .queries()
+                .delete(&name, None, author.as_deref(), true)?
+            {
                 bail!("no stored query '{name}'");
             }
         }

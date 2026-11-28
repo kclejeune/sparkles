@@ -519,7 +519,14 @@ fn run_op(
                 ctx.rdfs = Some(r.schema_in_ctx(&ctx)?);
             }
             let pattern = super::rdfs::apply(&ctx, pattern);
-            let node = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new())?;
+            // list bindings: inject VALUES blocks into the WHERE clause
+            let pattern = super::inject_list_values(pattern.into_owned(), &req.opts.list_bindings);
+            let mut planner = Planner::new(&ctx);
+            // initial bindings: substitute variables in the WHERE clause
+            for (name, term) in &req.opts.initial_bindings {
+                planner.bind_initial(name, term);
+            }
+            let node = planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?;
             // Shared as query preparation shares a context, so that a LIMIT, an ASK or
             // an EXISTS in the WHERE clause pulls its input only to the rows it needs.
             let ctx = ctx.into_shared();
@@ -545,11 +552,29 @@ fn run_op(
                 }
             };
             stats.mem_peak_bytes = stats.mem_peak_bytes.max(ctx.mem_peak());
+            // initial bindings are pre-interned for template use: the planner
+            // substituted them out of the WHERE clause, so they won't appear in the
+            // result table, but templates may still reference these variables.
+            let bound_ids: Vec<(&str, Id)> = req
+                .opts
+                .initial_bindings
+                .iter()
+                .map(|(name, term)| (name.as_str(), ctx.intern_outside_term(term)))
+                .collect();
             let map = table.var_map(ctx.nvars());
             let get = |ctx: &Ctx, name: &str, i: usize| -> Option<Id> {
-                let c = map.get(ctx.var(name) as usize).copied().flatten()?;
-                let id = table.cols[c][i];
-                (!id.is_undef()).then_some(id)
+                // first check the result table
+                if let Some(c) = map.get(ctx.var(name) as usize).copied().flatten() {
+                    let id = table.cols[c][i];
+                    if !id.is_undef() {
+                        return Some(id);
+                    }
+                }
+                // fall back to initial bindings for template variables
+                bound_ids
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, id)| *id)
             };
             // A blank node the WHERE clause minted (BNODE(), a SERVICE result) is not in
             // the store: inserting it makes a new stored node, the same one wherever the

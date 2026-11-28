@@ -49,14 +49,19 @@ impl PyStoredQueries {
             results,
             mcp,
             questions: Vec::new(),
+            kind: Default::default(),
+            owner: None,
+            visibility: Default::default(),
         };
         let change = sparkles::stored::Change {
-            author,
+            author: author.clone(),
             message,
             if_version,
             dataset_commit: Some(ds.head_commit().seq),
         };
-        let r = py.detach(|| ds.queries().put(name, def, change)).py(py)?;
+        let r = py
+            .detach(|| ds.queries().put(name, def, change, author.as_deref(), true))
+            .py(py)?;
         admin::to_py(
             py,
             &serde_json::json!({"stored":r.stored,"created":r.created,"changed":r.changed}),
@@ -65,7 +70,8 @@ impl PyStoredQueries {
     #[pyo3(signature=(name,*,if_version=None))]
     fn delete(&self, py: Python<'_>, name: &str, if_version: Option<u64>) -> PyResult<bool> {
         let ds = self.write(py)?;
-        py.detach(|| ds.queries().delete(name, if_version)).py(py)
+        py.detach(|| ds.queries().delete(name, if_version, None, true))
+            .py(py)
     }
     #[pyo3(signature=(name,params=None,*,version=None,progress=None,**query_kwargs))]
     fn run<'py>(
