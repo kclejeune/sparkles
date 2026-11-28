@@ -5,26 +5,35 @@
 ### The marker repair on by default in rooted runs (items 1231 and 1247)
 
 A rooted run now repairs the delivery of conditional ground facts about individuals by
-default. `Limits::rooted_marker_repair` is true, in the filtered mode `129` of item 1250, and
-`Limits::rooted_decline`, the partial check that withdrew answers which could miss such
-facts and also withdrew complete ones, is false. On 18,916 generated ontologies with HermiT
-1.4.5 answers, on one thread and on four, the default rooted run claims 34,810 answers
-against 32,674 before and loses 3 to the work bound. Its answers differ from HermiT's only
-on s2-g2-150, as every earlier setting's did. Over the answers that both claim, the repair
-derives 3 to 13% more conclusions and holds 2 to 5% more estimated memory on the larger
-generated corpora, and up to 1.96 and 1.26 times on the fixtures built for orders of
-arrival. Item 1326 follows the cost of the notices that make most of the added conclusions,
-and item 1251 the family whose nested conditions pass the work bound with the repair. A run
-that sets the repair off should set the check on, which the tests of the check now do.
+default. `Limits::rooted_marker_repair` is true, in the filtered mode `129` of item 1250,
+and `Limits::rooted_decline`, the partial check that withdrew answers which could miss such
+facts and also withdrew complete ones, is false. The measurement covers 18,916 generated
+input files in 33 sets, 18,870 of them with a usable HermiT 1.4.5 reference. Each runs on
+one thread with the cautious strategy and with four threads requested with the eager one,
+which a rooted run with the default steps saturates on one thread. The parser rejects 690
+files of two sets in both configurations and in every build, 1,380 rows in all, which
+leaves 36,360 result rows, 18,180 for each configuration. On them the default rooted run
+claims 34,810 answers against 32,674 for the previous default and loses 3 to the work
+bound. Its answers differ from HermiT's only on s2-g2-150, as every earlier setting's did.
+Against a run with both the repair and the check off, over the answers that both claim, the
+repair derives 3 to 13% more conclusions and holds 2 to 5% more estimated memory on the
+larger generated corpora, and 1.96 and 1.26 times on the fixtures built for orders of
+arrival, of which the previous default claimed none. Runs with `--no-dl-steps` on four
+saturation workers give no answer that differs from HermiT. Item 1326 follows the cost of
+the notices that make most of the added conclusions, and item 1251 the family whose nested
+conditions pass the work bound with the repair. A run that sets the repair off should set
+the check on, which the tests of the check now do.
 
 The repair's state moves out of the contexts into a table that a run makes with the
 repair's first use, and a context names its slot in the padding of its Tier D state (item
 1247). A rooted run without the repair allocates nothing for the repair and charges 8 bytes
 less for each context with constants. A run with the repair charges the table, a slot for
 each context that holds repair state and the state itself. On the generated corpora that
-adds a median of 0.03% and at most 512 bytes to the peak estimated memory. The repair's handlers take a context's
-state out of its slot for their reads and changes and put it back when they are done or
-unwind.
+adds a median of 0.03% and at most 512 bytes to the peak estimated memory. The repair's
+handlers take a context's state out of its slot for their reads and changes and put it back
+when they are done or unwind. A context's first slot is admitted with the table's lock
+released, so the caller's memory callback never runs under it, and a worker that loses the
+race to make the table frees its own before it gives the charge back.
 
 ### One meter for the marker repair and the rooted premise lists (item 1280)
 

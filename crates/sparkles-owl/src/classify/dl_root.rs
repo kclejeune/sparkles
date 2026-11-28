@@ -147,12 +147,49 @@ pub(super) struct MRep {
 #[derive(Default)]
 pub struct MTab {
     slots: parking_lot::Mutex<Vec<Option<Box<MRep>>>>,
+    #[cfg(test)]
+    _live: MTabLive,
+}
+
+/// A count, on each thread, of the tables made on it less the tables dropped on it, for the
+/// test that checks that a worker that loses the race to install the table frees its own
+/// before it gives its charge back. A run on several threads can make a table on one thread
+/// and drop it on another, so a thread's count can be negative, and only its changes within
+/// one thread mean anything. It holds no bytes.
+#[cfg(test)]
+pub(super) struct MTabLive;
+
+#[cfg(test)]
+thread_local! {
+    static MTABS_LIVE: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl Default for MTabLive {
+    fn default() -> Self {
+        MTABS_LIVE.with(|n| n.set(n.get() + 1));
+        MTabLive
+    }
+}
+
+#[cfg(test)]
+impl Drop for MTabLive {
+    fn drop(&mut self) {
+        MTABS_LIVE.with(|n| n.set(n.get() - 1));
+    }
+}
+
+/// [`MTabLive`]'s count on this thread, for tests.
+#[cfg(test)]
+pub(super) fn mtabs_live() -> isize {
+    MTABS_LIVE.with(|n| n.get())
 }
 
 impl MTab {
-    /// The bytes the table holds: itself with its shared count, its slots and their states,
-    /// which the run charged as they grew, for tests that recount them.
-    #[cfg(test)]
+    /// The bytes the table holds: itself with its shared count, its slots and the states in
+    /// them, which the run charged as they grew. A state taken out of its slot is not
+    /// counted, so the count is exact only when no handler holds one, as between the
+    /// saturation and the partial-answer record and in the tests that recount the table.
     pub(super) fn bytes(&self) -> usize {
         let slots = self.slots.lock();
         MTAB_BYTES
@@ -164,11 +201,17 @@ impl MTab {
     pub(super) fn len(&self) -> usize {
         self.slots.lock().len()
     }
+    /// Whether some thread holds the table's lock, for tests that check that no admission
+    /// runs under it.
+    #[cfg(test)]
+    pub(super) fn locked(&self) -> bool {
+        self.slots.is_locked()
+    }
 }
 
 /// The bytes of a run's [`MTab`] before its first slot: the table and the counts of its
 /// shared pointer.
-const MTAB_BYTES: usize = std::mem::size_of::<MTab>() + 2 * std::mem::size_of::<usize>();
+pub(super) const MTAB_BYTES: usize = std::mem::size_of::<MTab>() + 2 * std::mem::size_of::<usize>();
 
 /// A context's repair state taken out of its slot of the run's [`MTab`], which goes back to
 /// the slot when this is dropped, so that a return or an unwind keeps it. A slot is taken
@@ -224,8 +267,9 @@ pub(super) fn mrep_get<S: Sink>(x: &DlSt, out: &S) -> Option<MHeld> {
     })
 }
 
-/// Reads the context's repair state in its slot, or `None` when the context has none.
-fn mrep_peek<S: Sink, R>(x: &DlSt, out: &S, f: impl FnOnce(&MRep) -> R) -> Option<R> {
+/// Reads the context's repair state in its slot, or `None` when the context has none. The
+/// state must be in its slot: reading it while a handler holds it panics.
+pub(super) fn mrep_peek<S: Sink, R>(x: &DlSt, out: &S, f: impl FnOnce(&MRep) -> R) -> Option<R> {
     if x.mslot == 0 {
         return None;
     }
@@ -239,7 +283,16 @@ fn mrep_peek<S: Sink, R>(x: &DlSt, out: &S, f: impl FnOnce(&MRep) -> R) -> Optio
 
 /// Pre-admits and takes the context's repair state, made with its first use: the run's
 /// table with the run's first, then the context's slot and state. `None` when admission
-/// refused, with nothing made.
+/// refused or a slot index would not fit, with no slot made and the context naming none.
+/// The run's table stays once it is made and charged, so a refusal of the slot after the
+/// table was admitted leaves the table installed with no slot for this context, and the
+/// run's ledger still holds exactly its bytes.
+///
+/// Every admission runs with the table's lock released, as in
+/// [`push_clause_admitted`](super::dl_clause::push_clause_admitted), so that the caller's
+/// charge callback never runs under the lock. The slot's growth is bounded under the lock,
+/// admitted outside it, and checked again under the lock before the push, which another
+/// worker's push between the two can have made larger.
 pub(super) fn mrep_admit<S: Sink>(x: &mut DlSt, out: &mut S) -> Option<MHeld> {
     if x.mslot != 0 {
         return mrep_get(x, out);
@@ -250,46 +303,72 @@ pub(super) fn mrep_admit<S: Sink>(x: &mut DlSt, out: &mut S) -> Option<MHeld> {
             if !out.admit_dl(MTAB_BYTES) {
                 return None;
             }
-            let made = std::sync::Arc::new(MTab::default());
-            match out.dl().mtab.set(made.clone()) {
-                Ok(()) => {
-                    out.commit_dl(MTAB_BYTES, MTAB_BYTES);
-                    made
-                }
-                Err(_) => {
+            match out.dl().mtab.set(std::sync::Arc::new(MTab::default())) {
+                Ok(()) => out.commit_dl(MTAB_BYTES, MTAB_BYTES),
+                Err(lost) => {
+                    // the losing table is freed before its reservation goes back, so that
+                    // no other admission can count on bytes that are still allocated
+                    drop(lost);
                     out.commit_dl(MTAB_BYTES, 0);
-                    out.dl().mtab.get().expect("set by another worker").clone()
                 }
             }
+            out.dl()
+                .mtab
+                .get()
+                .expect("set above or by another worker")
+                .clone()
         }
     };
-    let mut slots = tab.slots.lock();
-    let Some(grow) = vec_grow_bound(&*slots) else {
-        out.speculative_overflow();
-        return None;
-    };
-    let need = grow + std::mem::size_of::<MRep>();
-    if !out.admit_dl(need) {
-        return None;
+    enum Step {
+        Made(u32, usize),
+        Need(usize),
+        Overflow,
     }
-    let Ok(slot) = u32::try_from(slots.len() + 1) else {
-        out.commit_dl(need, 0);
-        out.speculative_overflow();
-        return None;
-    };
-    let delta = vec_push_delta(&mut *slots, None);
-    drop(slots);
-    out.commit_dl(need, delta + std::mem::size_of::<MRep>());
-    x.mslot = slot;
-    Some(MHeld {
-        tab,
-        slot,
-        m: Some(Box::default()),
-    })
+    let mut guard = DlGuard::new(out);
+    loop {
+        let step = {
+            let mut slots = tab.slots.lock();
+            let slot = slots
+                .len()
+                .checked_add(1)
+                .and_then(|n| u32::try_from(n).ok());
+            let need =
+                vec_grow_bound(&*slots).and_then(|g| g.checked_add(std::mem::size_of::<MRep>()));
+            match (slot, need) {
+                (Some(slot), Some(need)) if need <= guard.bytes() => {
+                    Step::Made(slot, vec_push_delta(&mut *slots, None))
+                }
+                (Some(_), Some(need)) => Step::Need(need),
+                _ => Step::Overflow,
+            }
+        };
+        match step {
+            Step::Made(slot, delta) => {
+                guard.commit(delta + std::mem::size_of::<MRep>());
+                x.mslot = slot;
+                return Some(MHeld {
+                    tab,
+                    slot,
+                    m: Some(Box::default()),
+                });
+            }
+            Step::Need(need) => {
+                let add = need - guard.bytes();
+                if !guard.admit_add(add) {
+                    return None;
+                }
+            }
+            Step::Overflow => {
+                // the guard refunds what it admitted before the overflow is reported
+                drop(guard);
+                out.speculative_overflow();
+                return None;
+            }
+        }
+    }
 }
 
 impl MRep {
-    #[cfg(test)]
     fn bytes(&self) -> usize {
         std::mem::size_of::<MRep>()
             + hash_table_bytes(self.mheld.capacity(), std::mem::size_of::<Lit>())
@@ -4473,7 +4552,6 @@ const M_POLL: usize = 64;
 const M_SCAN: usize = 1024;
 
 /// Makes the repair's state of a context with its first use, and counts it.
-#[cfg(test)]
 #[cfg(test)]
 fn mrep_new<S: Sink>(x: &mut DlSt, out: &S) {
     if x.mslot == 0 {

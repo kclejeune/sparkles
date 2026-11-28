@@ -1165,9 +1165,9 @@ impl DlRun {
                     .saturating_mul(std::mem::size_of::<(u32, u32)>()),
             )
     }
-    /// The bytes of the marker repair's table of the run's contexts, 0 without it, for tests
-    /// that recount the contexts' bytes.
-    #[cfg(test)]
+    /// The bytes of the marker repair's table of the run's contexts, 0 without it. The
+    /// contexts' own counts leave the table out, and so does [`DlRun::bytes`], as it leaves
+    /// out the clause table's admitted bytes, so a recount of the contexts' bytes adds this.
     pub(super) fn mtab_bytes(&self) -> usize {
         self.mtab.get().map_or(0, |t| t.bytes())
     }
@@ -1744,7 +1744,10 @@ pub struct DlSt {
     blocker_reads: u8,
     /// in a rooted run with row 1231's marker repair, one more than the index of the
     /// context's slot in the run's [`MTab`](super::dl_root::MTab), 0 for none, which the
-    /// padding after the flags above holds (item 1247)
+    /// padding after the flags above holds on a 64-bit target (item 1247). A clone of the context copies the
+    /// slot's index and so names the same slot, which two contexts that run the repair must
+    /// never do. Only the EL and Horn worlds clone a context's state, and a world applies no
+    /// Tier D rule to its copy, so a copied slot is never taken or read.
     pub(super) mslot: u32,
     /// in a rooted run, the heads of the facts a hypothetical successor sent the root
     pub(super) promoted: FxHashSet<Box<[Lit]>>,
@@ -1775,6 +1778,44 @@ pub struct DlSt {
     /// that entails one of them makes its own; [`flush`] releases them
     pending: Vec<Ex>,
 }
+
+// Item 1247: on a 64-bit target the repair's slot shares one aligned 8-byte word with the
+// four flags before it, and every other field of `DlSt` is a whole number of such words,
+// so the struct is exactly its fields with no other padding. Without the slot the flags
+// would still take the word, padded, so the slot adds nothing to a context.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(align_of::<DlSt>() == 8);
+    let slot = offset_of!(DlSt, mslot);
+    let word = slot - slot % 8;
+    assert!(slot + size_of::<u32>() <= word + 8);
+    let flags = [
+        offset_of!(DlSt, empty_core),
+        offset_of!(DlSt, taking_fact),
+        offset_of!(DlSt, given_fact),
+        offset_of!(DlSt, blocker_reads),
+    ];
+    let mut i = 0;
+    while i < flags.len() {
+        assert!(flags[i] >= word && flags[i] < word + 8);
+        i += 1;
+    }
+    assert!(
+        size_of::<DlSt>()
+            == size_of::<Store>()
+                + 8
+                + size_of::<FxHashSet<Box<[Lit]>>>()
+                + size_of::<FxHashMap<Ex, Vec<u32>>>()
+                + size_of::<FxHashSet<(Ex, u32)>>()
+                + 2 * size_of::<Vec<(Ex, Ex)>>()
+                + size_of::<FxHashSet<Ex>>()
+                + size_of::<FxHashSet<(Ex, Ex)>>()
+                + size_of::<FxHashMap<(Role, Ex), u32>>()
+                + 2 * size_of::<Vec<Ex>>()
+                + size_of::<Option<Box<super::dl_root::RootSt>>>()
+    );
+};
 
 impl DlSt {
     pub fn bytes(&self) -> usize {

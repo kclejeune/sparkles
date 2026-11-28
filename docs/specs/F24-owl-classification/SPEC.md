@@ -476,15 +476,24 @@ synthetic family whose conditions nest two or more deep grows with the repair's 
 which is item 1251.
 
 Item 1231 turned the repair on by default in mode `129` and the check off. The measurement
-covers the 33 generated corpus sets of the measurements above, 18,916 ontologies with
-HermiT 1.4.5 answers, each run on one thread with the cautious strategy and on four threads
-with the eager one. There the default run claims 34,810 answers against 32,674 with the
-repair off and the check on, and loses 3 claims, each to the rooted work bound. The only
-answers that differ from HermiT's are the two of s2-g2-150, which every setting gives and
-in which the rooted run derives four subsumptions that HermiT does not. Against a run with
-both the repair and the check off, which differs from HermiT on 1,456 answers, the repair
-leaves those two and loses 9 claims to the work bound, 6 of them in item 1251's family.
-Over the answers that both runs claim, the repair derives 3 to 13% more conclusions on the
+covers the 33 generated corpus sets of the measurements above. They hold 18,916 input
+files, and 18,870 of them have a usable HermiT 1.4.5 reference. Each of those runs in two
+configurations. The first asks for one thread with the cautious strategy. The second, `4e`,
+asks for four threads with the eager strategy, and since a rooted run with the default
+steps saturates on one thread whatever the caller asks for, its saturation runs no workers
+concurrently. The parser rejects 690 files of `fz` and `gen` in both configurations and in
+every compared build, 1,380 rows in all, which leaves 36,360 result rows, 18,180 for each
+configuration. On those rows the default run claims 34,810 answers against 32,674 for the
+previous default, which had the repair off and the check on, and loses 3 claims, each to
+the rooted work bound. The only answers that differ from HermiT's are the two of s2-g2-150,
+which every setting gives and in which the rooted run derives four subsumptions that HermiT
+does not. Against a run with both the repair and the check off, which differs from HermiT
+on 1,456 answers, the repair leaves those two and loses 9 claims to the work bound, 6 of
+them in item 1251's family. The ratios below compare the default run with that run with
+both off, since the previous default claims no answer of the fixtures built for orders of
+arrival or of item 1251's family. On the larger generated sets the previous default claims
+the same answers as the run with both off, or a subset of them, with the same ratios. Over
+the answers that both runs claim, the repair derives 3 to 13% more conclusions on the
 larger generated sets and 6.9% more over all sets, with 1.61 times on `av`, 1.96 times on
 the fixtures built for orders of arrival and 34.6 times on item 1251's family. The peak
 estimated memory of the same answers rises by 2.1 to 4.8% on the larger sets and 4.9% over
@@ -492,13 +501,13 @@ all sets, with 1.20 times on `av`, 1.26 times on the fixtures and 4.4 times on i
 family. On `p2`, `g2` and `g6`, 93 to 98% of the added conclusions are the conclusion that
 each notice of a held literal charges, and most of those notices send no marker and return
 no clause. On `av` and `ps` the products of returned clauses and their consequences make up
-about half. Item 1326 follows the cost of the notices. Three repeated runs on four threads
-without steps on six sets, among them `av`, `ps` and the fixtures, and a run through
-`Classifier` on nine sets give no answer that differs from HermiT. On the forest set a run
-through `Classifier` claims the same 976 answers with and without the repair. The 18 forest
-answers that it does not claim against the saturation's pass the rooted bound without the
-repair too. The repair's completeness is not proved, which item 823 records for the rooted
-run as a whole.
+about half. Item 1326 follows the cost of the notices. Three repeated runs with
+`--no-dl-steps` on four threads, whose saturation does run four workers, on six sets, among
+them `av`, `ps` and the fixtures, and a run through `Classifier` on nine sets give no
+answer that differs from HermiT. On the forest set a run through `Classifier` claims the
+same 976 answers with and without the repair. The 18 forest answers that it does not claim
+against the saturation's pass the rooted bound without the repair too. The repair's
+completeness is not proved, which item 823 records for the rooted run as a whole.
 
 Item 1247 moved the repair's state out of the contexts. A run that uses the repair makes
 one table with the repair's first use and charges it to the memory budget. Each context
@@ -507,16 +516,18 @@ index in the padding after the flags of its Tier D state. A run without the repa
 table, and each context with constants charges 8 bytes less than when it carried a pointer
 to its state. A handler takes a context's state out of its slot and puts it back when it
 finishes or unwinds. It puts the state back before a drain that can reach the same context
-again, and a second take of state that is out of its slot panics. On the 33 corpus sets,
-on one thread cautious and on four threads eager, the change gives the same claims,
-agreements and counts of derived conclusions as the build before it, with the repair on,
-with both the repair and the check off and with the old default. The one exception is an
-answer on `p3` whose count differs by one between runs of the same build. The peak
-estimated memory of a run with the repair off falls by a multiple of 8 bytes, at most
-1,488 bytes. With the repair on it rises by a median of 0.03% and at most 512 bytes, which
-is what the table and its slots cost beyond the pointers they replace. Two repeated runs on
-four threads without steps on six sets, among them `av`, `ps` and the fixtures, give no
-answer that differs from HermiT.
+again, and a second take of state that is out of its slot panics. On the 33 corpus sets, on
+one thread cautious and on four threads eager, the change gives the same claims, agreements
+and counts of derived conclusions as the build before it, with the repair on, with both the
+repair and the check off and with the old default. The one exception is an answer on `p3`
+whose count differs by one between runs of the same build. The peak estimated memory of a
+run with the repair off falls by a multiple of 8 bytes, at most 1,488 bytes. With the
+repair on it rises by a median of 0.03% and at most 512 bytes, which is what the table and
+its slots cost beyond the pointers they replace. Those rows come from the same two
+configurations as item 1231's, so their `4e` rows also saturate on one thread. Two repeated
+runs with `--no-dl-steps` on four threads, whose saturation runs four workers that share
+the table, on six sets, among them `av`, `ps` and the fixtures, give no answer that differs
+from HermiT.
 
 The repair keeps the resource contract of the rest of Tier D, and the contract is
 cooperative. A run charges each conclusion that it derives to the work bound, and several

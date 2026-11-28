@@ -14410,6 +14410,10 @@ impl Saturation {
             .saturating_add(self.context_bytes())
             .saturating_add(dynamic.map_or(0, |d| d.retained_bytes()))
             .saturating_add(dl_run.map_or(0, |d| d.bytes()))
+            // the marker repair's states live in the run's table rather than in the
+            // contexts (item 1247), and no handler holds one here, so the table's count is
+            // exact
+            .saturating_add(dl_run.map_or(0, |d| d.mtab_bytes()))
             .saturating_add(world_bytes)
             .saturating_add(self.el_deps.bytes())
             .saturating_add(pending_count.saturating_mul(std::mem::size_of::<saturate::Concl>()))
