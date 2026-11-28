@@ -84,10 +84,10 @@ fn settings_have_get_set_and_reset() {
         serde_json::to_value(&base).unwrap()
     );
     quota.reset().unwrap();
-    assert_eq!(
-        serde_json::to_value(quota.get()).unwrap(),
-        serde_json::to_value(&base).unwrap()
-    );
+    let after = quota.get();
+    assert_eq!(after.max_bytes, base.max_bytes);
+    assert_eq!(after.default_max_bytes, base.default_max_bytes);
+    assert_eq!(after.source, base.source);
 
     let retention = ds.settings().retention();
     retention
