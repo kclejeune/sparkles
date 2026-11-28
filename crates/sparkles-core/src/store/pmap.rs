@@ -36,12 +36,12 @@ const fn heavy<K, V>() -> bool {
 
 /// Most entries in a leaf.
 const fn leaf_cap<K, V>() -> usize {
-    if heavy::<K, V>() { 16 } else { 32 }
+    if heavy::<K, V>() { 16 } else { 16 }
 }
 
 /// Most children of a branch.
 const fn branch_cap<K, V>() -> usize {
-    if heavy::<K, V>() { 16 } else { 32 }
+    if heavy::<K, V>() { 16 } else { 16 }
 }
 
 /// The most levels of a tree. A node below the root holds at least a quarter of its
