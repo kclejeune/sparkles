@@ -236,7 +236,8 @@ pass the bound and give their default answer, and 9 take the default paths. ore_
 run is rooted now. It passes the bound and gives the default answer, which is HermiT's,
 in 0.3 to 1 s against 16 ms without the option on a shared laptop. ore_ont_15803 does the
 same in 1.7 s against 0.7 s on four threads, with the same taxonomy as before item 805.
-Item 1061 follows that cost.
+Item 1061 follows that cost, and [its section](#item-1061-shared-ground-reasoning-across-contexts)
+records what the contexts now share.
 
 Item 1265 closes a crash of the keys that the rewriting declines. When an ontology's only
 individuals were in axioms outside OWL 2 EL, the disjunctive rules took the run, the
@@ -5358,6 +5359,58 @@ is the duplication of ground reasoning across contexts that item 1061 follows. I
 clauses that hold x, about 380,000 of 866,000 conclusions in four seconds. With a bound of
 200 million it finishes after 4.7 million conclusions in 4.4 s on four threads of a build
 without link-time optimization. Item 1075 follows these equalities.
+
+#### Item 1061: shared ground reasoning across contexts
+
+Item 1061 shares the ground part of a rooted run's reasoning between the root and the
+other contexts. Three switches, all off by default, control it. `SPARKLES_ROOTED_SHARED_FACTS=1`
+marks a unit that the root delivers to another context as the root's. That context then
+leaves out a ground inference whose premises are all such units and whose conclusion is a
+unit over constants it is registered for, because the root derives the same conclusion and
+delivers it. The context also takes a successor's clause over constants alone once for
+each successor instead of once for each edge to it. `Limits::rooted_merge`, or
+`SPARKLES_ROOTED_MERGE=1`, merges two individuals when the ontology asserts their equality
+or the root derives it as a unit, and starts the run again on the merged ontology within
+the same work bound. It takes shoi-022 within the bound with 455,548 derived conclusions
+on one thread and 479,366 on four eager threads. `SPARKLES_ROOTED_BOUND_PER_CLASS=1` raises
+the bound of a rooted run without counting to 32 conclusions for each named class when
+that is more than 524,288.
+
+With shared facts on, a context that holds a root unit and would send it to a predecessor
+other than the root by Pred sends it as the root's own delivery instead, under the root's
+identifier for the clause. Pred moves such a unit unchanged, because only a unit over
+constants with an empty body goes to a predecessor, so the predecessor receives the same
+clause by either message and runs the same rules on it. Only the channel and the
+provenance change. The predecessor takes the unit once, however many successors send it,
+and holds it as the root's, so the rule for root units applies there too. The predecessor
+still makes every inference it made before, except those that the rule for root units
+leaves out, so forwarding is complete if that rule is. That rule's completeness is not
+proved, as for the rest of the rooted run. `SPARKLES_ROOTED_FACT_FORWARD=0` turns
+forwarding off, and the run then derives exactly what it derived before forwarding.
+
+On ore_ont_14924, the rooted run with shared facts and without forwarding needs 5,073,778
+conclusions, and 16,693,380 without shared facts. With forwarding it needs 324,029 on one
+thread and 321,884 on four eager threads, within the bound, and gives HermiT's taxonomy
+with and without merging. On the 393 generated ontologies of item 805 that parse, on one
+and on four threads, forwarding derives fewer conclusions in 220 of the 357 runs on one
+thread that finish with and without it and more in 7. It finishes the same runs apart
+from one four-thread run of s2-g2-115, whose outcome varies between schedules in both
+builds, and it changes no answer.
+The dl1061 regression family derives 0.55 times the conclusions, and the 50 `shoi`
+fixtures all finish with HermiT's taxonomies with merging and item 1075's splitting, as
+before. With shared facts, merging and forwarding together, shoi-022 needs at most 506,938
+conclusions in 20 runs on four eager threads, against 474,314 without forwarding.
+
+Two parts of the item remain. 36 of the generated ontologies still pass the bound in 71
+runs, all on one thread and all but s2-g2-266 on four. With a bound of 30 million on one
+thread, 11 of them finish, ten after 529,652 to 29.8 million conclusions, 18 pass that
+bound, 4 run past 120 s and 3 end without finishing or passing it. In the first 600,000
+conclusions of each, the commonest rule is Pred over the edges `f_e(u)` to successors in
+18 files and Eq on equalities `f_e(u) ≈ v` in 7, both in the contexts other than the root.
+Forwarding does not reach that work, since those clauses are not root units. ore_ont_15803 needs 3,778,620 conclusions with or
+without forwarding, about 9.5 for each of its 398,583 named classes, so no sharing brings
+it under 524,288. It finishes with HermiT's taxonomy of 2,432,194 entailed pairs under the
+per-class bound of 12,754,656, whose adoption is a separate decision about the bound.
 
 #### Item 1075: binary splitting over disjunctive equalities of constants
 

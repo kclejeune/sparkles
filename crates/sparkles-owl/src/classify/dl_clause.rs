@@ -1880,6 +1880,26 @@ impl Store {
     }
 
     /// [`Store::add_parts_admitted`], with exact root-unit provenance when `is_fact` is set.
+    /// Records the run's table id `cid` of the root's unit `→ l` on the live stored copy
+    /// of that unit that holds root provenance and has not been sent yet, so that the
+    /// context forwards it to its predecessors under the root's id (item 1061). Allocates
+    /// nothing.
+    pub fn adopt_root_id(&mut self, l: Lit, cid: u32) {
+        if let Some(ids) = self.by_last.get(&l) {
+            for &i in ids {
+                let s = &mut self.clauses[i as usize];
+                if !s.dead
+                    && s.fact
+                    && s.sent.is_none()
+                    && s.c.body().is_empty()
+                    && s.c.head() == [l]
+                {
+                    s.sent = Some(cid);
+                }
+            }
+        }
+    }
+
     pub fn add_parts_admitted_with_fact<S: Sink>(
         &mut self,
         body: Vec<Lit>,

@@ -2573,6 +2573,12 @@ pub fn rpred_c<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bo
     ds(st).taking_fact = true;
     drain(ix, st, found, out);
     ds(st).taking_fact = false;
+    if out.dl().forwards_facts() {
+        let c = out.dl().table.get(cid);
+        if let [l] = c.head() {
+            ds(st).store.adopt_root_id(*l, cid);
+        }
+    }
     true
 }
 
@@ -9881,69 +9887,82 @@ pub(super) mod tests {
     fn pred_to_non_root_predecessor_preserved_and_to_root_omitted_for_root_unit() {
         // Gap G6: a certified root unit in a successor is STILL sent via PredC to a non-root
         // predecessor (both live and late via dedge), and kept in `store.preds`; only sends
-        // back to the root itself (which already holds the unit) are omitted.
-        let mut s = Sig::new();
-        let na = s.ind("a");
-        let [a, p, z] = ["A", "P", "Z"].map(|n| s.class(n));
-        let r = s.role("r");
-        let e = s.some_h(r, a);
-        let (ix, root) = probe_ix(s);
-        let run = DlRun::new(false, Default::default()).with_shared_facts(true);
-        let mut out = Probe {
-            run: &run,
-            sent: Vec::new(),
-            mine: Vec::new(),
-        };
-        let RTerm::C(u) = c(na, &ix) else {
-            unreachable!()
-        };
-        let la = atom(&ix, &out, a, u);
-        let mut st = State {
-            init: true,
-            ..State::default()
-        };
-        // Register both `root` and non-root predecessor `p` before processing the unit.
-        assert!(super::super::dl_rules::dedge(
-            &ix, z, &mut st, root, e, &mut out
-        ));
-        assert!(super::super::dl_rules::dedge(
-            &ix, z, &mut st, p, e, &mut out
-        ));
-        out.sent.clear();
+        // back to the root itself (which already holds the unit) are omitted. With item
+        // 1061's forwarding the unit goes to the non-root predecessor as the root's own
+        // delivery under the root's table id, and forwarding off is the Pred control.
+        for forward in [false, true] {
+            let mut s = Sig::new();
+            let na = s.ind("a");
+            let [a, p, z] = ["A", "P", "Z"].map(|n| s.class(n));
+            let r = s.role("r");
+            let e = s.some_h(r, a);
+            let (ix, root) = probe_ix(s);
+            let run = DlRun::new(false, Default::default())
+                .with_shared_facts(true)
+                .with_forward_facts(forward);
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let RTerm::C(u) = c(na, &ix) else {
+                unreachable!()
+            };
+            let la = atom(&ix, &out, a, u);
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            // Register both `root` and non-root predecessor `p` before processing the unit.
+            assert!(super::super::dl_rules::dedge(
+                &ix, z, &mut st, root, e, &mut out
+            ));
+            assert!(super::super::dl_rules::dedge(
+                &ix, z, &mut st, p, e, &mut out
+            ));
+            out.sent.clear();
 
-        let cid_in = run.table.push(Clause::new(Vec::new(), vec![la]));
-        rpred_c(&ix, &mut st, cid_in, &mut out);
-        super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+            let cid_in = run.table.push(Clause::new(Vec::new(), vec![la]));
+            rpred_c(&ix, &mut st, cid_in, &mut out);
+            super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
 
-        let sent_to_p = out
-            .sent
-            .iter()
-            .any(|&(to, c)| to == p && matches!(c, Concl::PredC(from, _) if from == z));
-        let sent_to_root = out
-            .sent
-            .iter()
-            .any(|&(to, c)| to == root && matches!(c, Concl::PredC(from, _) if from == z));
-        assert!(sent_to_p, "non-root predecessor must receive PredC for G6");
-        assert!(
-            !sent_to_root,
-            "root itself must not be re-sent its own root unit via PredC"
-        );
-        assert!(
-            !dl(&st).unwrap().store.preds.is_empty(),
-            "root unit must remain in store.preds for late non-root predecessors"
-        );
+            let to_pred = |to: Ex, c: Concl, dest: Ex| {
+                to == dest
+                    && if forward {
+                        matches!(c, Concl::RPred(cid) if cid == cid_in)
+                    } else {
+                        matches!(c, Concl::PredC(from, _) if from == z)
+                    }
+            };
+            let sent_to_p = out.sent.iter().any(|&(to, c)| to_pred(to, c, p));
+            let sent_to_root = out.sent.iter().any(|&(to, c)| {
+                to == root
+                    && (matches!(c, Concl::PredC(from, _) if from == z)
+                        || matches!(c, Concl::RPred(_)))
+            });
+            assert!(
+                sent_to_p,
+                "forward={forward}: non-root predecessor must receive the unit for G6"
+            );
+            assert!(
+                !sent_to_root,
+                "root itself must not be re-sent its own root unit via PredC"
+            );
+            assert!(
+                !dl(&st).unwrap().store.preds.is_empty(),
+                "root unit must remain in store.preds for late non-root predecessors"
+            );
 
-        // A late non-root predecessor `a` receives it via dedge replay; root does not.
-        out.sent.clear();
-        assert!(super::super::dl_rules::dedge(
-            &ix, z, &mut st, a, e, &mut out
-        ));
-        assert!(
-            out.sent
-                .iter()
-                .any(|&(to, c)| to == a && matches!(c, Concl::PredC(from, _) if from == z)),
-            "late non-root predecessor must receive root unit from store.preds"
-        );
+            // A late non-root predecessor `a` receives it via dedge replay; root does not.
+            out.sent.clear();
+            assert!(super::super::dl_rules::dedge(
+                &ix, z, &mut st, a, e, &mut out
+            ));
+            assert!(
+                out.sent.iter().any(|&(to, c)| to_pred(to, c, a)),
+                "forward={forward}: late non-root predecessor must receive root unit from store.preds"
+            );
+        }
     }
 
     #[test]
@@ -10610,154 +10629,201 @@ Ontology(<http://example.org/g6>
             let RTerm::C(uc) = c(nc, &ix) else {
                 unreachable!()
             };
-            let run = DlRun::new(false, Default::default()).with_shared_facts(true);
-            let mut out = Probe {
-                run: &run,
-                sent: Vec::new(),
-                mine: Vec::new(),
-            };
-            let le = atom(&ix, &out, e, ub);
-            let lg = atom(&ix, &out, g, uc);
-            let lbhit = atom(&ix, &out, bhit, ub);
-            let cid_eb = run.table.push(Clause::new(Vec::new(), vec![le]));
-            let ret_clause = Clause::new(vec![Lit::x(a), Lit::ry(s_role), lg], vec![Lit::y(bhit)]);
-            let cid_ret = run.table.push(ret_clause);
+            // Forwarding off is the control: the sender sends Pred. With forwarding on it
+            // sends the root's own delivery under the root's table id, and the destination
+            // must still open the edge, forward its marker and derive the return.
+            for forward in [false, true] {
+                let run = DlRun::new(false, Default::default())
+                    .with_shared_facts(true)
+                    .with_forward_facts(forward);
+                let mut out = Probe {
+                    run: &run,
+                    sent: Vec::new(),
+                    mine: Vec::new(),
+                };
+                let le = atom(&ix, &out, e, ub);
+                let lg = atom(&ix, &out, g, uc);
+                let lbhit = atom(&ix, &out, bhit, ub);
+                let cid_eb = run.table.push(Clause::new(Vec::new(), vec![le]));
+                let ret_clause =
+                    Clause::new(vec![Lit::x(a), Lit::ry(s_role), lg], vec![Lit::y(bhit)]);
+                let cid_ret = run.table.push(ret_clause);
+                // the root's units over b that it derives from its own -> E(b), which it
+                // delivers to every context registered for b
+                let inv = inv_of(&ix, dix(&ix));
+                let lit_of = |v: XLit| match run.lits.lit(v, inv) {
+                    Made::Lit(l) => l,
+                    _ => panic!("literal"),
+                };
+                let cid_af = run.table.push(Clause::new(
+                    Vec::new(),
+                    vec![lit_of(XLit::Atom(a, RTerm::Fc(e, ub)))],
+                ));
+                let cid_rf = run.table.push(Clause::new(
+                    Vec::new(),
+                    vec![lit_of(XLit::Role(r, RTerm::C(ub), RTerm::Fc(e, ub)))],
+                ));
 
-            // Sender `V`: has `root` in `dpreds` (must be skipped by D2) and early predecessor
-            // `Z` pre-registered in `st_v.back` over `p` BEFORE `V` processes `-> E(b)`.
-            let mut st_v = State {
-                init: true,
-                ..State::default()
-            };
-            let mut back_z = super::super::saturate::Small::default();
-            back_z.insert(z_c);
-            st_v.back.push((p_role, back_z));
-            assert!(super::super::dl_rules::dedge(
-                &ix, v_c, &mut st_v, root, e_p, &mut out
-            ));
-            out.sent.clear();
-            // Deliver root unit `-> E(b)` to `V` via `rpred_c` so `Stored::fact == true`.
-            assert!(rpred_c(&ix, &mut st_v, cid_eb, &mut out));
-            assert!(
-                dl(&st_v)
-                    .unwrap()
-                    .store
-                    .clauses
-                    .iter()
-                    .any(|cl| !cl.dead && cl.fact && cl.c.body().is_empty() && cl.c.head() == [le]),
-                "sender V must store -> E(b) with Stored::fact == true"
-            );
-            super::super::dl_rules::flush(&ix, v_c, &mut st_v, &mut out, 64);
-            let cid_early = out
-                .sent
-                .iter()
-                .find_map(|&(to, msg)| match msg {
-                    Concl::PredC(from, cid)
-                        if to == z_c
-                            && from == v_c
-                            && run.table.get(cid).body().is_empty()
-                            && run.table.get(cid).head() == [le] =>
-                    {
-                        Some(cid)
-                    }
-                    _ => None,
-                })
-                .expect("early Z must receive live PredC(V, -> E(b)) when V flushes");
-            assert!(
-                !out.sent.iter().any(|&(to, msg)| {
-                    to == root && matches!(msg, Concl::PredC(from, _) if from == v_c)
-                }),
-                "D2 must still skip live unit PredC back to root"
-            );
-            assert!(
-                !out.sent.iter().any(|&(to, _)| to == z2_c),
-                "unregistered late Z2 must not receive PredC before dedge"
-            );
-
-            // Late predecessor `Z2` registers with `V` AFTER `V` already processed `-> E(b)`.
-            out.sent.clear();
-            assert!(super::super::dl_rules::dedge(
-                &ix, v_c, &mut st_v, z2_c, e_p, &mut out
-            ));
-            let cid_late = out
-                .sent
-                .iter()
-                .find_map(|&(to, msg)| match msg {
-                    Concl::PredC(from, cid)
-                        if to == z2_c
-                            && from == v_c
-                            && run.table.get(cid).body().is_empty()
-                            && run.table.get(cid).head() == [le] =>
-                    {
-                        Some(cid)
-                    }
-                    _ => None,
-                })
-                .expect("late Z2 must receive replayed PredC(V, -> E(b)) via dedge");
-
-            // Drive BOTH destinations through actual `dl_rules::pred_c` delivery from `V`.
-            for (label, dest, cid_delivered, use_unit_edge) in [
-                ("early Z (live PredC)", z_c, cid_early, true),
-                ("late Z2 (dedge replay)", z2_c, cid_late, false),
-            ] {
-                out.sent.clear();
-                out.mine.clear();
-                let mut st = State {
+                // Sender `V`: has `root` in `dpreds` (must be skipped by D2) and early predecessor
+                // `Z` pre-registered in `st_v.back` over `p` BEFORE `V` processes `-> E(b)`.
+                let mut st_v = State {
                     init: true,
                     ..State::default()
                 };
-                if use_unit_edge {
-                    st.subs.insert(e_p);
-                } else {
-                    ds(&mut st).insert_edge(e_p, v_c);
-                }
-                // Destination holds private `-> G(c)`, then ingests `PredC(V, -> E(b))`.
-                super::super::dl_rules::derive(&ix, &mut st, (Vec::new(), vec![lg]), &mut out);
-                assert!(super::super::dl_rules::pred_c(
-                    &ix,
-                    dest,
-                    &mut st,
-                    v_c,
-                    cid_delivered,
-                    &mut out
+                let mut back_z = super::super::saturate::Small::default();
+                back_z.insert(z_c);
+                st_v.back.push((p_role, back_z));
+                assert!(super::super::dl_rules::dedge(
+                    &ix, v_c, &mut st_v, root, e_p, &mut out
                 ));
-                super::super::dl_rules::flush(&ix, dest, &mut st, &mut out, 64);
-
-                let r_st = dl(&st)
-                    .and_then(|x| x.root.as_deref())
-                    .expect("destination must have RootSt");
+                out.sent.clear();
+                // Deliver root unit `-> E(b)` to `V` via `rpred_c` so `Stored::fact == true`.
+                assert!(rpred_c(&ix, &mut st_v, cid_eb, &mut out));
                 assert!(
-                    r_st.succ_set.contains(&(e, ub)),
-                    "{label}: destination must open rooted existential edge (E, b)"
+                    dl(&st_v).unwrap().store.clauses.iter().any(|cl| !cl.dead
+                        && cl.fact
+                        && cl.c.body().is_empty()
+                        && cl.c.head() == [le]),
+                    "sender V must store -> E(b) with Stored::fact == true"
                 );
-                assert!(
-                    out.sent.iter().any(|&(to, c)| to == w
-                        && matches!(c, Concl::DEdge(from, f) if from == dest && f == e)),
-                    "{label}: destination must send DEdge(dest, E) to successor w"
-                );
-                assert!(
-                    r_st.gsent.contains(&(w, lg))
-                        && out.sent.iter().any(|&(to, c)| {
-                            to == w && matches!(c, Concl::HypL(xid) if xid == lg.xid())
-                        }),
-                    "{label}: destination must forward private ground marker G(c) to successor w"
-                );
-
-                // Successor `w` returns `A(x) ∧ s(y, x) ∧ G(c) -> BHit(y)` to destination.
-                assert!(super::super::dl_rules::pred_c(
-                    &ix, dest, &mut st, w, cid_ret, &mut out
-                ));
-                super::super::dl_rules::flush(&ix, dest, &mut st, &mut out, 64);
-                let has_bhit = dl(&st)
-                    .unwrap()
-                    .store
-                    .clauses
+                super::super::dl_rules::flush(&ix, v_c, &mut st_v, &mut out, 64);
+                let cid_early = out
+                    .sent
                     .iter()
-                    .any(|s| !s.dead && s.c.body().is_empty() && s.c.head() == [lbhit]);
+                    .find_map(|&(to, msg)| match msg {
+                        Concl::PredC(from, cid)
+                            if !forward
+                                && to == z_c
+                                && from == v_c
+                                && run.table.get(cid).body().is_empty()
+                                && run.table.get(cid).head() == [le] =>
+                        {
+                            Some(cid)
+                        }
+                        Concl::RPred(cid) if forward && to == z_c && cid == cid_eb => Some(cid),
+                        _ => None,
+                    })
+                    .expect("early Z must receive -> E(b) from V when V flushes");
                 assert!(
-                    has_bhit,
-                    "{label}: destination must derive -> BHit(b) from w's return and private G(c)"
+                    !out.sent.iter().any(|&(to, msg)| to == z_c
+                        && forward
+                        && matches!(msg, Concl::PredC(from, _) if from == v_c)),
+                    "forwarding sends the root unit as the root's delivery, not Pred"
                 );
+                assert!(
+                    !out.sent.iter().any(|&(to, msg)| {
+                        to == root && matches!(msg, Concl::PredC(from, _) if from == v_c)
+                    }),
+                    "D2 must still skip live unit PredC back to root"
+                );
+                assert!(
+                    !out.sent.iter().any(|&(to, _)| to == z2_c),
+                    "unregistered late Z2 must not receive PredC before dedge"
+                );
+
+                // Late predecessor `Z2` registers with `V` AFTER `V` already processed `-> E(b)`.
+                out.sent.clear();
+                assert!(super::super::dl_rules::dedge(
+                    &ix, v_c, &mut st_v, z2_c, e_p, &mut out
+                ));
+                let cid_late = out
+                    .sent
+                    .iter()
+                    .find_map(|&(to, msg)| match msg {
+                        Concl::PredC(from, cid)
+                            if !forward
+                                && to == z2_c
+                                && from == v_c
+                                && run.table.get(cid).body().is_empty()
+                                && run.table.get(cid).head() == [le] =>
+                        {
+                            Some(cid)
+                        }
+                        Concl::RPred(cid) if forward && to == z2_c && cid == cid_eb => Some(cid),
+                        _ => None,
+                    })
+                    .expect("late Z2 must receive -> E(b) replayed via dedge");
+
+                // Drive BOTH destinations through actual `dl_rules::pred_c` delivery from `V`.
+                for (label, dest, cid_delivered, use_unit_edge) in [
+                    ("early Z (live PredC)", z_c, cid_early, true),
+                    ("late Z2 (dedge replay)", z2_c, cid_late, false),
+                ] {
+                    out.sent.clear();
+                    out.mine.clear();
+                    let mut st = State {
+                        init: true,
+                        ..State::default()
+                    };
+                    if use_unit_edge {
+                        st.subs.insert(e_p);
+                    } else {
+                        ds(&mut st).insert_edge(e_p, v_c);
+                    }
+                    // Destination holds private `-> G(c)`, then ingests `PredC(V, -> E(b))`.
+                    super::super::dl_rules::derive(&ix, &mut st, (Vec::new(), vec![lg]), &mut out);
+                    if forward {
+                        // The destination takes -> E(b) as the root's unit, so the rule for
+                        // root units leaves out its local A(f_E(b)) and r(b, f_E(b)), which
+                        // the root derives too. Taking -> E(b) registers the destination for
+                        // b, and the root then delivers those units, as it does in a run.
+                        assert!(rpred_c(&ix, &mut st, cid_delivered, &mut out));
+                        super::super::dl_rules::flush(&ix, dest, &mut st, &mut out, 64);
+                        assert!(
+                            out.sent.iter().any(|&(to, c)| to == root
+                                && matches!(c, Concl::REdge(from, u) if from == dest && u == ub)),
+                            "{label}: destination must register with the root for b"
+                        );
+                        assert!(rpred_c(&ix, &mut st, cid_rf, &mut out));
+                        assert!(rpred_c(&ix, &mut st, cid_af, &mut out));
+                    } else {
+                        assert!(super::super::dl_rules::pred_c(
+                            &ix,
+                            dest,
+                            &mut st,
+                            v_c,
+                            cid_delivered,
+                            &mut out
+                        ));
+                    }
+                    super::super::dl_rules::flush(&ix, dest, &mut st, &mut out, 64);
+
+                    let r_st = dl(&st)
+                        .and_then(|x| x.root.as_deref())
+                        .expect("destination must have RootSt");
+                    assert!(
+                        r_st.succ_set.contains(&(e, ub)),
+                        "{label}: destination must open rooted existential edge (E, b)"
+                    );
+                    assert!(
+                        out.sent.iter().any(|&(to, c)| to == w
+                            && matches!(c, Concl::DEdge(from, f) if from == dest && f == e)),
+                        "{label}: destination must send DEdge(dest, E) to successor w"
+                    );
+                    assert!(
+                        r_st.gsent.contains(&(w, lg))
+                            && out.sent.iter().any(|&(to, c)| {
+                                to == w && matches!(c, Concl::HypL(xid) if xid == lg.xid())
+                            }),
+                        "{label}: destination must forward private ground marker G(c) to successor w"
+                    );
+
+                    // Successor `w` returns `A(x) ∧ s(y, x) ∧ G(c) -> BHit(y)` to destination.
+                    assert!(super::super::dl_rules::pred_c(
+                        &ix, dest, &mut st, w, cid_ret, &mut out
+                    ));
+                    super::super::dl_rules::flush(&ix, dest, &mut st, &mut out, 64);
+                    let has_bhit = dl(&st)
+                        .unwrap()
+                        .store
+                        .clauses
+                        .iter()
+                        .any(|s| !s.dead && s.c.body().is_empty() && s.c.head() == [lbhit]);
+                    assert!(
+                        has_bhit,
+                        "{label} forward={forward}: destination must derive -> BHit(b) from w's return and private G(c)"
+                    );
+                }
             }
         }
     }

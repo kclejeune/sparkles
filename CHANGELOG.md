@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Shared ground reasoning in rooted runs (item 1061)
+
+A rooted run with `SPARKLES_ROOTED_SHARED_FACTS=1` now forwards a unit the root delivered
+to a context on to that context's predecessors as the root's own delivery, in place of
+Pred. The predecessor takes the unit once, however many successors send it, and applies
+the shared-facts rule to it. ore_ont_14924 drops from 5.07 million to about 324,000 derived
+conclusions and finishes within the rooted bound with HermiT's taxonomy.
+`SPARKLES_ROOTED_FACT_FORWARD=0` turns forwarding off. Shared facts, constant merging
+(`Limits::rooted_merge`) and the per-class rooted bound stay off by default, and 36
+generated ontologies with keys or the universal property and ore_ont_15803 still pass the
+bound, as roadmap item 1061 records.
+
 ### Hierarchical memory budgets for reasoning and views
 
 Reasoning, ontology reads and maintained views share the dataset's query memory pool.

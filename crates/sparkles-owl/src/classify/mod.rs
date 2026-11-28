@@ -21540,6 +21540,293 @@ mod tests {
         );
     }
 
+    /// The named classes of `ax` and HermiT's entailed pairs of distinct satisfiable
+    /// classes in BatchHermit's `SUB a b` format, which the fixtures use.
+    fn hermit_pairs(
+        ax: &[crate::model::Axiom],
+        text: &str,
+    ) -> (Vec<Class>, std::collections::BTreeSet<(String, String)>) {
+        let mut classes: Vec<Class> = ax
+            .iter()
+            .filter_map(|a| match &a.kind {
+                crate::model::AxiomKind::Declaration(crate::model::Entity::Class(c)) => {
+                    Some(c.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        classes.sort();
+        classes.dedup();
+        assert!(text.trim_end().ends_with("END"), "a finished HermiT answer");
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.starts_with("UNSAT") || l.starts_with("TOP"))
+        );
+        let want = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("SUB "))
+            .map(|l| {
+                let (a, b) = l.split_once(' ').unwrap();
+                (a.to_string(), b.to_string())
+            })
+            .collect();
+        (classes, want)
+    }
+
+    /// The entailed pairs of distinct named classes of a finished run, for comparison with
+    /// [`hermit_pairs`].
+    fn run_pairs(
+        out: &Classification,
+        classes: &[Class],
+    ) -> std::collections::BTreeSet<(String, String)> {
+        let mut got = std::collections::BTreeSet::new();
+        for a in classes {
+            assert!(!out.taxonomy.is_unsatisfiable(a), "{a:?} is satisfiable");
+            for b in classes {
+                if a != b && out.taxonomy.is_subclass(a, b) {
+                    got.insert((a.as_str().to_string(), b.as_str().to_string()));
+                }
+            }
+        }
+        got
+    }
+
+    /// Item 1061's forwarding of root units: a context other than the root sends a unit the
+    /// root delivered it to a predecessor as the root's own message, which the predecessor
+    /// takes once whichever successor sends it and holds as a root unit. On these generated
+    /// ontologies with keys and the universal property, a rooted run with shared facts
+    /// derives far fewer conclusions with forwarding than without, finishes within a bound
+    /// that the run without forwarding passes, and gives HermiT's taxonomy on every
+    /// schedule, with and without constant merging and the marker repair.
+    #[test]
+    fn forwarded_root_units_finish_within_a_bound_the_run_without_forwarding_passes() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl1061/forward");
+        let names = ["s1-g1-002", "s2-g2-009", "s2-g2-211", "s2-g2-298"];
+        let run = |ax: &[crate::model::Axiom], forward: bool, limits: &Limits| {
+            dl_root::with_marker_diag_override(limits.rooted_marker_repair, || {
+                dl_rules::with_shared_facts_override(true, || {
+                    dl_rules::with_forward_facts_override(forward, || {
+                        let mut k = Classifier::of(ax);
+                        let out = k.classify(limits).unwrap();
+                        let excluded = k.excluded().len();
+                        (out, excluded)
+                    })
+                })
+            })
+        };
+        for name in names {
+            let ax = crate::ofn_read::parse(
+                &std::fs::read_to_string(dir.join(format!("{name}.ofn"))).unwrap(),
+            )
+            .unwrap()
+            .axioms;
+            let hermit = std::fs::read_to_string(dir.join(format!("{name}.hermit.txt"))).unwrap();
+            let (classes, want) = hermit_pairs(&ax, &hermit);
+            // the deterministic schedule: one thread in steps
+            let one = Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            };
+            let (off, _) = run(&ax, false, &one);
+            let (on, _) = run(&ax, true, &one);
+            assert!(
+                off.complete && on.complete,
+                "{name}: both finish under the default bound"
+            );
+            assert_eq!(
+                run_pairs(&off, &classes),
+                want,
+                "{name}: without forwarding"
+            );
+            // the work of the whole run, with the prefix before any merge's restart
+            let total = |o: &Classification| o.stats.dl_work + o.stats.dl_rooted_spent;
+            let (w_off, w_on) = (total(&off), total(&on));
+            assert!(
+                w_on * 5 <= w_off * 3,
+                "{name}: forwarding derives {w_on} conclusions against {w_off} without it"
+            );
+            // a bound between the two: the run without forwarding passes it and falls back,
+            // and the run with forwarding finishes within it with HermiT's taxonomy
+            let bound = Limits {
+                dl_work: Some((w_on + w_off) / 2),
+                ..one.clone()
+            };
+            let (off_b, _) = run(&ax, false, &bound);
+            assert!(
+                off_b.stats.dl_rooted_over,
+                "{name}: without forwarding passes {}",
+                (w_on + w_off) / 2
+            );
+            let (on_b, excluded) = run(&ax, true, &bound);
+            assert!(
+                on_b.complete && !on_b.stats.dl_rooted_over && excluded == 0,
+                "{name}: with forwarding finishes within the bound: {:?}",
+                on_b.stats
+            );
+            assert_eq!(
+                total(&on_b),
+                w_on,
+                "{name}: one thread in steps is deterministic"
+            );
+            assert_eq!(run_pairs(&on_b, &classes), want, "{name}: with forwarding");
+            // every schedule, with and without merging and the marker repair, agrees with
+            // HermiT under the default bound
+            for (threads, expansion, dl_steps, merge, repair) in [
+                (1, Expansion::Cautious, true, false, false),
+                (1, Expansion::Cautious, true, true, true),
+                (4, Expansion::Cautious, false, true, false),
+                (4, Expansion::Eager, false, true, false),
+                (4, Expansion::Eager, false, false, true),
+            ] {
+                let at = format!(
+                    "{name} {threads}t {expansion:?} steps={dl_steps} merge={merge} repair={repair}"
+                );
+                let limits = Limits {
+                    threads,
+                    expansion,
+                    dl_steps,
+                    rooted: true,
+                    rooted_merge: merge,
+                    rooted_marker_repair: repair,
+                    ..Limits::default()
+                };
+                let (out, excluded) = run(&ax, true, &limits);
+                assert!(out.complete && excluded == 0, "{at}: {:?}", out.stats);
+                assert!(
+                    !out.stats.dl_rooted_over && !out.stats.dl_rooted_declined,
+                    "{at}"
+                );
+                assert_eq!(out.stats.tier, Tier::Disjunctive, "{at}");
+                assert_eq!(run_pairs(&out, &classes), want, "{at}");
+                if repair {
+                    assert_eq!(out.stats.dl_marker_deficits, [0, 0, 0], "{at}");
+                }
+            }
+        }
+    }
+
+    /// Item 1061's forwarding of root units keeps the run's resource controls. With shared
+    /// facts and forwarding on, the reported peak memory covers the counting allocator's
+    /// peak with and without the marker repair, a cancellation at any poll ends the run
+    /// with the cancellation or a partial answer and never with a passed bound, a tight
+    /// memory cap ends it cleanly and the same classifier then gives the full answer, and a
+    /// rooted run with counting gives the same answer with and without forwarding.
+    #[test]
+    fn forwarded_root_units_keep_memory_accounting_cancellation_and_counting() {
+        use super::numeric::tests::measure;
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl1061/forward");
+        fn with(
+            forward: bool,
+            f: &mut dyn FnMut() -> Result<Classification, Error>,
+        ) -> Result<Classification, Error> {
+            dl_rules::with_shared_facts_override(true, || {
+                dl_rules::with_forward_facts_override(forward, f)
+            })
+        }
+        for name in ["s1-g1-002", "s2-g2-298"] {
+            let ax = crate::ofn_read::parse(
+                &std::fs::read_to_string(dir.join(format!("{name}.ofn"))).unwrap(),
+            )
+            .unwrap()
+            .axioms;
+            let hermit = std::fs::read_to_string(dir.join(format!("{name}.hermit.txt"))).unwrap();
+            let (classes, want) = hermit_pairs(&ax, &hermit);
+            let base = Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            };
+            for repair in [false, true] {
+                let limits = Limits {
+                    rooted_marker_repair: repair,
+                    ..base.clone()
+                };
+                let (out, sample) = dl_rules::with_shared_facts_override(true, || {
+                    dl_rules::with_forward_facts_override(true, || {
+                        let mut k = Classifier::of(&ax);
+                        measure(|| k.classify(&limits).expect("rooted forwarding classify"))
+                    })
+                });
+                assert!(out.complete, "{name} repair={repair}: {:?}", out.stats);
+                assert!(
+                    out.stats.peak_memory >= sample.peak,
+                    "{name} repair={repair}: peak_memory ({}) < measured peak ({})",
+                    out.stats.peak_memory,
+                    sample.peak
+                );
+            }
+            // a cancellation from the n-th poll on, for growing n, until a run ends first
+            let mut cancelled = 0usize;
+            let mut finished = false;
+            for n in (0..20).map(|k| (1usize << k) - 1) {
+                let polls = Arc::new(AtomicUsize::new(0));
+                let p = polls.clone();
+                let limits = Limits {
+                    partial: true,
+                    cancelled: Some(Arc::new(move || p.fetch_add(1, Ordering::Relaxed) >= n)),
+                    ..base.clone()
+                };
+                match with(true, &mut || Classifier::of(&ax).classify(&limits)) {
+                    Err(Error::Cancelled) => cancelled += 1,
+                    Err(e) => panic!("{name} poll {n}: {e:?}"),
+                    Ok(out) => {
+                        assert!(
+                            !out.stats.dl_rooted_over && !out.stats.dl_over_budget,
+                            "{name} poll {n}: a cancellation is no passed bound"
+                        );
+                        if polls.load(Ordering::Relaxed) <= n {
+                            assert!(out.complete, "{name} poll {n}: {:?}", out.stats);
+                            assert_eq!(run_pairs(&out, &classes), want, "{name} poll {n}");
+                            finished = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            assert!(
+                cancelled > 0 && finished,
+                "{name}: cancelled {cancelled}, finished {finished}"
+            );
+            // a tight memory cap, then the full answer from the same classifier
+            let mut k = Classifier::of(&ax);
+            let tight = Limits {
+                max_memory: Some(1 << 16),
+                ..base.clone()
+            };
+            match with(true, &mut || k.classify(&tight)) {
+                Ok(out) => assert!(!out.stats.dl_rooted_over, "{name}: {:?}", out.stats),
+                Err(Error::Memory { .. }) => {}
+                Err(e) => panic!("{name} tight cap: {e:?}"),
+            }
+            let again = with(true, &mut || k.classify(&base)).unwrap();
+            assert!(again.complete, "{name}: after the cap {:?}", again.stats);
+            assert_eq!(run_pairs(&again, &classes), want, "{name}: after the cap");
+            // counting with the rooted rules, with and without forwarding
+            let counting = Limits {
+                counting: true,
+                ..base.clone()
+            };
+            let off = with(false, &mut || Classifier::of(&ax).classify(&counting)).unwrap();
+            let on = with(true, &mut || Classifier::of(&ax).classify(&counting)).unwrap();
+            assert_eq!(off.complete, on.complete, "{name} counting");
+            assert_eq!(off.consistency, on.consistency, "{name} counting");
+            assert_eq!(
+                run_pairs(&off, &classes),
+                run_pairs(&on, &classes),
+                "{name} counting"
+            );
+            if on.complete {
+                assert_eq!(run_pairs(&on, &classes), want, "{name} counting");
+            }
+        }
+    }
+
     #[test]
     fn post_run_scratch_respects_paid_offset_and_partial_stop_flag() {
         use std::sync::Arc;
