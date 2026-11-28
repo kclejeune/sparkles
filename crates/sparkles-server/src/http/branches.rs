@@ -466,12 +466,21 @@ pub(crate) async fn select(
         // rebuilding a resolution map works on any branch
         let rebuild_identities = seg == "evidence" && path.ends_with("/identities/rebuild");
         let evidence_reconcile = seg == "evidence" && path.ends_with("/projections/reconcile");
+        // Index settings display the selected branch's inherited codec.
+        let index_settings = path
+            .strip_prefix("/$/settings/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(_, kind)| {
+                percent_encoding::percent_decode_str(kind).decode_utf8_lossy()
+                    == crate::settings::index::INDEX.name
+            });
         if branch != MAIN
             && !clone
             && !algo_run
             && !memberships
             && !rebuild_identities
             && !evidence_reconcile
+            && !index_settings
             && !ADMIN_BRANCH_ROUTES.contains(&seg)
         {
             return bad_branch(format!("{path} does not take a branch"));

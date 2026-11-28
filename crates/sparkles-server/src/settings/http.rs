@@ -20,8 +20,8 @@ use super::merge::{
     at, diff, forbidden_member, merged, parse_path, path_string, prune, remove_at, set_at,
 };
 use super::{
-    KINDS, Kind, Providers, Resolved, SERVER_KINDS, kind, resolve, runtime, server_kind,
-    store_runtime,
+    KINDS, Kind, Providers, Resolved, SERVER_KINDS, kind, resolve_with_index_codec, runtime,
+    server_kind, store_runtime,
 };
 use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, blocking, dataset, err, err_body, err_code};
@@ -62,7 +62,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 /// A change to a kind's runtime layer.
 pub enum Write {
-    /// make the effective object equal to the body
+    /// replace the runtime layer for `index`, or set the effective object for other kinds
     Put(Bytes),
     /// merge the body into the runtime layer
     Patch(Bytes),
@@ -97,6 +97,9 @@ fn body_object(body: &[u8], kind: &Kind) -> ApiResult<Value> {
             "{f} is not allowed: providers are defined in the server's model configuration only"
         )));
     }
+    if super::index::is(kind) {
+        super::index::validate_layer(&v).map_err(|e| bad(format!("{}: {e}", kind.name)))?;
+    }
     Ok(v)
 }
 
@@ -109,8 +112,8 @@ fn etag_matches(if_match: &str, etag: &str) -> bool {
 }
 
 /// The runtime layer that `op` makes of `cur`'s (§6): `If-Match` checked, a `PUT`
-/// turned into the fields where the body differs from the declared and default layers,
-/// and the locks of §4.1 applied. A write that leaves a locked field alone or restates
+/// interpreted as a complete runtime layer for index settings or as a diff for other
+/// kinds, and the locks of §4.1 applied. A write that leaves a locked field alone or restates
 /// its value stores nothing for it, and any other is refused with `locked-by-config`.
 /// `owner` names the dataset, or the server, in the messages. The caller checks the
 /// effective object after the change and stores the layer.
@@ -161,6 +164,11 @@ pub(crate) fn plan(
                 }
             }
             new
+        }
+        Op::Put(body) if super::index::is(kind) => {
+            // Keep explicit values even when they match the current base. Omitted
+            // and null values inherit the base again.
+            merged(&Value::Object(Map::new()), &body)
         }
         Op::Put(mut body) => {
             if kind.name == "assistant"
@@ -331,6 +339,9 @@ pub async fn write(
         ));
     }
     let op = op_of(w, kind)?;
+    let owner_dataset = (super::index::is(kind) && ds.store.is_branch())
+        .then(|| crate::http::main_dataset(&st, &ds.name))
+        .transpose()?;
     blocking(move || {
         let internal = |e: anyhow::Error| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
         let lock = st.settings.write_lock(&ds.name, kind);
@@ -342,10 +353,11 @@ pub async fn write(
         let providers = Providers::Checked(models.as_deref());
         let declared = st.settings.declared();
         let rt = runtime(&st, &ds, kind).map_err(internal)?;
-        let cur = resolve(kind, &declared, &ds.name, rt, providers);
+        let current = super::index::current_codec(kind, &ds);
+        let cur = resolve_with_index_codec(kind, &declared, &ds.name, rt, providers, current);
         let owner = format!("/{}", ds.name);
         let new = plan(&cur, op, if_match.as_deref(), &owner)?;
-        let r = resolve(kind, &declared, &ds.name, new, providers);
+        let r = resolve_with_index_codec(kind, &declared, &ds.name, new, providers, current);
         if let Err(e) = &r.status {
             return Err(bad(format!("{}: {e}", kind.name)));
         }
@@ -362,7 +374,8 @@ pub async fn write(
             }
         }
         if r.runtime != cur.runtime {
-            store_runtime(&st, &ds, kind, &r.runtime).map_err(|e| {
+            let owner_dataset = owner_dataset.as_deref().unwrap_or(&ds);
+            store_runtime(&st, owner_dataset, kind, &r.runtime).map_err(|e| {
                 match e.downcast_ref::<sparkles::Error>() {
                     Some(sparkles::Error::Invalid(m)) => bad(m.clone()),
                     _ => internal(e),
@@ -463,7 +476,14 @@ async fn write_kind(
     kind: &'static Kind,
     w: Write,
     headers: &HeaderMap,
+    principal: &Principal,
 ) -> ApiResult<Response> {
+    if super::index::is(kind) && !principal.admin_everywhere(&ds.name) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "changing index settings requires admin on the whole dataset",
+        ));
+    }
     if super::evidence::is(kind) {
         refuse_read_only(&st)?;
         let if_match = if_match(headers);
@@ -544,12 +564,13 @@ async fn get_kind(
         let rt = runtime(&st, &ds, kind)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
         let models = st.models();
-        let r = resolve(
+        let r = resolve_with_index_codec(
             kind,
             &st.settings.declared(),
             &ds.name,
             rt,
             Providers::Checked(models.as_deref()),
+            super::index::current_codec(kind, &ds),
         );
         Ok(with_etag(&r, &ds.name))
     })
@@ -560,22 +581,24 @@ async fn put_kind(
     State(st): St,
     Path((name, kind)): Path<(String, String)>,
     headers: HeaderMap,
+    Extension(principal): Extension<Principal>,
     AdminBody(body): AdminBody,
 ) -> ApiResult<Response> {
     let ds = dataset(&st, &name)?;
     let kind = kind_of(&kind)?;
-    write_kind(st, ds, kind, Write::Put(body), &headers).await
+    write_kind(st, ds, kind, Write::Put(body), &headers, &principal).await
 }
 
 async fn patch_kind(
     State(st): St,
     Path((name, kind)): Path<(String, String)>,
     headers: HeaderMap,
+    Extension(principal): Extension<Principal>,
     AdminBody(body): AdminBody,
 ) -> ApiResult<Response> {
     let ds = dataset(&st, &name)?;
     let kind = kind_of(&kind)?;
-    write_kind(st, ds, kind, Write::Patch(body), &headers).await
+    write_kind(st, ds, kind, Write::Patch(body), &headers, &principal).await
 }
 
 #[derive(Deserialize)]
@@ -591,11 +614,12 @@ async fn delete_kind(
     State(st): St,
     Path((name, kind)): Path<(String, String)>,
     headers: HeaderMap,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<FieldParam>,
 ) -> ApiResult<Response> {
     let ds = dataset(&st, &name)?;
     let kind = kind_of(&kind)?;
-    write_kind(st, ds, kind, Write::Delete(q.field), &headers).await
+    write_kind(st, ds, kind, Write::Delete(q.field), &headers, &principal).await
 }
 
 // ------------------------------------------------------ server-wide kinds (§11.3) ------

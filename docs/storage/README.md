@@ -21,6 +21,35 @@ The storage engine combines TDB2-style bulk loads, durable transactions, compact
 * **Numeric side column.** `vocab.num` stores the exact 8-byte numeric value of every non-canonical numeric literal (such as `xsd:float` coordinates or `xsd:int`), allowing range filters, sorts, and aggregates to avoid string decoding. Bulk loads and compactions write it automatically; `sparkles vocab-index` builds it for existing datasets ([USAGE.md](../USAGE.md#command-line-tools)).
 * **Planner statistics and predicate patterns.** Generations retain predicate, class, and graph statistics plus per-subject predicate patterns for the default graph and the union of named graphs ([X11](../specs/X11-index-compression-and-predicate-patterns.md#outcome)). Corrected against the live delta, predicate patterns accelerate `GROUP BY ?p` with `COUNT(DISTINCT ?s)`, `SELECT DISTINCT ?p`, `spk:hasPredicate` (`ql:has-predicate`), and class profiles. Queries under triple protections, RDFS on read, specific named-graph sets, or large deltas fall back to ordinary permutations.
 
+### Dataset index settings
+
+The `index` settings kind controls the codec and pattern tables for future generations
+of a dataset. The `vocabCodec` field takes `front` or `fsst`, and `patterns` takes a
+boolean. Front coding and enabled patterns are the built-in defaults. With
+`serve --settings`, the flags `--vocab-codec` and `--no-patterns` supply server
+defaults below the file's `defaults.index` and `datasets.<name>.index` layers.
+An administrator can override an unlocked field at runtime.
+
+```sh
+sparkles settings get org index
+sparkles settings set org index.vocabCodec=fsst index.patterns=false
+sparkles settings reset org index.patterns
+```
+
+The [settings API](../API.md#index-settings) exposes the same layers and locks.
+Rust callers use `Dataset::settings().index()` to read or update the policy.
+A persistent dataset keeps its runtime overrides in `index-settings.json`. Standalone
+loads and compactions also read this layer. With no configured codec, a rebuild keeps
+the current generation's codec. Standalone `sparkles load --loc` and `sparkles compact`
+report when a saved setting overrides `--vocab-codec` or `--no-patterns`.
+
+Bulk loads and compactions capture both options when they start writing a generation.
+A codec change requires a full compaction. Partial compaction can omit pattern tables
+and a full pass builds them when enabled and missing from a prior disabled build.
+A branch relink uses main's generation, including its codec and pattern tables.
+Existing readers keep their generation across a switch. Use `sparkles stats --loc DIR
+--patterns` to see the codec and pattern tables of the current generation.
+
 ### Cold reads
 
 Read paths are tuned for queries running against data that is not resident in the block or OS page cache ([X07](../specs/X07-cold-sparse-reads.md), [API.md](../API.md#the-io-profile)).
@@ -121,7 +150,7 @@ Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
 ### Storage and execution
 
 * **Scale and format cutoff.** The largest measured dataset is English DBpedia (1.24 billion input triples on one machine); larger graphs such as Wikidata have not been benchmarked (roadmap [item 1](../ROADMAP.md)). Databases and backups written before the first-release format cutoff are refused with a message directing `sparkles dump` and `sparkles load`, and `sparkles migrate --check` identifies obsolete files ([X16](../specs/X16-storage-consolidation/SPEC.md#phase-1-first-release-format-cutoff-item-479)).
-* **Codec settings and read-path costs.** FSST vocabulary compression stays off by default because string-heavy queries run 4% to 12% slower and DBpedia exports take 1.05× longer; single-term lookup optimization is roadmap [item 160](../ROADMAP.md). Dataset-local layered settings for vocabulary codecs and predicate patterns remain planned (roadmap [item 343](../ROADMAP.md)). The first query arriving roughly 2 seconds after startup pays idle thread/core wakeup overhead (roadmap [item 572](../ROADMAP.md)), cold `export-1m` at 1.01B takes 1,293 ms with framed columns (4% above unframed, and 17× slower with `SPARKLES_IO_HINTS=off`; roadmap [item 573](../ROADMAP.md)), and warm point lookups run 1.6% to 2.5% more instructions for cold-segment checks (roadmap [item 516](../ROADMAP.md)). Prewarming restores blocks and file pages up to 4 GiB, not the result cache, and may read blocks future queries do not touch.
+* **Codec settings and read-path costs.** FSST vocabulary compression stays off by default because string-heavy queries run 4% to 12% slower and DBpedia exports take 1.05× longer; single-term lookup optimization is roadmap [item 160](../ROADMAP.md). The first query arriving roughly 2 seconds after startup pays idle thread/core wakeup overhead (roadmap [item 572](../ROADMAP.md)), cold `export-1m` at 1.01B takes 1,293 ms with framed columns (4% above unframed, and 17× slower with `SPARKLES_IO_HINTS=off`; roadmap [item 573](../ROADMAP.md)), and warm point lookups run 1.6% to 2.5% more instructions for cold-segment checks (roadmap [item 516](../ROADMAP.md)). Prewarming restores blocks and file pages up to 4 GiB, not the result cache, and may read blocks future queries do not touch.
 * **Caller-owned snapshot retention.** Caller-owned snapshot getters intentionally hand out unbudgeted views that pin their referenced generation and delta storage until dropped (`Store::snapshot`, `Dataset::snapshot`, `QuadIter::snapshot`, `Embedder::snapshot`, `WriteTxn::view`, `WriteTxn::base`, `WriteTxn::read_view`, `Snapshot::without_cache_fill`, `Snapshot::with_overlay`, `sparql::with_union_default`, `Opened::snapshot`, `ReportOutcome::snapshot`, context structs carrying an `Arc<Snapshot>`, and clones of `Snapshot::generation` or `Snapshot::delta`). An uncommitted `WriteTxn::view` or `WriteTxn::read_view` must not be retained past `WriteTxn::discard_terms` or a dry-run drop. Checked transaction reads use `WriteTxn::prepare_read_view`, which reserves transaction snapshot storage up front and returns a `PreparedTxnView` borrowed from the writer so neither the view nor its `ScopedQueryResult` can outlive the transaction or survive vocabulary rollback. Incremental view snapshots retain their credit while readers hold them. See [X14's accounting outcome](../specs/X14-unified-executor/SPEC.md#outcome). `Store::managed_snapshot` returns registry metadata.
 * **Write-path and quota edges.** Intel verification of serial latency for the unified WAL commit path remains in [roadmap item 833](../ROADMAP.md#numbered-phases-of-items-453-455-and-456). [Item 448](../ROADMAP.md#performance-follow-ups) tracks Intel verification of serial spatial inserts and deletes at 10.5M and spatial readers under mixed load at 1.05M. On benchmark drives that alternate between fast (~0.2 ms) and slow (~1.5 ms) write-through states, write-through fences remain faster than flushing fences with a smaller margin in the slow state ([results](../benchmarks/writes/RESULTS.md#fences-in-each-drive-state)). A small first `POST` or `sparkles load` into an empty dataset incurs a ~20 to 25 ms index rebuild compared to 0.7 to 8.5 ms for a transactional first `PUT` (roadmap [item 1097](../ROADMAP.md)). Branch stores share dataset quotas, and preallocated WAL/vocabulary zero padding from non-last-written branches counts toward quota usage (roadmap [item 560](../ROADMAP.md)).
 * **Streaming, spill, and memory accounting.** Remaining eager execution fallbacks, MCP and collected Python result buffering, non-spilling `DISTINCT` above `ORDER BY` or rankings, single-group spill bounds, extra merge passes on order-dependent spilled joins, and partly ordered `DISTINCT` admission are tracked in roadmap [items 7, 496, 497, and 498](../ROADMAP.md). Graph views, commit-time view maintenance, and live query profiling remain in roadmap [items 17 and 27](../ROADMAP.md). Queries nesting past 4,000 plan levels (over 1,998 triple patterns in one BGP) are refused, quadratic BGP planning takes ~3 s at 1,998 patterns, and `/{ds}/sparql/explain` caps plan depth at 256 (roadmap [item 84](../ROADMAP.md)). Self-`SERVICE` runs in-process only from SPARQL endpoints, validation/diff/stats endpoints hold an outer admission slot while running inner queries, and eager `CONSTRUCT`/`DESCRIBE` retains peak pool credit until dropped (roadmap [item 7](../ROADMAP.md)). Server caches count value bytes rather than allocator overhead (~1.2× heap for the result cache; ten datasets at `--cache-mb 32` use 1.157× predicted anonymous memory; roadmap [item 88](../ROADMAP.md)).

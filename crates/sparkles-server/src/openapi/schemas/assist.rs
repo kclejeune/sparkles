@@ -3039,8 +3039,9 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                 ],
                 json!({
                     "dataset": string(),
-                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes", "graphrag", "paths", "forms", "evidence"]),
+                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes", "graphrag", "paths", "forms", "evidence", "index"]),
                     "effective": any_object("The effective object: the built-in defaults, the declared values and the runtime layer merged, with the locked fields from the settings file."),
+                    "base": with_desc(sref("IndexSettings"), "The index settings inherited from the selected generation, server invocation and declared settings before runtime overrides."),
                     "declared": any_object("The settings file's `defaults` and dataset entry for this kind, merged."),
                     "runtime": any_object("The runtime layer: the fields changed through the API. `null` removes a declared member."),
                     "sources": { "type": "object", "description": "The source of each field of `effective`, by dotted path such as `budget.perRequest`.", "additionalProperties": source },
@@ -3055,6 +3056,20 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
             ),
             "One settings kind of a dataset with its layers and sources.",
             "settings",
+        ),
+    );
+    put(
+        "IndexSettings",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "vocabCodec": or_null(string_enum(&["front", "fsst"])),
+                    "patterns": or_null(boolean()),
+                }),
+            ),
+            "Vocabulary and predicate pattern settings for future generation builds. Null clears the runtime override in a write.",
+            "index-settings",
         ),
     );
     put(

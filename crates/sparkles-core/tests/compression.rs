@@ -212,3 +212,18 @@ fn text_doc_store_uses_zstd_and_lz4_on_request() {
     );
     assert_eq!(hits(&store), zstd_hits);
 }
+
+#[cfg(not(feature = "zstd"))]
+#[test]
+fn zstd_requires_the_native_feature() {
+    let frame_magic = &[0x28, 0xb5, 0x2f, 0xfd][..];
+    assert!(!Codec::Zstd.supported());
+    assert!(matches!(
+        Codec::Zstd.reader(frame_magic, None),
+        Err(sparkles_core::Error::Unsupported(ref msg)) if msg.contains("built without zstd")
+    ));
+    assert!(matches!(
+        Codec::Zstd.writer(Vec::new(), None, 1),
+        Err(sparkles_core::Error::Unsupported(ref msg)) if msg.contains("built without zstd")
+    ));
+}

@@ -3925,25 +3925,25 @@ export interface paths {
         };
         /**
          * Get a settings kind
-         * @description The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer. The `evidence` kind needs `admin` on the dataset and includes `recorded`.
+         * @description The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer. The `evidence` kind needs `admin` on the dataset and includes `recorded`. The `index` kind accepts `?branch=NAME` and includes its resolved `base`.
          */
         get: operations["getSettings"];
         /**
          * Set a settings kind
-         * @description Makes the effective object equal to the body, with built-in defaults for the members it leaves out and the current value for locked fields it leaves out. The runtime layer keeps the fields where the body differs from the declared values and the defaults. Needs `admin`.
+         * @description Makes the effective object equal to the body, with built-in defaults for the members it leaves out and the current value for locked fields it leaves out. The runtime layer keeps the fields where the body differs from the declared values and the defaults. For `index`, explicit values including equal ones are stored, and omitted or null fields inherit the resolved base. The `index` kind accepts `?branch=NAME` and requires `admin` on the whole dataset.
          */
         put: operations["putSettings"];
         post?: never;
         /**
          * Reset settings
-         * @description Clears the runtime layer, or with `field` one field of it, so the declared values and the defaults apply. Needs `admin`.
+         * @description Clears the runtime layer, or with `field` one field of it, so the declared values and the defaults apply. Needs `admin` on the whole dataset for `index`, including when `?branch=NAME` selects a branch.
          */
         delete: operations["resetSettings"];
         options?: never;
         head?: never;
         /**
          * Change settings fields
-         * @description Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. A change to a locked field is a `409` with `locked-by-config` and `fields`, and an `endpoint` or `apiKey` anywhere is a `400`. Needs `admin`.
+         * @description Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. A change to a locked field is a `409` with `locked-by-config` and `fields`, and an `endpoint` or `apiKey` anywhere is a `400`. Needs `admin` on the whole dataset for `index`, including when `?branch=NAME` selects a branch.
          */
         patch: operations["patchSettings"];
         trace?: never;
@@ -9269,6 +9269,11 @@ export interface components {
             }[];
             snapshots: number;
         };
+        /** @description Vocabulary and predicate pattern settings for future generation builds. Null clears the runtime override in a write. */
+        IndexSettings: {
+            patterns?: boolean | null;
+            vocabCodec?: ("front" | "fsst") | null;
+        };
         /** @description The triple to explain and the limits of the search. */
         InferenceExplainRequest: {
             maxDepth?: number;
@@ -13275,6 +13280,8 @@ export interface components {
         };
         /** @description One settings kind of a dataset with its layers and sources. */
         SettingsKind: {
+            /** @description The index settings inherited from the selected generation, server invocation and declared settings before runtime overrides. */
+            base?: components["schemas"]["IndexSettings"];
             dataset: string;
             /** @description The settings file's `defaults` and dataset entry for this kind, merged. */
             declared: {
@@ -13287,7 +13294,7 @@ export interface components {
             /** @description The entity tag of the runtime layer, as in the `ETag` header. */
             etag: string;
             /** @enum {string} */
-            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths" | "forms" | "evidence";
+            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths" | "forms" | "evidence" | "index";
             /** @description The fields the settings file locks. */
             locked: string[];
             /** @description Locked fields whose runtime value is kept in the file but ignored. */
@@ -14918,8 +14925,8 @@ export interface components {
         ifMatch: string;
         /** @description Entity tags, or `*`. */
         ifNoneMatch: string;
-        /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
-        kind: "assistant" | "memory" | "ingest" | "graphrag" | "forms" | "models" | "notifications";
+        /** @description The dataset or server-wide settings kind. */
+        kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths" | "forms" | "evidence" | "index" | "models" | "notifications" | "connections";
         /** @description The page size. */
         limit: number;
         /** @description The local path appended to the hosted namespace IRI. */
@@ -25411,7 +25418,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The dataset or server-wide settings kind. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -25441,7 +25448,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The dataset or server-wide settings kind. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -25482,7 +25489,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The dataset or server-wide settings kind. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -25515,7 +25522,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The dataset or server-wide settings kind. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -25598,12 +25605,15 @@ export interface operations {
     };
     getSettings: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description For the index kind, the branch whose generation supplies the inherited codec. The runtime layer is shared by the dataset. */
+                branch?: string;
+            };
             header?: never;
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The dataset or server-wide settings kind. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -25628,7 +25638,10 @@ export interface operations {
     };
     putSettings: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description For the index kind, the branch whose generation supplies the inherited codec. The runtime layer is shared by the dataset. */
+                branch?: string;
+            };
             header?: {
                 /** @description The `etag` of the runtime layer the change is based on. */
                 "If-Match"?: string;
@@ -25636,12 +25649,12 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The dataset or server-wide settings kind. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. */
+        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `IndexSettings`. */
         requestBody: {
             content: {
                 "application/json": {
@@ -25674,6 +25687,8 @@ export interface operations {
             query?: {
                 /** @description A dotted field such as `historyDays` or `budget.perRequest`. */
                 field?: string;
+                /** @description For the index kind, the branch whose generation supplies the inherited codec. The runtime layer is shared by the dataset. */
+                branch?: string;
             };
             header?: {
                 /** @description The `etag` of the runtime layer the change is based on. */
@@ -25682,7 +25697,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The dataset or server-wide settings kind. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -25710,7 +25725,10 @@ export interface operations {
     };
     patchSettings: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description For the index kind, the branch whose generation supplies the inherited codec. The runtime layer is shared by the dataset. */
+                branch?: string;
+            };
             header?: {
                 /** @description For an assistant ingestion enable patch, percent-encoded JSON naming the approved settings fields, document recipients, and the modelRevision from assistant status. A changed proposal returns 412. */
                 "If-Ingest-Confirmation"?: string;
@@ -25720,12 +25738,12 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The dataset or server-wide settings kind. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. */
+        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `IndexSettings`. */
         requestBody: {
             content: {
                 "application/json": {

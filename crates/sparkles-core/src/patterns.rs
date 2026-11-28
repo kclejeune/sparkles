@@ -140,6 +140,8 @@ pub struct PatternInfo {
     pub bytes: u64,
 }
 
+pub(crate) const DISABLED_FOR_BUILD: &str = "turned off for this build";
+
 impl PatternInfo {
     pub fn skipped(why: impl Into<String>) -> PatternInfo {
         PatternInfo {

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Dataset-local index settings
+
+The `index` settings kind controls vocabulary compression and predicate patterns for
+future bulk builds and compactions. It supports front coding, optional FSST, and a
+boolean pattern switch. The CLI, HTTP API and embedded Rust handles read the saved
+policy without relabeling existing generations. Builds without the native zstd
+feature continue to refuse zstd input.
+
 ### Rooted classification keeps the Horn share (item 1286)
 
 A classification with `Limits::rooted` and without `Limits::counting` no longer trades the

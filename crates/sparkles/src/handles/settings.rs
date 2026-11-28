@@ -8,7 +8,8 @@ use crate::history::{CatalogHorizon, HistoryStatus, Retention, Schedule};
 use crate::sparql::AggregateErrors;
 use crate::sparql::describe::{DescribeMode, DescribeOptions};
 use crate::store::{
-    ChangeLogSettings, ChangeLogStatus, CompactionMeasures, CompactionSettings, QuotaStatus,
+    ChangeLogSettings, ChangeLogStatus, CompactionMeasures, CompactionSettings, IndexSettings,
+    QuotaStatus,
 };
 use crate::store::{CompactionPolicy, Trigger};
 use serde::Serialize;
@@ -20,6 +21,13 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// The vocabulary codec and predicate patterns for future generation builds.
+    pub fn index(&self) -> IndexSetting {
+        IndexSetting {
+            ds: self.ds.clone(),
+        }
+    }
+
     /// Automatic compaction (`compaction.json`).
     pub fn compaction(&self) -> CompactionSetting {
         CompactionSetting {
@@ -61,6 +69,34 @@ impl Settings {
         ChangeLogSetting {
             ds: self.ds.clone(),
         }
+    }
+}
+
+/// The build settings shared by a dataset and its branches.
+#[derive(Clone)]
+pub struct IndexSetting {
+    ds: Dataset,
+}
+
+impl IndexSetting {
+    /// Choices for the next build under the current policy.
+    pub fn get(&self) -> IndexSettings {
+        self.ds.store().index_settings()
+    }
+
+    /// The dataset's own overrides, with inherited fields absent.
+    pub fn layer(&self) -> IndexSettings {
+        self.ds.store().index_settings_layer()
+    }
+
+    /// Replace the dataset's overrides. Use the main dataset to edit them.
+    pub fn set(&self, settings: IndexSettings) -> Result<()> {
+        self.ds.store().set_index_settings(settings)
+    }
+
+    /// Remove the dataset's overrides.
+    pub fn reset(&self) -> Result<()> {
+        self.set(IndexSettings::default())
     }
 }
 

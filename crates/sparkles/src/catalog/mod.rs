@@ -265,11 +265,14 @@ fn failure_kind(e: &Error) -> &'static str {
     }
 }
 
+type IndexSettingsSources = Arc<dyn Fn(&str) -> crate::store::IndexSettingsSource + Send + Sync>;
+
 pub(crate) struct Inner {
     dir: Option<PathBuf>,
     /// Keep the startup-verified database parent open for managed deletes.
     databases: Option<RecoveryDir>,
     options: RwLock<CatalogOptions>,
+    index_settings_sources: RwLock<Option<IndexSettingsSources>>,
     /// the caches every dataset opened by this catalog reads through
     caches: Option<SharedCaches>,
     /// the pool its datasets' queries take grants from
@@ -469,6 +472,7 @@ impl Catalog {
                     .pool_bytes
                     .map(crate::sparql::pool::QueryPool::new),
                 options: RwLock::new(options),
+                index_settings_sources: Default::default(),
                 entries: Arc::new(RwLock::new(BTreeMap::new())),
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
@@ -677,6 +681,7 @@ impl Catalog {
                     .pool_bytes
                     .map(crate::sparql::pool::QueryPool::new),
                 options: RwLock::new(options),
+                index_settings_sources: Default::default(),
                 entries: Arc::new(RwLock::new(BTreeMap::new())),
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
@@ -705,6 +710,21 @@ impl Catalog {
     /// Datasets that are already open keep their options.
     pub fn set_defaults(&self, dataset: DatasetOptions) {
         self.inner.options.write().dataset = dataset;
+    }
+    /// Supply the server's declared index settings to the catalog's stores.
+    #[doc(hidden)]
+    pub fn set_index_settings_sources(
+        &self,
+        source: impl Fn(&str) -> crate::store::IndexSettingsSource + Send + Sync + 'static,
+    ) {
+        let source = Arc::new(source);
+        *self.inner.index_settings_sources.write() = Some(source.clone());
+        for (name, entry) in self.inner.entries.read().iter() {
+            entry
+                .dataset
+                .store()
+                .set_index_settings_source(source(name));
+        }
     }
     pub fn dir(&self) -> Option<&Path> {
         self.inner.dir.as_deref()
@@ -953,23 +973,41 @@ impl Catalog {
             ..self.inner.options.read().dataset.clone()
         }
     }
+    fn index_settings_source(&self, name: &str) -> Option<crate::store::IndexSettingsSource> {
+        self.inner
+            .index_settings_sources
+            .read()
+            .as_ref()
+            .map(|source| source(name))
+    }
+    fn apply_index_settings_source(&self, name: &str, store: &Store) {
+        if let Some(source) = self.index_settings_source(name) {
+            store.set_index_settings_source(source);
+        }
+    }
     fn open_dataset(&self, name: &str, kind: DatasetKind, loc: Option<&Path>) -> Result<Dataset> {
         let mut opts = self.dataset_options(name);
         if let Some(c) = &self.inner.caches {
             opts.store.shared = Some(c.scope());
         }
         match kind {
-            DatasetKind::Memory => Ok(Dataset::from_store_with(
-                Store::in_memory(opts.store.clone()),
-                opts,
-            )),
-            DatasetKind::Persistent => Dataset::open_with(
-                match loc {
+            DatasetKind::Memory => {
+                let store = Store::in_memory(opts.store.clone());
+                self.apply_index_settings_source(name, &store);
+                Ok(Dataset::from_store_with(store, opts))
+            }
+            DatasetKind::Persistent => {
+                let root = match loc {
                     Some(p) => p.to_path_buf(),
                     None => self.database_dir(name)?,
-                },
-                opts,
-            ),
+                };
+                let store = Store::open_with_index_settings(
+                    &root,
+                    opts.store.clone(),
+                    self.index_settings_source(name),
+                )?;
+                Dataset::try_from_store_with(store, opts)
+            }
         }
     }
     /// Why a registered persistent dataset cannot be opened in place, when its root
@@ -1000,6 +1038,7 @@ impl Catalog {
             opts.store.shared = Some(caches.scope());
         }
         let store = Store::open_existing(&self.database_dir(name)?, opts.store.clone(), expected)?;
+        self.apply_index_settings_source(name, &store);
         Dataset::try_from_store_with(store, opts)
     }
     fn require_determinate_registry(&self, name: &str) -> Result<()> {
@@ -1540,6 +1579,7 @@ impl Catalog {
                 }
             }
             entry.dataset.alias = Some(Arc::from(to));
+            self.apply_index_settings_source(to, entry.dataset.store());
             observe(RenameEvent::Publishing(entry.dataset.state().open_id));
             self.inner.entries.write().insert(to.into(), entry);
             return Ok(self.get(to).expect("renamed"));
@@ -1769,6 +1809,7 @@ impl Catalog {
             origin: Some(origin),
             ..self.dataset_options(name)
         };
+        self.apply_index_settings_source(name, &store);
         let ds = Dataset::from_store_with(store, opts);
         ds.state().restore_reasoning(reasoning)?;
         self.inner.entries.write().insert(

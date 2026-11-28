@@ -858,3 +858,90 @@ async fn authoring_consult_hidden_branch_uuid_is_not_an_oracle() {
         "identity oracle responses: {failures:#?}"
     );
 }
+
+#[tokio::test]
+async fn index_settings_require_whole_dataset_admin() {
+    use crate::auth::{Access, Grants, Kind, Level, Principal, Restricted, Scheme};
+    use axum::{Extension, middleware};
+
+    let s = build(Fixture::default());
+    let ds = s.state.attach("br", DbType::Persistent, None).unwrap();
+    ds.dataset
+        .create_branch("work", &Default::default())
+        .unwrap();
+    let router = |grants: Grants, branch| {
+        // A graph-limited admin is an effective principal the TOML grant syntax
+        // refuses to construct. Inject it at the boundary checked by the handler.
+        let p =
+            Principal::new(Kind::User, "test", Scheme::Basic, Access::of(grants)).on_branch(branch);
+        crate::settings::http::routes()
+            .with_state(s.state.clone())
+            .layer(Extension(p))
+            .layer(middleware::from_fn_with_state(
+                s.state.clone(),
+                crate::http::branches::select,
+            ))
+    };
+    let headers = [("content-type", "application/json")];
+    for (branches, graphs) in [
+        (Some(vec!["work".into()]), None),
+        (None, Some(vec!["http://example.org/allowed".into()])),
+    ] {
+        let grants = Grants {
+            restricted: vec![Restricted {
+                dataset: "br".into(),
+                level: Level::Admin,
+                branches,
+                graphs,
+                endpoints: None,
+                lifts: vec![],
+                server_models: false,
+            }],
+            ..Default::default()
+        };
+        for branch in [None, Some("work")] {
+            let app = router(grants.clone(), branch);
+            let uri = if branch.is_some() {
+                "/$/settings/br/index?branch=work"
+            } else {
+                "/$/settings/br/index"
+            };
+            if branch.is_some() {
+                let r = call(&app, "GET", uri, &headers, "").await;
+                assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            }
+            for method in ["PUT", "PATCH", "DELETE"] {
+                let body = if method == "DELETE" {
+                    ""
+                } else {
+                    r#"{"patterns":false}"#
+                };
+                let r = call(&app, method, uri, &headers, body).await;
+                assert_eq!(
+                    r.status,
+                    StatusCode::FORBIDDEN,
+                    "{method} {uri}: {}",
+                    r.text()
+                );
+                assert!(r.text().contains("admin on the whole dataset"));
+            }
+        }
+    }
+    let app = router(
+        Grants {
+            datasets: vec![("br".into(), Level::Admin)],
+            ..Default::default()
+        },
+        Some("work"),
+    );
+    let r = call(
+        &app,
+        "PATCH",
+        "/$/settings/br/index?branch=work",
+        &headers,
+        r#"{"patterns":false}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["effective"]["patterns"], false);
+}
