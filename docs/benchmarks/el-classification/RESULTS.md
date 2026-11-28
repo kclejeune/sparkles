@@ -2213,8 +2213,7 @@ files in `fz` and `gen` in both configurations across every arm (1,380 rows), le
   three arms (new default, previous default and both off), the patched `m1247` side-table
   build matches the patched `flip` build on claims, HermiT agreement and completeness, and
   matches derived conclusion counts apart from one `p3` row (`p201109.ofn` in `4e`, 46 on
-  patched `flip` against 47 on patched `m1247`, a 1-conclusion difference also seen between
-  runs of one build). Peak
+  patched `flip` against 47 on patched `m1247`). Peak
   estimated memory with repair off drops by multiples of 8 bytes (at most 1,488 bytes) and
   with repair on rises by a median of 0.03% (at most 512 bytes for the table and its slots).
 - **Concurrent four-worker correctness and open Intel timing.** Separate repeated runs with
