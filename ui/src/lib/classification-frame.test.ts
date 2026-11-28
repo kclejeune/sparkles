@@ -4,6 +4,7 @@ import type {
   ClassificationResult,
   ClassificationView,
   KeptClassification,
+  KeptAxioms,
 } from './classification-read';
 
 const view: ClassificationView = {
@@ -71,6 +72,58 @@ function server(answer: (call: Call) => Response | Promise<Response>) {
   });
   return calls;
 }
+function entity(call: Call, overrides: Partial<KeptClassification> = {}) {
+  const iri = call.url.searchParams.get('iri');
+  const classification = available(overrides);
+  const initial = (part: 'parents' | 'equivalents', nameIri: string) => ({
+    part,
+    about: iri,
+    offset: 0,
+    limit: 100,
+    total: 1,
+    items: [name(nameIri)],
+    nextOffset: null,
+  });
+  return response({
+    commit: classification.commit,
+    iri,
+    classification: {
+      ...classification,
+      source: 'keptClassification',
+      covers: ['namedClass'],
+      parents: initial('parents', 'urn:Parent'),
+      equivalents: initial('equivalents', 'urn:Alias'),
+      children: null,
+    },
+  });
+}
+const notFound = () => response({ error: 'not an asserted named class' }, 404);
+const isEntity = (call: Call) => call.url.pathname.endsWith('/entity');
+const isStatus = (call: Call) => call.url.searchParams.get('part') === 'status';
+const statusOrEntity = (call: Call, overrides: Partial<KeptClassification> = {}) =>
+  isEntity(call) ? entity(call, overrides) : page(call, overrides);
+const axiomItem = (i: number) => ({
+  type: 'SubClassOf',
+  ofn: `SubClassOf(<urn:C${i}> <urn:A>)`,
+  axiom: { type: 'SubClassOf', subClass: `urn:C${i}`, superClass: 'urn:A' },
+});
+function axioms(call: Call, overrides: Partial<KeptAxioms> = {}) {
+  const offset = Number(call.url.searchParams.get('offset'));
+  const limit = 100;
+  const total = 101;
+  return response({
+    ...available(),
+    source: 'keptClassification',
+    offset,
+    total,
+    limit,
+    axioms: Array.from({ length: Math.min(limit, total - offset) }, (_, i) =>
+      axiomItem(i + offset),
+    ),
+    next: offset === 0 ? limit : null,
+    ...overrides,
+  });
+}
 function page(call: Call, overrides: Partial<KeptClassification> = {}) {
   const q = call.url.searchParams;
   const part = q.get('part');
@@ -103,7 +156,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe('one pinned class frame', () => {
   it('does not retry an identical parent view when its containing term refreshes', async () => {
-    const calls = server(page);
+    const calls = server(statusOrEntity);
     const controller = new ClassificationFrame();
     await controller.reset(view);
     await controller.reset({
@@ -111,63 +164,137 @@ describe('one pinned class frame', () => {
       selection: { ...view.selection },
       languages: [...view.languages],
     });
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(2);
     expect(controller.parts.parents.items).toHaveLength(1);
   });
   it('changes label languages under the same immutable pin, without computing', async () => {
-    const calls = server(page);
+    const calls = server(statusOrEntity);
     const controller = new ClassificationFrame();
     await controller.reset(view);
     await controller.reset({ ...view, languages: ['fr'] });
-    expect(calls).toHaveLength(6);
-    for (const call of calls.slice(3)) {
+    expect(calls).toHaveLength(4);
+    for (const call of calls.slice(2)) {
       expect(call.url.searchParams.get('resultId')).toBe('result-a');
       expect(call.url.searchParams.get('lang')).toBe('fr');
       expect(call.init.method ?? 'GET').toBe('GET');
     }
   });
   it('autoloads through GET only, with exact branch, graph, commit, language and one pin', async () => {
-    const calls = server(page);
+    const calls = server(statusOrEntity);
     const controller = new ClassificationFrame();
     await controller.reset(view);
     expect(controller.parts.parents.items).toEqual([name('urn:Parent')]);
     expect(controller.parts.equivalents.items).toEqual([name('urn:Alias')]);
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(2);
     for (const { url, init } of calls) {
       expect(init.method ?? 'GET').toBe('GET');
       expect(init.cache).toBe('no-store');
-      expect(url.pathname).toContain('ds/classification');
+      if (url.pathname.endsWith('/entity')) {
+        expect(url.searchParams.get('iri')).toBe('urn:A');
+        expect(url.searchParams.get('kind')).toBe('Class');
+        expect(url.searchParams.get('classification')).toBe('kept');
+        expect(url.searchParams.get('resultId')).toBe('result-a');
+      } else {
+        expect(url.pathname).toContain('ds/classification');
+        expect(url.searchParams.get('part')).toBe('status');
+      }
       expect(url.searchParams.get('branch')).toBe('dev');
       expect(url.searchParams.get('graph')).toBe('urn:open');
       expect(url.searchParams.get('at')).toBe('commit:7');
       expect(url.searchParams.get('lang')).toBe('en');
       expect(url.searchParams.has('inferences')).toBe(false);
-      if (url.searchParams.get('part') !== 'status')
-        expect(url.searchParams.get('resultId')).toBe('result-a');
     }
   });
   it.each(['unavailable', 'running', 'mismatch'] as const)(
     'represents %s without computation or borrowed outcome',
     async (status) => {
-      const calls = server(() =>
-        response(available({ status, result: null, outcome: null, entity: null })),
+      const calls = server((call) =>
+        page(call, { status, result: null, outcome: null, entity: null }),
       );
       const controller = new ClassificationFrame();
       await controller.reset(view);
       expect(controller.reply?.status).toBe(status);
       expect(controller.reply?.outcome).toBeNull();
       expect(calls).toHaveLength(1);
+      expect(isStatus(calls[0])).toBe(true);
       await controller.refresh();
       expect(calls.every((c) => c.init.method !== 'POST')).toBe(true);
     },
   );
+  it('reads taxonomy axioms only on demand and pages at the entity result pin', async () => {
+    const calls = server((call) =>
+      isStatus(call) || isEntity(call) ? statusOrEntity(call) : axioms(call),
+    );
+    const model = new ClassificationFrame();
+    await model.reset(view);
+    expect(calls).toHaveLength(2);
+    expect(model.parts.axioms.loaded).toBe(false);
+    await model.more('axioms');
+    await model.more('axioms');
+    expect(model.parts.axioms.items).toHaveLength(101);
+    expect(model.parts.axioms.items.at(-1)).toEqual(axiomItem(100));
+    expect(model.parts.axioms.next).toBeNull();
+    for (const [i, { url, init }] of calls.slice(2).entries()) {
+      expect(url.pathname).toContain('ds/axioms');
+      expect(Object.fromEntries(url.searchParams)).toMatchObject({
+        classification: 'kept',
+        about: 'urn:A',
+        resultId: 'result-a',
+        at: 'commit:7',
+        graph: 'urn:open',
+        imports: 'true',
+        branch: 'dev',
+        offset: String(i * 100),
+      });
+      expect(init.method ?? 'GET').toBe('GET');
+      expect(init.cache).toBe('no-store');
+    }
+  });
+  it('clears entity and axiom rows when the axiom continuation loses its producer', async () => {
+    const calls = server((call) => {
+      if (isStatus(call) || isEntity(call)) return statusOrEntity(call);
+      return call.url.searchParams.get('offset') === '100'
+        ? axioms(call, {
+            status: 'mismatch',
+            reason: 'resultChanged',
+            result: null,
+            outcome: null,
+            entity: null,
+            axioms: null,
+            total: null,
+            next: null,
+          })
+        : axioms(call);
+    });
+    const model = new ClassificationFrame();
+    await model.reset(view);
+    await model.more('axioms');
+    await model.more('axioms');
+    expect(model.reply?.reason).toBe('resultChanged');
+    expect(model.reply?.result).toBeNull();
+    expect(model.parts.parents.items).toEqual([]);
+    expect(model.parts.axioms.items).toEqual([]);
+    expect(calls).toHaveLength(4);
+  });
+  it('keeps a permission failure visible without falling back to another kept route', async () => {
+    const calls = server((call) =>
+      isStatus(call) ? page(call) : response({ error: 'entity read denied' }, 403),
+    );
+    const model = new ClassificationFrame();
+    await model.reset(view);
+    expect(model.error).toContain('entity read denied');
+    expect(model.reply?.result).toEqual(result);
+    expect(model.parts.parents.items).toEqual([]);
+    expect(calls).toHaveLength(2);
+  });
   it('keeps successful rows and exact provenance when another page fails, and retries GET', async () => {
     let fail = true;
-    const calls = server((c) =>
-      c.url.searchParams.get('part') === 'equivalents' && fail
+    const calls = server((c) => {
+      if (isEntity(c)) return notFound();
+      return c.url.searchParams.get('part') === 'equivalents' && fail
         ? response({ error: 'read failed' }, 503)
-        : page(c),
-    );
+        : page(c);
+    });
     const controller = new ClassificationFrame();
     await controller.reset(view);
     expect(controller.parts.parents.items).toHaveLength(1);
@@ -181,18 +308,19 @@ describe('one pinned class frame', () => {
   });
   it('invalidates all assembled clauses on a replaced result and ignores a late successful page', async () => {
     const late = deferred<Response>();
-    const calls = server((c) =>
-      c.url.searchParams.get('part') === 'parents'
+    const calls = server((c) => {
+      if (isEntity(c)) return notFound();
+      return c.url.searchParams.get('part') === 'parents'
         ? late.promise
         : c.url.searchParams.get('part') === 'equivalents'
           ? response(available({ status: 'mismatch', result: null, outcome: null }))
-          : page(c),
-    );
+          : page(c);
+    });
     const controller = new ClassificationFrame();
     const loading = controller.reset(view);
-    await vi.waitFor(() => expect(calls).toHaveLength(3));
+    await vi.waitFor(() => expect(calls).toHaveLength(4));
     await vi.waitFor(() => expect(controller.reply?.status).toBe('mismatch'));
-    late.resolve(page(calls[1]));
+    late.resolve(page(calls[2]));
     await loading;
     expect(controller.parts.parents.items).toEqual([]);
     expect(controller.parts.equivalents.items).toEqual([]);
@@ -206,7 +334,7 @@ describe('one pinned class frame', () => {
         initial = false;
         return old.promise;
       }
-      return response(available({ commit: 8, status: 'unavailable', result: null, outcome: null }));
+      return page(c, { commit: 8, status: 'unavailable', result: null, outcome: null });
     });
     const controller = new ClassificationFrame();
     const before = controller.reset(view);
@@ -249,7 +377,7 @@ describe('one pinned class frame', () => {
               retention: { kept: false, resultId: null },
             },
           })
-        : response(available({ status: 'unavailable', result: null, outcome: null })),
+        : page(c, { status: 'unavailable', result: null, outcome: null }),
     );
     const controller = new ClassificationFrame();
     await controller.reset(view);
@@ -301,7 +429,7 @@ describe('one pinned class frame', () => {
               retention: { kept: false, resultId: null },
             },
           })
-        : response(available({ status: 'unavailable', result: null, outcome: null, entity: null })),
+        : page(c, { status: 'unavailable', result: null, outcome: null, entity: null }),
     );
     const controller = new ClassificationFrame();
     await controller.reset(view);
@@ -339,7 +467,7 @@ describe('one pinned class frame', () => {
       },
       entity: { iri: 'urn:A', present: true, unsatisfiable: false, incomplete: true },
     };
-    const calls = server((c) => page(c, retainedIncomplete));
+    const calls = server((c) => statusOrEntity(c, retainedIncomplete));
     const controller = new ClassificationFrame();
     await controller.reset(view);
     expect(controller.reply?.outcome?.partial).toBe(false);
@@ -380,7 +508,7 @@ describe('one pinned class frame', () => {
               retention: { kept: false, resultId: null },
             },
           })
-        : response(available({ status: 'unavailable', result: null, outcome: null, entity: null })),
+        : page(c, { status: 'unavailable', result: null, outcome: null, entity: null }),
     );
     const controller = new ClassificationFrame(undefined, acceptResult);
     await controller.reset(view);
@@ -419,7 +547,7 @@ describe('one pinned class frame', () => {
               retention: { kept: true, resultId: result.resultId },
             },
           })
-        : response(available({ status: 'unavailable', result: null, outcome: null, entity: null })),
+        : page(c, { status: 'unavailable', result: null, outcome: null, entity: null }),
     );
     const controller = new ClassificationFrame(undefined, acceptResult);
     await controller.reset(view);
@@ -433,9 +561,7 @@ describe('one pinned class frame', () => {
     let posts = 0;
     server((c) => {
       if (c.init.method !== 'POST')
-        return response(
-          available({ status: 'unavailable', result: null, outcome: null, entity: null }),
-        );
+        return page(c, { status: 'unavailable', result: null, outcome: null, entity: null });
       posts++;
       if (posts === 1) return response({ error: 'classification timed out' }, 408);
       return response({

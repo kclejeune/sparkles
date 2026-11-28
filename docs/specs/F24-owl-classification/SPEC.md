@@ -1484,9 +1484,10 @@ the listing also refuses `assertions` and `format=ofn`, kept pages take limits f
 a `GET` that names the selector are `Cache-Control: no-store`, including the refusals of
 authentication, the rate limiter and the pool admission that come before the route. A
 kept HTTP read stops when its client disconnects, and the listing polls the request's
-controls while it scans the taxonomy, renders its rows and serializes the page. The reads cover named classes. Property and
-individual entailments stay with items 609 and 622, and justifications with F24's
-remaining phases.
+controls while it scans the taxonomy, renders its rows and serializes the page. The reads cover named classes. The Workbench reads these entity reports and pages
+through the emitted taxonomy axioms. Item 1380 tracks property and individual entailments
+for the trees and frames. Item 1381 tracks explanation links for matching F24
+justifications.
 
 `Ontologies::at_snapshot` pins a handle to a snapshot that a read transaction or a
 historical view holds. Every read of the handle answers at that snapshot without
@@ -1803,7 +1804,7 @@ source and access checks apply to hierarchy continuation and frame clauses. Mate
 property/individual views use a separate recorded-profile source and never advertise the
 class-only publication as their producer. Item 588's entity and axiom reads use the same
 revision, publication, source and access checks. Matching arbitrary-axiom justifications
-remain open under item 622 and F24's remaining phases.
+remain open under item 1381 and F24's remaining phases.
 
 An optional explicit `projection=frame` on classify branches before legacy whole-node
 and ancestor arrays. It preserves useful direct-parent/equivalent clauses even for an

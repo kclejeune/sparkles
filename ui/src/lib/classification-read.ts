@@ -1,5 +1,5 @@
 // Read-only kept classification pages and the deliberate one-request frame action.
-import { request } from './api';
+import { ApiError, request } from './api';
 import {
   formatTimeoutSeconds,
   type AxiomItem,
@@ -97,13 +97,29 @@ export type KeptClassification = {
   page: ClassificationPage | null;
   staleCommit: number | null;
 };
-export type ClassificationView = {
+export type ClassificationScope = {
   target: string;
   selection: Selection;
-  iri: string;
   commit: number;
   mode: 'lenient' | 'strict';
   languages: string[];
+};
+export type ClassificationView = ClassificationScope & { iri: string };
+export type KeptSelection = Omit<KeptClassification, 'page'>;
+export type KeptEntity = KeptSelection & {
+  source: 'keptClassification';
+  covers: string[];
+  parents: ClassificationPage | null;
+  children: ClassificationPage | null;
+  equivalents: ClassificationPage | null;
+};
+export type KeptAxioms = KeptSelection & {
+  source: 'keptClassification';
+  axioms: AxiomItem[] | null;
+  offset: number;
+  limit: number;
+  total: number | null;
+  next: number | null;
 };
 export type ProjectedClassification = {
   commit: number;
@@ -120,7 +136,7 @@ export type ProjectedClassification = {
     retention: { kept: boolean; resultId: string | null };
   };
 };
-function scope(view: ClassificationView) {
+function scope(view: ClassificationScope) {
   return new URLSearchParams({
     graph: view.selection.graph ?? 'default',
     imports: String(view.selection.imports),
@@ -130,7 +146,7 @@ function scope(view: ClassificationView) {
   });
 }
 export async function readKeptClassification(
-  view: ClassificationView,
+  view: ClassificationScope & { iri?: string },
   query: {
     part?: ClassificationPart;
     offset?: number;
@@ -142,8 +158,9 @@ export async function readKeptClassification(
 ): Promise<KeptClassification> {
   const params = scope(view);
   params.set('part', query.part ?? 'status');
-  if (query.part !== 'sources' && query.part !== 'excluded' && query.part !== 'roots')
-    params.set('about', query.about ?? view.iri);
+  const about = query.about ?? view.iri;
+  if (about && query.part !== 'sources' && query.part !== 'excluded' && query.part !== 'roots')
+    params.set('about', about);
   params.set('limit', String(query.limit ?? CLASSIFICATION_PAGE_SIZE));
   if (query.resultId) params.set('resultId', query.resultId);
   if (query.offset != null) params.set('offset', String(query.offset));
@@ -157,6 +174,93 @@ export async function readKeptClassification(
   );
   return await res.json();
 }
+/** The entity route requires an asserted named class. A taxonomy may also have built-in nodes. */
+export async function readKeptEntity(
+  view: ClassificationView,
+  resultId: string | undefined,
+  signal: AbortSignal,
+): Promise<KeptEntity | null> {
+  const params = scope(view);
+  params.set('classification', 'kept');
+  params.set('iri', view.iri);
+  params.set('kind', 'Class');
+  params.set('limit', String(CLASSIFICATION_PAGE_SIZE));
+  if (resultId) params.set('resultId', resultId);
+  try {
+    const res = await request(`/$/ontology/${encodeURIComponent(view.target)}/entity?${params}`, {
+      headers: { Accept: 'application/json' },
+      cache: 'no-store',
+      signal,
+    });
+    const { commit, iri, classification } = (await res.json()) as {
+      commit: number;
+      iri: string;
+      classification: KeptEntity;
+    };
+    if (
+      commit !== view.commit ||
+      iri !== view.iri ||
+      classification?.source !== 'keptClassification' ||
+      !classification.covers.includes('namedClass')
+    )
+      throw new Error('The kept entity read changed the displayed source or entity.');
+    return classification;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+export async function readKeptAxioms(
+  view: ClassificationView,
+  resultId: string,
+  offset: number,
+  signal: AbortSignal,
+): Promise<KeptAxioms> {
+  const params = scope(view);
+  params.delete('lang');
+  params.set('classification', 'kept');
+  params.set('about', view.iri);
+  params.set('limit', String(CLASSIFICATION_PAGE_SIZE));
+  params.set('offset', String(offset));
+  params.set('resultId', resultId);
+  const res = await request(`/$/ontology/${encodeURIComponent(view.target)}/axioms?${params}`, {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store',
+    signal,
+  });
+  const reply: KeptAxioms = await res.json();
+  if (reply.source !== 'keptClassification')
+    throw new Error('The axiom listing did not return a kept classification source.');
+  return reply;
+}
+
+export function validateKeptSelection(reply: KeptSelection, view: ClassificationScope) {
+  if (reply.commit !== view.commit) throw new Error('The kept read changed the displayed commit.');
+  if (reply.status !== 'available') return;
+  const { result, outcome } = reply;
+  if (
+    !result ||
+    !outcome ||
+    result.classifiedCommit !== view.commit ||
+    result.mode !== view.mode ||
+    result.imports !== (view.selection.imports ? 'dataset' : 'none') ||
+    result.assertions ||
+    result.elOnly
+  )
+    throw new Error('The kept result has no matching source and outcome.');
+}
+
+export function keptAvailability(reply: KeptSelection) {
+  if (reply.status === 'running') return 'Classification is running for this source.';
+  if (reply.reason === 'unsupportedScope') return 'This view does not share a kept classification.';
+  if (reply.staleCommit != null)
+    return `The kept classification is stale. It covers commit ${reply.staleCommit}.`;
+  if (reply.status === 'mismatch')
+    return 'The kept classification does not match this source or result pin.';
+  return 'No kept classification is available for this source.';
+}
+
 /** Only a deliberate Classify action calls this POST. Pagination always uses GET. */
 export async function projectClassification(
   view: ClassificationView,

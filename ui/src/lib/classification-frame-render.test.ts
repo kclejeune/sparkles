@@ -66,6 +66,15 @@ const fixture = vi.hoisted(() => ({
       error: null as string | null,
       failedOffset: null as number | null,
     },
+    axioms: {
+      items: [] as unknown[],
+      total: 0,
+      next: null as number | null,
+      loaded: false,
+      loading: false,
+      error: null as string | null,
+      failedOffset: null as number | null,
+    },
     excluded: {
       items: [] as unknown[],
       total: 0,
@@ -136,6 +145,7 @@ beforeEach(() => {
     equivalents: emptyPage(),
     sources: emptyPage(),
     excluded: emptyPage(),
+    axioms: emptyPage(),
   };
   fixture.isolated = false;
   fixture.error = null;
@@ -229,6 +239,50 @@ describe('ClassificationFrame partial classification rendering', () => {
     expect(body).toContain('omitted or partly used 2');
     expect(body).toContain('triple of the input map to no axiom');
     expect(body).toContain('Classify with deadline or partial options');
+  });
+
+  it('shows a stale source and makes the materialized fallback a distinct action', () => {
+    fixture.reply = {
+      commit: 7,
+      status: 'mismatch',
+      reason: 'commitMismatch',
+      staleCommit: 6,
+      activity: null,
+      entity: null,
+      result: null,
+      outcome: null,
+      page: null,
+    };
+    const body = renderFrame();
+    expect(body).toContain('The kept classification is stale. It covers commit 6.');
+    expect(body).toContain('Read fresh materialized axioms');
+    expect(body).not.toContain('Materialized inferred axioms');
+    expect(body).not.toContain('Kept taxonomy axioms');
+  });
+
+  it('shows the exact kept axiom listing with inferred badges and a page total', () => {
+    fixture.reply = availableReply(
+      {
+        tier: 'el',
+        partial: false,
+        complete: true,
+        consistency: 'consistent',
+        excludedCount: 0,
+        incompleteCount: 0,
+        unmappedCount: 0,
+      },
+      { iri: 'urn:OpenClass', present: true, unsatisfiable: false, incomplete: false },
+    );
+    fixture.parts.axioms = {
+      ...emptyPage(),
+      total: 1,
+      items: [{ type: 'SubClassOf', ofn: 'SubClassOf(<urn:C> <urn:OpenClass>)' }],
+    };
+    const body = renderFrame();
+    expect(body).toContain('Kept taxonomy axioms');
+    expect(body).toContain('SubClassOf(&lt;urn:C> &lt;urn:OpenClass>)');
+    expect(body).toContain('>Inferred<');
+    expect(body).toContain('Read 1 of 1 taxonomy axioms.');
   });
 
   it('distinguishes consistent and inconsistent outcomes from unknown', () => {

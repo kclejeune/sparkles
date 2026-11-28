@@ -4,17 +4,24 @@ import {
   CLASSIFICATION_DISPLAY_CAP,
   CLASSIFICATION_PAGE_SIZE,
   projectClassification,
+  readKeptAxioms,
   readKeptClassification,
+  readKeptEntity,
+  validateKeptSelection,
   type ClassificationFramePart as ClassificationPart,
   type ClassificationResult,
+  type KeptSelection,
   type ClassificationRow,
   type ClassificationView,
   type ClassifyOptions,
   type KeptClassification,
 } from './classification-read';
+import type { AxiomItem } from './ontology';
+
+type FramePart = ClassificationPart | 'axioms';
 
 export type FramePageState = {
-  items: ClassificationRow[];
+  items: (ClassificationRow | AxiomItem)[];
   total: number;
   next: number | null;
   loaded: boolean;
@@ -31,12 +38,44 @@ const emptyPage = (): FramePageState => ({
   error: null,
   failedOffset: null,
 });
-const emptyParts = (): Record<ClassificationPart, FramePageState> => ({
+const emptyParts = (): Record<FramePart, FramePageState> => ({
   parents: emptyPage(),
   equivalents: emptyPage(),
   sources: emptyPage(),
   excluded: emptyPage(),
+  axioms: emptyPage(),
 });
+function pageState(
+  previous: FramePageState['items'],
+  offset: number,
+  returnedOffset: number,
+  limit: number,
+  total: number | null,
+  items: FramePageState['items'] | null,
+  next: number | null,
+): FramePageState {
+  if (
+    returnedOffset !== offset ||
+    limit !== CLASSIFICATION_PAGE_SIZE ||
+    !items ||
+    items.length > limit ||
+    total == null ||
+    !Number.isSafeInteger(total) ||
+    total < offset + items.length ||
+    next !== (total > offset + items.length ? offset + items.length : null) ||
+    (next != null && next <= offset)
+  )
+    throw new Error('The kept result returned an invalid page.');
+  return {
+    items: [...previous.slice(0, offset), ...items],
+    total,
+    next,
+    loaded: true,
+    loading: false,
+    error: null,
+    failedOffset: null,
+  };
+}
 function sameResult(a: ClassificationResult, b: ClassificationResult) {
   return (
     a.resultId === b.resultId &&
@@ -119,21 +158,54 @@ export class ClassificationFrame {
     this.loading = true;
     this.error = null;
     try {
-      const reply = await readKeptClassification(view, { resultId }, this.#abort.signal);
+      const signal = this.#abort.signal;
+      const reply = await readKeptClassification(view, { resultId }, signal);
       if (epoch !== this.#epoch) return;
-      this.#validateStatus(reply, view);
-      if (resultId && reply.result && reply.result.resultId !== resultId)
+      validateKeptSelection(reply, view);
+      const result = reply.result;
+      if (resultId && result && result.resultId !== resultId)
         throw new Error('The kept read changed its selected result pin.');
-      if (reply.status === 'available' && reply.result && !this.acceptResult(reply.result))
+      if (reply.status === 'available' && reply.entity?.iri !== view.iri)
+        throw new Error('The kept read changed the displayed class.');
+      if (reply.status === 'available' && result && !this.acceptResult(result))
         throw new Error(
           'The class frame and hierarchy sources differ. Reload this view to select a new source.',
         );
       this.reply = reply;
-      if (
+      const readClauses =
         reply.status === 'available' &&
+        result &&
         reply.entity?.present &&
-        reply.outcome?.consistency !== 'inconsistent'
-      )
+        reply.outcome?.consistency !== 'inconsistent';
+      const initialParts = emptyParts();
+      let entity = null;
+      if (readClauses) {
+        // A status miss should stay cheap. The entity route also opens the asserted ontology.
+        entity = await readKeptEntity(view, result.resultId, signal);
+        if (epoch !== this.#epoch) return;
+        if (entity) {
+          if (!this.#matchesPage(entity, view, result)) return;
+          if (entity.entity?.iri !== view.iri || !entity.entity.present)
+            throw new Error('The kept entity read changed the displayed class.');
+          // Verify both first pages before publishing either one.
+          for (const part of ['parents', 'equivalents'] as const) {
+            const page = entity[part];
+            if (!page || page.part !== part || page.about !== view.iri)
+              throw new Error('The kept entity returned an invalid clause page.');
+            initialParts[part] = pageState(
+              [],
+              0,
+              page.offset,
+              page.limit,
+              page.total,
+              page.items,
+              page.nextOffset,
+            );
+          }
+        }
+      }
+      this.parts = initialParts;
+      if (readClauses && !entity)
         await Promise.all([this.#page('parents', 0), this.#page('equivalents', 0)]);
     } catch (e) {
       if (epoch === this.#epoch) this.error = errorMessage(e);
@@ -216,7 +288,12 @@ export class ClassificationFrame {
       if (epoch === this.#epoch) this.computing = false;
     }
   }
-  more(part: ClassificationPart) {
+  more(part: FramePart) {
+    if (
+      part === 'axioms' &&
+      (!this.reply?.entity?.present || this.reply.outcome?.consistency === 'inconsistent')
+    )
+      return Promise.resolve();
     const state = this.parts[part];
     const offset = state.failedOffset ?? (state.loaded ? state.next : 0);
     if (
@@ -228,69 +305,71 @@ export class ClassificationFrame {
       return Promise.resolve();
     return this.#page(part, offset);
   }
-  #validateStatus(reply: KeptClassification, view: ClassificationView) {
-    if (reply.commit !== view.commit)
-      throw new Error('The kept read changed the displayed commit.');
-    if (
-      reply.status === 'available' &&
-      (!reply.result || !reply.outcome || reply.result.classifiedCommit !== view.commit)
-    )
-      throw new Error('The kept result has no exact source and outcome.');
+  #matchesPage(reply: KeptSelection, view: ClassificationView, pin: ClassificationResult) {
+    validateKeptSelection(reply, view);
+    if (reply.status === 'available' && reply.result && sameResult(pin, reply.result)) return true;
+    // A replaced result cannot be combined with pages already on screen.
+    this.#epoch++;
+    this.#abort.abort();
+    this.parts = emptyParts();
+    this.reply = {
+      commit: reply.commit,
+      status: reply.status === 'available' ? 'mismatch' : reply.status,
+      reason: reply.reason ?? 'resultReplaced',
+      result: null,
+      outcome: null,
+      entity: null,
+      activity: reply.activity,
+      staleCommit: reply.staleCommit,
+      page: null,
+    };
+    this.loading = false;
+    return false;
   }
-  async #page(part: ClassificationPart, offset: number) {
+  async #page(part: FramePart, offset: number) {
     const view = this.#view;
     const pin = this.reply?.result;
     if (!view || !pin || this.parts[part].loading) return;
     const epoch = this.#epoch;
     this.parts[part] = { ...this.parts[part], loading: true, error: null };
     try {
-      const reply = await readKeptClassification(
-        view,
-        { part, offset, resultId: pin.resultId },
-        this.#abort.signal,
-      );
-      if (epoch !== this.#epoch) return;
-      this.#validateStatus(reply, view);
-      if (reply.status !== 'available' || !reply.result || !sameResult(pin, reply.result)) {
-        // Invalidate the entire assembled clause set, including another page that
-        // may already have succeeded. A new status read must establish a new pin.
-        this.#epoch++;
-        this.#abort.abort();
-        this.parts = emptyParts();
-        this.reply = {
-          ...reply,
-          status: reply.status === 'available' ? 'mismatch' : reply.status,
-          reason: 'resultReplaced',
-          result: null,
-          outcome: null,
-          entity: null,
-          page: null,
-        };
-        this.loading = false;
-        return;
+      const signal = this.#abort.signal;
+      const previous = this.parts[part].items;
+      if (part === 'axioms') {
+        const reply = await readKeptAxioms(view, pin.resultId, offset, signal);
+        if (epoch !== this.#epoch || !this.#matchesPage(reply, view, pin)) return;
+        if (reply.entity?.iri !== view.iri || !reply.entity.present)
+          throw new Error('The kept axiom listing changed the displayed class.');
+        this.parts.axioms = pageState(
+          previous,
+          offset,
+          reply.offset,
+          reply.limit,
+          reply.total,
+          reply.axioms,
+          reply.next,
+        );
+      } else {
+        const reply = await readKeptClassification(
+          view,
+          { part, offset, resultId: pin.resultId },
+          signal,
+        );
+        if (epoch !== this.#epoch || !this.#matchesPage(reply, view, pin)) return;
+        const page = reply.page;
+        const about = part === 'parents' || part === 'equivalents' ? view.iri : null;
+        if (!page || page.part !== part || page.about !== about)
+          throw new Error('The kept result returned an invalid page.');
+        this.parts[part] = pageState(
+          previous,
+          offset,
+          page.offset,
+          page.limit,
+          page.total,
+          page.items,
+          page.nextOffset,
+        );
       }
-      const page = reply.page;
-      const about = part === 'parents' || part === 'equivalents' ? view.iri : null;
-      if (
-        !page ||
-        page.part !== part ||
-        page.about !== about ||
-        page.offset !== offset ||
-        page.items.length > CLASSIFICATION_PAGE_SIZE ||
-        page.total < offset + page.items.length ||
-        (page.nextOffset != null &&
-          (page.nextOffset !== offset + page.items.length || page.nextOffset <= offset))
-      )
-        throw new Error('The kept result returned an invalid page.');
-      this.parts[part] = {
-        items: [...this.parts[part].items.slice(0, offset), ...page.items],
-        total: page.total,
-        next: page.nextOffset,
-        loaded: true,
-        loading: false,
-        error: null,
-        failedOffset: null,
-      };
     } catch (e) {
       if (epoch === this.#epoch)
         this.parts[part] = {

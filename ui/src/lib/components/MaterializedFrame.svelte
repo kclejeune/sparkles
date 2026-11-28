@@ -8,6 +8,7 @@
   import { materializedClauses } from '$lib/materialized-clauses';
   import type { PrefixMap } from '$lib/rdf';
   import MaterializationNotice from './MaterializationNotice.svelte';
+  import KeptCoverageNotice from './KeptCoverageNotice.svelte';
   let {
     target,
     graph,
@@ -35,6 +36,7 @@
     onopen?: (iri: string) => void;
   } = $props();
   const model = new MaterializedFrame();
+  let revision = $state(0);
   $effect(() => {
     const view =
       commit == null
@@ -77,9 +79,15 @@
     <button
       class="btn sm ghost"
       disabled={commit == null || model.loading}
-      onclick={() => void model.refresh()}>Read again</button
+      onclick={() => {
+        revision++;
+        void model.refresh();
+      }}>Read again</button
     >
   </div>
+  {#if kind !== 'Class'}
+    <KeptCoverageNotice {target} {graph} {imports} {commit} {pins} {revision} />
+  {/if}
   {#if commit == null}<p>Waiting for the displayed source commit.</p>
   {:else if model.loading}<p>Reading materialized facts…</p>{/if}
   {#if model.error}<p class="error-box" role="alert">
