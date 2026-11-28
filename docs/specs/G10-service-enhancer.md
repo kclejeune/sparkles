@@ -423,20 +423,22 @@ cross-dataset SERVICE.
   (`Entry::range`). A plain SERVICE records the request text without the slice and the
   slice on its plan node (`ServiceKey`), and a LIMIT that the planner passes into the
   request narrows that slice. A SILENT call reads its whole answer and stores the
-  response once it has read all of it. A non-SILENT call that reaches the LIMIT drops
-  the copy without blocking on the response tail, so the query returns promptly even
-  when the endpoint stalls after the last demanded row. The response is cached only
-  when EOF is observed before or at the LIMIT row.
+  response once it has read all of it. On the eager path, a non-SILENT call reads
+  through EOF and caches the response once it has all of it. On the streamed path, a
+  non-SILENT call that reaches the LIMIT drops the copy without blocking on the
+  response tail, so the query returns promptly even when the endpoint stalls after the
+  last demanded row; the response is cached only when EOF has already been observed
+  before the pushed limit is reached.
   A response to a request without a LIMIT is cached once the response ends.
-  Preservation of a wider slice when replacing an entry is opportunistic in memory:
-  `put` checks the existing entry in memory only, so a disk-only miss on a different
-  slice replaces the entry on disk without that check, which affects the hit rate but
-  not correctness because the stored slice still gates reuse. A hit from a disk-only
-  entry on a different slice serves the matching range, and the new response replaces
-  only entries that hold fewer solutions.  A remote loop splits the slice off its pattern once
-  (`enhancer::outer_slice`). A miss sends the request as the query writes it, and a
-  response replaces the entry of its request only when the entry cannot answer it and
-  holds fewer solutions.
+  For both plain SERVICE and remote loops, `put` checks the existing entry in memory
+  only, so a request whose slice differs from an entry that is on disk but not in
+  memory replaces that entry without the wider-slice check. This affects the hit rate
+  but not correctness, because the stored slice still gates reuse. A hit from a
+  disk-only entry on a different slice serves the matching range. Reservation for the
+  wider-slice memory check on direct dispatch is tracked as roadmap item 1342.
+  A remote loop splits the slice off its pattern once (`enhancer::outer_slice`). A
+  miss sends the request as the query writes it, and a response replaces the entry of
+  its request only when the entry cannot answer it and holds fewer solutions.
 - Every entry carries its scope, endpoint and pattern as lengths into its key
   (`Parts`), so listing and removal compare the caller's scope as a whole and never
   search the key for a separator. The server's scope names the credential with the
@@ -543,10 +545,10 @@ cross-dataset SERVICE.
 - Clones and backups carry neither the directory nor `service-cache.json`, so a clone
   starts with an empty cache and the default setting.
 
-**Tests.** `crates/sparkles-core/tests/service_enhancer.rs` adds eighteen tests against the
+**Tests.** `crates/sparkles-core/tests/service_enhancer.rs` adds thirty-five tests against the
 in-process endpoint. They cover slices answered inside an entry and sent past it, an
 endpoint that caps its responses without saying so, a LIMIT pushed into a plain SERVICE
-in both execution modes, `se:cacheLs` and `se:cacheRm` across two scopes with and
+in both execution modes with request-count assertions, `se:cacheLs` and `se:cacheRm` across two scopes with and
 without the right, `parallel+n` against the requests and the answer of a run one request
 at a time with the endpoint's peak of requests in flight, the deadline that stops
 further waves, cancellation during a wave, the shared outbound time with and without
@@ -554,8 +556,10 @@ SILENT, the memory admission of parallel answers in both modes and of a listing,
 `se:cacheRm` through `fn:apply` and `afn:eval`, listings kept out of the query result
 cache, listings and removals inside a correlated LATERAL and a loop over the dataset
 across two callers, a wave out of time under SILENT, removal in an update, a removal in
-an EXISTS refused when the query is planned, a guarded view whose exemptions change, and
-a disk tier read back after the store is opened again.
+an EXISTS refused when the query is planned, a guarded view whose exemptions change,
+a disk tier read back after the store is opened again, empty LATERAL groups that release
+their plan leases, a truncated bulk response that falls back to individual retries, and
+a stalled response tail that does not block a non-SILENT limited fill.
 `crates/sparkles-core/tests/service_cache_alloc.rs` counts the reading thread's
 allocations to show that a disk entry is refused before it is decoded. Unit tests in `svccache.rs`, `svcdisk.rs`, `store/service_cache.rs`,
 `outbound.rs`, `enhancer.rs`, the server's `auth/api.rs` and the Fuseki converter cover

@@ -106,7 +106,7 @@ fn a_disk_entry_is_admitted_before_it_is_decoded() {
 /// Nested RDF 1.2 triple terms allocate a boxed `Triple` and owned names per nesting
 /// level. The admission counts them from `<<` markers in the raw text before parsing,
 /// so the query budget stops the decoding before the parser reaches its peak (Sol
-/// round-2 P1-2, Sol round-3 P3-1).
+/// round-2 P1-2, Sol round-3 P3-1, Sol round-4 P3-1).
 #[test]
 fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
     let dir = tempfile::tempdir().unwrap();
@@ -124,19 +124,42 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
         ))),
     )));
     let count = 500;
-    let rows = Arc::new(Rows {
+    let url = "http://e/sparql";
+
+    // measure the flat baseline independently with plain literals of the same layout
+    let plain_term = Term::Literal(oxrdf::Literal::new_simple_literal("plain"));
+    let plain_rows = Arc::new(Rows {
+        vars: vec!["v".to_string()],
+        rows: (0..count).map(|_| vec![Some(plain_term.clone())]).collect(),
+    });
+    let pk = key("a", url, "plain-baseline", &[]);
+    cache.put(
+        pk.clone(),
+        Parts::of("a", url, "plain-baseline"),
+        Slice::ALL,
+        plain_rows,
+    );
+    let flat = std::cell::Cell::new(0u64);
+    let pr = cache.get_admitted(&pk, Slice::ALL, &|n| {
+        flat.set(flat.get().saturating_add(n));
+        Ok(())
+    });
+    assert!(pr.unwrap().is_some(), "plain baseline reads back");
+    let flat = flat.get();
+
+    // store the nested entry and measure its total admission
+    let nested_rows = Arc::new(Rows {
         vars: vec!["v".to_string()],
         rows: (0..count)
             .map(|_| vec![Some(triple_term.clone())])
             .collect(),
     });
-    let url = "http://e/sparql";
     let k = key("a", url, "nested", &[]);
     cache.put(
         k.clone(),
         Parts::of("a", url, "nested"),
         Slice::ALL,
-        rows.clone(),
+        nested_rows.clone(),
     );
     let file = cache.disk().unwrap().bytes();
     assert!(file > 0, "the entry is on disk");
@@ -145,14 +168,15 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
         total.set(total.get().saturating_add(n));
         Ok(())
     });
-    let triple_box = std::mem::size_of::<oxrdf::Triple>() as u64 + 3 * 24;
-    let nested_total = count as u64 * 2 * triple_box;
-    let flat = total.get().saturating_sub(nested_total);
-    let budget = flat + nested_total / 2;
+    let total = total.get();
     assert!(
-        budget < total.get(),
-        "the budget {budget} should be less than the total {}",
-        total.get()
+        total > flat,
+        "nested ({total}) should cost more than flat ({flat})"
+    );
+    let budget = (flat + total) / 2;
+    assert!(
+        budget < total,
+        "the budget {budget} should be less than the total {total}"
     );
     let admitted = std::cell::Cell::new(0u64);
     let before = allocated();
@@ -170,5 +194,24 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
         "{spent} bytes allocated under a budget of {budget}"
     );
     let r = cache.get_admitted(&k, Slice::ALL, &|_| Ok(()));
-    assert!(r.unwrap().is_some(), "an ample budget admits the entry");
+    let rows = r.unwrap().expect("an ample budget admits the entry");
+    assert_eq!(rows.rows.len(), count, "all rows returned");
+
+    // a literal containing many `<<` characters round-trips correctly under a tight budget
+    let angle_text = "<<".repeat(50);
+    let angle_term = Term::Literal(oxrdf::Literal::new_simple_literal(&angle_text));
+    let angle_rows = Arc::new(Rows {
+        vars: vec!["v".to_string()],
+        rows: (0..count).map(|_| vec![Some(angle_term.clone())]).collect(),
+    });
+    let ak = key("a", url, "angle-literal", &[]);
+    cache.put(
+        ak.clone(),
+        Parts::of("a", url, "angle-literal"),
+        Slice::ALL,
+        angle_rows.clone(),
+    );
+    let ar = cache.get_admitted(&ak, Slice::ALL, &|_| Ok(()));
+    let angle_back = ar.unwrap().expect("angle literals round-trip");
+    assert_eq!(angle_back.rows.len(), count, "angle literal row count");
 }

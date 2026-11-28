@@ -1695,66 +1695,62 @@ impl RemoteRun {
             for (chunk, answer) in wave.iter().copied().zip(answers) {
                 // the charges that admitted the answers, held until `admit` has them
                 let mut charges = Vec::new();
-                let fetched: Result<Vec<(usize, Rows, bool)>> = if chunk.len() == 1 {
+                let fetched: Result<Vec<(usize, Arc<Rows>, bool)>> = if chunk.len() == 1 {
                     answer.map(|(r, c)| {
                         charges.push(c);
-                        vec![(chunk[0], r, true)]
+                        vec![(chunk[0], Arc::new(r), true)]
                     })
                 } else {
                     match answer {
                         Ok((r, c)) => {
-                            // the parts copy the response and each gets its own
-                            // schema clone and row vector
-                            let schema_bytes: u64 = r
-                                .vars
-                                .iter()
-                                .filter(|v| *v != rl.idx.as_str())
-                                .map(|v| (v.len() + std::mem::size_of::<String>()) as u64)
-                                .sum();
-                            let split_overhead = chunk.len() as u64
-                                * (schema_bytes + std::mem::size_of::<Rows>() as u64);
-                            let admitted = c
-                                .add(r.retained_bytes().saturating_add(split_overhead))
-                                .map(|()| {
-                                    charges.push(c);
-                                    split(&r, &rl.idx, chunk.len())
-                                });
-                            match admitted {
-                                Err(e) => Err(e),
-                                Ok(Some(parts)) => Ok(chunk
-                                    .iter()
-                                    .copied()
-                                    .zip(parts)
-                                    .map(|(i, p)| (i, p, true))
-                                    .collect()),
-                                Ok(None) => {
-                                    drop(r);
-                                    charges.clear();
-                                    stats.retried += 1;
-                                    let mut out = Vec::new();
-                                    let mut err = None;
-                                    let mut retried = held;
-                                    for i in chunk {
-                                        match ctx
-                                            .check()
-                                            .and_then(|()| one(&inputs[*i], stats))
-                                            .and_then(|(r, c)| {
-                                                drop(c);
-                                                retried =
-                                                    retried.saturating_add(r.retained_bytes());
-                                                admit(retried).map(|()| r)
-                                            }) {
-                                            Ok(r) => out.push((*i, r, true)),
-                                            Err(e) => {
-                                                err = Some(e);
-                                                break;
-                                            }
+                            let has_marker = has_end_marker(&r, &rl.idx);
+                            if !has_marker {
+                                drop(r);
+                                drop(c);
+                                stats.retried += 1;
+                                let mut out = Vec::new();
+                                let mut err = None;
+                                let mut retried = held;
+                                for i in chunk {
+                                    match ctx
+                                        .check()
+                                        .and_then(|()| one(&inputs[*i], stats))
+                                        .and_then(|(r, c)| {
+                                            drop(c);
+                                            retried = retried.saturating_add(r.retained_bytes());
+                                            admit(retried).map(|()| r)
+                                        }) {
+                                        Ok(r) => out.push((*i, Arc::new(r), true)),
+                                        Err(e) => {
+                                            err = Some(e);
+                                            break;
                                         }
                                     }
-                                    match err {
-                                        Some(e) => Err(e),
-                                        None => Ok(out),
-                                    }
+                                }
+                                match err {
+                                    Some(e) => Err(e),
+                                    None => Ok(out),
+                                }
+                            } else {
+                                let arc_header = std::mem::size_of::<Arc<Rows>>() as u64;
+                                let schema_bytes: u64 = r
+                                    .vars
+                                    .iter()
+                                    .filter(|v| *v != rl.idx.as_str())
+                                    .map(|v| (v.len() + std::mem::size_of::<String>()) as u64)
+                                    .sum();
+                                let per_part =
+                                    schema_bytes + std::mem::size_of::<Rows>() as u64 + arc_header;
+                                let split_overhead = chunk.len() as u64 * per_part;
+                                let admitted = c
+                                    .add(r.retained_bytes().saturating_add(split_overhead))
+                                    .map(|()| {
+                                        charges.push(c);
+                                        split_arc(&r, &rl.idx, chunk)
+                                    });
+                                match admitted {
+                                    Err(e) => Err(e),
+                                    Ok(parts) => Ok(parts),
                                 }
                             }
                         }
@@ -1764,7 +1760,6 @@ impl RemoteRun {
                 match fetched {
                     Ok(answered) => {
                         for (i, rows, complete) in answered {
-                            let rows = Arc::new(rows);
                             if self.caching
                                 && complete
                                 && rl.cache.writes()
@@ -1780,10 +1775,11 @@ impl RemoteRun {
                 // release the per-fetch charges before admitting the held total, so
                 // the same rows are not counted twice against the budget
                 drop(charges);
+                let arc_overhead = std::mem::size_of::<Arc<Rows>>() as u64;
                 let answered: u64 = chunk
                     .iter()
                     .filter_map(|&i| inputs[i].rows.as_ref())
-                    .map(|rows| rows.retained_bytes())
+                    .map(|rows| rows.retained_bytes().saturating_add(arc_overhead))
                     .sum();
                 held = held.saturating_add(answered);
                 self.held = held;
@@ -1905,12 +1901,23 @@ fn failed(
     }
 }
 
-/// The rows of a bulk response by input, or `None` when the end marker is missing.
-fn split(r: &Rows, idx: &str, n: usize) -> Option<Vec<Rows>> {
-    let ic = r.vars.iter().position(|v| v == idx)?;
+/// Whether the bulk response contains the end marker row.
+fn has_end_marker(r: &Rows, idx: &str) -> bool {
+    let Some(ic) = r.vars.iter().position(|v| v == idx) else {
+        return false;
+    };
+    r.rows.iter().any(|row| {
+        matches!(&row[ic], Some(Term::Literal(i)) if i.value().parse::<i64>().ok() == Some(END_MARKER))
+    })
+}
+
+/// Split a bulk response into per-input `Arc<Rows>`, paired with the chunk index and a
+/// completeness flag. The caller has already verified the end marker is present.
+fn split_arc(r: &Rows, idx: &str, chunk: &[usize]) -> Vec<(usize, Arc<Rows>, bool)> {
+    let n = chunk.len();
+    let ic = r.vars.iter().position(|v| v == idx).expect("index column");
     let vars: Vec<String> = r.vars.iter().filter(|v| *v != idx).cloned().collect();
     let mut counts = vec![0usize; n];
-    let mut marker = false;
     for row in &r.rows {
         let Some(Term::Literal(i)) = &row[ic] else {
             continue;
@@ -1919,15 +1926,11 @@ fn split(r: &Rows, idx: &str, n: usize) -> Option<Vec<Rows>> {
             continue;
         };
         if i == END_MARKER {
-            marker = true;
             continue;
         }
         if let Some(c) = usize::try_from(i).ok().and_then(|i| counts.get_mut(i)) {
             *c += 1;
         }
-    }
-    if !marker {
-        return None;
     }
     let mut parts: Vec<Rows> = counts
         .iter()
@@ -1957,7 +1960,12 @@ fn split(r: &Rows, idx: &str, n: usize) -> Option<Vec<Rows>> {
                 .collect(),
         );
     }
-    Some(parts)
+    chunk
+        .iter()
+        .copied()
+        .zip(parts)
+        .map(|(i, p)| (i, Arc::new(p), true))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2194,16 +2202,21 @@ mod tests {
                 vec![None, lit(END_MARKER)],
             ],
         };
-        let parts = split(&r, "__idx__", 3).unwrap();
+        assert!(has_end_marker(&r, "__idx__"));
+        let chunk = [0, 1, 2];
+        let parts = split_arc(&r, "__idx__", &chunk);
         assert_eq!(
-            parts.iter().map(|p| p.rows.len()).collect::<Vec<_>>(),
+            parts
+                .iter()
+                .map(|(_, p, _)| p.rows.len())
+                .collect::<Vec<_>>(),
             [1, 2, 0]
         );
-        assert_eq!(parts[0].vars, ["o"]);
+        assert_eq!(parts[0].1.vars, ["o"]);
         let cut = Rows {
             vars: r.vars.clone(),
             rows: r.rows[..2].to_vec(),
         };
-        assert!(split(&cut, "__idx__", 3).is_none());
+        assert!(!has_end_marker(&cut, "__idx__"));
     }
 }

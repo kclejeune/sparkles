@@ -1141,4 +1141,83 @@ mod tests {
             }
         }
     }
+
+    /// A non-SILENT fill returns the demanded rows from the ready head without reading
+    /// the stalled tail, so a slow endpoint does not block the query past its rows.
+    #[test]
+    fn non_silent_fill_does_not_read_the_stalled_tail() {
+        use crate::sparql::svccache::{Parts, Slice};
+        let head = br#"{"head":{"vars":["s"]},"results":{"bindings":["#.to_vec();
+        let row = |v: &str| format!(r#"{{"s":{{"type":"literal","value":"{v}"}}}}"#);
+        let ctx = ctx(1 << 20);
+        let var = ctx.var("s");
+        let tail_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut chunks = std::collections::VecDeque::new();
+        chunks.push_back(head);
+        // include a comma after row b so the parser can emit it without reading ahead
+        chunks.push_back(format!("{},{},", row("a"), row("b")).into_bytes());
+        let reader = StalledTailReader {
+            chunks,
+            tail_reads: tail_reads.clone(),
+        };
+        let answer = RemoteAnswer::from_reader(
+            Box::new(reader),
+            sparesults::QueryResultsFormat::Json,
+            "http://test.invalid/sparql",
+        )
+        .unwrap();
+        let slice = Slice::ALL.limited(2);
+        let tee = Tee::new(
+            &ctx,
+            "stalled".to_string(),
+            ctx.snap.results.service.max_entry_bytes(),
+        )
+        .unwrap()
+        .of(Parts::default(), slice);
+        let mut svc = test_service(
+            &ctx,
+            var,
+            Source::Remote {
+                answer: Box::new(answer),
+                tee: Some(tee),
+                peeked: None,
+            },
+        );
+        let buf = svc.fill(&ctx, 2, None).unwrap();
+        let rows = buf.map(|b| b.table.len).unwrap_or(0);
+        assert_eq!(rows, 2, "both demanded rows returned");
+        assert_eq!(
+            tail_reads.load(Ordering::SeqCst),
+            0,
+            "no tail reads attempted"
+        );
+        assert!(
+            ctx.snap.results.service.get("stalled", slice).is_none(),
+            "stalled response is not cached"
+        );
+    }
+
+    struct StalledTailReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        tail_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::io::Read for StalledTailReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(mut chunk) = self.chunks.pop_front() {
+                let n = chunk.len().min(buf.len());
+                buf[..n].copy_from_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    self.chunks.push_front(chunk.split_off(n));
+                }
+                Ok(n)
+            } else {
+                self.tail_reads.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "stalled tail",
+                ))
+            }
+        }
+    }
 }

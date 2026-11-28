@@ -1048,15 +1048,27 @@ fn a_pushed_limit_bounds_the_entry() {
         };
         assert_eq!(count(&q(6), mode), 6, "{mode:?}");
         let sent = ep.take();
-        assert_eq!(sent.len(), 1, "{mode:?}");
+        assert_eq!(sent.len(), 1, "{mode:?}: first request dispatched");
         assert!(sent[0].trim_end().ends_with("LIMIT 6"), "{}", sent[0]);
         assert_eq!(count(&q(2), mode), 2, "{mode:?}");
-        // A non-SILENT query that reaches the LIMIT does not block on the response
-        // tail and does not cache the response, so a later request with a narrower
-        // LIMIT sends its own request.
-        ep.take();
+        let narrower = ep.take();
+        // A non-SILENT query that reaches its LIMIT does not cache the response
+        // (the streamed path drops the copy, the eager path gets only the LIMIT's
+        // rows from the endpoint), so a later narrower request dispatches its own.
+        assert_eq!(narrower.len(), 1, "{mode:?}: narrower LIMIT dispatches");
+        assert!(
+            narrower[0].trim_end().ends_with("LIMIT 2"),
+            "{mode:?}: {}",
+            narrower[0]
+        );
         assert_eq!(count(&q(10), mode), 10, "{mode:?}");
-        ep.take();
+        let wider = ep.take();
+        assert_eq!(wider.len(), 1, "{mode:?}: wider LIMIT dispatches");
+        assert!(
+            wider[0].trim_end().ends_with("LIMIT 10"),
+            "{mode:?}: {}",
+            wider[0]
+        );
     }
 }
 
@@ -1748,4 +1760,77 @@ fn a_deferred_optional_refuses_cache_rm() {
         "expected NotPermitted, got {r:?}"
     );
     assert!(ep.take().is_empty(), "no requests should have been sent");
+}
+
+/// Repeated empty non-OPTIONAL LATERAL groups release their plan leases even though the
+/// inner join produces no rows and `continue` skips the joined path (Sol round-4 P2-1).
+#[test]
+fn empty_lateral_groups_release_plan_leases() {
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    // five departments whose SERVICE returns no rows, plus four that do, under a tight
+    // memory budget so leaked leases would exhaust it
+    let q = format!(
+        "SELECT ?d ?p {{ \
+         VALUES ?d {{ <urn:dept1> <urn:dept2> <urn:dept3> <urn:dept4> <urn:dept5> <urn:dept6> <urn:dept7> <urn:dept8> <urn:dept9> }} \
+         LATERAL {{ SERVICE <cache:{url}> {{ ?d <urn:hasEmployee> ?p FILTER(?p = <urn:person1>) }} }} }}"
+    );
+    let o = QueryOptions {
+        max_memory_bytes: Some(2 << 20),
+        ..opts()
+    };
+    let r = run(&data, &q, &o).unwrap();
+    assert_eq!(r.len(), 9, "every department matches person1");
+    // confirm the joined path produced results too
+    let joined = format!(
+        "SELECT ?d ?p {{ \
+         VALUES ?d {{ <urn:dept1> <urn:dept5> }} \
+         LATERAL {{ SERVICE <cache:{url}> {{ ?d <urn:hasEmployee> ?p }} }} }}"
+    );
+    let r2 = run(&data, &joined, &o).unwrap();
+    assert_eq!(r2.len(), 9 + 5, "joined groups produce expected rows");
+}
+
+/// A bulk response without the end marker falls back to individual retries without
+/// first reserving the split, and a marker-only response splits into empty parts
+/// (Sol round-4 P2-2).
+#[test]
+fn bulk_missing_marker_and_marker_only_response() {
+    let data = store(&departments(4));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    // cut the endpoint after enough rows that the per-input retries succeed
+    // but the bulk response loses its end marker
+    ep.limit.store(usize::MAX, Ordering::SeqCst);
+    let q = format!(
+        "SELECT ?d ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} \
+         SERVICE <loop:bulk+5:{url}> {{ ?d <urn:hasEmployee> ?p }} }}"
+    );
+    // first run warms the individual responses to know the counts
+    let r = rows(&data, &q);
+    assert_eq!(r.len(), 4 + 3);
+    let warmup = ep.take();
+    assert_eq!(warmup.len(), 1, "one bulk request");
+
+    // now cut at a low limit so the UNION marker row is dropped
+    data.result_cache().service.clear().unwrap();
+    ep.limit.store(3, Ordering::SeqCst);
+    let r2 = rows(&data, &q);
+    // with limit 3, each individual retry returns at most 3 rows
+    assert!(r2.len() <= 3 + 3, "truncated retries: {}", r2.len());
+    let sent = ep.take();
+    // the first bulk is truncated (no marker), so individual retries follow
+    assert!(sent.len() >= 3, "bulk + retries: got {}", sent.len());
+
+    // now let the endpoint return only the marker (all departments are empty of rows)
+    ep.limit.store(usize::MAX, Ordering::SeqCst);
+    let empty = format!(
+        "SELECT ?d ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} \
+         SERVICE <loop:bulk+5:{url}> {{ ?d <urn:hasEmployee> ?p FILTER(false) }} }}"
+    );
+    let re = rows(&data, &empty);
+    assert!(re.is_empty(), "marker-only gives no rows");
+    let sent2 = ep.take();
+    assert_eq!(sent2.len(), 1, "marker-only: one bulk request, no retries");
 }
