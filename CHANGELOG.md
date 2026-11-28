@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Shared ground reasoning in rooted runs (item 1061)
+
+A rooted run with `SPARKLES_ROOTED_SHARED_FACTS=1` now forwards a unit the root delivered
+to a context on to that context's predecessors as the root's own delivery, in place of
+Pred. The context's copy takes the root's identifier when the root's delivery arrives,
+also after the context sent a copy of its own by Pred, so the predecessor takes the unit
+once, however many successors send it and in whatever order, and applies the shared-facts
+rule to it. On the forwarding build measured before the canonical-ID arrival-order fix,
+ore_ont_14924 drops from 5.07 million to about 324,000 derived conclusions on
+one thread and finishes within the rooted bound with HermiT's taxonomy.
+`SPARKLES_ROOTED_FACT_FORWARD=0` turns forwarding off. Shared facts, constant merging
+(`Limits::rooted_merge`) and the per-class rooted bound stay off by default, and 36
+generated ontologies with keys or the universal property and ore_ont_15803 still pass the
+bound, as roadmap item 1061 records.
+
 ### Rooted counting applies at-most restrictions at individuals
 
 The opt-in rooted counting classifier now derives equalities between the values of a

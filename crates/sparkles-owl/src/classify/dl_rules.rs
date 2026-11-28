@@ -1078,6 +1078,11 @@ pub struct DlRun {
     /// constants-only successor replay deduplication are enabled (default off, behind
     /// `SPARKLES_ROOTED_SHARED_FACTS=1`)
     pub(super) shared_facts: bool,
+    /// whether a context other than the root sends a root unit it holds to a predecessor
+    /// other than the root as the root's own message (`Concl::RPred` with the root's table
+    /// id) in place of Pred, item 1061's forwarding of facts. It holds only with
+    /// [`DlRun::shared_facts`], and `SPARKLES_ROOTED_FACT_FORWARD=0` turns it off
+    pub(super) forward_facts: bool,
     /// whether item 1061 phase 2 root unit constant-equality discovery is active during
     /// the current saturation round (default off, disabled after the main round)
     pub(super) merge: std::sync::atomic::AtomicBool,
@@ -1145,6 +1150,7 @@ impl DlRun {
             eager,
             worked,
             shared_facts: shared_facts_switch(),
+            forward_facts: forward_facts_switch(),
             ..DlRun::default()
         }
     }
@@ -1172,6 +1178,7 @@ impl DlRun {
             width_limit: AtomicUsize::new(self.width_limit.load(Ordering::Relaxed)),
             mrepair: self.mrepair,
             shared_facts: self.shared_facts,
+            forward_facts: self.forward_facts,
             merge: std::sync::atomic::AtomicBool::new(self.merge.load(Ordering::Relaxed)),
             merge_skip: self.merge_skip,
             split_mode: std::sync::atomic::AtomicU8::new(self.split_mode.load(Ordering::Relaxed)),
@@ -1186,6 +1193,16 @@ impl DlRun {
     #[cfg(test)]
     pub(super) fn exhausted(&self) -> bool {
         self.exhausted.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    pub(super) fn with_forward_facts(mut self, on: bool) -> DlRun {
+        self.forward_facts = on;
+        self
+    }
+    /// Whether a context other than the root forwards the root units it holds as the
+    /// root's own messages, [`DlRun::forward_facts`] under [`DlRun::shared_facts`].
+    pub(super) fn forwards_facts(&self) -> bool {
+        self.shared_facts && self.forward_facts
     }
     pub(super) fn split_meta_bytes(&self) -> usize {
         self.const_rank
@@ -1761,6 +1778,9 @@ pub struct DlSt {
     pub empty_core: bool,
     /// in a rooted run, whether the context is taking a fact of the root, which it keeps
     pub taking_fact: bool,
+    /// in a rooted run that forwards root units, the root's table id of the fact the
+    /// context is taking, which its stored copy goes to predecessors by (item 1061)
+    pub taking_root_id: Option<u32>,
     /// in a rooted run, whether the clause currently being processed by [`process`] is an
     /// exact empty-body unit delivered from the root (`Stored::fact == true`), cleared on
     /// every exit from `process`
@@ -3013,6 +3033,31 @@ pub fn shared_facts_switch() -> bool {
 #[cfg(test)]
 thread_local! {
     static SHARED_FACTS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static FORWARD_FACTS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether item 1061's forwarding of root units to predecessors is on when shared facts
+/// are ([`DlRun::forward_facts`]). It is on unless `SPARKLES_ROOTED_FACT_FORWARD=0`.
+pub fn forward_facts_switch() -> bool {
+    #[cfg(test)]
+    if let Some(on) = FORWARD_FACTS_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_FACT_FORWARD").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+pub(super) fn with_forward_facts_override<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORWARD_FACTS_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = FORWARD_FACTS_TEST.with(|c| c.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
 }
 
 #[cfg(test)]
@@ -4883,9 +4928,13 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
     }
     if let Some(x) = ds_admit(st, out) {
         let unit_fact = incoming_unit_fact && body.is_empty() && head.len() == 1;
+        // the root's id goes with the unit only when the stored clause is the root's own
+        let root_id = x
+            .taking_root_id
+            .filter(|&id| unit_fact && out.dl().table.get(id).head() == head.as_slice());
         let _ = x
             .store
-            .add_parts_admitted_with_fact(body, head, unit_fact, out);
+            .add_parts_admitted_with_fact(body, head, unit_fact, root_id, out);
     }
 }
 
@@ -6932,6 +6981,21 @@ pub(super) fn pred_ready(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool
     })
 }
 
+/// The message that takes the stored clause `cid` from `me` to a predecessor: Pred, or,
+/// when `fact` says that the clause is a unit the root delivered and the predecessor is
+/// not the root, the root's own delivery of it (item 1061). A root unit that goes up by
+/// Pred has an empty body and only constants (`pred_ready`), so Pred gives the
+/// predecessor the same clause unchanged, and the root's message gives it that clause
+/// with its provenance, keyed by the root's table id so that a predecessor takes it once
+/// whichever successor sends it.
+fn pred_msg(me: Ex, cid: u32, fact: bool) -> Concl {
+    if fact {
+        Concl::RPred(cid)
+    } else {
+        Concl::PredC(me, cid)
+    }
+}
+
 /// The table id of a stored clause over the predecessor, `None` once it is dead or on
 /// admission refusal.
 pub(super) fn pred_id<S: Sink>(x: &mut DlSt, i: u32, out: &mut S) -> Option<u32> {
@@ -6976,6 +7040,7 @@ pub fn back<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, r: Role, out: &m
         return;
     };
     let skip_late = out.dl().shared_facts && skip_non_root_late_predc();
+    let forward = out.dl().forwards_facts() && !dix(ix).is_root(e);
     for k in 0..x.store.preds.len() {
         let i = x.store.preds[k];
         if skip_late && x.store.clauses[i as usize].fact {
@@ -6984,7 +7049,10 @@ pub fn back<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, r: Role, out: &m
         if let Some(cid) = pred_id(x, i, out)
             && meets(ix, &x.store.clauses[i as usize].c, r)
         {
-            out.send(e, Concl::PredC(me, cid));
+            out.send(
+                e,
+                pred_msg(me, cid, forward && x.store.clauses[i as usize].fact),
+            );
         }
     }
 }
@@ -7047,6 +7115,7 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
     }
     let Some(r) = role_of(ix, e) else { return true };
     let to_root = (dix(ix).is_root(u) || skip_non_root_late_predc()) && out.dl().shared_facts;
+    let forward = out.dl().forwards_facts() && !dix(ix).is_root(u);
     for k in 0..x.store.preds.len() {
         let i = x.store.preds[k];
         if to_root && x.store.clauses[i as usize].fact {
@@ -7055,7 +7124,10 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
         if let Some(cid) = pred_id(x, i, out)
             && (any || meets(ix, &x.store.clauses[i as usize].c, r))
         {
-            out.send(u, Concl::PredC(me, cid));
+            out.send(
+                u,
+                pred_msg(me, cid, forward && x.store.clauses[i as usize].fact),
+            );
         }
     }
     for (s, c) in props {
@@ -7866,19 +7938,20 @@ fn process<S: Sink>(
         // late replay are preserved for every non-root predecessor (gap G6); only the root
         // itself has an independent witness that it already holds its own delivered unit.
         let skip_live = x.given_fact && skip_non_root_live_predc();
+        let forward = x.given_fact && found_guard.dl().forwards_facts();
         for &(u, e) in &x.dpreds {
             if x.given_fact && (dx.is_root(u) || skip_live) {
                 continue;
             }
             if rooted || role_of(ix, e).is_some_and(|r| meets(ix, c, r)) {
-                found_guard.send(u, Concl::PredC(me, cid));
+                found_guard.send(u, pred_msg(me, cid, forward));
             }
         }
         if !skip_live {
             for (r, srcs) in &st.back {
                 if meets(ix, c, *r) {
                     for &e in &srcs.list {
-                        found_guard.send(e, Concl::PredC(me, cid));
+                        found_guard.send(e, pred_msg(me, cid, forward && !dx.is_root(e)));
                     }
                 }
             }

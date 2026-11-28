@@ -1539,7 +1539,8 @@ pub struct Stored {
     pub dead: bool,
     /// the rules have run on it
     pub done: bool,
-    /// its id in the run's table, once sent to a predecessor
+    /// its id in the run's table, once sent to a predecessor, which is the root's id of
+    /// the same unit once the root delivered it in a run that forwards root units
     pub sent: Option<u32>,
     /// its maximal literal once processed, when it has one
     pub max: Option<Lit>,
@@ -1940,19 +1941,24 @@ impl Store {
         covered_payload: usize,
         out: &mut S,
     ) -> (bool, bool) {
-        self.add_parts_admitted_covered_with_fact(body, head, covered_payload, false, out)
+        self.add_parts_admitted_covered_with_fact(body, head, covered_payload, false, None, out)
     }
 
     /// [`Store::add_parts_admitted_covered`], conferring exact root-unit provenance
     /// (`Stored::fact = true`) when `is_fact` is set and the normalized clause is an exact
     /// empty-body unit. When a live exact duplicate unit already exists in the store (even
-    /// if still queued), marks it `fact = true` in place with zero allocation.
+    /// if still queued), marks it `fact = true` in place with zero allocation. With
+    /// `root_id`, the root's table id of that unit, the stored copy takes the root's id as
+    /// the id it goes to predecessors by, in place of any local id it was sent by before,
+    /// so that every forwarded copy carries the root's id whatever the arrival order (item
+    /// 1061).
     fn add_parts_admitted_covered_with_fact<S: Sink>(
         &mut self,
         mut body: Vec<Lit>,
         mut head: Vec<Lit>,
         covered_payload: usize,
         is_fact: bool,
+        root_id: Option<u32>,
         out: &mut S,
     ) -> (bool, bool) {
         body.sort_unstable();
@@ -1970,6 +1976,9 @@ impl Store {
                     let s = &mut self.clauses[i as usize];
                     if !s.dead && s.c.body().is_empty() && s.c.head() == head.as_slice() {
                         s.fact = true;
+                        if root_id.is_some() {
+                            s.sent = root_id;
+                        }
                     }
                 }
             }
@@ -2002,6 +2011,9 @@ impl Store {
         }
         let c = Clause::from_sorted(body, head);
         let delta = self.add_unchecked(c, sig, unit_fact);
+        if unit_fact && let Some(s) = self.clauses.last_mut() {
+            s.sent = root_id;
+        }
         let committed_bound = covered_payload + extra_need;
         debug_assert!(committed_bound >= total_need);
         out.commit_dl(committed_bound, delta);
@@ -2018,19 +2030,22 @@ impl Store {
         head: Vec<Lit>,
         out: &mut S,
     ) -> bool {
-        self.add_parts_admitted_covered_with_fact(body, head, 0, false, out)
+        self.add_parts_admitted_covered_with_fact(body, head, 0, false, None, out)
             .0
     }
 
-    /// [`Store::add_parts_admitted`], with exact root-unit provenance when `is_fact` is set.
+    /// [`Store::add_parts_admitted`], with exact root-unit provenance when `is_fact` is set
+    /// and the root's table id `root_id` of the unit when the run forwards root units, as
+    /// [`Store::add_parts_admitted_covered_with_fact`] describes.
     pub fn add_parts_admitted_with_fact<S: Sink>(
         &mut self,
         body: Vec<Lit>,
         head: Vec<Lit>,
         is_fact: bool,
+        root_id: Option<u32>,
         out: &mut S,
     ) -> bool {
-        self.add_parts_admitted_covered_with_fact(body, head, 0, is_fact, out)
+        self.add_parts_admitted_covered_with_fact(body, head, 0, is_fact, root_id, out)
             .0
     }
 
