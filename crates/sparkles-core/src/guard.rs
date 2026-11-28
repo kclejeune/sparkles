@@ -466,10 +466,13 @@ impl ValidationSummary {
         summary
     }
 
-    /// Whether a ShEx or SHACL summary's results block in its mode: in grandfather mode
-    /// the introduced ones, otherwise any.
+    /// Whether any guard has blocking results under its own baseline policy.
     pub fn blocks(&self) -> bool {
-        self.introduced.unwrap_or(self.blocking) > 0
+        if self.guards.is_empty() {
+            self.introduced.unwrap_or(self.blocking) > 0
+        } else {
+            self.guards.iter().any(Self::blocks)
+        }
     }
 
     /// `Sparkles-Validation` header value (an RFC 9651 Dictionary). A ShEx guard's adds
@@ -585,6 +588,23 @@ impl std::fmt::Display for Rejection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_blocking_uses_each_guards_baseline() {
+        let mut shacl =
+            ValidationSummary::empty(GuardStatus::Passed, GuardMode::Reject, Severity::Violation);
+        shacl.blocking = 3;
+        shacl.introduced = Some(0);
+        let mut shex = shacl.clone();
+        shex.language = GuardLanguage::Shex;
+        let mut combined = ValidationSummary::combined(vec![shacl, shex]);
+        assert_eq!(combined.blocking, 6);
+        assert!(!combined.blocks());
+        combined.guards[1].introduced = Some(1);
+        assert!(combined.blocks());
+        combined.guards[1].introduced = None;
+        assert!(combined.blocks());
+    }
 
     #[test]
     fn shex_summaries() {

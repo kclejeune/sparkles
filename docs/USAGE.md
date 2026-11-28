@@ -1286,7 +1286,9 @@ imports. The local commands allow private destinations by default. Use
 resolving their imports.
 
 `validation --lang combined` uses one mode and baseline policy for both guards. Use
-a [format 4 configuration](API.md#write-time-validation) to set these independently.
+a [format 4 configuration](API.md#write-time-validation) with `serve --validate
+NAME=CONFIG.json` or `PUT /$/validation/{ds}` to set these independently. Local SHACL
+shapes files supplied to `validation` or a startup configuration can be up to 16 MiB.
 `--schema-graph` may accompany `--schema` or supply the whole ShEx schema. Load the
 named graph as ShExR before enabling the guard.
 `validation --grandfather` blocks only the results a write introduces, so a guard in

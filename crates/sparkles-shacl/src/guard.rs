@@ -1518,6 +1518,38 @@ fn prepare(
 }
 
 impl ShaclGuard {
+    /// Promote a detached guard under the drained store writer, after its standalone
+    /// configuration has been published. Keep the old guard readable as part of the pair.
+    #[doc(hidden)]
+    pub fn retain_persistent(
+        &self,
+        cfg: ValidationConfig,
+        root: &Path,
+        hash: String,
+        head: u64,
+    ) -> (Arc<Self>, Option<StatusFile>) {
+        let baseline = self.baseline.lock().clone();
+        let exact = self.exact.lock().clone();
+        let status = baseline
+            .as_ref()
+            .filter(|b| b.commit == head && b.conforms.is_some() && exact.is_some())
+            .map(|b| StatusFile::of(b, &hash));
+        let guard = Self {
+            cfg,
+            loaded: RwLock::new(self.loaded.read().clone()),
+            pending: Mutex::new(Vec::new()),
+            baseline: Mutex::new(baseline),
+            exact: Mutex::new(exact),
+            counters: self.counters.clone(),
+            last_full: AtomicU64::new(self.last_full.load(Ordering::Relaxed)),
+            tuning: RwLock::new(*self.tuning.read()),
+            history: self.history.clone(),
+            persist: Some((root.to_path_buf(), hash)),
+            file_shapes: self.file_shapes.clone(),
+        };
+        (Arc::new(guard), status)
+    }
+
     /// Discard a candidate's state when a different guard refused it.
     #[doc(hidden)]
     pub fn discard_pending(&self, seq: u64) {

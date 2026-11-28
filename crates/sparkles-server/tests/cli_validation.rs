@@ -282,6 +282,25 @@ fn cli_combines_guards_and_schema_sources() {
         status["config"]["guards"][1]["schema"]["graphs"][0],
         "urn:schema"
     );
+    for extra in [
+        &[][..],
+        &["--shapes", "guard"][..],
+        &["--shapes", "none"][..],
+    ] {
+        let mut args = vec!["schema", "--loc", "db", "--format", "json"];
+        args.extend_from_slice(extra);
+        let o = sparkles(dir, &args);
+        assert!(o.status.success(), "{args:?}: {}", err(&o));
+        let schema: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        if extra.last() == Some(&"none") {
+            assert!(schema.get("constraints").is_none(), "{schema}");
+        } else {
+            let sources = schema["constraints"]["sources"].as_array().unwrap();
+            assert_eq!(sources.len(), 2, "{sources:?}");
+            assert_eq!(sources[0]["threshold"], "violation");
+            assert_eq!(sources[1]["graphs"][0], "urn:schema");
+        }
+    }
     let o = sparkles(
         dir,
         &[

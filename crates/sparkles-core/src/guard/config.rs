@@ -379,6 +379,15 @@ pub struct CheckHistory {
 /// Rejected writes the status keeps.
 const REJECTED_KEPT: usize = 10;
 
+impl Clone for CheckHistory {
+    fn clone(&self) -> Self {
+        Self {
+            last: parking_lot::Mutex::new(self.last()),
+            rejected: parking_lot::Mutex::new(self.rejected.lock().clone()),
+        }
+    }
+}
+
 impl CheckHistory {
     /// Record a validation (skipped and bypassed writes are not recorded).
     pub fn record(&self, kind: crate::commit::CommitKind, s: &ValidationSummary) {
@@ -432,6 +441,16 @@ pub struct Counters {
 /// A guard's decision counters, updated as it decides.
 #[derive(Debug, Default)]
 pub struct DecisionCounts([AtomicU64; 5]);
+
+impl Clone for DecisionCounts {
+    fn clone(&self) -> Self {
+        Self(
+            self.0
+                .each_ref()
+                .map(|count| AtomicU64::new(count.load(Ordering::Relaxed))),
+        )
+    }
+}
 
 impl DecisionCounts {
     /// Count one decision.

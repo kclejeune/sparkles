@@ -2,7 +2,9 @@
 
 use super::WriteGuard;
 use crate::commit::CommitKind;
-use crate::guard::config::{CONFIG_FILE, StatusFile, remove_files, write_atomic, write_config};
+use crate::guard::config::{
+    CONFIG_FILE, StatusFile, remove_files, sha256_hex, write_atomic, write_config,
+};
 use crate::guard::{
     Candidate, CommitGuard, GuardLanguage, GuardMode, GuardStatus, ValidationSummary,
 };
@@ -117,7 +119,7 @@ pub(crate) fn retain(
     config: &GuardConfig,
 ) -> Result<Option<crate::handles::GuardOutcome>> {
     let store = dataset.store();
-    let _txn = store.write_as(CommitKind::Transaction);
+    let txn = store.write_as(CommitKind::Transaction);
     let Some(WriteGuard::Combined(combined)) = dataset.write_guard() else {
         return Ok(None);
     };
@@ -132,23 +134,69 @@ pub(crate) fn retain(
     if current.first() != Some(config) {
         return Ok(None);
     }
-    let publish = || {
+    let publish = |guard: WriteGuard| {
         guard.attach(store);
-        dataset.set_write_guard(Some(guard.clone()));
+        dataset.set_write_guard(Some(guard));
     };
     if let Some(root) = store.root() {
         let files = guard.memory_files();
         let Some((_, cfg)) = files.first() else {
             return Err(Error::invalid("could not serialize the remaining guard"));
         };
-        for (file, data) in files.iter().skip(1) {
-            write_atomic(&root.join(file), data)?;
+        let hash = sha256_hex(cfg);
+        let head = txn.view().commit;
+        match guard {
+            WriteGuard::Shacl(g) => {
+                let cfg = serde_json::from_slice(cfg).map_err(invalid)?;
+                persist_retained(root, &files, publish, || {
+                    let (guard, status) = g.retain_persistent(cfg, root, hash, head);
+                    (WriteGuard::Shacl(guard), status)
+                })?;
+            }
+            WriteGuard::Shex(g) => {
+                persist_retained(root, &files, publish, || {
+                    let (guard, status) = g.retain_persistent(root, hash, head);
+                    (WriteGuard::Shex(guard), status)
+                })?;
+            }
+            WriteGuard::Combined(_) => unreachable!(),
         }
-        write_config(root, cfg, publish)?;
     } else {
-        publish();
+        publish(guard.clone());
     }
     Ok(Some(crate::handles::GuardOutcome::Retained))
+}
+
+fn persist_retained(
+    root: &std::path::Path,
+    files: &[(String, Vec<u8>)],
+    publish: impl FnOnce(WriteGuard),
+    promote: impl FnOnce() -> (WriteGuard, Option<StatusFile>),
+) -> Result<()> {
+    let [(config, cfg), sources @ ..] = files else {
+        unreachable!();
+    };
+    for (file, data) in sources {
+        write_atomic(&root.join(file), data)?;
+    }
+    write_config(root, cfg, || {
+        let (guard, status) = promote();
+        publish(guard);
+        if let Err(e) = StatusFile::remove(root) {
+            tracing::warn!("cannot remove obsolete validation status: {e}");
+        }
+        if let Some(status) = status
+            && let Err(e) = status.write(root)
+        {
+            tracing::warn!("cannot write validation status: {e}");
+        }
+    })?;
+    let mut keep = vec![config.as_str()];
+    keep.extend(sources.iter().map(|(file, _)| file.as_str()));
+    if let Err(e) = remove_files(root, &keep) {
+        tracing::warn!("cannot remove obsolete validation files: {e}");
+    }
+    Ok(())
 }
 
 fn invalid(e: impl std::fmt::Display) -> Error {

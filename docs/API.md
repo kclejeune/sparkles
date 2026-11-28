@@ -9785,7 +9785,9 @@ rejection status without guard findings.
 `GET` returns `config.guards` and `status.guards` for a combined guard. For a combined
 configuration, supply file sources inline. Each can hold up to 16 MiB, subject to the
 request body limit. The database keeps both source copies in the atomic configuration
-file. Standalone guard summaries and status keep their flat format. To drop one of the
+file. Two sources at the limit can produce a file of 32 MiB or more after JSON escaping.
+The store reads this file when it opens. Use named graphs or smaller source files to
+keep the configuration file small. Standalone guard summaries and status keep their flat format. To drop one of the
 guards while preserving the other's live baseline, send a format 4 list containing just
 the unchanged configuration entry returned by `GET`.
 
@@ -9798,7 +9800,8 @@ the unchanged configuration entry returned by `GET`.
 The dataset page's **Write-time validation** panel lets an administrator configure or
 disable the guard on a writable server. It shows both sections of a combined guard.
 Its editor configures a standalone SHACL or ShEx guard, with sources taken from named
-graphs, supplied inline, or both. It sets the mode, baseline, data
+graphs, supplied inline, or both. The combined editor is tracked in
+[roadmap item 1350](ROADMAP.md#tier-4-worth-doing-not-urgent). It sets the mode, baseline, data
 selection, inferences, timeout and report limit. For an in-memory dataset, `GET`
 returns the guard configuration with its inline source, so the settings can be edited
 without supplying the source again. A persistent dataset keeps its copy of the source

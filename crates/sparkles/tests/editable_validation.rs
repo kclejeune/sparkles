@@ -227,7 +227,7 @@ fn combined_validation_reports_both_guards_and_installs_atomically() {
     let v = settings.get().unwrap();
     ds.update("INSERT DATA { <urn:n> <urn:email> 'n@example' }")
         .unwrap();
-    let kept = v.shex().unwrap().clone();
+    let before = v.shex().unwrap().status().baseline.unwrap();
     let config = v.json()["config"]["guards"][0].clone();
     let configs =
         sparkles::write_guard::parse_configs(json!({"format": 4, "guards": [config]})).unwrap();
@@ -238,7 +238,10 @@ fn combined_validation_reports_both_guards_and_installs_atomically() {
         GuardOutcome::Retained
     ));
     let retained = settings.get().unwrap();
-    assert!(std::sync::Arc::ptr_eq(&kept, retained.shex().unwrap()));
+    assert_eq!(
+        retained.shex().unwrap().status().baseline.unwrap().commit,
+        before.commit
+    );
     assert_eq!(retained.language(), GuardLanguage::Shex);
     assert_eq!(
         serde_json::from_slice::<Value>(&std::fs::read(&file).unwrap()).unwrap()["format"],
@@ -256,6 +259,65 @@ fn combined_validation_reports_both_guards_and_installs_atomically() {
             .language(),
         GuardLanguage::Shex
     );
+}
+
+#[test]
+fn retained_persistent_guard_keeps_config_and_validation_state() {
+    use sparkles::guard::config::{CONFIG_FILE, STATUS_FILE, StatusFile, TYPING_FILE, sha256_hex};
+    use sparkles::handles::GuardOutcome;
+
+    for (kept, source) in [(0, "schema"), (1, "shapes")] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ds = Dataset::open(root).unwrap();
+        ds.update("INSERT DATA { <urn:n> a <urn:C> ; <urn:name> 'N' ; <urn:email> 'old' }")
+            .unwrap();
+        let mut configs = combined("reject", "reject");
+        let sparkles::write_guard::GuardConfig::Shex(cfg) = &mut configs[0] else {
+            unreachable!()
+        };
+        cfg.schema.inline = Some("<urn:Shex> { <urn:email> @<urn:E> } <urn:E> LITERAL".into());
+        let settings = ds.validation().guard();
+        assert!(matches!(
+            settings
+                .set_guards(configs, &sparkles_shex::NoImports)
+                .unwrap(),
+            GuardOutcome::Installed(_)
+        ));
+        let combined = settings.get().unwrap();
+        let entry = combined.json()["config"]["guards"][kept].clone();
+        let configs =
+            sparkles::write_guard::parse_configs(json!({"format": 4, "guards": [entry]})).unwrap();
+        assert!(matches!(
+            settings
+                .set_guards(configs, &sparkles_shex::NoImports)
+                .unwrap(),
+            GuardOutcome::Retained
+        ));
+        let bytes = std::fs::read(root.join(CONFIG_FILE)).unwrap();
+        let config: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(config[source]["file"].is_string());
+        assert!(config[source].get("inline").is_none());
+        assert_eq!(settings.get().unwrap().json()["config"], config);
+        assert_eq!(combined.json()["config"]["guards"][kept], entry);
+
+        let hash = sha256_hex(&bytes);
+        let initial = ds.snapshot().commit;
+        assert!(StatusFile::read(root, initial, &hash).is_some());
+        ds.update("INSERT DATA { <urn:m> a <urn:C> ; <urn:name> 'M' ; <urn:email> 'new' }")
+            .unwrap();
+        let head = ds.snapshot().commit;
+        assert!(head > initial);
+        assert!(StatusFile::read(root, head, &hash).is_some());
+        drop(settings);
+        drop(ds);
+        assert!(root.join(STATUS_FILE).is_file());
+        assert_eq!(root.join(TYPING_FILE).is_file(), source == "schema");
+        let reopened = Dataset::open(root).unwrap();
+        let state = reopened.validation().guard().get().unwrap().json();
+        assert_eq!(state["config"], config);
+        assert_eq!(state["status"]["baseline"]["commit"], head);
+    }
 }
 
 #[test]

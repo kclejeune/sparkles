@@ -1344,6 +1344,10 @@ Claims without validity keep their record and payload digests. `ClaimInput` has 
 
 ### Format
 
+A combined guard writes the ordered guard list and both inline sources in
+`validation.json` format 4. A standalone ShEx guard with a graph and file schema also
+writes format 4. Standalone formats 1 through 3 remain readable.
+
 The first-release format cutoff of item 479 implements X16 Phase 1. `dataset.json` is written
 as `format` 2 with `minimumReader` 5 or more, and a `format` 1 file or one that requires a
 reader below 5 is refused with the dump-and-reload message. The generation index is

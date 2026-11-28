@@ -19,6 +19,7 @@ use crate::state::Dataset;
 use oxrdf::{NamedNode, Term, Triple};
 use serde_json::{Map, Value, json};
 use sparkles::error::Error;
+use sparkles::guard::{GuardLanguage, ValidationSummary};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -654,25 +655,44 @@ fn guard_failures(
             let Some(v) = &pv.validation else {
                 return Some((false, HashSet::new()));
             };
-            let mut out = HashSet::new();
-            for r in &v.results {
-                let sev = r["severity"]["value"].as_str().unwrap_or("");
-                if !sev.ends_with("Violation") && !r.get("shape").is_some() {
-                    continue;
-                }
-                let focus = r["focusNode"]["value"]
-                    .as_str()
-                    .or_else(|| r["node"].as_str())
-                    .map(str::to_string);
-                let path = r["resultPath"]["value"].as_str().map(str::to_string);
-                if let Some(f) = focus {
-                    out.insert((f, path));
-                }
-            }
-            Some((v.blocks(), out))
+            Some(guard_verdict(v))
         }
         _ => None,
     }
+}
+
+fn guard_verdict(v: &ValidationSummary) -> GuardVerdict {
+    let reports = if v.guards.is_empty() {
+        std::slice::from_ref(v)
+    } else {
+        &v.guards
+    };
+    let mut failures = HashSet::new();
+    for (language, result) in reports
+        .iter()
+        .flat_map(|report| report.results.iter().map(|r| (report.language, r)))
+    {
+        let (term, path) = match language {
+            GuardLanguage::Shacl
+                if result["severity"]["value"]
+                    .as_str()
+                    .is_some_and(|s| s.ends_with("Violation")) =>
+            {
+                (&result["focusNode"], result["resultPath"]["value"].as_str())
+            }
+            GuardLanguage::Shex if result["status"] == "nonconformant" => (&result["node"], None),
+            _ => continue,
+        };
+        if let Some(value) = term["value"].as_str() {
+            let focus = if term["type"] == "bnode" {
+                format!("_:{value}")
+            } else {
+                value.to_string()
+            };
+            failures.insert((focus, path.map(str::to_string)));
+        }
+    }
+    (v.blocks(), failures)
 }
 
 fn guard_signal(f: &ReifiedFact, verdict: &Option<GuardVerdict>) -> &'static str {
@@ -1509,4 +1529,61 @@ pub(crate) fn promotion_args(
     a.insert("allowUnknownIris".into(), true.into());
     a.insert("message".into(), message.into());
     a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparkles::guard::{GuardMode, GuardStatus, Severity};
+
+    #[test]
+    fn combined_guard_results_signal_failures_from_both_languages() {
+        let mut shacl =
+            ValidationSummary::empty(GuardStatus::Passed, GuardMode::Reject, Severity::Violation);
+        shacl.blocking = 1;
+        shacl.introduced = Some(0);
+        shacl.results.push(json!({
+            "severity": {"value": "http://www.w3.org/ns/shacl#Violation"},
+            "focusNode": {"value": "urn:s"},
+            "resultPath": {"value": "urn:p"},
+        }));
+        let mut shex =
+            ValidationSummary::empty(GuardStatus::Passed, GuardMode::Reject, Severity::Violation);
+        shex.language = GuardLanguage::Shex;
+        shex.blocking = 1;
+        shex.introduced = Some(0);
+        shex.results.push(json!({
+            "node": {"type": "uri", "value": "urn:x"},
+            "shape": {"type": "uri", "value": "urn:Shape"},
+            "status": "nonconformant",
+        }));
+        shex.results.push(json!({
+            "node": {"type": "uri", "value": "urn:ok"},
+            "shape": {"type": "uri", "value": "urn:Shape"},
+            "status": "conformant",
+        }));
+        let (blocks, failures) = guard_verdict(&ValidationSummary::combined(vec![shacl, shex]));
+        assert!(!blocks);
+        let verdict = Some((blocks, failures));
+        let mut fact = ReifiedFact {
+            s: iri("urn:s").into(),
+            p: iri("urn:p"),
+            o: iri("urn:o").into(),
+            g: iri("urn:g"),
+            reifiers: Vec::new(),
+            time: None,
+            confidence: None,
+            quote: None,
+            span: None,
+            by: None,
+            agent: None,
+        };
+        assert_eq!(guard_signal(&fact, &verdict), "fail");
+        fact.p = iri("urn:other");
+        assert_eq!(guard_signal(&fact, &verdict), "pass");
+        fact.s = iri("urn:x").into();
+        assert_eq!(guard_signal(&fact, &verdict), "fail");
+        fact.s = iri("urn:ok").into();
+        assert_eq!(guard_signal(&fact, &verdict), "pass");
+    }
 }

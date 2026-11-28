@@ -341,10 +341,11 @@ listed in the README's Jena→Sparkles table.
 
 ### 2.7 Write-time validation with ShEx (Phase 2)
 
-Write-time validation reuses the [C10](../C10-write-time-validation.md) guard. A dataset
-uses one language at a time (Open question 7). `validation.json` moves to format 2, which
-adds a `language` field. A format 1 file reads as `"language": "shacl"` and keeps working
-unchanged:
+Write-time validation reuses the [C10](../C10-write-time-validation.md) guard. Phase 2
+introduced standalone ShEx. Item 54 added
+[combined guards](OUTCOME.md#guards-schema-sources-and-cli-controls) and resolved
+open question 7. Phase 2 used format 2 of `validation.json` to add a `language` field.
+A format 1 file reads as `"language": "shacl"`:
 
 ```json
 { "format": 2, "language": "shex", "mode": "reject",

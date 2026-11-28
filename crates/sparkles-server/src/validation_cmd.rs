@@ -262,8 +262,10 @@ fn shacl_config(
         ..Default::default()
     };
     if let Some(f) = &a.shapes {
-        shapes.inline =
-            Some(std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?);
+        shapes.inline = Some(
+            crate::write_validation::read_shapes_file(f)
+                .with_context(|| format!("reading {}", f.display()))?,
+        );
         shapes.source = Some(f.display().to_string());
         // the syntax from the file name: SHACLC, or an RDF syntax (Turtle by default)
         if let Some((syntax, _)) = sparkles_shacl::ShapesSyntax::from_path(f) {

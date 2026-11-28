@@ -193,6 +193,22 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
     })
 }
 
+/// Read a local shapes file without allocating more than the source limit requires.
+#[cfg(any(feature = "shacl", feature = "shex"))]
+pub(crate) fn read_shapes_file(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    const MAX_BYTES: u64 = 16 << 20;
+    let mut bytes = Vec::new();
+    let mut file = std::fs::File::open(path)?.take(MAX_BYTES);
+    file.read_to_end(&mut bytes)?;
+    let mut extra = [0];
+    anyhow::ensure!(
+        file.into_inner().read(&mut extra)? == 0,
+        "SHACL shapes exceed 16 MiB"
+    );
+    Ok(String::from_utf8(bytes)?)
+}
+
 /// Read local sources for a startup validation configuration.
 #[cfg(any(feature = "shacl", feature = "shex"))]
 fn resolve_sources(entry: &mut J, dir: Option<&std::path::Path>) -> Result<()> {
@@ -212,7 +228,7 @@ fn resolve_sources(entry: &mut J, dir: Option<&std::path::Path>) -> Result<()> {
                 if key == "schema" {
                     return sparkles_shex::guard::read_schema_file(&file);
                 }
-                Ok(std::fs::read_to_string(&file)?)
+                read_shapes_file(&file)
             };
             let text = read().with_context(|| format!("reading {}", file.display()))?;
             if key == "schema" && src.get("base").is_none() {
@@ -248,6 +264,21 @@ mod tests {
         let store = Store::open(dir.path(), Default::default()).unwrap();
         assert!(install(&store).unwrap().is_none());
         assert!(!store.guard_required());
+    }
+
+    #[cfg(feature = "shacl")]
+    #[test]
+    fn startup_validation_bounds_shapes_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.ttl");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len((16 << 20) + 1)
+            .unwrap();
+        let mut entry = json!({"shapes": {"source": "oversized.ttl"}});
+        let err = resolve_sources(&mut entry, Some(dir.path())).unwrap_err();
+        assert!(format!("{err:#}").contains("SHACL shapes exceed 16 MiB"));
+        assert!(entry["shapes"].get("inline").is_none());
     }
 
     /// A database with a ShEx configuration (and its schema copy).

@@ -1960,6 +1960,42 @@ fn prepare(
 }
 
 impl ShexGuard {
+    /// Promote a detached guard under the drained store writer, after its standalone
+    /// configuration has been published. Move its typing without copying the cache.
+    #[doc(hidden)]
+    pub fn retain_persistent(
+        &self,
+        root: &Path,
+        hash: String,
+        head: u64,
+    ) -> (Arc<Self>, Option<StatusFile>) {
+        let baseline = self.baseline.lock().clone();
+        let exact = *self.exact.lock();
+        let status = baseline
+            .as_ref()
+            .filter(|b| b.commit == head && b.conforms.is_some() && exact.is_some())
+            .map(|b| StatusFile::of(b, &hash));
+        let guard = Self {
+            cfg: self.cfg.clone(),
+            model: parking_lot::RwLock::new(self.model()),
+            pending: Mutex::new(None),
+            baseline: Mutex::new(baseline),
+            exact: Mutex::new(exact),
+            typing: Mutex::new(self.typing.lock().take()),
+            saved: Mutex::new(None),
+            persist: Some((root.to_path_buf(), hash)),
+            counters: self.counters.clone(),
+            last_full: AtomicU64::new(self.last_full.load(Ordering::Relaxed)),
+            associations: AtomicU64::new(self.associations.load(Ordering::Relaxed)),
+            warnings: Mutex::new(self.warnings.lock().clone()),
+            copy: None,
+            graph_file: self.graph_file.clone(),
+            graph_dirty: AtomicBool::new(self.graph_dirty.load(Ordering::Relaxed)),
+            history: self.history.clone(),
+        };
+        (Arc::new(guard), status)
+    }
+
     /// Discard a candidate's state when a different guard refused it.
     #[doc(hidden)]
     pub fn discard_pending(&self, seq: u64) {
