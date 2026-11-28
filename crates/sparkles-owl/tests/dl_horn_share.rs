@@ -628,8 +628,8 @@ fn a_minimum_the_horn_rules_leave_out_does_not_refuse() {
     }
 }
 
-/// A minimum above 64 with an empty filler, and a maximum in the body whose dual is one,
-/// is empty for the Horn rules, while the rooted rules with counting unfold it before they
+/// A minimum above 64 with an empty filler, and a maximum in the body whose dual is a
+/// minimum of 65, is empty for the Horn rules, while the rooted rules with counting unfold it before they
 /// read its filler and leave it out past 64. It does not refuse, and the rooted run keeps
 /// the union and `D ⊑ G`.
 #[test]
@@ -661,6 +661,28 @@ fn a_bottom_minimum_past_the_tier_d_bound_does_not_refuse() {
             got.left_out
         );
     }
+}
+
+/// A maximum of 64 with an empty filler inside the filler of a minimum of two in the head
+/// is in a positive position, where the rooted rules with counting take it, and so are the
+/// Horn rules. The axiom refuses, and the rooted run answers as the default run does.
+#[test]
+fn a_bottom_maximum_inside_a_minimum_refuses() {
+    let classes = ex(&["A", "D", "E", "F", "G"]);
+    let axiom = "SubClassOf(:A ObjectMinCardinality(2 :r ObjectMaxCardinality(64 :s owl:Nothing)))";
+    let axioms = parse(&format!("{UNION}\n{axiom}"));
+    let mut k = Classifier::of(&axioms);
+    let out = k.classify(&rooted(&Limits::default())).unwrap();
+    let got = answer(&k, &out, &classes);
+    let want = classify(&axioms, &classes, &Limits::default());
+    assert_eq!(got, want);
+    assert_eq!(out.stats.dl_contexts, 0, "the Horn rules take the axioms");
+    assert!(!got.subsumptions.contains(&pair("D", "G")));
+    assert!(
+        !got.left_out.iter().any(|a| a.contains("Cardinality")),
+        "{:?}",
+        got.left_out
+    );
 }
 
 /// Disjuncts that the Horn rules intern as one expression are one disjunct, such as an

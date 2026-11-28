@@ -466,20 +466,28 @@ for a self restriction, a data restriction, the top or bottom property or nestin
 than they read does not refuse, and neither does an irreflexive property. The rooted rules
 with counting unfold a minimum in a positive position, and the dual of a maximum in a
 negative one, before they read its filler, so a minimum above 64 there does not refuse even
-when its filler is empty and the Horn rules take the axiom. On the Horn side the check
-follows the flattening of an inclusion, the limit of 64 on a minimum that the rules unfold,
-the bottom property and the simple roles that number restrictions and the property axioms
-need. The Horn rules remove the repeats of an interned expression from a disjunction, and
-the check compares the disjuncts it can match without interning them, such as an
-existential restriction and a minimum of one with the same filler. Two disjuncts that it
-cannot match count as distinct. A bounded search for a chain below a role settles its
-simplicity, reads an equivalence of properties as the ring of inclusions that the Horn rules
-build, and charges and polls every step. It follows that ring one inclusion at a time, so
-a member of an equivalence of more than 64 properties is a role that it does not settle. A
-role that the search does not settle does not refuse. An axiom that both rules leave out, such as a minimum above 64 with a filler that is
-not empty, therefore keeps the rooted run's disjunctive axioms and their consequences. The
-test for an individual in the axioms walks them without listing their individuals and polls
-as it goes.
+when its filler is empty and the Horn rules take the axiom. They read the filler of a
+minimum in the minimum's own position, the filler of a maximum in the opposite one and the
+filler of an exact cardinality in both, so a number restriction inside a filler has the
+bound of its own position. On the Horn side the check follows the flattening of an
+inclusion, the limit of 64 on a minimum that the rules unfold, the bottom property and the
+simple roles that number restrictions and the property axioms need. The Horn rules remove
+the repeats of an interned expression from a disjunction, and the check compares the
+disjuncts it can match without interning them, such as an existential restriction and a
+minimum of one with the same filler. Two disjuncts that it cannot match count as distinct,
+and so do two whose comparison reaches its limit of 4,096 steps. The comparison charges the
+operands of an intersection before it reads them, and it stops at that limit or at a
+cancellation without reading the remaining operands. A bounded search for a chain below a
+role settles its simplicity, reads an equivalence of properties as the ring of inclusions
+that the Horn rules build, and charges and polls every step. It follows that ring one
+inclusion at a time and visits at most 64 roles beyond the one it starts from, so it
+settles a member of an equivalence of 65 properties and not a member of one of 66. A role
+that the search does not settle does not refuse. An axiom that both rules leave out, such
+as a minimum above 64 with a filler that is not empty, therefore keeps the rooted run's
+disjunctive axioms and their consequences. The test for an individual in the axioms walks
+them without listing their individuals, and counts a step for every axiom and every
+expression it reads, so it polls in a long stretch of property axioms or declarations as
+well.
 
 Over item 805's rewriting the rooted rules read the rewritten axioms, and the Horn rules
 read the original axioms that each one stands for, with the role box of the original

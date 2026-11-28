@@ -82,16 +82,7 @@ fn refusing(
         Roles::El(ax) => (None, candidates, Some(ax)),
         Roles::Original(red, original) => (Some((red, original)), original, None),
     };
-    let mut s = Scan {
-        roles: role_axioms,
-        el,
-        it,
-        stop,
-        ticks: 0,
-        halted: false,
-        path: [(Key::Fresh(u32::MAX), false); ROLE_DEPTH],
-        path_len: 0,
-    };
+    let mut s = Scan::new(role_axioms, el, it, stop);
     for (i, k) in candidates.iter().enumerate() {
         if !s.tick() {
             return Err(Halt::Stopped);
@@ -186,73 +177,10 @@ fn fill(g: Option<&ClassExpression>) -> Fill<'_> {
     g.map_or(Fill::Top, Fill::Expr)
 }
 
-/// The shape of an expression in a positive (`pos`) or a negative position, as
-/// `horn::Norm::pos` and `horn::Norm::neg` intern it. An intersection drops `owl:Thing`
-/// and a union `owl:Nothing`, and one that keeps a single operand is that operand, as
-/// both do. An existential restriction, a minimum of one and a value restriction are one
-/// shape, and a maximum of one in a positive position another.
-fn shape(c: &ClassExpression, pos: bool) -> Shape<'_> {
-    match c {
-        C::Class(k) => match class_v(k) {
-            V::Top => Shape::Top,
-            V::Bottom => Shape::Bottom,
-            V::Other => Shape::Class(k),
-        },
-        C::ObjectIntersectionOf(cs) => {
-            let mut rest = cs.iter().filter(|c| class_of(c) != Some(V::Top));
-            match (rest.next(), rest.next()) {
-                (None, _) => Shape::Top,
-                (Some(c), None) => shape(c, pos),
-                _ if cs.iter().any(|c| class_of(c) == Some(V::Bottom)) => Shape::Bottom,
-                _ => Shape::Conj(cs),
-            }
-        }
-        C::ObjectUnionOf(cs) => {
-            if cs.iter().any(|c| class_of(c) == Some(V::Top)) {
-                return Shape::Top;
-            }
-            let mut rest = cs.iter().filter(|c| class_of(c) != Some(V::Bottom));
-            match (rest.next(), rest.next()) {
-                (None, _) => Shape::Bottom,
-                (Some(c), None) => shape(c, pos),
-                _ => Shape::Opaque,
-            }
-        }
-        C::ObjectSomeValuesFrom(p, g) => Shape::Exist(p, Fill::Expr(g)),
-        C::ObjectMinCardinality(0, ..) => Shape::Top,
-        C::ObjectMinCardinality(1, p, g) => Shape::Exist(p, fill(g.as_deref())),
-        C::ObjectHasValue(p, a) => Shape::Exist(p, Fill::Nominal(a)),
-        C::ObjectOneOf(is) if is.len() == 1 => {
-            is.iter().next().map_or(Shape::Opaque, Shape::Nominal)
-        }
-        C::ObjectMaxCardinality(1, p, g) if pos => Shape::AtMost1(p, fill(g.as_deref())),
-        _ => Shape::Opaque,
-    }
-}
-
-/// The shape of a filler in a positive (`pos`) or a negative position.
-fn fill_shape(f: Fill<'_>, pos: bool) -> Shape<'_> {
-    match f {
-        Fill::Top => Shape::Top,
-        Fill::Expr(g) => shape(g, pos),
-        Fill::Nominal(i) => Shape::Nominal(i),
-    }
-}
-
 fn class_of(c: &ClassExpression) -> Option<V> {
     match c {
         C::Class(k) => Some(class_v(k)),
         _ => None,
-    }
-}
-
-/// The shape of a disjunct of a Horn inclusion's head, in a positive position.
-fn head_shape(h: Head<'_>) -> Shape<'_> {
-    match h {
-        Head::Expr(c) => shape(c, true),
-        Head::Min(1, p, g) => Shape::Exist(p, fill(g)),
-        Head::Max(1, p, g) => Shape::AtMost1(p, fill(g)),
-        _ => Shape::Opaque,
     }
 }
 
@@ -371,6 +299,24 @@ struct Scan<'a> {
 }
 
 impl<'a> Scan<'a> {
+    fn new(
+        roles: &'a [&'a AxiomKind],
+        el: Option<&'a Axioms>,
+        it: &'a Interner,
+        stop: &'a dyn Fn() -> bool,
+    ) -> Self {
+        Scan {
+            roles,
+            el,
+            it,
+            stop,
+            ticks: 0,
+            halted: false,
+            path: [(Key::Fresh(u32::MAX), false); ROLE_DEPTH],
+            path_len: 0,
+        }
+    }
+
     /// One step, `false` once `stop` said the run's deadline or cancellation came.
     fn tick(&mut self) -> bool {
         if self.halted {
@@ -411,9 +357,13 @@ impl<'a> Scan<'a> {
     }
 
     /// Whether an axiom holds an individual outside its annotations, named or anonymous,
-    /// as `index::holds_individual` reads a logical axiom, with no list of them. `None`
-    /// once `stop` came or past the nesting bound.
+    /// as `index::holds_individual` reads a logical axiom, with no list of them. It
+    /// counts a step for every axiom, whatever its kind, and for every expression it
+    /// reads. `None` once `stop` came or past the nesting bound.
     fn holds_individual(&mut self, k: &AxiomKind) -> Option<bool> {
+        if !self.tick() {
+            return None;
+        }
         Some(match k {
             K::SubClassOf(a, b) => self.ce_individual(a, 0)? || self.ce_individual(b, 0)?,
             K::EquivalentClasses(cs) => self.any_individual(cs)?,
@@ -612,8 +562,11 @@ impl<'a> Scan<'a> {
     /// above zero in either position, as a maximum in a negative position is the minimum
     /// above it in a positive one. The run with counting unfolds a minimum in a positive
     /// position and the dual of a maximum in a negative one before it reads the filler,
-    /// and leaves either out past [`MAX_MIN`]. The depth grows at least as fast as the
-    /// normalization's.
+    /// and leaves either out past [`MAX_MIN`]. It reads the filler of a minimum in the
+    /// minimum's own positions, the filler of a maximum in the opposite ones and the
+    /// filler of an exact cardinality in both, as the run with counting does, so that a
+    /// number restriction inside a filler has the bound of its own positions. The depth
+    /// grows at least as fast as the normalization's.
     fn td(&mut self, c: &ClassExpression, depth: usize, pol: Pol, f: &mut Td) {
         if f.other || !self.tick() || depth > MAX_DEPTH {
             f.other = true;
@@ -662,50 +615,16 @@ impl<'a> Scan<'a> {
                 }
                 self.td_role(p, f);
                 if let Some(g) = g {
-                    self.td_any(g, d + 1, f);
+                    let inner = match (min, max) {
+                        (true, false) => pol,
+                        (false, true) => pol.flip(),
+                        _ => Pol::BOTH,
+                    };
+                    self.td(g, d + 1, inner, f);
                 }
             }
             C::ObjectHasValue(p, _) => self.td_role(p, f),
             // self restrictions and data restrictions
-            _ => f.other = true,
-        }
-    }
-
-    /// Whether the Tier D normalization with counting leaves out something inside the
-    /// filler of a number restriction, in either position. A number restriction past the
-    /// bound of [`Scan::td`] counts as left out in any position.
-    fn td_any(&mut self, c: &ClassExpression, depth: usize, f: &mut Td) {
-        if f.other || !self.tick() || depth > MAX_DEPTH {
-            f.other = true;
-            return;
-        }
-        let d = depth + 1;
-        match c {
-            C::Class(_) | C::ObjectOneOf(_) | C::ObjectMinCardinality(0, ..) => {}
-            C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
-                for c in cs {
-                    self.td_any(c, d, f);
-                }
-            }
-            C::ObjectComplementOf(g) => self.td_any(g, d, f),
-            C::ObjectSomeValuesFrom(p, g) | C::ObjectAllValuesFrom(p, g) => {
-                self.td_role(p, f);
-                self.td_any(g, d, f);
-            }
-            C::ObjectMinCardinality(n, p, g)
-            | C::ObjectMaxCardinality(n, p, g)
-            | C::ObjectExactCardinality(n, p, g) => {
-                let min = matches!(c, C::ObjectMinCardinality(..));
-                if *n > MAX_MIN || (!min && *n == MAX_MIN) {
-                    f.other = true;
-                    return;
-                }
-                self.td_role(p, f);
-                if let Some(g) = g {
-                    self.td_any(g, d + 1, f);
-                }
-            }
-            C::ObjectHasValue(p, _) => self.td_role(p, f),
             _ => f.other = true,
         }
     }
@@ -801,7 +720,7 @@ impl<'a> Scan<'a> {
                         let mut s = Sub::default();
                         self.h_left(&ds[i], &mut s)?;
                         self.h_step(&mut s)?;
-                        self.h_head(&mut s, class, Shape::Opaque);
+                        self.h_head(&mut s, class, None)?;
                         s.finish()?;
                     } else {
                         self.h_empty(&ds[i])?;
@@ -904,66 +823,212 @@ impl<'a> Scan<'a> {
         Some(())
     }
 
-    /// A disjunct of a Horn inclusion's head with its value and shape. A disjunct whose
+    /// A disjunct of a Horn inclusion's head with its value, and the expression whose
+    /// shape it has, `None` for one that the check does not compare. A disjunct whose
     /// shape is that of the first does not count again, as the normalization removes
-    /// repeats of an interned expression.
-    fn h_head<'c>(&mut self, s: &mut Sub<'c>, v: V, h: Shape<'c>) {
+    /// repeats of an interned expression. The check builds the shape of the first two
+    /// distinct disjuncts only. `None` once `stop` came.
+    fn h_head<'c>(&mut self, s: &mut Sub<'c>, v: V, h: Option<Head<'c>>) -> Option<()> {
         match v {
             V::Top => s.head_top = true,
             V::Bottom => {}
             V::Other => match s.head {
                 0 => {
                     s.head = 1;
-                    s.first = h;
+                    s.first = match h {
+                        Some(h) => self.first_shape(h)?,
+                        None => Shape::Opaque,
+                    };
                 }
-                1 if self.same(s.first, h, true, &mut 0) => {}
-                _ => s.head = 2,
+                1 => {
+                    let repeat = match h {
+                        Some(h) => self.repeats(s.first, h)?,
+                        None => false,
+                    };
+                    if !repeat {
+                        s.head = 2;
+                    }
+                }
+                _ => {}
             },
+        }
+        Some(())
+    }
+
+    /// The shape of the first distinct disjunct, [`Shape::Opaque`] past [`SAME_WORK`],
+    /// which keeps it apart from the others, and `None` once `stop` came.
+    fn first_shape<'c>(&mut self, h: Head<'c>) -> Option<Shape<'c>> {
+        let mut work = 0;
+        match self.head_shape(h, &mut work) {
+            Some(shape) => Some(shape),
+            None if self.halted => None,
+            None => Some(Shape::Opaque),
+        }
+    }
+
+    /// Whether a disjunct normalizes to the first one, `false` past [`SAME_WORK`], which
+    /// keeps the two apart and the Tier D run as it was, and `None` once `stop` came.
+    fn repeats<'c>(&mut self, first: Shape<'c>, h: Head<'c>) -> Option<bool> {
+        let mut work = 0;
+        let same = match self.head_shape(h, &mut work) {
+            Some(shape) => self.same(first, shape, true, &mut work),
+            None => None,
+        };
+        match same {
+            Some(same) => Some(same),
+            None if self.halted => None,
+            None => Some(false),
+        }
+    }
+
+    /// One comparison step of [`Scan::same`] or of a shape's construction, which reads
+    /// `ops` operands. `false` past [`SAME_WORK`] or once `stop` came.
+    fn compare(&mut self, ops: usize, work: &mut usize) -> bool {
+        *work = work.saturating_add(1).saturating_add(ops);
+        *work <= SAME_WORK && self.tick()
+    }
+
+    /// The shape of an expression in a positive (`pos`) or a negative position, as
+    /// `horn::Norm::pos` and `horn::Norm::neg` intern it. An intersection drops
+    /// `owl:Thing` and a union `owl:Nothing`, and one that keeps a single operand is that
+    /// operand, as both do. An existential restriction, a minimum of one and a value
+    /// restriction are one shape, and a maximum of one in a positive position another.
+    /// The construction charges the operands of an intersection or a union before it
+    /// reads them, and answers `None` past [`SAME_WORK`] or once `stop` came.
+    fn shape<'c>(
+        &mut self,
+        c: &'c ClassExpression,
+        pos: bool,
+        work: &mut usize,
+    ) -> Option<Shape<'c>> {
+        let ops = match c {
+            C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs.len(),
+            _ => 0,
+        };
+        if !self.compare(ops, work) {
+            return None;
+        }
+        Some(match c {
+            C::Class(k) => match class_v(k) {
+                V::Top => Shape::Top,
+                V::Bottom => Shape::Bottom,
+                V::Other => Shape::Class(k),
+            },
+            C::ObjectIntersectionOf(cs) => {
+                let mut rest = cs.iter().filter(|c| class_of(c) != Some(V::Top));
+                match (rest.next(), rest.next()) {
+                    (None, _) => Shape::Top,
+                    (Some(c), None) => self.shape(c, pos, work)?,
+                    _ if cs.iter().any(|c| class_of(c) == Some(V::Bottom)) => Shape::Bottom,
+                    _ => Shape::Conj(cs),
+                }
+            }
+            C::ObjectUnionOf(cs) => {
+                if cs.iter().any(|c| class_of(c) == Some(V::Top)) {
+                    return Some(Shape::Top);
+                }
+                let mut rest = cs.iter().filter(|c| class_of(c) != Some(V::Bottom));
+                match (rest.next(), rest.next()) {
+                    (None, _) => Shape::Bottom,
+                    (Some(c), None) => self.shape(c, pos, work)?,
+                    _ => Shape::Opaque,
+                }
+            }
+            C::ObjectSomeValuesFrom(p, g) => Shape::Exist(p, Fill::Expr(g)),
+            C::ObjectMinCardinality(0, ..) => Shape::Top,
+            C::ObjectMinCardinality(1, p, g) => Shape::Exist(p, fill(g.as_deref())),
+            C::ObjectHasValue(p, a) => Shape::Exist(p, Fill::Nominal(a)),
+            C::ObjectOneOf(is) if is.len() == 1 => {
+                is.iter().next().map_or(Shape::Opaque, Shape::Nominal)
+            }
+            C::ObjectMaxCardinality(1, p, g) if pos => Shape::AtMost1(p, fill(g.as_deref())),
+            _ => Shape::Opaque,
+        })
+    }
+
+    /// The shape of a filler in a positive (`pos`) or a negative position, as
+    /// [`Scan::shape`] answers.
+    fn fill_shape<'c>(&mut self, f: Fill<'c>, pos: bool, work: &mut usize) -> Option<Shape<'c>> {
+        match f {
+            Fill::Top => Some(Shape::Top),
+            Fill::Expr(g) => self.shape(g, pos, work),
+            Fill::Nominal(i) => Some(Shape::Nominal(i)),
+        }
+    }
+
+    /// The shape of a disjunct of a Horn inclusion's head, in a positive position, as
+    /// [`Scan::shape`] answers.
+    fn head_shape<'c>(&mut self, h: Head<'c>, work: &mut usize) -> Option<Shape<'c>> {
+        match h {
+            Head::Expr(c) => self.shape(c, true, work),
+            Head::Min(1, p, g) => Some(Shape::Exist(p, fill(g))),
+            Head::Max(1, p, g) => Some(Shape::AtMost1(p, fill(g))),
+            _ => Some(Shape::Opaque),
         }
     }
 
     /// Whether two shapes in a positive (`pos`) or a negative position normalize to the
-    /// same expression, as far as the check tells. It answers `false` when it cannot tell,
-    /// past [`SAME_WORK`] comparisons or once `stop` came, which keeps the repeats apart
-    /// and the Tier D run as it was.
-    fn same<'c>(&mut self, a: Shape<'c>, b: Shape<'c>, pos: bool, work: &mut usize) -> bool {
-        *work += 1;
-        if *work > SAME_WORK || !self.tick() {
-            return false;
+    /// same expression, as far as the check tells, with `false` when it cannot. It
+    /// answers `None` past [`SAME_WORK`] comparisons or once `stop` came, and then visits
+    /// nothing more.
+    fn same<'c>(
+        &mut self,
+        a: Shape<'c>,
+        b: Shape<'c>,
+        pos: bool,
+        work: &mut usize,
+    ) -> Option<bool> {
+        if !self.compare(0, work) {
+            return None;
         }
-        match (a, b) {
+        Some(match (a, b) {
             (Shape::Top, Shape::Top) | (Shape::Bottom, Shape::Bottom) => true,
             (Shape::Class(x), Shape::Class(y)) => x == y,
             (Shape::Nominal(x), Shape::Nominal(y)) => x == y,
-            (Shape::Exist(p, f), Shape::Exist(q, g)) => {
-                p == q && self.same(fill_shape(f, pos), fill_shape(g, pos), pos, work)
+            (Shape::Exist(p, f), Shape::Exist(q, g)) if p == q => {
+                let f = self.fill_shape(f, pos, work)?;
+                let g = self.fill_shape(g, pos, work)?;
+                self.same(f, g, pos, work)?
             }
             // the filler of a maximum is in a negative position
-            (Shape::AtMost1(p, f), Shape::AtMost1(q, g)) => {
-                p == q && self.same(fill_shape(f, false), fill_shape(g, false), false, work)
+            (Shape::AtMost1(p, f), Shape::AtMost1(q, g)) if p == q => {
+                let f = self.fill_shape(f, false, work)?;
+                let g = self.fill_shape(g, false, work)?;
+                self.same(f, g, false, work)?
             }
             // the same operands besides `owl:Thing`, each of one a repeat of one of the other
             (Shape::Conj(xs), Shape::Conj(ys)) => {
-                self.within(xs, ys, pos, work) && self.within(ys, xs, pos, work)
+                self.within(xs, ys, pos, work)? && self.within(ys, xs, pos, work)?
             }
             _ => false,
-        }
+        })
     }
 
-    /// Whether every operand of `xs` besides `owl:Thing` has the shape of one of `ys`.
+    /// Whether every operand of `xs` besides `owl:Thing` has the shape of one of `ys`,
+    /// `None` as [`Scan::same`] answers it.
     fn within<'c>(
         &mut self,
         xs: &'c std::collections::BTreeSet<ClassExpression>,
         ys: &'c std::collections::BTreeSet<ClassExpression>,
         pos: bool,
         work: &mut usize,
-    ) -> bool {
+    ) -> Option<bool> {
         let thing = |c: &ClassExpression| class_of(c) == Some(V::Top);
-        xs.iter().filter(|x| !thing(x)).all(|x| {
-            ys.iter()
-                .filter(|y| !thing(y))
-                .any(|y| self.same(shape(x, pos), shape(y, pos), pos, work))
-        })
+        for x in xs.iter().filter(|x| !thing(x)) {
+            let x = self.shape(x, pos, work)?;
+            let mut found = false;
+            for y in ys.iter().filter(|y| !thing(y)) {
+                let y = self.shape(y, pos, work)?;
+                if self.same(x, y, pos, work)? {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     fn h_step(&mut self, s: &mut Sub<'_>) -> Option<()> {
@@ -1022,8 +1087,7 @@ impl<'a> Scan<'a> {
             Head::Min(n, p, g) => self.h_at_least(n, p, g, 1)?,
             Head::Max(n, p, g) => self.h_at_most(n, p, g, 1)?,
         };
-        self.h_head(s, v, head_shape(h));
-        Some(())
+        self.h_head(s, v, Some(h))
     }
 
     fn h_role(&mut self, p: &ObjectPropertyExpression) -> Option<()> {
@@ -1053,8 +1117,8 @@ impl<'a> Scan<'a> {
                     match self.h_pos(c, d)? {
                         V::Top => top = true,
                         V::Bottom => {}
-                        V::Other if n == 0 => (n, first) = (1, shape(c, true)),
-                        V::Other if n == 1 && self.same(first, shape(c, true), true, &mut 0) => {}
+                        V::Other if n == 0 => (n, first) = (1, self.first_shape(Head::Expr(c))?),
+                        V::Other if n == 1 && self.repeats(first, Head::Expr(c))? => {}
                         V::Other => n = 2,
                     }
                 }
@@ -1472,6 +1536,13 @@ mod tests {
             class("A"),
             min(2, "r", Some(min(65, "s", Some(nothing()))))
         )]));
+        // a number restriction inside a filler has the bound of its own position: the
+        // filler of a minimum has the minimum's, and the filler of a maximum the other one
+        let max64 = || max(64, "s", Some(nothing()));
+        assert!(check(&[sub(class("A"), min(2, "r", Some(max64())))]));
+        assert!(check(&[sub(max(1, "r", Some(max64())), nothing())]));
+        assert!(!check(&[sub(min(2, "r", Some(max64())), class("A"))]));
+        assert!(!check(&[sub(class("A"), max(1, "r", Some(max64())))]));
     }
 
     /// Disjuncts that the Horn normalization interns as one expression are one disjunct.
@@ -1623,13 +1694,15 @@ mod tests {
             ring,
             below
         ]));
-        // the search follows the ring one inclusion at a time, so that a member of an
-        // equivalence wider than its depth bound is a role it does not settle
+        // the search follows the ring one inclusion at a time and visits at most 64 roles
+        // besides the one it starts from, so that it settles a member of an equivalence of
+        // 65 properties and not one of 66
         let ring = |k: usize| {
             K::EquivalentObjectProperties((0..k).map(|i| prop(&format!("q{i}"))).collect())
         };
         let functional = K::FunctionalObjectProperty(prop("q0"));
         assert!(check(&[functional.clone(), ring(ROLE_DEPTH)]));
+        assert!(check(&[functional.clone(), ring(ROLE_DEPTH + 1)]));
         assert!(!check(&[functional, ring(ROLE_DEPTH + 2)]));
     }
 
@@ -1674,6 +1747,94 @@ mod tests {
         assert!(!check_empty(K::Declaration(Entity::NamedIndividual(
             NamedIndividual::new("http://example.org/a")
         ))));
+    }
+
+    /// Without an individual in the interner, the walk of the axioms for one counts a step
+    /// for every axiom, so that it polls inside a wide stretch of role axioms and
+    /// declarations before an assertion. Over the rewriting the role box comes from the
+    /// original axioms, so that only the walk reads the stretch.
+    #[test]
+    fn the_individual_walk_polls_for_every_axiom() {
+        let text = "Prefix(:=<urn:dl1286:>)\nOntology(
+             SubClassOf(:B ObjectAllValuesFrom(owl:topObjectProperty :E))
+             SubClassOf(:E ObjectUnionOf(:F :G))
+             ClassAssertion(:B :b)
+             FunctionalObjectProperty(:p)\n)";
+        let input = crate::ofn_read::parse(text).unwrap().axioms;
+        let original: Vec<&AxiomKind> = input.iter().map(|a| &a.kind).collect();
+        let red = super::super::dl_reduce::plan(&original, None, None).unwrap();
+        let functional = original
+            .iter()
+            .copied()
+            .find(|k| matches!(k, K::FunctionalObjectProperty(_)))
+            .unwrap();
+        let wide: Vec<AxiomKind> = (0..10_000)
+            .map(|i| match i % 2 {
+                0 => K::Declaration(Entity::NamedIndividual(NamedIndividual::new(format!(
+                    "http://example.org/i{i}"
+                )))),
+                _ => K::TransitiveObjectProperty(prop(&format!("t{i}"))),
+            })
+            .collect();
+        let assertion = K::ClassAssertion(class("B"), Individual::named("http://example.org/b"));
+        let candidates: Vec<&AxiomKind> = std::iter::once(functional)
+            .chain(&wide)
+            .chain(std::iter::once(&assertion))
+            .collect();
+        let it = Interner::default();
+        let run = |stop: &dyn Fn() -> bool| {
+            refuses(&candidates, &it, Roles::Original(&red, &original), stop)
+        };
+        let calls = std::cell::Cell::new(0usize);
+        let count = || {
+            calls.set(calls.get() + 1);
+            false
+        };
+        assert!(run(&count).unwrap());
+        assert!(calls.get() >= wide.len() / POLL_TICKS, "{}", calls.get());
+        assert!(matches!(run(&|| true), Err(Halt::Stopped)));
+    }
+
+    /// The comparison of two disjuncts stops at its work limit or once `stop` came, and
+    /// then visits no operand of a wide intersection that does not match. The construction
+    /// of a shape charges the operands of an intersection before it reads them.
+    #[test]
+    fn the_comparison_stops_at_its_work_limit() {
+        use std::collections::BTreeSet;
+        let it = Interner::default();
+        let never = || false;
+        let narrow: BTreeSet<_> = [class("X"), class("Y")].into_iter().collect();
+        let wide: BTreeSet<_> = (0..10_000).map(|i| class(&format!("W{i}"))).collect();
+        let mut s = Scan::new(&[], None, &it, &never);
+        let mut work = SAME_WORK - 8;
+        let got = s.same(Shape::Conj(&narrow), Shape::Conj(&wide), true, &mut work);
+        assert_eq!(got, None);
+        assert!(work <= SAME_WORK + 1, "{work}");
+        assert!(!s.halted);
+        // with work to spare, the comparison answers
+        let other: BTreeSet<_> = [class("X"), class("Z")].into_iter().collect();
+        let got = s.same(Shape::Conj(&narrow), Shape::Conj(&other), true, &mut 0);
+        assert_eq!(got, Some(false));
+        let got = s.same(Shape::Conj(&narrow), Shape::Conj(&narrow), true, &mut 0);
+        assert_eq!(got, Some(true));
+        // the shape of a wide intersection is charged before its operands are read
+        let wide_and = C::ObjectIntersectionOf(wide.clone());
+        let (mut work, ticks) = (0, s.ticks);
+        assert!(s.shape(&wide_and, true, &mut work).is_none());
+        assert_eq!(work, wide.len() + 1);
+        assert_eq!(s.ticks, ticks);
+        // two existential disjuncts whose fillers do not match count as distinct
+        let union = or([some("r", and(narrow.clone())), some("r", wide_and)]);
+        assert!(!check(&[sub(class("A"), and([min(2, "s", None), union]))]));
+        // a stop ends the comparison at once
+        let always = || true;
+        let mut s = Scan::new(&[], None, &it, &always);
+        s.ticks = POLL_TICKS - 1;
+        let mut work = 0;
+        let got = s.same(Shape::Conj(&narrow), Shape::Conj(&wide), true, &mut work);
+        assert_eq!(got, None);
+        assert!(s.halted);
+        assert_eq!(work, 1);
     }
 
     /// The ontology's EL axioms and interner, and its axioms outside OWL 2 EL with the
@@ -1780,6 +1941,14 @@ mod tests {
             "SubClassOf(ObjectMaxCardinality(64 :r owl:Nothing) :A)",
             "SubClassOf(ObjectMinCardinality(65 :r owl:Nothing) :A)",
             "SubClassOf(:A ObjectMinCardinality(2 :r ObjectMinCardinality(65 :s owl:Nothing)))",
+            "SubClassOf(:A ObjectMinCardinality(2 :r ObjectMaxCardinality(64 :s owl:Nothing)))",
+            "SubClassOf(ObjectMinCardinality(2 :r ObjectMaxCardinality(64 :s owl:Nothing)) :A)",
+            "SubClassOf(ObjectMaxCardinality(1 :r ObjectMaxCardinality(64 :s owl:Nothing)) :A)",
+            "SubClassOf(ObjectMaxCardinality(1 :r ObjectMaxCardinality(64 :s owl:Nothing)) owl:Nothing)",
+            "SubClassOf(:A ObjectMaxCardinality(1 :r ObjectMaxCardinality(64 :s owl:Nothing)))",
+            "SubClassOf(:A ObjectMinCardinality(2 :r ObjectExactCardinality(64 :s owl:Nothing)))",
+            "SubClassOf(:A ObjectMinCardinality(2 :r ObjectExactCardinality(65 :s owl:Nothing)))",
+            "SubClassOf(:A ObjectExactCardinality(2 :r ObjectMaxCardinality(64 :s owl:Nothing)))",
             "SubClassOf(:A ObjectIntersectionOf(ObjectMinCardinality(2 :s) ObjectUnionOf(ObjectSomeValuesFrom(:r :B) ObjectMinCardinality(1 :r :B))))",
             "SubClassOf(:A ObjectUnionOf(ObjectMaxCardinality(1 :r :B) ObjectMaxCardinality(1 :r ObjectIntersectionOf(:B owl:Thing))))",
             "SubClassOf(:A ObjectUnionOf(ObjectMaxCardinality(1 :r :B) ObjectMaxCardinality(1 :r :C)))",
