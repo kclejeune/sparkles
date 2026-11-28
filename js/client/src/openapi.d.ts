@@ -13287,7 +13287,7 @@ export interface components {
             /** @description The entity tag of the runtime layer, as in the `ETag` header. */
             etag: string;
             /** @enum {string} */
-            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths" | "forms" | "evidence";
+            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths" | "forms" | "evidence" | "index";
             /** @description The fields the settings file locks. */
             locked: string[];
             /** @description Locked fields whose runtime value is kept in the file but ignored. */
@@ -25641,7 +25641,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. */
+        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `vocabCodec` (`front` or `fsst`) and the boolean `patterns`. */
         requestBody: {
             content: {
                 "application/json": {
@@ -25725,7 +25725,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. */
+        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `vocabCodec` (`front` or `fsst`) and the boolean `patterns`. */
         requestBody: {
             content: {
                 "application/json": {

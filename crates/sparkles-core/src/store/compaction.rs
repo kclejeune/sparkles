@@ -1168,6 +1168,7 @@ impl Store {
                 tmp,
             )
         };
+        let build = (relink.is_none()).then(|| self.build_options(&snap0.generation));
         if self.root.is_some() {
             run.dir = Some(dir.clone());
             self.quota.exclude(Some(&dir));
@@ -1187,10 +1188,14 @@ impl Store {
             Some((main, source)) => self
                 .build_relinked(main, source, &snap0, &dir, &name, next_bnode, o)
                 .map(|meta| (meta, How::Relink)),
-            None => match &pool {
-                Some(p) => p.install(|| self.build_new(&snap0, &dir, next_bnode, o, mode)),
-                None => self.build_new(&snap0, &dir, next_bnode, o, mode),
-            },
+            None => {
+                let build = build.expect("a rebuild has captured build options");
+                let write = || self.build_new(&snap0, &dir, next_bnode, o, mode, build);
+                match &pool {
+                    Some(p) => p.install(write),
+                    None => write(),
+                }
+            }
         }?;
         let mut build = tb.elapsed();
         self.failpoint("compact-built");
@@ -1500,6 +1505,7 @@ impl Store {
 
     /// Write the generation of `snap` to `dir`: partially when `mode` allows it and the
     /// delta suits it, else in full.
+    #[allow(clippy::too_many_arguments)]
     fn build_new(
         &self,
         snap: &Snapshot,
@@ -1507,15 +1513,24 @@ impl Store {
         next_bnode: u64,
         o: &CompactOptions,
         mode: PartialMode,
+        build: crate::builder::BuildOptions,
     ) -> Result<(IndexMeta, How)> {
         let codec = snap.generation.vocab_codec();
         let why = match mode {
             PartialMode::Off => "partial compaction is off".to_string(),
             // a partial compaction copies the vocabulary as it is
-            _ if self.opts.build.vocab_codec.is_some_and(|c| c != codec) => format!(
+            _ if build.vocab_codec != Some(codec) => format!(
                 "the vocabulary codec changes from {codec} to {}",
-                self.opts.build.vocab_codec.unwrap()
+                build.vocab_codec.expect("the build has a vocabulary codec")
             ),
+            _ if build.patterns
+                && snap.generation.patterns.file.is_none()
+                && (snap.generation.meta.patterns.is_none()
+                    || snap.generation.patterns.missing.as_deref()
+                        == Some(crate::patterns::DISABLED_FOR_BUILD)) =>
+            {
+                "the previous generation has no predicate patterns to update".into()
+            }
             _ => match partial::plan(snap) {
                 Err(why) => why,
                 Ok(plan)
@@ -1539,7 +1554,7 @@ impl Store {
                         dir,
                         next_bnode,
                         self.prefixes(),
-                        self.opts.build.patterns,
+                        build.patterns,
                         &interrupt,
                     )?;
                     interrupt()?;
@@ -1553,7 +1568,7 @@ impl Store {
                 }
             },
         };
-        let meta = self.build_compacted(snap, dir, next_bnode, o)?;
+        let meta = self.build_compacted(snap, dir, next_bnode, o, build)?;
         Ok((meta, How::Full(why)))
     }
 
@@ -1650,12 +1665,9 @@ impl Store {
         dir: &Path,
         next_bnode: u64,
         o: &CompactOptions,
+        mut bopts: crate::builder::BuildOptions,
     ) -> Result<IndexMeta> {
-        let mut bopts = self.opts.build.clone();
         bopts.first_bnode = next_bnode;
-        bopts
-            .vocab_codec
-            .get_or_insert(snap.generation.vocab_codec());
         if let Some(t) = o.threads {
             bopts.threads = t.max(1);
         }

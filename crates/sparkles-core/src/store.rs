@@ -58,6 +58,9 @@ mod history_probe;
 pub mod import_journal;
 pub(crate) use history_limited::SnapshotCharge;
 mod history_query;
+mod index_settings;
+pub use index_settings::{INDEX_SETTINGS_FILE, IndexSettings, IndexSettingsSource};
+pub(crate) use index_settings::{INDEX_SETTINGS_TEMP_FILE, read as read_index_settings};
 mod holds;
 #[cfg(test)]
 mod holds_tests;
@@ -3160,13 +3163,22 @@ impl Store {
     /// [`Error::TextUnavailable`] until a ready view is published. Healthy index
     /// verification and covered WAL catch-up still complete before this returns.
     pub fn open(root: &Path, opts: StoreOptions) -> Result<Store> {
+        Self::open_with_index_settings(root, opts, None)
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_index_settings(
+        root: &Path,
+        opts: StoreOptions,
+        source: Option<IndexSettingsSource>,
+    ) -> Result<Store> {
         if branching::read_branch_file(root)?.is_some() {
             return Err(crate::branch::invalid_branch(format!(
                 "{} is a branch of a dataset; open the dataset's directory and choose the branch",
                 root.display()
             )));
         }
-        Self::open_inner(root, opts, None, OpenMode::Create)
+        Self::open_inner(root, opts, None, OpenMode::Create, source)
     }
 
     /// Open only an existing root, optionally requiring its original dataset UUID.
@@ -3183,7 +3195,7 @@ impl Store {
                 "an existing dataset root cannot be a member branch",
             ));
         }
-        Self::open_inner(root, opts, None, OpenMode::Existing(expected))
+        Self::open_inner(root, opts, None, OpenMode::Existing(expected), None)
     }
 
     /// Open the store of a branch (by the dataset's [`BranchSet`]).
@@ -3192,7 +3204,7 @@ impl Store {
         opts: StoreOptions,
         ctx: branching::OpenCtx,
     ) -> Result<Store> {
-        Self::open_inner(root, opts, Some(ctx), OpenMode::Create)
+        Self::open_inner(root, opts, Some(ctx), OpenMode::Create, None)
     }
 
     fn open_inner(
@@ -3200,6 +3212,7 @@ impl Store {
         opts: StoreOptions,
         ctx: Option<branching::OpenCtx>,
         mode: OpenMode,
+        index_settings_source: Option<IndexSettingsSource>,
     ) -> Result<Store> {
         // A database whose migration stopped part way is refused, before this open
         // creates the directory a missing root would get, and again under the lock
@@ -3233,6 +3246,8 @@ impl Store {
         // root writer runs, agreeing with the physical tree migrate --check inspects.
         if ctx.is_none() {
             crate::formats::check_dataset_tree(root)?;
+            *family.index_settings.runtime.lock() = index_settings::read(root)?;
+            *family.index_settings.source.write() = index_settings_source;
             // the dataset's managed-graph registry, which its branches share
             let state = managed::load_dir(root);
             // An activated family cannot fall back to legacy absence of its
@@ -3276,7 +3291,8 @@ impl Store {
             };
             let name = "gen-0001";
             let dir = root.join(name);
-            Builder::new(&dir, opts.build.clone())?.finish()?;
+            let build = family.index_settings.build_options(&opts.build, None);
+            Builder::new(&dir, build)?.finish()?;
             let first = CommitInfo {
                 seq: 0,
                 timestamp_ms: commit::now_ms(),
@@ -5907,16 +5923,6 @@ impl Store {
     }
 
     /// Current read snapshot.
-    /// The build options for a generation that replaces the current one: the store's,
-    /// with the current generation's vocabulary codec unless they name one.
-    pub(crate) fn build_options(&self) -> BuildOptions {
-        let mut o = self.opts.build.clone();
-        if o.vocab_codec.is_none() {
-            o.vocab_codec = Some(self.snapshot().generation.vocab_codec());
-        }
-        o
-    }
-
     pub fn snapshot(&self) -> Arc<Snapshot> {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
         self.current.load_full()
@@ -7860,7 +7866,7 @@ impl Store {
                 (t.path().to_path_buf(), "mem".to_string(), Some(t))
             }
         };
-        let mut bopts = self.build_options();
+        let mut bopts = self.build_options(&snap.generation);
         bopts.first_bnode = w.next_bnode;
         let interrupt = self.build_interrupt(Some(o.clone()), &dir);
         let mut sourced: Option<Vec<QuadKey>> = None;
@@ -8019,7 +8025,7 @@ impl Store {
         keep: impl FnMut(&[Id; 4]) -> Result<bool>,
         indexing: impl FnOnce(),
     ) -> Result<IndexMeta> {
-        let mut bopts = self.build_options();
+        let mut bopts = self.build_options(&snap.generation);
         bopts.first_bnode = next_bnode;
         let mut builder = Builder::new(gdir, bopts)?;
         if let Some(reserve) = reserve {

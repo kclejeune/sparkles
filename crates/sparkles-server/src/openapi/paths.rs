@@ -4919,7 +4919,7 @@ fn assist(p: &mut Paths) {
     let kind_body = |o: super::Op| {
         o.body(
             true,
-            "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs.",
+            "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `vocabCodec` (`front` or `fsst`) and the boolean `patterns`.",
             json!({ "application/json": { "schema": { "type": "object", "additionalProperties": true } } }),
         )
         .header(

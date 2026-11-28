@@ -308,3 +308,270 @@ fn migration_preflight_checks_features_and_tables() {
     );
     assert!(Store::open(&root, StoreOptions::default()).is_err());
 }
+
+#[test]
+fn index_settings_apply_to_builds_and_compactions_without_relabeling_snapshots() {
+    use sparkles_core::store::IndexSettings;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("db");
+    let store = Arc::new(Store::open(&root, options(None)).unwrap());
+    store
+        .load(&[Source::from_bytes(
+            b"<urn:a> <urn:p> <urn:b> .\n<urn:b> <urn:q> <urn:a> .\n".to_vec(),
+            RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    let old = store.snapshot();
+    assert_eq!(old.generation.vocab_codec(), VocabCodec::Front);
+    assert!(old.generation.patterns.file.is_some());
+    let count = |s| {
+        let result = sparkles_core::sparql::query(
+            s,
+            "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) { ?s ?p ?o } GROUP BY ?p ORDER BY ?p",
+            &QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        result
+            .rows()
+            .unwrap()
+            .iter()
+            .map(|row| format!("{:?}", row.values()))
+            .collect::<Vec<_>>()
+    };
+    let expected_count = count(old.clone());
+    let mut expected_dump = Vec::new();
+    store.dump_nquads(&mut expected_dump).unwrap();
+
+    let switched = IndexSettings {
+        vocab_codec: Some(VocabCodec::Fsst),
+        patterns: Some(false),
+    };
+    store.set_index_settings(switched).unwrap();
+    assert_eq!(store.index_settings(), switched);
+    assert!(Arc::ptr_eq(&old, &store.snapshot()));
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let stop = cancelled.clone();
+    let result = store.compact_with(&CompactOptions {
+        cancel: Some(cancelled.clone()),
+        progress: Some(Arc::new(move |_| stop.store(true, Ordering::Relaxed))),
+        ..Default::default()
+    });
+    assert!(cancelled.load(Ordering::Relaxed));
+    assert!(matches!(result, Err(sparkles_core::Error::Cancelled)));
+    assert!(Arc::ptr_eq(&old, &store.snapshot()));
+    assert_clean(&root);
+
+    let always = CompactOptions {
+        partial: Some(PartialMode::Always),
+        ..Default::default()
+    };
+    let after_start = IndexSettings {
+        patterns: Some(true),
+        ..switched
+    };
+    let edit_store = store.clone();
+    let report = store
+        .compact_with(&CompactOptions {
+            progress: Some(Arc::new(move |_| {
+                if edit_store.index_settings_layer() != after_start {
+                    edit_store.set_index_settings(after_start).unwrap();
+                }
+            })),
+            ..always.clone()
+        })
+        .unwrap();
+    assert_eq!(report.mode, "full");
+    assert!(report.full_reason.unwrap().contains("vocabulary codec"));
+    assert_eq!(store.index_settings(), after_start);
+    let fsst = store.snapshot();
+    assert_eq!(fsst.generation.vocab_codec(), VocabCodec::Fsst);
+    assert!(fsst.generation.patterns.file.is_none());
+    assert_eq!(
+        fsst.generation
+            .meta
+            .patterns
+            .as_ref()
+            .unwrap()
+            .skipped
+            .as_deref(),
+        Some("turned off for this build"),
+    );
+    assert_eq!(count(fsst.clone()), expected_count);
+    assert_eq!(count(old.clone()), expected_count);
+    assert_eq!(old.generation.vocab_codec(), VocabCodec::Front);
+    let mut dump = Vec::new();
+    store.dump_nquads(&mut dump).unwrap();
+    assert_eq!(dump, expected_dump);
+
+    let report = store.compact_with(&always).unwrap();
+    assert_eq!(report.mode, "full");
+    assert!(report.full_reason.unwrap().contains("predicate patterns"));
+    assert!(store.snapshot().generation.patterns.file.is_some());
+    assert!(fsst.generation.patterns.file.is_none());
+    assert_eq!(count(store.snapshot()), expected_count);
+
+    store.set_index_settings(switched).unwrap();
+    let report = store.compact_with(&always).unwrap();
+    assert_eq!(report.mode, "partial", "{report:?}");
+    assert!(store.snapshot().generation.patterns.file.is_none());
+    assert_eq!(count(store.snapshot()), expected_count);
+    assert_clean(&root);
+
+    store
+        .set_index_settings(IndexSettings {
+            vocab_codec: Some(VocabCodec::Front),
+            patterns: None,
+        })
+        .unwrap();
+    drop((store, old, fsst));
+    // The saved codec takes precedence over the opening's explicit build option.
+    let store = Store::open(&root, options(Some(VocabCodec::Fsst))).unwrap();
+    assert_eq!(store.index_settings().vocab_codec, Some(VocabCodec::Front));
+    assert_eq!(store.snapshot().generation.vocab_codec(), VocabCodec::Fsst);
+    assert!(store.snapshot().generation.patterns.file.is_none());
+    let fresh_root = temp.path().join("fresh");
+    let fresh = Store::open(&fresh_root, options(None)).unwrap();
+    fresh.set_index_settings(switched).unwrap();
+    fresh
+        .load(&[Source::from_bytes(
+            b"<urn:c> <urn:p> <urn:a> .\n".to_vec(),
+            RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    assert_eq!(fresh.snapshot().generation.vocab_codec(), VocabCodec::Fsst);
+    assert!(fresh.snapshot().generation.patterns.file.is_none());
+    assert_clean(&fresh_root);
+    store.compact().unwrap();
+    assert_eq!(store.snapshot().generation.vocab_codec(), VocabCodec::Front);
+    assert!(store.snapshot().generation.patterns.file.is_some());
+    assert_clean(&root);
+}
+
+#[test]
+fn index_settings_reject_unknown_versions_and_choices_before_open() {
+    use sparkles_core::store::INDEX_SETTINGS_FILE;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("db");
+    drop(Store::open(&root, options(None)).unwrap());
+    let current = std::fs::read(root.join("CURRENT")).unwrap();
+    for (json, message, unsupported) in [
+        (r#"{"format": 2, "vocabCodec": "fsst"}"#, "format 2", true),
+        (r#"{"format": 1, "vocabCodec": "zstd"}"#, "zstd", false),
+        (r#"{"format": 1, "patterns": "yes"}"#, "boolean", false),
+        (r#"{"format": 1, "blockCodec": "lz4"}"#, "blockCodec", false),
+    ] {
+        std::fs::write(root.join(INDEX_SETTINGS_FILE), json).unwrap();
+        let error = Store::open(&root, options(None)).err().unwrap();
+        assert_eq!(
+            matches!(error, sparkles_core::Error::Unsupported(_)),
+            unsupported
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains(INDEX_SETTINGS_FILE) && error.contains(message),
+            "{error}"
+        );
+        let report = check(&root, &CheckOptions { quick: true }).unwrap();
+        assert_eq!(report.status, Status::Error, "{}", report.to_text());
+        assert!(report.to_text().contains(message));
+        assert_eq!(std::fs::read(root.join("CURRENT")).unwrap(), current);
+    }
+}
+
+#[test]
+fn branch_rebuilds_read_the_live_dataset_index_policy() {
+    use sparkles_core::store::IndexSettings;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path(), options(None)).unwrap();
+    store
+        .load(&[Source::from_bytes(
+            b"<urn:a> <urn:p> <urn:b> .\n".to_vec(),
+            RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    store.create_branch("work", &Default::default()).unwrap();
+    let branch = store.branch("work").unwrap();
+    let old = branch.snapshot();
+    let index = IndexSettings {
+        vocab_codec: Some(VocabCodec::Fsst),
+        patterns: Some(false),
+    };
+    store.set_index_settings(index).unwrap();
+    assert_eq!(branch.index_settings(), index);
+    assert_eq!(old.generation.vocab_codec(), VocabCodec::Front);
+    branch
+        .compact_with(&CompactOptions {
+            partial: Some(PartialMode::Off),
+            ..Default::default()
+        })
+        .unwrap();
+    let new = branch.snapshot();
+    assert_eq!(new.generation.vocab_codec(), VocabCodec::Fsst);
+    assert!(new.generation.patterns.file.is_none());
+    assert_eq!(new.len(), old.len());
+    assert_eq!(store.snapshot().generation.vocab_codec(), VocabCodec::Front);
+}
+
+#[test]
+fn explicit_patterns_respect_the_budget_without_forcing_full_compaction() {
+    use sparkles_core::store::IndexSettings;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        temp.path(),
+        StoreOptions {
+            build: BuildOptions {
+                pattern_bytes: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    store
+        .set_index_settings(IndexSettings {
+            patterns: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    store
+        .load(&[Source::from_bytes(
+            b"<urn:a> <urn:p> <urn:b> .\n<urn:b> <urn:q> <urn:a> .\n".to_vec(),
+            RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    let old = store.snapshot();
+    assert!(old.generation.patterns.file.is_none());
+    assert!(
+        old.generation
+            .patterns
+            .missing
+            .as_deref()
+            .unwrap()
+            .contains("memory budget"),
+        "{:?}",
+        old.generation.patterns.missing
+    );
+
+    let report = store
+        .compact_with(&CompactOptions {
+            partial: Some(PartialMode::Always),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(report.mode, "partial", "{report:?}");
+    assert!(store.snapshot().generation.patterns.file.is_none());
+}

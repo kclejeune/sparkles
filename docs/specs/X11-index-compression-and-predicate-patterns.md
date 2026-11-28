@@ -508,8 +508,9 @@ by default because the warm queries that decode many terms miss §4.4's gate. Ro
 records why the gate is still missed. Phase 2b, Phase 3 and open question 1 were not
 adopted. [Phases not built](#phases-not-built) records the measurements and gate
 decisions that completed roadmap items 16 and 108. Their rejection does not require
-shipping them later to complete the accepted codec contract. Dataset-local settings
-remain under item 343, while items 160 and 241 track retained lookup costs.
+shipping them later to complete the accepted codec contract. Item 343 delivered
+[dataset-local settings](#dataset-local-settings). Items 160 and 241 track retained
+lookup costs.
 
 ### What was built
 
@@ -887,3 +888,31 @@ observe the same accepted precedence and compatibility contract.
 Item 343 also records the optional portable-decoder decision described by
 [X01](X01-compression-codecs.md#remaining-codec-decisions). No rejected storage
 experiment is reopened merely to remove a partial status label.
+
+#### Delivered under item 343
+
+The C19 `index` kind accepts `vocabCodec` as `front` or `fsst` and `patterns` as a
+boolean. A new dataset starts with front coding and patterns enabled. A rebuild
+defaults to the current generation's codec. The invocation flags also contribute
+to the default layer, followed by the settings file's defaults and dataset entry
+and then the dataset's runtime layer. The declared locks take precedence. Runtime edits through the HTTP routes and
+`sparkles settings` persist the overrides in `index-settings.json` at format 1. Embedded
+Rust callers can read the effective settings and set or clear the runtime layer through
+`Dataset::settings().index()`. Physical backups preserve each generation's actual
+codec and features. They omit the runtime policy file, as they do for automatic
+compaction and quota settings.
+
+The build captures both settings before writing generation files. The runtime layer
+belongs to the dataset and applies when a branch builds its own generation.
+Compaction can drop patterns in a partial rewrite. It builds in full when the codec
+changes or to build pattern tables for a generation written with patterns disabled
+or without pattern metadata. A prior build that exhausted the pattern memory budget
+remains eligible for partial compaction. An edit during compaction applies
+to the next build, and cancellation before publication keeps the current generation.
+
+Index format 5 and the `fsst-vocab` feature continue to describe the files actually
+written. Readers hold their generation across a switch, and `sparkles stats` reports
+that generation's codec and pattern availability. The settings reader refuses unknown
+versions and invalid choices before opening a dataset. Tests cover declared locks
+and overrides, CLI and HTTP validation, reopen, bulk load, branches, full and partial
+compaction, cancellation, query and dump parity, and format and feature refusals.

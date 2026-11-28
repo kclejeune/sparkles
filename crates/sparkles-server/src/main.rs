@@ -204,18 +204,16 @@ struct Cli {
     /// data stops adding its prefixes
     #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_MAX_PREFIXES)]
     max_prefixes: usize,
-    /// Build no predicate patterns when a bulk load or a compaction writes a generation
-    /// (queries then read the permutations for predicate listings)
+    /// Default to skipping predicate patterns in new generations, unless dataset settings
+    /// enable them
     #[arg(long, global = true)]
     no_patterns: bool,
     /// Memory in MiB for the distinct predicate patterns while a generation is built; a
     /// generation that needs more is built without them
     #[arg(long, global = true, default_value_t = 1024)]
     pattern_memory_mb: usize,
-    /// How a bulk load or a full compaction stores the vocabulary: `front` (front-coded
-    /// keys) or `fsst` (front-coded keys whose suffixes are FSST-compressed, an index of
-    /// format 4 that releases reading only format 3 cannot open)
-    /// (default: front for a new database, and the current generation's for a compaction)
+    /// Default vocabulary codec for new generations: `front` or `fsst`. Dataset settings
+    /// can override it. Standalone rebuilds without a codec setting keep the current codec
     #[arg(long, global = true)]
     vocab_codec: Option<sparkles::builder::VocabCodec>,
     /// Write without write-time validation (load, update, infer)
@@ -4443,6 +4441,14 @@ fn run() -> Result<()> {
                         return Ok(());
                     }
                 }
+            }
+            if let (Some(requested), Some(saved)) =
+                (cli.vocab_codec, store.index_settings_layer().vocab_codec)
+                && requested != saved
+            {
+                eprintln!(
+                    "dataset index settings choose vocabulary codec {saved}; --vocab-codec {requested} supplies the default"
+                );
             }
             let t = Instant::now();
             let rep = store.compact_with(&sparkles::store::CompactOptions {

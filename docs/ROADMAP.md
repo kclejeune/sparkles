@@ -100,10 +100,9 @@ resources and source identity go ahead of unrelated feature expansion.
 ### Release
 
 The first release fixes the storage formats that later versions must read and completes
-backup. Item 479 set the first-release format cutoff, item 343 settles the dataset-local
-codec settings in Wave E before the release fixture, and item 61 completes backup in
-Wave F. Waves A through F complete their declared scope ahead of cutting the first
-release, and items 343 and 61 may also use capacity that earlier waves leave free.
+backup. Item 479 set the first-release format cutoff and item 343 delivered dataset-local
+codec settings. Item 61 completes backup in Wave F. Waves A through F complete their
+declared scope ahead of cutting the first release.
 The first release publishes the server binaries and container images of item 59 and
 the PyPI, Maven Central and npm packages of item 58 after the format cutoff, while
 the remaining X12 Phase 4 compatibility policy checks of item 60 may follow the first
@@ -248,7 +247,7 @@ completion.
   and cache accounting in items 88 and 210, idle server RSS, Python process RSS and
   full-text index footprint in item 40, parallel checkpoint reader tail and indexed
   group-commit overhead in items 170 and 448, FSST and front-coding lookup costs in
-  items 160 and 241, and dataset-local codec settings in item 343. Item 448 tracks the
+  items 160 and 241. Item 448 tracks the
   remaining Intel verification for serial spatial writes and spatial reads under mixed load.
 
 ### Wave F: bindings parity, web UI and operational completion
@@ -317,8 +316,6 @@ Several workstreams have hard orderings.
 * Item 833 builds on the shared publish tail of item 484 and the idle writer
   optimizations of item 448. Item 479 lands before item 830.
 * Storage consolidation in X16 lands before fragment composition in X18.
-* Item 343 lands after the format cutoff of item 479 and before the release
-  artifacts of items 58 and 59.
 * The Horn-rule work of items 693 and 692 lands before or between item 603's phases
   5 to 8, since both change the classifier's index in `classify/index.rs`.
 * Item 753 follows the dependency rules of each supported tier of item 603. Support for
@@ -499,13 +496,13 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [P03](specs/P03-query-extensions.md#outcome) | 25 | Complete dynamic registered dispatch, foreign callbacks, batching and the adopted aggregate arities. Verify captured-view access, duplicate invocation, error, cancellation and transaction behavior, and measure callback costs. |
 | [P04](specs/P04-jvm-bindings/SPEC.md#outcome) | 25, 32, 33, 58, 76, 405 | Complete the named callback, plan, integration-harness, metrics and release gaps with the accepted Jena contract tests. Keep fallback BGP batching and optional module/allocator/transaction choices explicit, and substantiate performance claims with matched bridge measurements. |
 | [P05](specs/P05-node-bindings.md#outcome) | 14, 32, 33, 44, 58, 329, 405 | Complete progress callbacks, reusable plans and publication/runtime acceptance while preserving RDF/JS terms, bounded streams and transaction hand-off. Record optional Wasm/UI-migration decisions separately, and retain full-consumption controls for the measured query/export costs. |
-| [X01](specs/X01-compression-codecs.md#outcome) | 61, 343 | Use the adopted X11 vocabulary and F05 repository codecs, and record the optional portable-decoder and repository-zstd decisions under the named follow-ups. Preserve format/feature refusal and codec round-trip tests; measured rejected storage codecs are not required to ship. |
+| [X01](specs/X01-compression-codecs.md#outcome) | 61 | Record the reserved repository-zstd decision in F05. Preserve format and feature refusals and codec round-trip tests. |
 | [X05](specs/X05-streaming-query-execution.md#outcome) | 7, 84 | Finish the named fallback-demand, aggregate, early-output, UI and buffering gaps, and settle large-plan and serialization costs. Preserve eager/cursor equivalence, cumulative budgets and disconnect cancellation, widening defaults only after measured adoption gates. |
 | [X06](specs/X06-benchmark-coverage.md#outcome) | 1, 8, 91, 290, 291, 292, 293, 299, 306, 328, 575, 576, 577, 1082, 1083 | Finish the later benchmark batches, 100M BSBM, BI-driver reruns, noise controls and reproducible table regeneration. Retain the named cost checks and comparison inventory, accepting documented close cases without requiring every engine comparison to be a win. |
 | [X07](specs/X07-cold-sparse-reads.md#outcome) | 7, 516, 572, 573, 574, 1273, 1274 | Finish the remaining I/O reporting, the counter-cost gate and the follow-ups on the first query after an idle start, dense exports at 1.01B and the warm cost of the rebuilt binary, while treating unachieved stretch targets and read-ahead tradeoffs explicitly. |
 | [X08](specs/X08-disk-spill-and-server-memory.md#outcome) | 1, 7, 40, 88, 210 | Spill is on by default. Complete the remaining eager fallbacks, spill execution costs, cache accounting and footprint work, preserving the passed full-scale plain/encrypted matrix and verifying ordered-join/grouping costs, one-pass outer joins, disk cleanup, admission and aggregate correctness. |
 | [X09](specs/X09-group-commit-by-default.md#outcome) | 170, 448, 560, 561 | Settle the reader tail of the parallel checkpoint and the small costs that the gates accept, and count each branch's preallocated space. Retain durability, crash recovery and the documented legacy-header limits while testing all indexed dataset classes. |
-| [X11](specs/X11-index-compression-and-predicate-patterns.md#outcome) | 160, 241, 343 | Add dataset-local settings for the adopted codecs and patterns with lock, compaction and format compatibility tests. Keep FSST optional until its adoption gates pass, address the named lookup costs, and preserve the measured rejection of encoded IRIs, column codecs and the count shortcut. |
+| [X11](specs/X11-index-compression-and-predicate-patterns.md#outcome) | 160, 241 | Address the named lookup costs. Keep FSST optional until its adoption gates pass. |
 | [X12](specs/X12-release-engineering.md#outcome) | 58, 59, 60 | Complete unified versions, artifact publication and platform coverage, then the HTTP/CLI/library stability policy and checks. Release validation must exercise installed artifacts and older-format fixtures, including verbose version/capability reporting and required feature flags. |
 | [U02](specs/U02-shape-driven-forms/SPEC.md#outcome) | 612, 613, 614, 615, 395 | Add node-level `sh:or` and `sh:xone` sub-forms, editable nested values through complex paths, blank-named graph contexts with admission for model sources, and the remaining target and query producers. Adopt item 395's controlled scan and decode seam. Keep previews, guards, graph-specific conflicts and branch saves tested against the candidate state. |
 | [U04](specs/U04-live-query-profiling.md#outcome) | 27 | Deliver live registry/progress, cancellation by id, hot spots and stop/explain, then integrate verified C18 rewrites. Test redaction and running/completed state transitions while retaining the shipped static overlay. |
@@ -872,7 +869,6 @@ numbered item when it is ready to start.
 | 250 | **Chinese segmentation after SmartChineseAnalyzer,** and Kuromoji's normal and extended modes and user dictionaries for `ja-dict` and `ko-dict`. `zh-dict` segments by jieba's frequencies today. `ja-dict` and `ko-dict` should also cut a run of unknown characters inside a surrogate pair where Lucene does, which they do before the pair. | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 | 251 | **Analyzers for the other languages of jena-text,** such as Greek, Arabic, Persian and Hindi, that reproduce Lucene's tokens as the analyzers for nine languages do. | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 | 222 | **View access by grant containment.** A caller reads a view only with full access or the principal's exact access. Containment of grant sets, a cache per caller and view, and a `view:{name}` grant that declassifies a view with an audit record are not built. Item 222 comes before items 424 and 426. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | M |
-| 343 | **Dataset-local codec and pattern settings.** Add layered settings for adopted vocabulary codecs and predicate patterns, used by subsequent builds and compactions. Preserve existing generations and format refusals, and record the optional portable zstd decoder decision without reopening measured rejected codecs. | [X11](specs/X11-index-compression-and-predicate-patterns.md#dataset-local-settings), [X01](specs/X01-compression-codecs.md#remaining-codec-decisions) | M |
 | 407 | **Software inventory corpus review and matcher.** The `testsuite/software-inventory/v1` fixtures await independent review before a matcher consumes them, and a test checks their manifest digests. Review the adjudicated outcomes, then build the bounded matcher or remove the unused fixtures. | [A01](specs/A01-shared-entity-representation/README.md) | M |
 
 ### Performance follow-ups
@@ -1296,6 +1292,7 @@ for them.
 
 ## Completed
 
+- **343.** Dataset-local codec and pattern settings apply to subsequent generation builds and compactions through C19. Existing generations retain their recorded codecs, and builds without native zstd continue to refuse zstd input. [X11](specs/X11-index-compression-and-predicate-patterns.md#dataset-local-settings), [X01](specs/X01-compression-codecs.md#remaining-codec-decisions)
 - **675.** Materialization, demand reasoning, OWL 2 QL rewriting, ontology analysis and incremental view circuits reserve in chunks from the query pool when one is configured. Concurrent work shares the pool ceiling while each operation keeps its local limit. Dropping the owners returns their exact reservations. [X14](specs/X14-unified-executor/SPEC.md#outcome)
 - **77.** Assistant ingestion redaction and UI controls. `memory.redaction` (`memory.json` format 4 when set, keeping `imports.secretPatterns` accepted) generalizes redaction across CLI imports, `register_source` (optionally on every graph via `everywhere`), and server-side document, claims, and table-mapping ingestion (`serverIngest`: `redact`, `refuse`, or `off`), adding optional high-entropy detection, opt-in personal data detectors (`email`, `phone`, `payment-card`, `iban`, `ip`), regex `allow` lists, and exact Aho-Corasick matching against server secrets or CLI environment and file values. `GET /$/assistant/{ds}` reports `status.ingest` and `status.extract`. Both the dataset Ingest panel and memory Ingest settings display whether server ingestion is on or off, let dataset admins turn it on under the C19 §8.1 default-only patch rule or jump to the blocking setting, turn it off via `ingest: false`, and confirm before storing non-table uploads without facts (`extract: false`) when server ingestion is off, verified against a shared Rust and UI fixture. [C18](specs/C18-natural-language-questions-and-ingest/OUTCOME.md#roadmap-follow-ups-2026-10-12), [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12)
 - **1140.** The growth cost of the shared floor table. `string_order_mask` validates its initial sample left to right before sizing or installing the table, sizes the first shared `FloorTable` from a stack-allocated stratified sample within the vocabulary clamp, cache cap and remaining memory budget while stepping down by halves to 2^10 slots before refusing, and copies live entries directly into the replacement table on growth so `FloorMap` probes only the current table. On `atlas` at 1.05M triples with one thread, `329f82f9` against its own base `a643de75` improves `str-pair-names` by 3.0% in streaming execution and 10.0% in eager execution across 12 alternating ABBA and BAAB rounds of 16 measured requests per query and server process with four processes per round and byte-identical sorted TSV answers, while eager `str-pair-lt` stays flat. The Forge 9.7% gap (`174de1f8..3a8b7adb`) stays historical context on a separate host and revision pair, the separate streaming one-thread A/A control and both 12-thread cells exceeded the 3% spread limit, and six small one-thread observations move to item 1089. [X14](specs/X14-unified-executor/SPEC.md#outcome)

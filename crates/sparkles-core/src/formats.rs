@@ -809,6 +809,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("describe.json", 1),
     ds("aggregate-errors.json", 1),
     ds("compaction.json", 1),
+    ds(crate::store::INDEX_SETTINGS_FILE, 1),
     ds("quota.json", 1),
     ds("changelog.json", 1),
     ds("history.json", 2),

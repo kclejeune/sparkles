@@ -26838,7 +26838,8 @@
               "graphrag",
               "paths",
               "forms",
-              "evidence"
+              "evidence",
+              "index"
             ],
             "type": "string"
           },
@@ -56269,7 +56270,7 @@
               }
             }
           },
-          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs.",
+          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `vocabCodec` (`front` or `fsst`) and the boolean `patterns`.",
           "required": true
         },
         "responses": {
@@ -56363,7 +56364,7 @@
               }
             }
           },
-          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs.",
+          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `vocabCodec` (`front` or `fsst`) and the boolean `patterns`.",
           "required": true
         },
         "responses": {

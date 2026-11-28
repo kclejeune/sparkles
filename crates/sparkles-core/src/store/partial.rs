@@ -425,7 +425,7 @@ pub(crate) fn write(
                 || {
                     if !patterns {
                         return Ok(crate::patterns::PatternInfo::skipped(
-                            "turned off for this build",
+                            crate::patterns::DISABLED_FOR_BUILD,
                         ));
                     }
                     let r = crate::patterns::rewrite(snap, dir, &|| interrupt());

@@ -1235,3 +1235,12 @@ and format 1 otherwise. `formats::stamp_settings` chooses the version from the c
 as it does for `validation.json`, so an older release refuses only the datasets that use
 the setting, with a message that names the newer release. Settings that older releases
 cannot read are otherwise unchanged, and the Outcome of C17 records the tests.
+
+### Dataset index settings
+
+The `index` kind accepts a vocabulary codec and a boolean predicate pattern setting.
+Invocation flags belong to the default layer, and an unconfigured codec inherits the
+current generation's codec on a rebuild. The settings file supplies the declared
+defaults, dataset entries and locks. Runtime edits apply to the whole dataset and
+its branches. [X11](X11-index-compression-and-predicate-patterns.md#dataset-local-settings)
+describes how builds and compactions take these settings.

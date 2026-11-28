@@ -614,15 +614,19 @@ The later X11 Outcome owns the adopted FSST option and the measured rejection of
 encoded IRIs and alternative block codecs. Those rejected choices are not an open
 requirement under completed item 16.
 
-Roadmap item 343 includes an explicit checkpoint for the optional pure-Rust zstd
-decoder. Compare its platform/dependency benefit, accepted input support and cost
-with the native decoder before adopting it, or record the decision to retain the
-current clean feature-disabled refusal. A decision to drop a retained requirement
-needs maintainer approval and an Outcome entry, rather than an implicit completion
-claim. Item 61 owns the equivalent decision for reserved repository-zstd encoding,
-with raw/LZ4 compatibility and restore/transfer measurements in F05.
+Item 343 retains the native zstd decoder and the explicit refusal in builds without
+the `zstd` feature. The native feature covers both reading and writing. A second
+decoder would remove the native build dependency for reading alone and require
+separate validation of input compatibility and resource limits. Builds without
+zstd continue to use gzip as the default for compressed dumps and backups. The
+codec tests cover round-trips when zstd is enabled and refusal when it is disabled.
+Section 3's optional `zstd-decode-pure` remains unbuilt, so a build without the native
+feature cannot read zstd. Dropping a retained requirement needs maintainer approval
+and an Outcome entry.
 
-Completion of the accepted compression contract requires those decisions, the
-adopted options' round-trip and feature-matrix tests, and the named X11 settings
-work. It does not require turning every optional or measured rejected codec into a
-production feature.
+Item 61 owns the decision for reserved repository-zstd encoding, with raw and LZ4
+compatibility and restore and transfer measurements in F05.
+
+The accepted compression contract includes the adopted codecs' round-trip and
+feature-matrix tests and the [X11 settings](X11-index-compression-and-predicate-patterns.md#dataset-local-settings).
+The remaining repository decision belongs to item 61.

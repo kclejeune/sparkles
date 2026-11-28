@@ -22,6 +22,7 @@ pub mod evidence;
 mod evidence_tests;
 pub mod forms;
 pub mod http;
+pub mod index;
 pub mod merge;
 pub mod paths;
 #[cfg(test)]
@@ -211,8 +212,16 @@ pub static FORMS: Kind = Kind {
 };
 
 /// Every dataset-wide kind, in the order the answers list them.
-pub static KINDS: [&Kind; 8] = [
-    &ASSISTANT, &MEMORY, &INGEST, &PREFIXES, &GRAPHRAG, &PATHS, &FORMS, &EVIDENCE,
+pub static KINDS: [&Kind; 9] = [
+    &ASSISTANT,
+    &MEMORY,
+    &INGEST,
+    &PREFIXES,
+    &GRAPHRAG,
+    &PATHS,
+    &FORMS,
+    &EVIDENCE,
+    &index::INDEX,
 ];
 
 /// The server-wide `notifications` kind (spec C21 §5): channels, routes and delivery,
@@ -324,6 +333,8 @@ struct Entry {
 /// The settings file of `serve --settings` (§5).
 #[derive(Clone, Debug, Default)]
 pub struct Declared {
+    // Invocation defaults sit below both layers of the settings file.
+    index_defaults: sparkles::store::IndexSettings,
     defaults: Entry,
     datasets: BTreeMap<String, Entry>,
     /// `server.locked`: the locked fields of server-wide kinds, such as
@@ -526,6 +537,9 @@ fn parse_entry(v: &Value) -> Result<Entry, String> {
         if !v.is_object() {
             return Err(format!("{k}: an object"));
         }
+        if index::is(kind) {
+            index::validate_layer(v).map_err(|e| format!("{k}: {e}"))?;
+        }
         e.values.insert(kind.name, v.clone());
     }
     Ok(e)
@@ -610,6 +624,8 @@ fn parse_lock(s: &str) -> Result<(&'static str, Vec<String>), String> {
         }
     } else if evidence::is(k) {
         evidence::check_lock_path(&p[1..])?;
+    } else if index::is(k) && p.len() != 2 {
+        return Err(format!("locked: {s:?} must name an index field"));
     } else if !k.members.contains(&p[1].as_str()) {
         return Err(format!("locked: {} has no member {:?}", k.name, p[1]));
     }
@@ -660,10 +676,27 @@ pub fn resolve(
     runtime: Value,
     providers: Providers,
 ) -> Resolved {
+    resolve_with_index_codec(kind, declared, dataset, runtime, providers, None)
+}
+
+fn resolve_with_index_codec(
+    kind: &'static Kind,
+    declared: &Declared,
+    dataset: &str,
+    runtime: Value,
+    providers: Providers,
+    current: Option<sparkles::builder::VocabCodec>,
+) -> Resolved {
     let (dd, de) = declared.layers(kind, dataset);
     let layers: Vec<&Value> = [dd, de].into_iter().flatten().collect();
-    resolve_layers(
+    let defaults = if index::is(kind) {
+        index::build_defaults(declared, current)
+    } else {
+        (kind.defaults)()
+    };
+    resolve_layers_with_base(
         kind,
+        defaults,
         &layers,
         declared.locked(kind, dataset),
         runtime,
@@ -683,11 +716,26 @@ pub fn resolve_layers(
     runtime: Value,
     providers: Providers,
 ) -> Resolved {
+    resolve_layers_with_base(kind, (kind.defaults)(), layers, locked, runtime, providers)
+}
+
+fn resolve_layers_with_base(
+    kind: &'static Kind,
+    mut base: Value,
+    layers: &[&Value],
+    locked: Vec<Vec<String>>,
+    runtime: Value,
+    providers: Providers,
+) -> Resolved {
     let mut decl = Value::Object(Map::new());
-    let mut base = (kind.defaults)();
     for l in layers {
         merge::merge(&mut decl, l);
-        merge::merge(&mut base, l);
+        if !index::is(kind) {
+            merge::merge(&mut base, l);
+        }
+    }
+    if index::is(kind) {
+        merge::merge(&mut base, &decl);
     }
     let unlocked = merged(&base, &runtime);
     let mut eff = unlocked.clone();
@@ -708,7 +756,13 @@ pub fn resolve_layers(
     if let Ok(n) = (kind.normalize)(&eff) {
         eff = n;
     }
-    let in_declared = |p: &[String]| layers.iter().any(|l| covers(l, p));
+    let in_declared = |p: &[String]| {
+        if index::is(kind) {
+            covers(&decl, p)
+        } else {
+            layers.iter().any(|l| covers(l, p))
+        }
+    };
     let sources = leaves(&eff)
         .into_iter()
         .map(|p| {
@@ -972,8 +1026,9 @@ impl Settings {
         self.evidence_declarations.read_arc_recursive()
     }
 
-    fn replace_declared(&self, d: Arc<Declared>) {
+    fn replace_declared(&self, mut d: Arc<Declared>) {
         let _guard = self.evidence_declarations.write();
+        Arc::make_mut(&mut d).index_defaults = self.declared.load().index_defaults;
         self.declared.store(d);
     }
 
@@ -1088,6 +1143,9 @@ pub fn runtime(st: &AppState, ds: &Dataset, kind: &Kind) -> anyhow::Result<Value
     if evidence::is(kind) {
         return evidence::runtime_layer(st, ds);
     }
+    if index::is(kind) {
+        return Ok(serde_json::to_value(ds.store.index_settings_layer())?);
+    }
     let v = crate::assist::read_file(st, ds, kind.file)?;
     Ok(match v {
         None => Value::Object(Map::new()),
@@ -1117,6 +1175,11 @@ pub fn store_runtime(
     let ds = main.as_deref().unwrap_or(ds);
     if prefixes::is(kind) {
         return Ok(prefixes::store_layer(ds, layer)?);
+    }
+    if index::is(kind) {
+        return Ok(ds
+            .store
+            .set_index_settings(serde_json::from_value(layer.clone())?)?);
     }
     let mut m = match layer {
         Value::Object(m) => m.clone(),
@@ -1149,12 +1212,13 @@ pub fn resolved(st: &AppState, ds: &Dataset, kind: &'static Kind) -> Resolved {
         Value::Object(Map::new())
     });
     let models = st.models();
-    resolve(
+    resolve_with_index_codec(
         kind,
         &st.settings.declared(),
         &ds.name,
         rt,
         Providers::Checked(models.as_deref()),
+        index::current_codec(kind, ds),
     )
 }
 

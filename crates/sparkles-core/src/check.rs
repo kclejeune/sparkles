@@ -752,6 +752,9 @@ impl Checker<'_> {
                 .file("prefixes.json"),
             );
         }
+        if let Err(e) = crate::store::read_index_settings(root) {
+            run.add(Issue::error(e.to_string()).file(crate::store::INDEX_SETTINGS_FILE));
+        }
         // leftovers of interrupted operations
         let cur_no = self.current.as_deref().map(commit::generation_number);
         let mut names: Vec<(String, bool)> = std::fs::read_dir(root)

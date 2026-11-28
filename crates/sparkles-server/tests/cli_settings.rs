@@ -864,3 +864,269 @@ fn declared_prefixes() {
     assert_eq!(j["sources"]["kclj"], "locked");
     assert_eq!(j["warnings"][0]["prefix"], "mem");
 }
+
+#[test]
+fn index_settings_resolve_per_dataset_and_survive_server_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let one = temp.path().join("one");
+    let two = temp.path().join("two");
+    let settings = temp.path().join("settings.json");
+    std::fs::write(
+        &settings,
+        json!({
+            "defaults": {"index": {"patterns": true}},
+            "datasets": {"two": {
+                "index": {"vocabCodec": "front"},
+                "locked": ["index.vocabCodec"]
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let two_loc = format!("two={}", two.display());
+    let one_loc = format!("one={}", one.display());
+    let args = [
+        "--vocab-codec",
+        "fsst",
+        "--no-patterns",
+        "--settings",
+        settings.to_str().unwrap(),
+        "--loc",
+        &one_loc,
+        "--loc",
+        &two_loc,
+    ];
+    let one_index = "/$/settings/one/index";
+    let two_index = "/$/settings/two/index";
+    {
+        let server = Server::start(&data, &args);
+        let (status, first) = server.call("GET", one_index, None);
+        assert_eq!(status, 200, "{first}");
+        assert_eq!(
+            first["effective"],
+            json!({"vocabCodec": "fsst", "patterns": true})
+        );
+        assert_eq!(first["sources"]["vocabCodec"], "default");
+        assert!(first["declared"].get("vocabCodec").is_none());
+        assert_eq!(first["sources"]["patterns"], "declared");
+        let (status, second) = server.call("GET", two_index, None);
+        assert_eq!(status, 200, "{second}");
+        assert_eq!(
+            second["effective"],
+            json!({"vocabCodec": "front", "patterns": true})
+        );
+        assert_eq!(second["sources"]["vocabCodec"], "locked");
+        let (status, locked) = server.call("PATCH", two_index, Some(json!({"vocabCodec": "fsst"})));
+        assert_eq!(
+            (status, locked["code"].as_str()),
+            (409, Some("locked-by-config"))
+        );
+        for wrong in [
+            json!({"vocabCodec": "zstd"}),
+            json!({"patterns": "off"}),
+            json!({"iriEncoding": null}),
+        ] {
+            let (status, msg) = server.call("PATCH", one_index, Some(wrong));
+            assert_eq!((status, msg["code"].as_str()), (400, Some("bad-settings")));
+        }
+
+        #[cfg(feature = "auth")]
+        {
+            cli(
+                &server,
+                temp.path(),
+                &[
+                    "settings",
+                    "set",
+                    "one",
+                    "index.vocabCodec=front",
+                    "index.patterns=false",
+                ],
+                "",
+                &[],
+            )
+            .ok();
+        }
+        #[cfg(not(feature = "auth"))]
+        {
+            let (status, msg) = server.call(
+                "PATCH",
+                one_index,
+                Some(json!({"vocabCodec": "front", "patterns": false})),
+            );
+            assert_eq!(status, 200, "{msg}");
+        }
+        let (_, first) = server.call("GET", one_index, None);
+        assert_eq!(first["sources"]["vocabCodec"], "runtime");
+        assert_eq!(first["sources"]["patterns"], "runtime");
+    }
+    let saved: J =
+        serde_json::from_slice(&std::fs::read(one.join("index-settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        saved,
+        json!({"format": 1, "vocabCodec": "front", "patterns": false})
+    );
+
+    let stats = |loc: &Path| {
+        let output = Command::new(BIN)
+            .args(["stats", "--patterns", "--loc"])
+            .arg(loc)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(stats(&one).contains("vocabulary fsst"));
+    assert!(stats(&two).contains("vocabulary front"));
+    let output = Command::new(BIN)
+        .args(["compact", "--vocab-codec", "fsst", "--loc"])
+        .arg(&one)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("dataset index settings choose vocabulary codec front")
+    );
+    let current = stats(&one);
+    assert!(current.contains("vocabulary front"), "{current}");
+    assert!(current.contains("turned off for this build"), "{current}");
+
+    let server = Server::start(&data, &args);
+    let (_, first) = server.call("GET", one_index, None);
+    assert_eq!(
+        first["effective"],
+        json!({"vocabCodec": "front", "patterns": false})
+    );
+    std::fs::write(
+        &settings,
+        r#"{"defaults":{"index":{"patterns":true},"locked":["index.patterns"]}}"#,
+    )
+    .unwrap();
+    server.hup();
+    eventually(|| server.call("GET", one_index, None).1["sources"]["patterns"] == "locked");
+    let (_, first) = server.call("GET", one_index, None);
+    assert_eq!(
+        first["effective"],
+        json!({"vocabCodec": "front", "patterns": true})
+    );
+    assert_eq!(first["runtime"]["patterns"], false);
+    assert_eq!(first["overridden"], json!(["patterns"]));
+    let (status, reset) = server.call("DELETE", one_index, None);
+    assert_eq!(status, 200, "{reset}");
+    assert_eq!(
+        reset["effective"],
+        json!({"vocabCodec": "fsst", "patterns": true})
+    );
+    assert!(!one.join("index-settings.json").exists());
+
+    compact_for_index_test(&server, "one");
+    drop(server);
+    let current = stats(&one);
+    assert!(current.contains("vocabulary fsst"), "{current}");
+    assert!(current.contains("default table"), "{current}");
+
+    std::fs::write(&settings, r#"{"defaults":{"index":{"blockCodec":"lz4"}}}"#).unwrap();
+    let invalid = Command::new(BIN)
+        .args(["settings", "check"])
+        .arg(&settings)
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("blockCodec"));
+}
+
+fn compact_for_index_test(server: &Server, name: &str) {
+    let (status, task) = server.call("POST", &format!("/$/compact/{name}"), None);
+    assert_eq!(status, 202, "{task}");
+    let task_url = format!("/$/tasks/{}", task["id"].as_str().unwrap());
+    eventually(|| {
+        let (_, task) = server.call("GET", &task_url, None);
+        if task["finished"].is_null() {
+            return false;
+        }
+        assert_eq!(task["success"], true, "{task}");
+        true
+    });
+}
+
+#[test]
+fn existing_server_codec_is_inherited_and_dataset_rename_rebinds_index_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let settings = temp.path().join("settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"datasets":{"renamed":{"index":{"vocabCodec":"front"}}}}"#,
+    )
+    .unwrap();
+    {
+        let server = Server::start(&data, &["--vocab-codec", "fsst"]);
+        let (status, result) = server.call(
+            "POST",
+            "/$/datasets",
+            Some(json!({"dbName": "legacy", "dbType": "tdb2"})),
+        );
+        assert!(status == 200 || status == 201, "{status} {result}");
+    }
+
+    let server = Server::start(&data, &["--settings", settings.to_str().unwrap()]);
+    let main = "/$/settings/legacy/index";
+    let branch = "/$/settings/legacy/index?branch=work";
+    let (_, before) = server.call("GET", main, None);
+    assert_eq!(before["effective"]["vocabCodec"], "fsst");
+    assert_eq!(before["sources"]["vocabCodec"], "default");
+    let (status, created) =
+        server.call("POST", "/$/branches/legacy", Some(json!({"name": "work"})));
+    assert_eq!(status, 201, "{created}");
+    let (status, selected) = server.call("GET", branch, None);
+    assert_eq!(status, 200, "{selected}");
+    assert_eq!(selected["effective"], before["effective"]);
+    let (status, changed) = server.call("PATCH", branch, Some(json!({"patterns": false})));
+    assert_eq!(status, 200, "{changed}");
+    let (_, main_policy) = server.call("GET", main, None);
+    assert_eq!(
+        main_policy["effective"],
+        json!({"vocabCodec": "fsst", "patterns": false})
+    );
+
+    let fsst = |name: &str| {
+        let root = data.join("databases").join(name);
+        let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+        let meta: J = serde_json::from_slice(
+            &std::fs::read(root.join(current.trim()).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        meta["features"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("fsst-vocab"))
+    };
+    compact_for_index_test(&server, "legacy");
+    assert!(fsst("legacy"));
+    let (status, renamed) = server.call(
+        "POST",
+        "/$/datasets/legacy/rename",
+        Some(json!({"name": "renamed"})),
+    );
+    assert_eq!(status, 200, "{renamed}");
+    let (status, renamed) = server.call("GET", "/$/settings/renamed/index", None);
+    assert_eq!(status, 200, "{renamed}");
+    assert_eq!(
+        renamed["effective"],
+        json!({"vocabCodec": "front", "patterns": false})
+    );
+    assert_eq!(renamed["sources"]["vocabCodec"], "declared");
+    assert!(fsst("renamed"));
+    compact_for_index_test(&server, "renamed");
+    assert!(!fsst("renamed"));
+}
