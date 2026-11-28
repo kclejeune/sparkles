@@ -181,6 +181,68 @@ fn stored_layout_and_dl_run_off_overhead() {
     assert_eq!(run.bytes(), 0);
 }
 
+/// Item 1061: the rooted bound scales with the visible named classes unless
+/// `SPARKLES_ROOTED_BOUND_PER_CLASS=0` turns the scaling off, and the scaled bound never
+/// falls below the fixed one.
+#[test]
+fn the_rooted_bound_scales_with_the_named_classes_by_default() {
+    if std::env::var_os("SPARKLES_ROOTED_BOUND_PER_CLASS").is_none() {
+        assert!(
+            rooted_bound_per_class(),
+            "the per-class bound is on by default"
+        );
+    }
+    // 16,384 classes or fewer keep the fixed bound, and each class past them adds 32
+    assert_eq!(rooted_work_bound(0, true), ROOTED_WORK_BOUND);
+    assert_eq!(rooted_work_bound(5, true), ROOTED_WORK_BOUND);
+    assert_eq!(rooted_work_bound(16_384, true), ROOTED_WORK_BOUND);
+    assert_eq!(rooted_work_bound(16_385, true), ROOTED_WORK_BOUND + 32);
+    assert_eq!(rooted_work_bound(398_583, true), 12_754_656);
+    assert_eq!(rooted_work_bound(16_385, false), ROOTED_WORK_BOUND);
+    assert_eq!(rooted_work_bound(398_583, false), ROOTED_WORK_BOUND);
+    assert_eq!(rooted_work_bound(usize::MAX, true), usize::MAX);
+
+    // with the scaling on, as by default, the scaled bound is the fallback that every
+    // selection without an explicit bound or the stepped adaptive policy takes
+    let scaled = with_rooted_bound_per_class(true, || {
+        rooted_work_bound(398_583, rooted_bound_per_class())
+    });
+    assert_eq!(scaled, 12_754_656);
+    let p = AdaptivePolicy::PROVISIONAL;
+    // an explicit bound wins, with 0 taken as 1
+    assert_eq!(
+        select_rooted_bound(Some(0), true, true, p, scaled),
+        RootedBoundPolicy::ExplicitFixed(1)
+    );
+    assert_eq!(
+        select_rooted_bound(Some(1_000), false, false, p, scaled),
+        RootedBoundPolicy::ExplicitFixed(1_000)
+    );
+    // the stepped adaptive policy keeps its own ceiling of 2^25
+    assert_eq!(
+        select_rooted_bound(None, true, true, p, scaled).work_limit(),
+        1 << 25
+    );
+    // an unstepped run takes the scaled fallback even with the adaptive switch on, and a
+    // stepped run without the adaptive switch takes it too
+    assert_eq!(
+        select_rooted_bound(None, false, true, p, scaled),
+        RootedBoundPolicy::DefaultFixed(12_754_656)
+    );
+    assert_eq!(
+        select_rooted_bound(None, true, false, p, scaled),
+        RootedBoundPolicy::DefaultFixed(12_754_656)
+    );
+    // with the scaling off the fallback is the fixed bound
+    let fixed = with_rooted_bound_per_class(false, || {
+        rooted_work_bound(398_583, rooted_bound_per_class())
+    });
+    assert_eq!(
+        select_rooted_bound(None, true, false, p, fixed),
+        RootedBoundPolicy::DefaultFixed(ROOTED_WORK_BOUND)
+    );
+}
+
 /// 2. Binding Decision #3: explicit `dl_work` wins, qualified adaptive keeps fixed ceiling
 ///    `2^25` even when a per-class fallback bound at >1,048,576 classes exceeds `2^25`,
 ///    and `dl_steps = false` falls through to the per-class fallback bound.

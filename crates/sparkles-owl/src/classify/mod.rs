@@ -211,22 +211,21 @@ fn drawing_on(
 /// threads, and the other five derive millions, as F24's measured effect records.
 const ROOTED_WORK_BOUND: usize = 1 << 19;
 
-/// Optional per-class rooted work allowance above [`ROOTED_WORK_BOUND`] for a rooted run
-/// without counting, gated independently behind `SPARKLES_ROOTED_BOUND_PER_CLASS=1` (off
-/// by default until qualified on the 2×2 matrix).
+/// The rooted work allowance for each visible named class of a rooted run without
+/// counting, above [`ROOTED_WORK_BOUND`]. A rooted run makes a context for each named
+/// class, so its work grows with the classes, and item 1061 found that ore_ont_15803 needs
+/// about 9.5 conclusions for each of its 398,583 classes, which a fixed bound refuses.
 const ROOTED_WORK_PER_CLASS: usize = 32;
 
-/// Whether the distinct-class scaled rooted work bound is enabled
-/// (`SPARKLES_ROOTED_BOUND_PER_CLASS=1`), off by default.
+/// Whether the rooted work bound scales with the visible named classes, which it does
+/// unless `SPARKLES_ROOTED_BOUND_PER_CLASS=0` turns the scaling off (item 1061).
 fn rooted_bound_per_class() -> bool {
     #[cfg(test)]
     if let Some(on) = ROOTED_BOUND_PER_CLASS_TEST.with(|c| c.get()) {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("SPARKLES_ROOTED_BOUND_PER_CLASS").is_some_and(|v| v == "1")
-    })
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_BOUND_PER_CLASS").is_none_or(|v| v != "0"))
 }
 
 /// The default non-counting rooted work bound for `distinct_named_classes` visible named

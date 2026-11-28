@@ -276,8 +276,8 @@ pass the bound and give their default answer, and 9 take the default paths. ore_
 run is rooted now. It passes the bound and gives the default answer, which is HermiT's,
 in 0.3 to 1 s against 16 ms without the option on a shared laptop. ore_ont_15803 does the
 same in 1.7 s against 0.7 s on four threads, with the same taxonomy as before item 805.
-Item 1061 follows that cost, and [its section](#item-1061-shared-ground-reasoning-across-contexts)
-records what the contexts now share.
+Item 1061 followed that cost, and [its section](#item-1061-shared-ground-reasoning-across-contexts)
+records what the contexts now share and the bound that scales with the named classes.
 
 Item 1265 closes a crash of the keys that the rewriting declines. When an ontology's only
 individuals were in axioms outside OWL 2 EL, the disjunctive rules took the run, the
@@ -5766,8 +5766,8 @@ This section is the design of item 603's sixth phase, which extends the disjunct
 to nominals. The rules it describes are built, apart from keys and the universal property,
 which item 805 builds. They run when `Limits::rooted` asks for them, and it is off by
 default, because the completeness of the calculus as item 804 departed from the journal's
-rules is not proved and two of the 50 `shoi` fixtures of the phase's gate pass the work
-bound of a rooted run, which items 1061 and 1075 follow. Without the option the disjunctive rules
+rules is not proved. Two of the 50 `shoi` fixtures of the phase's gate pass the work
+bound of a rooted run without item 1061's merging and item 1075's equality split. Without the option the disjunctive rules
 refuse ontologies with individuals and nominals as the section above says, and every run
 takes the paths it took before these rules existed. The option changes nothing for an
 ontology without individuals, nominals or the universal object property. The measurements of the journal's rules are at the end of
@@ -5935,8 +5935,8 @@ answer. The classes and individuals of an axiom that
 the rewriting drops stay in the signature, and the statistics count the original axioms
 outside OWL 2 EL. The universal property links every context
 to h, and on the generated ontologies above every run that passed the bound had the
-universal property, which item 1061 follows with the cost of ground reasoning in each
-context.
+universal property, whose cost in the contexts other than the root items 1061, 1405 and
+1406 follow.
 
 The run relies on the journal's Theorem 1 for soundness, Theorem 2 with condition C2 for
 the completeness of each named class's context under the journal's rules, which item
@@ -6272,7 +6272,8 @@ disjunctive equalities here do not give.
 default, under the policy that it becomes the default only after 0 taxonomy differences on
 the ORE 2015 DL sample, several thousand generated fixtures against HermiT and the `shoi`
 and nominal fixtures, which item 823 holds. A rooted run without counting has a bound of
-524,288 derived conclusions, which `Limits::dl_work` changes, since the 45 fixtures that
+524,288 derived conclusions, or 32 for each visible named class when that is more, which
+`Limits::dl_work` changes, since the 45 fixtures that
 finish derive under 190,000 on one and on four threads and the five that do not derive
 millions. A run that passes it classifies again without the rooted rules, which leaves the
 axioms outside OWL 2 EL out and reports them as a run without the option does, and sets
@@ -6463,7 +6464,8 @@ by the cut. Item 1410 follows the repeated use of root units across contexts.
 #### Item 1061: shared ground reasoning across contexts
 
 Item 1061 shares the ground part of a rooted run's reasoning between the root and the
-other contexts. Three switches, all off by default, control it. `SPARKLES_ROOTED_SHARED_FACTS=1`
+other contexts, and the bound of a rooted run scales with the named classes. Two switches,
+both off by default, control the sharing. `SPARKLES_ROOTED_SHARED_FACTS=1`
 marks a unit that the root delivers to another context as the root's. That context then
 leaves out a ground inference whose premises are all such units and whose conclusion is a
 unit over constants it is registered for, because the root derives the same conclusion and
@@ -6473,9 +6475,9 @@ each successor instead of once for each edge to it. `Limits::rooted_merge`, or
 or the root derives it as a unit, and starts the run again on the merged ontology within
 the same work bound. Merging alone, with shared facts off, takes shoi-022 within the bound
 with 455,548 derived conclusions on one thread and 479,366 on four eager threads, in one
-run each of the build before forwarding. `SPARKLES_ROOTED_BOUND_PER_CLASS=1` raises
-the bound of a rooted run without counting to 32 conclusions for each named class when
-that is more than 524,288.
+run each of the build before forwarding. The bound of a rooted run without counting is 32
+conclusions for each visible named class when that is more than 524,288, which is the case
+above 16,384 classes, and `SPARKLES_ROOTED_BOUND_PER_CLASS=0` keeps the fixed bound.
 
 With shared facts on, a context that holds a root unit and would send it to a predecessor
 other than the root by Pred sends it as the root's own delivery instead, under the root's
@@ -6511,18 +6513,42 @@ conclusions on one thread and 430,041 on four eager threads with forwarding, aga
 425,497 and 470,299 without it. The largest of 20 runs on four eager threads needs 506,938
 conclusions with forwarding and 474,314 without it, both within the bound.
 
-Two parts of the item remain. 36 of the generated ontologies still pass the bound in 71
-runs, all on one thread and all but s2-g2-266 on four. With a bound of 30 million on one
-thread, 11 of them finish, 18 pass that bound, 4 run past 120 s and 3 end without
-finishing or passing it. Ten of the 11 report 529,652 to 29.8 million conclusions. The
-eleventh, s2-g2-266, reports 4,982 under that bound, although its single-thread run passes
-the default bound. In the first 600,000
-conclusions of each, the commonest rule is Pred over the edges `f_e(u)` to successors in
-18 files and Eq on equalities `f_e(u) ≈ v` in 7, both in the contexts other than the root.
-Forwarding does not reach that work, since those clauses are not root units. ore_ont_15803 needs 3,778,620 conclusions with or
-without forwarding, about 9.5 for each of its 398,583 named classes, so no sharing brings
-it under 524,288. It finishes with HermiT's taxonomy of 2,432,194 entailed pairs under the
-per-class bound of 12,754,656, whose adoption is a separate decision about the bound.
+The bound scales with the named classes because a rooted run makes a context for each
+named class, so its work grows with them, and a fixed bound refuses a large ontology that
+is easy for each class. ore_ont_15803 needs 3,779,775 conclusions on one thread, about 9.5
+for each of its 398,583 named classes, and no sharing of ground work brings it under
+524,288. Under its bound of 12,754,656 it finishes with HermiT's taxonomy of 2,432,194
+entailed pairs on one thread and on four eager threads, with and without shared facts and
+merging, and with `SPARKLES_ROOTED_BOUND_PER_CLASS=0` it passes the bound and gives its
+default answer. An explicit `Limits::dl_work` still wins, item 1284's adaptive bound keeps
+its own ceiling of 2^25 on the stepped schedule, a run that counts keeps the counting bound,
+and the restarts of merging charge their work against the bound of the first attempt. The
+bound counts derived conclusions, so it bounds neither the time nor the memory of a run,
+which the memory budget governs as before. Only a rooted run is affected, and it is off by
+default.
+
+At ac994f48 with shared facts and merging on, shoi-022 finishes within the bound with
+HermiT's taxonomy after 431,740 conclusions on one thread and 384,071 to 453,378 on four
+eager threads, with item 1231's marker repair on. ore_ont_14924 needs 587,367 conclusions
+on one thread with the repair and 323,828 without it, so it passes the bound because of
+the repair's charges. Its traced conclusions are the same in both runs. Item 1337 follows
+that cost, and item 1284's adaptive bound finishes the file on one thread with HermiT's
+taxonomy.
+
+Of the 36 generated ontologies of item 805 that passed the bound after forwarding, 3 now
+finish within it and 33 still pass it. Item 1284's adaptive bound finishes 9 of the 33
+with HermiT's taxonomies after about 0.53 to 8.2 million conclusions, and the other 24 pass
+it as well. In the contexts other than the root most of their work is Pred over the edges
+`f_e(u)` to successors and Eq on disjunctive equalities `f_e(u) ≈ v`. A context derives
+many conclusions that it already holds, which the bound counts before the store finds them
+subsumed. In most of these files Pred makes most of the repeats, and in the three whose
+repeats were traced to the products that made them, most repeated Pred conclusions repeat
+a clause that another edge and another successor clause made first. No rule that takes a
+successor's clause once per successor removes them, and sharing the ground conclusions that the root also derives
+removes only part of the work. No further restriction of Pred or Eq is built for these
+files, and disjunctive root facts are not given the shared-facts rule, which would need
+its own completeness argument. Item 1405 follows the growth of distinct clauses in these
+files and item 1406 the repeated conclusions, and item 823 follows both.
 
 #### Item 1075: binary splitting over disjunctive equalities of constants
 
