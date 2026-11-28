@@ -484,6 +484,7 @@ pub(crate) fn host_shards() -> usize {
 pub struct ServiceStore {
     cache: Option<Inner>,
     max_entry_bytes: u64,
+    keep_gate: std::sync::Mutex<()>,
 }
 
 impl ServiceStore {
@@ -496,6 +497,7 @@ impl ServiceStore {
         ServiceStore {
             cache: (bytes > 0).then(|| bounded_cache(bytes, shards, Weighter)),
             max_entry_bytes: bytes / 8,
+            keep_gate: std::sync::Mutex::new(()),
         }
     }
 
@@ -721,16 +723,14 @@ impl ServiceCache {
             && let Some(e) = disk.get(key, self.ttl(), admit)?
         {
             r = e.serve_admitted(want, admit)?;
-            // an entry that a removal may have dropped while it was read is not kept,
-            // and one kept as a removal ran is dropped again
+            let e = Arc::new(e);
+            let _gate = self
+                .store
+                .keep_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if self.removals.load(Ordering::SeqCst) == before {
-                let e = Arc::new(e);
-                self.keep(e.clone());
-                if self.removals.load(Ordering::SeqCst) != before
-                    && let Some(c) = &self.store.cache
-                {
-                    c.remove_if(&NsKeyRef { ns: self.ns, key }, |v| Arc::ptr_eq(v, &e));
-                }
+                self.keep(e);
             }
         }
         let n = if r.is_some() {
@@ -768,21 +768,15 @@ impl ServiceCache {
             disk.put(&e);
         }
         after_disk_put();
+        let _gate = self
+            .store
+            .keep_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if self.removals.load(Ordering::SeqCst) != before {
             return;
         }
-        self.keep(e.clone());
-        if self.removals.load(Ordering::SeqCst) != before
-            && let Some(c) = &self.store.cache
-        {
-            c.remove_if(
-                &NsKeyRef {
-                    ns: self.ns,
-                    key: &e.key,
-                },
-                |v| Arc::ptr_eq(v, &e),
-            );
-        }
+        self.keep(e);
     }
 
     /// Keep `e` in memory, if it is small enough.
@@ -816,8 +810,13 @@ impl ServiceCache {
         {
             tracing::warn!(error = %e, "a SERVICE cache entry stays on disk");
         }
-        self.removed();
         between_tiers();
+        let _gate = self
+            .store
+            .keep_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.removed();
         if let Some(c) = &self.store.cache {
             c.remove(&NsKeyRef { ns: self.ns, key });
         }
@@ -861,8 +860,13 @@ impl ServiceCache {
     /// directory is the error, after the entries it removed are out of memory too.
     pub fn remove_in_scope(&self, scope: &str, id: Option<u64>) -> crate::error::Result<u64> {
         let removal = self.disk().map(|d| d.remove_in_scope(scope, id));
-        self.removed();
         between_tiers();
+        let _gate = self
+            .store
+            .keep_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.removed();
         let mut n = removal.as_ref().map_or(0, |r| r.count());
         let hit = |e: &Entry| e.scope() == scope && id.is_none_or(|id| e.id == id);
         if let Some(c) = &self.store.cache {
@@ -896,6 +900,11 @@ impl ServiceCache {
     /// The error is the disk tier's, after memory is emptied too.
     pub fn clear(&self) -> std::io::Result<()> {
         let disk = self.disk().map_or(Ok(()), |d| d.clear());
+        let _gate = self
+            .store
+            .keep_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.removed();
         if let Some(c) = &self.store.cache {
             if self.shared {

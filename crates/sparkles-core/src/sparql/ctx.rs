@@ -3332,6 +3332,14 @@ impl Ctx {
         self.plan_scratch_leases.lock().push(lease);
     }
 
+    pub(super) fn plan_lease_count(&self) -> usize {
+        self.plan_scratch_leases.lock().len()
+    }
+
+    pub(super) fn truncate_plan_leases(&self, len: usize) {
+        self.plan_scratch_leases.lock().truncate(len);
+    }
+
     pub fn charge(&self, bytes: u64) -> Result<Charge<'_>> {
         let c = Charge {
             ctx: self,

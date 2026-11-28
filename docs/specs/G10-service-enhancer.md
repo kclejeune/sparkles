@@ -423,16 +423,17 @@ cross-dataset SERVICE.
   (`Entry::range`). A plain SERVICE records the request text without the slice and the
   slice on its plan node (`ServiceKey`), and a LIMIT that the planner passes into the
   request narrows that slice. A SILENT call reads its whole answer and stores the
-  response once it has read all of it. A non-SILENT call that reaches the LIMIT reads
-  one more row to check whether the response ends there, and stores the entry when it
-  does. An error during the read-ahead, such as a timeout when the endpoint stalls
-  after the last row, leaves the response uncached rather than failing the query.
+  response once it has read all of it. A non-SILENT call that reaches the LIMIT drops
+  the copy without blocking on the response tail, so the query returns promptly even
+  when the endpoint stalls after the last demanded row. The response is cached only
+  when EOF is observed before or at the LIMIT row.
   A response to a request without a LIMIT is cached once the response ends.
   Preservation of a wider slice when replacing an entry is opportunistic in memory:
-  `put` checks the existing entry in memory only, so a disk-only hit on a different
+  `put` checks the existing entry in memory only, so a disk-only miss on a different
   slice replaces the entry on disk without that check, which affects the hit rate but
-  not correctness because the stored slice still gates reuse. A
-  remote loop splits the slice off its pattern once
+  not correctness because the stored slice still gates reuse. A hit from a disk-only
+  entry on a different slice serves the matching range, and the new response replaces
+  only entries that hold fewer solutions.  A remote loop splits the slice off its pattern once
   (`enhancer::outer_slice`). A miss sends the request as the query writes it, and a
   response replaces the entry of its request only when the entry cannot answer it and
   holds fewer solutions.
@@ -516,7 +517,8 @@ cross-dataset SERVICE.
   Concurrent direct dispatches that share the same parent `RequestBudget` each see
   the parent's time left at the moment they start and can together take that much time,
   since the single-request path takes a snapshot of the balance rather than a
-  reservation. Reservation for concurrent direct dispatch is tracked as a follow-up.
+  reservation. Reservation for concurrent direct dispatch is tracked as roadmap item
+  1342.
   The budget's bytes need no share, because they are counted
   atomically as responses stream in and bound concurrent requests as they bound one. A
   loop over an in-process endpoint sends one request at a time. The eager loop now

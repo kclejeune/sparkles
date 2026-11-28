@@ -12976,6 +12976,9 @@ impl LocalCall {
         opts.work = Some(ctx.rows_produced.clone());
         opts.outbound_budget = Some(ctx.outbound_budget.clone());
         opts.service_depth = ctx.service_depth + 1;
+        if !ctx.use_cache {
+            opts.no_cache = true;
+        }
         // the right to manage a cache is the caller's on its own dataset, not the target's
         opts.service_cache_mgmt = false;
         // the call's plan is dropped below, so it names no patterns (item 180)

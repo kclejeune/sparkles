@@ -106,7 +106,7 @@ fn a_disk_entry_is_admitted_before_it_is_decoded() {
 /// Nested RDF 1.2 triple terms allocate a boxed `Triple` and owned names per nesting
 /// level. The admission counts them from `<<` markers in the raw text before parsing,
 /// so the query budget stops the decoding before the parser reaches its peak (Sol
-/// round-2 P1-2).
+/// round-2 P1-2, Sol round-3 P3-1).
 #[test]
 fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
     let dir = tempfile::tempdir().unwrap();
@@ -123,9 +123,12 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
             Term::Literal(oxrdf::Literal::new_simple_literal("leaf")),
         ))),
     )));
+    let count = 500;
     let rows = Arc::new(Rows {
         vars: vec!["v".to_string()],
-        rows: (0..100).map(|_| vec![Some(triple_term.clone())]).collect(),
+        rows: (0..count)
+            .map(|_| vec![Some(triple_term.clone())])
+            .collect(),
     });
     let url = "http://e/sparql";
     let k = key("a", url, "nested", &[]);
@@ -137,8 +140,21 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
     );
     let file = cache.disk().unwrap().bytes();
     assert!(file > 0, "the entry is on disk");
+    let total = std::cell::Cell::new(0u64);
+    let _ = cache.get_admitted(&k, Slice::ALL, &|n| {
+        total.set(total.get().saturating_add(n));
+        Ok(())
+    });
+    let triple_box = std::mem::size_of::<oxrdf::Triple>() as u64 + 3 * 24;
+    let nested_total = count as u64 * 2 * triple_box;
+    let flat = total.get().saturating_sub(nested_total);
+    let budget = flat + nested_total / 2;
+    assert!(
+        budget < total.get(),
+        "the budget {budget} should be less than the total {}",
+        total.get()
+    );
     let admitted = std::cell::Cell::new(0u64);
-    let budget = file + (8 << 10);
     let before = allocated();
     let r = cache.get_admitted(&k, Slice::ALL, &|n| {
         admitted.set(admitted.get().saturating_add(n));
@@ -148,12 +164,11 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
         Ok(())
     });
     let spent = allocated() - before;
-    assert!(
-        r.is_err(),
-        "nested triple terms should exceed a file-sized budget"
-    );
+    assert!(r.is_err(), "nested triple terms should exceed the budget");
     assert!(
         spent < budget + (64 << 10),
         "{spent} bytes allocated under a budget of {budget}"
     );
+    let r = cache.get_admitted(&k, Slice::ALL, &|_| Ok(()));
+    assert!(r.unwrap().is_some(), "an ample budget admits the entry");
 }

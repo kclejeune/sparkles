@@ -1728,7 +1728,8 @@ impl RemoteRun {
                                     .map(|(i, p)| (i, p, true))
                                     .collect()),
                                 Ok(None) => {
-                                    // cut short: one request per input
+                                    drop(r);
+                                    charges.clear();
                                     stats.retried += 1;
                                     let mut out = Vec::new();
                                     let mut err = None;
@@ -1738,12 +1739,10 @@ impl RemoteRun {
                                             .check()
                                             .and_then(|()| one(&inputs[*i], stats))
                                             .and_then(|(r, c)| {
+                                                drop(c);
                                                 retried =
                                                     retried.saturating_add(r.retained_bytes());
-                                                admit(retried).map(|()| {
-                                                    drop(c);
-                                                    r
-                                                })
+                                                admit(retried).map(|()| r)
                                             }) {
                                             Ok(r) => out.push((*i, r, true)),
                                             Err(e) => {
@@ -1910,12 +1909,7 @@ fn failed(
 fn split(r: &Rows, idx: &str, n: usize) -> Option<Vec<Rows>> {
     let ic = r.vars.iter().position(|v| v == idx)?;
     let vars: Vec<String> = r.vars.iter().filter(|v| *v != idx).cloned().collect();
-    let mut parts: Vec<Rows> = (0..n)
-        .map(|_| Rows {
-            vars: vars.clone(),
-            rows: Vec::new(),
-        })
-        .collect();
+    let mut counts = vec![0usize; n];
     let mut marker = false;
     for row in &r.rows {
         let Some(Term::Literal(i)) = &row[ic] else {
@@ -1926,6 +1920,30 @@ fn split(r: &Rows, idx: &str, n: usize) -> Option<Vec<Rows>> {
         };
         if i == END_MARKER {
             marker = true;
+            continue;
+        }
+        if let Some(c) = usize::try_from(i).ok().and_then(|i| counts.get_mut(i)) {
+            *c += 1;
+        }
+    }
+    if !marker {
+        return None;
+    }
+    let mut parts: Vec<Rows> = counts
+        .iter()
+        .map(|&c| Rows {
+            vars: vars.clone(),
+            rows: Vec::with_capacity(c),
+        })
+        .collect();
+    for row in &r.rows {
+        let Some(Term::Literal(i)) = &row[ic] else {
+            continue;
+        };
+        let Ok(i) = i.value().parse::<i64>() else {
+            continue;
+        };
+        if i == END_MARKER {
             continue;
         }
         let Some(p) = usize::try_from(i).ok().and_then(|i| parts.get_mut(i)) else {
@@ -1939,7 +1957,7 @@ fn split(r: &Rows, idx: &str, n: usize) -> Option<Vec<Rows>> {
                 .collect(),
         );
     }
-    marker.then_some(parts)
+    Some(parts)
 }
 
 #[cfg(test)]

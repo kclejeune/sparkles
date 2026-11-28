@@ -600,35 +600,16 @@ impl Service {
                     }
                     // A SILENT call reads its whole answer before returning any row and
                     // caches it at the end. A non-SILENT call that reached the LIMIT
-                    // reads one more row: the copy is kept only if the response ends
-                    // there, and an extra row or failure drops it. An error during the
-                    // read-ahead (such as a timeout when the endpoint stalls after the
-                    // last row) leaves the response uncached rather than failing the
-                    // query, since the demanded rows are already in hand.
+                    // drops the copy without blocking on the response tail, so the
+                    // query returns promptly even when the endpoint stalls after the
+                    // last demanded row. The response is cached only when EOF has
+                    // already been observed (the loop breaks naturally).
                     if silent_prior.is_none()
                         && tee
                             .as_ref()
                             .is_some_and(|t| t.slice.limit == Some(t.rows.rows.len()))
                     {
-                        ctx.check()?;
-                        let after = answer.next_solution();
-                        if after.is_none() {
-                            ctx.check()?;
-                            if let Some(t) = tee.take() {
-                                ctx.snap.results.service.put(
-                                    t.key,
-                                    t.parts,
-                                    t.slice,
-                                    Arc::new(t.rows),
-                                );
-                            }
-                        } else {
-                            *tee = None;
-                        }
-                        match after {
-                            Some(Err(_)) => {}
-                            other => *peeked = Some(other),
-                        }
+                        *tee = None;
                     }
                     push(&mut b, bnodes, &ServiceSolution::Remote(&solution));
                     ctx.check()?;
@@ -1151,9 +1132,10 @@ mod tests {
                         r = svc.fill(&ctx, 2, silent).map(|_| ());
                     }
                 }
+                let expect = if silent.is_some() { cached } else { false };
                 assert_eq!(
                     ctx.snap.results.service.get(&key, slice).is_some(),
-                    cached,
+                    expect,
                     "{tail} silent {silent:?}"
                 );
             }

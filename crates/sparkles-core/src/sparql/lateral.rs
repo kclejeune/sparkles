@@ -287,6 +287,7 @@ pub(super) fn run(
     let mut solutions = 0;
     for key in &order {
         ctx.check()?;
+        let leases_before = ctx.plan_lease_count();
         let mut p = Planner::new(ctx);
         p.subst.extend(spec.outer.iter().copied());
         p.scoped.extend(spec.outer_scoped.iter().copied());
@@ -327,6 +328,7 @@ pub(super) fn run(
         };
         ctx.check_output(out.len() + joined.len(), vars.len())?;
         out.append(joined.project(vars));
+        ctx.truncate_plan_leases(leases_before);
     }
     Ok((out, order.len(), solutions))
 }

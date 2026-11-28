@@ -956,7 +956,7 @@ fn decode(
             let n = take!(peek.u32());
             if n != UNBOUND {
                 let raw = take!(peek.take(take!(usize::try_from(n).map_err(|_| Bad::Damaged))));
-                let nesting = raw.windows(2).filter(|w| w == b"<<").count() as u64;
+                let nesting = syntactic_triple_openers(raw) as u64;
                 let nested = nesting * (size_of::<oxrdf::Triple>() as u64 + 3 * 24);
                 terms = terms.saturating_add(u64::from(n) + TERM_EXTRA + nested);
             }
@@ -1012,6 +1012,44 @@ fn decode(
         binding: String::new(),
         rows: count,
     }))
+}
+
+fn syntactic_triple_openers(raw: &[u8]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'"' => {
+                i += 1;
+                while i < raw.len() {
+                    match raw[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'<' => {
+                if i + 1 < raw.len() && raw[i + 1] == b'<' {
+                    count += 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                    while i < raw.len() && raw[i] != b'>' {
+                        i += 1;
+                    }
+                    if i < raw.len() {
+                        i += 1;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    count
 }
 
 #[cfg(test)]
