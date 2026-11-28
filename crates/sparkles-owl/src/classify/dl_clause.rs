@@ -1689,16 +1689,16 @@ impl Store {
         self.subsumed_parts(c.body(), c.head(), sig)
     }
 
-    /// [`Store::subsumed`], telling `read` of each candidate it reads and of each literal
-    /// that a comparison steps over, for item 1280's meter, and `None` once read answers
-    /// false.
+    /// [`Store::subsumed_parts`] of a sorted body and head without repeats, telling `read`
+    /// of each candidate it reads and of each literal that a comparison steps over, for
+    /// item 1280's meter, and `None` once read answers false.
     pub(super) fn subsumed_with(
         &self,
-        c: &Clause,
+        body: &[Lit],
+        head: &[Lit],
         sig: u64,
         read: &mut dyn FnMut(usize) -> bool,
     ) -> Option<bool> {
-        let (body, head) = (c.body(), c.head());
         let check = |ids: &[u32], read: &mut dyn FnMut(usize) -> bool| -> Option<bool> {
             for &i in ids {
                 if !read(1) {

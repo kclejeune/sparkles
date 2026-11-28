@@ -577,7 +577,8 @@ The meter reads these steps.
 - On the default path, Hyper reads each body position of an ontology clause and each
   partner in the index, and its restriction, its test of a routable unit, its sizing and its
   copy read each literal of a partner and of the premise that they touch, in spans as they
-  go. Its test of root facts over a constant ends at the first refused read. Join reads each
+  go. The build of a product's lists reads each body position again and copies the fixed
+  premise in spans through the same meter. Hyper's test of root facts over a constant ends at the first refused read. Join reads each
   body literal of the given clause and each premise over a ground body literal, and its
   restriction, its count of the premise's head and its copy read in spans as they go. A stop
   inside Join's copy releases the conclusion's admission. The root's offer of a fact reads each literal of its head, each lookup of the
@@ -587,9 +588,12 @@ The meter reads these steps.
 The marker pass that the decline check and the diagnostic run after a rooted run saturates
 is outside the saturation. Its redundancy test of each product reads the stored candidates,
 the literals of their comparisons, the copies of the chosen premises and of the base's head,
-each literal that the normalization of an assembled clause filters and each literal that
-its test of a tautology compares, the search of the head for each equality's inequality
-included, through a meter of its own. That meter
+each literal that the normalization of an assembled clause filters or compares as it removes
+repeats, each literal that its test of a tautology compares, and each literal of the clause's
+signature, through a meter of its own. The test of a tautology includes the search of the
+head for each equality's inequality and each step of a walk over the sorted body and head.
+The library sorts of the assembled clause and the lookup of its whole head among the root's
+promoted facts read without the meter, and item 1319 follows them. That meter
 checks only the deadline and cancellation through the diagnostic's callback, and it counts
 its reads as separate deficit work, `dwork`, which neither the saturation's work bound nor
 the admission of the deficit pass's scratch takes.
@@ -620,7 +624,13 @@ check between the deliveries of their returns sends fewer returns than there are
 literal of both, and a refusal of its first read ends it. A redundancy test of a product
 whose head holds 4,096 distinct equalities stops at the first check inside its test of a
 tautology, after exactly 1,024 reads since the check before, and asks no read of the
-stopped meter. A late replay whose preparation and flush are granted stops at the first
+stopped meter. A redundancy test of a product whose body holds 4,096 distinct literals below
+its one head literal stops at the first check inside the walk over the body in the same way.
+A copy of a fixed premise of 3,072 literals in Hyper stops at each of its checks with the
+caller's guard holding only what the step kept and no product pushed. A fresh meter that
+charges and is refused at the first check of a count of 2,053 reads charges the 1,024 reads
+up to that check and none of the rest, through a sink and through the diagnostic's
+callback. A late replay whose preparation and flush are granted stops at the first
 charge inside the drain, before it derives anything, and holds nothing. A return of one premise under a sink that
 grants memory without the full check derives nothing after a stop that was already asked
 for. A test reads through guarded views of one sink that keeps the activation's count, with
@@ -630,7 +640,7 @@ reads. A late replay's batches keep M-return's rule across a flush. A test harne
 premises per literal, the length of a premise, the width of a single premise, the returned
 body, the body that a late premise's literal is searched for in, the returns of a late
 premise, the holders and body of an offered clause, the stored clauses of the diagnostic's
-test, Hyper's premises and partners, the root fact offer's registrations and head, and
+test, Hyper's premises, partners and fixed premise, the root fact offer's registrations and head, and
 Join's premises and given body eight times over, as well as a premise, a partner, a side, a
 returned clause's head and a late premise's body of up to 8,192 literals and a head of up to
 2,048 equalities. It asserts each time that no more than 1,024 reads are counted between two
@@ -647,7 +657,8 @@ and from constants, the registration of a context with the root, Hyper's restric
 copy of its fixed premise alone for a conjunction or an existential restriction, the
 materialization of the head atoms of a multi-head ontology clause in Hyper, the root fact
 offer's list of constants and the sort, deduplication and delivery of its destinations, the
-library sorts named above, and the copy of a returned clause that M-return takes before it
+library sorts named above, the diagnostic's lookup of an assembled clause's whole head among
+the root's promoted facts, and the copy of a returned clause that M-return takes before it
 admits its lists. Outside the diagnostic's
 counts and redundancy test, which check the deadline and cancellation, the marker pass that
 the decline check and the diagnostic run after a rooted run saturates checks no bound, and

@@ -2338,10 +2338,28 @@ fn hyper_at<S: Sink>(
                 };
                 h_lits.push(la);
             }
+            // the build reads each body position and copies the fixed premise in spans
+            // through the meter of the sizing, as it reads each partner it copies
             let mut lists = Vec::with_capacity(body.len());
             for &a in body.iter() {
+                if !meter.read(1, out) {
+                    drop((lists, h_lits));
+                    out.release_to(found.held_bytes());
+                    mark_interrupted(st);
+                    return false;
+                }
                 if a == d {
-                    lists.push(vec![(prem.0.clone(), prem.1.clone())]);
+                    let mut pb = Vec::with_capacity(prem.0.len());
+                    let mut ph = Vec::with_capacity(prem.1.len());
+                    if !meter.extend(&mut pb, &prem.0, &*out)
+                        || !meter.extend(&mut ph, &prem.1, &*out)
+                    {
+                        drop((pb, ph, lists, h_lits));
+                        out.release_to(found.held_bytes());
+                        mark_interrupted(st);
+                        return false;
+                    }
+                    lists.push(vec![(pb, ph)]);
                 } else {
                     let mut count = 0usize;
                     let mut v = Vec::new();
@@ -5622,6 +5640,25 @@ fn retain_read(v: &mut Vec<Lit>, rd: &mut Reads, keep: impl Fn(Lit) -> bool) -> 
     Some(())
 }
 
+/// Removes the repeats of the sorted `v`, reading each literal it compares through `rd`,
+/// `None` once a check of the bounds stopped the diagnostic.
+fn dedup_read(v: &mut Vec<Lit>, rd: &mut Reads) -> Option<()> {
+    let mut w = 0;
+    for r in 0..v.len() {
+        if !rd.read(1) {
+            return None;
+        }
+        #[cfg(test)]
+        super::dl_rules::meter_probe::visit(1);
+        if w == 0 || v[w - 1] != v[r] {
+            v[w] = v[r];
+            w += 1;
+        }
+    }
+    v.truncate(w);
+    Some(())
+}
+
 /// Whether the context holds every product of `lists` with the head `head`: each is a
 /// tautology or a live clause of the context subsumes it.
 fn products_held(
@@ -5663,16 +5700,22 @@ fn products_held(
             copy(&mut hd, &l[i].1, rd)?;
         }
         // the normalization of the assembled clause reads each of its literals as it filters
-        // them, and its test of a tautology reads each literal it compares, the nested
-        // search for an equality's inequality included
+        // them and as it removes repeats, and its test of a tautology reads each literal it
+        // compares, the nested search for an equality's inequality included and each step
+        // of the walk over the sorted body and head. The library sorts read without the
+        // meter (roadmap item 1319).
         let true_x = |l: Lit| l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom()));
         retain_read(&mut body, rd, |l| !true_x(l) && !is(l, TOP))?;
         retain_read(&mut hd, rd, |l| !is(l, BOTTOM))?;
         body.sort_unstable();
-        body.dedup();
+        dedup_read(&mut body, rd)?;
         hd.sort_unstable();
-        hd.dedup();
+        dedup_read(&mut hd, rd)?;
         let mut taut = lits.complementary_with(&hd, inv, &mut |n| rd.read(n))?;
+        // each head literal is a read, which covers its own tests and its comparison with
+        // the body literal the walk stands on, and each step of the walk past a smaller body
+        // literal is a read
+        let mut j = 0;
         for &l in &hd {
             if taut {
                 break;
@@ -5682,13 +5725,39 @@ fn products_held(
             }
             #[cfg(test)]
             super::dl_rules::meter_probe::visit(1);
-            taut = true_x(l) || is(l, TOP) || body.binary_search(&l).is_ok();
+            if true_x(l) || is(l, TOP) {
+                taut = true;
+                break;
+            }
+            while j < body.len() && body[j] < l {
+                if !rd.read(1) {
+                    return None;
+                }
+                #[cfg(test)]
+                super::dl_rules::meter_probe::visit(1);
+                j += 1;
+            }
+            taut = body.get(j) == Some(&l);
         }
-        // a fact that derive sent the root ([`super::dl_rules::derive`]) is held
+        // a fact that derive sent the root ([`super::dl_rules::derive`]) is held, which one
+        // lookup of the whole head finds without the meter (roadmap item 1319)
         let promoted = body.is_empty() && x.promoted.contains(hd.as_slice());
         if !taut && !promoted {
-            let c = Clause::new(body, hd);
-            if !x.store.subsumed_with(&c, c.sig(), &mut |n| rd.read(n))? {
+            // the signature reads each literal of the clause, which the store's search
+            // takes as the sorted body and head without a copy of them
+            let mut sig = 0u64;
+            for &l in body.iter().chain(&hd) {
+                if !rd.read(1) {
+                    return None;
+                }
+                #[cfg(test)]
+                super::dl_rules::meter_probe::visit(1);
+                sig |= l.sig_bit();
+            }
+            if !x
+                .store
+                .subsumed_with(&body, &hd, sig, &mut |n| rd.read(n))?
+            {
                 return Some(false);
             }
         }
@@ -6702,9 +6771,10 @@ pub(super) mod tests {
                     out.refuse = true;
                     out.after = k;
                 }
-                let _ = super::super::dl_rules::meter_probe::take_refused();
+                let _ = super::super::dl_rules::meter_probe::take();
                 m_offer(&ix, &mut st, id, &c, &mut out);
                 let refused = super::super::dl_rules::meter_probe::take_refused();
+                let (reads, checks, _) = super::super::dl_rules::meter_probe::take();
                 let sent = out
                     .sent
                     .iter()
@@ -6716,24 +6786,40 @@ pub(super) mod tests {
                     dl(&st).unwrap().store.interrupted,
                     out.held,
                     refused,
+                    // a refusal that the meter makes leaves its reads at a check, and the
+                    // index reads 16, so such a refusal falls in the holders' scan
+                    checks > 0 && reads == checks * METER_CHECK,
                 )
             };
-            let (granted, sent, cut, _, _) = offer(None);
+            let (granted, sent, cut, _, _, _) = offer(None);
             assert!(
                 !cut && sent == 1200 && granted >= 4,
                 "mode {mode}: {granted}"
             );
+            let mut in_scan = 0;
             for k in 0..granted {
-                let (_, sent, cut, held, refused) = offer(Some(k));
-                assert!(
-                    cut && sent < 1200 && held == 0,
-                    "mode {mode} at {k}: {sent}"
-                );
+                let (_, sent, cut, held, refused, scan) = offer(Some(k));
+                // a stop in the scan sends none of the holders it collected, and a stop
+                // between the deliveries sends fewer returns than there are holders
+                if scan {
+                    in_scan += 1;
+                    assert!(cut && sent == 0 && held == 0, "mode {mode} at {k}: {sent}");
+                } else {
+                    assert!(
+                        cut && sent < 1200 && held == 0,
+                        "mode {mode} at {k}: {sent}"
+                    );
+                }
                 assert_eq!(
                     refused, 0,
                     "mode {mode} at {k}: reads asked of a stopped meter"
                 );
             }
+            assert_eq!(
+                in_scan,
+                4 * 1200 / METER_CHECK,
+                "mode {mode}: a refusal at each check of the holders' scan"
+            );
         }
         // Join's premises on the default path
         let mut sig = Sig::new();
@@ -7066,12 +7152,19 @@ pub(super) mod tests {
             );
             (n * n, polls)
         });
+        use super::super::dl_rules::meter_probe;
+        // a granted test reads the choice, the copy of the head, its filter and its removal
+        // of repeats, the nested search, the walk over the head, the signature and the
+        // store's search of the head, each of them in full
+        let n = 256;
+        let _ = meter_probe::take();
+        assert_eq!(eqs(n, None).0, Some(false));
+        assert_eq!(meter_probe::take().0, WORK_READS + 7 * n + n * n);
         // a stop at the first check inside the test of a tautology ends it there
         let n = 4096;
         // a choice, the copy of the head and its normalization come before the test
-        let before = WORK_READS + 2 * n;
+        let before = WORK_READS + 3 * n;
         let k = before / METER_CHECK;
-        use super::super::dl_rules::meter_probe;
         let _ = meter_probe::take();
         let _ = meter_probe::take_gap();
         let (got, polls) = eqs(n, Some(k));
@@ -7086,6 +7179,63 @@ pub(super) mod tests {
             "the stop falls inside the test"
         );
         assert!(reads > before && reads < before + n * n);
+        assert_eq!(most, METER_CHECK);
+        assert!(made <= METER_CHECK, "{made} reads made between two checks");
+        assert_eq!(refused, 0, "reads asked of a stopped meter");
+        // A product whose body holds `n` distinct literals below the one literal of its
+        // head: the test of a tautology walks the whole sorted body to compare the head
+        // literal with it, a read for each step.
+        let disjoint = |n: usize, stop: Option<usize>| {
+            let run = DlRun::new(false, Default::default());
+            let ix = probe_ix(Sig::new()).0;
+            let mut st = State::default();
+            let _ = ds(&mut st);
+            let body: Vec<Lit> = (0..n as Ex).map(|i| Lit::x(1000 + i)).collect();
+            let head = [Lit::x(1000 + n as Ex)];
+            let lists = [vec![(body, vec![])]];
+            let polls = std::cell::Cell::new(0);
+            let mut poll = |_| {
+                polls.set(polls.get() + 1);
+                stop.is_none_or(|k| polls.get() <= k)
+            };
+            let mut rd = Reads::new(&mut poll);
+            let got = products_held(&ix, &st, &lists, &head, &run.lits, &mut rd);
+            if got.is_some() {
+                assert!(rd.end());
+            }
+            (got, polls.get())
+        };
+        let n = 4096;
+        let _ = meter_probe::take();
+        assert_eq!(
+            disjoint(n, None).0,
+            Some(false),
+            "no tautology and nothing subsumes it"
+        );
+        // the choice, the copies, the filters, the removals of repeats, the nested search,
+        // the walk, the signature and the store's search of the head
+        assert_eq!(meter_probe::take().0, WORK_READS + 5 * n + 7);
+        // the walk's steps past the body literals follow every other read of the
+        // normalization and the walk's read of the head literal
+        let before = WORK_READS + 3 * n + 5;
+        let k = before / METER_CHECK;
+        let _ = meter_probe::take();
+        let _ = meter_probe::take_gap();
+        let (got, polls) = disjoint(n, Some(k));
+        let refused = meter_probe::take_refused();
+        let (reads, _, most) = meter_probe::take();
+        let made = meter_probe::take_gap();
+        assert_eq!(got, None, "the stop ends the test");
+        assert_eq!(polls, k + 1, "no check after the stop");
+        assert_eq!(
+            reads,
+            (k + 1) * METER_CHECK,
+            "the stop falls inside the walk"
+        );
+        assert!(
+            reads > before && reads <= before + n,
+            "{reads} after {before}"
+        );
         assert_eq!(most, METER_CHECK);
         assert!(made <= METER_CHECK, "{made} reads made between two checks");
         assert_eq!(refused, 0, "reads asked of a stopped meter");
@@ -7236,6 +7386,73 @@ pub(super) mod tests {
                 assert_eq!(found.products_len(), 1);
                 (n, out.polls.get())
             },
+        );
+        // Hyper's fixed premise of n body literals on D(u), with a partner of one literal
+        // for A(u), which the build of the product's lists copies in spans
+        use super::super::dl_rules::meter_probe;
+        let fixed = |n: usize, after: Option<usize>| {
+            let (ix, run, mut st, _, d, u, _) = wide_partner(1);
+            let wide: Side = (
+                (0..n as Ex).map(|i| Lit::x((1 << 20) + i)).collect(),
+                vec![],
+            );
+            let mut out = Stops::new(&run);
+            if let Some(k) = after {
+                out.refuse = true;
+                out.after = k;
+            }
+            let mut found = Found::default();
+            let _ = meter_probe::take_refused();
+            let go = {
+                let mut g = Guard::new(&mut out);
+                let go = hyper_at(&ix, &mut st, &mut g, d, u, &wide, &mut found, false);
+                assert_eq!(g.bytes(), found.held_bytes(), "held with the guard");
+                go
+            };
+            let refused = meter_probe::take_refused();
+            (go, found.products_len(), out.polls.get(), out.held, refused)
+        };
+        meter_grows(
+            "a wide fixed premise of Hyper",
+            METER_CHECK,
+            [1024, 2048, 4096, 8192],
+            |n| {
+                let (go, prods, polls, held, _) = fixed(n, None);
+                assert!(go && prods == 1 && held == 0, "{n}");
+                (n, polls)
+            },
+        );
+        // A refusal at each check leaves nothing held or pushed. Hyper reads fewer than a
+        // check's reads besides the copy, as a granted run with a premise of one literal
+        // shows, so a refusal that the meter makes, with its reads at a check, past that
+        // run's reads and within the copy's, falls inside the copy.
+        let _ = meter_probe::take();
+        let _ = fixed(1, None);
+        let (rest, _, _) = meter_probe::take();
+        assert!(rest < METER_CHECK, "{rest} reads besides the copy");
+        let n = 3 * METER_CHECK;
+        let (_, _, granted, _, _) = fixed(n, None);
+        let mut in_copy = 0;
+        for k in 0..granted {
+            let _ = meter_probe::take();
+            let (go, prods, _, held, refused) = fixed(n, Some(k));
+            let (reads, checks, _) = meter_probe::take();
+            assert!(
+                !go && prods == 0 && held == 0 && refused == 0,
+                "the fixed premise at {k}"
+            );
+            if checks > 0 && reads == checks * METER_CHECK {
+                assert!(
+                    reads > rest && reads <= n,
+                    "the fixed premise at {k}: {reads}"
+                );
+                in_copy += 1;
+            }
+        }
+        assert_eq!(
+            in_copy,
+            n / METER_CHECK,
+            "a refusal at each check inside the copy"
         );
         // Join's premise of n body literals on the ground literal of a given clause
         let join = |n: usize, after: Option<usize>| {
@@ -7580,6 +7797,37 @@ pub(super) mod tests {
         assert_eq!((out.polls.get(), checks), (4, 3));
         assert_eq!(most, METER_CHECK);
         assert_eq!(out.cadence.as_ref().unwrap().get(), 5);
+    }
+
+    #[test]
+    fn a_refused_bulk_read_charges_only_the_reads_up_to_its_check() {
+        // A fresh meter that charges is asked for a count that crosses two checks and is
+        // refused at the first: it charges the check's reads and none of those past it.
+        let n = 2 * METER_CHECK + 5;
+        let meter = Meter::new(Bill::Work);
+        let mut calls = Vec::new();
+        let mut poll = |w: usize| {
+            calls.push(w);
+            false
+        };
+        assert!(!meter.read_poll(n, &mut poll));
+        assert_eq!(calls, [METER_CHECK / WORK_READS], "the diagnostic's poll");
+        assert!(
+            !meter.end_poll(&mut |_| true),
+            "the stopped meter stays stopped"
+        );
+        let run = DlRun::new(false, Default::default());
+        let mut out = Stops::new(&run);
+        out.refuse = true;
+        let work = run.work();
+        let meter = Meter::new(Bill::Work);
+        assert!(!meter.read_mut(n, &mut out));
+        assert_eq!(out.polls.get(), 1, "one check");
+        assert_eq!(
+            run.work() - work,
+            METER_CHECK / WORK_READS,
+            "a sink's charge"
+        );
     }
 
     #[test]
