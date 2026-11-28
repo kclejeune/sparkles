@@ -430,12 +430,12 @@ cross-dataset SERVICE.
   last demanded row; the response is cached only when EOF has already been observed
   before the pushed limit is reached.
   A response to a request without a LIMIT is cached once the response ends.
-  For both plain SERVICE and remote loops, `put` checks the existing entry in memory
-  only, so a request whose slice differs from an entry that is on disk but not in
-  memory replaces that entry without the wider-slice check. This affects the hit rate
-  but not correctness, because the stored slice still gates reuse. A hit from a
-  disk-only entry on a different slice serves the matching range. Reservation for the
-  wider-slice memory check on direct dispatch is tracked as roadmap item 1342.
+  For both plain SERVICE and remote loops, a cache miss followed by `put` checks only
+  what is live in memory at that point. A disk lookup can promote an entry even when
+  its slice cannot answer the request, and if the old entry is absent from memory at
+  `put`, the new response replaces the disk file without the wider-slice check. This
+  affects the hit rate but not correctness, because the stored slice still gates reuse.
+  A hit from a disk-only entry on a different slice serves the matching range.
   A remote loop splits the slice off its pattern once (`enhancer::outer_slice`). A
   miss sends the request as the query writes it, and a response replaces the entry of
   its request only when the entry cannot answer it and holds fewer solutions.

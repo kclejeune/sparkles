@@ -126,16 +126,20 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
     let count = 500;
     let url = "http://e/sparql";
 
-    // measure the flat baseline independently with plain literals of the same layout
-    let plain_term = Term::Literal(oxrdf::Literal::new_simple_literal("plain"));
+    // The nested triple serializes to 52 bytes via Display:
+    //   << <urn:s> <urn:p> << <urn:s2> <urn:p2> "leaf" >> >>
+    // A simple literal of 50 characters serializes to "x...x" = 52 bytes.
+    // Equal serialized byte length and equal key length make the ONLY admission
+    // difference the nested triple-opener allowance.
+    let plain_term = Term::Literal(oxrdf::Literal::new_simple_literal("x".repeat(50)));
     let plain_rows = Arc::new(Rows {
         vars: vec!["v".to_string()],
         rows: (0..count).map(|_| vec![Some(plain_term.clone())]).collect(),
     });
-    let pk = key("a", url, "plain-baseline", &[]);
+    let pk = key("a", url, "flat-500-rows", &[]);
     cache.put(
         pk.clone(),
-        Parts::of("a", url, "plain-baseline"),
+        Parts::of("a", url, "flat-500-rows"),
         Slice::ALL,
         plain_rows,
     );
@@ -147,17 +151,16 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
     assert!(pr.unwrap().is_some(), "plain baseline reads back");
     let flat = flat.get();
 
-    // store the nested entry and measure its total admission
     let nested_rows = Arc::new(Rows {
         vars: vec!["v".to_string()],
         rows: (0..count)
             .map(|_| vec![Some(triple_term.clone())])
             .collect(),
     });
-    let k = key("a", url, "nested", &[]);
+    let k = key("a", url, "nest-500-rows", &[]);
     cache.put(
         k.clone(),
-        Parts::of("a", url, "nested"),
+        Parts::of("a", url, "nest-500-rows"),
         Slice::ALL,
         nested_rows.clone(),
     );
@@ -178,6 +181,10 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
         budget < total,
         "the budget {budget} should be less than the total {total}"
     );
+    assert!(
+        budget >= flat,
+        "the midpoint {budget} should pass the flat baseline ({flat})"
+    );
     let admitted = std::cell::Cell::new(0u64);
     let before = allocated();
     let r = cache.get_admitted(&k, Slice::ALL, &|n| {
@@ -197,7 +204,8 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
     let rows = r.unwrap().expect("an ample budget admits the entry");
     assert_eq!(rows.rows.len(), count, "all rows returned");
 
-    // a literal containing many `<<` characters round-trips correctly under a tight budget
+    // a literal containing many `<<` characters round-trips under a budget that would
+    // fail if the parser counted the quoted `<<` as triple openers
     let angle_text = "<<".repeat(50);
     let angle_term = Term::Literal(oxrdf::Literal::new_simple_literal(&angle_text));
     let angle_rows = Arc::new(Rows {
@@ -211,7 +219,26 @@ fn a_nested_triple_term_is_admitted_before_it_is_decoded() {
         Slice::ALL,
         angle_rows.clone(),
     );
-    let ar = cache.get_admitted(&ak, Slice::ALL, &|_| Ok(()));
-    let angle_back = ar.unwrap().expect("angle literals round-trip");
+    let angle_total = std::cell::Cell::new(0u64);
+    let _ = cache.get_admitted(&ak, Slice::ALL, &|n| {
+        angle_total.set(angle_total.get().saturating_add(n));
+        Ok(())
+    });
+    let angle_total = angle_total.get();
+    let broken_per_row = 50 * (std::mem::size_of::<oxrdf::Triple>() as u64 + 72);
+    let angle_budget = angle_total + count as u64 * broken_per_row / 2;
+    let angle_admitted = std::cell::Cell::new(0u64);
+    let ar = cache.get_admitted(&ak, Slice::ALL, &|n| {
+        angle_admitted.set(angle_admitted.get().saturating_add(n));
+        if angle_admitted.get() > angle_budget {
+            return Err(Error::invalid("over the angle budget"));
+        }
+        Ok(())
+    });
+    let angle_back = ar.unwrap().expect("angle literals under a tight budget");
     assert_eq!(angle_back.rows.len(), count, "angle literal row count");
+    match &angle_back.rows[0][0] {
+        Some(Term::Literal(l)) => assert_eq!(l.value(), angle_text, "decoded value matches"),
+        other => panic!("expected a literal, got {other:?}"),
+    }
 }

@@ -1052,9 +1052,9 @@ fn a_pushed_limit_bounds_the_entry() {
         assert!(sent[0].trim_end().ends_with("LIMIT 6"), "{}", sent[0]);
         assert_eq!(count(&q(2), mode), 2, "{mode:?}");
         let narrower = ep.take();
-        // A non-SILENT query that reaches its LIMIT does not cache the response
-        // (the streamed path drops the copy, the eager path gets only the LIMIT's
-        // rows from the endpoint), so a later narrower request dispatches its own.
+        // An unordered outer LIMIT pulls through cursor operators even with
+        // ExecutionMode::Eager. The streamed path drops the copy, and the eager path
+        // gets only the LIMIT's rows, so a later narrower request dispatches its own.
         assert_eq!(narrower.len(), 1, "{mode:?}: narrower LIMIT dispatches");
         assert!(
             narrower[0].trim_end().ends_with("LIMIT 2"),
@@ -1833,4 +1833,104 @@ fn bulk_missing_marker_and_marker_only_response() {
     assert!(re.is_empty(), "marker-only gives no rows");
     let sent2 = ep.take();
     assert_eq!(sent2.len(), 1, "marker-only: one bulk request, no retries");
+}
+
+/// A marker-only bulk response splits into empty parts whose Arc and tuple overhead is
+/// properly admitted, and a truncated bulk response retries within budget (Sol round-5
+/// P2). Both execution modes use the same admission code.
+#[test]
+fn bulk_arc_overhead_budget_in_both_modes() {
+    use sparkles_core::sparql::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let data = store(&departments(10));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let run_mode =
+        |q: &str, mode: ExecutionMode, o: &QueryOptions| -> sparkles_core::Result<usize> {
+            match query_execution(data.snapshot(), q, o, &CursorOptions::default(), mode)? {
+                QueryExecution::Select(mut c) => {
+                    let mut n = 0;
+                    while let Some(b) = c.next_batch()? {
+                        n += b.len();
+                    }
+                    Ok(n)
+                }
+                QueryExecution::Eager(r) => Ok(r.into_result().len()),
+                _ => unreachable!("a SELECT"),
+            }
+        };
+    for mode in [ExecutionMode::Eager, ExecutionMode::Streaming] {
+        data.result_cache().service.clear().unwrap();
+        // marker-only: 10 inputs, FILTER(false) → endpoint returns only the end marker
+        let marker_q = format!(
+            "SELECT ?d ?p {{ VALUES ?d {{ {} }} \
+             SERVICE <loop:bulk+12:{url}> {{ ?d <urn:hasEmployee> ?p FILTER(false) }} }}",
+            (1..=10)
+                .map(|d| format!("<urn:dept{d}>"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let o = QueryOptions {
+            max_memory_bytes: Some(512 << 10),
+            ..opts()
+        };
+        let n = run_mode(&marker_q, mode, &o).unwrap();
+        assert_eq!(n, 0, "{mode:?}: marker-only gives no rows");
+        let sent = ep.take();
+        assert_eq!(sent.len(), 1, "{mode:?}: one bulk request, no retries");
+
+        data.result_cache().service.clear().unwrap();
+        // truncated: 2 inputs, endpoint truncates at 3 rows → no end marker → retry
+        ep.limit.store(3, Ordering::SeqCst);
+        let trunc_q = format!(
+            "SELECT ?d ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} \
+             SERVICE <loop:bulk+5:{url}> {{ ?d <urn:hasEmployee> ?p }} }}"
+        );
+        let n = run_mode(&trunc_q, mode, &o).unwrap();
+        ep.limit.store(usize::MAX, Ordering::SeqCst);
+        let sent = ep.take();
+        // bulk (truncated, no marker) + 2 individual retries (each truncated at 3)
+        assert!(
+            sent.len() >= 3,
+            "{mode:?}: bulk + retries: got {}",
+            sent.len()
+        );
+        assert_eq!(n, 3 + 3, "{mode:?}: each retry truncated at 3");
+    }
+}
+
+/// Repeated empty non-OPTIONAL LATERAL groups that plan `se:cacheLs` release their
+/// plan scratch leases between groups, so a tight budget does not overflow even when
+/// most groups produce no rows (Sol round-5 P3-1).
+#[test]
+fn lateral_cache_ls_empty_groups_release_plan_leases() {
+    let data = caching_store(2);
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let caching = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    rows(
+        &data,
+        &format!(
+            "SELECT ?p {{ VALUES ?d {{ <urn:dept1> <urn:dept2> }} \
+             SERVICE <loop:cache:{url}> {{ ?d <urn:hasEmployee> ?p }} }}"
+        ),
+    );
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    // 2 present groups (the endpoint URL) and 5 missing groups (urn: URIs that match
+    // nothing in the listing). The budget fits one listing plan at a time; leaked
+    // scratch leases across the 5 empty groups would exhaust it.
+    let q = format!(
+        "{se} SELECT ?target ?id ?ep {{ \
+         VALUES ?target {{ <{url}> <urn:gone1> <urn:gone2> <urn:gone3> <urn:gone4> <urn:gone5> <{url}> }} \
+         LATERAL {{ ?id se:cacheLs (?ep) FILTER(?ep = ?target) }} }}"
+    );
+    let o = QueryOptions {
+        max_memory_bytes: Some(256 << 10),
+        no_cache: false,
+        ..caching
+    };
+    let r = run(&data, &q, &o).unwrap();
+    assert_eq!(r.len(), 4, "2 present groups * 2 cached entries each");
 }

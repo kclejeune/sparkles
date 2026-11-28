@@ -1687,6 +1687,9 @@ impl RemoteRun {
         // Up to `width` requests go out at once. Their answers are taken in the order of
         // the inputs, so neither the answer nor the requests that follow depend on
         // which response came first, and no wave starts after a failure.
+        let arc_counters = (2 * std::mem::size_of::<usize>()) as u64;
+        let answer_slot = std::mem::size_of::<(usize, Arc<Rows>, bool)>() as u64;
+        let per_answer_overhead = arc_counters + answer_slot;
         for wave in chunks.chunks(width) {
             ctx.check()?;
             let queries: Vec<String> = wave.iter().map(|c| request(c, inputs)).collect();
@@ -1696,9 +1699,10 @@ impl RemoteRun {
                 // the charges that admitted the answers, held until `admit` has them
                 let mut charges = Vec::new();
                 let fetched: Result<Vec<(usize, Arc<Rows>, bool)>> = if chunk.len() == 1 {
-                    answer.map(|(r, c)| {
+                    answer.and_then(|(r, c)| {
+                        c.add(per_answer_overhead)?;
                         charges.push(c);
-                        vec![(chunk[0], Arc::new(r), true)]
+                        Ok(vec![(chunk[0], Arc::new(r), true)])
                     })
                 } else {
                     match answer {
@@ -1717,7 +1721,9 @@ impl RemoteRun {
                                         .and_then(|()| one(&inputs[*i], stats))
                                         .and_then(|(r, c)| {
                                             drop(c);
-                                            retried = retried.saturating_add(r.retained_bytes());
+                                            retried = retried
+                                                .saturating_add(r.retained_bytes())
+                                                .saturating_add(per_answer_overhead);
                                             admit(retried).map(|()| r)
                                         }) {
                                         Ok(r) => out.push((*i, Arc::new(r), true)),
@@ -1732,16 +1738,20 @@ impl RemoteRun {
                                     None => Ok(out),
                                 }
                             } else {
-                                let arc_header = std::mem::size_of::<Arc<Rows>>() as u64;
+                                let arc_inner = (std::mem::size_of::<Rows>()
+                                    + 2 * std::mem::size_of::<usize>())
+                                    as u64;
                                 let schema_bytes: u64 = r
                                     .vars
                                     .iter()
                                     .filter(|v| *v != rl.idx.as_str())
                                     .map(|v| (v.len() + std::mem::size_of::<String>()) as u64)
                                     .sum();
-                                let per_part =
-                                    schema_bytes + std::mem::size_of::<Rows>() as u64 + arc_header;
-                                let split_overhead = chunk.len() as u64 * per_part;
+                                let per_part = schema_bytes + arc_inner + answer_slot;
+                                let counts_overhead =
+                                    std::mem::size_of_val(chunk) as u64;
+                                let split_overhead =
+                                    chunk.len() as u64 * per_part + counts_overhead;
                                 let admitted = c
                                     .add(r.retained_bytes().saturating_add(split_overhead))
                                     .map(|()| {
@@ -1775,11 +1785,10 @@ impl RemoteRun {
                 // release the per-fetch charges before admitting the held total, so
                 // the same rows are not counted twice against the budget
                 drop(charges);
-                let arc_overhead = std::mem::size_of::<Arc<Rows>>() as u64;
                 let answered: u64 = chunk
                     .iter()
                     .filter_map(|&i| inputs[i].rows.as_ref())
-                    .map(|rows| rows.retained_bytes().saturating_add(arc_overhead))
+                    .map(|rows| rows.retained_bytes().saturating_add(per_answer_overhead))
                     .sum();
                 held = held.saturating_add(answered);
                 self.held = held;
@@ -1932,11 +1941,19 @@ fn split_arc(r: &Rows, idx: &str, chunk: &[usize]) -> Vec<(usize, Arc<Rows>, boo
             *c += 1;
         }
     }
-    let mut parts: Vec<Rows> = counts
+    let mut out: Vec<(usize, Arc<Rows>, bool)> = chunk
         .iter()
-        .map(|&c| Rows {
-            vars: vars.clone(),
-            rows: Vec::with_capacity(c),
+        .copied()
+        .zip(&counts)
+        .map(|(i, &c)| {
+            (
+                i,
+                Arc::new(Rows {
+                    vars: vars.clone(),
+                    rows: Vec::with_capacity(c),
+                }),
+                true,
+            )
         })
         .collect();
     for row in &r.rows {
@@ -1949,10 +1966,10 @@ fn split_arc(r: &Rows, idx: &str, chunk: &[usize]) -> Vec<(usize, Arc<Rows>, boo
         if i == END_MARKER {
             continue;
         }
-        let Some(p) = usize::try_from(i).ok().and_then(|i| parts.get_mut(i)) else {
+        let Some(p) = usize::try_from(i).ok().and_then(|i| out.get_mut(i)) else {
             continue;
         };
-        p.rows.push(
+        Arc::get_mut(&mut p.1).unwrap().rows.push(
             row.iter()
                 .enumerate()
                 .filter(|(c, _)| *c != ic)
@@ -1960,12 +1977,7 @@ fn split_arc(r: &Rows, idx: &str, chunk: &[usize]) -> Vec<(usize, Arc<Rows>, boo
                 .collect(),
         );
     }
-    chunk
-        .iter()
-        .copied()
-        .zip(parts)
-        .map(|(i, p)| (i, Arc::new(p), true))
-        .collect()
+    out
 }
 
 #[cfg(test)]
