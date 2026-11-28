@@ -1,0 +1,3 @@
+SUB http://example.org/hd2#A http://example.org/hd2#Goal
+SUB http://example.org/hd2#A http://example.org/hd2#S
+END

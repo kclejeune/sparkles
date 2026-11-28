@@ -1,0 +1,4 @@
+UNSAT http://example.org/hd3#A
+UNSAT http://example.org/hd3#S
+UNSAT http://www.w3.org/2002/07/owl#Nothing
+END

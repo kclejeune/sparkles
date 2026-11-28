@@ -732,40 +732,45 @@ the universals at `x` along a role atom `r(x, u)` to a constant `u`, in either o
 arrival, and these still merge the bodies of their premises, so `B(v) → (∀r.D)(x)` and
 `E(w) → r(x, u)` give `B(v) ∧ E(w) → D(u)`. The root's clauses are never cut.
 
-The argument has four parts. The first is the stage of facts. The model construction of
-item 1220's proof work starts from the clauses with an empty body of the query context and
-of the root, none of which is ground-bodied, so the cut leaves every inference among them in
-place. The second is the discharge of a ground body in the query context, and it covers
-only body literals whose terms are all constants. Join takes such a literal as its pivot
-and no other, the index of ground body literals holds only such literals, and registration
-with the root uses the same test, so a body literal over a successor term of a constant,
-such as `B(f(u))`, is not discharged by Join. Take a clause in the query context whose body
-literals that mention neither `x` nor `y` are all over constants and all hold in the model,
-and whose head is false in it. Each such body literal has a producer, a processed clause
-with an empty body and the literal maximal, held by the query context or delivered to it
-as a root fact by registration. The induction uses two properties of the producer. Its
-body is empty, so it is not ground-bodied and Join takes it on the side of the head. The
-rest of its head must be false in the model, which holds when it is the clause that makes
-the literal true there, and for a disjunctive producer this means that every other
-disjunct is false. Join with the
-clause on the side of the body and the producer on the side of the head is not cut, and
-the Join exemption keeps its conclusion, since the producer has no ground body literal.
-The conclusion has one ground body literal fewer, and its head is the clause's head with
-the rest of the producer's head, which is false in the model. Otherwise a live clause
-subsumes the conclusion with no more ground body literals and a head that is still false.
-Processing the clause first finds the producer through the index of maximal literals, and
-processing the producer first finds the clause through the index of ground body literals,
-so the order of arrival does not matter. After at most as many Joins as the body has
-literals over constants, the clause has no ground body and takes every inference.
+The argument has four parts. The first is the stage of facts. The model construction of item
+1220's proof work starts from the clauses with an empty body of the query context and of the
+root, none of which is ground-bodied, so the cut leaves every inference among them in place.
+The second is the discharge of a ground body in the query context, and it covers only body
+literals whose terms are all constants. Join takes such a literal as its pivot and no other,
+the index of ground body literals holds only such literals, and registration with the root
+uses the same test, so a body literal over a successor term of a constant, such as
+`B(f(u))`, is not discharged by Join. Take a clause in the query context whose body consists
+wholly of plain ground literals, each of them produced, and whose head is false in the stage
+of facts. A literal is produced when a live processed clause with an empty body, held by the
+query context or delivered to it as a root fact by registration, has that exact literal as
+an active maximum and every other literal of its head false. The residues of all the
+producers that the discharge uses are false in one and the same valuation of the stage of
+facts. Truth in the model is not enough, since an equality `b ≈ c` of two constants that
+both rewrite to `a` holds with no producer of that spelling. The induction uses two
+properties of the producer. Its body is empty, so it is not ground-bodied and Join takes it
+on the side of the head. Join with the clause on the side of the body and the producer on
+the side of the head is not cut, and the Join exemption keeps its conclusion, since the
+producer has no ground body literal. The conclusion has one ground body literal fewer, and
+its head is the clause's head with the false rest of the producer's head. Otherwise a live
+clause subsumes the conclusion with no more ground body literals and a head that is still
+false. With the producers delivered and the saturation quiescent, processing the clause
+first finds the producer through the index of maximal literals, and processing the producer
+first finds the clause through the index of ground body literals, so the order of arrival
+does not matter. After at most as many Joins as the body has literals, the query context
+reaches a contradiction or a false clause that the stage of facts covers, and this endpoint
+includes the exits of derivation by a unit and by bottom. The discharge promises no maximal
+literal for a later inference, since a false residue can dominate an equality of the head
+after Join and so change the maximal pivot that a later Eq would need.
 
 The third part is the elements outside the stage of facts. Each inference that the same
 construction needs at such an element has a pivot of its own, an atom over `x`, a literal
 over `f(x)` or a role atom between `x` and a constant, and the cut keeps all of them. A
 ground-bodied clause whose head holds a literal over a constant either has that literal
-true in the model, where its consequences follow from the clause with an empty body that
-produces it, or is assumed to reach the query context or the root by Pred with its ground
-body intact. In the query context the second part discharges the ground body, while the
-root does not apply the ground-body cut. Pred accepts a clause whose body holds atoms over
+produced in the sense of the second part, where its consequences follow from its producer,
+or is applicable with that literal false, and is then assumed to reach the query context or
+the root by Pred with its ground body intact. A literal that holds in the model without a
+producer is outside the argument, as in the second part. In the query context the second part discharges the ground body when its literals are
+produced, while the root does not apply the ground-body cut. Pred accepts a clause whose body holds atoms over
 `x`, role atoms `s(y, x)` and literals over constants alone, and whose head holds
 predecessor triggers, constant inequalities or role atoms between `x` and a constant, with
 the role-atom head handled on the rooted path over `f(u)` while ordinary Pred refuses it.
@@ -794,8 +799,8 @@ route of growth in place. Pred itself keeps ground-bodied partners, since a cand
 left them out broke the return of facts over `f(u)` that hold under a marker. The growth is
 cut where the routes above make those partners and not in Pred.
 
-Six obligations stay open. The first is the assumption of the third part, that a
-ground-bodied clause outside the query context whose literal is false in the model, or a
+Six obligations were left open when the cut landed. The first is the assumption of the third part, that an
+applicable ground-bodied clause outside the query context with a false head literal, or a
 replacement of the shape that Pred sends, reaches the query context or the root by Pred.
 The second is the holder of such a clause. A clause with a ground body and a literal over
 `f(u)` in its head can be held by a context other than the query context, and the argument
@@ -808,12 +813,101 @@ as a pivot. The argument needs to show that such a body cannot arise in this par
 construction or how its literal is discharged. The fifth is a live clause in mode `129` that
 subsumes a producer and drops the returned body literal. The sixth is that counting is not
 covered and that the filter of the return is checked only against the uses of the return
-that the argument names. No measured run loses an entailment to any of them, and all six
-stay with item 1220's proof, which item 823 waits for. An earlier design also proposed
+that the argument names. No measured run loses an entailment to any of them. Item 1220's
+proof, which item 823 waits for, takes them up, and the next paragraphs record which of them
+it closes. An earlier design also proposed
 selecting one ground body literal for Join and pruning a product early against the store.
 The consult on the design found that the first needs the holder argument above, which is
 open, and that the second breaks the product's guarantee that every union reaches the
 redundancy test, so neither was built.
+
+Item 1220's proof work closes the fourth and fifth obligations and the finite part of the
+sixth, and an independent audit of the proof checked each argument against the code. The
+fourth cannot arise. The body of a clause of a context other than the root holds only atoms
+over x, the packed role atoms of predecessor edges and literals over constants. The core and
+the hypotheses give atoms over x. The universals, the propagation of a universal, the
+qualified roles and the at-most rule add role atoms, and each is the role atom of a
+predecessor edge. `ground_trigger` admits a
+marker's literal only over constants. Pred and Pred over `f_e(u)` carry only body literals over
+constants, and the receiver of a returned root clause resolves the whole root body away. Every
+other rule takes the union of its premises' bodies and rewrites only literals of the head. A
+ground-bodied clause therefore has a body literal over constants, which Join takes as its
+pivot. This settles the shape of the pivot, and the discharge still needs a live producer of
+the literal in the query context.
+
+The flags follow the bodies. A clause of a context other than the root that reaches the
+rules gets its flags from its body before the rules run, and no root clause gets either
+flag, so no clause with an empty body is cut. A saturation that stops after the store marks
+a clause processed and before the rules run on it can leave that clause with the initial
+flags, which are both off, so the census reads finished saturations only. The discharge in
+the query context is the one that the second part states. The body is wholly plain ground,
+and each of its literals is produced by a live clause with an empty body or a delivered copy
+of one that has that exact literal as an active maximum. The residues of all the producers
+are false in the same valuation of the stage of facts. A literal that holds in the model
+without such a clause, such as an equality of two constants that rewrite to the same
+constant, is outside the argument. Under that hypothesis, with delivery and quiescence, each
+Join removes one ground body literal and keeps the false residues, in either order of
+arrival, until the query context reaches a contradiction or a false clause that the stage of
+facts covers, including the exits by a unit and by bottom.
+
+The fifth obligation is vacuous under the hypotheses that the argument already uses. The
+store compares literals in both sides of a clause without substitution, so a live clause
+that subsumes a producer has a literally empty body. If it drops the returned literal, its
+head lies inside the false rest of the producer's head, and the stage of facts would falsify
+a live clause with an empty body. If it keeps the literal, that literal is still a maximum
+and the subsumer is itself an eligible producer. The filter of the return passes the two
+uses of the return that the argument makes, relative to the availability of the producers
+and a completed saturation. The first returns a denial to the query context, where it
+resolves with its one productive premise. In the second the root's Join first removes the
+literals that the root produces, and the remaining clause returns to the query context,
+where the producers of its remaining literals are eligible premises because their bodies are
+empty. The filter reads the body of the holder and never the returned clause. A returned
+clause is recorded under every literal of its body before its first filtered lookup, so a
+producer that arrives later still finds it. That producer passes its own filter check before
+it supplies the fixed side, even when an earlier holder that the filter excluded announced
+the same literal, so both orders of arrival reach the filtered product. The diagnostic of
+the return assesses the filtered products and adds no inference. Counting in the sixth
+obligation belongs to item 1229. The first three obligations, the completeness of the
+repaired selection and item 1220's Eq and Factor query case stay open. The next target is a
+context that is neither the query context nor the root and that holds a conditional clause
+over `f_e(u)`, which the second obligation is about. The audit did not check the
+construction of the stage of facts, so the closed arguments stay relative to it.
+
+The unit tests of `rooted_lemma_tests` check the flags and the bodies after every finished
+saturation of the `shoi` fixtures, the hand cases with nominals, keys and the universal
+property, the fixtures of item 1061 and eleven ontologies built for this item. Each runs in
+the default arm, in the cut with the selection off and in the uncut control, under both
+strategies and with counting under the cautious one. A setting of the three switches and
+the Join exemption for the test's thread lets one test binary run every arm. The census
+computes the expected flags from the literals' terms and not from the rule's own test, and it
+reads the bodies of every stored clause, processed or not. It fails on a flag that differs
+from the body, on a body of a context other than the root that holds a literal over
+`f_e(u)` or a literal over x or y of the kind that holds constants, and on a fixture that
+does not parse. Over the whole family, an arm that cuts must meet ground-bodied clauses and
+ground-bodied clauses with a head over `f_e(u)` outside a query context, which are the
+holders of the second obligation, and the uncut arm must cut nothing. These totals show that
+the family reaches the cases and do not show it for each file. Each of the eleven ontologies must give HermiT 1.4.5's unsatisfiable named classes and its
+subsumptions between declared classes with a satisfiable source in full in the arms that cut,
+and the comparison leaves out the records of `owl:Thing`. Two of them, built
+around item 1220's query case, are regressions of the taxonomy only, since no test shows
+that their runs reach a query-shaped Eq or Factor step. A mutation that lets markers carry literals over
+`f_e(u)` makes the census fail on `shoi-000` and on the first hand case. Two ontologies
+with two ground body literals in a successor's clause miss their subsumption with the
+selection on and without the repair of Hyper's partners. A third, whose clause in the query
+context has two ground body literals and an empty head, loses the unsatisfiable class
+without the Join exemption. Tests check that both controls still lose. A set of 1,500
+generated ontologies is built around the open obligations. Each has a query context that
+mentions one individual and a successor that mentions another, with successor terms of
+constants made in the successor or in the root, equalities between such a term and a
+constant under a marker, facts at that constant derived in the root, named classes reused
+as successors and residues on edges. Its 9,000 runs in the three arms, on one thread under
+the cautious strategy and on four under the eager one, give 8,889 complete answers and none
+that differs from HermiT. In the census of its cautious runs, the default arm and the cut
+meet 3,937 and 4,763 ground-bodied clauses with a head over `f_e(u)` outside a query
+context, and neither breaks the flags or holds a body over `f_e(u)`. With counting, the default arm gives
+2,992 complete answers on the same set and none that differs. The run with the selection on
+and without the repair also gives none that differs there, so the set has not shown that it
+can find a loss of that kind, and its agreement is weak evidence for the open obligations.
 
 The cut finishes the ontologies of the item. The measured set holds 104 generated input
 files around g1-051_p0012, which are g1-051_p0011, g1-051_p0012, g1-051_p0121, 17 one-axiom

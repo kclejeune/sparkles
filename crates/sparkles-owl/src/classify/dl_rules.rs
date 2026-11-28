@@ -3307,8 +3307,42 @@ pub(super) fn late<S: Sink>(
 /// adopted on a measured gate and its completeness is not proved.
 /// `SPARKLES_ROOTED_SELECT_GROUND=0` turns the selection off, for measurement.
 pub fn select_ground() -> bool {
+    #[cfg(test)]
+    if let Some(a) = test_arm() {
+        return a.select_ground;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| !std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_some_and(|v| v == "0"))
+}
+
+/// The settings of [`select_ground`], [`ground_body_cut`], [`sel_partners_x`] and
+/// [`join_exempt`] that a
+/// unit test sets for its own thread, so that one test binary can run every arm of item
+/// 1220's lemmas. The switches read the environment once per process otherwise.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TestArm {
+    pub select_ground: bool,
+    pub ground_body_cut: bool,
+    pub sel_partners_x: bool,
+    pub join_exempt: u8,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ARM: std::cell::Cell<Option<TestArm>> = const { std::cell::Cell::new(None) };
+}
+
+/// The arm that the current thread's test set, if any.
+#[cfg(test)]
+pub(super) fn test_arm() -> Option<TestArm> {
+    TEST_ARM.with(|a| a.get())
+}
+
+/// Sets the current thread's arm, or clears it with `None`.
+#[cfg(test)]
+pub(super) fn set_test_arm(a: Option<TestArm>) {
+    TEST_ARM.with(|c| c.set(a));
 }
 
 /// Whether a context other than the root cuts clauses with a ground or `f_e(u)` body
@@ -3317,6 +3351,10 @@ pub fn select_ground() -> bool {
 /// `SPARKLES_ROOTED_SELECT_GROUND=0` and `SPARKLES_ROOTED_GROUND_BODY_CUT=0` reproduces
 /// the original uncut containment arm for measurement.
 pub fn ground_body_cut() -> bool {
+    #[cfg(test)]
+    if let Some(a) = test_arm() {
+        return a.ground_body_cut;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         !std::env::var_os("SPARKLES_ROOTED_GROUND_BODY_CUT").is_some_and(|v| v == "0")
@@ -3330,6 +3368,10 @@ pub fn ground_body_cut() -> bool {
 /// [`select_ground`] is on. It is on by default, and `SPARKLES_ROOTED_SEL_PARTNERS_X=0`
 /// turns it off, for measurement.
 pub fn sel_partners_x() -> bool {
+    #[cfg(test)]
+    if let Some(a) = test_arm() {
+        return a.sel_partners_x;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         !std::env::var_os("SPARKLES_ROOTED_SEL_PARTNERS_X").is_some_and(|v| v == "0")
@@ -3344,6 +3386,10 @@ pub fn sel_partners_x() -> bool {
 /// the residual head. `SPARKLES_ROOTED_JOIN_EXEMPT=0` restricts
 /// every Join and `=1` exempts every Join, for measurement.
 pub fn join_exempt() -> u8 {
+    #[cfg(test)]
+    if let Some(a) = test_arm() {
+        return a.join_exempt;
+    }
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("SPARKLES_ROOTED_JOIN_EXEMPT")
@@ -9428,6 +9474,144 @@ impl PredAudit {
     pub fn found(&self) -> usize {
         self.clauses + self.units + self.facts
     }
+}
+
+/// What the census of item 1220's lemmas found in one context after a saturation that
+/// finished, for the tests of `rooted_lemma_tests`.
+#[cfg(test)]
+#[derive(Default, Debug, Clone)]
+pub(super) struct LemmaCensus {
+    pub rooted: bool,
+    pub root: bool,
+    /// whether the context is a query context, of a named class or of `owl:Thing`
+    pub query: bool,
+    /// the processed clauses that the census read; L2 reads every stored clause
+    pub processed: usize,
+    /// the processed clauses that are ground-bodied, `Stored::gbody`
+    pub gbody: usize,
+    /// the ground-bodied clauses whose head holds a literal over a successor term of a
+    /// constant, which item 1250's second obligation is about when the context is not a
+    /// query context
+    pub fc_head_gbody: usize,
+    /// the selected clauses with a maximal literal, among all of their maxima, that is an
+    /// equality of x and a constant, which item 1220's Eq and Factor query case is about
+    /// when the context is a query context; a count of shapes, not of Eq or Factor steps
+    pub sel_eq_x: usize,
+    /// lemma L2's violations: a body literal over a successor term of a constant
+    pub fc_body: Vec<String>,
+    /// the body literals of kind XL that mention x or y, which L2 excludes
+    pub xy_body: usize,
+    /// the clauses that hold them
+    pub xy_bodies: Vec<String>,
+    /// lemma L1's violations: flags that differ from those the body gives
+    pub flags: Vec<String>,
+}
+
+/// The census of item 1220's lemmas L1 and L2 on the context `me`, read from its store
+/// after a saturation that finished. L1 says that a clause of a context other than the root
+/// that reached rule processing has `gbody` exactly when the cut or the selection is active
+/// and its body holds a literal with neither x nor y, and `sel` exactly when the selection
+/// is active and it does, and that no clause of the root has either. L2 says that no body
+/// of a context other than the root holds a literal over a successor term `f_e(u)` of a
+/// constant, and that every body literal of kind XL there is over constants alone. The
+/// expected flags come from the literal views here, not from [`selected_always`], and L2
+/// reads every stored clause, processed or not. The expected flags also take the arm from
+/// the test's request and not from [`select_ground`] or [`ground_body_cut`].
+#[cfg(test)]
+pub(super) fn lemma_census(ix: &Index, me: Ex, st: &State, run: &DlRun) -> LemmaCensus {
+    use super::dl_clause::{XLit, terms_of};
+    let dx = dix(ix);
+    let inv = |r: Role| dx.inv(ix, r);
+    let root = dx.is_root(me);
+    let mut c = LemmaCensus {
+        rooted: dx.root.is_some(),
+        root,
+        query: query_of(ix, me).is_some(),
+        ..LemmaCensus::default()
+    };
+    let Some(x) = dl(st) else {
+        return c;
+    };
+    // the expected flags read the arm that the test requested and not the switches, so
+    // that an arm the switches fail to apply also fails L1
+    let arm =
+        super::rooted_lemma_tests::requested_arm().expect("the census runs under a requested arm");
+    let terms = |l: &Lit| terms_of(run.lits.view(*l, inv));
+    let fc = |l: &Lit| {
+        l.kind() == XL && {
+            let (ts, n) = terms(l);
+            ts[..n].iter().any(|t| matches!(t, RTerm::Fc(..)))
+        }
+    };
+    for (i, s) in x.store.clauses.iter().enumerate() {
+        let shown = || {
+            format!(
+                "ctx {me} {:?} -> {:?}",
+                tr(ix, &run.lits, s.c.body()),
+                tr(ix, &run.lits, s.c.head())
+            )
+        };
+        if !root && c.rooted {
+            for l in s.c.body() {
+                if fc(l) {
+                    c.fc_body.push(shown());
+                } else if l.kind() == XL && !run.lits.view(*l, inv).is_ground() {
+                    c.xy_body += 1;
+                    c.xy_bodies.push(shown());
+                }
+            }
+        }
+        if !s.done {
+            continue;
+        }
+        c.processed += 1;
+        // a body literal of kind XL whose terms are all constants or successor terms of
+        // constants, read from the literal's view
+        let has = s.c.body().iter().any(|l| {
+            l.kind() == XL && {
+                let (ts, n) = terms(l);
+                ts[..n]
+                    .iter()
+                    .all(|t| matches!(t, RTerm::C(_) | RTerm::Fc(..)))
+            }
+        });
+        let want = if root || !c.rooted {
+            (false, false)
+        } else {
+            (
+                arm.select_ground && has,
+                (arm.select_ground || arm.ground_body_cut) && has,
+            )
+        };
+        if (s.sel, s.gbody) != want {
+            c.flags.push(format!(
+                "{}: (sel, gbody) {:?} where the body gives {want:?}",
+                shown(),
+                (s.sel, s.gbody)
+            ));
+        }
+        if root || !c.rooted {
+            continue;
+        }
+        if s.sel
+            && x.store.maxes(i as u32).any(|m| {
+                m.kind() == XL
+                    && matches!(
+                        run.lits.view(m, inv),
+                        XLit::Eq(RTerm::X, RTerm::C(_)) | XLit::Eq(RTerm::C(_), RTerm::X)
+                    )
+            })
+        {
+            c.sel_eq_x += 1;
+        }
+        if s.gbody {
+            c.gbody += 1;
+            if s.c.head().iter().any(fc) {
+                c.fc_head_gbody += 1;
+            }
+        }
+    }
+    c
 }
 
 /// The closure check of item 1229's lemma, for tests. After a saturation that finished,

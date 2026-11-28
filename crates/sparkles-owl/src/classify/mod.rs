@@ -106,6 +106,8 @@ mod query;
 mod retained_accounting_tests;
 #[cfg(test)]
 mod rooted_adaptive_tests;
+#[cfg(test)]
+mod rooted_lemma_tests;
 mod saturate;
 #[cfg(test)]
 mod scratch_admission_tests;
@@ -13740,6 +13742,29 @@ impl Saturation {
             #[cfg(test)]
             if pred_audit_tests::observing() && open.is_some() {
                 pred_audit_tests::unfinished();
+            }
+            // the census of item 1220's lemmas L1 and L2, for the tests that observe it,
+            // read from every context's store after a saturation that finished
+            #[cfg(test)]
+            if rooted_lemma_tests::observing() {
+                if open.is_none() {
+                    let made = dynamic.iter().flat_map(|dy| {
+                        (0..dy.len() as Ex)
+                            .filter_map(move |i| dy.get_ctx(base + i).map(|c| (base + i, c)))
+                    });
+                    for (e, c) in self
+                        .ctx
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(e, c)| c.get().map(|c| (e as Ex, &**c)))
+                        .chain(made)
+                    {
+                        rooted_lemma_tests::record(dl_rules::lemma_census(&ix, e, &c.st.lock(), d));
+                    }
+                    rooted_lemma_tests::saturated();
+                } else {
+                    rooted_lemma_tests::unfinished();
+                }
             }
             let decline = dl_root::marker_decline(limits.rooted_decline);
             if self.dl_rooted && open.is_none() && (dl_root::marker_diag() || decline.is_some()) {

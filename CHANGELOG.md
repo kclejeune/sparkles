@@ -28,6 +28,29 @@ and the second idea of item 896, a positive existential restriction left unexpan
 where its negative name holds, which is not built. Counting stays off by default, since
 ore_ont_541 and ore_ont_14817 cost 3.4 to 3.5 times their runs without counting with
 counting requested, in approximate measurements on a Boat worker. Roadmap items 1395 and 1396 follow them.
+### Lemmas of the rooted selection and ground-body cut
+
+Item 1220's proof work closes the fourth and fifth obligations of item 1250's ground-body
+cut and the finite part of the sixth, and an independent audit checked each argument against
+the code. No body of a context other than the root holds a literal over a successor term of
+a constant, so a ground body literal is always over constants and Join takes it as its pivot.
+The flags of the selection and the cut follow the bodies of the clauses that reach the rules,
+so no clause with an empty body is cut. The fifth obligation is vacuous under the hypotheses
+of the stage of facts, since a live subsumer of a producer has a literally empty body. The
+filter of the return passes the two uses of the return that the argument makes, relative to
+the availability of the producers and a completed saturation. The discharge in
+the query context is stated for literals that a clause with an empty body produces in that
+exact form, and not for every literal that holds in the model. Unit tests check the bodies
+and the flags after every finished saturation of the `shoi`, nominal, key and top-property
+fixtures and eleven new ones, in the default arm, the cut with the selection off and the
+uncut control, with expected flags computed independently of the rules. The census of the
+query case reads every maximal literal of a clause. A setting of the
+three switches and the Join exemption for a test's thread lets one test binary run every arm.
+The first three obligations, counting, the completeness of the repaired selection and the Eq
+and Factor query case stay open. A set of 1,500 generated ontologies built around them gives
+8,889 complete answers in 9,000 runs and none that differs from HermiT 1.4.5. The selection
+without its repair, which is known to lose, also agrees there, so the set is regression
+coverage only. The rules are unchanged.
 
 ### SERVICE enhancer cache slices, disk tier, management functions and parallel requests
 
