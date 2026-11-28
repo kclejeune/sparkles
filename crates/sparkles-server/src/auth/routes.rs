@@ -1701,6 +1701,12 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             };
             if through.is_none_or(|h| h < lvl) {
                 if p.is_anonymous() {
+                    if st.declared(&ds)
+                        && p.level_any_branch(&ds).is_some()
+                        && let Some(view) = managed_view(&route, &method, req.uri().path())
+                    {
+                        crate::http::views::manage_refused(&ds, &view, &p, "level");
+                    }
                     return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
                 }
                 // a branch the grants do not cover answers as one that does not exist;

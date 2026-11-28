@@ -1810,7 +1810,9 @@ time than the caller reads. `Protection::stable` accepts a pattern only when eve
 construct in it is on a list of those whose results depend on the snapshot and the caller
 alone, so a call of `NOW()`, `RAND()`, `UUID()`, `STRUUID()`, `BNODE()` or an extension
 function other than a cast, a `SERVICE`, a property function, a `LIMIT` or `OFFSET`, and
-an aggregate other than `COUNT`, `MIN` and `MAX` refuse containment. The projection of
+an aggregate other than `COUNT` refuse containment, since `MIN` and `MAX` keep the
+first-seen lexical spelling on value ties and their result can change when the input
+order changes at an unchanged commit. The projection of
 review-policy output hides only quads without supports the reader can read, so a caller
 whose graphs and lifts contain the principal's hides no more of it, with one exception.
 A reader whose guard is decided at the snapshot it reads refuses support that a stored
@@ -1863,7 +1865,8 @@ sets and view names. Unrestricted callers never reach it.
 The audit log receives a `view_access` record on the `sparkles::audit` target for every
 refusal, including one the cache answered, for every declassified read, and for each
 other decision the cache did not hold. A read that waits for its view is recorded once
-for each decision. The record names the dataset, the view, the operation (`read` or
+for each (decision, generation) pair, so that a replacement with equal grants while the
+read waits emits a fresh uncached record for the new generation. The record names the dataset, the view, the operation (`read` or
 `watch`), the decision, its reason and whether the cache answered, and the caller's
 `Principal::id`. Its reason is `contained`, `declassified` or the category of the first
 gap, which is `graphs`, `protections`, `caller-pattern` or `evaluation`, the last for a
@@ -1875,9 +1878,10 @@ before the handler runs, and their records `view_defined`, `view_rebuilt` and
 `view_deleted` carry the operation `manage` and the decision `allow` in the same
 vocabulary. A caller who sees the dataset and is refused one of these routes, by its
 grants or because the server is read-only, gets a `view_access` record with the
-operation `manage`, the decision `deny` and the reason `level` or `read-only`. A caller
-who does not see the dataset gets the same `404` as for a dataset that does not exist,
-and no record names the view.
+operation `manage`, the decision `deny` and the reason `level` or `read-only`, including
+an anonymous caller whose grants make the dataset visible. A caller who does not see
+the dataset gets the same `404` as for a dataset that does not exist, and an anonymous
+caller without visibility gets the authentication challenge with no record.
 
 `GET /$/views/{ds}` and `GET /$/views/{ds}/{name}` read each view's state and the grants
 of its principal under one registry lock and decide on that pair, so a definition that
@@ -1915,7 +1919,9 @@ of suspended, failed, rebuilt and unattached views without their sizes or errors
 with a record of each refusal, refuse a read without asking for its fallback memory
 parent and within the least query budget that reaches the view cursor, decide again
 under a new host with the same epoch, keep no decision that was in flight when a new
-definition emptied the cache, and pair metadata with its decision across a replacement.
+definition emptied the cache, pair metadata with its decision across a replacement, and
+emit a fresh uncached audit record when a waiting read crosses a replacement with equal
+grants.
 `evidence_visibility.rs` in the library builds two commits whose second accepts a claim
 on a stored fact of the first, shows that a principal with a fixed guard reads the claim
 and a caller whose guard binds does not, maintains a view of it for the principal, and
@@ -1925,17 +1931,18 @@ declassified, narrower and view-only callers, also below a join so that the resu
 cannot answer a narrower caller, check the redaction of listings, the validation of
 `view:{name}` entries, that view grants follow their dataset, branch and token scope and
 drop under hidden graphs, the dataset, operation, principal and absence of graph names in
-the JSON audit lines, the records of allowed and refused management, metadata decided on
-the state it reports across a replacement, and the reduced reason of a suspended view.
+the JSON audit lines, the records of allowed and refused management including anonymous
+callers with dataset visibility, metadata decided on the state it reports across a
+replacement, and the reduced reason of a suspended view.
 
 The comparison of IRI patterns is incomplete. A caller pattern with literal text between
 two `*`, such as `http://*/data/*`, proves no containment of another pattern, and an
 excluded pattern or guard of the caller that may overlap a principal's pattern refuses
 unless the principal excludes it too. Such reads are refused rather than allowed, and
 [ROADMAP](../ROADMAP.md) item 1323 tracks a complete pattern comparison. Callers whose
-guards bind under a pattern protection, and patterns that `Protection::stable` cannot
-prove stable, are refused containment too, and item 1324 tracks deciding them without
-that refusal.
+guards bind under a pattern protection, patterns that `Protection::stable` cannot
+prove stable, and protections whose patterns use `MIN` or `MAX` are refused containment
+too, and item 1324 tracks deciding them without that refusal.
 
 ### Scope changes
 

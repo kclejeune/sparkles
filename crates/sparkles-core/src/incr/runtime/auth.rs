@@ -415,4 +415,22 @@ impl Runtime {
     pub(crate) fn set_after_info_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
         *self.after_info_hook.lock() = hook;
     }
+
+    /// Run `hook` in `open_view` before each state observation, after the decision.
+    #[cfg(test)]
+    pub(crate) fn set_before_read_state_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.before_read_state_hook.lock() = hook;
+    }
+
+    /// Run `hook` in `open_view` before the observer wait, after the view is behind.
+    #[cfg(test)]
+    pub(crate) fn set_observer_wait_hook(&self, hook: Option<Arc<dyn Fn(Instant) + Send + Sync>>) {
+        *self.observer_wait_hook.lock() = hook;
+    }
+
+    /// Mark a completed round so that `wait_round_after` returns.
+    #[cfg(test)]
+    pub(crate) fn mark_round_complete(&self) {
+        self.complete_round();
+    }
 }

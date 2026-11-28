@@ -669,3 +669,70 @@ async fn a_suspended_view_hides_its_size_from_other_readers() {
         }
     }
 }
+
+/// An anonymous reader with visibility on a dataset gets a `view_access` audit record
+/// with `op=manage, decision=deny, reason=level` when refused PUT, DELETE or rebuild,
+/// while a hidden dataset produces no record.
+#[test]
+fn anonymous_manage_refusal_is_audited() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let s = build(Fixture::default());
+    s.state.attach("graphs", DbType::Memory, None).unwrap();
+    let body =
+        serde_json::json!({ "query": "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }" }).to_string();
+    let anon = |method: &str, path: &str| {
+        rt.block_on(call(
+            &s.app,
+            method,
+            path,
+            &[("content-type", "application/json")],
+            if method == "PUT" { &body } else { "" },
+        ))
+    };
+    let lines = audited(|| {
+        for (method, path) in [
+            ("PUT", "/$/views/public/anon-v"),
+            ("POST", "/$/views/public/anon-v/rebuild"),
+            ("DELETE", "/$/views/public/anon-v"),
+        ] {
+            let r = anon(method, path);
+            assert_eq!(
+                r.status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} visible: {}",
+                r.text()
+            );
+        }
+        for (method, path) in [
+            ("PUT", "/$/views/graphs/anon-v"),
+            ("DELETE", "/$/views/graphs/anon-v"),
+            ("POST", "/$/views/graphs/anon-v/rebuild"),
+        ] {
+            let r = anon(method, path);
+            assert_eq!(
+                r.status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} hidden: {}",
+                r.text()
+            );
+        }
+    });
+    let denied: Vec<_> = audit_fields(&lines, "view_access")
+        .into_iter()
+        .filter(|f| f["op"] == "manage")
+        .collect();
+    assert_eq!(
+        denied.len(),
+        3,
+        "three records for the visible dataset: {denied:?}"
+    );
+    for f in &denied {
+        assert_eq!(f["decision"], "deny", "{f}");
+        assert_eq!(f["reason"], "level", "{f}");
+        assert_eq!(f["dataset"], "public", "{f}");
+        assert_eq!(f["view"], "anon-v", "{f}");
+    }
+}

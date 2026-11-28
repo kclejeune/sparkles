@@ -91,7 +91,9 @@ fn a_pattern_that_reads_the_clock_is_not_contained() {
     let caller = protected(&["default"], &clock, Graphs::none(), alice());
     let policy = Policy::with(&[("dated", Some(principal))]);
     let rt = runtime(&s, &policy);
-    define_ages(&rt, &s, "dated");
+    crate::sparql::ctx::at_test_clock(instant("2029-06-01T00:00:00Z"), || {
+        define_ages(&rt, &s, "dated");
+    });
     let decided = rt
         .authorize_view("ages", Some(&caller), ViewOp::Read)
         .unwrap();
@@ -219,4 +221,28 @@ fn a_caller_whose_guards_bind_is_not_contained_under_a_pattern() {
         )),
         Some(&plain(rule(&["default"]).guarded(GUARDED, &[]))),
     ));
+}
+
+/// A protection whose pattern uses MIN or MAX refuses containment because their
+/// result depends on the input order, which can change at an unchanged commit.
+#[test]
+fn a_pattern_with_min_or_max_refuses_containment() {
+    let s = dated();
+    for agg in ["MIN", "MAX"] {
+        let pattern = format!(
+            "{{ SELECT ?s ({}(?a) AS ?m) WHERE {{ ?s <http://ex/age> ?a }} GROUP BY ?s }}",
+            agg
+        );
+        let p = protection("agg", Some(&pattern));
+        let principal = protected(&["default"], &p, Graphs::none(), alice());
+        let caller = protected(&["default"], &p, Graphs::none(), alice());
+        let policy = Policy::with(&[("agg", Some(principal))]);
+        let rt = runtime(&s, &policy);
+        define_ages(&rt, &s, "agg");
+        let decided = rt
+            .authorize_view("ages", Some(&caller), ViewOp::Read)
+            .unwrap();
+        assert!(!decided.allowed(), "{agg}: {decided:?}");
+        assert_eq!(decided.reason(), "evaluation", "{agg}");
+    }
 }

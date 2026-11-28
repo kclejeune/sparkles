@@ -65,15 +65,11 @@ fn pattern_is_stable(p: &GraphPattern, pfs: &[String]) -> bool {
                 && aggregates.iter().all(|(_, a)| match a {
                     AggregateExpression::CountSolutions { .. } => true,
                     AggregateExpression::FunctionCall { name, expr: e, .. } => {
-                        matches!(
-                            name,
-                            AggregateFunction::Count
-                                | AggregateFunction::Min
-                                | AggregateFunction::Max
-                        ) && expr(e)
+                        matches!(name, AggregateFunction::Count) && expr(e)
                     }
-                    // the order of a group's solutions, which FOLD, SAMPLE and
-                    // GROUP_CONCAT observe, and a sum's rounding are not proven
+                    // MIN and MAX keep the first-seen lexical spelling on value
+                    // ties, so their result can change when the input order
+                    // changes at an unchanged commit (e.g. after compaction)
                     _ => false,
                 })
         }
@@ -212,7 +208,7 @@ mod tests {
             "?s <http://ex/a>/<http://ex/b>* ?o FILTER(?o > 3 && STRSTARTS(STR(?s), \"http://ex/\"))",
             "{ ?s a <http://ex/C> } UNION { ?s <http://ex/p> ?o } MINUS { ?s <http://ex/q> ?o }",
             "OPTIONAL { ?s <http://ex/p> ?o } BIND(xsd:integer(?o) AS ?n) FILTER EXISTS { ?s <http://ex/q> ?n }",
-            "{ SELECT ?s (COUNT(?o) AS ?n) WHERE { ?s <http://ex/p> ?o } GROUP BY ?s HAVING (MAX(?o) > 1) }",
+            "{ SELECT ?s (COUNT(?o) AS ?n) WHERE { ?s <http://ex/p> ?o } GROUP BY ?s HAVING (COUNT(?o) > 1) }",
             "GRAPH ?g { ?s ?p ?o } VALUES ?g { <http://ex/g> }",
         ] {
             let q = format!(
@@ -235,6 +231,8 @@ mod tests {
             "?s ?p ?o FILTER(<http://jena.apache.org/ARQ/function#now>() > ?o)",
             "SERVICE <http://ex/sparql> { ?s ?p ?o }",
             "{ SELECT ?s WHERE { ?s ?p ?o } LIMIT 1 }",
+            "{ SELECT ?s (MIN(?o) AS ?x) WHERE { ?s ?p ?o } GROUP BY ?s }",
+            "{ SELECT ?s (MAX(?o) AS ?x) WHERE { ?s ?p ?o } GROUP BY ?s }",
             "{ SELECT ?s (SAMPLE(?o) AS ?x) WHERE { ?s ?p ?o } GROUP BY ?s }",
             "{ SELECT ?s (GROUP_CONCAT(?o) AS ?x) WHERE { ?s ?p ?o } GROUP BY ?s }",
             "{ SELECT ?s (SUM(?o) AS ?x) WHERE { ?s ?p ?o } GROUP BY ?s }",

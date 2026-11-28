@@ -1075,3 +1075,57 @@ fn guards_close_inside_the_lifts() {
     );
     assert_eq!(closed.guards_closed(), closed);
 }
+
+/// A read that waits across a view replacement with equal grants emits a fresh
+/// uncached audit record for the new generation, even though the decision is the same.
+#[test]
+fn a_waiting_read_across_replacement_re_audits() {
+    let s = Arc::new(store());
+    let policy = Policy::with(&[("reports", Some(reads(&["default"])))]);
+    let rt = runtime(&s, &policy);
+    define(&rt, &s, "team-sizes", "reports");
+    let wider = granted(&["default", "http://ex/g1"], &[], "erin");
+    // insert data so the view is behind
+    crate::sparql::update::update(
+        &s,
+        &q("INSERT DATA { :d org:memberOf :t3 }"),
+        &crate::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    // when the read finds the view behind and enters the observer wait,
+    // replace the definition with equal grants and round so the view catches
+    // up; the next loop iteration sees a new generation and should re-audit
+    let once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (rt2, s2, once2) = (Arc::downgrade(&rt), s.clone(), once.clone());
+    rt.set_observer_wait_hook(Some(Arc::new(move |_| {
+        if !once2.swap(true, Ordering::SeqCst)
+            && let Some(rt) = rt2.upgrade()
+        {
+            let mut def = ViewDef::table(q(TEAM_SIZES));
+            def.principal = Some("reports".into());
+            rt.put(&s2, "team-sizes", def).unwrap();
+            rt.round(&s2);
+            rt.mark_round_complete();
+        }
+    })));
+    policy.events();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let rows = read_at(&rt, &s, "team-sizes", Some(&wider), Some(deadline)).unwrap();
+    assert_eq!(rows, 3, "the new commit's rows");
+    assert!(once.load(Ordering::SeqCst), "the observer-wait hook ran");
+    rt.set_observer_wait_hook(None);
+    let events = policy.events();
+    let reads: Vec<_> = events
+        .iter()
+        .filter(|e| e.starts_with("team-sizes read"))
+        .collect();
+    assert!(
+        reads.len() >= 2,
+        "at least two read records across the generation change: {events:?}"
+    );
+    let uncached: Vec<_> = reads
+        .iter()
+        .filter(|e| e.contains("cached=false"))
+        .collect();
+    assert!(uncached.len() >= 2, "at least two are uncached: {events:?}");
+}

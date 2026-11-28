@@ -355,8 +355,9 @@ impl Runtime {
         let wait = Instant::now() + self.opts.read().view_wait;
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         let mut final_check = false;
-        // a read is audited once for each decision, however often it waits for the view
-        let mut last: Option<ViewDecision> = None;
+        // a read is audited once for each (decision, generation) pair so that a
+        // view replacement with equal grants across a wait emits a fresh record
+        let mut last: Option<(ViewDecision, u64)> = None;
         loop {
             let round_start = self.round_epoch();
             check()?;
@@ -409,10 +410,10 @@ impl Runtime {
                 // without a circuit, which is not attached, suspended or failed to
                 // attach, is decided as a view that reads every quad.
                 let decided = self.decide_cached(r.name, r.caller, grants.as_ref(), generation);
-                if last != Some(decided.0) {
+                if last != Some((decided.0, generation)) {
                     self.audit(r.name, r.caller, ViewOp::Read, decided);
                 }
-                last = Some(decided.0);
+                last = Some((decided.0, generation));
                 if !decided.0.allowed() {
                     return Err(super::auth::refused(r.name));
                 }
