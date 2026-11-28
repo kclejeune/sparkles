@@ -125,6 +125,9 @@ pub fn classify(
     if r == "/$/algo/{ds}/run" && *method == Method::POST {
         return None;
     }
+    if r.starts_with("/ols4/api/") {
+        return Some(Class::Query);
+    }
     if let Some(admin) = r.strip_prefix("/$/") {
         // MCP charges each message by its tool and dataset (`mcp::http`)
         if admin == "ping" || admin == "metrics" || admin.starts_with("ready") || admin == "mcp" {
@@ -159,6 +162,7 @@ pub fn classify(
                 && read
                 && form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
                     .any(|(k, v)| k == "classification" && v == "kept"))
+            || admin == "ontology/{ds}/doc"
         {
             return Some(Class::Query);
         }

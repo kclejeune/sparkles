@@ -2020,6 +2020,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ld/resources/{id}/doc": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get catalog resource documentation
+         * @description Generates self-contained HTML from the asserted RDF the caller can query.
+         */
+        get: operations["getCatalogDocumentation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ld/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search published terms
+         * @description Searches the caller's readable catalog terms. Facets count every match in each ontology before paging.
+         */
+        get: operations["searchCatalogTerms"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/lint": {
         parameters: {
             query?: never;
@@ -2607,6 +2647,26 @@ export interface paths {
          * @description Answers the class expression `expression` with its equivalent classes, its direct and inferred superclasses and subclasses, and its instances, as `answers` selects (every one by default). When the expression and every logical axiom of the ontology are in OWL 2 EL, the EL classifier answers it completely by classifying the expression as a fresh class with the dataset's kept classification, incrementally, and leaves the kept taxonomy as it was. Otherwise the OWL 2 RL rules answer it by demand reasoning over a copy of the terminology and the assertions, which can miss class answers. `reasoning` (`auto`, `el` or `rl`) chooses the engine, and `el` keeps to the classifier outside EL, leaving out the axioms it cannot use. The answer's `reasoning` names the engine, why it was chosen, whether the answers are complete, and the axioms outside the profile that can make them incomplete. `syntax` reads a text expression as Manchester syntax (the default) or functional-style syntax, and an object expression is read as the JSON form. A Manchester expression that does not read is `400` as `POST /$/ontology/{ds}/parse` answers it. A caller whose grants limit endpoints needs the `query` endpoint.
          */
         post: operations["dlQueryOntology"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/doc": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get dataset ontology documentation
+         * @description Generates self-contained HTML from the asserted RDF the caller can query.
+         */
+        get: operations["getOntologyDocumentation"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -4604,6 +4664,159 @@ export interface paths {
          * @description RFC 9728 metadata that tells MCP clients which authorization server issues tokens for `/$/mcp` and which scopes it takes. Both paths answer the same document. `404` unless the server runs with `--mcp`, an auth configuration and an `[oidc]` provider.
          */
         get: operations["oauthProtectedResourceMcp"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ols4/api": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Discover OLS resources */
+        get: operations["getOlsIndex"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ols4/api/ontologies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List OLS ontologies */
+        get: operations["listOlsOntologies"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ols4/api/ontologies/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get an OLS ontology */
+        get: operations["getOlsOntology"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ols4/api/ontologies/{id}/terms": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List OLS terms */
+        get: operations["listOlsTerms"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ols4/api/ontologies/{id}/terms/{iri}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get an OLS term */
+        get: operations["getOlsTerm"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ols4/api/ontologies/{id}/terms/{iri}/{relation}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Browse the asserted OLS hierarchy */
+        get: operations["getOlsTermRelations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ols4/api/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Search OLS terms */
+        get: operations["searchOlsTerms"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ols4/api/select": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Select OLS terms */
+        get: operations["selectOlsTerms"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ols4/api/suggest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Autocomplete OLS labels and synonyms */
+        get: operations["suggestOlsTerms"];
         put?: never;
         post?: never;
         delete?: never;
@@ -15000,6 +15213,8 @@ export interface components {
         ifMatch: string;
         /** @description Entity tags, or `*`. */
         ifNoneMatch: string;
+        /** @description The absolute term IRI, percent-encoded twice. */
+        iri: string;
         /** @description The dataset or server-wide settings kind. */
         kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths" | "forms" | "evidence" | "index" | "models" | "notifications" | "connections";
         /** @description The page size. */
@@ -15038,6 +15253,8 @@ export interface components {
         receipt: boolean;
         /** @description A commit: `42`, `commit:42` or `head`. */
         reference: string;
+        /** @description The asserted hierarchy traversal. */
+        relation: "parents" | "children" | "ancestors" | "descendants";
         /** @description The backup repository. */
         repo: string;
         /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
@@ -20051,6 +20268,106 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getCatalogDocumentation: {
+        parameters: {
+            query?: {
+                /** @description Render one term's documentation instead of the whole scope. */
+                iri?: string;
+                /** @description Download a standalone HTML file. */
+                download?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The generated documentation. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    /** @description Attachment for a static HTML export when download is true. */
+                    "Content-Disposition"?: string;
+                    /** @description Script-free Content Security Policy. */
+                    "Content-Security-Policy"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    searchCatalogTerms: {
+        parameters: {
+            query: {
+                /** @description The search text, at most 1000 bytes. */
+                q: string;
+                /** @description Ranking or autocomplete mode. The default is hybrid. */
+                mode?: "hybrid" | "lexical" | "vector" | "prefix";
+                /** @description Repeat or pass comma-separated catalog resource ids. */
+                ontology?: string;
+                /** @description Preferred label language. */
+                lang?: string;
+                /** @description The page size, 1 to 100. The default is 20. */
+                limit?: number;
+                /** @description The number of matches to skip. Offset plus limit must be at most 10000. */
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Visible matches and ontology facets. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        facets: {
+                            [key: string]: number;
+                        };
+                        hits: {
+                            documentation: string;
+                            iri: string;
+                            /** @enum {string} */
+                            kind: "class" | "property" | "individual" | "ontology";
+                            label: string;
+                            ontology: string;
+                        }[];
+                        total: number;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     lint: {
         parameters: {
             query?: never;
@@ -21593,6 +21910,49 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getOntologyDocumentation: {
+        parameters: {
+            query?: {
+                /** @description Render one term's documentation instead of the whole scope. */
+                iri?: string;
+                /** @description Download a standalone HTML file. */
+                download?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The generated documentation. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    /** @description Attachment for a static HTML export when download is true. */
+                    "Content-Disposition"?: string;
+                    /** @description Script-free Content Security Policy. */
+                    "Content-Security-Policy"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
@@ -27511,6 +27871,409 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getOlsIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Links to the OLS4-compatible endpoints. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listOlsOntologies: {
+        parameters: {
+            query?: {
+                /** @description The zero-based page number. */
+                page?: number;
+                /** @description The page size, 1 to 100. The default is 20. */
+                size?: number;
+                /** @description Preferred label language. */
+                lang?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of visible catalog ontologies. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getOlsOntology: {
+        parameters: {
+            query?: {
+                /** @description Preferred label language. */
+                lang?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Visible ontology metadata. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listOlsTerms: {
+        parameters: {
+            query?: {
+                /** @description The zero-based page number. */
+                page?: number;
+                /** @description The page size, 1 to 100. The default is 20. */
+                size?: number;
+                /** @description Preferred label language. */
+                lang?: string;
+                /** @description Filter by an absolute term IRI. */
+                iri?: string;
+                /** @description Filter by the short form. */
+                short_form?: string;
+                /** @description Filter by the OBO identifier. */
+                obo_id?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of visible ontology terms. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getOlsTerm: {
+        parameters: {
+            query?: {
+                /** @description Preferred label language. */
+                lang?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+                /** @description The absolute term IRI, percent-encoded twice. */
+                iri: components["parameters"]["iri"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The visible term document. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getOlsTermRelations: {
+        parameters: {
+            query?: {
+                /** @description The zero-based page number. */
+                page?: number;
+                /** @description The page size, 1 to 100. The default is 20. */
+                size?: number;
+                /** @description Preferred label language. */
+                lang?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The id of the task, token, lock or catalog resource. */
+                id: components["parameters"]["id"];
+                /** @description The absolute term IRI, percent-encoded twice. */
+                iri: components["parameters"]["iri"];
+                /** @description The asserted hierarchy traversal. */
+                relation: components["parameters"]["relation"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of visible parents, children, ancestors or descendants. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    searchOlsTerms: {
+        parameters: {
+            query: {
+                /** @description The search text, at most 1000 bytes. */
+                q: string;
+                /** @description The page size, 1 to 100. The default is 10. */
+                rows?: number;
+                /** @description The number of matches to skip. Start plus rows must be at most 10000. */
+                start?: number;
+                /** @description Repeat or pass comma-separated catalog resource ids. */
+                ontology?: string;
+                /** @description Repeat or pass comma-separated entity types. */
+                type?: string;
+                /** @description Preferred label language. */
+                lang?: string;
+                /** @description Comma-separated label, synonym, description or identifier fields. */
+                queryFields?: string;
+                /** @description Include obsolete terms. */
+                obsoletes?: boolean;
+                /** @description Match complete normalized values only. */
+                exact?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description An OLS4 search response. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    selectOlsTerms: {
+        parameters: {
+            query: {
+                /** @description The search text, at most 1000 bytes. */
+                q: string;
+                /** @description The page size, 1 to 100. The default is 10. */
+                rows?: number;
+                /** @description The number of matches to skip. Start plus rows must be at most 10000. */
+                start?: number;
+                /** @description Repeat or pass comma-separated catalog resource ids. */
+                ontology?: string;
+                /** @description Repeat or pass comma-separated entity types. */
+                type?: string;
+                /** @description Preferred label language. */
+                lang?: string;
+                /** @description Comma-separated label, synonym, description or identifier fields. */
+                queryFields?: string;
+                /** @description Include obsolete terms. */
+                obsoletes?: boolean;
+                /** @description Match complete normalized values only. */
+                exact?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description An OLS4 search response. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    suggestOlsTerms: {
+        parameters: {
+            query: {
+                /** @description The search text, at most 1000 bytes. */
+                q: string;
+                /** @description The page size, 1 to 100. The default is 10. */
+                rows?: number;
+                /** @description The number of matches to skip. Start plus rows must be at most 10000. */
+                start?: number;
+                /** @description Repeat or pass comma-separated catalog resource ids. */
+                ontology?: string;
+                /** @description Repeat or pass comma-separated entity types. */
+                type?: string;
+                /** @description Preferred label language. */
+                lang?: string;
+                /** @description Comma-separated label, synonym, description or identifier fields. */
+                queryFields?: string;
+                /** @description Include obsolete terms. */
+                obsoletes?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description An OLS4 search response. */
+            200: {
+                headers: {
+                    /** @description Private, with storage prohibited. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };

@@ -208,6 +208,18 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // graphs the caller may read
     ("/$/ld", &["GET"]),
     ("/$/ld/doc", &["GET"]),
+    ("/$/ld/search", &["GET"]),
+    ("/$/ld/resources/{id}/doc", &["GET"]),
+    ("/$/ontology/{ds}/doc", &["GET"]),
+    ("/ols4/api", &["GET"]),
+    ("/ols4/api/search", &["GET"]),
+    ("/ols4/api/select", &["GET"]),
+    ("/ols4/api/suggest", &["GET"]),
+    ("/ols4/api/ontologies", &["GET"]),
+    ("/ols4/api/ontologies/{id}", &["GET"]),
+    ("/ols4/api/ontologies/{id}/terms", &["GET"]),
+    ("/ols4/api/ontologies/{id}/terms/{iri}", &["GET"]),
+    ("/ols4/api/ontologies/{id}/terms/{iri}/{relation}", &["GET"]),
     ("/$/ld/ns/{prefix}", &["GET"]),
     ("/$/ld/ns/{prefix}/", &["GET"]),
     ("/$/ld/ns/{prefix}/{*local}", &["GET"]),
@@ -517,6 +529,18 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // triple read permissions
         "/$/ld"
         | "/$/ld/doc"
+        | "/$/ld/search"
+        | "/$/ld/resources/{id}/doc"
+        | "/$/ontology/{ds}/doc"
+        | "/ols4/api"
+        | "/ols4/api/search"
+        | "/ols4/api/select"
+        | "/ols4/api/suggest"
+        | "/ols4/api/ontologies"
+        | "/ols4/api/ontologies/{id}"
+        | "/ols4/api/ontologies/{id}/terms"
+        | "/ols4/api/ontologies/{id}/terms/{iri}"
+        | "/ols4/api/ontologies/{id}/terms/{iri}/{relation}"
         | "/$/ld/ns/{prefix}"
         | "/$/ld/ns/{prefix}/"
         | "/$/ld/ns/{prefix}/{*local}" => Caller,

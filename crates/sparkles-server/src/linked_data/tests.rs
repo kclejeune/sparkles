@@ -109,6 +109,18 @@ fn linked_data_routes_classify_as_queries_for_rate_limiting() {
     for (route, uri) in [
         ("/$/ld", "/$/ld?iri=http://ex/a"),
         ("/$/ld/doc", "/$/ld/doc?iri=http://ex/a"),
+        ("/$/ld/search", "/$/ld/search?q=anatomy"),
+        ("/$/ld/resources/{id}/doc", "/$/ld/resources/anatomy/doc"),
+        ("/$/ontology/{ds}/doc", "/$/ontology/anatomy/doc"),
+        ("/ols4/api/search", "/ols4/api/search?q=anatomy"),
+        (
+            "/ols4/api/ontologies/{id}/terms/{iri}",
+            "/ols4/api/ontologies/anatomy/terms/urn%253Aexample",
+        ),
+        (
+            "/ols4/api/ontologies/{id}/terms/{iri}/{relation}",
+            "/ols4/api/ontologies/anatomy/terms/urn%253Aexample/parents",
+        ),
         ("/$/ld/ns/{prefix}", "/$/ld/ns/ex"),
         ("/$/ld/ns/{prefix}/", "/$/ld/ns/ex/"),
         ("/$/ld/ns/{prefix}/{*local}", "/$/ld/ns/ex/Person"),
@@ -4430,4 +4442,486 @@ graphs = ["http://example.org/ds/public"]
     let adm_body = adm_html.text();
     assert!(adm_body.contains(&local_pub), "{adm_body}");
     assert!(adm_body.contains(&local_priv), "{adm_body}");
+}
+
+mod publishing {
+    use super::*;
+
+    const ROOT: &str = "https://example.org/vocabulary/";
+    const CHILD: &str = "https://example.org/vocabulary/A_001";
+    const PARENT: &str = "https://example.org/vocabulary/A_002";
+    const PUBLIC: &str = "https://example.org/graph/public";
+    const PRIVATE: &str = "https://example.org/graph/private";
+
+    fn seed(st: &AppState) {
+        let ds = st.attach("vocabulary", DbType::Mem, None).unwrap();
+        let data = r#"
+@prefix v: <https://example.org/vocabulary/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix dct: <http://purl.org/dc/terms/> .
+<https://example.org/graph/public> {
+  v: a owl:Ontology ; rdfs:label "Cardiac ontology" ; dct:creator "Ada" .
+  v:A_001 a owl:Class ; rdfs:label "Cardiac muscle"@en, "Muscle cardiaque"@fr ;
+    skos:altLabel "Heart muscle" ;
+    skos:definition "Hidden myocardium" ;
+    rdfs:comment "Contractile tissue" ;
+    rdfs:subClassOf v:A_002 ;
+    skos:scopeNote "Used in anatomy" ;
+    skos:example "<script>unsafe</script>" .
+  v:A_002 a owl:Class ; rdfs:label "Muscle tissue" ;
+    rdfs:subClassOf v:A_001 .
+  v:Masked skos:definition "Hidden myocardial entity" .
+}
+<https://example.org/graph/private> {
+  v:Private a owl:Class ; rdfs:subClassOf v:A_001 ; rdfs:label "Private cardiac information" .
+}
+v:Default a owl:Class ; rdfs:label "Cardiac default graph" .
+"#;
+        ds.store
+            .load(&[Source::from_bytes(
+                data.as_bytes().to_vec(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+    }
+
+    async fn register(app: &Router, auth: Option<&str>) {
+        for (id, kind, title, graphs, dataset) in [
+            (
+                "anatomy",
+                "vocabulary",
+                "Vocabulary & anatomy",
+                vec![PUBLIC],
+                None,
+            ),
+            (
+                "secret",
+                "vocabulary",
+                "Unpublished resource",
+                vec![PRIVATE],
+                None,
+            ),
+            (
+                "all-data",
+                "dataset",
+                "All data",
+                vec![],
+                Some("vocabulary"),
+            ),
+        ] {
+            let mut json = json!({ "id": id, "kind": kind, "title": title });
+            if let Some(dataset) = dataset {
+                json["dataset"] = json!(dataset);
+            } else {
+                json["graphs"] = json!(
+                    graphs
+                        .iter()
+                        .map(|graph| json!({"dataset": "vocabulary", "graph": graph}))
+                        .collect::<Vec<_>>()
+                );
+                let namespace = if id == "anatomy" {
+                    ROOT
+                } else {
+                    "https://example.org/private/"
+                };
+                json["namespaces"] = json!([{"prefix": id, "iri": namespace}]);
+            }
+            let response = send(app, post_json("/$/resources", json, auth)).await;
+            assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+        }
+    }
+
+    async fn get(app: &Router, uri: &str, auth: Option<&str>) -> Resp {
+        let mut request = get_req(uri, None, auth);
+        // Use one correlation ID so the hidden/missing body comparison checks
+        // the complete error envelope.
+        request.headers_mut().insert(
+            crate::obs::X_REQUEST_ID.clone(),
+            axum::http::HeaderValue::from_static("linked-data-test"),
+        );
+        send(app, request).await
+    }
+
+    fn state(dir: &tempfile::TempDir) -> AppState {
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(20)).unwrap()
+    }
+
+    fn term_path() -> String {
+        format!("/ols4/api/ontologies/anatomy/terms/{}", enc(&enc(CHILD)))
+    }
+
+    #[tokio::test]
+    async fn documents_cover_terms_hierarchy_examples_and_static_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(state(&dir));
+        seed(&st);
+        let app = crate::http::router(st);
+        register(&app, None).await;
+
+        let live = get(&app, "/$/ld/resources/anatomy/doc", None).await;
+        assert_eq!(live.status, StatusCode::OK, "{}", live.text());
+        assert_eq!(
+            live.header("content-type"),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(live.header("cache-control"), Some("private, no-store"));
+        assert_eq!(live.header("content-security-policy"), Some(html::HTML_CSP));
+        let text = live.text();
+        for value in [
+            "Vocabulary &amp; anatomy",
+            "Annotation coverage",
+            "Cardiac ontology",
+            "Ontology metadata",
+            "Ada",
+            "Cardiac muscle",
+            "Definitions",
+            "Contractile tissue",
+            "Hierarchy",
+            "Usage",
+            "Used in anatomy",
+            "Examples",
+            "&lt;script&gt;unsafe&lt;/script&gt;",
+        ] {
+            assert!(text.contains(value), "missing {value}: {text}");
+        }
+        assert!(!text.contains("Private cardiac information"));
+        assert!(!text.contains("Cardiac default graph"));
+        assert!(!text.contains("<script>"));
+        let first_anchor = text
+            .split("href=\"#")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert!(text.contains(&format!("id=\"{first_anchor}\"")));
+
+        let export = get(&app, "/$/ld/resources/anatomy/doc?download=true", None).await;
+        assert_eq!(export.status, StatusCode::OK, "{}", export.text());
+        assert_eq!(
+            export.header("content-disposition"),
+            Some("attachment; filename=\"ontology.html\"")
+        );
+        assert_eq!(export.body, live.body);
+        let focused = get(
+            &app,
+            &format!("/$/ld/resources/anatomy/doc?iri={}", enc(CHILD)),
+            None,
+        )
+        .await;
+        assert_eq!(focused.status, StatusCode::OK, "{}", focused.text());
+        assert!(focused.text().contains("Children"));
+        assert!(focused.text().contains("href=\"?iri="));
+        let focused_static = get(
+            &app,
+            &format!(
+                "/$/ld/resources/anatomy/doc?iri={}&download=true",
+                enc(CHILD)
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(
+            focused_static.status,
+            StatusCode::OK,
+            "{}",
+            focused_static.text()
+        );
+        assert!(!focused_static.text().contains("href=\"?iri="));
+
+        let dataset = get(&app, "/$/ontology/vocabulary/doc", None).await;
+        assert_eq!(dataset.status, StatusCode::OK, "{}", dataset.text());
+        assert!(dataset.text().contains("Cardiac default graph"));
+        assert!(dataset.text().contains("Private cardiac information"));
+
+        let hosted = send(
+            &app,
+            get_req(
+                &format!("/$/ld/doc?iri={}", enc(CHILD)),
+                Some("text/html"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(hosted.status, StatusCode::OK, "{}", hosted.text());
+        assert_eq!(hosted.header("vary"), Some("Accept"));
+        assert!(hosted.text().contains("<h2>Definitions</h2>"));
+        assert!(hosted.text().contains("<h2>Hierarchy</h2>"));
+    }
+
+    #[tokio::test]
+    async fn search_modes_facets_pagination_and_ols_wire_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(state(&dir));
+        seed(&st);
+        let app = crate::http::router(st);
+        register(&app, None).await;
+
+        let search = get(&app, "/$/ld/search?q=cardiac&mode=lexical&limit=1", None).await;
+        assert_eq!(search.status, StatusCode::OK, "{}", search.text());
+        assert_eq!(search.header("cache-control"), Some("private, no-store"));
+        let results = search.json();
+        assert_eq!(results["total"], 7);
+        assert_eq!(results["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            results["facets"],
+            json!({"all-data": 4, "anatomy": 2, "secret": 1})
+        );
+        let uri = results["hits"][0]["documentation"].as_str().unwrap();
+        assert_eq!(get(&app, uri, None).await.status, StatusCode::OK);
+
+        for (q, mode, expected) in [
+            ("contractile tissue", "lexical", 1),
+            ("heart mus", "prefix", 1),
+            ("cardac muscle", "vector", 1),
+            ("cardac muscle", "lexical", 0),
+        ] {
+            let response = get(
+                &app,
+                &format!("/$/ld/search?q={}&mode={mode}&ontology=anatomy", enc(q)),
+                None,
+            )
+            .await;
+            assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+            assert_eq!(response.json()["total"], expected, "{}", response.text());
+        }
+
+        let find = get(&app, "/ols4/api/select?q=heart+muscle&exact=true&queryFields=synonym&ontology=anatomy&lang=fr", None).await;
+        assert_eq!(find.status, StatusCode::OK, "{}", find.text());
+        let find = find.json();
+        assert_eq!(find["response"]["numFound"], 1);
+        assert_eq!(find["response"]["docs"][0]["label"], "Muscle cardiaque");
+        assert_eq!(find["response"]["docs"][0]["obo_id"], "A:001");
+        assert_eq!(
+            find["facet_counts"]["facet_fields"]["ontologyId"],
+            json!(["anatomy", "1"])
+        );
+
+        let suggest = get(&app, "/ols4/api/suggest?q=heart+mus&ontology=anatomy", None).await;
+        assert_eq!(suggest.status, StatusCode::OK, "{}", suggest.text());
+        assert_eq!(
+            suggest.json()["response"]["docs"],
+            json!([{"autosuggest": "Heart muscle"}])
+        );
+
+        let ontologies = get(&app, "/ols4/api/ontologies?page=1&size=1", None).await;
+        assert_eq!(ontologies.status, StatusCode::OK, "{}", ontologies.text());
+        assert_eq!(
+            ontologies.json()["_embedded"]["ontologies"][0]["ontologyId"],
+            "anatomy"
+        );
+        assert_eq!(ontologies.json()["page"]["totalElements"], 3);
+
+        let terms = get(&app, "/ols4/api/ontologies/anatomy/terms?size=1", None).await;
+        assert_eq!(terms.status, StatusCode::OK, "{}", terms.text());
+        let terms = terms.json();
+        assert_eq!(terms["page"]["totalElements"], 2);
+        let next = terms["_links"]["next"]["href"].as_str().unwrap();
+        assert_eq!(
+            get(&app, next, None).await.json()["_embedded"]["terms"][0]["iri"],
+            PARENT
+        );
+        let term_uri = term_path();
+        let term = get(&app, &term_uri, None).await;
+        assert_eq!(term.status, StatusCode::OK, "{}", term.text());
+        assert_eq!(term.json()["iri"], CHILD);
+        for relation in ["parents", "children", "ancestors", "descendants"] {
+            let result = get(&app, &format!("{term_uri}/{relation}"), None).await;
+            assert_eq!(result.status, StatusCode::OK, "{}", result.text());
+            assert_eq!(result.json()["page"]["totalElements"], 1);
+            assert_eq!(result.json()["_embedded"]["terms"][0]["iri"], PARENT);
+        }
+        let invalid = get(&app, "/$/ld/search?q=cardiac&offset=10000", None).await;
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(feature = "auth")]
+    #[tokio::test]
+    async fn publishing_checks_dataset_graph_and_triple_grants_before_indexing() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let password = crate::auth::hash_password_with("secret", 8, 1, 1).unwrap();
+        let auth_file = dir.path().join("auth.toml");
+        std::fs::write(
+            &auth_file,
+            format!(
+                r#"
+version = 1
+[anonymous]
+datasets = {{}}
+[[protections]]
+name = "definition"
+dataset = "vocabulary"
+predicates = ["http://www.w3.org/2004/02/skos/core#definition"]
+[[users]]
+name = "operator"
+password = "{password}"
+server = ["server-admin"]
+[[users]]
+name = "reader"
+password = "{password}"
+[[users.grants]]
+dataset = "vocabulary"
+level = "read"
+graphs = ["{PUBLIC}"]
+[[users]]
+name = "gsp"
+password = "{password}"
+[[users.grants]]
+dataset = "vocabulary"
+level = "read"
+graphs = ["{PUBLIC}"]
+endpoints = ["gsp-r"]
+"#
+            ),
+        )
+        .unwrap();
+        let mut st = state(&dir);
+        st.auth = crate::auth::load(Some(&auth_file), dir.path(), "127.0.0.1", false).unwrap();
+        seed(&st);
+        let st = Arc::new(st);
+        let app = crate::http::router(st);
+        let basic = |name| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{name}:secret"))
+            )
+        };
+        let admin = basic("operator");
+        let reader = basic("reader");
+        let gsp = basic("gsp");
+        register(&app, Some(&admin)).await;
+
+        // Prime each surface as an administrator before sending the same request as
+        // a reader. Neither a private graph nor protected triples may affect the
+        // restricted body, counts or navigation.
+        for uri in [
+            "/$/ontology/vocabulary/doc?download=true",
+            "/$/ld/resources/anatomy/doc",
+            "/ols4/api/search?q=hidden+myocardium&queryFields=description",
+            "/$/ld/search?q=cardiac&mode=lexical",
+            "/ols4/api/ontologies",
+        ] {
+            let privileged = get(&app, uri, Some(&admin)).await;
+            assert_eq!(privileged.status, StatusCode::OK, "{}", privileged.text());
+            let restricted = get(&app, uri, Some(&reader)).await;
+            assert_eq!(restricted.status, StatusCode::OK, "{}", restricted.text());
+            assert_eq!(
+                restricted.header("cache-control"),
+                Some("private, no-store")
+            );
+            assert_ne!(privileged.body, restricted.body, "{uri}");
+            for secret in [
+                "Hidden myocardium",
+                "Hidden myocardial entity",
+                "Private cardiac information",
+                "Unpublished resource",
+                "/secret",
+                "Cardiac default graph",
+            ] {
+                assert!(
+                    !restricted.text().contains(secret),
+                    "{uri}: {}",
+                    restricted.text()
+                );
+            }
+        }
+
+        for (hidden, missing) in [
+            (
+                "/$/ld/resources/secret/doc".to_string(),
+                "/$/ld/resources/missing/doc".to_string(),
+            ),
+            (
+                "/ols4/api/ontologies/secret".to_string(),
+                "/ols4/api/ontologies/missing".to_string(),
+            ),
+            (
+                format!(
+                    "/$/ld/resources/anatomy/doc?iri={}",
+                    enc(&format!("{ROOT}Masked"))
+                ),
+                format!(
+                    "/$/ld/resources/anatomy/doc?iri={}",
+                    enc(&format!("{ROOT}Nonexistent"))
+                ),
+            ),
+            (
+                format!(
+                    "/ols4/api/ontologies/all-data/terms/{}",
+                    enc(&enc(&format!("{ROOT}Private")))
+                ),
+                format!(
+                    "/ols4/api/ontologies/all-data/terms/{}",
+                    enc(&enc(&format!("{ROOT}Nonexistent")))
+                ),
+            ),
+        ] {
+            let hidden = get(&app, &hidden, Some(&reader)).await;
+            let missing = get(&app, &missing, Some(&reader)).await;
+            assert_eq!(hidden.status, StatusCode::NOT_FOUND, "{}", hidden.text());
+            assert_eq!(hidden.body, missing.body);
+        }
+        for auth in [None, Some(gsp.as_str())] {
+            let list = get(&app, "/ols4/api/ontologies", auth).await;
+            assert_eq!(list.status, StatusCode::OK, "{}", list.text());
+            assert_eq!(list.json()["_embedded"]["ontologies"], json!([]));
+            let doc = get(&app, "/$/ontology/vocabulary/doc", auth).await;
+            assert_eq!(doc.status, StatusCode::NOT_FOUND, "{}", doc.text());
+        }
+        let response = get(&app, "/$/ld/search?q=cardiac&mode=lexical", Some(&reader)).await;
+        assert_eq!(
+            response.json()["facets"],
+            json!({"all-data": 2, "anatomy": 2})
+        );
+        let response = get(&app, "/ols4/api/suggest?q=private+cardiac", Some(&reader)).await;
+        assert_eq!(response.json()["response"]["numFound"], 0);
+        let all_terms = format!(
+            "/ols4/api/ontologies/all-data/terms/{}/children",
+            enc(&enc(CHILD))
+        );
+        let children = get(&app, &all_terms, Some(&reader)).await;
+        assert_eq!(children.json()["page"]["totalElements"], 1);
+        assert_eq!(children.json()["_embedded"]["terms"][0]["iri"], PARENT);
+
+        let term = get(&app, &term_path(), Some(&reader)).await;
+        assert_eq!(term.status, StatusCode::OK, "{}", term.text());
+        assert_eq!(term.json()["description"], json!(["Contractile tissue"]));
+        let search = get(
+            &app,
+            "/$/ld/search?q=private+cardiac&mode=lexical&ontology=secret",
+            Some(&reader),
+        )
+        .await;
+        assert_eq!(search.json(), json!({"total": 0, "hits": [], "facets": {}}));
+    }
+
+    #[tokio::test]
+    async fn publications_fail_closed_over_the_result_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = state(&dir);
+        st.limits.max_result_bytes = Some(256);
+        seed(&st);
+        let app = crate::http::router(Arc::new(st));
+        register(&app, None).await;
+        for uri in [
+            "/$/ontology/vocabulary/doc?download=true",
+            "/ols4/api/ontologies",
+            "/$/ld/search?q=cardiac",
+        ] {
+            let result = get(&app, uri, None).await;
+            assert_eq!(
+                result.status,
+                StatusCode::INSUFFICIENT_STORAGE,
+                "{uri}: {}",
+                result.text()
+            );
+            assert_eq!(result.header("cache-control"), Some("private, no-store"));
+            assert!(result.header("content-disposition").is_none());
+        }
+    }
 }

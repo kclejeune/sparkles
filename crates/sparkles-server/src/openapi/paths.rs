@@ -764,6 +764,190 @@ fn resources(p: &mut Paths) {
                 .resp_h("303", "Redirect from a slash IRI to its negotiated document representation.", None, ld_redirect_headers),
         ),
     );
+    publication(p);
+}
+
+fn publication(p: &mut Paths) {
+    let begin = |route, id, title| {
+        op(GET, route, id, "Catalog", title)
+            .see("linked-data-publishing")
+            .errors(&[400, 404, 408, 429, 503, 507])
+    };
+    let cache = json!({
+        "Cache-Control": { "description": "Private, with storage prohibited.", "schema": s() }
+    });
+    let mut doc_headers = cache.clone();
+    doc_headers["Content-Disposition"] = json!({
+        "description": "Attachment for a static HTML export when download is true.",
+        "schema": s(),
+    });
+    doc_headers["Content-Security-Policy"] = json!({
+        "description": "Script-free Content Security Policy.", "schema": s(),
+    });
+    for (route, id, title) in [
+        (
+            "/$/ontology/{ds}/doc",
+            "getOntologyDocumentation",
+            "Get dataset ontology documentation",
+        ),
+        (
+            "/$/ld/resources/{id}/doc",
+            "getCatalogDocumentation",
+            "Get catalog resource documentation",
+        ),
+    ] {
+        p.add(
+            begin(route, id, title)
+                .doc("Generates self-contained HTML from the asserted RDF the caller can query.")
+                .query(
+                    "iri",
+                    s(),
+                    "Render one term's documentation instead of the whole scope.",
+                )
+                .query("download", boolean(), "Download a standalone HTML file.")
+                .resp_h(
+                    "200",
+                    "The generated documentation.",
+                    Some(json!({"text/html": text()})),
+                    doc_headers.clone(),
+                ),
+        );
+    }
+    let search_schema = json!({
+        "type": "object",
+        "required": ["total", "hits", "facets"],
+        "properties": {
+            "total": int(),
+            "facets": {"type": "object", "additionalProperties": int()},
+            "hits": {"type": "array", "items": {
+                "type": "object",
+                "required": ["iri", "ontology", "label", "kind", "documentation"],
+                "properties": {
+                    "iri": s(), "ontology": s(), "label": s(), "documentation": s(),
+                    "kind": str_enum(&["class", "property", "individual", "ontology"])
+                }
+            }}
+        }
+    });
+    p.add(begin("/$/ld/search", "searchCatalogTerms", "Search published terms")
+        .doc("Searches the caller's readable catalog terms. Facets count every match in each ontology before paging.")
+        .query_req("q", s(), "The search text, at most 1000 bytes.")
+        .query("mode", str_enum(&["hybrid", "lexical", "vector", "prefix"]), "Ranking or autocomplete mode. The default is hybrid.")
+        .query("ontology", s(), "Repeat or pass comma-separated catalog resource ids.")
+        .query("lang", s(), "Preferred label language.")
+        .query("limit", int(), "The page size, 1 to 100. The default is 20.")
+        .query("offset", int(), "The number of matches to skip. Offset plus limit must be at most 10000.")
+        .resp_h("200", "Visible matches and ontology facets.", Some(json!({
+            "application/json": { "schema": search_schema }
+        })), cache.clone()));
+
+    let ols_reply = |op: Op, description, required: &[&str]| {
+        op.resp_h("200", description, Some(json!({
+            "application/json": { "schema": { "type": "object", "required": required, "additionalProperties": true } }
+        })), cache.clone())
+    };
+    let ols_page = |op: Op| {
+        op.query("page", int(), "The zero-based page number.")
+            .query("size", int(), "The page size, 1 to 100. The default is 20.")
+            .query("lang", s(), "Preferred label language.")
+    };
+    p.add(ols_reply(
+        begin("/ols4/api", "getOlsIndex", "Discover OLS resources"),
+        "Links to the OLS4-compatible endpoints.",
+        &["_links"],
+    ));
+    for (route, id, title) in [
+        ("/ols4/api/search", "searchOlsTerms", "Search OLS terms"),
+        ("/ols4/api/select", "selectOlsTerms", "Select OLS terms"),
+        (
+            "/ols4/api/suggest",
+            "suggestOlsTerms",
+            "Autocomplete OLS labels and synonyms",
+        ),
+    ] {
+        let search = begin(route, id, title)
+            .query_req("q", s(), "The search text, at most 1000 bytes.")
+            .query("rows", int(), "The page size, 1 to 100. The default is 10.")
+            .query(
+                "start",
+                int(),
+                "The number of matches to skip. Start plus rows must be at most 10000.",
+            )
+            .query(
+                "ontology",
+                s(),
+                "Repeat or pass comma-separated catalog resource ids.",
+            )
+            .query("type", s(), "Repeat or pass comma-separated entity types.")
+            .query("lang", s(), "Preferred label language.")
+            .query(
+                "queryFields",
+                s(),
+                "Comma-separated label, synonym, description or identifier fields.",
+            )
+            .query("obsoletes", boolean(), "Include obsolete terms.");
+        let search = if route.ends_with("/suggest") {
+            search
+        } else {
+            search.query("exact", boolean(), "Match complete normalized values only.")
+        };
+        p.add(ols_reply(
+            search,
+            "An OLS4 search response.",
+            &["response", "responseHeader"],
+        ));
+    }
+    let hal = &["_embedded", "_links", "page"];
+    p.add(ols_reply(
+        ols_page(begin(
+            "/ols4/api/ontologies",
+            "listOlsOntologies",
+            "List OLS ontologies",
+        )),
+        "A page of visible catalog ontologies.",
+        hal,
+    ));
+    p.add(ols_reply(
+        begin(
+            "/ols4/api/ontologies/{id}",
+            "getOlsOntology",
+            "Get an OLS ontology",
+        )
+        .query("lang", s(), "Preferred label language."),
+        "Visible ontology metadata.",
+        &["ontologyId", "config", "_links"],
+    ));
+    p.add(ols_reply(
+        ols_page(begin(
+            "/ols4/api/ontologies/{id}/terms",
+            "listOlsTerms",
+            "List OLS terms",
+        ))
+        .query("iri", s(), "Filter by an absolute term IRI.")
+        .query("short_form", s(), "Filter by the short form.")
+        .query("obo_id", s(), "Filter by the OBO identifier."),
+        "A page of visible ontology terms.",
+        hal,
+    ));
+    p.add(ols_reply(
+        begin(
+            "/ols4/api/ontologies/{id}/terms/{iri}",
+            "getOlsTerm",
+            "Get an OLS term",
+        )
+        .query("lang", s(), "Preferred label language."),
+        "The visible term document.",
+        &["iri", "label", "ontology_name", "_links"],
+    ));
+    p.add(ols_reply(
+        ols_page(begin(
+            "/ols4/api/ontologies/{id}/terms/{iri}/{relation}",
+            "getOlsTermRelations",
+            "Browse the asserted OLS hierarchy",
+        )),
+        "A page of visible parents, children, ancestors or descendants.",
+        hal,
+    ));
 }
 
 /// Editing forms generated from SHACL shapes (U02).

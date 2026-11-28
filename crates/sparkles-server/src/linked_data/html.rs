@@ -6,6 +6,7 @@
 //! is rendered as plain escaped text. Output is bounded against `max_result_bytes` as
 //! chunks are written so oversized pages abort without allocating past the limit.
 
+use super::publication::{Field, field};
 use super::{Description, Format, HostedTarget, MemoryCharge};
 use oxrdf::{NamedOrBlankNode, Term, Triple};
 use std::cmp::Ordering;
@@ -30,7 +31,7 @@ pub fn safe_external_href(iri: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
-fn percent_encode_param(s: &str) -> String {
+pub(super) fn percent_encode_param(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
@@ -157,7 +158,7 @@ impl<'a> HtmlWriter<'a> {
 
     /// Write `s` with HTML escaping directly into `self.buf`, checking `limit` and
     /// `charge` as slices are emitted so oversized literals abort immediately.
-    fn push_escaped(&mut self, s: &str) -> sparkles::Result<()> {
+    pub(super) fn push_escaped(&mut self, s: &str) -> sparkles::Result<()> {
         let mut last = 0usize;
         for (i, c) in s.char_indices() {
             let repl = match c {
@@ -180,7 +181,7 @@ impl<'a> HtmlWriter<'a> {
         Ok(())
     }
 
-    fn into_string(self) -> String {
+    pub(super) fn into_string(self) -> String {
         self.buf
     }
 }
@@ -534,9 +535,35 @@ pub fn render(
         )?;
     }
 
-    if !outgoing.is_empty() {
-        w.push_str("<h2>Properties</h2>\n<table><tbody>\n")?;
-        for t in outgoing {
+    let section = |triple: &&Triple| match field(triple.predicate.as_str()) {
+        Some(Field::Definition) => "Definitions",
+        Some(Field::Synonym) => "Synonyms",
+        Some(Field::Parent) => "Hierarchy",
+        Some(Field::Equivalent) => "Equivalent terms",
+        Some(Field::Usage) => "Usage",
+        Some(Field::Example) => "Examples",
+        _ => "Properties",
+    };
+    for heading in [
+        "Definitions",
+        "Synonyms",
+        "Hierarchy",
+        "Equivalent terms",
+        "Usage",
+        "Examples",
+        "Properties",
+    ] {
+        let mut rows = outgoing
+            .iter()
+            .filter(|triple| section(triple) == heading)
+            .peekable();
+        if rows.peek().is_none() {
+            continue;
+        }
+        w.push_str("<h2>")?;
+        w.push_str(heading)?;
+        w.push_str("</h2>\n<table><tbody>\n")?;
+        for t in rows {
             w.push_str("<tr><th>")?;
             write_iri(
                 &mut w,

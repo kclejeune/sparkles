@@ -550,6 +550,13 @@ fn parameters() -> Map<String, J> {
             "The local path appended to the hosted namespace IRI.",
         ),
     );
+    put(
+        "iri",
+        path("iri", "The absolute term IRI, percent-encoded twice."),
+    );
+    let mut relation = path("relation", "The asserted hierarchy traversal.");
+    relation["schema"]["enum"] = json!(["parents", "children", "ancestors", "descendants"]);
+    put("relation", relation);
     put("repo", path("repo", "The backup repository."));
     put("backup", path("backup", "The backup's id."));
     put("policy", path("policy", "The backup policy."));

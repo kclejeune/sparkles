@@ -93,6 +93,13 @@ individual and term reads now answer a dataset returned by `at()` and an active 
 transaction at their own commit, where they threw `JenaTransactionException` before. They
 still throw it in a write transaction, before anything is flushed. Python and Node.js
 selectors are roadmap item 1339.
+### Ontology documentation and catalog term search
+
+Sparkles generates ontology and term documentation from readable dataset and catalog
+graphs, with definitions, hierarchy, usage, examples and a standalone HTML export.
+Catalog search adds lexical and character trigram vector ranking, ontology facets and
+autocomplete. An OLS4 REST subset serves search, ontology metadata and asserted hierarchy
+under the caller's query grants. This completes roadmap item 461.
 
 ### View access by grant containment
 

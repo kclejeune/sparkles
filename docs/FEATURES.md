@@ -209,7 +209,7 @@ instruction counts, and the limits of attributing them to layout.
 | [Access control and authentication](server/README.md#access-control-and-security) | Core complete | Dataset, graph, branch, endpoint and triple guards pair with Basic, OIDC, API-token, trusted-proxy and TLS authentication. Provenance-based derived visibility, guarded view preparation and triple-restricted change feeds or validation remain planned. |
 | [Settings and declared prefixes](server/README.md#server-and-protocols) | Complete | Layered server and dataset settings, operator locks, runtime administration and declared prefix completion span HTTP, the CLI, LSP and the web UI. |
 | [Resource catalog](server/README.md#resource-catalog) | Early (Phase 1) | DCAT 3 resource records, SPDX licence tracking, NOTICE generation, warning licence gates and vocabulary namespaces are available for administrators. Remote fetching, content-addressed storage, recipes, mirrors and export enforcement remain under items 458, 525 and 526. |
-| [Linked-data publishing](server/README.md#linked-data-publishing) | Early (Phase 1) | Content-negotiated HTML and bounded DESCRIBE RDF for hosted namespaces, 303 slash-IRI redirects, version-IRI snapshot resolution and PURL or w3id recipe export are available under caller ACLs. Term and ontology documentation pages, catalog-wide term search and the OLS4 API subset remain under item 461. |
+| [Linked-data publishing](server/README.md#linked-data-publishing) | Complete | Hosted IRIs negotiate HTML and bounded RDF with slash redirects and pinned version lookup. Ontology documentation and static export, faceted catalog term search and an OLS4 REST subset use the caller's query permissions. |
 
 ### Agents and interfaces
 

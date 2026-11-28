@@ -6336,6 +6336,68 @@ Generated Apache rules delegate `Accept` content negotiation to Sparkles. Terms 
 contains percent-encoded slashes (`%2F`) require `AllowEncodedSlashes NoDecode` in the
 enclosing Apache virtual host, because Apache does not permit that directive in `.htaccess`.
 
+
+### Ontology and term documentation
+
+| Route | What it does |
+|---|---|
+| `GET /$/ontology/{ds}/doc` | Generates an ontology document from the dataset's default and named graphs. |
+| `GET /$/ld/resources/{id}/doc` | Generates documentation for a catalog resource. A vocabulary reads its registered graph locations, and a dataset resource reads the dataset it names. |
+
+Both routes serve HTML with a term index, annotation coverage, and sections for asserted
+hierarchy, definitions, usage and examples. Pass `iri=<IRI>` to focus on a single term
+and `download=true` to receive a self-contained `ontology.html` attachment. Whole
+documents link to local sections, so the export can be opened offline. Hosted IRI
+lookups also group their authorized `DESCRIBE` facts into these sections when returning
+HTML.
+
+### Catalog term search
+
+`GET /$/ld/search?q=<text>` returns `total`, `hits` and `facets`. Each hit includes an
+`iri`, `ontology` catalog id, `label`, `kind` and a `documentation` URL. A term
+registered in two resources can appear once in each. Facets count matching terms by
+catalog id before paging. Repeat `ontology` or pass comma-separated ids to limit the
+scope. `lang` selects a preferred display label when available.
+
+Search covers labels, synonyms, definitions, and identifiers. `mode=lexical` ranks
+exact matches, prefixes, then matches on all query words. `mode=vector` uses cosine
+similarity on sparse Unicode character trigram vectors, which can match spelling
+variants. The default `mode=hybrid` uses the lexical tiers before vector matches.
+`mode=prefix` autocompletes labels, synonyms and identifiers. The query has at most
+1,000 bytes. `limit` defaults to 20, may be 1 to 100, and must end by position 10,000
+after `offset`.
+
+### OLS4-compatible API
+
+The [OLS legacy REST contract](https://www.ebi.ac.uk/ols4/ols3help) is available under
+`/ols4/api`. A catalog id names each ontology.
+
+| Route under `/ols4/api` | Response |
+|---|---|
+| `GET /` | Links to the supported endpoints at `/ols4/api`. |
+| `GET /search` and `GET /select` | OLS full-text search with `response.docs`, `numFound` and ontology facets. |
+| `GET /suggest` | Prefix matches on labels and synonyms in `response.docs[].autosuggest`. |
+| `GET /ontologies` and `GET /ontologies/{id}` | The HAL ontology list and a readable ontology's metadata. |
+| `GET /ontologies/{id}/terms` | A HAL page of classes. `iri` can select one term by its full IRI. `short_form` and `obo_id` filter by identifiers. |
+| `GET /ontologies/{id}/terms/{iri}` | A single term with descriptions, synonyms and hierarchy links. Percent-encode the IRI twice as one path segment. |
+| `GET /ontologies/{id}/terms/{iri}/{relation}` | A HAL page of direct or transitive asserted relations. Use `parents`, `children`, `ancestors` or `descendants`. |
+
+Search uses `q`, `ontology`, `type`, `queryFields`, `lang`, `obsoletes`, and `rows`
+and `start` for paging. `exact=true` restricts search and select to exact normalized
+values. HAL lists use zero-based `page` and `size`. `size` defaults to 20 and `rows`
+defaults to 10. Both accept 1 to 100, with a window ending by position 10,000. HAL links
+are relative to the server unless its public URL is configured. Each hierarchy traversal
+can visit at most 100,000 edges and return a set of at most 10,000 distinct related terms
+before paging.
+
+Documentation, search and OLS use live asserted data from the main branch. Each
+catalog scope needs at least one readable triple. Page contents, hierarchy, suggestions
+and counts use only facts allowed by the caller's query grants and graph and triple
+protections. An absent or unreadable resource or term answers the same `404 Not Found`.
+Responses are private and prohibit caching. A request that exceeds a server query
+deadline, row limit, memory budget or response budget returns an error. The
+request-local index uses a 128 MiB memory ceiling when `--query-memory-mb` is unset.
+
 ## Backup repositories
 
 The design and its rationale are in [F05 Backup repositories](specs/F05-snapshot-repositories/README.md).

@@ -246,6 +246,15 @@
           "type": "string"
         }
       },
+      "iri": {
+        "description": "The absolute term IRI, percent-encoded twice.",
+        "in": "path",
+        "name": "iri",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
       "kind": {
         "description": "The dataset or server-wide settings kind.",
         "in": "path",
@@ -438,6 +447,21 @@
         "name": "reference",
         "required": true,
         "schema": {
+          "type": "string"
+        }
+      },
+      "relation": {
+        "description": "The asserted hierarchy traversal.",
+        "in": "path",
+        "name": "relation",
+        "required": true,
+        "schema": {
+          "enum": [
+            "parents",
+            "children",
+            "ancestors",
+            "descendants"
+          ],
           "type": "string"
         }
       },
@@ -42854,6 +42878,306 @@
         "x-sparkles-permission": "any caller"
       }
     },
+    "/$/ld/resources/{id}/doc": {
+      "get": {
+        "description": "Generates self-contained HTML from the asserted RDF the caller can query.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "getCatalogDocumentation",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "Render one term's documentation instead of the whole scope.",
+            "in": "query",
+            "name": "iri",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Download a standalone HTML file.",
+            "in": "query",
+            "name": "download",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The generated documentation.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Disposition": {
+                "description": "Attachment for a static HTML export when download is true.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Security-Policy": {
+                "description": "Script-free Content Security Policy.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Get catalog resource documentation",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/$/ld/search": {
+      "get": {
+        "description": "Searches the caller's readable catalog terms. Facets count every match in each ontology before paging.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "searchCatalogTerms",
+        "parameters": [
+          {
+            "description": "The search text, at most 1000 bytes.",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Ranking or autocomplete mode. The default is hybrid.",
+            "in": "query",
+            "name": "mode",
+            "schema": {
+              "enum": [
+                "hybrid",
+                "lexical",
+                "vector",
+                "prefix"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repeat or pass comma-separated catalog resource ids.",
+            "in": "query",
+            "name": "ontology",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Preferred label language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The page size, 1 to 100. The default is 20.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The number of matches to skip. Offset plus limit must be at most 10000.",
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "facets": {
+                      "additionalProperties": {
+                        "type": "integer"
+                      },
+                      "type": "object"
+                    },
+                    "hits": {
+                      "items": {
+                        "properties": {
+                          "documentation": {
+                            "type": "string"
+                          },
+                          "iri": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "enum": [
+                              "class",
+                              "property",
+                              "individual",
+                              "ontology"
+                            ],
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "ontology": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "iri",
+                          "ontology",
+                          "label",
+                          "kind",
+                          "documentation"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "total": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "total",
+                    "hits",
+                    "facets"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Visible matches and ontology facets.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Search published terms",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
     "/$/lint": {
       "post": {
         "description": "Lints a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads, JSON-LD or SHACLC document, with the rules of `sparkles lint`. The SPARQL in `sh:select`, `sh:ask`, `sh:construct` and `sh:update` literals is linted too. A syntax error is one of the findings, so the answer is `200` either way. `--format-endpoint` may limit or turn off the route.",
@@ -46499,6 +46823,118 @@
           "Ontology"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ontology/{ds}/doc": {
+      "get": {
+        "description": "Generates self-contained HTML from the asserted RDF the caller can query.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "getOntologyDocumentation",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "Render one term's documentation instead of the whole scope.",
+            "in": "query",
+            "name": "iri",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Download a standalone HTML file.",
+            "in": "query",
+            "name": "download",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The generated documentation.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Disposition": {
+                "description": "Attachment for a static HTML export when download is true.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Security-Policy": {
+                "description": "Script-free Content Security Policy.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Get dataset ontology documentation",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
       }
     },
     "/$/ontology/{ds}/entities": {
@@ -60452,6 +60888,1118 @@
           "MCP"
         ],
         "x-sparkles-permission": "public"
+      }
+    },
+    "/ols4/api": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "getOlsIndex",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "required": [
+                    "_links"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Links to the OLS4-compatible endpoints.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Discover OLS resources",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/ols4/api/ontologies": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "listOlsOntologies",
+        "parameters": [
+          {
+            "description": "The zero-based page number.",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The page size, 1 to 100. The default is 20.",
+            "in": "query",
+            "name": "size",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Preferred label language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "required": [
+                    "_embedded",
+                    "_links",
+                    "page"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A page of visible catalog ontologies.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "List OLS ontologies",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/ols4/api/ontologies/{id}": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "getOlsOntology",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "Preferred label language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "required": [
+                    "ontologyId",
+                    "config",
+                    "_links"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Visible ontology metadata.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Get an OLS ontology",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/ols4/api/ontologies/{id}/terms": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "listOlsTerms",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "description": "The zero-based page number.",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The page size, 1 to 100. The default is 20.",
+            "in": "query",
+            "name": "size",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Preferred label language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by an absolute term IRI.",
+            "in": "query",
+            "name": "iri",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by the short form.",
+            "in": "query",
+            "name": "short_form",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by the OBO identifier.",
+            "in": "query",
+            "name": "obo_id",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "required": [
+                    "_embedded",
+                    "_links",
+                    "page"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A page of visible ontology terms.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "List OLS terms",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/ols4/api/ontologies/{id}/terms/{iri}": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "getOlsTerm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/iri"
+          },
+          {
+            "description": "Preferred label language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "required": [
+                    "iri",
+                    "label",
+                    "ontology_name",
+                    "_links"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The visible term document.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Get an OLS term",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/ols4/api/ontologies/{id}/terms/{iri}/{relation}": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "getOlsTermRelations",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          },
+          {
+            "$ref": "#/components/parameters/iri"
+          },
+          {
+            "$ref": "#/components/parameters/relation"
+          },
+          {
+            "description": "The zero-based page number.",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The page size, 1 to 100. The default is 20.",
+            "in": "query",
+            "name": "size",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Preferred label language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "required": [
+                    "_embedded",
+                    "_links",
+                    "page"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A page of visible parents, children, ancestors or descendants.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Browse the asserted OLS hierarchy",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/ols4/api/search": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "searchOlsTerms",
+        "parameters": [
+          {
+            "description": "The search text, at most 1000 bytes.",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The page size, 1 to 100. The default is 10.",
+            "in": "query",
+            "name": "rows",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The number of matches to skip. Start plus rows must be at most 10000.",
+            "in": "query",
+            "name": "start",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Repeat or pass comma-separated catalog resource ids.",
+            "in": "query",
+            "name": "ontology",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repeat or pass comma-separated entity types.",
+            "in": "query",
+            "name": "type",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Preferred label language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated label, synonym, description or identifier fields.",
+            "in": "query",
+            "name": "queryFields",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include obsolete terms.",
+            "in": "query",
+            "name": "obsoletes",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Match complete normalized values only.",
+            "in": "query",
+            "name": "exact",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "required": [
+                    "response",
+                    "responseHeader"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "An OLS4 search response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Search OLS terms",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/ols4/api/select": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "selectOlsTerms",
+        "parameters": [
+          {
+            "description": "The search text, at most 1000 bytes.",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The page size, 1 to 100. The default is 10.",
+            "in": "query",
+            "name": "rows",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The number of matches to skip. Start plus rows must be at most 10000.",
+            "in": "query",
+            "name": "start",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Repeat or pass comma-separated catalog resource ids.",
+            "in": "query",
+            "name": "ontology",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repeat or pass comma-separated entity types.",
+            "in": "query",
+            "name": "type",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Preferred label language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated label, synonym, description or identifier fields.",
+            "in": "query",
+            "name": "queryFields",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include obsolete terms.",
+            "in": "query",
+            "name": "obsoletes",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Match complete normalized values only.",
+            "in": "query",
+            "name": "exact",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "required": [
+                    "response",
+                    "responseHeader"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "An OLS4 search response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Select OLS terms",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
+    "/ols4/api/suggest": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linked-data-publishing"
+        },
+        "operationId": "suggestOlsTerms",
+        "parameters": [
+          {
+            "description": "The search text, at most 1000 bytes.",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The page size, 1 to 100. The default is 10.",
+            "in": "query",
+            "name": "rows",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The number of matches to skip. Start plus rows must be at most 10000.",
+            "in": "query",
+            "name": "start",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Repeat or pass comma-separated catalog resource ids.",
+            "in": "query",
+            "name": "ontology",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repeat or pass comma-separated entity types.",
+            "in": "query",
+            "name": "type",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Preferred label language.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated label, synonym, description or identifier fields.",
+            "in": "query",
+            "name": "queryFields",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include obsolete terms.",
+            "in": "query",
+            "name": "obsoletes",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "required": [
+                    "response",
+                    "responseHeader"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "An OLS4 search response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Private, with storage prohibited.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Autocomplete OLS labels and synonyms",
+        "tags": [
+          "Catalog"
+        ],
+        "x-sparkles-permission": "any caller"
       }
     },
     "/{ds}": {

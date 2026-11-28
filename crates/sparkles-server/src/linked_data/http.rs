@@ -1,4 +1,4 @@
-//! HTTP routes for the linked-data front end (spec C32, phase 1).
+//! HTTP routes for C32 server-local linked-data publishing.
 //!
 //! Routes:
 //! * `GET /$/ld` — IRI lookup and content negotiation (`?iri=...`). Slash IRIs answer
@@ -11,8 +11,9 @@
 //!   of PURL / w3id Apache `.htaccess` redirection recipes.
 
 use super::{
-    Format, LookupOutcome, LookupTarget, MemoryCharge, html, negotiate_format, recipes,
-    resolve_and_describe, serialize_rdf, valid_local_part, valid_lookup_iri,
+    ChargedLimitedWriter, Format, LookupOutcome, LookupTarget, MemoryCharge, bad, docs, html,
+    negotiate_format, not_found, ols, publication, recipes, resolve_and_describe, search,
+    serialize_rdf, valid_local_part, valid_lookup_iri,
 };
 use crate::auth::Principal;
 use crate::http::{ApiError, ApiResult, Params, blocking, err_code};
@@ -32,6 +33,21 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/$/ld", get(resolve_query))
         .route("/$/ld/doc", get(document))
+        .route("/$/ld/search", get(catalog_search))
+        .route("/$/ld/resources/{id}/doc", get(resource_document))
+        .route("/$/ontology/{ds}/doc", get(ontology_document))
+        .route("/ols4/api", get(ols_root))
+        .route("/ols4/api/search", get(ols_search))
+        .route("/ols4/api/select", get(ols_search))
+        .route("/ols4/api/suggest", get(ols_suggest))
+        .route("/ols4/api/ontologies", get(ols_ontologies))
+        .route("/ols4/api/ontologies/{id}", get(ols_ontology))
+        .route("/ols4/api/ontologies/{id}/terms", get(ols_term_list))
+        .route("/ols4/api/ontologies/{id}/terms/{iri}", get(ols_term))
+        .route(
+            "/ols4/api/ontologies/{id}/terms/{iri}/{relation}",
+            get(ols_related),
+        )
         .route("/$/ld/ns/{prefix}", get(resolve_ns_root))
         .route("/$/ld/ns/{prefix}/", get(resolve_ns_root))
         .route("/$/ld/ns/{prefix}/{*local}", get(resolve_ns_local))
@@ -585,6 +601,261 @@ pub async fn recipes(
         resp.headers_mut()
             .insert(header::VARY, HeaderValue::from_static("Accept"));
         Ok(resp)
+    })
+    .await
+}
+
+/// Catalog and ontology documents and their errors depend on the current caller's
+/// effective query grants and live data. Keep them out of HTTP caches.
+async fn publication_read(
+    st: Arc<AppState>,
+    principal: Principal,
+    f: impl FnOnce(&mut publication::Read<'_>) -> ApiResult + Send + 'static,
+) -> Response {
+    let grant = crate::server_memory::current_grant();
+    let (cancel, _cancel_on_drop) = crate::http::cancel_on_drop();
+    let mut response =
+        blocking(move || f(&mut publication::Read::new(&st, &principal, grant, cancel)))
+            .await
+            .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
+pub(super) fn json_response(
+    read: &publication::Read<'_>,
+    document: &impl serde::Serialize,
+) -> ApiResult {
+    read.check()?;
+    let mut charge = read.output_charge()?;
+    let mut output = ChargedLimitedWriter::new(read.st.limits.max_result_bytes, &mut charge);
+    let result = serde_json::to_writer(&mut output, document);
+    let buf = output.into_result()?;
+    result.map_err(|e| ApiError::from(sparkles::Error::Io(std::io::Error::other(e))))?;
+    read.check()?;
+    Ok(publication_body("application/json", buf, charge))
+}
+
+fn publication_body(content_type: &'static str, buf: Vec<u8>, charge: MemoryCharge) -> Response {
+    let bytes = Bytes::from_owner(ChargedBytes {
+        buf,
+        _charge: charge,
+    });
+    ([(header::CONTENT_TYPE, content_type)], Body::from(bytes)).into_response()
+}
+
+async fn catalog_search(
+    State(st): St,
+    Extension(principal): Extension<Principal>,
+    uri: Uri,
+) -> Response {
+    publication_read(st, principal, move |read| {
+        let params = Params::from_query(&uri);
+        let request = search::Request::native(&params)?;
+        let catalog = read.catalog()?;
+        search::response(read, &catalog, &request)
+    })
+    .await
+}
+
+async fn resource_document(
+    State(st): St,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    uri: Uri,
+) -> Response {
+    publication_read(st, principal, move |read| {
+        let params = Params::from_query(&uri);
+        let (focus, download) = doc_options(&params)?;
+        let catalog = read.catalog()?;
+        let resource = crate::resources::find(&catalog, &id).ok_or_else(not_found)?;
+        let terms = read.resource_terms(resource)?;
+        if !terms.visible {
+            return Err(not_found());
+        }
+        documentation(read, &resource.input.title, &terms, focus, download)
+    })
+    .await
+}
+
+async fn ontology_document(
+    State(st): St,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    uri: Uri,
+) -> Response {
+    publication_read(st, principal, move |read| {
+        let params = Params::from_query(&uri);
+        let (focus, download) = doc_options(&params)?;
+        let terms = read.dataset_terms(&name)?;
+        let title = terms
+            .ontology_iri
+            .as_deref()
+            .and_then(|iri| terms.entries.get(iri).map(|term| term.label(iri, None)))
+            .unwrap_or(&name);
+        documentation(read, title, &terms, focus, download)
+    })
+    .await
+}
+
+fn doc_options(params: &Params) -> ApiResult<(Option<&str>, bool)> {
+    let focus = params.get("iri");
+    if focus.is_some_and(|iri| !valid_lookup_iri(iri)) {
+        return Err(bad("iri must be a valid absolute IRI"));
+    }
+    let download = match params.get("download") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(bad("download must be true or false")),
+    };
+    Ok((focus, download))
+}
+
+fn documentation(
+    read: &publication::Read<'_>,
+    title: &str,
+    terms: &publication::Terms,
+    focus: Option<&str>,
+    download: bool,
+) -> ApiResult {
+    if focus.is_some_and(|iri| !terms.entries.contains_key(iri)) {
+        return Err(not_found());
+    }
+    let mut charge = read.output_charge()?;
+    let mut output = html::HtmlWriter::new(read.st.limits.max_result_bytes, &mut charge);
+    docs::render(&mut output, &read.control, title, terms, focus, download)?;
+    let mut response = publication_body(
+        "text/html; charset=utf-8",
+        output.into_string().into_bytes(),
+        charge,
+    );
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(html::HTML_CSP),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    if download {
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=\"ontology.html\""),
+        );
+    }
+    Ok(response)
+}
+
+async fn ols_root() -> Response {
+    (
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(serde_json::json!({"_links": {
+            "ontologies": {"href": "/ols4/api/ontologies"},
+            "search": {"href": "/ols4/api/search{?q}", "templated": true},
+            "suggest": {"href": "/ols4/api/suggest{?q}", "templated": true},
+        }})),
+    )
+        .into_response()
+}
+
+async fn ols_search(
+    State(st): St,
+    Extension(principal): Extension<Principal>,
+    uri: Uri,
+) -> Response {
+    publication_read(st, principal, move |read| {
+        let catalog = read.catalog()?;
+        ols::search_response(read, &catalog, &Params::from_query(&uri), false)
+    })
+    .await
+}
+
+async fn ols_suggest(
+    State(st): St,
+    Extension(principal): Extension<Principal>,
+    uri: Uri,
+) -> Response {
+    publication_read(st, principal, move |read| {
+        let catalog = read.catalog()?;
+        ols::search_response(read, &catalog, &Params::from_query(&uri), true)
+    })
+    .await
+}
+
+async fn ols_ontologies(
+    State(st): St,
+    Extension(principal): Extension<Principal>,
+    uri: Uri,
+) -> Response {
+    publication_read(st, principal, move |read| {
+        let catalog = read.catalog()?;
+        ols::ontology_list(read, &catalog, &Params::from_query(&uri))
+    })
+    .await
+}
+
+async fn ols_ontology(
+    State(st): St,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    uri: Uri,
+) -> Response {
+    publication_read(st, principal, move |read| {
+        let catalog = read.catalog()?;
+        ols::ontology_response(read, &catalog, &id, &Params::from_query(&uri))
+    })
+    .await
+}
+
+async fn ols_term_list(
+    State(st): St,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    uri: Uri,
+) -> Response {
+    publication_read(st, principal, move |read| {
+        let catalog = read.catalog()?;
+        ols::term_list(read, &catalog, &id, &Params::from_query(&uri))
+    })
+    .await
+}
+
+async fn ols_term(
+    State(st): St,
+    Extension(principal): Extension<Principal>,
+    Path((id, iri)): Path<(String, String)>,
+    uri: Uri,
+) -> Response {
+    publication_read(st, principal, move |read| {
+        let iri = ols::decode_iri(&iri)?;
+        let catalog = read.catalog()?;
+        ols::term_response(read, &catalog, &id, &iri, &Params::from_query(&uri))
+    })
+    .await
+}
+
+async fn ols_related(
+    State(st): St,
+    Extension(principal): Extension<Principal>,
+    Path((id, iri, relation)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    publication_read(st, principal, move |read| {
+        let iri = ols::decode_iri(&iri)?;
+        let relation = ols::Relation::parse(&relation)?;
+        let catalog = read.catalog()?;
+        ols::related_terms(
+            read,
+            &catalog,
+            &id,
+            &iri,
+            relation,
+            &Params::from_query(&uri),
+        )
     })
     .await
 }

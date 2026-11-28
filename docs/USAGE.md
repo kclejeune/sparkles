@@ -28,6 +28,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 **Running and operating the server**
 
 * [Running the server](#running-the-server)
+  * [Publishing linked data](#publishing-linked-data)
   * [Network exposure](#network-exposure) · [Limits that are off by default](#limits-that-are-off-by-default) · [TLS](#tls)
   * [Endpoints and operations](#endpoints-and-operations) · [Previewing a write](#previewing-a-write)
   * [Fuseki and Jena clients](#fuseki-and-jena-clients) · [Migrating from Fuseki](#migrating-from-fuseki)
@@ -721,6 +722,28 @@ disk, is passed over with a warning and the server runs without spill. A sort th
 10.5M triples took 0.72 to 0.85 times the eager time on one thread and 1.9 to 2.2 times
 on eight, holding about 50 MB where an in-memory sort holds 580 MB. The details are in
 [API.md](API.md#disk-spill).
+
+## Publishing linked data
+
+Register a vocabulary with a namespace and the datasets and graphs that hold its
+terms. Serve IRI lookups through `/$/ld` or `/$/ld/ns/{prefix}`. The
+[resource catalog API](API.md#resource-catalog) manages the registration.
+
+Open `/$/ld/resources/{id}/doc` to browse a registered vocabulary or dataset, or
+`/$/ontology/{ds}/doc` to document the asserted ontology of a server dataset.
+Use `download=true` to save a standalone HTML file. Exporting with an administrator's
+session includes all data that session can query, so use a caller with the intended
+reader's permissions when preparing a restricted export.
+
+```sh
+curl -o anatomy.html 'http://localhost:3030/$/ld/resources/anatomy/doc?download=true'
+curl 'http://localhost:3030/$/ld/search?q=cardiac&ontology=anatomy&mode=prefix'
+```
+
+Point OLS clients at `http://localhost:3030/ols4/api` for search, autocomplete,
+ontology metadata and term hierarchy. Supply the same credentials the client would
+use for a dataset query. The [publishing API](API.md#linked-data-publishing) lists
+the routes and their parameters.
 
 ## Command-line tools
 
