@@ -3995,8 +3995,8 @@ fn marker_repair_mode(env: Option<u8>, test: u8, on: bool) -> u8 {
 }
 
 /// Row 1231's marker repair for a run, as [`DlRun::mrepair`](super::dl_rules::DlRun)
-/// holds it: `on` is [`Limits::rooted_marker_repair`](super::Limits), which defaults to
-/// [`MREPAIR_ON`] | [`MREPAIR_CF`] (M-return-cf, item 1250), and
+/// holds it: `on` is [`Limits::rooted_marker_repair`](super::Limits), which is on by
+/// default (item 1231) and gives [`MREPAIR_ON`] | [`MREPAIR_CF`] (M-return-cf, item 1250), and
 /// `SPARKLES_ROOTED_MARKER_REPAIR` overrides it for measurements with `0` (off), `1`
 /// (unfiltered [`MREPAIR_ON`]) or a sum of the bits [`MREPAIR_ON`], [`MREPAIR_HOLDER`],
 /// [`MREPAIR_UNITS`], [`MREPAIR_WIDE`] and [`MREPAIR_CF`].
@@ -5278,9 +5278,9 @@ fn marker_detail() -> bool {
 /// The tier of [`marker_trips`] at which row 1231's decline withdraws a rooted run's answer,
 /// or `None` for no decline. A finished rooted run with a pair at that tier makes no claim:
 /// the classifier starts again without the rooted rules and reports
-/// `Stats::dl_rooted_declined`. `on` is [`Limits::rooted_decline`](super::Limits), which
-/// gives tier 4, and `SPARKLES_ROOTED_MARKER_DECLINE` overrides it for measurements, with
-/// `off` for no decline or a tier.
+/// `Stats::dl_rooted_declined`. `on` is [`Limits::rooted_decline`](super::Limits), which is
+/// off by default (item 1231) and gives tier 4, and `SPARKLES_ROOTED_MARKER_DECLINE`
+/// overrides it for measurements, with `off` for no decline or a tier.
 pub(super) fn marker_decline(on: bool) -> Option<usize> {
     static ENV: std::sync::OnceLock<Option<Option<usize>>> = std::sync::OnceLock::new();
     let env = *ENV.get_or_init(|| {

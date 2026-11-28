@@ -5989,11 +5989,16 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
             restarts: 1,
             outcome: PlanKind::PollErr
         }));
+        // the 300 individuals take 475,505 conclusions without item 1231's repair, and the
+        // repair's notices take the run past the rooted bound, so the recovery runs without
+        // it and with the check
         let rec = k
             .classify(&Limits {
                 threads: 1,
                 rooted: true,
                 rooted_merge: true,
+                rooted_marker_repair: false,
+                rooted_decline: true,
                 ..Limits::default()
             })
             .expect("recovery after wide DifferentIndividuals cancel");

@@ -433,6 +433,7 @@ mod tests {
                     threads: 1,
                     rooted: true,
                     rooted_decline: decline,
+                    rooted_marker_repair: false,
                     ..Limits::default()
                 })
                 .expect("classify");

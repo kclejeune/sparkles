@@ -1930,6 +1930,7 @@ fn without_the_decline_a_rooted_run_claims_an_answer_that_misses_an_entailment()
                 expansion,
                 rooted: true,
                 rooted_decline: false,
+                rooted_marker_repair: false,
                 ..Limits::default()
             })
             .unwrap();
@@ -2153,6 +2154,7 @@ fn without_the_marker_repair_a_rooted_run_misses_each_fixture() {
                     expansion,
                     rooted: true,
                     rooted_decline: false,
+                    rooted_marker_repair: false,
                     ..Limits::default()
                 })
                 .unwrap();
@@ -2189,6 +2191,8 @@ fn the_decline_withdraws_the_rooted_answer_on_every_path() {
                 expansion,
                 counting,
                 rooted: true,
+                rooted_decline: true,
+                rooted_marker_repair: false,
                 ..Limits::default()
             };
             let at = format!("{name}, {threads} threads {expansion:?}");
@@ -2310,6 +2314,64 @@ fn the_marker_repair_delivers_on_every_path() {
     }
 }
 
+/// A rooted run with the default limits repairs the delivery of conditional ground facts
+/// and does not withdraw its answer (roadmap item 1231): on every path that the decline's
+/// test above takes, the run claims its answer and finds `K ⊑ Ans`, which the run with the
+/// repair and the check both off misses.
+#[test]
+fn the_default_rooted_run_repairs_and_claims_on_every_path() {
+    let d = Limits::default();
+    assert!(d.rooted_marker_repair && !d.rooted_decline);
+    let keyed = format!("{AV2}\n     HasKey(:K (:q) ())");
+    let counted = format!("{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))");
+    for (name, body, counting) in [
+        ("plain", AV2.to_string(), false),
+        ("counting", counted, true),
+        ("keys", keyed, false),
+    ] {
+        let ax = axioms(&body);
+        for (threads, expansion) in CONFIGS {
+            let limits = Limits {
+                threads,
+                expansion,
+                counting,
+                rooted: true,
+                ..Limits::default()
+            };
+            let at = format!("{name}, {threads} threads {expansion:?}");
+            let mut k = Classifier::of(&ax);
+            for round in 0..2 {
+                let out = k.classify(&limits).unwrap();
+                assert!(rooted_claim(&k, &out), "{at}, round {round}: no claim");
+                assert!(!out.stats.dl_over_budget, "{at}, round {round}");
+                assert!(out.consistent, "{at}, round {round}");
+                assert!(
+                    out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                    "{at}, round {round}: the rooted run misses K ⊑ Ans"
+                );
+            }
+            let mut k = Classifier::of(&ax);
+            let sat = k.saturate(&limits).unwrap();
+            assert!(sat.consistent, "{at}: saturate");
+            assert!(!sat.stats.dl_rooted_declined, "{at}: saturate");
+            assert!(!sat.stats.dl_over_budget, "{at}: saturate");
+            // the control: without the repair and the check the rooted run misses it
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    rooted_marker_repair: false,
+                    ..limits.clone()
+                })
+                .unwrap();
+            assert!(rooted_claim(&k, &out), "{at}: control");
+            assert!(
+                !out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "{at}: the control found K ⊑ Ans"
+            );
+        }
+    }
+}
+
 /// A rooted run with counting that passes its bound starts again without counting, and
 /// that run is rooted too: when it withdraws its answer, the run starts again without the
 /// rooted rules and reports both fallbacks. The bound lies between the work of the run
@@ -2323,6 +2385,8 @@ fn a_rooted_run_without_counting_after_the_bound_withdraws_its_answer_too() {
         threads: 1,
         counting: true,
         rooted: true,
+        rooted_decline: true,
+        rooted_marker_repair: false,
         dl_work: Some(180),
         ..Limits::default()
     };
@@ -2735,6 +2799,7 @@ fn the_marker_repair_delivers_in_the_run_without_counting_after_the_bound() {
                 counting: true,
                 rooted: true,
                 rooted_decline: false,
+                rooted_marker_repair: false,
                 dl_work: Some(180),
                 ..Limits::default()
             })
@@ -3875,6 +3940,10 @@ fn a_rooted_run_that_merges_equal_individuals_finishes_shoi_022() {
                     expansion,
                     rooted: true,
                     rooted_merge: true,
+                    // the merge finishes shoi-022 within the bound with item 1231's repair
+                    // off, which item 1327 follows
+                    rooted_marker_repair: false,
+                    rooted_decline: true,
                     dl_steps,
                     ..Limits::default()
                 })
@@ -4513,6 +4582,8 @@ fn a_restart_after_the_counting_fallback_keeps_counting_off_and_its_bound() {
             counting: true,
             rooted: true,
             rooted_decline: false,
+            // the bound lies between the two runs without item 1231's repair
+            rooted_marker_repair: false,
             rooted_merge: true,
             dl_work: Some(380),
             ..Limits::default()
@@ -5280,6 +5351,10 @@ fn all_50_shoi_fixtures_complete_within_bound_and_match_hermit_with_rooted_eq_sp
                     rooted: true,
                     rooted_merge: true,
                     rooted_eq_split: true,
+                    // shoi-022 finishes within the bound with item 1231's repair off, which
+                    // item 1327 follows
+                    rooted_marker_repair: false,
+                    rooted_decline: true,
                     ..Limits::default()
                 })
                 .unwrap();

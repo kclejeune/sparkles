@@ -62,7 +62,7 @@ const FIXTURES: [(&str, &str); 3] = [
     ),
 ];
 
-/// The modes: the default opt-in repair (0 with `rooted_marker_repair: true`, which selects
+/// The modes: the default repair (0 with `rooted_marker_repair: true`, which selects
 /// M-return-cf `1 | 128`), unfiltered on (1), explicit M-return-cf (1 + 128), on without
 /// returns (1 + 32), on without the replay of markers to contexts registered or reached
 /// late (1 + 64), and off.

@@ -1068,9 +1068,9 @@ pub struct DlRun {
     /// the most choices of one product that the run makes before it passes its bound on
     /// derived conclusions, zero for no limit (roadmap item 1011)
     width_limit: AtomicUsize,
-    /// row 1231's marker repair (PLAN v3.1's rule M), which is off unless
-    /// [`Limits::rooted_marker_repair`](super::Limits) turns it on: [`MREPAIR_ON`] with
-    /// [`MREPAIR_CF`] by default (M-return-cf, item 1250), with [`MREPAIR_HOLDER`],
+    /// row 1231's marker repair (PLAN v3.1's rule M), which
+    /// [`Limits::rooted_marker_repair`](super::Limits) turns on by default: [`MREPAIR_ON`]
+    /// with [`MREPAIR_CF`] (M-return-cf, item 1250), with [`MREPAIR_HOLDER`],
     /// [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`] for measurements, and [`MREPAIR_NO_RETURN`]
     /// and [`MREPAIR_NO_REPLAY`] for the diagnostic's tests
     pub mrepair: u8,
@@ -1134,8 +1134,8 @@ pub const MREPAIR_NO_REPLAY: u8 = 64;
 /// function terms of constants, while permitting `x`-only bodies), at both initial return
 /// arrival and late-premise replay. A product with a ground body then never arises, which
 /// would go back to the root and out again through each alternative condition of its body
-/// atoms. Enabled by default whenever [`Limits::rooted_marker_repair`](super::Limits) is on
-/// (`MREPAIR_ON | MREPAIR_CF`, item 1250); `SPARKLES_ROOTED_MARKER_REPAIR=1` selects
+/// atoms. On whenever [`Limits::rooted_marker_repair`](super::Limits) is, which it is by
+/// default (`MREPAIR_ON | MREPAIR_CF`, items 1250 and 1231); `SPARKLES_ROOTED_MARKER_REPAIR=1` selects
 /// unfiltered [`MREPAIR_ON`] for comparison.
 pub const MREPAIR_CF: u8 = 128;
 
