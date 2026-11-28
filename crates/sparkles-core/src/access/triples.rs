@@ -77,7 +77,7 @@ impl Protection {
     /// otherwise only when every construct of the pattern is on a list of those whose
     /// results depend on the snapshot and the caller alone. A call of `NOW()`, `RAND()`,
     /// `UUID()`, `STRUUID()`, `BNODE()` or an extension function, a SERVICE, a property
-    /// function, a LIMIT or OFFSET, and an aggregate other than `COUNT`, `MIN` and `MAX`
+    /// function, a LIMIT or OFFSET, and an aggregate other than `COUNT`
     /// make it `false`, as does a pattern that does not parse.
     pub fn stable(&self) -> bool {
         let Some(pattern) = &self.pattern else {

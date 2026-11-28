@@ -1701,9 +1701,9 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             };
             if through.is_none_or(|h| h < lvl) {
                 if p.is_anonymous() {
-                    if st.declared(&ds)
+                    if let Some(view) = managed_view(&route, &method, req.uri().path())
                         && p.level_any_branch(&ds).is_some()
-                        && let Some(view) = managed_view(&route, &method, req.uri().path())
+                        && st.declared(&ds)
                     {
                         crate::http::views::manage_refused(&ds, &view, &p, "level");
                     }

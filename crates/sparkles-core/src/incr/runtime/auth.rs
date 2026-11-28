@@ -416,12 +416,6 @@ impl Runtime {
         *self.after_info_hook.lock() = hook;
     }
 
-    /// Run `hook` in `open_view` before each state observation, after the decision.
-    #[cfg(test)]
-    pub(crate) fn set_before_read_state_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
-        *self.before_read_state_hook.lock() = hook;
-    }
-
     /// Run `hook` in `open_view` before the observer wait, after the view is behind.
     #[cfg(test)]
     pub(crate) fn set_observer_wait_hook(&self, hook: Option<Arc<dyn Fn(Instant) + Send + Sync>>) {
