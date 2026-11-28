@@ -737,6 +737,11 @@ async fn a03_tool_list() {
             "list_sources",
             "ingest_profile",
             "list_branches",
+            "catalog_sources",
+            "catalog_plan",
+            "catalog_harvest",
+            "catalog_import_lock",
+            "catalog_manifest",
         ]
     );
     let mut expected = expected_input_schemas();
@@ -780,6 +785,12 @@ async fn a03_tool_list() {
         "list_branches",
         json!({"type":"object","additionalProperties":false,"properties":{"dataset": expected[1].1["properties"]["dataset"].clone()}}),
     ));
+    expected.extend(
+        super::catalog::tool_defs()
+            .into_iter()
+            .filter(|def| def.read_only)
+            .map(|def| (def.name, def.input)),
+    );
     assert_eq!(expected.len(), tools.len());
     for ((name, schema), tool) in expected.into_iter().zip(tools) {
         assert_eq!(tool["name"], name);
@@ -792,7 +803,7 @@ async fn a03_tool_list() {
         assert!(tool["title"].is_string() && tool["description"].is_string());
         assert_eq!(
             tool.get("outputSchema").is_some(),
-            name != "sparql_query" && name != "recall",
+            name != "sparql_query" && name != "recall" && !super::catalog::READ.contains(&name),
             "{name}"
         );
         // no composition keywords or references anywhere
