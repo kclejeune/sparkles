@@ -896,6 +896,7 @@ async fn index_settings_require_whole_dataset_admin() {
                 endpoints: None,
                 lifts: vec![],
                 server_models: false,
+                views: Default::default(),
             }],
             ..Default::default()
         };
