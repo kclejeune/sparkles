@@ -118,6 +118,17 @@ pub(super) fn parse(
     field: Field,
     analyzer: Option<super::Analyzer>,
 ) -> Res<Parsed> {
+    parse_adjusted(src, searcher, field, analyzer, None, None)
+}
+
+pub(super) fn parse_adjusted(
+    src: &str,
+    searcher: &Searcher,
+    field: Field,
+    analyzer: Option<super::Analyzer>,
+    overlay: Option<&Searcher>,
+    check: Option<&dyn Fn() -> Res<()>>,
+) -> Res<Parsed> {
     let toks = lex(src)?;
     let mut p = Parser { toks, pos: 0 };
     let ast = p.query(0)?;
@@ -129,6 +140,8 @@ pub(super) fn parse(
     }
     let b = Builder {
         searcher,
+        overlay,
+        check,
         field,
         analyzer: searcher
             .index()
@@ -654,6 +667,8 @@ impl Parser {
 
 struct Builder<'a> {
     searcher: &'a Searcher,
+    overlay: Option<&'a Searcher>,
+    check: Option<&'a dyn Fn() -> Res<()>>,
     field: Field,
     analyzer: TextAnalyzer,
     matchers: std::cell::RefCell<Matchers>,
@@ -870,39 +885,53 @@ impl Builder<'_> {
             return Ok(self.term_query(w));
         }
         let dfa = automaton(edits).build_dfa(w);
-        let mut found: Vec<Vec<u8>> = Vec::new();
-        for seg in self.searcher.segment_readers() {
+        let mut scored: Vec<(f32, String)> = Vec::with_capacity(FUZZY_EXPANSIONS);
+        for seg in self
+            .searcher
+            .segment_readers()
+            .iter()
+            .chain(self.overlay.into_iter().flat_map(Searcher::segment_readers))
+        {
             let inv = seg.inverted_index(self.field).map_err(|e| e.to_string())?;
             let mut s = inv
                 .terms()
                 .search(Dfa(&dfa))
                 .into_stream()
                 .map_err(|e| e.to_string())?;
+            let mut visited = 0usize;
             while s.advance() {
-                found.push(s.key().to_vec());
-            }
-        }
-        found.sort_unstable();
-        found.dedup();
-        // Lucene's similarity: 1 - edits / the shorter length
-        let mut scored: Vec<(f32, &str)> = found
-            .iter()
-            .filter_map(|t| {
-                let t = std::str::from_utf8(t).ok()?;
-                let Distance::Exact(d) = dfa.eval(t) else {
-                    return None;
+                if visited.is_multiple_of(256)
+                    && let Some(check) = self.check
+                {
+                    check()?;
+                }
+                visited += 1;
+                let Ok(term) = std::str::from_utf8(s.key()) else {
+                    continue;
                 };
-                let sim = if d == 0 {
+                let Distance::Exact(d) = dfa.eval(term) else {
+                    continue;
+                };
+                // Lucene's similarity is 1 - edits / the shorter length.
+                let similarity = if d == 0 {
                     1.0
                 } else {
-                    1.0 - f32::from(d) / t.chars().count().min(len) as f32
+                    1.0 - f32::from(d) / term.chars().count().min(len) as f32
                 };
-                Some((sim, t))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(b.1)));
-        scored.truncate(FUZZY_EXPANSIONS);
-        self.mark_words(scored.iter().map(|(_, t)| *t));
+                if let Err(at) = scored.binary_search_by(|(value, word)| {
+                    similarity
+                        .total_cmp(value)
+                        .then_with(|| word.as_str().cmp(term))
+                }) && at < FUZZY_EXPANSIONS
+                {
+                    if scored.len() == FUZZY_EXPANSIONS {
+                        scored.pop();
+                    }
+                    scored.insert(at, (similarity, term.to_owned()));
+                }
+            }
+        }
+        self.mark_words(scored.iter().map(|(_, t)| t.as_str()));
         Ok(Box::new(BooleanQuery::new(
             scored
                 .iter()

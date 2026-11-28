@@ -17,13 +17,19 @@ use crate::sparql::plan::{GraphFilter, PathEnd, TextSpec};
 use crate::sparql::table::{Table, VarId};
 use crate::store::Snapshot;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::sync::Arc;
 use tantivy::collector::{Collector, SegmentCollector, TopDocs};
 use tantivy::columnar::BytesColumn;
 use tantivy::query::{
-    BooleanQuery, ConstScoreQuery, EnableScoring, Occur, Query, TermQuery, TermSetQuery,
+    Bm25StatisticsProvider, BooleanQuery, ConstScoreQuery, EnableScoring, Occur, Query, TermQuery,
+    TermSetQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption};
-use tantivy::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, Term};
+use tantivy::{
+    DocAddress, DocId, DocSet, Score, Searcher, SegmentOrdinal, SegmentReader, TERMINATED, Term,
+};
 
 /// Evaluate a `text:query` call against the snapshot's text view.
 pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
@@ -42,6 +48,13 @@ pub fn search_in(
     lenient: bool,
 ) -> Result<Table> {
     let snap = &ctx.snap;
+    if let Some(base) = snap
+        .text
+        .as_ref()
+        .and_then(|view| view.overlay_base.as_deref())
+    {
+        return search_adjusted(ctx, spec, vars, subjects, lenient, base);
+    }
     let Some(Prepared {
         sh,
         resolved,
@@ -137,9 +150,9 @@ fn prepare<'a>(
     lenient: bool,
 ) -> Result<Option<Prepared<'a>>> {
     let snap = &ctx.snap;
-    if snap.historical {
+    if snap.historical && snap.text.is_none() {
         return Err(Error::HistoryUnsupported(format!(
-            "full-text search is only available at the head; this query reads commit {}",
+            "historical full-text search needs the current generation or an indexed named snapshot; this query reads commit {}",
             snap.commit
         )));
     }
@@ -183,6 +196,346 @@ fn prepare<'a>(
         matchers: parsed.matchers,
         query,
     }))
+}
+
+/// A transaction or historical query searches the committed corpus and its private
+/// overlay with one query and one set of BM25 statistics.
+struct Adjusted<'a> {
+    sh: &'a Arc<super::imp::Shared>,
+    resolved: Resolved,
+    field: Field,
+    matchers: super::lucene::Matchers,
+    query: Box<dyn Query>,
+}
+
+fn prepare_adjusted<'a>(
+    ctx: &Ctx,
+    spec: &TextSpec,
+    subjects: Option<&[Id]>,
+    lenient: bool,
+    base: &'a Snapshot,
+    charge: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<Option<Adjusted<'a>>> {
+    ctx.check()?;
+    let view = base.text.as_ref().expect("adjustment has a base text view");
+    let sh = &view.ready(base.commit)?.index;
+    if view.seq != base.commit {
+        return Err(unavailable("dataset", "stale", view.seq, base.commit));
+    }
+    for p in &spec.predicates {
+        if !sh.config.predicates.contains(p) {
+            return Err(Error::invalid(format!(
+                "text:query: <{p}> is not text-indexed"
+            )));
+        }
+    }
+    let mut resolved = view.resolved()?.clone();
+    resolved.overlay = super::imp::build_overlay(ctx, base, sh, &resolved.searcher, charge)?;
+    resolved.adjusted = true;
+    resolved.uncertain = Arc::new(FxHashSet::default());
+    let (field, analyzer) = sh.fields.text_for(spec.lang.as_deref());
+    let stopped = std::cell::RefCell::new(None);
+    let check = || {
+        ctx.check().map_err(|error| {
+            let message = error.to_string();
+            *stopped.borrow_mut() = Some(error);
+            message
+        })
+    };
+    let parsed = super::lucene::parse_adjusted(
+        &spec.query,
+        &resolved.searcher,
+        field,
+        analyzer,
+        resolved.overlay.as_ref(),
+        Some(&check),
+    );
+    if let Some(error) = stopped.into_inner() {
+        return Err(error);
+    }
+    let parsed = match parsed {
+        Ok(p) => p,
+        Err(_) if lenient => return Ok(None),
+        Err(e) => return Err(Error::invalid(format!("text:query: {e}"))),
+    };
+    let Some(query) = scoped(&ctx.snap, spec, &sh.fields, parsed.query, subjects) else {
+        return Ok(None);
+    };
+    Ok(Some(Adjusted {
+        sh,
+        resolved,
+        field,
+        matchers: parsed.matchers,
+        query,
+    }))
+}
+
+/// An empty committed corpus or field needs a positive average field length so
+/// matching documents of a newly indexed term get finite scores.
+struct CommittedStats<'a>(&'a Searcher);
+
+impl Bm25StatisticsProvider for CommittedStats<'_> {
+    fn total_num_tokens(&self, field: Field) -> tantivy::Result<u64> {
+        let tokens = self.0.total_num_tokens(field)?;
+        if tokens == 0 {
+            self.total_num_docs()
+        } else {
+            Ok(tokens)
+        }
+    }
+
+    fn total_num_docs(&self) -> tantivy::Result<u64> {
+        Ok(self.0.total_num_docs()?.max(1))
+    }
+
+    fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
+        self.0.doc_freq(term)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RankedHit(Score, DocAddress);
+
+impl Ord for RankedHit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.0.total_cmp(&self.0).then(self.1.cmp(&other.1))
+    }
+}
+
+impl PartialOrd for RankedHit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for RankedHit {}
+
+fn adjusted_hit_bytes(count: usize, bytes: u64) -> Result<u64> {
+    (count as u64).checked_mul(bytes).ok_or_else(|| {
+        Error::BudgetExceeded(crate::Budget {
+            kind: crate::BudgetKind::Memory,
+            limit: u64::MAX,
+            requested: u64::MAX,
+        })
+    })
+}
+
+impl Adjusted<'_> {
+    /// Collect only actual visible hits. The committed searcher can retain later
+    /// additions and earlier removals from its batch, so a hit must belong to the
+    /// committed state as well as to the read's target state.
+    fn hits(
+        &self,
+        ctx: &Ctx,
+        base: &Snapshot,
+        top: Option<usize>,
+        charge: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Vec<(Score, DocAddress)>> {
+        const CHECK_PAGE: usize = 128;
+        let _page_charge = ctx.charge(CHECK_PAGE as u64 * PAGE_HIT_BYTES)?;
+        let resolved = &self.resolved;
+        let snap = &ctx.snap;
+        let stats = CommittedStats(&resolved.searcher);
+        let mut page = Vec::with_capacity(CHECK_PAGE);
+        let mut hits = BinaryHeap::new();
+        let max = self.sh.config.max_hits;
+        let cap = top.unwrap_or(max);
+        let mut admit = |hit: RankedHit| -> Result<()> {
+            if hits.len() == cap {
+                if top.is_none() {
+                    return Err(Error::BudgetExceeded(crate::Budget {
+                        kind: crate::BudgetKind::Rows,
+                        limit: max as u64,
+                        requested: (max as u64)
+                            .checked_add(1)
+                            .ok_or_else(|| text_err("hit count overflow"))?,
+                    }));
+                }
+                if let Some(mut worst) = hits.peek_mut()
+                    && hit < *worst
+                {
+                    *worst = hit;
+                }
+                return Ok(());
+            }
+            if hits.len() == hits.capacity() {
+                let old = hits.capacity();
+                let new = old.checked_mul(2).unwrap_or(cap).max(GROW).min(cap);
+                let overlapping = old
+                    .checked_add(new)
+                    .ok_or_else(|| text_err("hit capacity overflow"))?;
+                charge(adjusted_hit_bytes(overlapping, HIT_BYTES)?)?;
+                hits.reserve_exact(new - old);
+                charge(adjusted_hit_bytes(hits.capacity(), HIT_BYTES)?)?;
+            }
+            hits.push(hit);
+            Ok(())
+        };
+        let mut flush = |page: &mut Vec<(Score, DocAddress)>, committed| -> Result<()> {
+            ctx.check()?;
+            let terms = hit_terms(
+                ctx,
+                resolved,
+                &self.sh.ids,
+                page,
+                Need {
+                    s: true,
+                    p: true,
+                    o: true,
+                    g: true,
+                    hash: false,
+                },
+            )?;
+            for (i, &(score, address)) in page.iter().enumerate() {
+                ctx.check()?;
+                let quad = [terms.s[i], terms.p[i], terms.o[i], terms.g[i]];
+                if quad.contains(&Id::UNDEF)
+                    || (committed && !base.contains(&quad)?)
+                    || !snap.contains(&quad)?
+                    || snap
+                        .mask
+                        .as_ref()
+                        .is_some_and(|m| m.hides(&quad.map(|id| id.0)))
+                {
+                    continue;
+                }
+                admit(RankedHit(score, address))?;
+            }
+            page.clear();
+            Ok(())
+        };
+        let mut segment = 0u32;
+        for (searcher, committed) in std::iter::once((&resolved.searcher, true))
+            .chain(resolved.overlay.as_ref().map(|overlay| (overlay, false)))
+        {
+            ctx.check()?;
+            let weight = self
+                .query
+                .weight(EnableScoring::enabled_from_statistics_provider(
+                    &stats, searcher,
+                ))
+                .map_err(text_err)?;
+            for reader in searcher.segment_readers() {
+                ctx.check()?;
+                let mut scorer = weight.scorer(reader, 1.0).map_err(text_err)?;
+                let alive = reader.alive_bitset();
+                let mut doc = scorer.doc();
+                let mut visited = 0u64;
+                while doc != TERMINATED {
+                    if visited.is_multiple_of(CHECK_PAGE as u64) {
+                        ctx.check()?;
+                    }
+                    visited += 1;
+                    if alive.is_none_or(|set| set.is_alive(doc)) {
+                        page.push((scorer.score(), DocAddress::new(segment, doc)));
+                        if page.len() == CHECK_PAGE {
+                            flush(&mut page, committed)?;
+                        }
+                    }
+                    doc = scorer.advance();
+                }
+                if !page.is_empty() {
+                    flush(&mut page, committed)?;
+                }
+                segment = segment
+                    .checked_add(1)
+                    .ok_or_else(|| text_err("segment count overflow"))?;
+            }
+        }
+        ctx.check()?;
+        // Converting the retained heap to the reader's ordered list holds two buffers.
+        let buffers = hits
+            .capacity()
+            .checked_add(hits.len())
+            .ok_or_else(|| text_err("hit capacity overflow"))?;
+        charge(adjusted_hit_bytes(buffers, HIT_BYTES)?)?;
+        let hits: Vec<_> = hits
+            .into_sorted_vec()
+            .into_iter()
+            .map(|h| (h.0, h.1))
+            .collect();
+        charge(adjusted_hit_bytes(hits.capacity(), HIT_BYTES)?)?;
+        Ok(hits)
+    }
+}
+
+fn search_adjusted(
+    ctx: &Ctx,
+    spec: &TextSpec,
+    vars: &[VarId],
+    subjects: Option<&[Id]>,
+    lenient: bool,
+    base: &Snapshot,
+) -> Result<Table> {
+    let overlay = ctx.charge(0)?;
+    let Some(prepared) = prepare_adjusted(ctx, spec, subjects, lenient, base, &mut |n| {
+        overlay.resize(n)
+    })?
+    else {
+        return Ok(Table::empty(vars.to_vec()));
+    };
+    let out = Outputs::new(
+        spec,
+        vars,
+        &prepared.resolved,
+        &prepared.sh.ids,
+        ctx.snap.mask.is_some(),
+    );
+    let max = prepared.sh.config.max_hits;
+    let limit = spec.limit.filter(|&n| n <= max);
+    let mut fetch = limit;
+    let mut table = loop {
+        let hit_charge = ctx.charge(0)?;
+        let hits = prepared.hits(ctx, base, fetch, &mut |n| hit_charge.resize(n))?;
+        let wanted = limit.unwrap_or(hits.len());
+        ctx.check_output(hits.len().min(wanted), vars.len())?;
+        let decode_count = if spec.dedup {
+            hits.len()
+        } else {
+            hits.len().min(wanted)
+        };
+        let _decode = ctx.charge(adjusted_hit_bytes(decode_count, PAGE_HIT_BYTES + 48)?)?;
+        let hits = &hits[..decode_count];
+        let terms = out.terms(ctx, &prepared.resolved, hits)?;
+        let mut table = Table::new(vars.to_vec());
+        let mut state = RowState::default();
+        out.rows(
+            ctx,
+            &prepared.resolved,
+            hits,
+            &terms,
+            0,
+            wanted,
+            &mut table,
+            &mut state,
+        )?;
+        state.finish();
+        if table.len() >= wanted || fetch.is_none_or(|fetch| hits.len() < fetch) {
+            break table;
+        }
+        fetch = fetch.and_then(|n| n.checked_mul(2));
+        if fetch.is_none() {
+            return Err(text_err("hit capacity overflow"));
+        }
+    };
+    if let (Some(opts), Some(c)) = (&spec.highlight, out.clit) {
+        highlight(
+            ctx,
+            &prepared.resolved,
+            prepared.field,
+            opts,
+            &prepared.matchers,
+            &mut table.cols[c],
+            usize::MAX,
+        )?;
+    }
+    Ok(table)
 }
 
 /// The hits a reader decodes at a time.
@@ -241,6 +594,14 @@ impl Reader {
             spec.limit.is_none(),
             "a reader serves a search without a limit"
         );
+        if let Some(base) = ctx
+            .snap
+            .text
+            .as_ref()
+            .and_then(|view| view.overlay_base.as_deref())
+        {
+            return Self::open_adjusted(ctx, spec, vars, base, charge);
+        }
         let Some(Prepared {
             sh,
             resolved,
@@ -341,6 +702,61 @@ impl Reader {
             sh: sh.clone(),
             field,
             matchers,
+            hits,
+            page: None,
+            at: 0,
+            st,
+        }))
+    }
+
+    fn open_adjusted(
+        ctx: &Ctx,
+        spec: &TextSpec,
+        vars: &[VarId],
+        base: &Snapshot,
+        charge: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Option<Reader>> {
+        let mut overlay_bytes = 0;
+        let Some(prepared) = prepare_adjusted(ctx, spec, None, false, base, &mut |n| {
+            charge(n)?;
+            overlay_bytes = n;
+            Ok(())
+        })?
+        else {
+            return Ok(None);
+        };
+        let mut adjust_charge = |n: u64| {
+            charge(
+                overlay_bytes
+                    .checked_add(n)
+                    .ok_or_else(|| text_err("text memory size overflow"))?,
+            )
+        };
+        let hits = prepared.hits(ctx, base, None, &mut adjust_charge)?;
+        ctx.check_output_rows(hits.len())?;
+        let hit_bytes = adjusted_hit_bytes(hits.capacity(), HIT_BYTES)?;
+        let page = adjusted_hit_bytes(hits.len().min(PAGE), PAGE_HIT_BYTES)?;
+        let seen = if spec.dedup {
+            adjusted_hit_bytes(hits.len(), 64)?
+        } else {
+            0
+        };
+        let bytes = hit_bytes
+            .checked_add(page)
+            .and_then(|n| n.checked_add(seen))
+            .ok_or_else(|| text_err("text memory size overflow"))?;
+        adjust_charge(bytes)?;
+        let mut st = RowState::default();
+        if spec.dedup {
+            st.seen.reserve(hits.len());
+        }
+        Ok(Some(Self {
+            spec: spec.clone(),
+            vars: vars.to_vec(),
+            sh: prepared.sh.clone(),
+            resolved: prepared.resolved,
+            field: prepared.field,
+            matchers: prepared.matchers,
             hits,
             page: None,
             at: 0,
@@ -949,7 +1365,7 @@ fn hit_terms(
         let run = &order[start..end];
         docs.clear();
         docs.extend(run.iter().map(|&i| hits[i as usize].1.doc_id));
-        let ff = resolved.searcher.segment_reader(seg).fast_fields();
+        let ff = resolved.segment(seg).fast_fields();
         let bytes = |name: &str| -> Result<BytesColumn> {
             ff.bytes(name)
                 .map_err(text_err)?
@@ -962,7 +1378,7 @@ fn hit_terms(
                 .ok_or_else(|| text_err(format!("no {name} column")))?
                 .into())
         };
-        let segment = resolved.searcher.segment_reader(seg).segment_id();
+        let segment = resolved.segment(seg).segment_id();
         // subjects and objects: from the id cache, or looked up and cached; with
         // documents to check against the snapshot, their keys are hashed too
         for (on, column, ids) in [
@@ -992,6 +1408,12 @@ fn hit_terms(
                 for (&i, v) in run.iter().zip(ords.per_doc(&vals, (Id::UNDEF, 0))) {
                     ids[i as usize] = v.0;
                     out.hash[i as usize] ^= v.1;
+                }
+            } else if resolved.adjusted {
+                let mut vals = Vec::with_capacity(ords.distinct.len());
+                decode(&col, &ords.distinct, |k| vals.push(lookup(k)))?;
+                for (&i, id) in run.iter().zip(ords.per_doc(&vals, Id::UNDEF)) {
+                    ids[i as usize] = id;
                 }
             } else {
                 let key = (segment, column);

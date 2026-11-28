@@ -8872,10 +8872,10 @@ impl WriteTxn<'_> {
             .cacheable(false)
             .results(Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)))
             .delta(self.delta.clone())
-            // the full-text index does not cover this transaction's changes either, and
-            // a search has no plan without it: refused once there are changes
             .text(match &self.base.text {
-                Some(t) if self.is_dirty() => Some(Arc::new(t.with_uncommitted_changes())),
+                Some(t) if self.is_dirty() => Some(Arc::new(
+                    t.with_uncommitted_changes(self.bulk.is_empty().then(|| self.base.clone())),
+                )),
                 t => t.clone(),
             })
             // the index does not cover this transaction's changes: plans without it

@@ -721,6 +721,9 @@ pub struct TextView {
     /// index does not cover: searches are refused
     #[cfg_attr(not(feature = "text"), allow(dead_code))]
     pub(crate) uncommitted: bool,
+    /// RDF state represented by this searcher, when the text call must apply its delta.
+    #[cfg(feature = "text")]
+    pub(crate) overlay_base: Option<std::sync::Arc<crate::store::Snapshot>>,
 }
 
 #[cfg(feature = "text")]
@@ -801,6 +804,7 @@ impl TextView {
             owner: 0,
             source: ViewSource::Unavailable(state),
             uncommitted: false,
+            overlay_base: None,
         }
     }
 
@@ -831,7 +835,12 @@ impl TextView {
     }
 
     /// This view for a write transaction with uncommitted changes.
-    pub(crate) fn with_uncommitted_changes(&self) -> TextView {
+    pub(crate) fn with_uncommitted_changes(
+        &self,
+        #[cfg_attr(not(feature = "text"), allow(unused_variables))] base: Option<
+            std::sync::Arc<crate::store::Snapshot>,
+        >,
+    ) -> TextView {
         TextView {
             seq: self.seq,
             epoch: self.epoch,
@@ -840,6 +849,8 @@ impl TextView {
             #[cfg(feature = "text")]
             source: self.source.clone(),
             uncommitted: true,
+            #[cfg(feature = "text")]
+            overlay_base: base,
         }
     }
 }
@@ -848,9 +859,8 @@ impl TextView {
 #[cfg_attr(not(feature = "text"), allow(dead_code))]
 pub(crate) fn uncommitted_changes() -> Error {
     Error::Unsupported(
-        "text:query cannot run in a write transaction after the transaction has changed \
-         data, because the full-text index covers committed data only: search before the \
-         first change or after the commit"
+        "text:query cannot index these uncommitted changes: the transaction has a staged \
+         bulk write or more than 10000 newly indexed literals"
             .into(),
     )
 }
@@ -1382,7 +1392,24 @@ mod imp {
     #[derive(Clone)]
     pub(crate) struct Resolved {
         pub(crate) searcher: tantivy::Searcher,
+        pub(super) overlay: Option<tantivy::Searcher>,
+        pub(super) adjusted: bool,
         pub(super) uncertain: Arc<FxHashSet<u64>>,
+    }
+
+    impl Resolved {
+        pub(super) fn segment(&self, ord: u32) -> &tantivy::SegmentReader {
+            let base_segments = self.searcher.segment_readers().len();
+            if (ord as usize) < base_segments || self.overlay.is_none() {
+                self.searcher.segment_reader(ord)
+            } else {
+                &self
+                    .overlay
+                    .as_ref()
+                    .expect("overlay segment")
+                    .segment_readers()[ord as usize - base_segments]
+            }
+        }
     }
 
     /// The views of the commits applied between two seals share a slot, set when the
@@ -1395,6 +1422,8 @@ mod imp {
             let slot = Slot::default();
             let _ = slot.0.set(Some(Resolved {
                 searcher,
+                overlay: None,
+                adjusted: false,
                 uncertain,
             }));
             Arc::new(slot)
@@ -2306,6 +2335,128 @@ mod imp {
         }
     }
 
+    /// Build only the literals added by the adjusted view. The caller holds the
+    /// memory charge for the writer arena, documents and resulting RAM files.
+    pub(super) fn build_overlay(
+        ctx: &crate::sparql::ctx::Ctx,
+        base: &Snapshot,
+        shared: &Shared,
+        committed: &tantivy::Searcher,
+        charge: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Option<tantivy::Searcher>> {
+        let snap = &ctx.snap;
+        let config = &shared.config;
+        let mut writer = None;
+        const DOCS: u64 = 10_000;
+        const BYTES: u64 = 128 << 20;
+        const ARENA: u64 = 2 << 20;
+        let over_budget = |requested| {
+            Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::Memory,
+                limit: BYTES,
+                requested,
+            })
+        };
+        let mut documents = 0u64;
+        let mut historical_changes = 0u64;
+        let mut bytes = 0u64;
+        let mut build = |q: &[Id; 4]| -> Result<()> {
+            ctx.check()?;
+            if snap.historical {
+                historical_changes += 1;
+                if historical_changes > DOCS {
+                    return Err(Error::HistoryUnsupported(
+                        "historical full-text search spans more than 10000 changed quads".into(),
+                    ));
+                }
+            }
+            if !matches!(q[2].tag(), Tag::Vocab | Tag::Delta)
+                || base.contains(q)?
+                || !snap.contains(q)?
+                || !ctx
+                    .with_controlled_key(q[2], |key| Ok(string_literal(key).is_some()))?
+                    .unwrap_or(false)
+            {
+                return Ok(());
+            }
+
+            // Admission precedes copying RDF keys. Cover the document, analyzer,
+            // postings and fast fields while the writer and RAM files overlap.
+            let key_cost = |id| {
+                ctx.with_controlled_key(id, |key| {
+                    (key.len() as u64)
+                        .checked_mul(32)
+                        .ok_or_else(|| over_budget(u64::MAX))
+                })
+                .map(|n| n.unwrap_or(0))
+            };
+            let mut growth = 4096u64;
+            for id in q {
+                growth = growth
+                    .checked_add(key_cost(*id)?)
+                    .ok_or_else(|| over_budget(u64::MAX))?;
+            }
+            let requested = bytes
+                .checked_add(growth)
+                .ok_or_else(|| over_budget(u64::MAX))?;
+            if requested > BYTES {
+                return Err(over_budget(requested));
+            }
+            charge(requested)?;
+            // Ineligible documents need only transient state. A fresh Terms keeps
+            // predicate/graph keys from accumulating when many are out of scope.
+            let Some(Doc { doc: Some(doc), .. }) =
+                Terms::default().document(snap, &shared.fields, config, q)
+            else {
+                return Ok(());
+            };
+            documents += 1;
+            if documents > DOCS {
+                return Err(super::uncommitted_changes());
+            }
+            bytes = requested;
+            if writer.is_none() {
+                bytes = bytes
+                    .checked_add(ARENA)
+                    .ok_or_else(|| over_budget(u64::MAX))?;
+                if bytes > BYTES {
+                    return Err(over_budget(bytes));
+                }
+                charge(bytes)?;
+                let source = committed.index();
+                let index = Index::builder()
+                    .schema(source.schema())
+                    .tokenizers(source.tokenizers().clone())
+                    .fast_field_tokenizers(source.fast_field_tokenizer().clone())
+                    .create_in_ram()
+                    .map_err(text_err)?;
+                writer =
+                    Some(tantivy::SingleSegmentIndexWriter::new(index, 1 << 20).map_err(text_err)?);
+            }
+            ctx.check()?;
+            writer
+                .as_mut()
+                .expect("opened above")
+                .add_document(doc)
+                .map_err(text_err)
+        };
+        let mut result = Ok(());
+        snap.delta.changes_since(&base.delta, |q| {
+            result = build(q);
+            result.is_ok()
+        });
+        result?;
+        ctx.check()?;
+        charge(bytes)?;
+        let Some(writer) = writer else {
+            return Ok(None);
+        };
+        let index = writer.finalize().map_err(text_err)?;
+        ctx.check()?;
+        let reader = index.reader().map_err(text_err)?;
+        Ok(Some(reader.searcher()))
+    }
+
     /// Copy a pinned committed Tantivy checkpoint into a branch-owned directory.
     /// Segment metadata is kept alive throughout copying, so upstream merges cannot
     /// garbage-collect its files. A checkpoint after the fork cannot seed that fork.
@@ -2734,6 +2885,7 @@ mod imp {
                 owner: inner.owner,
                 source: ViewSource::Pending(outcome.clone()),
                 uncommitted: false,
+                overlay_base: None,
             });
             let staged = Staged {
                 inner: inner.clone(),
@@ -3238,6 +3390,7 @@ mod imp {
                     owner: Arc::downgrade(self),
                 }),
                 uncommitted: false,
+                overlay_base: None,
             })
         }
 
@@ -3509,6 +3662,8 @@ mod imp {
             }
             let _ = slot.0.set(Some(Resolved {
                 searcher: live.reader.searcher(),
+                overlay: None,
+                adjusted: false,
                 uncertain: Arc::new(live.uncertain.clone()),
             }));
             live.open = None;
@@ -4672,6 +4827,41 @@ mod imp {
         }
 
         #[test]
+        fn text_overlay_checks_cancellation_after_admitting_a_document() {
+            use crate::sparql::ctx::Ctx;
+            let store = crate::store::Store::in_memory(Default::default());
+            store.enable_text(Default::default()).unwrap();
+            let mut tx = store.write();
+            let quad = oxrdf::Quad::new(
+                oxrdf::NamedNode::new_unchecked("urn:overlay"),
+                oxrdf::NamedNode::new_unchecked("urn:label"),
+                oxrdf::Literal::from("quokka"),
+                oxrdf::GraphName::DefaultGraph,
+            );
+            let id = tx.encode_quad(&quad, &mut Default::default()).unwrap();
+            assert!(tx.insert(id).unwrap());
+            let ctx = Ctx::new(Arc::new(tx.view()));
+            let base = tx.base();
+            let view = base.text.as_ref().unwrap();
+            let shared = &view.ready(base.commit).unwrap().index;
+            let committed = &view.resolved().unwrap().searcher;
+            assert!(
+                build_overlay(&ctx, base, shared, committed, &mut |_| Ok(()))
+                    .unwrap()
+                    .is_some()
+            );
+            let mut admitted = 0;
+            let stopped = build_overlay(&ctx, base, shared, committed, &mut |bytes| {
+                admitted += 1;
+                assert!(bytes > 0);
+                ctx.cancel.store(true, Ordering::Relaxed);
+                Ok(())
+            });
+            assert!(matches!(stopped, Err(Error::Cancelled)));
+            assert!(admitted > 0);
+        }
+
+        #[test]
         fn a_newer_text_config_is_refused() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("text.json");
@@ -4868,7 +5058,7 @@ mod imp {
                 )
                 .unwrap();
                 assert!(plain.boolean);
-                let changed = held.text.as_ref().unwrap().with_uncommitted_changes();
+                let changed = held.text.as_ref().unwrap().with_uncommitted_changes(None);
                 assert!(!changed.is_available());
                 assert!(changed.uncommitted);
                 let mut historical = (*held).clone();
