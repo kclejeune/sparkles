@@ -479,6 +479,7 @@ async fn large_pieces_are_checked_before_sending() {
     assert_eq!(m.stats.new_blobs, 0);
     assert_eq!(m.stats.reused_blobs, 2);
     assert_eq!(m.parent, None);
-    // one HEAD for the big piece (plus the early name check); the small one is a create
-    assert_eq!(after.head.ok - before.head.ok, 2);
+    // The big piece, the early name check and the final lease check each use HEAD.
+    // The small piece uses a conditional create.
+    assert_eq!(after.head.ok - before.head.ok, 3);
 }

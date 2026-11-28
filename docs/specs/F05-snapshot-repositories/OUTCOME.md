@@ -160,19 +160,48 @@ and running scripts already use them, and because Fuseki has no other route unde
 
 ### Roadmap follow-ups (2026-10-12)
 
-**Whole-server backup and restore, every dataset in one request, a remote backup CLI,
-repository copy, content-defined chunking and retained-history storage controls** (item 61, Tier 6,
-[ROADMAP](../../ROADMAP.md)).
+Item 61 in the [roadmap](../../ROADMAP.md) covers repository controls, whole-server and
+multi-dataset backups, and retained dataset history.
 
-* **What is missing today.** The status block's list still holds. The repository routes
-  are `GET /$/repositories/{repo}/backups` (a listing only), `gc`, `locks`, `test` and
-  `verify`; there is no `POST` that backs up several datasets
-  (`docs/openapi.json`). `sparkles repo` has `add`, `key`, `list`, `show`, `test`,
-  `verify`, `remove`, `gc` and `locks`, with no `copy`, and `sparkles backup` works on a
-  data directory or a stopped server only, with no `--server`
-  (`crates/sparkles-server/src/backup/cli.rs`). Pieces are fixed 32 MiB slices of each
-  file. Server state (the catalog's `config.json`, auth state, `models.json`, settings
-  and notification files, repository registrations) is not backed up.
+`Repository::copy_to` copies backups selected by name, dataset and completion time.
+The copy verifies source blobs by their content IDs and checks each complete file digest
+before publishing its destination manifest. Existing destination blobs are verified
+before reuse. Encrypted copies derive destination blob IDs from the active destination
+key and seal the blobs and manifests with that key. A retry can reuse uploaded blobs and
+published backups. A different backup using the same destination name fails. Copy
+replans vocabulary boundaries using the destination settings. Copying from an
+encrypted source to a plaintext destination requires explicit opt-in. The copy keeps
+the source policy and run names. A policy with the same name in the destination can
+select the copied backup for expiry. Each manifest becomes visible independently
+after its own transfer completes.
+
+New repositories can opt in to [F11 FastCDC](../F11-encryption-at-rest.md#6-content-defined-chunking-and-write-only-repositories-phase-2)
+for immutable `vocab.dat` files. The format 2 repository marker records the 1 MiB
+minimum, 4 MiB target, 16 MiB maximum and NC-2 settings. The repository UUID seeds
+plaintext chunking, and encrypted repositories derive the table with the active key epoch.
+The manifest records `fastcdc-2016/1` on each chunked file and in its required feature
+list. Older readers refuse format 2 repositories and backups requiring an unknown
+chunker. Default repositories keep 32 MiB fixed pieces. Enabling FastCDC by default still
+requires the measured 30% upload reduction in F11 §6.4.
+
+The format 2 marker can select an S3 storage class for blobs and configure Object Lock
+for blobs and manifests. Before publishing a protected manifest, the repository
+extends the retention of any referenced blob that expires sooner. Metadata remains in
+the backend's default storage class. Restore and copy report `archive-restore-required`
+when S3 requires the operator to thaw an archived blob. Logical policy expiry identifies
+backups to delete. A protected manifest remains visible until its storage retention
+or legal hold allows deletion. Garbage collection keeps referenced blobs and only
+deletes specific unreferenced object versions, without governance bypass. It reports
+retained blobs and records partial deletion failures so a later run can retry them.
+
+Repository zstd remains reserved. Raw and LZ4 cover existing repositories and transfers,
+and there is no measured transfer-size, CPU and restore-time evidence to justify a
+third codec. The reader still refuses the zstd tag and other unknown codecs. Retiring
+the reserved feature requires the maintainer decision described in
+[X01](../X01-compression-codecs.md#remaining-codec-decisions).
+
+The remaining server and capture work includes the following operations.
+
 * **Every dataset in one request.** `POST /$/repositories/{repo}/backups` with
   `{datasets: [...] | "*", message?}` starts one task that backs up each dataset in
   turn, sharing a `run` id, as §7 Phase 2 designs; policies already do this.
@@ -193,45 +222,29 @@ repository copy, content-defined chunking and retained-history storage controls*
   `verify` and `delete`, sending the existing routes through the shared client with the
   saved credentials of [C09 §7.4](../C09-dataset-access-control.md), and waiting for the
   task with progress unless `--no-wait`.
-* **Repository copy.** `sparkles repo copy SRC DST [--dataset D] [--backups NAME...]
-  [--since DATE]` copies manifests and the blobs they reference that `DST` lacks,
-  checked by id, then writes the manifests last so that a partial copy is invisible.
-  Between two encrypted repositories blob ids are keyed per repository ([F11
-  §5.2](../F11-encryption-at-rest.md)), so the copy re-encrypts and re-keys each blob and
-  cannot deduplicate by id; it deduplicates by the plaintext id inside the run. The
-  server route is a task, `POST /$/repositories/{repo}/copy`.
-* **Content-defined chunking.** Designed in [F11 §6](../F11-encryption-at-rest.md#6-content-defined-chunking-and-write-only-repositories-phase-2):
-  FastCDC for `vocab.dat` behind the 30% gate of §5.4. It applies to plaintext
-  repositories too, and the manifest records the chunker per file so old backups stay
-  readable.
+* **Repository management.** Expose repository copy in `sparkles repo copy SRC DST`
+  and the task route `POST /$/repositories/{repo}/copy`. Pin requested storage policy
+  in registered repository configuration and expose initialization options to operators.
+  Report storage-protected expiry as deferred in lifecycle policy results.
 
+### Object Lock version visibility
 
-### Remaining history and retention contract
+Object Lock protects specific versions. A principal allowed to write a key
+unconditionally can make a new version current while the protected version remains
+recoverable in S3. Sparkles writes immutable keys with a create condition. Item 1330
+covers recovery and detection when a write outside that contract shadows a protected
+version. Deployments should restrict writes to the repository prefix and enforce the
+create condition on its blob and manifest keys.
 
-Item 61 also completes the optional inclusion of F06 retained generations, pins and
-retention metadata from the original Phase 3. Capture those references consistently
-with the backup's head and protect their referenced files until transfer completes.
-Restore must answer every included retained commit and preserve its pins, without
-claiming to recover states that were already expired. The default remains a
-current-state backup. Version any new manifest contract and test both modes against
-older readers and unknown required fields.
+### Remaining history contract
 
-Complete storage-class selection and S3 Object Lock/WORM controls from Phase 3.
-Distinguish the repository's logical expiry from the object's enforced retention,
-so GC does not promise deletion before it is permitted. Acceptance covers locked
-blobs shared by backups, denied or partial deletion, expiry, retries and an archived
-object's restore-before-read behavior.
-
-Resolve X01's reserved zstd repository encoding explicitly when selecting codecs for
-the versioned manifest and copy path. Measure an adopted implementation against
-raw/LZ4 for transfer size, CPU and restore time, or record why it remains unadopted.
-Older raw/LZ4 backups must remain readable, and unknown required codec tags must be
-refused. The measured rejected X11 column codecs are separate decisions and are not
-reopened by this checkpoint.
-
-These are planned acceptance requirements. Item 61 does not complete while the
-optional history mode or storage-retention controls promised by Phase 3 are silently
-omitted. Changing that accepted scope needs an explicit maintainer decision recorded here.
+Item 61 also covers optional F06 retained generations, pins and retention metadata
+from the original Phase 3. Capture those references with the backup's head and protect
+their referenced files until transfer completes. Restore must answer every included
+retained commit and preserve its pins. The default remains a current-state backup.
+Version the new manifest contract and test both modes against older readers and unknown
+required fields. Removing this requirement needs an explicit maintainer decision
+recorded here.
 
 ### Recovery of managed definitions
 

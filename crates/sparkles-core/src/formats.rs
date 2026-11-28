@@ -506,10 +506,10 @@ pub const SPILL: FileKind = FileKind {
 pub const BACKUP_LAYOUT: FileKind = FileKind {
     id: "backup-layout",
     files: "sparkles-repo.json of a backup repository",
-    marker: "`format`",
+    marker: "`format`; default repositories still write 1",
     class: Class::Archive,
-    writes: 1,
-    reads: &[1],
+    writes: 2,
+    reads: &[1, 2],
 };
 
 /// The blobs of a backup repository.
@@ -566,6 +566,7 @@ pub const BACKUP_MANIFEST_FEATURES: &[&str] = &[
     "evidence-configuration-history/1",
     "evidence-configuration-history/2",
     "control/1",
+    "fastcdc-2016/1",
 ];
 
 /// A kind of dataset-managed definition that backups and clones carry beside the data,

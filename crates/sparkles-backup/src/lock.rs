@@ -52,6 +52,8 @@ pub struct LockGuard {
     /// the lock object's `last_modified` when it was acquired: the storage server's
     /// clock, the reference for other objects' ages (GC's grace period)
     server_time: Option<DateTime<Utc>>,
+    acquired_at: Instant,
+    refreshed_at: Arc<std::sync::Mutex<Instant>>,
     /// the task re-writing the lock every [`REFRESH`]
     refresh: Option<tokio::task::JoinHandle<()>>,
 }
@@ -63,6 +65,8 @@ impl LockGuard {
             id: None,
             store: None,
             server_time: None,
+            acquired_at: Instant::now(),
+            refreshed_at: Arc::new(std::sync::Mutex::new(Instant::now())),
             refresh: None,
         }
     }
@@ -76,6 +80,31 @@ impl LockGuard {
     /// a lock is held: the clock that ages locks and blobs.
     pub fn server_time(&self) -> Option<DateTime<Utc>> {
         self.server_time
+    }
+
+    pub(crate) fn estimated_server_time(&self) -> Option<DateTime<Utc>> {
+        let elapsed = chrono::Duration::from_std(self.acquired_at.elapsed()).ok()?;
+        self.server_time?.checked_add_signed(elapsed)
+    }
+
+    /// A writer may publish only while its current lease still exists and is fresh.
+    pub(crate) async fn check_live(&self) -> Result<()> {
+        let (Some(id), Some(store)) = (self.id(), &self.store) else {
+            return Ok(());
+        };
+        let expired = || locked(id, None);
+        match store.head(&lock_key(id)).await {
+            Ok(meta)
+                if self.refreshed_at.lock().unwrap().elapsed() < STALE
+                    && self
+                        .estimated_server_time()
+                        .is_none_or(|now| !is_stale(meta.last_modified, now)) =>
+            {
+                Ok(())
+            }
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => Err(expired()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Delete the lock object (best effort: a failure is logged, the lock goes stale).
@@ -227,6 +256,7 @@ pub async fn acquire(
         } else {
             PutMode::Create
         };
+        let acquired_at = Instant::now();
         match store
             .put_opts(&key, PutPayload::from(body.clone()), mode.into())
             .await
@@ -282,11 +312,17 @@ pub async fn acquire(
             }
         }
         let Some((other, obj)) = conflict else {
+            let refreshed_at = Arc::new(std::sync::Mutex::new(acquired_at));
             let refresh = tokio::runtime::Handle::try_current().ok().map(|h| {
+                let renewed = refreshed_at.clone();
                 let (store, key, body) = (store.clone(), key.clone(), body.clone());
                 h.spawn(async move {
                     loop {
                         tokio::time::sleep(REFRESH).await;
+                        if renewed.lock().unwrap().elapsed() >= STALE {
+                            break;
+                        }
+                        let refresh_started = Instant::now();
                         if let Err(e) = store
                             .put_opts(
                                 &key,
@@ -300,6 +336,8 @@ pub async fn acquire(
                                 error = %BackupError::from(e),
                                 "could not refresh a repository lock"
                             );
+                        } else {
+                            *renewed.lock().unwrap() = refresh_started;
                         }
                     }
                 })
@@ -308,6 +346,8 @@ pub async fn acquire(
                 id: Some(id),
                 store: Some(store),
                 server_time: now,
+                acquired_at,
+                refreshed_at,
                 refresh,
             });
         };
@@ -441,6 +481,29 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn removed_lease_refuses_to_publish() {
+        let repo = crate::fixture::memory_repo().await;
+        let guard = acquire(
+            &repo,
+            LockKind::Shared,
+            LockOperation::Create,
+            &Ctl::default(),
+        )
+        .await
+        .unwrap();
+        guard.check_live().await.unwrap();
+        repo.store
+            .delete(&lock_key(guard.id().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(
+            guard.check_live().await.unwrap_err().code(),
+            Code::RepositoryLocked
+        );
+        guard.release().await.unwrap();
+    }
+
     use super::*;
     use crate::fixture;
 

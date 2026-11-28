@@ -62,7 +62,12 @@ pub enum BlobError {
 
 impl From<BlobError> for crate::BackupError {
     fn from(e: BlobError) -> crate::BackupError {
-        crate::BackupError::new(crate::Code::Internal, e.to_string())
+        let code = if matches!(e, BlobError::Unsupported { .. }) {
+            crate::Code::IncompatibleFormat
+        } else {
+            crate::Code::Internal
+        };
+        crate::BackupError::new(code, e.to_string())
     }
 }
 

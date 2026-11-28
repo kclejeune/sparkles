@@ -192,9 +192,9 @@ impl Repository {
     ) -> std::result::Result<RestoreReport, Failure> {
         let security = self.security().await?;
         let (m, _, _) = manifest::fetch_with_security(self, name, None, &security).await?;
-        manifest::validate(
+        manifest::validate_for_repo(
             &m,
-            self.marker.piece_bytes,
+            &self.marker,
             sparkles_core::formats::READABLE_INDEX_FORMATS,
         )?;
         // definitions of an unknown kind that are not required are left out
@@ -501,7 +501,7 @@ impl Repository {
 
     /// Download blob `id` of `size` plaintext bytes (of the file `path`) and check it,
     /// fetching it again up to [`BLOB_RETRIES`] times when it does not verify.
-    async fn fetch_blob(
+    pub(crate) async fn fetch_blob(
         &self,
         id: &str,
         size: u64,
@@ -531,7 +531,10 @@ impl Repository {
                 Err(e) => return Err(BackupError::from(e).into()),
             };
             let result = if got.meta.size > cap {
-                Err(format!("stored size {} is too large", got.meta.size))
+                Err(BackupError::internal(format!(
+                    "stored size {} is too large",
+                    got.meta.size
+                )))
             } else {
                 let mut stream = got.into_stream();
                 let mut buf = Vec::with_capacity(size.min(cap) as usize);
@@ -551,9 +554,9 @@ impl Repository {
                     }
                 }
                 if too_big {
-                    Err("stored size is too large".to_string())
+                    Err(BackupError::internal("stored size is too large"))
                 } else {
-                    security.decode(&buf, id, size).map_err(|e| e.to_string())
+                    security.decode(&buf, id, size)
                 }
             };
             match result {
@@ -567,6 +570,9 @@ impl Repository {
                         attempt,
                         "blob did not verify ({why}); fetching it again"
                     );
+                }
+                Err(error) if error.code() == Code::IncompatibleFormat => {
+                    return Err(error.with("blob", id).with("path", path).into());
                 }
                 Err(_) => {
                     return Err(Failure::Corrupt {

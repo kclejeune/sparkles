@@ -15,6 +15,7 @@ pub(crate) struct EpochKeys {
     pub epoch: u32,
     pub master: super::memory::LockedKey,
     pub id: super::memory::LockedKey,
+    pub chunker: super::memory::LockedKey,
     blob: super::memory::LockedKey,
     manifest: super::memory::LockedKey,
 }
@@ -40,6 +41,11 @@ impl EpochKeys {
                 master.as_ref(),
                 &[],
                 b"sparkles/f07/repo/id",
+            )?)?,
+            chunker: super::memory::LockedKey::new(primitive::derive(
+                master.as_ref(),
+                &[],
+                b"sparkles/f07/repo/chunker",
             )?)?,
             blob: super::memory::LockedKey::new(primitive::derive(
                 master.as_ref(),
@@ -153,7 +159,12 @@ impl EpochKeys {
                     .map_err(|_| invalid("invalid encrypted compressed payload"))?;
                 (plain, 9 + cursor.position() as usize)
             }
-            _ => return Err(invalid("unsupported encrypted codec")),
+            codec => {
+                return Err(crate::BackupError::new(
+                    crate::Code::IncompatibleFormat,
+                    format!("unsupported encrypted blob codec {codec}"),
+                ));
+            }
         };
         if plain.len() as u64 != expected
             || self.blob_id(&plain) != id

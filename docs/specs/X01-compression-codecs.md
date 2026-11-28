@@ -619,8 +619,14 @@ decoder. Compare its platform/dependency benefit, accepted input support and cos
 with the native decoder before adopting it, or record the decision to retain the
 current clean feature-disabled refusal. A decision to drop a retained requirement
 needs maintainer approval and an Outcome entry, rather than an implicit completion
-claim. Item 61 owns the equivalent decision for reserved repository-zstd encoding,
-with raw/LZ4 compatibility and restore/transfer measurements in F05.
+claim.
+
+Item 61 retains the reserved repository zstd tag as a clean refusal. Current
+repository writes and copies use raw or LZ4. Adding zstd needs comparative evidence
+for transfer size, CPU and restore time under the F05 workload. Dropping the reserved
+option requires maintainer approval and an Outcome entry. The
+[F05 Outcome](F05-snapshot-repositories/OUTCOME.md#roadmap-follow-ups-2026-10-12)
+records the repository decision.
 
 Completion of the accepted compression contract requires those decisions, the
 adopted options' round-trip and feature-matrix tests, and the named X11 settings

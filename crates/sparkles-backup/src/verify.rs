@@ -142,9 +142,9 @@ impl Repository {
         }
         for it in &mut items {
             let Some(m) = &it.manifest else { continue };
-            let bad = match crate::manifest::validate(
+            let bad = match crate::manifest::validate_for_repo(
                 m,
-                self.marker.piece_bytes,
+                &self.marker,
                 sparkles_core::formats::READABLE_INDEX_FORMATS,
             ) {
                 // another index format is intact, only not restorable by this build

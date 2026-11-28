@@ -1708,6 +1708,7 @@ async fn restore_refuses_format_1_origin_under_v2_manifest_feature() {
             id: origin_blob.id,
             size: fmt1_origin.len() as u64,
         }],
+        chunker: None,
         definition: None,
     });
     m.files.push(sparkles_backup::FileEntry {
@@ -1719,6 +1720,7 @@ async fn restore_refuses_format_1_origin_under_v2_manifest_feature() {
             id: import_blob.id,
             size: unauth_import.len() as u64,
         }],
+        chunker: None,
         definition: None,
     });
     // Ensure the crafted manifest passes manifest-level grammar validation so

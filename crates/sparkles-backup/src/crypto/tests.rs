@@ -872,3 +872,65 @@ async fn planted_passphrase_slots_are_refused_before_key_derivation() {
     let error = try_open(store, None, &opts).await.err().unwrap();
     assert!(error.to_string().contains("share one label"), "{error}");
 }
+
+#[tokio::test]
+async fn repository_copy_rekeys_blobs_and_restores_after_destination_rotation() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("db");
+    fixture::make_db(&db);
+    let source = open(Arc::new(InMemory::new()), None, &options(23)).await;
+    let destination = open(Arc::new(InMemory::new()), None, &options(24)).await;
+    backup(&source, &db, "encrypted").await;
+    backup(&source, &db, "second").await;
+    let before = source.manifest("encrypted").await.unwrap();
+    let selection = crate::CopyOptions::default();
+    let plaintext = fixture::memory_repo().await;
+    assert_eq!(
+        source
+            .copy_to(&plaintext, &selection)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidRequest
+    );
+    source
+        .copy_to(
+            &plaintext,
+            &crate::CopyOptions {
+                allow_plaintext_destination: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        plaintext
+            .manifest("encrypted")
+            .await
+            .unwrap()
+            .encryption
+            .is_none()
+    );
+
+    let copied = source.copy_to(&destination, &selection).await.unwrap();
+    assert_eq!(copied.copied.len(), 2);
+    let after = destination.manifest("encrypted").await.unwrap();
+    for (a, b) in before.files.iter().zip(&after.files) {
+        assert_eq!(a.sha256, b.sha256);
+        for (plain, rekeyed) in a.blobs.iter().zip(&b.blobs) {
+            assert_ne!(plain.id, rekeyed.id);
+        }
+    }
+    assert_eq!(after.id, before.id);
+    assert!(copied.uploaded_blobs <= after.stats.blobs);
+    destination.key_rotate(&Ctl::default()).await.unwrap();
+    let report = source.copy_to(&destination, &selection).await.unwrap();
+    assert_eq!(report.already_present, copied.copied);
+    assert_eq!(report.uploaded_blobs, 0);
+    let restored = temp.path().join("restored");
+    destination
+        .restore("encrypted", &restored, &RestoreOptions::default())
+        .await
+        .unwrap();
+    assert!(restored.join("CURRENT").exists());
+}
