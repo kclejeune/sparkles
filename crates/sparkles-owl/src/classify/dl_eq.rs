@@ -31,7 +31,7 @@ use super::dl_clause::{Lit, Lits, Made, RTerm, Rooted, XLit, admit_lit, rank, te
 use super::dl_rules::{
     DlIx, Found, Side, dl, local, merge_parts, no_xy, side_exact_bytes, side_parts_bytes, unit,
 };
-use super::index::{Ex, Index, Role, TOP};
+use super::index::{BOTTOM, Ex, Index, Role, TOP};
 use super::saturate::{Guard, Sink, State};
 use std::sync::OnceLock;
 
@@ -40,6 +40,13 @@ use std::sync::OnceLock;
 pub fn eq_block() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_EQ_BLOCK").is_none_or(|v| v != "0"))
+}
+
+/// Whether a rooted query skips Eq products whose rewritten atom it already holds.
+/// The experiment is off unless `SPARKLES_ROOTED_EQ_KNOWN=1`.
+pub(super) fn skip_known_atoms_switch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_EQ_KNOWN").is_some_and(|v| v == "1"))
 }
 
 /// The rule's name in the derivation trace with the shape of its rewriting equality
@@ -146,6 +153,19 @@ impl Eqs<'_> {
             }
             _ => true,
         }
+    }
+
+    /// For B(u), return u when rewriting it to x would put a known unit B(x)
+    /// in the head. Derive removes a denied atom or bottom before it checks
+    /// the units, so those atoms still take the ordinary path.
+    fn known_atom_constant(st: &State, v: XLit) -> Option<RTerm> {
+        let XLit::Atom(b, u @ RTerm::C(_)) = v else {
+            return None;
+        };
+        (b != BOTTOM
+            && st.subs.contains(&b)
+            && dl(st).is_none_or(|x| x.neg.binary_search(&b).is_err()))
+        .then_some(u)
     }
 
     /// The literals `v` rewrites to with `s₁ ↦ t₁`, one for each position the rule allows.
@@ -353,6 +373,9 @@ impl Eqs<'_> {
                 if let Some(d) = dl(st)
                     && let Some(by) = d.store.terms.as_deref()
                 {
+                    let skip_known = guard.dl().skip_known_eq_atoms
+                        && self.query.is_some()
+                        && matches!((s1, t1), (RTerm::C(_), RTerm::X));
                     for &i in by.any.get(&s1).into_iter().flatten() {
                         let s = &d.store.clauses[i as usize];
                         if s.dead {
@@ -360,7 +383,8 @@ impl Eqs<'_> {
                         }
                         for &l2 in d.store.maxima(i) {
                             let v2 = self.view(&guard.dl().lits, l2);
-                            if (v2 == v && side_eq(prem, s.c.body(), s.c.head(), Some(l2)))
+                            if (skip_known && Self::known_atom_constant(st, v2) == Some(s1))
+                                || (v2 == v && side_eq(prem, s.c.body(), s.c.head(), Some(l2)))
                                 || !self.admits_parts(s1, t1, v2, s.c.body(), s.c.head(), Some(l2))
                             {
                                 continue;
@@ -428,6 +452,11 @@ impl Eqs<'_> {
         let Some(by) = d.store.terms.as_deref() else {
             return true;
         };
+        let known = if guard.dl().skip_known_eq_atoms && self.query.is_some() {
+            Self::known_atom_constant(st, v)
+        } else {
+            None
+        };
         let (ts, n) = terms_of(v);
         let mut seen = [RTerm::X; 4];
         let mut seen_len = 0usize;
@@ -456,7 +485,10 @@ impl Eqs<'_> {
                             continue;
                         };
                         let t1 = if a == s1 { b } else { a };
-                        if (a != s1 && b != s1) || !Eqs::orients(s1, t1) {
+                        if (t1 == RTerm::X && known == Some(s1))
+                            || (a != s1 && b != s1)
+                            || !Eqs::orients(s1, t1)
+                        {
                             continue;
                         }
                         if !self.admits_parts(s1, t1, v, &prem.0, &prem.1, None) {
@@ -657,5 +689,25 @@ fn unit_lits(q: &Eqs<'_>, st: &State, e: Ex, out: &mut Vec<XLit>) {
         if a != TOP {
             out.push(XLit::Atom(a, f));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_denied_or_bottom_atom_cannot_discard_an_equality_conclusion() {
+        let mut st = State::default();
+        let b = 12;
+        let u = RTerm::C(0);
+        let target = XLit::Atom(b, u);
+        assert_eq!(Eqs::known_atom_constant(&st, target), None);
+        st.subs.insert(b);
+        assert_eq!(Eqs::known_atom_constant(&st, target), Some(u));
+        super::super::dl_rules::ds(&mut st).neg.push(b);
+        assert_eq!(Eqs::known_atom_constant(&st, target), None);
+        st.subs.insert(BOTTOM);
+        assert_eq!(Eqs::known_atom_constant(&st, XLit::Atom(BOTTOM, u)), None);
     }
 }

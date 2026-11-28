@@ -5826,6 +5826,27 @@ diagnostic switch `SPARKLES_ROOTED_ATMOST=0` disables these additional inference
 Relative completeness under the rooted calculus's selection and delivery restrictions,
 and the proof for all orders of late Pred replay, remain part of item 1229.
 
+#### Equality rewrites to known query atoms (item 1284)
+
+A rooted query can obtain the same conclusion many times when a primitive class
+is placed below an enumeration. If rewriting `B(u)` with an equality between the
+individual `u` and the query variable `x` would yield a known unit `B(x)`, ordinary
+clause simplification discards the conclusion. The switch `SPARKLES_ROOTED_EQ_KNOWN=1`
+skips that product whichever premise arrives last. Bottom and locally denied atoms
+still take the ordinary path because the simplifier handles them first. The switch
+is off by default.
+
+On the six-axiom enumeration fixture with its 18 primitive subclasses, this cut
+the one-thread work count from 3,388,100 to 969,033. That still exceeds the
+524,288 default work bound. The two large OBO inputs whose subclass axioms reproduce
+the effect normally take the Horn route under item 1286.
+
+On the generated ontology `s2-g2-150`, both switch settings produce four named
+subsumptions that HermiT 1.4.5.519 omits. Two explicit assertions of the universal
+object property suffice for HermiT to entail all four as well. Those assertions
+already hold in every interpretation of the original ontology. The original
+discrepancy remains part of the evidence for item 823.
+
 #### Item 1061: shared ground reasoning across contexts
 
 Item 1061 shares the ground part of a rooted run's reasoning between the root and the

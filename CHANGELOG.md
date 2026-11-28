@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Optional pruning of rooted equality conclusions (item 1284)
+
+With `SPARKLES_ROOTED_EQ_KNOWN=1`, rooted classification skips an equality rewrite
+when the query context already holds the class assertion the rewrite would produce.
+
 ### Rooted classification keeps the Horn share (item 1286)
 
 A classification with `Limits::rooted` and without `Limits::counting` no longer trades the

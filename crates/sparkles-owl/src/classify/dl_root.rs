@@ -9263,9 +9263,19 @@ pub(super) mod tests {
     /// Saturates as [`saturate_seeded`] does, after saturating the contexts of `before`
     /// one at a time.
     fn saturate_after(
+        s: Sig,
+        before: &[Ex],
+        at: Option<Ex>,
+        seed: impl FnOnce(&Index, &mut Interner) -> Vec<(Vec<XLit>, Vec<XLit>)>,
+    ) -> Done {
+        saturate_after_with_run(s, before, at, DlRun::new(false, Default::default()), seed)
+    }
+
+    fn saturate_after_with_run(
         mut s: Sig,
         before: &[Ex],
         at: Option<Ex>,
+        run: DlRun,
         seed: impl FnOnce(&Index, &mut Interner) -> Vec<(Vec<XLit>, Vec<XLit>)>,
     ) -> Done {
         let root = s.it.fresh_class();
@@ -9276,7 +9286,6 @@ pub(super) mod tests {
         s.ax.dl = Some(Box::new(std::mem::take(&mut s.dl)));
         let ix = Index::build(&s.ax, &mut s.it, None, &|| false).unwrap();
         let ctx: Contexts = (0..s.it.nodes.len()).map(|_| OnceLock::new()).collect();
-        let run = DlRun::new(false, Default::default());
         let bounds = Bounds {
             threads: 1,
             deadline: None,
@@ -10867,6 +10876,30 @@ pub(super) mod tests {
             && d.has(&[XLit::Atom(b, RTerm::X), XLit::Atom(cc, o)]);
         assert_eq!(mixed, !super::super::dl_eq::eq_block());
         assert!(!d.has(&[XLit::Atom(b, o)]));
+    }
+
+    #[test]
+    fn a_known_query_atom_skips_its_equality_product_and_an_unknown_atom_is_still_derived() {
+        let work = |skip| {
+            let mut s = Sig::new();
+            let nominal = s.ind("o");
+            let [a, b] = ["A", "B"].map(|name| s.class(name));
+            s.sub(a, nominal);
+            let mut run = DlRun::new(false, Default::default());
+            run.skip_known_eq_atoms = skip;
+            let result = saturate_after_with_run(s, &[ROOT], Some(a), run, |ix, _| {
+                let o = c(nominal, ix);
+                [a, b]
+                    .map(|class| (vec![], vec![XLit::Atom(class, o)]))
+                    .into()
+            });
+            assert!(result.subs(a) && result.subs(b));
+            assert!(!result.bottom());
+            result.run.work()
+        };
+        let control = work(false);
+        let pruned = work(true);
+        assert!(pruned < control, "pruned {pruned}, control {control}");
     }
 
     #[test]
