@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Dataset storage quota accounting
+
+Dataset quotas now exclude unused write-ahead log, delta vocabulary and change-log
+segment space independently for each branch. Change records and sealed segment indexes
+count toward the shared quota.
+
 ### SERVICE enhancer cache slices, disk tier, management functions and parallel requests
 
 The cache of remote SERVICE results keys an entry without the outermost LIMIT and OFFSET

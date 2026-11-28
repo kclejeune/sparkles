@@ -1914,6 +1914,8 @@ struct Inner {
     file: Option<File>,
     /// the open segment file's length: records, then zeros written ahead of them
     alloc: u64,
+    /// The last possible data byte, including a failed append.
+    written_end: u64,
     /// unsynced bytes were written
     dirty: bool,
     /// the newest commit covered (`None`: nothing recorded yet)
@@ -1934,6 +1936,7 @@ pub struct ChangeLog {
     dir: Option<PathBuf>,
     root: Option<PathBuf>,
     limits: LogLimits,
+    quota: Option<Arc<super::quota::Quota>>,
     settings: Mutex<ChangeLogSettings>,
     enabled: AtomicBool,
     inner: Mutex<Inner>,
@@ -1988,6 +1991,7 @@ impl ChangeLog {
             ChangeLogSettings::default(),
             Inner::empty(),
             None,
+            None,
         )
     }
 
@@ -1998,6 +2002,7 @@ impl ChangeLog {
         settings: ChangeLogSettings,
         inner: Inner,
         readonly: Option<readonly::ReadOnlyLog>,
+        quota: Option<Arc<super::quota::Quota>>,
     ) -> Arc<ChangeLog> {
         let enabled = settings.enabled.unwrap_or(limits.default_on);
         Arc::new_cyclic(|me| ChangeLog {
@@ -2006,6 +2011,7 @@ impl ChangeLog {
             dir: root.map(|r| r.join(CHANGES_DIR)),
             root: root.map(Path::to_path_buf),
             limits,
+            quota,
             settings: Mutex::new(settings),
             enabled: AtomicBool::new(enabled),
             inner: Mutex::new(inner),
@@ -2024,6 +2030,7 @@ impl ChangeLog {
         root: &Path,
         dataset_id: uuid::Uuid,
         limits: LogLimits,
+        quota: Arc<super::quota::Quota>,
     ) -> Result<Arc<ChangeLog>> {
         let settings = read_settings(root)?;
         let dir = root.join(CHANGES_DIR);
@@ -2031,7 +2038,15 @@ impl ChangeLog {
             Some(i) => i,
             None => Inner::empty(),
         };
-        let log = Self::new(dataset_id, Some(root), limits, settings, inner, None);
+        let log = Self::new(
+            dataset_id,
+            Some(root),
+            limits,
+            settings,
+            inner,
+            None,
+            Some(quota),
+        );
         if !log.enabled.load(Ordering::Relaxed) && dir.exists() {
             // turned off while the store was closed: nothing is kept
             log.remove_all()?;
@@ -2193,6 +2208,7 @@ impl ChangeLog {
             segs,
             file,
             alloc,
+            written_end: alloc,
             dirty: false,
             last,
             failed: None,
@@ -2259,6 +2275,35 @@ impl ChangeLog {
         Ok(())
     }
 
+    /// Give back the unused space before the store closes, even when snapshots
+    /// still hold the log for reads.
+    pub(super) fn trim(&self) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if let Some(file) = &inner.file
+            && inner.failed.is_none()
+            && inner.alloc > inner.written_end
+        {
+            self.withdraw_padding();
+            let result = file.set_len(inner.written_end);
+            if result.is_ok() {
+                inner.alloc = inner.written_end;
+            }
+            // A quota walk may have cached the old length after padding was withdrawn.
+            if let Some(quota) = &self.quota {
+                quota.account_changes(self.dataset_id, inner.alloc - inner.written_end, None);
+            }
+            result?;
+            inner.file.as_ref().expect("open segment").sync_data()?;
+        }
+        Ok(())
+    }
+
+    fn withdraw_padding(&self) {
+        if let Some(quota) = &self.quota {
+            quota.account_changes(self.dataset_id, 0, None);
+        }
+    }
+
     fn sync_locked(&self, inner: &mut Inner) -> Result<()> {
         if inner.dirty
             && let Some(f) = &inner.file
@@ -2308,13 +2353,43 @@ impl ChangeLog {
     }
 
     fn append(&self, inner: &mut Inner, rec: Record) -> Result<()> {
+        let Some(quota) = &self.quota else {
+            return self.append_record(inner, rec);
+        };
+        let open = |inner: &Inner| {
+            inner
+                .file
+                .as_ref()
+                .and_then(|_| inner.segs.last().map(|s| (s.first, inner.alloc)))
+        };
+        let before = open(inner);
+        let last = inner.last;
+        let measures = quota.measures();
+        let result = self.append_record(inner, rec);
+        let after = open(inner);
+        if last != inner.last || result.is_err() {
+            let growth = match (before, after) {
+                (Some((first, alloc)), Some((next, new_alloc)))
+                    if first == next && result.is_ok() =>
+                {
+                    Some((new_alloc - alloc, measures))
+                }
+                _ => None,
+            };
+            let padding = after.map_or(0, |(_, alloc)| alloc.saturating_sub(inner.written_end));
+            quota.account_changes(self.dataset_id, padding, growth);
+        }
+        result
+    }
+
+    fn append_record(&self, inner: &mut Inner, rec: Record) -> Result<()> {
         // records follow each other: a hole becomes a gap, a repeat is skipped
         if let Some(last) = inner.last {
             if rec.last() <= last {
                 return Ok(());
             }
             if rec.first() > last + 1 {
-                self.append(
+                self.append_record(
                     inner,
                     Record::Gap {
                         from: last + 1,
@@ -2341,6 +2416,8 @@ impl ChangeLog {
             Some(f) => {
                 // records overwrite zeros written ahead of them, so that a sync of
                 // the file needs no journal commit (as the write-ahead log does)
+                let end = offset + bytes.len() as u64;
+                inner.written_end = inner.written_end.max(end);
                 super::wal::write_commit(f, offset, &mut inner.alloc, &bytes, PREALLOC)?;
                 inner.dirty = true;
             }
@@ -2374,7 +2451,13 @@ impl ChangeLog {
         };
         match &self.dir {
             Some(dir) => {
-                std::fs::create_dir_all(dir)?;
+                // The store directory must still exist. A queued record from a
+                // deleted branch must not recreate it after the branch is unlinked.
+                match std::fs::create_dir(dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e.into()),
+                }
                 let path = dir.join(seg_name(first));
                 let mut f = OpenOptions::new()
                     .create(true)
@@ -2389,6 +2472,7 @@ impl ChangeLog {
                 }
                 seg.path = Some(path);
                 inner.alloc = SEG_HEADER as u64;
+                inner.written_end = inner.alloc;
                 inner.file = Some(f);
             }
             None => seg.mem.extend_from_slice(&header),
@@ -2410,7 +2494,9 @@ impl ChangeLog {
         ix.seal();
         if let (Some(f), Some(idx)) = (&inner.file, seg.idx_path()) {
             // a sealed segment ends with its last record
+            self.withdraw_padding();
             f.set_len(seg.bytes)?;
+            inner.alloc = seg.bytes;
             f.sync_data()?;
             write_synced_atomic(&idx, &ix.encode(self.dataset_id, seg.first, seg.last))?;
             if let Some(dir) = &self.dir {
@@ -2668,10 +2754,13 @@ impl ChangeLog {
             }
             dropped += 1;
         }
-        if dropped > 0
-            && let Some(dir) = &self.dir
-        {
-            sync_dir(dir)?;
+        if dropped > 0 {
+            if let Some(quota) = &self.quota {
+                quota.invalidate();
+            }
+            if let Some(dir) = &self.dir {
+                sync_dir(dir)?;
+            }
         }
         Ok(dropped)
     }
@@ -2680,9 +2769,14 @@ impl ChangeLog {
         self.require_writable()?;
         self.pending.lock().clear();
         let mut inner = self.inner.lock();
+        self.withdraw_padding();
         *inner = Inner::empty();
         if let Some(dir) = &self.dir {
-            match std::fs::remove_dir_all(dir) {
+            let removed = std::fs::remove_dir_all(dir);
+            if let Some(quota) = &self.quota {
+                quota.invalidate();
+            }
+            match removed {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
@@ -3371,6 +3465,7 @@ impl Inner {
             segs: Vec::new(),
             file: None,
             alloc: 0,
+            written_end: 0,
             dirty: false,
             last: None,
             failed: None,
@@ -4046,6 +4141,48 @@ mod settings_format_tests {
         fn drop(&mut self) {
             PAGED_FILTER_EVALUATIONS.with(|count| count.set(None));
         }
+    }
+
+    #[test]
+    fn change_log_quota_charges_records_even_when_they_fit_in_an_open_segment() {
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let quota = Arc::new(super::super::quota::Quota::open(Some(root.path()), None).unwrap());
+        quota.register_store(id);
+        let gap = |n| Record::Gap {
+            from: n,
+            through: n,
+        };
+        let frame = encode(&gap(1)).len() as u64;
+        let log = ChangeLog::open(
+            root.path(),
+            id,
+            LogLimits {
+                segment_bytes: SEG_HEADER as u64 + 3 * frame,
+                default_max_bytes: 0,
+                default_on: true,
+                bulk_max_quads: 0,
+            },
+            quota.clone(),
+        )
+        .unwrap();
+
+        let mut inner = log.inner.lock();
+        log.append(&mut inner, gap(1)).unwrap();
+        let first = quota.used();
+        assert_eq!(first, SEG_HEADER as u64 + frame);
+        assert!(inner.alloc > first);
+        let walks = quota.measures();
+        log.append(&mut inner, gap(2)).unwrap();
+        assert_eq!(quota.used(), first + frame);
+        assert_eq!(
+            quota.measures(),
+            walks,
+            "the append updated the cached quota"
+        );
+        log.append(&mut inner, gap(3)).unwrap();
+        assert!(inner.file.is_none());
+        assert_eq!(quota.used(), super::super::dir_size(root.path()));
     }
 
     #[test]

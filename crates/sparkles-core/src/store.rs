@@ -2534,14 +2534,13 @@ impl Store {
 impl WriterState {
     /// Cut the space preallocated after the last commit off the WAL, before the store
     /// closes or moves on to another generation's log: a log that is no longer
-    /// written ends at its last commit (an open truncates it as well). Not after a
-    /// failed write, whose bytes the next open sorts out.
+    /// written ends at its last commit (an open truncates it as well). The caller
+    /// must know that the last write finished successfully.
     fn trim_wal(&mut self) {
         let len = self.wal_len;
         let mut io = self.tail.lock();
         // a commit still queued for its fence would be written past the cut
-        if !self.poisoned
-            && io.end == len
+        if io.end == len
             && io.alloc > len
             && let Some(wal) = self.wal.as_ref()
             && wal.set_len(len).is_ok()
@@ -3673,15 +3672,17 @@ impl Store {
         )?;
         #[cfg(test)]
         open_step("annotations-open");
-        let changelog = Some(changelog::ChangeLog::open(
-            root,
-            dataset_id,
-            Store::log_limits(&opts),
-        )?);
         let quota = match &ctx {
             Some(c) => c.quota.clone(),
             None => Arc::new(quota::Quota::open(Some(root), opts.max_disk_bytes)?),
         };
+        let changelog = Some(changelog::ChangeLog::open(
+            root,
+            dataset_id,
+            Store::log_limits(&opts),
+            quota.clone(),
+        )?);
+        quota.register_store(dataset_id);
         let mut branching = branching::Branching {
             merges: Mutex::new(branching::MergeLog::open(root, head.seq)?),
             ..Default::default()
@@ -5293,8 +5294,8 @@ impl Store {
         {
             let mut a = self.annotations.lock();
             let pruned = a.prune_before(cutoff, self.dataset_id);
-            let (was, now) = a.take_prealloc();
-            self.quota.move_ann_preallocated(was, now);
+            let (_, now) = a.take_prealloc();
+            self.quota.account_annotations(self.dataset_id, now, None);
             pruned?;
         }
         drop(w);
@@ -5421,18 +5422,22 @@ impl Store {
     ) -> Result<crate::annotations::Annotation> {
         let mut a = self.annotations.lock();
         let ann = self.annotation_of(&a, c, message, changes);
+        let measures = self.quota.measures();
         let written = a.append(c.seq, ann.clone(), self.dataset_id, || {
             self.annotation_prealloc()
         });
-        // a failed append cut the file back, zeros included, which the cached size of
-        // the directory still holds
-        let (was, now) = a.take_prealloc();
-        self.quota.move_ann_preallocated(was, now);
-        if written.is_err() {
-            self.quota.invalidate();
-        }
-        if let Some(w) = written? {
-            self.quota.add(w.grew);
+        let (_, padding) = a.take_prealloc();
+        match written {
+            Ok(Some(w)) => {
+                self.quota
+                    .account_annotations(self.dataset_id, padding, Some((w.grew, measures)))
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.quota
+                    .account_annotations(self.dataset_id, padding, None);
+                return Err(e);
+            }
         }
         Ok(ann)
     }
@@ -5456,10 +5461,8 @@ impl Store {
     fn undo_annotation(&self, seq: u64) -> Result<()> {
         let mut a = self.annotations.lock();
         let undone = a.undo(seq);
-        let (was, now) = a.take_prealloc();
-        self.quota.move_ann_preallocated(was, now);
-        // the cut is not in the cached size of the directory
-        self.quota.invalidate();
+        let (_, now) = a.take_prealloc();
+        self.quota.account_annotations(self.dataset_id, now, None);
         undone
     }
 
@@ -5487,7 +5490,7 @@ impl Store {
         drop(a);
         if let Some(measures) = measures {
             match &queued {
-                Ok(_) => self.quota.account_append(header, measures),
+                Ok(_) => self.quota.account_append(self.dataset_id, header, measures),
                 Err(_) => self.quota.invalidate(),
             }
         }
@@ -7719,7 +7722,7 @@ impl Store {
         }
         let fits = self
             .check_memory(dir_size(&dir))
-            .and_then(|_| self.quota.check_rebuild(old, &dir));
+            .and_then(|_| self.quota.check_rebuild(Some(self.dataset_id), old, &dir));
         match fits {
             Err(e) if dry.is_some() => storage.refused = Some(e),
             Err(e) => {
@@ -8263,14 +8266,20 @@ impl Store {
     /// Move the writer onto the log of the generation `gen_` that `CURRENT` now names.
     /// The old generation's log and vocabulary take no more writes.
     fn adopt_generation_log(&self, w: &mut WriterState, gen_: &Generation, next: NextLog) {
+        // Rebuild and compaction reach this point only after draining the old
+        // writer and switching CURRENT successfully, including a control-log switch.
+        self.quota.set_generation_padding(self.dataset_id, 0, None);
         w.trim_wal();
         self.snapshot().generation.dvocab.trim();
-        self.quota.set_vocab_preallocated(next.vocab_preallocated);
+        self.quota.set_generation_padding(
+            self.dataset_id,
+            next.vocab_preallocated,
+            gen_.dir.as_deref(),
+        );
         w.wal = Some(next.wal);
         w.tail = next.tail;
         w.wal_len = next.len;
         self.wal_end.store(next.len, Ordering::Relaxed);
-        self.quota.set_preallocated(0);
         *gen_.wal_index.lock() = Some(next.index);
     }
 
@@ -8517,12 +8526,23 @@ fn write_snapshot(
 pub use crate::task::ProgressFn;
 
 pub(crate) fn dir_size(p: &Path) -> u64 {
+    dir_size_skipping(p, &|_| false)
+}
+
+fn dir_size_skipping(p: &Path, skip: &impl Fn(&Path) -> bool) -> u64 {
     let Ok(rd) = std::fs::read_dir(p) else {
         return 0;
     };
     rd.flatten()
         .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => dir_size(&e.path()),
+            Ok(m) if m.is_dir() => {
+                let path = e.path();
+                if skip(&path) {
+                    0
+                } else {
+                    dir_size_skipping(&path, skip)
+                }
+            }
             Ok(m) => m.len(),
             Err(_) => 0,
         })
@@ -10408,19 +10428,28 @@ impl Drop for Store {
             if let Some(g) = &self.group {
                 *g.vocab.lock() = Default::default();
             }
-            w.trim_wal();
             if !w.poisoned {
-                self.snapshot().generation.dvocab.trim();
+                self.quota.set_generation_padding(self.dataset_id, 0, None);
+                w.trim_wal();
+                let snapshot = self.snapshot();
+                snapshot.generation.dvocab.trim();
+                let wal_padding = {
+                    let tail = w.tail.lock();
+                    tail.alloc.saturating_sub(tail.end)
+                };
+                self.quota.set_generation_padding(
+                    self.dataset_id,
+                    wal_padding + snapshot.generation.dvocab.preallocated(),
+                    None,
+                );
             }
-            // Branch stores share the quota, so a closing store takes back its zeros,
-            // and a poisoned one too, since its directory may be deleted next.
             let mut a = self.annotations.lock();
             a.trim();
-            let (was, now) = a.take_prealloc();
-            self.quota.move_ann_preallocated(was, now);
+            let (_, now) = a.take_prealloc();
+            self.quota.account_annotations(self.dataset_id, now, None);
         }
         if let Some(log) = &self.changelog
-            && let Err(e) = log.flush(true)
+            && let Err(e) = log.flush(true).and_then(|()| log.trim())
         {
             tracing::warn!(target: "sparkles::store", error = %e, "could not write the change log on close");
         }

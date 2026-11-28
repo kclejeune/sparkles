@@ -121,7 +121,7 @@ impl Store {
         let catalog_growth = self.catalog.lock().append(c.info);
         if let Some(measures) = measures {
             match catalog_growth {
-                Some(bytes) => self.quota.account_append(bytes, measures),
+                Some(bytes) => self.quota.account_append(self.dataset_id, bytes, measures),
                 None => self.quota.invalidate(),
             }
         }

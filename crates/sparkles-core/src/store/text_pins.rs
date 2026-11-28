@@ -248,7 +248,7 @@ impl Store {
         }
         write_atomic(&stage.join(META), &metadata)?;
         sync_dir(stage)?;
-        self.quota.check_rebuild(old_dir, stage)?;
+        self.quota.check_rebuild(None, old_dir, stage)?;
         check()?;
         let id = uuid::Uuid::new_v4();
         let path = parent.join(id.to_string());

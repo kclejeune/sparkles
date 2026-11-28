@@ -630,7 +630,7 @@ impl Drop for Run<'_> {
         }
         s.compaction.reserved.store(0, Ordering::Relaxed);
         if self.dir.is_some() {
-            s.quota.exclude(None);
+            s.quota.exclude(s.dataset_id, None);
         }
         s.compaction.running.store(false, Ordering::Release);
     }
@@ -1171,7 +1171,7 @@ impl Store {
         let build = (relink.is_none()).then(|| self.build_options(&snap0.generation));
         if self.root.is_some() {
             run.dir = Some(dir.clone());
-            self.quota.exclude(Some(&dir));
+            self.quota.exclude(self.dataset_id, Some(&dir));
             // Marks the directory as this dataset's unfinished build. Earlier releases
             // remove a marked directory at open, and this one removes every
             // generation newer than CURRENT (see `history::remove_newer_generations`).
@@ -1205,18 +1205,8 @@ impl Store {
             p(RELINK_CATCHING_UP);
         }
         // the first rebuild of a linked branch adds a full index: refused over the quota
-        if snap0.generation.link.is_some()
-            && let (Some(limit), Some(root)) = (self.quota.limit(), &self.root)
-        {
-            let ds_root = super::link::dataset_root_of(root)?;
-            let projected = dir_size(&ds_root);
-            if projected > limit {
-                return Err(Error::BudgetExceeded(crate::Budget {
-                    kind: crate::BudgetKind::DatasetBytes,
-                    limit,
-                    requested: projected,
-                }));
-            }
+        if snap0.generation.link.is_some() {
+            self.quota.check_linked_compaction(self.dataset_id)?;
         }
         let persistent = self.root.is_some();
         let mut gen_ = match super::link::read_link(&dir)? {

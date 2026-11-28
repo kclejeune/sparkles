@@ -1092,6 +1092,7 @@ mod tests {
             },
             Inner::empty(),
             Some(reader),
+            None,
         );
 
         // Under Unlimited, status() walks captured segments through fallible frame
@@ -1799,6 +1800,7 @@ impl ChangeLog {
             settings,
             Inner::empty(),
             Some(reader.value),
+            None,
         );
         value.background.store(false, Ordering::Relaxed);
         Ok(Loaded {

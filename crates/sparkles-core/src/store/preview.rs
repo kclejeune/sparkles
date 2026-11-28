@@ -126,7 +126,7 @@ impl Store {
     /// an in-memory store's size limit.
     pub(super) fn rebuild_storage(&self, old: Option<&Path>, new: &Path) -> StorageCheck {
         if self.root.is_some() {
-            return match self.quota.project_rebuild(old, new) {
+            return match self.quota.project_rebuild(Some(self.dataset_id), old, new) {
                 Some((limit, used, projected)) => StorageCheck {
                     refused: None,
                     limit: Some(limit),

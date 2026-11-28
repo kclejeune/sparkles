@@ -1992,6 +1992,18 @@ Serial commits, which take the ordinary path and write their record through befo
 log records, issued 0.005 to 0.007 flushes per commit instead of 1.105 to 1.109, with paired
 p50 and p90 latency ratios of 0.618 and 0.627.
 
+**Dataset quota preallocation (items 560 and 561).** The shared quota tracks the unused
+tails of the write-ahead log, delta vocabulary and annotations separately for each
+store. A fence publishes its store's new padding and releases its queued bytes under
+the same lock. Compaction replaces only the padding of the store it switches, and
+branch deletion removes that branch's contribution when its directory is removed.
+
+The change log reports the unused tail of its open segment. Appending charges the
+record bytes, and sealing trims the tail and charges the sealed index. A clean close
+trims the segment, and writable open truncates padding or a torn tail left on disk.
+Rebuild quota checks deduct padding from both the dataset size and the size of the
+generation that the rebuild replaces.
+
 **Fences in each drive state (item 502).** Four probe runs on `forge` on 2026-11-01
 measured the two fence shapes on their own, outside the engine, with the drive in each
 state, as the [fence probe results](../benchmarks/writes/RESULTS.md#fences-in-each-drive-state)
